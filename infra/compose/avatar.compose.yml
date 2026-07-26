@@ -1,0 +1,46 @@
+# Avatar renderer sidecar (SPEC-W9 Part A / A3) — OPTIONAL compose override.
+#
+# Publishes a generated video track into active `site-{slug}` LiveKit rooms
+# (open lip-sync path; the hosted alternative is AVATAR_PROVIDER=tavus).
+# NOT part of the base stack; start it as an override on top of the root
+# compose + the voice fragment:
+#
+#   docker compose -f docker-compose.yml \
+#     -f services/voice-agent-runtime/docker-compose.fragment.yml \
+#     -f infra/compose/avatar.compose.yml --profile voice up -d avatar-renderer
+#
+# Voice-runtime env to activate the provider (see docs/avatar.md):
+#   AVATAR_PROVIDER=musetalk AVATAR_RENDERER=enabled MUSETALK_ROOM_AGENT=true
+
+services:
+  avatar-renderer:
+    build:
+      context: ../../services/avatar-renderer
+    image: opendesk/avatar-renderer:dev
+    container_name: opendesk-avatar-renderer
+    profiles: ["voice"]
+    restart: unless-stopped
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      # mock = warm test pattern (no GPU, default). musetalk = real lip-sync
+      # inference — requires the Dockerfile MuseTalk enablement block + GPU.
+      AVATAR_RENDERER_MODE: ${AVATAR_RENDERER_MODE:-mock}
+      AVATAR_ROOM_PREFIX: ${AVATAR_ROOM_PREFIX:-site-}
+      AVATAR_DISCOVERY_INTERVAL_S: ${AVATAR_DISCOVERY_INTERVAL_S:-5}
+    # MuseTalk GPU mode (uncomment together with the Dockerfile block):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    depends_on:
+      - livekit
+    # Joins the `opendesk` network defined by the root docker-compose.yml
+    # (no re-declaration needed when used as a -f override).
+    networks:
+      - opendesk
+
