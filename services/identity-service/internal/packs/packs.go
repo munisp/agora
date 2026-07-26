@@ -75,6 +75,16 @@ type CustomTool struct {
 	BodyTemplate string `yaml:"bodyTemplate" json:"bodyTemplate,omitempty"`
 }
 
+// MCPServer is one external MCP (Model Context Protocol) server a pack
+// connects to the voice tool layer (SPEC-W9 Part C2): the voice runtime
+// handshakes it (initialize -> tools/list) and exposes its tools namespaced
+// mcp__{server}__{tool}. Https-only; packs carry no credentials — auth
+// headers belong in the runtime's MCP_SERVERS env var.
+type MCPServer struct {
+	Name string `yaml:"name" json:"name"`
+	URL  string `yaml:"url" json:"url"`
+}
+
 // Pack is one industry pack definition (industries/<id>.yaml).
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
@@ -90,6 +100,8 @@ type Pack struct {
 	// SPEC-W3 §4: optional, validated when present.
 	Agents      []Agent      `yaml:"agents" json:"agents,omitempty"`
 	CustomTools []CustomTool `yaml:"customTools" json:"customTools,omitempty"`
+	// SPEC-W9 Part C2: optional MCP servers, validated when present.
+	MCPServers []MCPServer `yaml:"mcpServers" json:"mcpServers,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -110,6 +122,7 @@ type Summary struct {
 	TemporalWorkflow string            `json:"temporalWorkflow"`
 	Agents           []Agent           `json:"agents,omitempty"`
 	CustomTools      []CustomTool      `json:"customTools,omitempty"`
+	MCPServers       []MCPServer       `json:"mcpServers,omitempty"`
 	ConsentText      string            `json:"consentText,omitempty"`
 	Languages        []string          `json:"languages,omitempty"`
 }
@@ -140,6 +153,7 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		TemporalWorkflow: p.TemporalWorkflow,
 		Agents:           p.Agents,
 		CustomTools:      p.CustomTools,
+		MCPServers:       p.MCPServers,
 		ConsentText:      p.ConsentText,
 		Languages:        p.Languages,
 	}
@@ -255,6 +269,9 @@ func (p Pack) Validate() error {
 	if err := validateCustomTools(p.CustomTools); err != nil {
 		return err
 	}
+	if err := validateMCPServers(p.MCPServers); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -318,6 +335,29 @@ func validateCustomTools(tools []CustomTool) error {
 	return nil
 }
 
+// validateMCPServers enforces the SPEC-W9 Part C2 mcpServers schema:
+// optional list, slug-rule unique names (same regex as agent ids) and
+// absolute https URLs only — MCP servers sit outside the platform SSRF
+// guard, so plaintext http is rejected outright. Kept in sync with
+// scripts/validate_pack.py.
+func validateMCPServers(servers []MCPServer) error {
+	seen := make(map[string]bool, len(servers))
+	for i, s := range servers {
+		if !agentIDRe.MatchString(s.Name) {
+			return fmt.Errorf("mcpServers[%d]: name %q must match %s", i, s.Name, agentIDRe)
+		}
+		if seen[s.Name] {
+			return fmt.Errorf("mcpServers[%d]: duplicate server name %q", i, s.Name)
+		}
+		seen[s.Name] = true
+		u, err := url.Parse(s.URL)
+		if err != nil || u.Host == "" || u.Scheme != "https" {
+			return fmt.Errorf("mcpServers[%d] (%s): url must be absolute https", i, s.Name)
+		}
+	}
+	return nil
+}
+
 // Get returns the pack for an id.
 func (r *Registry) Get(id string) (Pack, bool) {
 	p, ok := r.packs[id]
@@ -344,3 +384,4 @@ func (r *Registry) IDs() []string {
 	sort.Strings(ids)
 	return ids
 }
+
