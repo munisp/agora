@@ -739,4 +739,3 @@ def build_mcp_tools_sync(tenant_ctx: Any = None) -> list[MCPTool]:
             _tools_cache[key] = (time.monotonic() + ttl, fetched)
         tools.extend(fetched)
     return tools
-

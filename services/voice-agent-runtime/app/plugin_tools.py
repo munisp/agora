@@ -204,4 +204,3 @@ def build_plugin_tools(
     except Exception as exc:  # noqa: BLE001 - MCP must never break the session
         log.warning("mcp tool build failed", error=str(exc)[:200])
     return tools
-
