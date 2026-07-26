@@ -126,4 +126,3 @@ OWNERSHIP (collision-critical):
 - D's pack must pass the CURRENT validator before C's mcpServers change lands — coordinate via the
   validator's existing optional-block behavior (it already tolerates optional blocks; C's change is
   additive-only).
-
