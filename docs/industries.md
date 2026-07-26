@@ -66,6 +66,7 @@ Every pack is a single YAML file named `<id>.yaml` with exactly this schema:
 | **law-enforcement** | officer / appointment / caller | intake required, no fees, 24h window | `ClinicIntakeWorkflow` | Police non-emergency reporting desk; hard rules: emergencies → national emergency number (911/999/112) FIRST, never dispatches officers, never promises response times, no legal advice, never confirms investigations; reference number for every report; weapon/injury mentions escalate to a human operator; anonymous tip intake |
 | **neighborhood-watch** | coordinator / signup / resident | no fees, 24h window | `ConsultancyFollowupWorkflow` | Community watch persona; golden rule "observe & report only — never confront suspects"; emergency vs police non-emergency escalation path; patrol shift signup in pairs, community meetings (capacity 40), new-member onboarding; reference number for every report |
 | **civic-services** | inspector / inspection slot / resident | no fees, 12h window | `SupportEscalationWorkflow` | 311-style municipal reporting; hard rule: gas leaks/downed power lines → emergency number FIRST; department routing (roads/lighting/sanitation/water/parks); published SLA expectations quoted as estimates, never promises; "what to have ready" guidance (location, landmark, photo description); ticket reference for every report |
+| **hospitality** | concierge / reservation / guest | first-night deposit (100% of the booked night), 48h window | `SalonDepositWorkflow` | Warm hotel-concierge persona; natural no-pressure upsells (airport pickup, breakfast package, late check-out — offer once, accept "no"); per-night kobo pricing (standard ₦45,000 / deluxe ₦85,000 / suite ₦150,000), event-hall day ₦750,000; check-in 14:00 / check-out 11:00 seeds, pet + parking + wifi policies; pre-arrival reminders 48h/24h with check-in instructions; hotel KPI dashboard labels (occupancy, ADR, RevPAR); `languages: [en, pcm]`, NDPA consent |
 
 ## How onboarding applies a pack
 
@@ -157,3 +158,4 @@ are registered alongside the existing saga/reminder workflows.
 > A pack that needs **new runtime behavior** (not just new data) requires a new
 > Temporal workflow in notification-worker plus its registration and tests —
 > follow `SalonDepositWorkflow` as the template.
+
