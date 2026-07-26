@@ -46,6 +46,14 @@ temporalWorkflow: SalonDepositWorkflow
 # handled at the PERSONA level by this pack, not by a locale switch — see
 # services/voice-agent-runtime/app/multilang.py.
 languages: [en, pcm]
+# Voice defaults (SPEC-W10 Part D): default TTS provider is MMS; English
+# prefers Azure en-NG-EzinneNeural, Pidgin uses MMS. The runtime fallback
+# chain degrades azure → mms → piper (see docs/voices.md).
+voice:
+  provider: mms
+  languages:
+    en: "azure:en-NG-EzinneNeural"
+    pcm: "mms:pcm"
 # NDPA 2023 consent text (data processing + call recording notice). Optional
 # field — scripts/validate_pack.py and the Go pack loader tolerate extra
 # fields. NOTE: passthrough via identity's GET /v1/tenants/{slug} pack

@@ -64,6 +64,13 @@ temporalWorkflow: SalonDepositWorkflow
 # at the PERSONA level (whisper returns Pidgin speech as 'en') — see
 # services/voice-agent-runtime/app/multilang.py.
 languages: [en, pcm]
+# Voice defaults (SPEC-W10 Part D): default TTS provider is MMS; English
+# prefers Azure en-NG-AbeoNeural, Pidgin uses MMS (see docs/voices.md).
+voice:
+  provider: mms
+  languages:
+    en: "azure:en-NG-AbeoNeural"
+    pcm: "mms:pcm"
 # NDPA 2023 consent text (data processing + call recording notice). Optional
 # field — scripts/validate_pack.py and the Go pack loader tolerate it.
 consentText: |

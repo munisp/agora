@@ -100,7 +100,7 @@
     {
       "id": "hospitality",
       "version": "1.0.0",
-      "sha256": "291b4a2f19db19c029892110bde730cf1c5166339e849e973169beaac1c9e034",
+      "sha256": "ed125efaa03e5d9335ed4d3397e2faebe834e64239287fed142793f7be36721d",
       "author": "opendesk",
       "signature": null,
       "path": "hospitality.yaml"
@@ -164,7 +164,7 @@
     {
       "id": "nigeria-sme",
       "version": "1.0.0",
-      "sha256": "aa84f2d629c0997dc8bfd93059cdbfae24bcfe822ade20edc950561999101092",
+      "sha256": "963f7b2a08286a5984eb6d26b71a2ddffbb6c37628885e97ae51bc857a2188e3",
       "author": "opendesk",
       "signature": null,
       "path": "nigeria-sme.yaml"
