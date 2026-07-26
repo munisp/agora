@@ -476,4 +476,3 @@ async def test_build_mcp_tools_sync_inside_running_loop(monkeypatch):
     )
     tools = build_plugin_tools([], allowed_hosts_raw="booking")
     assert [t.name for t in tools] == ["mcp__crm__lookup_order"]
-

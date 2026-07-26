@@ -115,4 +115,3 @@ async def test_chat_passes_tenant_ctx_to_plugin_tools(monkeypatch):
     assert captured and captured[0] is ctx
     # …so the pack MCP tool was registered and offered to the LLM.
     assert "mcp__n8n__lookup_order" in llm.tools_seen[0]
-
