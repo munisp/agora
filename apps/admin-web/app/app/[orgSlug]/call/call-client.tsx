@@ -13,6 +13,36 @@ const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL ?? "ws://localhost:7880"
 type CallState = "joining" | "connected" | "ended" | "error";
 
 /**
+ * Warm-styled avatar tile (SPEC-W9 Part A). Renders the remote video track
+ * an avatar provider (Tavus or the open avatar-renderer sidecar) publishes
+ * into the LiveKit room. Audio-only rooms never produce a video track, so
+ * nothing renders and the audio fallback is unchanged.
+ */
+function AvatarVideoTile({
+  track,
+}: {
+  track: import("livekit-client").RemoteVideoTrack;
+}) {
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  React.useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    track.attach(el);
+    return () => {
+      track.detach(el);
+    };
+  }, [track]);
+  return (
+    <div
+      className="overflow-hidden rounded-2xl border shadow-sm"
+      style={{ borderColor: "#e6d8c8", backgroundColor: "#f7f1ea" }}
+    >
+      <video ref={videoRef} autoPlay playsInline className="h-44 w-64 object-cover" />
+    </div>
+  );
+}
+
+/**
  * Staff warm-handoff join page (innovation 1). Reached from the
  * EscalationRequested dashboard toast with the LiveKit room name and the
  * staff join token minted by the voice runtime.
@@ -29,6 +59,8 @@ export function CallClient({
   const [state, setState] = React.useState<CallState>("joining");
   const [muted, setMuted] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const [avatarTrack, setAvatarTrack] =
+    React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
 
   React.useEffect(() => {
@@ -40,10 +72,23 @@ export function CallClient({
     let cancelled = false;
     (async () => {
       try {
-        const { Room, RoomEvent } = await import("livekit-client");
+        const { Room, RoomEvent, Track } = await import("livekit-client");
         const lk = new Room();
         roomRef.current = lk;
-        lk.on(RoomEvent.Disconnected, () => setState("ended"));
+        lk.on(RoomEvent.Disconnected, () => {
+          setAvatarTrack(null);
+          setState("ended");
+        });
+        // SPEC-W9 Part A: avatar presence — render a provider-published
+        // remote VIDEO track as the avatar tile when one appears.
+        lk.on(RoomEvent.TrackSubscribed, (track) => {
+          if (track.kind === Track.Kind.Video) {
+            setAvatarTrack(track as import("livekit-client").RemoteVideoTrack);
+          }
+        });
+        lk.on(RoomEvent.TrackUnsubscribed, (track) => {
+          if (track.kind === Track.Kind.Video) setAvatarTrack(null);
+        });
         await lk.connect(LIVEKIT_URL, token);
         await lk.localParticipant.setMicrophoneEnabled(true);
         if (!cancelled) setState("connected");
@@ -101,24 +146,32 @@ export function CallClient({
               : "The caller was told a human is joining."}
           </CardDescription>
         </CardHeader>
-        <CardContent className="flex items-center gap-3">
-          {state === "connected" ? (
-            <>
-              <Button variant="outline" onClick={() => void toggleMute()}>
-                {muted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-                {muted ? "Unmute" : "Mute"}
-              </Button>
-              <Button variant="destructive" onClick={() => void hangUp()}>
-                <PhoneOff className="h-4 w-4" /> End call
-              </Button>
-            </>
-          ) : state === "ended" || state === "error" ? (
-            <Link href={`/app/${orgSlug}/bookings`}>
-              <Button variant="outline">Back to bookings</Button>
-            </Link>
+        <CardContent className="flex flex-col items-start gap-3">
+          {/* Avatar tile above the call controls when a provider publishes
+              video into the room; audio-only rooms skip this entirely. */}
+          {state === "connected" && avatarTrack ? (
+            <AvatarVideoTile track={avatarTrack} />
           ) : null}
+          <div className="flex items-center gap-3">
+            {state === "connected" ? (
+              <>
+                <Button variant="outline" onClick={() => void toggleMute()}>
+                  {muted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                  {muted ? "Unmute" : "Mute"}
+                </Button>
+                <Button variant="destructive" onClick={() => void hangUp()}>
+                  <PhoneOff className="h-4 w-4" /> End call
+                </Button>
+              </>
+            ) : state === "ended" || state === "error" ? (
+              <Link href={`/app/${orgSlug}/bookings`}>
+                <Button variant="outline">Back to bookings</Button>
+              </Link>
+            ) : null}
+          </div>
         </CardContent>
       </Card>
     </div>
   );
 }
+

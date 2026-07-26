@@ -8,6 +8,36 @@ import type { VoiceSession } from "@/lib/types";
 type CallState = "idle" | "joining" | "connected" | "error";
 
 /**
+ * Warm-styled avatar tile (SPEC-W9 Part A). Renders the remote video track
+ * an avatar provider (Tavus or the open avatar-renderer sidecar) publishes
+ * into the LiveKit room. Audio-only sessions never produce a video track,
+ * so nothing renders and the audio fallback is unchanged.
+ */
+function AvatarVideoTile({
+  track,
+}: {
+  track: import("livekit-client").RemoteVideoTrack;
+}) {
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  React.useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    track.attach(el);
+    return () => {
+      track.detach(el);
+    };
+  }, [track]);
+  return (
+    <div
+      className="overflow-hidden rounded-2xl border shadow-sm"
+      style={{ borderColor: "#e6d8c8", backgroundColor: "#f7f1ea" }}
+    >
+      <video ref={videoRef} autoPlay playsInline className="h-44 w-64 object-cover" />
+    </div>
+  );
+}
+
+/**
  * "Talk to receptionist" voice button.
  *
  * STUB (clearly bounded): obtains a LiveKit token from the voice runtime via
@@ -27,6 +57,8 @@ export function VoiceSessionButton({
 }) {
   const [state, setState] = React.useState<CallState>("idle");
   const [error, setError] = React.useState<string | null>(null);
+  const [avatarTrack, setAvatarTrack] =
+    React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
 
   const hangUp = React.useCallback(async () => {
@@ -34,6 +66,7 @@ export function VoiceSessionButton({
       await roomRef.current?.disconnect();
     } finally {
       roomRef.current = null;
+      setAvatarTrack(null);
       setState("idle");
     }
   }, []);
@@ -56,10 +89,24 @@ export function VoiceSessionButton({
 
       // 2. Connect the LiveKit room (livekit-client, dynamic import so the
       //    SDK stays out of the initial public-page bundle).
-      const { Room, RoomEvent } = await import("livekit-client");
+      const { Room, RoomEvent, Track } = await import("livekit-client");
       const room = new Room();
       roomRef.current = room;
-      room.on(RoomEvent.Disconnected, () => setState("idle"));
+      room.on(RoomEvent.Disconnected, () => {
+        setAvatarTrack(null);
+        setState("idle");
+      });
+      // SPEC-W9 Part A: avatar presence — when a provider (Tavus / open
+      // renderer) publishes a remote VIDEO track into the room, surface it
+      // as the avatar tile. Audio-only sessions never emit these events.
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (track.kind === Track.Kind.Video) {
+          setAvatarTrack(track as import("livekit-client").RemoteVideoTrack);
+        }
+      });
+      room.on(RoomEvent.TrackUnsubscribed, (track) => {
+        if (track.kind === Track.Kind.Video) setAvatarTrack(null);
+      });
       await room.connect(session.url, session.token);
       await room.localParticipant.setMicrophoneEnabled(true);
       setState("connected");
@@ -76,14 +123,21 @@ export function VoiceSessionButton({
 
   if (state === "connected" || state === "joining") {
     return (
-      <button
-        onClick={() => void hangUp()}
-        disabled={state === "joining"}
-        className="inline-flex items-center gap-2 rounded-full bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground cursor-pointer disabled:opacity-60"
-      >
-        <PhoneOff className="h-4 w-4" />
-        {state === "joining" ? "Connecting…" : "End call"}
-      </button>
+      <span className="inline-flex flex-col items-start gap-3">
+        {/* Avatar tile sits above the call controls (this stub has no audio
+            visualizer yet; when one lands the tile stays directly above it). */}
+        {state === "connected" && avatarTrack ? (
+          <AvatarVideoTile track={avatarTrack} />
+        ) : null}
+        <button
+          onClick={() => void hangUp()}
+          disabled={state === "joining"}
+          className="inline-flex items-center gap-2 rounded-full bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground cursor-pointer disabled:opacity-60"
+        >
+          <PhoneOff className="h-4 w-4" />
+          {state === "joining" ? "Connecting…" : "End call"}
+        </button>
+      </span>
     );
   }
 
@@ -103,3 +157,4 @@ export function VoiceSessionButton({
     </span>
   );
 }
+
