@@ -31,6 +31,7 @@ Every pack is a single YAML file named `<id>.yaml` with exactly this schema:
 | `consentText` | string (block) | no | Data-processing / call-recording consent notice (GDPR/NDPA). Validators tolerate it; the Go `Pack`/`Summary` structs carry it (`consentText` in identity's resolved pack summary, `omitempty`) — see docs/compliance/ndpa.md. |
 | `languages` | list of strings | no | ISO-639 language codes the deployment supports (e.g. `[en, pcm]`). Optional; carried through the Go `Pack`/`Summary` structs (`languages`, `omitempty`). |
 | `agents` | list | no | Multi-agent crew (SPEC-W3 §4): `{id, name, persona, intents}` — the voice runtime routes turns to a specialist persona on intent-keyword match. |
+| `voice` | map | no | Packs may declare voice defaults (SPEC-W10 Part D): `{provider, voiceId?, languages?}` — default TTS provider and per-language `provider:voiceId` overrides passed through to the voice runtime (see docs/voices.md). |
 
 ## The built-in packs
 
