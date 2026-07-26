@@ -338,4 +338,3 @@ async def test_stream_without_ui_actions_has_no_frames(monkeypatch):
     ]
     assert not any("ui_action" in e for e in events)
     assert events[-1]["done"] is True
-

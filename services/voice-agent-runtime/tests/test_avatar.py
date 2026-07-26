@@ -301,4 +301,3 @@ class TestVoiceSessionEndpoint:
         assert data["avatar"]["provider"] == "tavus"
         assert data["avatar"]["status"] == "unavailable"
         assert "TAVUS_API_KEY" in data["avatar"]["detail"]
-
