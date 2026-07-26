@@ -257,7 +257,7 @@ class SessionMetrics:
         self._tool_calls: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    # ------------------------------------------------------------- recording
+    # ----------------------------------------------------------- recording
     def record_turn(self) -> None:
         with self._lock:
             self.turn_count += 1
