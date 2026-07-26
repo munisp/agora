@@ -1,0 +1,80 @@
+# Voice TTS sidecars (SPEC-W10 Part B) — OPTIONAL compose override.
+#
+# Adds the MMS (Nigerian/African languages, :5800) and XTTS (voice cloning,
+# :5810) sidecars consumed by voice-agent-runtime's tts_providers. NOT part of
+# the base stack; start as an override on top of the root compose:
+#
+#   docker compose -f docker-compose.yml -f infra/compose/voices.compose.yml up -d
+#
+# Both services default to MOCK mode (deterministic sine wav, no model
+# downloads, no GPU) so the voice pipeline is e2e-testable. Real inference:
+#   MMS_MOCK=0  (CPU is fine; checkpoints ~100-250MB/lang cached in mms-models)
+#   XTTS_MOCK=0 (GPU REQUIRED, >=6GB VRAM — build the CUDA variant per
+#                services/xtts-tts/Dockerfile and uncomment the deploy block)
+# Point the runtime at these services via MMS_TTS_URL / XTTS_TTS_URL
+# (defaults http://mms-tts:5800 / http://xtts-tts:5810).
+
+services:
+  mms-tts:
+    build:
+      context: ../../services/mms-tts
+    image: opendesk/mms-tts:dev
+    container_name: opendesk-mms-tts
+    restart: unless-stopped
+    ports:
+      - "5800:5800"
+    environment:
+      MMS_MOCK: ${MMS_MOCK:-1}
+      # Real-mode per-language allow-list (facebook/mms-tts-{lang}).
+      # All five: eng,pcm,yor,ibo,hau
+      MMS_LANGS: ${MMS_LANGS:-eng,pcm}
+      HF_HOME: /models
+    volumes:
+      - mms-models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5800/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Joins the `opendesk` network defined by the root docker-compose.yml
+    # (no re-declaration needed when used as a -f override).
+    networks:
+      - opendesk
+
+  xtts-tts:
+    build:
+      context: ../../services/xtts-tts
+    image: opendesk/xtts-tts:dev
+    container_name: opendesk-xtts-tts
+    restart: unless-stopped
+    ports:
+      - "5810:5810"
+    environment:
+      XTTS_MOCK: ${XTTS_MOCK:-1}
+      VOICES_DIR: /data
+      # Real mode: persist the ~1.8GB XTTS-v2 checkpoint on the volume too.
+      # TTS_HOME: /data/models
+    volumes:
+      - xtts-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5810/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # XTTS GPU mode (uncomment together with the Dockerfile CUDA block +
+    # XTTS_MOCK=0):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    networks:
+      - opendesk
+
+volumes:
+  mms-models:
+  xtts-data:
