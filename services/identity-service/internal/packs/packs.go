@@ -85,6 +85,16 @@ type MCPServer struct {
 	URL  string `yaml:"url" json:"url"`
 }
 
+// VoiceDefaults is the optional pack-level voice/TTS defaults block
+// (SPEC-W10 Part D): the default TTS provider chain entry plus per-language
+// provider-qualified overrides ("provider:voiceId") the voice runtime merges
+// into its TTS voice map.
+type VoiceDefaults struct {
+	Provider  string            `yaml:"provider" json:"provider"`
+	VoiceID   string            `yaml:"voiceId" json:"voiceId,omitempty"`
+	Languages map[string]string `yaml:"languages" json:"languages,omitempty"`
+}
+
 // Pack is one industry pack definition (industries/<id>.yaml).
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
@@ -102,6 +112,9 @@ type Pack struct {
 	CustomTools []CustomTool `yaml:"customTools" json:"customTools,omitempty"`
 	// SPEC-W9 Part C2: optional MCP servers, validated when present.
 	MCPServers []MCPServer `yaml:"mcpServers" json:"mcpServers,omitempty"`
+	// SPEC-W10 Part D: optional pack-level voice/TTS defaults, validated
+	// when present and passed through to the runtime Summary.
+	Voice *VoiceDefaults `yaml:"voice" json:"voice,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -123,6 +136,7 @@ type Summary struct {
 	Agents           []Agent           `json:"agents,omitempty"`
 	CustomTools      []CustomTool      `json:"customTools,omitempty"`
 	MCPServers       []MCPServer       `json:"mcpServers,omitempty"`
+	Voice            *VoiceDefaults    `json:"voice,omitempty"`
 	ConsentText      string            `json:"consentText,omitempty"`
 	Languages        []string          `json:"languages,omitempty"`
 }
@@ -154,6 +168,7 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		Agents:           p.Agents,
 		CustomTools:      p.CustomTools,
 		MCPServers:       p.MCPServers,
+		Voice:            p.Voice,
 		ConsentText:      p.ConsentText,
 		Languages:        p.Languages,
 	}
@@ -272,6 +287,9 @@ func (p Pack) Validate() error {
 	if err := validateMCPServers(p.MCPServers); err != nil {
 		return err
 	}
+	if err := validateVoice(p.Voice); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -353,6 +371,32 @@ func validateMCPServers(servers []MCPServer) error {
 		u, err := url.Parse(s.URL)
 		if err != nil || u.Host == "" || u.Scheme != "https" {
 			return fmt.Errorf("mcpServers[%d] (%s): url must be absolute https", i, s.Name)
+		}
+	}
+	return nil
+}
+
+var voiceLangValueRe = regexp.MustCompile(`^(piper|mms|xtts|azure|spitch):[A-Za-z0-9_\-\.]+$`)
+
+// validateVoice enforces the SPEC-W10 Part D voice block: optional mapping,
+// provider required and one of piper/mms/xtts/azure/spitch, optional voiceId
+// string, and optional languages map of lang -> "provider:voiceId". Kept in
+// sync with scripts/validate_pack.py.
+func validateVoice(voice *VoiceDefaults) error {
+	if voice == nil {
+		return nil
+	}
+	switch voice.Provider {
+	case "piper", "mms", "xtts", "azure", "spitch":
+	default:
+		return fmt.Errorf("voice.provider %q must be one of piper, mms, xtts, azure, spitch", voice.Provider)
+	}
+	if strings.TrimSpace(voice.VoiceID) == "" && voice.VoiceID != "" {
+		return fmt.Errorf("voice.voiceId must be a non-empty string")
+	}
+	for lang, value := range voice.Languages {
+		if !voiceLangValueRe.MatchString(value) {
+			return fmt.Errorf("voice.languages[%q]: value %q must match %s", lang, value, voiceLangValueRe)
 		}
 	}
 	return nil

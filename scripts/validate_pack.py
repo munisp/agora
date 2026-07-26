@@ -42,6 +42,9 @@ AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 TOOL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 MCP_SERVER_NAME_RE = AGENT_ID_RE  # slug rule, kept in sync with packs.go
+# SPEC-W10 Part D: optional pack-level voice defaults.
+VOICE_PROVIDERS = ("piper", "mms", "xtts", "azure", "spitch")
+VOICE_LANG_VALUE_RE = re.compile(r"^(piper|mms|xtts|azure|spitch):[A-Za-z0-9_\-\.]+$")
 INDEX_SCHEMA_VERSION = 1
 
 
@@ -155,6 +158,39 @@ def _validate_mcp_servers(servers: Any, errs: list[str]) -> None:
             )
 
 
+def _validate_voice(voice: Any, errs: list[str]) -> None:
+    """SPEC-W10 Part D: optional voice block — pack-level TTS defaults
+    ({provider, voiceId?, languages?}). provider is required and one of
+    VOICE_PROVIDERS; languages maps a language tag to a provider-qualified
+    "provider:voiceId" string. Kept in sync with packs.go."""
+    if voice is None:
+        return
+    if not isinstance(voice, dict):
+        errs.append("voice must be a mapping")
+        return
+    provider = voice.get("provider")
+    if not isinstance(provider, str) or provider not in VOICE_PROVIDERS:
+        errs.append(
+            f"voice.provider {provider!r} is required and must be one of "
+            f"{', '.join(VOICE_PROVIDERS)}"
+        )
+    if "voiceId" in voice and (
+        not isinstance(voice["voiceId"], str) or not voice["voiceId"].strip()
+    ):
+        errs.append("voice.voiceId must be a non-empty string")
+    languages = voice.get("languages")
+    if languages is not None:
+        if not isinstance(languages, dict):
+            errs.append("voice.languages must be a mapping of lang -> provider:voiceId")
+        else:
+            for lang, value in languages.items():
+                if not isinstance(value, str) or not VOICE_LANG_VALUE_RE.match(value):
+                    errs.append(
+                        f"voice.languages[{lang!r}]: value {value!r} must match "
+                        f"{VOICE_LANG_VALUE_RE.pattern}"
+                    )
+
+
 def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     """Validate one parsed pack document; returns the list of errors
     (empty == valid). Mirrors Pack.Validate() in identity-service."""
@@ -248,6 +284,7 @@ def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     _validate_agents(doc.get("agents"), errs)
     _validate_custom_tools(doc.get("customTools"), errs)
     _validate_mcp_servers(doc.get("mcpServers"), errs)
+    _validate_voice(doc.get("voice"), errs)
     return errs
 
 
