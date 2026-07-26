@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import metrics
+from . import metrics, ui_actions
 from .config import Settings
 from .dapr_client import DaprClient
 from .escalation import LiveKitEscalation, escalation_room_name
@@ -152,9 +152,78 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    # SPEC-W9 Part B: agent-driven UI actions. These tools never execute
+    # anything server-side — a validated action is attached to the chat
+    # turn's outgoing payload and applied by the web widget (embed.js).
+    {
+        "type": "function",
+        "function": {
+            "name": "navigate_to_page",
+            "description": (
+                "Show the visitor a page on this website (web chat only). "
+                "The path must be same-origin: it starts with '/' and has no "
+                "scheme or host."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Same-origin path, e.g. '/rooms' or '/#booking'",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "highlight_element",
+            "description": (
+                "Highlight an element on the visitor's page (web chat only): "
+                "it scrolls into view and pulses briefly. Use a simple CSS "
+                "selector such as '#booking-form' or '.offerings'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector (letters, digits, - _ # . : [ ] = \" ' > only, max 120 chars)",
+                    },
+                },
+                "required": ["selector"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "prefill_booking",
+            "description": (
+                "Pre-select an offering in the visitor's booking form (web "
+                "chat only). Use an offering id from get_business_info."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "offering_id": {
+                        "type": "string",
+                        "description": "Offering UUID",
+                    },
+                },
+                "required": ["offering_id"],
+            },
+        },
+    },
 ]
 
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
+
+# SPEC-W9 Part B: names of the agent-driven UI action tools (validated
+# client-side actions attached to the chat turn's outgoing payload).
+UI_ACTION_TOOL_NAMES = ["navigate_to_page", "highlight_element", "prefill_booking"]
 
 
 def _confirmation_payload(pending_phone: str) -> dict[str, Any]:
@@ -181,6 +250,7 @@ class ToolLayer:
         session: SessionState,
         escalation: LiveKitEscalation | None = None,
         plugin_tools: list[PluginTool] | None = None,
+        ui_action_sink: list[dict[str, Any]] | None = None,
     ) -> None:
         self._dapr = dapr
         self._settings = settings
@@ -188,10 +258,20 @@ class ToolLayer:
         self._session = session
         self._escalation = escalation or LiveKitEscalation(settings)
         self._plugin_tools = {t.name: t for t in (plugin_tools or [])}
+        # SPEC-W9 Part B: per-turn collector for validated UI actions. The
+        # chat path injects a fresh list per turn; other callers (voice
+        # worker, ElevenLabs) get a private one that is simply never read —
+        # the tools still ack so the model gets a sensible answer.
+        self._ui_actions = ui_action_sink if ui_action_sink is not None else []
 
     @property
     def tenant_context(self) -> TenantContext:
         return self._ctx
+
+    @property
+    def collected_ui_actions(self) -> list[dict[str, Any]]:
+        """Validated UI actions queued by tools during this turn (SPEC-W9 B)."""
+        return self._ui_actions
 
     def schemas(self) -> list[dict[str, Any]]:
         """Built-in tool schemas plus any pack plugin tool schemas."""
@@ -477,6 +557,76 @@ class ToolLayer:
             ),
         }
 
+    # ---------------------------------------------------- UI actions (W9 B)
+    def _queue_ui_action(self, tool: str, action: dict[str, Any] | None, hint: str) -> dict[str, Any] | None:
+        """Shared validation path for the UI action tools.
+
+        Returns the error payload to hand back to the model when ``action``
+        is None (invalid input — dropped, never reaches the client); queues
+        the action on the per-turn sink otherwise and returns None.
+        """
+        if action is None:
+            log.info("ui action rejected", tool=tool)
+            return {"status": "error", "message": f"Invalid {tool} argument: {hint}"}
+        self._ui_actions.append(action)
+        return None
+
+    async def navigate_to_page(self, path: str) -> dict[str, Any]:
+        action = ui_actions.validate_navigate(path)
+        error = self._queue_ui_action(
+            "navigate_to_page",
+            action,
+            "path must start with '/' and contain no scheme or host (same-origin only)",
+        )
+        if error is not None:
+            await self._emit_tool_event("navigate_to_page", "rejected", {})
+            return error
+        assert action is not None
+        await self._emit_tool_event("navigate_to_page", "ok", {"path": action["path"]})
+        return {
+            "status": "ok",
+            "message": f"The visitor is being shown {action['path']}.",
+            "ui_action": action,
+        }
+
+    async def highlight_element(self, selector: str) -> dict[str, Any]:
+        action = ui_actions.validate_highlight(selector)
+        error = self._queue_ui_action(
+            "highlight_element",
+            action,
+            "selector may only contain letters, digits and - _ # . : [ ] = \" ' > (max 120 chars)",
+        )
+        if error is not None:
+            await self._emit_tool_event("highlight_element", "rejected", {})
+            return error
+        assert action is not None
+        await self._emit_tool_event("highlight_element", "ok", {"selector": action["selector"]})
+        return {
+            "status": "ok",
+            "message": "The element is being highlighted for the visitor.",
+            "ui_action": action,
+        }
+
+    async def prefill_booking(self, offering_id: str) -> dict[str, Any]:
+        action = ui_actions.validate_prefill_booking(offering_id)
+        error = self._queue_ui_action(
+            "prefill_booking",
+            action,
+            "offering_id must be a UUID (see get_business_info for the catalog)",
+        )
+        if error is not None:
+            await self._emit_tool_event("prefill_booking", "rejected", {})
+            return error
+        assert action is not None
+        await self._emit_tool_event(
+            "prefill_booking", "ok", {"offering_id": action["offering_id"]}
+        )
+        return {
+            "status": "ok",
+            "message": "The offering is being pre-selected in the visitor's booking form.",
+            "ui_action": action,
+        }
+
     # ----------------------------------------------------------- dispatching
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Dispatch a tool call by name (chat path / ElevenLabs webhook)."""
@@ -512,6 +662,15 @@ class ToolLayer:
             "request_human": lambda: self.request_human(
                 reason=arguments.get("reason"),
             ),
+            "navigate_to_page": lambda: self.navigate_to_page(
+                path=str(arguments.get("path", "")),
+            ),
+            "highlight_element": lambda: self.highlight_element(
+                selector=str(arguments.get("selector", "")),
+            ),
+            "prefill_booking": lambda: self.prefill_booking(
+                offering_id=str(arguments.get("offering_id", "")),
+            ),
         }.get(name)
         if handler is None:
             plugin = self._plugin_tools.get(name)
@@ -531,3 +690,4 @@ class ToolLayer:
             log.warning("tool call failed", tool=name, error=str(exc))
             await self._emit_tool_event(name, "error", {"error": str(exc)[:200]})
             return {"status": "error", "message": f"{name} failed: {exc}"}
+
