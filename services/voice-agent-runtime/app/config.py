@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .multilang import parse_voice_map
+from .sip import parse_tenant_phone_map
+
 
 def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
@@ -73,6 +76,25 @@ class Settings:
     elevenlabs_api_key: str = ""
     elevenlabs_agent_id: str = ""
 
+    # Avatar presence (SPEC-W9 Part A, app/avatar/): which provider joins a
+    # visual avatar into the LiveKit room after session mint. `none` (default)
+    # keeps sessions audio-only; per-tenant override via tenant context
+    # `avatar_provider` (defensive getattr) when present. Joining is
+    # fire-and-forget — failures never block session creation.
+    avatar_provider: str = "none"  # none|tavus|musetalk
+    # Tavus CVI (hosted) provider settings.
+    tavus_api_key: str = ""
+    tavus_replica_id: str = ""
+    tavus_persona_id: str = ""
+    # Open lip-sync path: avatar-renderer sidecar (services/avatar-renderer).
+    # avatar_renderer=enabled means the sidecar is deployed and will join
+    # `site-*` rooms; musetalk_room_agent publishes the join intent per
+    # session. avatar_renderer_mode is informational here (the sidecar reads
+    # its own env) and logged with the intent.
+    avatar_renderer: str = "disabled"  # disabled|enabled
+    avatar_renderer_mode: str = "mock"  # mock|musetalk
+    musetalk_room_agent: bool = False
+
     # Session bootstrap
     knowledge_snippet_count: int = 3
     knowledge_query: str = "opening hours services pricing"
@@ -104,6 +126,24 @@ class Settings:
     # default OFF. Not wired into the audio pipeline (see README).
     voiceprints: bool = False
     voiceprint_threshold: float = 0.75
+
+    # SIP telephony inbound (Wave 5 #1, app/sip.py): dialed-number -> tenant
+    # map (TENANT_PHONE_MAP JSON, dev-mode; production = phone_numbers table)
+    # and the fallback site when the dialed number is unmapped (empty =
+    # reject the call bootstrap with an error log).
+    tenant_phone_map: dict = field(default_factory=dict)
+    sip_default_site: str = ""
+
+    # Multilingual receptionist (Wave 5 #3, app/multilang.py): language ->
+    # piper voice map (PIPER_VOICE_MAP JSON). Languages without an entry fall
+    # back to `piper_voice`.
+    piper_voice_map: dict = field(default_factory=dict)
+
+    # A/B prompt testing (Wave 5 #8, eval/ab_test.py): allow POST /voice/chat
+    # to carry a `persona_override` replacing the tenant persona. OFF by
+    # default — enabling it on a public endpoint is a prompt-injection
+    # surface; only turn on for eval runs.
+    eval_persona_override: bool = False
 
     extra: dict = field(default_factory=dict)
 
@@ -152,6 +192,17 @@ def load_settings() -> Settings:
         agent_backend=_env("AGENT_BACKEND", "livekit"),
         elevenlabs_api_key=_env("ELEVENLABS_API_KEY", ""),
         elevenlabs_agent_id=_env("ELEVENLABS_AGENT_ID", ""),
+        avatar_provider=_env("AVATAR_PROVIDER", "none"),
+        tavus_api_key=_env("TAVUS_API_KEY", ""),
+        tavus_replica_id=_env("TAVUS_REPLICA_ID", ""),
+        tavus_persona_id=_env("TAVUS_PERSONA_ID", ""),
+        avatar_renderer=_env("AVATAR_RENDERER", "disabled"),
+        avatar_renderer_mode=_env("AVATAR_RENDERER_MODE", "mock"),
+        # SPEC spells this flag MUSEtalk_ROOM_AGENT; honor both casings.
+        musetalk_room_agent=_env(
+            "MUSETALK_ROOM_AGENT", _env("MUSEtalk_ROOM_AGENT", "false")
+        ).lower()
+        in ("1", "true", "yes", "on"),
         knowledge_snippet_count=_env_int("KNOWLEDGE_SNIPPET_COUNT", 3),
         knowledge_query=_env("KNOWLEDGE_QUERY", "opening hours services pricing"),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
@@ -168,4 +219,10 @@ def load_settings() -> Settings:
         ),
         voiceprints=_env("VOICEPRINTS", "off").lower() in ("1", "on", "true", "yes"),
         voiceprint_threshold=float(os.environ.get("VOICEPRINT_THRESHOLD", "0.75")),
+        tenant_phone_map=parse_tenant_phone_map(_env("TENANT_PHONE_MAP", "")),
+        sip_default_site=_env("SIP_DEFAULT_SITE", ""),
+        piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
+        eval_persona_override=_env("EVAL_PERSONA_OVERRIDE", "false").lower()
+        in ("1", "true", "yes", "on"),
     )
+

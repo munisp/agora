@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import timedelta
@@ -22,6 +23,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import metrics
+from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
 from .config import Settings, load_settings
 from .dapr_client import DaprClient
@@ -62,6 +64,10 @@ class VoiceSessionResponse(BaseModel):
     url: str | None = None
     token: str | None = None
     signed_url: str | None = None
+    # SPEC-W9 Part A (additive): avatar presence for this session, e.g.
+    # {"provider": "tavus", "status": "joining"}. None when AVATAR_PROVIDER
+    # is `none` (default) — the client renders audio-only in that case.
+    avatar: dict | None = None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -130,8 +136,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             .to_jwt()
         )
         log.info("livekit session token minted", room=room, identity=identity)
+
+        # SPEC-W9 Part A: optional avatar presence. Fire-and-forget — the
+        # provider join is a background task; misconfiguration is reported
+        # synchronously via check_ready, everything else degrades in the
+        # background (warning log, audio-only session). Never blocks or
+        # fails session creation.
+        avatar_payload: dict | None = None
+        provider_name = resolve_provider_name(settings, tenant_ctx=None)
+        provider = (
+            create_provider(provider_name, settings)
+            if provider_name != PROVIDER_NONE
+            else None
+        )
+        if provider is not None:
+            not_ready = provider.check_ready()
+            if not_ready:
+                log.warning(
+                    "avatar provider not ready", provider=provider_name, detail=not_ready
+                )
+                avatar_payload = {
+                    "provider": provider_name,
+                    "status": "unavailable",
+                    "detail": not_ready,
+                }
+            else:
+                asyncio.create_task(provider.join_room(room, tenant_ctx=None))
+                avatar_payload = {"provider": provider_name, "status": "joining"}
+
         return VoiceSessionResponse(
-            backend="livekit", room=room, url=settings.livekit_url, token=token
+            backend="livekit",
+            room=room,
+            url=settings.livekit_url,
+            token=token,
+            avatar=avatar_payload,
         )
 
     @app.post("/voice/chat")
@@ -182,3 +220,4 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
+

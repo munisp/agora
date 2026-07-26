@@ -39,6 +39,9 @@ class TenantContext:
     # Pack multi-agent crew + plugin tools (SPEC-W3 §4), set by _apply_pack.
     agents: list[dict[str, Any]] = field(default_factory=list)
     custom_tools: list[dict[str, Any]] = field(default_factory=list)
+    # SPEC-W9 Part C: pack `mcpServers: [{name, url}]`, set by _apply_pack
+    # (mirrors custom_tools); consumed by mcp_client.tenant_mcp_servers.
+    mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     # Pack `languages: [en, es]` (Wave 5 #3): languages this tenant's
     # receptionist supports; bounds the whisper auto-language switch
     # (app/multilang.py). Empty = unconstrained.
@@ -87,6 +90,12 @@ def _apply_pack(ctx: TenantContext, tenant_payload: dict[str, Any]) -> None:
         custom_tools = pack.get("customTools")
         if isinstance(custom_tools, list):
             ctx.custom_tools = [t for t in custom_tools if isinstance(t, dict)]
+        # SPEC-W9 Part C: pack `mcpServers` passthrough (identity forwards it
+        # unvalidated, like customTools; validated at consumption in
+        # mcp_client.tenant_mcp_servers).
+        mcp_servers = pack.get("mcpServers")
+        if isinstance(mcp_servers, list):
+            ctx.mcp_servers = [s for s in mcp_servers if isinstance(s, dict)]
         # Wave 5 #3: pack `languages: [en, es]`. Identity (Go) passes packs
         # through unvalidated, so the voice runtime validates at consumption
         # (app/multilang.validate_pack_languages): invalid entries drop out
@@ -174,3 +183,4 @@ async def fetch_tenant_context(
         snippets=len(ctx.knowledge_snippets),
     )
     return ctx
+
