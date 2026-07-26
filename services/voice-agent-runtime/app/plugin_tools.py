@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .logging import get_logger
+from .mcp_client import build_mcp_tools_sync
 
 log = get_logger("plugin-tools")
 
@@ -172,15 +173,25 @@ def build_plugin_tools(
     allowed_hosts_raw: str,
     context: dict[str, Any] | None = None,
     client: httpx.AsyncClient | None = None,
-) -> list[PluginTool]:
+    tenant_ctx: Any = None,
+) -> list[Any]:
     """Validate pack customTools and build executable PluginTools.
 
     Invalid entries are skipped with a warning (a broken pack tool must not
     take down the session); validation in identity's pack loader is the
     fail-fast gate at provisioning time.
+
+    SPEC-W9 Part C: MCP tools (env MCP_SERVERS + per-tenant pack mcpServers,
+    namespaced ``mcp__{server}__{tool}``) are appended AFTER the customTools.
+    When no MCP servers are configured the MCP step is a no-op and the
+    returned list is exactly the customTools result — existing behavior is
+    unchanged. A down/unreachable MCP server is skipped with a warning and
+    never breaks the session. ``tenant_ctx`` is optional: the chat path does
+    not pass it yet, so per-tenant pack servers activate here as soon as the
+    tenant context exposes them (see docs/mcp.md).
     """
     allowed = parse_allowed_hosts(allowed_hosts_raw)
-    tools: list[PluginTool] = []
+    tools: list[Any] = []
     for spec in specs:
         try:
             tools.append(
@@ -188,4 +199,9 @@ def build_plugin_tools(
             )
         except PluginToolError as exc:
             log.warning("skipping invalid plugin tool", error=str(exc))
+    try:
+        tools.extend(build_mcp_tools_sync(tenant_ctx))
+    except Exception as exc:  # noqa: BLE001 - MCP must never break the session
+        log.warning("mcp tool build failed", error=str(exc)[:200])
     return tools
+
