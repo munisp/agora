@@ -1,0 +1,14 @@
+# MMS-TTS sidecar runtime deps (python:3.11-slim).
+#
+# NOTE: install torch FIRST with the CPU wheel index so you do not pull the
+# multi-GB CUDA build (the Dockerfile does this):
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+# torch/transformers are only imported when MMS_MOCK=0 (lazy imports) — mock
+# mode and the pytest suite need only fastapi/httpx/pytest/soundfile/numpy.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+numpy==2.1.3
+soundfile==0.12.1
+torch==2.5.1
+transformers==4.46.3
