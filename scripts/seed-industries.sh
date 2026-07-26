@@ -45,4 +45,3 @@ create_tenant community-watch "Community Watch Network"       neighborhood-watch
 create_tenant acme-hotel   "Acme Grand Hotel"       hospitality "Africa/Lagos"  "NGN" "en-NG"
 
 echo "Seed complete. Industry packs are applied asynchronously by the TenantOnboardingWorkflow."
-
