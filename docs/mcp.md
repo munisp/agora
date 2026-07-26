@@ -153,4 +153,3 @@ round-trip incl. `isError` mapping, server-down graceful skip, namespacing
 `build_plugin_tools` no-MCP byte-compatibility. Validator coverage for the
 `mcpServers` block is in `tests/packs/test_validate_pack.py`; Go loader
 coverage in `internal/packs/packs_mcp_test.go`.
-
