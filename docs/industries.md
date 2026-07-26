@@ -158,4 +158,3 @@ are registered alongside the existing saga/reminder workflows.
 > A pack that needs **new runtime behavior** (not just new data) requires a new
 > Temporal workflow in notification-worker plus its registration and tests —
 > follow `SalonDepositWorkflow` as the template.
-
