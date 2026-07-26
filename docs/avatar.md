@@ -126,4 +126,3 @@ Real MuseTalk lip-sync inference is a video diffusion/UNet workload:
 Unit-level: `services/voice-agent-runtime/tests/test_avatar.py` covers the
 registry, Tavus request shape + failure degradation (mocked httpx), the
 MuseTalk intent gates, and the additive `avatar` response field.
-
