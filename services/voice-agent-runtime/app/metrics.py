@@ -11,6 +11,7 @@ Series:
 - voice_llm_latency_seconds   (histogram)
 - voice_llm_tokens_total      (counter, label kind=prompt|completion)
 - voice_tts_latency_seconds   (histogram)
+- tts_provider_failures_total (counter, label provider) — SPEC-W10 chain
 - voice_tool_calls_total      (counter, labels tool,result)
 - voice_active_sessions       (gauge)
 """
@@ -161,6 +162,14 @@ class Registry:
         self.tts_latency = Histogram(
             "voice_tts_latency_seconds", "TTS synthesis latency per call."
         )
+        # SPEC-W10 Part A: per-provider failures in the TTS fallback chain
+        # (app/tts_providers/chain.py FallbackTTS); label provider =
+        # piper|mms|xtts|azure|spitch.
+        self.tts_provider_failures = Counter(
+            "tts_provider_failures_total",
+            "TTS provider failures triggering chain fallback.",
+            ("provider",),
+        )
         self.tool_calls = Counter(
             "voice_tool_calls_total",
             "Tool calls executed by the voice tool layer.",
@@ -177,6 +186,7 @@ class Registry:
             self.llm_latency,
             self.llm_tokens,
             self.tts_latency,
+            self.tts_provider_failures,
             self.tool_calls,
             self.active_sessions,
         ):
@@ -207,6 +217,11 @@ def reset_registry() -> Registry:
 
 def render() -> str:
     return _registry.render()
+
+
+def tts_provider_failure(provider: str) -> None:
+    """SPEC-W10: one failed hop in the TTS provider fallback chain."""
+    _registry.tts_provider_failures.inc(provider=provider)
 
 
 # ---------------------------------------------------------------------------

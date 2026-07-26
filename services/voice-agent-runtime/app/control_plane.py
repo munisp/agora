@@ -7,19 +7,26 @@
          through the same tool layer (no audio)
 - POST /voice/elevenlabs/tools -> ElevenLabs tool webhook passthrough
          (mounted only when AGENT_BACKEND=elevenlabs)
+- GET  /voice/voices -> aggregated TTS provider/voice catalog (SPEC-W10)
+- POST /voice/tts-preview {text, language?, provider?, voice?} -> audio/wav
+         through the same FallbackTTS chain (SPEC-W10)
+- POST /voice/voices/enroll {name, sample_base64, tenant} -> {voice_id}
+         (XTTS brand-voice enrollment; requires the xtts provider)
 - GET  /metrics -> Prometheus text exposition (voice_* inference series)
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import uuid
 from datetime import timedelta
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import metrics
@@ -30,8 +37,10 @@ from .dapr_client import DaprClient
 from .elevenlabs_adapter import ElevenLabsBackend
 from .livekit_worker import ROOM_PREFIX
 from .logging import configure_logging, get_logger
+from .multilang import resolve_tts_voice
 from .pipeline.llm import build_llm
 from .session_state import SessionStore
+from .tts_providers.chain import build_fallback_tts
 
 log = get_logger("control-plane")
 
@@ -58,6 +67,24 @@ class ChatRequest(BaseModel):
     channel: str = "web"
 
 
+class TtsPreviewRequest(BaseModel):
+    """SPEC-W10: admin voice preview through the FallbackTTS chain."""
+
+    text: str = Field(min_length=1)
+    language: str | None = None
+    provider: str | None = None
+    voice: str | None = None  # may be provider-qualified ("mms:pcm")
+
+
+class VoiceEnrollRequest(BaseModel):
+    """SPEC-W10: XTTS brand-voice enrollment (admin path; consent gate lives
+    in the admin UI — see docs/voices.md)."""
+
+    name: str = Field(min_length=1)
+    sample_base64: str = Field(min_length=1)
+    tenant: str = Field(min_length=1)
+
+
 class VoiceSessionResponse(BaseModel):
     backend: str
     room: str | None = None
@@ -80,6 +107,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (LLM_FALLBACK_* envs, VOICE-SCALING §3).
     llm = build_llm(settings)
     chat_service = ChatService(settings=settings, dapr=dapr, llm=llm, sessions=sessions)
+    # SPEC-W10 Part A: TTS provider fallback chain (default "piper" =
+    # pre-W10 behavior). Backs the /voice/voices, /voice/tts-preview and
+    # /voice/voices/enroll endpoints below.
+    tts_chain = build_fallback_tts(settings)
     elevenlabs = (
         ElevenLabsBackend(settings=settings, dapr=dapr, sessions=sessions)
         if settings.agent_backend == "elevenlabs"
@@ -91,6 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         await dapr.aclose()
+        await tts_chain.aclose()
         if elevenlabs is not None:
             await elevenlabs.aclose()
 
@@ -208,6 +240,82 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             log.warning("chat failed", site_slug=req.site_slug, error=str(exc))
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # SPEC-W10 Part A: voice provider catalog, preview, brand-voice enroll.
+    # Same (unauthenticated, internal-network) posture as the other control
+    # plane endpoints; enrollment is an admin path at the BFF layer.
+    # ------------------------------------------------------------------
+    @app.get("/voice/voices")
+    async def list_tts_voices() -> dict[str, Any]:
+        """Aggregate the configured TTS providers with availability flags;
+        unavailable providers are listed with available:false and no voices."""
+        providers_out: list[dict[str, Any]] = []
+        for name, provider in tts_chain.providers_in_order():
+            try:
+                available = await provider.available()
+            except Exception:  # noqa: BLE001 - probe must never 5xx the route
+                available = False
+            voices: list[dict[str, Any]] = []
+            if available:
+                try:
+                    voices = [v.as_dict() for v in await provider.list_voices()]
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("voice catalog fetch failed", provider=name, error=str(exc)[:200])
+            providers_out.append(
+                {"name": name, "available": available, "voices": voices}
+            )
+        return {"providers": providers_out}
+
+    @app.post("/voice/tts-preview")
+    async def tts_preview(req: TtsPreviewRequest) -> Response:
+        """Synthesize a preview clip through the same FallbackTTS chain the
+        calls use. Voice resolution: explicit `voice` param, then
+        TTS_VOICE_MAP (provider-qualified), then PIPER_VOICE_MAP, then the
+        default piper voice (app/multilang.py resolve_tts_voice)."""
+        voice_spec = (req.voice or "").strip() or resolve_tts_voice(
+            req.language or "",
+            settings.tts_voice_map,
+            settings.piper_voice_map,
+            settings.piper_voice,
+        )
+        try:
+            wav = await tts_chain.synthesize(
+                req.text,
+                voice=voice_spec,
+                language=(req.language or "").strip(),
+                provider=(req.provider or "").strip().lower() or None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            log.warning("tts preview failed", error=str(exc)[:200])
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return Response(content=wav, media_type="audio/wav")
+
+    @app.post("/voice/voices/enroll")
+    async def enroll_brand_voice(req: VoiceEnrollRequest) -> dict[str, Any]:
+        """Enroll a brand voice on the XTTS provider (requires `xtts` in
+        TTS_PROVIDER_CHAIN). Consent (NDPA) is captured in the admin UI."""
+        xtts = tts_chain.provider("xtts")
+        if xtts is None:
+            raise HTTPException(
+                status_code=400,
+                detail="xtts provider not enabled (add 'xtts' to TTS_PROVIDER_CHAIN)",
+            )
+        try:
+            base64.b64decode(req.sample_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(
+                status_code=400, detail="sample_base64 is not valid base64"
+            ) from exc
+        try:
+            voice_id = await xtts.enroll_voice(req.name, req.sample_base64)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("voice enrollment failed", tenant=req.tenant, error=str(exc)[:200])
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        log.info("brand voice enrolled", tenant=req.tenant, voice_id=voice_id)
+        return {"voice_id": voice_id}
 
     if elevenlabs is not None:
 
