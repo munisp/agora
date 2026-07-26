@@ -501,3 +501,31 @@ export interface WebhookDelivery {
   created_at: string;
   updated_at: string;
 }
+
+/* ------------------------------------------------------------------ */
+/* SPEC-W10 — voice runtime control-plane contract (Agent A / Agent C) */
+/* ------------------------------------------------------------------ */
+
+/** A single selectable voice as reported by a TTS provider. */
+export interface VoiceInfo {
+  id: string;
+  languages: string[];
+  gender?: string | null;
+  labels?: string[];
+}
+
+/** A configured TTS provider and its voice catalog (GET /voice/voices). */
+export interface VoiceProviderInfo {
+  name: string;
+  available: boolean;
+  voices: VoiceInfo[];
+}
+
+export interface VoicesCatalog {
+  providers: VoiceProviderInfo[];
+}
+
+/** Response of POST /voice/voices/enroll (XTTS brand-voice enrollment). */
+export interface VoiceEnrollResponse {
+  voice_id: string;
+}

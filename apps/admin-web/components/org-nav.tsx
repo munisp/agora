@@ -20,6 +20,7 @@ import {
   MessagesSquare,
   MapPin,
   Target,
+  AudioLines,
   Settings,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -28,6 +29,7 @@ import {
   canViewBilling,
   canViewGeoCampaigns,
   canViewLocations,
+  canViewVoices,
 } from "@/lib/roles";
 
 /** Self-hosted Twenty CRM UI (SPEC-CRM §A). */
@@ -55,6 +57,7 @@ const items: NavItem[] = [
   { segment: "channels", label: "Channels", icon: MessagesSquare },
   { segment: "locations", label: "Locations", icon: MapPin },
   { segment: "geo-campaigns", label: "Geo campaigns", icon: Target },
+  { segment: "voices", label: "Voices", icon: AudioLines },
   { external: CRM_URL, label: "CRM", icon: UsersRound },
   { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
   { segment: "settings", label: "Settings", icon: Settings },
@@ -93,6 +96,10 @@ export function OrgNav({
       return canViewLocations(roles);
     if ("segment" in item && item.segment === "geo-campaigns")
       return canViewGeoCampaigns(roles);
+    // SPEC-W10 Part C: voices studio is owner/admin/staff; the page enforces
+    // the same rule server-side.
+    if ("segment" in item && item.segment === "voices")
+      return canViewVoices(roles);
     return true;
   });
 
