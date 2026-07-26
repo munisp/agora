@@ -137,3 +137,41 @@ def test_upsert_index_rejects_invalid_pack(tmp_path):
 def test_cli_validate_ok_and_fail(capsys):
     assert vp.main(["validate", str(FIXTURES / "valid_full.yaml")]) == 0
     assert vp.main(["validate", str(FIXTURES / "invalid_workflow.yaml")]) == 1
+
+
+# ------------------------------------------------------- mcpServers (SPEC-W9)
+def _with_mcp(servers):
+    doc = load("valid_minimal.yaml")
+    doc["mcpServers"] = servers
+    return doc
+
+
+def test_mcp_servers_valid_block_accepted():
+    doc = _with_mcp([
+        {"name": "n8n", "url": "https://n8n.example.com/mcp/front-desk/sse"},
+        {"name": "crm-2", "url": "https://mcp.crm.example.com/"},
+    ])
+    assert vp.validate_pack(doc) == []
+
+
+def test_mcp_servers_absent_or_empty_accepted():
+    assert vp.validate_pack(load("valid_minimal.yaml")) == []
+    assert vp.validate_pack(_with_mcp([])) == []
+
+
+def test_mcp_servers_rejects_bad_shapes():
+    cases = [
+        ("not-a-list", "mcpServers must be a list"),
+        (["junk"], "must be a mapping"),
+        ([{"name": "Bad Name", "url": "https://x.example.com/"}], "must match"),
+        ([{"name": "n8n", "url": "http://x.example.com/sse"}], "absolute https"),
+        ([{"name": "n8n", "url": "not-a-url"}], "absolute https"),
+        ([{"name": "n8n", "url": "https://x.example.com/"},
+          {"name": "n8n", "url": "https://y.example.com/"}], "duplicate server name"),
+        ([{"name": "n8n", "url": "https://x.example.com/",
+           "headers": {"authorization": "Bearer x"}}], "headers are not allowed"),
+    ]
+    for servers, expected in cases:
+        errs = vp.validate_pack(_with_mcp(servers))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+

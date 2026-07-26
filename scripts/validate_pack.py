@@ -41,6 +41,7 @@ DASHBOARD_LABEL_KEYS = ("bookingSingular", "bookingPlural", "customerTerm")
 AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 TOOL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+MCP_SERVER_NAME_RE = AGENT_ID_RE  # slug rule, kept in sync with packs.go
 INDEX_SCHEMA_VERSION = 1
 
 
@@ -120,6 +121,38 @@ def _validate_custom_tools(tools: Any, errs: list[str]) -> None:
             errs.append(f"customTools[{i}] ({name}): url must be absolute http(s)")
         if "bodyTemplate" in t and not isinstance(t["bodyTemplate"], str):
             errs.append(f"customTools[{i}] ({name}): bodyTemplate must be a string")
+
+
+def _validate_mcp_servers(servers: Any, errs: list[str]) -> None:
+    """SPEC-W9 Part C2: optional mcpServers passthrough block — slug names,
+    https-only URLs, no credentials (headers live in env MCP_SERVERS only)."""
+    if servers is None:
+        return
+    if not isinstance(servers, list):
+        errs.append("mcpServers must be a list")
+        return
+    seen: set[str] = set()
+    for i, s in enumerate(servers):
+        if not isinstance(s, dict):
+            errs.append(f"mcpServers[{i}] must be a mapping")
+            continue
+        name = s.get("name")
+        if not isinstance(name, str) or not MCP_SERVER_NAME_RE.match(name):
+            errs.append(
+                f"mcpServers[{i}]: name {name!r} must match {MCP_SERVER_NAME_RE.pattern}"
+            )
+            continue
+        if name in seen:
+            errs.append(f"mcpServers[{i}]: duplicate server name {name!r}")
+        seen.add(name)
+        url = s.get("url")
+        if not isinstance(url, str) or not re.match(r"^https://[^/]+", url):
+            errs.append(f"mcpServers[{i}] ({name}): url must be absolute https")
+        if "headers" in s:
+            errs.append(
+                f"mcpServers[{i}] ({name}): headers are not allowed in packs "
+                "(credentials belong in the MCP_SERVERS env var)"
+            )
 
 
 def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
@@ -214,6 +247,7 @@ def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
 
     _validate_agents(doc.get("agents"), errs)
     _validate_custom_tools(doc.get("customTools"), errs)
+    _validate_mcp_servers(doc.get("mcpServers"), errs)
     return errs
 
 
@@ -365,3 +399,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
