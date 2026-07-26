@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { serverApi, unwrapList } from "@/lib/server-api";
 import { ApiError } from "@/lib/api";
 import { PublicBookingClient } from "../../p/[siteSlug]/public-booking-client";
+import { UiActionsBridge } from "../ui-actions-bridge";
 import type { Offering, PublicSite } from "@/lib/types";
 
 export const metadata = { title: "Booking widget" };
@@ -41,5 +42,15 @@ export default async function EmbedPage({
     offerings = [];
   }
 
-  return <PublicBookingClient site={site} offerings={offerings} embed />;
+  return (
+    <>
+      <PublicBookingClient site={site} offerings={offerings} embed />
+      {/* SPEC-W9 Part B: executes agent-driven UI actions (navigate /
+          highlight / prefill_booking) tapped from /voice/chat responses. */}
+      <UiActionsBridge
+        offerings={offerings.map((o) => ({ id: o.id, name: o.name }))}
+      />
+    </>
+  );
 }
+
