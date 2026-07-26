@@ -1,0 +1,14 @@
+# XTTS-TTS sidecar runtime deps (mock-mode default image, python:3.11-slim).
+# Mock mode and the pytest suite need only fastapi/httpx/pytest/soundfile/numpy.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+numpy==2.1.3
+soundfile==0.12.1
+# ---------------------------------------------------------------------------
+# Real inference (XTTS_MOCK=0) — NOT installed in the default mock image.
+# Requires a CUDA GPU (>=6GB VRAM); CPU is not viable. See README/Dockerfile
+# CUDA block and requirements-gpu.txt.
+#   TTS==0.22.0          (Coqui; pulls its own torch — pin torch CUDA wheel
+#   torch==2.5.1          via the matching pytorch CUDA index)
+# ---------------------------------------------------------------------------
