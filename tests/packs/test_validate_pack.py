@@ -174,4 +174,3 @@ def test_mcp_servers_rejects_bad_shapes():
     for servers, expected in cases:
         errs = vp.validate_pack(_with_mcp(servers))
         assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
-
