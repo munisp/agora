@@ -384,4 +384,3 @@ func (r *Registry) IDs() []string {
 	sort.Strings(ids)
 	return ids
 }
-

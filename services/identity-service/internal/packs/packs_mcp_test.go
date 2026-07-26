@@ -67,4 +67,3 @@ func TestPacksWithoutMCPServersStillValidate(t *testing.T) {
 		t.Fatalf("pack without mcpServers must validate: %v", err)
 	}
 }
-
