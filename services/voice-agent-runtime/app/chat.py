@@ -18,9 +18,20 @@ from .plugin_tools import build_plugin_tools
 from .prompts import build_system_prompt
 from .session_state import SessionState, SessionStore
 from .tenant_context import fetch_tenant_context
-from .tools import ToolLayer
+from .tools import UI_ACTION_TOOL_NAMES, ToolLayer
 
 log = get_logger("chat")
+
+# SPEC-W9 Part B: prompt addendum for the agent-driven UI action tools.
+# prompts.py is shared ownership this wave, so the addendum is injected
+# here (chat path only), and only when the UI action tools are actually
+# registered in the turn's tool layer.
+UI_ACTION_PROMPT_ADDENDUM = (
+    "When it would help the visitor on the website, you can offer to show "
+    "them a page, highlight an element such as the booking form, or "
+    "pre-select a service in the booking form using the navigate_to_page, "
+    "highlight_element and prefill_booking tools."
+)
 
 
 @dataclass
@@ -104,7 +115,14 @@ class ChatService:
                 "tenant_slug": ctx.tenant_slug,
                 "tenant_id": ctx.tenant_id,
             },
+            # SPEC-W9 Part C: pack-level mcpServers ride the tenant context
+            # into build_mcp_tools (env MCP_SERVERS alone worked before).
+            tenant_ctx=ctx,
         )
+        # SPEC-W9 Part B: fresh per-turn collector for validated UI actions
+        # (navigate / highlight / prefill_booking). Read back after the tool
+        # loop and attached to the outgoing payload.
+        ui_action_sink: list[dict[str, Any]] = []
         tool_layer = ToolLayer(
             dapr=self._dapr,
             settings=self._settings,
@@ -112,6 +130,7 @@ class ChatService:
             session=session,
             escalation=self._escalation,
             plugin_tools=plugin_tools,
+            ui_action_sink=ui_action_sink,
         )
 
         history = self._histories.get(session.conversation_id)
@@ -126,6 +145,11 @@ class ChatService:
             # path sets it via whisper; None keeps the tenant default).
             language=session.active_language,
         )
+        # SPEC-W9 Part B: tell the agent it may drive the visitor's UI — but
+        # only when the UI action tools are registered for this turn.
+        registered = {t["function"]["name"] for t in tool_layer.schemas()}
+        if any(name in registered for name in UI_ACTION_TOOL_NAMES):
+            system_prompt = f"{system_prompt}\n\n{UI_ACTION_PROMPT_ADDENDUM}"
         if history and history[0].get("role") == "system":
             history[0] = {"role": "system", "content": system_prompt}
         else:
@@ -197,6 +221,9 @@ class ChatService:
             "phone_confirmed": session.confirmed_phone is not None,
             "active_agent": session.active_agent,
             "escalated": session.escalation_room is not None,
+            # SPEC-W9 Part B (additive): validated UI actions the LLM invoked
+            # this turn; the web widget executes them client-side.
+            "ui_actions": list(tool_layer.collected_ui_actions),
         }
 
     async def handle_message_stream(
@@ -261,5 +288,11 @@ class ChatService:
             tool_calls=len(trace),
             active_agent=session.active_agent,
             copilot=copilot_posted,
+            ui_actions=len(tool_layer.collected_ui_actions),
         )
+        # SPEC-W9 Part B: validated UI actions ride the stream as
+        # `data: {"ui_action": {...}}` frames ahead of the terminal done frame.
+        for action in tool_layer.collected_ui_actions:
+            yield {"ui_action": action}
         yield {"done": True, "conversation_id": session.conversation_id}
+
