@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .multilang import parse_voice_map
+from .multilang import parse_tts_voice_map, parse_voice_map
 from .sip import parse_tenant_phone_map
 
 
@@ -139,6 +139,23 @@ class Settings:
     # back to `piper_voice`.
     piper_voice_map: dict = field(default_factory=dict)
 
+    # TTS provider chain (SPEC-W10 Part A, app/tts_providers/): ordered
+    # comma-separated provider fallback chain (TTS_PROVIDER_CHAIN). Default
+    # "piper" = byte-identical pre-W10 behavior; piper is always the implicit
+    # last resort when configured. TTS_VOICE_MAP JSON maps language tags to
+    # provider-qualified "provider:voiceId" values (consulted BEFORE
+    # piper_voice_map; see app/multilang.py resolve_tts_voice).
+    tts_provider_chain: str = "piper"
+    tts_voice_map: dict = field(default_factory=dict)
+    mms_tts_url: str = "http://mms-tts:5800"
+    xtts_tts_url: str = "http://xtts-tts:5810"
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""
+    spitch_api_key: str = ""
+    spitch_base_url: str = "https://api.spitch.app"
+    tts_cb_failures: int = 3  # consecutive provider failures before circuit opens
+    tts_cb_cooldown_s: float = 60.0  # open window before a half-open probe
+
     # A/B prompt testing (Wave 5 #8, eval/ab_test.py): allow POST /voice/chat
     # to carry a `persona_override` replacing the tenant persona. OFF by
     # default — enabling it on a public endpoint is a prompt-injection
@@ -222,6 +239,16 @@ def load_settings() -> Settings:
         tenant_phone_map=parse_tenant_phone_map(_env("TENANT_PHONE_MAP", "")),
         sip_default_site=_env("SIP_DEFAULT_SITE", ""),
         piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
+        tts_provider_chain=_env("TTS_PROVIDER_CHAIN", "piper"),
+        tts_voice_map=parse_tts_voice_map(_env("TTS_VOICE_MAP", "")),
+        mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
+        xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
+        azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
+        azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
+        spitch_api_key=_env("SPITCH_API_KEY", ""),
+        spitch_base_url=_env("SPITCH_BASE_URL", "https://api.spitch.app"),
+        tts_cb_failures=_env_int("TTS_CB_FAILURES", 3),
+        tts_cb_cooldown_s=float(os.environ.get("TTS_CB_COOLDOWN_S", "60")),
         eval_persona_override=_env("EVAL_PERSONA_OVERRIDE", "false").lower()
         in ("1", "true", "yes", "on"),
     )

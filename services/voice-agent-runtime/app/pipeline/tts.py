@@ -105,16 +105,36 @@ class PiperTTS:
             )
         return pcm
 
+    async def synthesize_wav(self, text: str, voice: str | None = None) -> bytes:
+        """RIFF wav bytes for `text` (defaults to the configured voice).
+
+        SPEC-W10: consumed by the tts_providers chain's piper adapter. Same
+        fetch paths as synthesize_pcm, without the PCM conversion.
+        """
+        text = text.strip()
+        if not text:
+            return b""
+        voice = (voice or "").strip() or self.voice
+        if self.mode == "subprocess":
+            return await self._subprocess_wav(text, voice)
+        return await self._http_wav(text, voice)
+
     async def _synthesize_http(self, text: str) -> tuple[bytes, int]:
+        return _wav_to_pcm(await self._http_wav(text, self.voice))
+
+    async def _http_wav(self, text: str, voice: str) -> bytes:
         resp = await self._http().post(
-            f"{self.http_url}/speak", json={"text": text, "voice": self.voice}
+            f"{self.http_url}/speak", json={"text": text, "voice": voice}
         )
         resp.raise_for_status()
-        return _wav_to_pcm(resp.content)
+        return resp.content
 
     async def _synthesize_subprocess(self, text: str) -> tuple[bytes, int]:
-        model = os.path.join(self.model_dir, f"{self.voice}.onnx")
-        config = os.path.join(self.model_dir, f"{self.voice}.onnx.json")
+        return _wav_to_pcm(await self._subprocess_wav(text, self.voice))
+
+    async def _subprocess_wav(self, text: str, voice: str) -> bytes:
+        model = os.path.join(self.model_dir, f"{voice}.onnx")
+        config = os.path.join(self.model_dir, f"{voice}.onnx.json")
 
         # Run the blocking subprocess in a thread to keep the event loop free.
         def _exec() -> bytes:
@@ -152,5 +172,4 @@ class PiperTTS:
                 except OSError:
                     pass
 
-        wav_bytes = await asyncio.to_thread(_exec)
-        return _wav_to_pcm(wav_bytes)
+        return await asyncio.to_thread(_exec)

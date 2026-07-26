@@ -237,6 +237,102 @@ def voice_for_language(
     return default_voice
 
 
+# ---------------------------------------------------------------------------
+# SPEC-W10 Part A: provider-qualified voice routing (TTS_VOICE_MAP).
+#
+# TTS_VOICE_MAP JSON maps language tags to ``"provider:voiceId"`` values:
+#   {"pcm": "mms:pcm", "en-NG": "azure:en-NG-EzinneNeural", "yo": "mms:yor",
+#    "ha": "mms:hau", "ig": "mms:ibo"}
+# Unlike PIPER_VOICE_MAP, keys keep their region subtag ("en-NG" is distinct
+# from "en") and ``pcm`` is NOT proxied to English — MMS/Spitch have real
+# Pidgin/Yoruba/Hausa/Igbo voices, so the pidgin_proxy hack only applies to
+# the piper fallback. When TTS_VOICE_MAP is unset, resolution is identical
+# to voice_for_language() (byte-identical pre-W10 behavior).
+# ---------------------------------------------------------------------------
+def _normalize_voice_key(code: str | None) -> str:
+    """Normalize a language tag for TTS_VOICE_MAP keys, KEEPING the region
+    subtag: ``"en-NG"`` -> ``"en-ng"``, ``"EN_us"`` -> ``"en-us"``.
+    Returns "" for unusable input."""
+    if not code:
+        return ""
+    tag = str(code).strip().replace("_", "-")
+    if not _LANG_RE.match(tag.lower()):
+        return ""
+    return tag.lower()
+
+
+def parse_tts_voice_map(raw: str | dict | None) -> dict[str, str]:
+    """Parse ``TTS_VOICE_MAP`` JSON ``{"pcm": "mms:pcm", ...}``.
+
+    Values are provider-qualified (``"provider:voiceId"``) or bare voice ids
+    (legacy piper semantics). Tolerant: invalid JSON, invalid keys and
+    malformed values drop out with a warning."""
+    if not raw:
+        return {}
+    data: Any = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("TTS_VOICE_MAP is not valid JSON; ignoring", raw=raw[:80])
+            return {}
+    if not isinstance(data, dict):
+        log.warning("TTS_VOICE_MAP must be a JSON object; ignoring")
+        return {}
+    out: dict[str, str] = {}
+    for lang, voice in data.items():
+        key = _normalize_voice_key(str(lang))
+        if not key or not isinstance(voice, str) or not voice.strip():
+            log.warning("TTS_VOICE_MAP: dropping invalid entry", key=str(lang)[:40])
+            continue
+        value = voice.strip()
+        if ":" in value:
+            provider, _, voice_id = value.partition(":")
+            if not re.match(r"^[a-z][a-z0-9]*$", provider.strip().lower()) or (
+                not voice_id.strip()
+            ):
+                log.warning(
+                    "TTS_VOICE_MAP: dropping malformed provider:voiceId", key=key
+                )
+                continue
+            value = f"{provider.strip().lower()}:{voice_id.strip()}"
+        out[key] = value
+    return out
+
+
+def resolve_tts_voice(
+    language: str,
+    tts_voice_map: dict[str, str],
+    piper_voice_map: dict[str, str],
+    default_voice: str,
+    *,
+    ctx: Any = None,
+) -> str:
+    """Resolve the voice spec for a language turn.
+
+    Precedence:
+    1. Per-tenant override ``ctx.tts_voice`` (defensive getattr; may itself
+       be provider-qualified) — pack/identity-supplied tenant voice.
+    2. ``TTS_VOICE_MAP`` (provider-qualified): full tag match ("en-ng")
+       then primary subtag ("en"); pcm is matched literally, NOT proxied.
+    3. Legacy ``PIPER_VOICE_MAP`` via :func:`voice_for_language` (pidgin
+       proxy + default fallback) — byte-identical to pre-W10 behavior when
+       TTS_VOICE_MAP is unset and no tenant override exists.
+    """
+    if ctx is not None:
+        override = getattr(ctx, "tts_voice", None)
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+    key = _normalize_voice_key(language)
+    if key and tts_voice_map:
+        if key in tts_voice_map:
+            return tts_voice_map[key]
+        primary = key.split("-", 1)[0]
+        if primary in tts_voice_map:
+            return tts_voice_map[primary]
+    return voice_for_language(language, piper_voice_map, default_voice)
+
+
 @dataclass
 class MultilangState:
     """Per-session language tracker.
