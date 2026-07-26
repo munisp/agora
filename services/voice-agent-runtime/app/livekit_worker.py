@@ -2,7 +2,8 @@
 
 Pipeline: silero VAD -> faster-whisper STT (in-process, lazy) ->
 OpenAI-compatible LLM (livekit-plugins-openai against LLM_BASE_URL, default
-Ollama) -> Piper TTS (HTTP sidecar or subprocess).
+Ollama) -> FallbackTTS provider chain (SPEC-W10; piper-only by default,
+which is byte-identical to the legacy direct PiperTTS path).
 
 Room convention: room name `site-{slug}` binds the session to a tenant's
 public site; the server (never the model) resolves the tenant from the slug
@@ -46,13 +47,14 @@ from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
-from .multilang import MultilangState, voice_for_language
+from .multilang import MultilangState, normalize_language, resolve_tts_voice
 from .pipeline.stt import FasterWhisperSTT
-from .pipeline.tts import PiperTTS
+from .pipeline.tts import TTSInterface
 from .prompts import build_system_prompt
 from .session_state import SessionState
 from .tenant_context import TenantContext, fetch_tenant_context
 from .tools import ToolLayer
+from .tts_providers.chain import FallbackTTS, build_fallback_tts
 
 log = get_logger("livekit-worker")
 
@@ -74,24 +76,40 @@ def _build_stt(settings: Settings) -> FasterWhisperSTT:
     )
 
 
-def _build_tts(settings: Settings) -> PiperTTS:
-    return PiperTTS(
-        mode=settings.piper_mode,
-        http_url=settings.piper_http_url,
-        voice=settings.piper_voice,
-        piper_bin=settings.piper_bin,
-        model_dir=settings.piper_model_dir,
-        sample_rate=settings.piper_sample_rate,
-    )
+def _build_tts(settings: Settings) -> FallbackTTS:
+    """Live-call TTS: the SPEC-W10 FallbackTTS provider chain.
+
+    Default config (TTS_PROVIDER_CHAIN="piper") builds a piper-only chain
+    whose PiperTTS stage is constructed with exactly the legacy settings, so
+    runtime behavior is byte-identical to the pre-W10 direct PiperTTS path.
+    """
+    return build_fallback_tts(settings)
+
+
+async def _warmup_tts(tts: Any) -> None:
+    """Prewarm-hook TTS warmup synthesis.
+
+    Piper-only chain (default): one ``synthesize_pcm`` pass — exactly the
+    pre-W10 piper warmup. Multi-provider chains exercise the FIRST configured
+    provider AND piper (when present but not first), so a warm process has no
+    cold start on either the primary or the implicit last-resort path.
+    """
+    order = tts.order if isinstance(tts, FallbackTTS) else []
+    if order and order[0] != "piper" and tts.provider("piper") is not None:
+        await tts.synthesize(PREWARM_PHRASE, provider=order[0])
+        await tts.synthesize(PREWARM_PHRASE, provider="piper")
+    else:
+        await tts.synthesize_pcm(PREWARM_PHRASE)
 
 
 def make_prewarm_fnc(settings: Settings):
     """WorkerOptions.prewarm_fnc (livekit-agents 0.10.x: runs synchronously in
     each warm job process before it accepts jobs).
 
-    Eagerly loads the whisper model and runs one piper warmup synthesis so a
-    warm process' first call has no dead air. Failures degrade to the old
-    lazy-load behaviour (logged, never fatal).
+    Eagerly loads the whisper model and runs the TTS warmup synthesis (one
+    piper pass on the default piper-only chain; first provider + piper on
+    multi-provider chains) so a warm process' first call has no dead air.
+    Failures degrade to the old lazy-load behaviour (logged, never fatal).
     """
 
     def _prewarm(proc) -> None:  # noqa: ARG001 - proc userdata unused; module cache suffices
@@ -106,11 +124,15 @@ def make_prewarm_fnc(settings: Settings):
             log.warning("prewarm: whisper load failed (lazy fallback)", error=str(exc)[:200])
         try:
             tts = _build_tts(settings)
-            asyncio.run(tts.synthesize_pcm(PREWARM_PHRASE))
+            asyncio.run(_warmup_tts(tts))
             _PREWARMED["tts"] = tts
-            log.info("prewarm: piper warmup synthesis done", voice=settings.piper_voice)
+            log.info(
+                "prewarm: tts warmup synthesis done",
+                chain=settings.tts_provider_chain,
+                voice=settings.piper_voice,
+            )
         except Exception as exc:  # noqa: BLE001 - degrade to lazy load
-            log.warning("prewarm: piper warmup failed (lazy fallback)", error=str(exc)[:200])
+            log.warning("prewarm: tts warmup failed (lazy fallback)", error=str(exc)[:200])
 
     return _prewarm
 
@@ -172,9 +194,11 @@ class WhisperSTTNode(lk_stt.STT):
 
 
 class PiperTTSNode(lk_tts.TTS):
-    """Bridge PiperTTS into the LiveKit pipeline (chunked synthesis)."""
+    """Bridge a TTSInterface stage into the LiveKit pipeline (chunked
+    synthesis). Since SPEC-W10 the impl is the FallbackTTS provider chain
+    (piper-only by default)."""
 
-    def __init__(self, impl: PiperTTS) -> None:
+    def __init__(self, impl: TTSInterface) -> None:
         super().__init__(
             capabilities=lk_tts.TTSCapabilities(streaming=False),
             sample_rate=impl.sample_rate,
@@ -426,22 +450,38 @@ async def build_voice_agent(
     tts_impl = _PREWARMED.get("tts") or _build_tts(settings)
 
     # Wave 5 #3 multilingual receptionist: tenant locale sets the default
-    # language; whisper detection switches it per turn, swapping the piper
-    # voice (PIPER_VOICE_MAP, default-voice fallback) and re-rendering the
-    # system prompt with the per-turn locale instruction.
+    # language; whisper detection switches it per turn, swapping the TTS
+    # voice and re-rendering the system prompt with the per-turn locale
+    # instruction. SPEC-W10: voice selection goes through resolve_tts_voice —
+    # provider-qualified TTS_VOICE_MAP entries ("mms:pcm") route to that
+    # provider on the FallbackTTS chain, with PIPER_VOICE_MAP + the default
+    # piper voice as the legacy fallback (byte-identical when TTS_VOICE_MAP
+    # is unset).
     ml_state = MultilangState.from_context(ctx)
     session.active_language = ml_state.active_language
-    tts_impl.voice = voice_for_language(
-        ml_state.active_language, settings.piper_voice_map, settings.piper_voice
-    )
+
+    def _voice_spec(language: str) -> str:
+        return resolve_tts_voice(
+            language,
+            settings.tts_voice_map,
+            settings.piper_voice_map,
+            settings.piper_voice,
+        )
+
+    tts_impl.voice = _voice_spec(ml_state.active_language)
 
     def _on_language(detected: str) -> None:
-        if not ml_state.observe(detected):
+        switched = ml_state.observe(detected)
+        if settings.tts_voice_map and normalize_language(detected):
+            # Provider-qualified maps follow the RAW detection: pcm/yo/ha/ig
+            # route to their mapped provider voice even when the locale stays
+            # put (pcm is proxied to English at the locale/prompt level).
+            tts_impl.voice = _voice_spec(detected)
+        elif switched:
+            tts_impl.voice = _voice_spec(ml_state.active_language)
+        if not switched:
             return
         session.active_language = ml_state.active_language
-        tts_impl.voice = voice_for_language(
-            ml_state.active_language, settings.piper_voice_map, settings.piper_voice
-        )
         new_prompt = build_system_prompt(
             ctx,
             conversation_id=conversation_id,
