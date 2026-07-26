@@ -78,4 +78,3 @@ def validate_prefill_booking(offering_id: Any) -> dict[str, str] | None:
     except (ValueError, AttributeError, TypeError):
         return None
     return {"type": PREFILL_BOOKING, "offering_id": normalized}
-

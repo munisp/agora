@@ -295,4 +295,3 @@ class ChatService:
         for action in tool_layer.collected_ui_actions:
             yield {"ui_action": action}
         yield {"done": True, "conversation_id": session.conversation_id}
-
