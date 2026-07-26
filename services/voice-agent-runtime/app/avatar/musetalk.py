@@ -65,4 +65,3 @@ class MuseTalkProvider:
 
 
 register_provider(MuseTalkProvider.name, MuseTalkProvider)
-

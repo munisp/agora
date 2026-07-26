@@ -113,4 +113,3 @@ def create_provider(name: str, settings: Settings) -> AvatarProvider | None:
     if cls is None:
         return None
     return cls(settings)
-
