@@ -690,4 +690,3 @@ class ToolLayer:
             log.warning("tool call failed", tool=name, error=str(exc))
             await self._emit_tool_event(name, "error", {"error": str(exc)[:200]})
             return {"status": "error", "message": f"{name} failed: {exc}"}
-
