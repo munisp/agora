@@ -312,4 +312,3 @@ export function UiActionsBridge({ offerings }: { offerings: BridgeOffering[] }) 
 
   return null;
 }
-
