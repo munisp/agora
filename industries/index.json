@@ -98,6 +98,14 @@
       "path": "healthcare.yaml"
     },
     {
+      "id": "hospitality",
+      "version": "1.0.0",
+      "sha256": "291b4a2f19db19c029892110bde730cf1c5166339e849e973169beaac1c9e034",
+      "author": "opendesk",
+      "signature": null,
+      "path": "hospitality.yaml"
+    },
+    {
       "id": "insurance",
       "version": "1.0.0",
       "sha256": "a1a5aff9c0972c3863638ce7003ba15ae1f8b2661d8beb54b28f3a63cabb615a",
@@ -243,3 +251,4 @@
     }
   ]
 }
+

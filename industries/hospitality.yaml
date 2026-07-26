@@ -1,0 +1,182 @@
+# Hospitality industry pack (SPEC-W9 Part D) — hotels, guest houses and
+# boutique resorts. Guest/reservation terminology, per-night pricing in NGN
+# kobo, first-night deposit, upsell-aware concierge persona.
+# NDPA profile: pair with infra/privacy/ndpa-profile.env (see
+# docs/compliance/ndpa.md).
+id: hospitality
+displayName: Hospitality (Hotels & Resorts)
+terminology:
+  offering: room night
+  team_member: concierge
+  booking: reservation
+  contact: guest
+agentPersona: |
+  You are the concierge of a warm, well-run Nigerian hotel. You are gracious,
+  unhurried and genuinely hospitable — guests may be jet-lagged, travelling
+  for a wedding or a funeral, or closing a business deal, and you meet each
+  one with the same calm warmth. Default to polite standard English with a
+  warm Nigerian tone; if the guest speaks Pidgin, mirror them naturally
+  ("Welcome o! You wan book room?", "No wahala, we go arrange am for you").
+
+  You know the property by heart: the room types and their per-night rates,
+  check-in from 14:00 and check-out by 11:00, the breakfast service, the
+  airport pickup cars, the event hall, parking and wifi. Reservations are
+  held with a first-night deposit; say it plainly ("the first night holds
+  your room") and always quote prices in naira format (e.g. ₦45,000 per
+  night) — never invent rates, discounts or availability.
+
+  UPSELLS — natural, never pushy: when a guest books a room, offer the
+  extras ONCE, the way a good concierge would:
+  - If they mention a flight or airport, offer the airport pickup
+    ("shall I arrange a car to meet you at the airport?").
+  - If they book more than one night or mention mornings, mention the
+    breakfast package.
+  - If they mention a late flight or an event on departure day, offer late
+    check-out (subject to availability, usually until 14:00).
+  Offer once, accept "no" gracefully, and never make an extra feel like a
+  condition of the booking.
+
+  Hard rules (never break these):
+  - NEVER confirm a room without checking real availability for the exact
+    dates; if the dates are sold out, offer the nearest alternatives or a
+    waitlist — never pretend a room exists.
+  - NEVER quote a rate that is not in the current catalog, and never promise
+    upgrades, early check-in or late check-out as guaranteed — they are
+    always "subject to availability".
+  - Cancellations and date changes are free up to 48 hours before check-in;
+    inside that window the first-night deposit is forfeited. State this
+    clearly before taking a deposit.
+  - After every reservation the guest receives a confirmation with the
+    check-in instructions; mention it so it never reads as spam.
+bookingPolicy:
+  # Deposit = first night: room offerings are priced per night, so a 100%
+  # deposit on the booked night equals the first-night rate (see
+  # bookingPolicy.depositPercent in docs/industries.md).
+  depositPercent: 100
+  # NGN has no cent: 1 naira = 100 kobo. No separate no-show fee — a no-show
+  # forfeits the first-night deposit already held.
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: false
+  cancellationWindowHours: 48
+temporalWorkflow: SalonDepositWorkflow
+# Languages the deployment supports (ISO-639). pcm = Nigerian Pidgin, handled
+# at the PERSONA level (whisper returns Pidgin speech as 'en') — see
+# services/voice-agent-runtime/app/multilang.py.
+languages: [en, pcm]
+# NDPA 2023 consent text (data processing + call recording notice). Optional
+# field — scripts/validate_pack.py and the Go pack loader tolerate it.
+consentText: |
+  We record this call and keep your name, phone number and reservation
+  details so we can hold your room, arrange your pickup and remind you
+  before arrival. We do not share your data with anyone outside your
+  reservation, and we delete call records after 180 days under the Nigeria
+  Data Protection Act 2023. You may ask us to see, correct or delete your
+  data at any time — just speak to the front desk. If you do not want the
+  call recorded, tell us now and we will stop the recording and continue.
+offerings:
+# Per-night stays: duration covers check-in 14:00 to check-out 11:00
+# (21 h = 1260 min) with a 3 h housekeeping/turnover buffer.
+- name: Standard Room Night
+  duration_min: 1260
+  buffer_min: 180
+  price_cents: 4500000 # ₦45,000 (≈ $30)
+  capacity: 20
+- name: Deluxe Room Night
+  duration_min: 1260
+  buffer_min: 180
+  price_cents: 8500000 # ₦85,000 (≈ $57)
+  capacity: 12
+- name: Suite Night
+  duration_min: 1260
+  buffer_min: 180
+  price_cents: 15000000 # ₦150,000 (≈ $100)
+  capacity: 4
+- name: Airport Pickup
+  duration_min: 60
+  buffer_min: 30
+  price_cents: 2500000 # ₦25,000 (≈ $17), per car (up to 3 guests)
+  capacity: 3
+- name: Breakfast Package
+  duration_min: 120
+  buffer_min: 0
+  price_cents: 1200000 # ₦12,000 (≈ $8), per guest per morning
+  capacity: 40
+# Premium full-day hire of the event hall (weddings, conferences).
+- name: Event Hall Day
+  duration_min: 720
+  buffer_min: 120
+  price_cents: 75000000 # ₦750,000 (≈ $500)
+  capacity: 1
+reminders:
+  # Pre-arrival: check-in instructions + pickup coordination at T-48h,
+  # final reminder with directions at T-24h.
+  offsets: ["48h", "24h"]
+  channels: ["email", "sms"]
+knowledgeSeed:
+- title: Check-in & check-out times, early/late options
+  body: |
+    Check-in is from 14:00 and check-out is by 11:00 (WAT, Africa/Lagos).
+    Early check-in (from 12:00) and late check-out (until 14:00) are
+    subject to availability on the day — never guaranteed in advance; late
+    check-out past 14:00 is charged at half the nightly rate. Guests
+    arriving before their room is ready can leave luggage with the front
+    desk free of charge. A valid ID and the reservation phone number are
+    needed at check-in.
+- title: Rooms & rates (per night)
+  body: |
+    Standard rooms are ₦45,000 per night (queen bed, ensuite, capacity 20
+    rooms), deluxe rooms ₦85,000 (king bed, city view, workspace, 12 rooms)
+    and suites ₦150,000 (separate lounge, balcony, complimentary
+    breakfast for two, 4 suites). All rates include VAT; a first-night
+    deposit holds every reservation. The event hall hires at ₦750,000 per
+    day (full-day hire, up to 300 guests, projector and PA included;
+    catering quoted separately).
+- title: Amenities, wifi & parking
+  body: |
+    Free high-speed wifi throughout the property (network name and
+    password at the front desk and in each room). Free secure on-site
+    parking for guests; the gate is manned 24 hours. Other amenities:
+    rooftop pool (07:00–20:00), gym (24h with room card), restaurant and
+    bar (07:00–23:00), laundry service (same-day if dropped before
+    09:00), and 24-hour room service. Generator backup covers all rooms
+    and public areas — no light wahala.
+- title: Airport pickup & transport
+  body: |
+    Airport pickup is ₦25,000 per car (up to 3 guests with standard
+    luggage) from the international or domestic terminal. Guests provide
+    their flight number and arrival time at booking; the concierge checks
+    the flight status and adjusts pickup timing for delays at no charge,
+    and the driver waits up to 60 minutes after actual landing. Child
+    seats are free on request. The hotel can also arrange day hire cars
+    and city transfers — quote on request, never invented on the call.
+- title: Breakfast package
+  body: |
+    The breakfast package is ₦12,000 per guest per morning (06:30–10:30
+    in the restaurant): a buffet of Nigerian and continental dishes —
+    akara, yam and egg sauce, jollof, fresh fruit, pastries, tea and
+    coffee. Suite rates already include breakfast for two. Guests can add
+    the package to a room booking at any time before 20:00 the evening
+    before; walk-in guests pay at the restaurant.
+- title: Cancellation, deposit & pet policy
+  body: |
+    Every reservation is held with a first-night deposit. Cancellations
+    and date changes are free up to 48 hours before the 14:00 check-in
+    time; inside that window the first-night deposit is forfeited, and a
+    no-show forfeits it too. Deposits are refundable to the original
+    payment method within 5–7 working days on free cancellations. Pets
+    are not allowed in guest rooms or the restaurant; certified service
+    animals are welcome at no charge. Smoking is allowed only in the
+    designated outdoor terrace.
+dashboardLabels:
+  bookingSingular: Reservation
+  bookingPlural: Reservations
+  customerTerm: Guest
+  # Hotel KPI labels (extra keys — the Go loader passes dashboardLabels
+  # through as a map and the validators only require the three keys above).
+  occupancy: Occupancy
+  adr: ADR (Average Daily Rate)
+  revpar: RevPAR
+  arrivals: Arrivals today
+  departures: Departures today
+

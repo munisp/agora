@@ -40,5 +40,9 @@ create_tenant acme-logistics "Acme Express Logistics"       logistics    "Africa
 # emergency number first.
 create_tenant city-civic      "City Civic Services (311)"     civic-services     "America/New_York" "USD" "en-US"
 create_tenant community-watch "Community Watch Network"       neighborhood-watch "Europe/London"   "GBP" "en-GB"
+# Wave 9: hospitality demo (SPEC-W9 Part D). Prices are kobo-denominated
+# (NGN), per-night room rates with a first-night deposit; timezone WAT.
+create_tenant acme-hotel   "Acme Grand Hotel"       hospitality "Africa/Lagos"  "NGN" "en-NG"
 
 echo "Seed complete. Industry packs are applied asynchronously by the TenantOnboardingWorkflow."
+
