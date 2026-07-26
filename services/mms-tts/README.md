@@ -31,7 +31,7 @@ modern CPU); no GPU required. The Dockerfile installs CPU-only torch wheels.
 ## Develop / test
 
 ```bash
-pip install fastapi httpx pytest soundfile numpy uvicorn
+pip install fastapi httpx pytest soundfile numpy
 MMS_MOCK=1 pytest tests/ -q          # contract tests (no torch needed)
 MMS_MOCK=1 python -m app.main        # serve on :5800
 ```
