@@ -225,4 +225,3 @@ def load_settings() -> Settings:
         eval_persona_override=_env("EVAL_PERSONA_OVERRIDE", "false").lower()
         in ("1", "true", "yes", "on"),
     )
-

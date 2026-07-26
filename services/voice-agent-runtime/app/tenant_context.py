@@ -183,4 +183,3 @@ async def fetch_tenant_context(
         snippets=len(ctx.knowledge_snippets),
     )
     return ctx
-

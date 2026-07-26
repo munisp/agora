@@ -220,4 +220,3 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
-
