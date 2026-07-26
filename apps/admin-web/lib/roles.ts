@@ -35,6 +35,12 @@ export const LOCATIONS_ROLES: readonly RealmRole[] = [
 /** Geo-targeted campaigns (SPEC-W8 Part C) — messaging spend, owner/admin. */
 export const GEO_CAMPAIGN_ROLES: readonly RealmRole[] = ["owner", "admin"];
 
+/** Voices studio (SPEC-W10 Part C) — operational staff can browse/preview. */
+export const VOICES_ROLES: readonly RealmRole[] = ["owner", "admin", "staff"];
+
+/** Brand-voice enrollment (SPEC-W10 Part C) — consent-sensitive, owner/admin. */
+export const VOICES_ENROLL_ROLES: readonly RealmRole[] = ["owner", "admin"];
+
 export function hasAnyRole(
   roles: readonly string[] | undefined | null,
   allowed: readonly RealmRole[],
@@ -69,4 +75,18 @@ export function canViewGeoCampaigns(
   roles: readonly string[] | undefined | null,
 ): boolean {
   return hasAnyRole(roles, GEO_CAMPAIGN_ROLES);
+}
+
+/** owner/admin/staff — viewers, analysts and billing never see the voices studio. */
+export function canViewVoices(
+  roles: readonly string[] | undefined | null,
+): boolean {
+  return hasAnyRole(roles, VOICES_ROLES);
+}
+
+/** owner/admin — only they may enroll brand voices (voice-cloning consent). */
+export function canEnrollVoices(
+  roles: readonly string[] | undefined | null,
+): boolean {
+  return hasAnyRole(roles, VOICES_ENROLL_ROLES);
 }
