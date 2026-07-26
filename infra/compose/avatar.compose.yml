@@ -43,4 +43,3 @@ services:
     # (no re-declaration needed when used as a -f override).
     networks:
       - opendesk
-

@@ -43,4 +43,3 @@ RUN pip install --no-cache-dir "livekit-api>=0.6,<0.7" "livekit>=0.17,<1"
 COPY app/ /app/app/
 
 CMD ["python", "-m", "app.main"]
-

@@ -52,4 +52,3 @@ app/main.py   # Renderer protocol + MockRenderer + MuseTalkRenderer stub,
               # LiveKit room worker (discovery -> join -> publish loop)
 Dockerfile    # mock build by default; MuseTalk steps ready to uncomment
 ```
-
