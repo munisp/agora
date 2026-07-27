@@ -26,7 +26,7 @@ log = get_logger("tts.spitch")
 # Documented Spitch languages (docs.spitch.app/features/speech).
 SPITCH_LANGUAGES = ["en", "yo", "ha", "ig"]
 # Named character voices confirmed in the official docs/SDK examples. The
-docs mention 8 characters but only these names are published; extend here
+# docs mention 8 characters but only these names are published; extend here
 # when Spitch publishes the full catalog.
 SPITCH_VOICES: tuple[Voice, ...] = (
     Voice(id="sade", languages=list(SPITCH_LANGUAGES), gender="Female"),
