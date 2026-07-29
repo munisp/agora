@@ -16,6 +16,7 @@ import (
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/geo"
+	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
@@ -64,6 +65,9 @@ type Deps struct {
 	// Geo serves the SPEC-W8 geospatial endpoints (locations, service
 	// areas, geo campaigns). Nil → those routes answer 503.
 	Geo *geo.Handlers
+	// Incidents serves the SPEC-W11 Part B incident endpoints (list/detail,
+	// dispatch, endpoint CRUD, ingest). Nil → those routes answer 503.
+	Incidents *incidents.Service
 }
 
 type ctxKey string
@@ -155,7 +159,28 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_bookings")).Post("/export", s.gdprExport)
 			r.With(s.require("manage_bookings")).Post("/erase", s.gdprErase)
 		})
+		// Incidents API (SPEC-W11 Part B §3): admin list/detail, manual
+		// dispatch and dispatch-endpoint CRUD (manage_bookings).
+		r.Route("/incidents", func(r chi.Router) {
+			r.Get("/", s.listIncidents)
+			r.Get("/{id}", s.getIncident)
+			r.With(s.require("manage_bookings")).Post("/{id}/dispatch", s.dispatchIncident)
+			r.With(s.require("manage_bookings")).Post("/dispatch-endpoints", s.createDispatchEndpoint)
+			r.Get("/dispatch-endpoints", s.listDispatchEndpoints)
+			r.With(s.require("manage_bookings")).Delete("/dispatch-endpoints", s.deleteDispatchEndpoint)
+		})
 	})
+
+	// IoT/webhook incident ingest (SPEC-W11 Part B §6): invoked
+	// service-to-service via Dapr by the messaging-gateway, which already
+	// authenticated the caller (per-tenant shared secret) — hence no tenant
+	// middleware here; the body carries tenant_id / tenant_slug.
+	r.Post("/v1/incidents/ingest", s.ingestIncident)
+
+	// Delivery-ledger update (SPEC-W11 Part B §4): notification-worker's
+	// UpdateWebhookDelivery activity (payload type "incident") records each
+	// attempt outcome here via Dapr service invocation.
+	r.Post("/internal/incidents/deliveries/{id}", s.updateIncidentDelivery)
 
 	// Public booking page endpoints — no auth; the site slug resolves the
 	// tenant server-side, so cross-tenant access is impossible by construction.
