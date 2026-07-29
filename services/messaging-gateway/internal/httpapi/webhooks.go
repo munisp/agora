@@ -9,8 +9,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -176,6 +179,168 @@ func (s *Server) bridge(parent context.Context, msg channel.InboundMessage, rout
 		s.Log.Warn("inbound bridge failed",
 			zap.String("channel", msg.Channel), zap.Error(err))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// IoT incident ingest (SPEC-W11 Part B §6)
+// ---------------------------------------------------------------------------
+//
+// POST /webhooks/incidents is the public IoT trigger: an alarm panel /
+// sensor gateway posts a PARTIAL Incident Data Packet; the gateway
+// authenticates the tenant via the per-tenant shared secret
+// (INCIDENT_WEBHOOK_SECRETS env JSON) and forwards to booking-service's
+// internal POST /v1/incidents/ingest via Dapr service invocation, which
+// completes the IDP (channel=webhook), persists it and triggers
+// auto-dispatch + critical/high outreach.
+//
+// Response contract mirrors the provider webhooks: 400 only for garbage
+// JSON, 403 for an unknown tenant / bad secret (authentication failure),
+// 200 otherwise — internal forward failures are logged, not propagated.
+
+// incidentWebhookBody is the accepted payload shape. Exactly one of
+// tenant_slug / tenant_id addresses the tenant.
+type incidentWebhookBody struct {
+	TenantSlug string          `json:"tenant_slug,omitempty"`
+	TenantID   string          `json:"tenant_id,omitempty"`
+	Secret     string          `json:"secret,omitempty"`
+	Incident   json.RawMessage `json:"incident"`
+}
+
+// ParseIncidentSecrets decodes the INCIDENT_WEBHOOK_SECRETS env JSON:
+//
+//	{"acme-ng": "s3cret", "9f1c…-uuid": "other-secret"}
+//
+// Keys may be tenant slugs or tenant ids (either addresses the tenant in the
+// webhook body). An empty string yields an empty map (ingest disabled —
+// every post is 403).
+func ParseIncidentSecrets(raw string) (map[string]string, error) {
+	m := map[string]string{}
+	if raw == "" {
+		return m, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return nil, fmt.Errorf("parse INCIDENT_WEBHOOK_SECRETS: %w", err)
+	}
+	return m, nil
+}
+
+// IncidentIngester forwards a validated incident to booking-service
+// (httpIncidentIngester in prod; faked in tests).
+type IncidentIngester interface {
+	Ingest(ctx context.Context, body []byte) error
+}
+
+// httpIncidentIngester posts the ingest envelope to booking-service:
+// {base}/v1/incidents/ingest, where base is the BOOKING_URL override or the
+// Dapr sidecar invoke base (…/v1.0/invoke/booking/method).
+type httpIncidentIngester struct {
+	base string
+	hc   *http.Client
+}
+
+// NewIncidentIngester builds the ingester; base must already be resolved
+// (direct base or Dapr invoke base) — see ResolveIncidentBase.
+func NewIncidentIngester(base string) IncidentIngester {
+	return &httpIncidentIngester{base: base, hc: &http.Client{Timeout: 10 * time.Second}}
+}
+
+// ResolveIncidentBase maps the BOOKING_URL override / DAPR_HTTP_PORT onto
+// the booking-service base URL (same convention as channel.ResolveBases).
+func ResolveIncidentBase(bookingOverride string, daprHTTPPort int) string {
+	if bookingOverride != "" {
+		return bookingOverride
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d/v1.0/invoke/booking/method", daprHTTPPort)
+}
+
+func (c *httpIncidentIngester) Ingest(ctx context.Context, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/v1/incidents/ingest", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("invoke booking ingest: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("booking ingest: status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+// incidentSignal is the minimal validation subset of the partial IDP: at
+// least one signal field must be present, otherwise the post is junk
+// telemetry and ignored (200, not forwarded).
+type incidentSignal struct {
+	IncidentType     string          `json:"incident_type"`
+	NarrativeSummary string          `json:"narrative_summary"`
+	CallbackNumber   *string         `json:"callback_number"`
+	Location         json.RawMessage `json:"location"`
+}
+
+func (s *Server) handleIncidentWebhook(w http.ResponseWriter, r *http.Request) {
+	var body incidentWebhookBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		// Garbage JSON is the ONE client error we report (400): unlike the
+		// provider webhooks there is no retry-storm risk from IoT gateways.
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	tenantKey := body.TenantSlug
+	if tenantKey == "" {
+		tenantKey = body.TenantID
+	}
+	if tenantKey == "" {
+		writeError(w, http.StatusForbidden, "tenant_slug or tenant_id is required")
+		return
+	}
+	want, known := s.IncidentSecrets[tenantKey]
+	if !known || want == "" || body.Secret != want {
+		writeError(w, http.StatusForbidden, "bad incident webhook secret")
+		return
+	}
+	if len(body.Incident) == 0 || string(body.Incident) == "null" {
+		// Valid JSON but nothing to ingest.
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
+		return
+	}
+	var sig incidentSignal
+	if err := json.Unmarshal(body.Incident, &sig); err != nil {
+		writeError(w, http.StatusBadRequest, "incident must be a JSON object")
+		return
+	}
+	if sig.IncidentType == "" && sig.NarrativeSummary == "" &&
+		(sig.CallbackNumber == nil || *sig.CallbackNumber == "") && len(sig.Location) == 0 {
+		s.Log.Info("incident webhook: no signal fields, ignoring",
+			zap.String("tenant", tenantKey))
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
+		return
+	}
+	if s.IncidentIngest == nil {
+		s.Log.Warn("incident ingest not configured, dropping", zap.String("tenant", tenantKey))
+		writeJSON(w, http.StatusOK, map[string]any{"status": "dropped"})
+		return
+	}
+	forward, err := json.Marshal(map[string]any{
+		"tenant_slug": body.TenantSlug,
+		"tenant_id":   body.TenantID,
+		"incident":    body.Incident,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid incident payload")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), webhookTimeout)
+	defer cancel()
+	if err := s.IncidentIngest.Ingest(ctx, forward); err != nil {
+		// Internal failure: logged, still 200 (the caller must not retry-storm;
+		// booking-side ingest is idempotent on incident_id for safe manual replays).
+		s.Log.Warn("incident ingest forward failed", zap.String("tenant", tenantKey), zap.Error(err))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 // ---------------------------------------------------------------------------

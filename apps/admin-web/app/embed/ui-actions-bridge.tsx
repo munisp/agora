@@ -30,7 +30,68 @@ import * as React from "react";
  * double-wrap fetch), the original window.fetch is restored on unmount,
  * every action is re-validated client-side and wrapped in try/catch —
  * the widget never breaks because of an action.
+ *
+ * Widget GPS capture (SPEC-W11 Part D): when the host page's embed script
+ * carries data-location-consent="true", embed.js requests geolocation once
+ * and postMessages it here as {type:"opendesk:location", location}. The
+ * fetch tap then merges it as client_location {lat,lng,accuracy} into the
+ * JSON body of every /voice/chat request (additive key — the server
+ * tolerates unknown keys). Request bodies without a location fix (or
+ * without consent) pass through byte-identical.
  */
+
+/** GPS fix forwarded by the embed.js loader (host page, consent-gated). */
+interface ClientLocation {
+  lat: number;
+  lng: number;
+  accuracy: number;
+}
+
+/** Latest consented location fix; null until the host page forwards one. */
+let clientLocation: ClientLocation | null = null;
+
+/** Validate an opendesk:location payload; returns null when unusable. */
+function sanitizeLocation(raw: unknown): ClientLocation | null {
+  if (!raw || typeof raw !== "object") return null;
+  const loc = raw as Record<string, unknown>;
+  const { lat, lng, accuracy } = loc;
+  if (
+    typeof lat !== "number" ||
+    typeof lng !== "number" ||
+    !Number.isFinite(lat) ||
+    !Number.isFinite(lng) ||
+    lat < -90 ||
+    lat > 90 ||
+    lng < -180 ||
+    lng > 180
+  ) {
+    return null;
+  }
+  const acc =
+    typeof accuracy === "number" && Number.isFinite(accuracy) && accuracy >= 0
+      ? accuracy
+      : 0;
+  return { lat, lng, accuracy: acc };
+}
+
+/**
+ * Merge client_location into a /voice/chat request body (SPEC-W11 Part D).
+ * Returns the original init untouched when there is no fix, no JSON string
+ * body, or the body is not a plain JSON object — never throws.
+ */
+function withClientLocation(init?: RequestInit): RequestInit | undefined {
+  if (!clientLocation || !init || typeof init.body !== "string") return init;
+  try {
+    const body = JSON.parse(init.body) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return init;
+    return {
+      ...init,
+      body: JSON.stringify({ ...(body as Record<string, unknown>), client_location: clientLocation }),
+    };
+  } catch {
+    return init;
+  }
+}
 
 interface UiAction {
   type: string;
@@ -159,7 +220,18 @@ function acquireFetchTap(listener: ActionListener): () => void {
     const original = window.fetch.bind(window);
     const listeners = new Set<ActionListener>();
     const wrapped: typeof fetch = async (input, init) => {
-      const res = await original(input, init);
+      let effectiveInit = init;
+      try {
+        const chatUrl = requestUrl(input);
+        if (chatUrl && new URL(chatUrl, window.location.href).pathname.endsWith("/voice/chat")) {
+          // SPEC-W11 Part D: merge the consented GPS fix (if any) into the
+          // chat payload; bodies pass through untouched without a fix.
+          effectiveInit = withClientLocation(init);
+        }
+      } catch {
+        /* never rewrite on error */
+      }
+      const res = await original(input, effectiveInit);
       try {
         const url = requestUrl(input);
         if (url && new URL(url, window.location.href).pathname.endsWith("/voice/chat")) {
@@ -306,8 +378,31 @@ export function UiActionsBridge({ offerings }: { offerings: BridgeOffering[] }) 
       }
     };
 
+    // SPEC-W11 Part D: receive the consented GPS fix from the embed.js
+    // loader on the host page. Only messages coming from the direct parent
+    // frame are honored, with an origin check against the referrer (the
+    // host page) when it is available.
+    const onLocationMessage = (event: MessageEvent) => {
+      try {
+        if (window.parent === window || event.source !== window.parent) return;
+        const data = event.data as { type?: unknown; location?: unknown } | null;
+        if (!data || data.type !== "opendesk:location") return;
+        if (document.referrer) {
+          if (event.origin !== new URL(document.referrer).origin) return;
+        }
+        const loc = sanitizeLocation(data.location);
+        if (loc) clientLocation = loc;
+      } catch {
+        /* location capture is best-effort */
+      }
+    };
+    window.addEventListener("message", onLocationMessage);
+
     const release = acquireFetchTap(execute);
-    return release;
+    return () => {
+      window.removeEventListener("message", onLocationMessage);
+      release();
+    };
   }, []);
 
   return null;
