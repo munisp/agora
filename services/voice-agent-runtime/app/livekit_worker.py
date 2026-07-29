@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import Any, AsyncIterable
+from typing import Any, AsyncIterable, Optional
 
 from livekit import agents, rtc
 from livekit.agents import llm as lk_llm
@@ -41,7 +41,7 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
-from . import metrics, sip
+from . import emergency, metrics, sip
 from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
@@ -50,7 +50,11 @@ from .logging import configure_logging, get_logger
 from .multilang import MultilangState, normalize_language, resolve_tts_voice
 from .pipeline.stt import FasterWhisperSTT
 from .pipeline.tts import TTSInterface
-from .prompts import build_system_prompt
+from .prompts import (
+    EMERGENCY_LOCATION_FIRST_ADDENDUM,
+    build_greeting,
+    build_system_prompt,
+)
 from .session_state import SessionState
 from .tenant_context import TenantContext, fetch_tenant_context
 from .tools import ToolLayer
@@ -365,6 +369,28 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
 
     @lk_llm.ai_callable(
         description=(
+            "Save the caller's location to their contact record (emergency / "
+            "location-first flow). Pass the spoken address in address_text; "
+            "pass lat and lng only when the caller gave exact coordinates."
+        )
+    )
+    async def capture_location(
+        self,
+        address_text: str = "",
+        # NOTE: Optional[float], not `float | None` — livekit-agents 0.10.x
+        # function registration crashes on PEP 604 unions (issubclass TypeError).
+        lat: Optional[float] = None,
+        lng: Optional[float] = None,
+    ) -> str:
+        import json
+
+        result = await self._tools.capture_location(
+            address_text=address_text or None, lat=lat, lng=lng
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
             "Escalate the conversation to a human staff member (warm handoff). "
             "Creates a LiveKit escalation room, notifies staff and confirms to "
             "the caller. Use when the caller asks for a human, is distressed, "
@@ -376,6 +402,104 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
 
         result = await self._tools.request_human(reason=reason or None)
         return json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Emergency priority lane (SPEC-W11 Part C)
+# ---------------------------------------------------------------------------
+class EmergencyTurnHook:
+    """Live-turn emergency detector wired to ``user_speech_committed``.
+
+    Runs ``emergency.is_emergency`` on every committed user turn. On the
+    FIRST hit of the session (EmergencyState latches):
+
+    (a) ``session.emergency = True`` (latched flag on session state);
+    (b) ``voice_emergency_sessions_total`` increments and the active
+        SessionMetrics gets its additive ``emergency`` flag (flows into the
+        SessionEnded quality payload);
+    (c) the EXISTING warm-handoff escalation path (ToolLayer.request_human,
+        app/escalation.py underneath) is triggered immediately with
+        reason ``"emergency"``. First-claim on prewarmed agents is inherent:
+        worker prewarming (VOICE-SCALING §2) is shared across sessions, so
+        the escalation-room creation + staff notification starts with no
+        cold-start penalty — nothing extra to prewarm for emergencies;
+    (d) the location-first prompt addendum (prompts.py) is appended to the
+        chat context: the agent confirms the exact location FIRST, then
+        reassures and keeps the caller on the line.
+
+    Never raises: a detector failure must not break the call.
+    """
+
+    def __init__(
+        self,
+        *,
+        tool_layer: ToolLayer,
+        session: SessionState,
+        agent: Any | None = None,
+    ) -> None:
+        self._tools = tool_layer
+        self._session = session
+        self._agent = agent
+        self.state = emergency.EmergencyState()
+
+    def __call__(self, message: Any = None, *_args: Any, **_kwargs: Any) -> None:
+        try:
+            text = emergency.message_text(message)
+            if not text:
+                return
+            hit = self.state.observe(text)
+            if hit is None:  # no emergency, or already triggered this session
+                return
+            severity, hazards = hit
+            # (a) latch the session flag.
+            self._session.emergency = True
+            self._session.touch()
+            # (b) metrics: registry counter + per-session quality flag.
+            metrics.emergency_session()
+            metrics.session_emergency()
+            log.warning(
+                "emergency detected on live call",
+                conversation_id=self._session.conversation_id,
+                severity=severity,
+                hazards=hazards,
+            )
+            # (d) location-first instruction for the next model turn.
+            self._inject_addendum()
+            # (c) warm handoff via the existing escalation path.
+            self._schedule_escalation()
+        except Exception as exc:  # noqa: BLE001 - never break the call
+            log.error("emergency hook failed", error=str(exc)[:200])
+
+    def _inject_addendum(self) -> None:
+        chat_ctx = getattr(self._agent, "chat_ctx", None)
+        if chat_ctx is None:
+            return
+        try:
+            chat_ctx.append(role="system", text=EMERGENCY_LOCATION_FIRST_ADDENDUM)
+        except Exception as exc:  # noqa: BLE001 - addendum is best-effort
+            log.warning("emergency addendum injection failed", error=str(exc)[:200])
+
+    def _schedule_escalation(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            log.error("emergency escalation skipped: no running event loop")
+            return
+        loop.create_task(self._escalate())
+
+    async def _escalate(self) -> None:
+        if self._session.escalation_room:
+            # Already escalated (e.g. the caller asked for a human first) —
+            # the emergency flag/metric above still stand.
+            return
+        try:
+            await self._tools.request_human(reason="emergency")
+        except Exception as exc:  # noqa: BLE001 - logged; call continues
+            log.error(
+                "emergency warm handoff failed",
+                conversation_id=self._session.conversation_id,
+                error=str(exc)[:200],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +639,19 @@ async def build_voice_agent(
     # Voice-path filler: speak the ack line through the agent's TTS while a
     # slow tool call is in flight (cancelled when the tool answers fast).
     fnc_ctx.set_speaker(lambda text: agent.say(text, allow_interruptions=True))
+
+    # SPEC-W11 Part C emergency lane: inspect every committed user turn; the
+    # hook latches session.emergency, counts the session, triggers the warm
+    # handoff and injects the location-first addendum on the first hit. A
+    # second listener (turn counting) is registered in entrypoint — the
+    # emitter supports multiple handlers per event.
+    try:
+        agent.on(
+            "user_speech_committed",
+            EmergencyTurnHook(tool_layer=tool_layer, session=session, agent=agent),
+        )
+    except Exception as exc:  # noqa: BLE001 - detection off, call unaffected
+        log.warning("emergency hook registration failed", error=str(exc)[:200])
     return agent, ctx, session
 
 
@@ -579,9 +716,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     metrics.get_registry().active_sessions.inc()
 
     agent.start(ctx.room)
-    # Greet the caller so the conversation opens naturally.
+    # Greet the caller so the conversation opens naturally. SPEC-W11 Part C
+    # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
+    # recording-consent lines when the tenant context carries a `disclosure`
+    # block; absent the block the greeting is byte-identical to before.
     await agent.say(
-        f"Hello, thank you for calling {tenant_ctx.display_name}. How can I help you today?",
+        build_greeting(tenant_ctx),
         allow_interruptions=True,
     )
 
