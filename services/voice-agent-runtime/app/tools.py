@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 from . import metrics, ui_actions
 from .config import Settings
@@ -127,6 +127,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "reason": {"type": "string"},
                 },
                 "required": ["booking_id", "phone"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_location",
+            "description": (
+                "Save the caller's location to their contact record "
+                "(emergency / location-first flow). Resolve the address the "
+                "caller gave into address_text; pass lat and lng only when "
+                "the caller explicitly provided coordinates."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "address_text": {
+                        "type": "string",
+                        "description": "Spoken address / landmark, e.g. '12 Allen Avenue, Ikeja, Lagos'",
+                    },
+                    "lat": {"type": "number", "description": "Latitude (only with lng)"},
+                    "lng": {"type": "number", "description": "Longitude (only with lat)"},
+                },
+                "required": [],
             },
         },
     },
@@ -500,7 +524,114 @@ class ToolLayer:
             "message": "Cancellation request accepted and queued.",
             "command_id": event_id,
             "booking_id": booking_id,
+            "starts_at": starts_at,
         }
+
+    # -------------------------------------------- location capture (W11 C)
+    async def capture_location(
+        self,
+        address_text: str | None = None,
+        lat: Optional[float] = None,
+        lng: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Save the caller's location on their contact record (SPEC-W11 C §4).
+
+        Contact resolution follows the SIP caller-ID pattern: the session's
+        confirmed phone (carrier-asserted for PSTN calls, app/sip.py) selects
+        the contact via booking-service ``GET /internal/contacts?phone=``;
+        the location is then upserted through the Wave-8 contract
+        ``PUT /v1/contacts/{id}/location`` with ``{lat, lng}`` when
+        coordinates were given, else ``{address: address_text}`` (server-side
+        geocoding per GEOCODE_ENABLED).
+
+        NEVER raises: every failure resolves to an error payload the model
+        can speak (the emergency flow must not break the call).
+        """
+        address_text = (address_text or "").strip()
+        try:
+            if lat is not None and lng is not None:
+                payload: dict[str, Any] = {
+                    "lat": float(lat),
+                    "lng": float(lng),
+                    "source": "manual",
+                }
+            elif address_text:
+                payload = {"address": address_text}
+            else:
+                return {
+                    "status": "error",
+                    "message": (
+                        "capture_location needs an address (address_text) or "
+                        "both lat and lng."
+                    ),
+                }
+
+            phone = (self._session.confirmed_phone or "").strip()
+            if not phone:
+                return {
+                    "status": "error",
+                    "message": (
+                        "No caller phone number is confirmed for this "
+                        "session, so the location cannot be attached to a "
+                        "contact. Ask the caller for their number first."
+                    ),
+                }
+
+            headers = {"X-Tenant-Slug": self._ctx.tenant_slug}
+            contact = await self._dapr.invoke_get(
+                self._settings.booking_app_id,
+                "internal/contacts",
+                params={"phone": phone},
+                headers=headers,
+            )
+            contact_id = str((contact or {}).get("id") or "").strip()
+            if not contact_id:
+                await self._emit_tool_event(
+                    "capture_location", "no_contact", {"phone": phone}
+                )
+                return {
+                    "status": "error",
+                    "message": (
+                        "No contact record exists for the caller's number, "
+                        "so the location could not be saved."
+                    ),
+                }
+
+            await self._dapr.invoke_put(
+                self._settings.booking_app_id,
+                f"v1/contacts/{contact_id}/location",
+                payload=payload,
+                headers=headers,
+            )
+            await self._emit_tool_event(
+                "capture_location", "ok", {"contact_id": contact_id}
+            )
+            log.info(
+                "caller location captured",
+                conversation_id=self._session.conversation_id,
+                contact_id=contact_id,
+                kind="latlng" if "lat" in payload else "address",
+            )
+            return {
+                "status": "ok",
+                "contact_id": contact_id,
+                "message": (
+                    "I've saved that location. Stay on the line — help is "
+                    "being notified."
+                ),
+            }
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("capture_location failed", error=str(exc)[:200])
+            await self._emit_tool_event(
+                "capture_location", "error", {"error": str(exc)[:200]}
+            )
+            return {
+                "status": "error",
+                "message": (
+                    "The location could not be saved just now; keep the "
+                    "caller on the line and note the address verbally."
+                ),
+            }
 
     # ------------------------------------------------------- warm handoff
     async def request_human(self, reason: str | None = None) -> dict[str, Any]:
@@ -658,6 +789,11 @@ class ToolLayer:
                 booking_id=str(arguments.get("booking_id", "")),
                 phone=str(arguments.get("phone", "")),
                 reason=arguments.get("reason"),
+            ),
+            "capture_location": lambda: self.capture_location(
+                address_text=arguments.get("address_text"),
+                lat=arguments.get("lat"),
+                lng=arguments.get("lng"),
             ),
             "request_human": lambda: self.request_human(
                 reason=arguments.get("reason"),
