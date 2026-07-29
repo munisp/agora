@@ -11,6 +11,7 @@ import (
 
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/geo"
+	"github.com/opendesk/booking-service/internal/incidents"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
@@ -118,6 +119,55 @@ func (c *Client) StartGdprExport(ctx context.Context, in GdprRequest) (string, e
 // StartGdprErase starts GdprEraseWorkflow; returns the workflow ID.
 func (c *Client) StartGdprErase(ctx context.Context, in GdprRequest) (string, error) {
 	return c.startGdpr(ctx, GdprEraseWorkflowType, "erase", in)
+}
+
+// WebhookDeliveryWorkflowType is the Wave-5 outbound webhook delivery
+// workflow (hosted by notification-worker), reused for incident dispatch
+// with payload type "incident" (SPEC-W11 Part B §4).
+const WebhookDeliveryWorkflowType = "WebhookDeliveryWorkflow"
+
+// StartIncidentDelivery starts one WebhookDeliveryWorkflow for an incident
+// dispatch delivery with workflow ID "incident-delivery-{deliveryID}" so
+// duplicate starts (re-dispatch of the same incident×endpoint) are
+// idempotent. Implements incidents.Starter.
+func (c *Client) StartIncidentDelivery(ctx context.Context, in incidents.DeliveryStart) (string, error) {
+	id := "incident-delivery-" + in.DeliveryID
+	opts := client.StartWorkflowOptions{
+		ID:                    id,
+		TaskQueue:             c.taskQueue,
+		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+	}
+	_, err := c.tc.ExecuteWorkflow(ctx, opts, WebhookDeliveryWorkflowType, in)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) {
+			return id, nil
+		}
+		return "", fmt.Errorf("execute %s: %w", WebhookDeliveryWorkflowType, err)
+	}
+	return id, nil
+}
+
+// StartIncidentAlert starts IncidentAlertWorkflow (hosted by
+// booking-service's own worker) with workflow ID
+// "incident-alert-{incidentID}" so a re-ingested incident does not
+// double-alert. Implements incidents.Starter.
+func (c *Client) StartIncidentAlert(ctx context.Context, in incidents.AlertStart) (string, error) {
+	id := "incident-alert-" + in.IncidentID
+	opts := client.StartWorkflowOptions{
+		ID:                    id,
+		TaskQueue:             c.taskQueue,
+		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+	}
+	_, err := c.tc.ExecuteWorkflow(ctx, opts, incidents.WorkflowTypeAlert, in)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) {
+			return id, nil
+		}
+		return "", fmt.Errorf("execute %s: %w", incidents.WorkflowTypeAlert, err)
+	}
+	return id, nil
 }
 
 func (c *Client) startGdpr(ctx context.Context, wfType, kind string, in GdprRequest) (string, error) {

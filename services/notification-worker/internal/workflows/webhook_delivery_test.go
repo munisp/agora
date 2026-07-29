@@ -101,6 +101,51 @@ func TestWebhookDeliverySuccessAfterFailures(t *testing.T) {
 	require.Equal(t, 200, updates[2].StatusCode)
 }
 
+// Payload type "incident" (SPEC-W11 Part B §4): the retry schedule is
+// reused unchanged and the payload type propagates to every persistence
+// update so the activity routes them to booking-service's incident ledger.
+func TestWebhookDeliveryIncidentPayloadTypePropagates(t *testing.T) {
+	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
+
+	in := WebhookDeliveryInput{
+		DeliveryID:  "d-inc-1",
+		URL:         "https://psap.example/hook",
+		Secret:      "s3",
+		PayloadType: PayloadTypeIncident,
+		IncidentID:  "11111111-1111-1111-1111-111111111111",
+		Body:        []byte(`{"incident_id":"11111111-1111-1111-1111-111111111111"}`),
+	}
+
+	attempt := 0
+	env.RegisterActivityWithOptions(func(ctx context.Context, in WebhookDeliveryInput) (int, error) {
+		attempt++
+		if attempt == 1 {
+			return 500, nil
+		}
+		return 200, nil
+	}, activity.RegisterOptions{Name: ActivityDeliverWebhookHTTP})
+	env.RegisterActivityWithOptions(func(ctx context.Context, upd WebhookDeliveryUpdate) error {
+		return nil
+	}, activity.RegisterOptions{Name: ActivityUpdateWebhookDelivery})
+
+	var updates []WebhookDeliveryUpdate
+	env.OnActivity(ActivityUpdateWebhookDelivery, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			updates = append(updates, args.Get(1).(WebhookDeliveryUpdate))
+		}).Return(nil)
+
+	env.ExecuteWorkflow(WebhookDeliveryWorkflow, in)
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	require.Len(t, updates, 2) // retrying, delivered
+	require.Equal(t, "retrying", updates[0].Status)
+	require.Equal(t, "delivered", updates[1].Status)
+	for i, upd := range updates {
+		require.Equal(t, PayloadTypeIncident, upd.PayloadType, "update %d must carry the incident payload type", i)
+	}
+}
+
 func TestWebhookDeliveryTransportErrorCountsAsFailure(t *testing.T) {
 	env := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 
