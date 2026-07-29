@@ -19,6 +19,7 @@ import (
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/geo"
 	"github.com/opendesk/booking-service/internal/httpapi"
+	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/store"
@@ -66,6 +67,7 @@ func run() error {
 	var saga bookingops.SagaStarter
 	var gdpr httpapi.GdprStarter
 	var geoStarter geo.CampaignStarter
+	var incidentStarter incidents.Starter
 	tc, err := temporalclient.Dial(cfg.TemporalHostPort, cfg.TemporalNamespace, cfg.TemporalTaskQueue)
 	if err != nil {
 		logger.Warn("temporal unavailable at boot; saga starts will fail until redeploy",
@@ -75,6 +77,7 @@ func run() error {
 		saga = tc
 		gdpr = tc
 		geoStarter = tc
+		incidentStarter = tc
 
 		// SPEC-W8 A2: booking-service hosts the GeoCampaignWorkflow and its
 		// DB activities on the shared opendesk-main task queue. Recipient
@@ -89,6 +92,10 @@ func run() error {
 		w.RegisterActivityWithOptions(geoActs.RecordSends, activity.RegisterOptions{Name: geo.ActivityGeoRecordSends})
 		w.RegisterActivityWithOptions(geoActs.CompleteCampaign, activity.RegisterOptions{Name: geo.ActivityGeoCompleteCampaign})
 		w.RegisterActivityWithOptions(geoActs.FailCampaign, activity.RegisterOptions{Name: geo.ActivityGeoFailCampaign})
+		// SPEC-W11 Part B §5: incident outreach workflow — delegates the send
+		// to the notification-worker paced fast-lane via NotifyPaced (kind
+		// incident_alert, priority=true).
+		w.RegisterWorkflowWithOptions(incidents.IncidentAlertWorkflow, workflow.RegisterOptions{Name: incidents.WorkflowTypeAlert})
 		if err := w.Start(); err != nil {
 			logger.Error("geo campaign worker failed to start", zap.Error(err))
 		} else {
@@ -123,6 +130,17 @@ func run() error {
 		Cache:       availCache,
 	}
 
+	// Incidents service (SPEC-W11 Part B): ingest (Kafka consumer + webhook
+	// ingest endpoint), signed dispatch via the Wave-5 delivery workflow and
+	// critical/high auto-outreach via the paced priority lane.
+	incidentSvc := &incidents.Service{
+		Store:        st,
+		Starter:      incidentStarter,
+		AutoDispatch: cfg.IncidentAutoDispatch,
+		UsageTopic:   cfg.UsageEventsTopic,
+		Log:          logger,
+	}
+
 	// Outbox dispatcher goroutine: outbox → Dapr pubsub `pubsub-kafka` →
 	// topic opendesk.booking.events.
 	dispatcher := outbox.New(st, daprClient, cfg.PubSubName, cfg.OutboxPollInterval, logger)
@@ -148,6 +166,16 @@ func run() error {
 			}
 		}()
 		defer privacyConsumer.Close() //nolint:errcheck
+
+		// SPEC-W11 Part B §2: IDP consumer (group booking-incidents) on
+		// opendesk.incidents → idempotent persist + auto-dispatch/outreach.
+		incidentsConsumer := incidents.NewConsumer(cfg.KafkaBrokers, cfg.IncidentsTopic, cfg.IncidentsGroup, cfg.DLQTopic, incidentSvc, logger)
+		go func() {
+			if err := incidentsConsumer.Run(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("incidents consumer exited", zap.Error(err))
+			}
+		}()
+		defer incidentsConsumer.Close() //nolint:errcheck
 	}
 
 	deps := httpapi.Deps{
@@ -167,6 +195,7 @@ func run() error {
 		PubSubName:         cfg.PubSubName,
 		NotificationsTopic: cfg.NotificationsTopic,
 		Geo:                geoHandlers,
+		Incidents:          incidentSvc,
 	}
 
 	srv := &http.Server{

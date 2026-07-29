@@ -145,3 +145,7 @@ dashboardLabels:
   bookingPlural: Appointments
   customerTerm: Caller
 languages: [en]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated police non-emergency assistant. This call may be recorded."
