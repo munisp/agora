@@ -88,15 +88,22 @@ func newTestStore(t *testing.T) *Store {
 	if testing.Short() {
 		t.Skip("skipping embedded-postgres store test in -short mode")
 	}
+	// Dedicated port + data dir: httpapi's portal fixture and the incidents
+	// service tests each run their own embedded Postgres in parallel
+	// packages; DefaultConfig shares ONE port (5432) and ONE data dir, which
+	// races (postmaster.pid lock) under `go test ./...`.
 	ep := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Username("postgres").Password("postgres").Database("booking_test"))
+		Username("postgres").Password("postgres").Database("booking_test").
+		Port(5433).
+		DataPath(t.TempDir()).
+		RuntimePath(t.TempDir()))
 	if err := ep.Start(); err != nil {
 		t.Skipf("embedded postgres unavailable: %v", err)
 	}
 	t.Cleanup(func() { _ = ep.Stop() })
 
 	ctx := context.Background()
-	st, err := New(ctx, "postgres://postgres:postgres@localhost:5432/booking_test?sslmode=disable", 0)
+	st, err := New(ctx, "postgres://postgres:postgres@localhost:5433/booking_test?sslmode=disable", 0)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}

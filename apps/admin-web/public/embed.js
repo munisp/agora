@@ -10,6 +10,14 @@
  *   data-width    iframe width,  default "100%"
  *   data-target   CSS selector of the element to mount into; default: the
  *                 script tag is replaced in place.
+ *   data-location-consent  "true" enables one-shot GPS capture (SPEC-W11
+ *                 Part D): after the iframe loads, the host page requests
+ *                 navigator.geolocation ONCE and forwards the fix to the
+ *                 widget via postMessage ("opendesk:location"); the widget
+ *                 then includes it as client_location {lat,lng,accuracy}
+ *                 in every /voice/chat request it originates. Denial,
+ *                 timeout or missing geolocation support are silent — chat
+ *                 is never blocked and no location is sent without consent.
  *
  * The loader is dependency-free and lazy: it only creates the iframe once
  * the host page has finished parsing.
@@ -143,6 +151,55 @@
   }
 
   // ---------------------------------------------------------------------
+  // Widget GPS capture (SPEC-W11 Part D)
+  // ---------------------------------------------------------------------
+  /**
+   * When the embed script carries data-location-consent="true", request the
+   * host page's geolocation ONCE after the iframe loads and forward the fix
+   * into the widget via the opendesk:* postMessage protocol. The widget's
+   * fetch bridge merges it as client_location {lat,lng,accuracy} into each
+   * /voice/chat payload (additive key; the server tolerates unknown keys).
+   * Graceful by contract: denial, timeout or a browser without geolocation
+   * never blocks chat and never sends anything.
+   */
+  var GEO_TIMEOUT_MS = 10000;
+  var GEO_MAX_AGE_MS = 300000;
+
+  function captureLocationOnce(widgetOrigin, iframe) {
+    if (!("geolocation" in navigator) || !iframe.contentWindow) return;
+    var send = function (pos) {
+      try {
+        var loc = {
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+        };
+        if (
+          typeof loc.lat !== "number" ||
+          typeof loc.lng !== "number" ||
+          !isFinite(loc.lat) ||
+          !isFinite(loc.lng)
+        ) {
+          return;
+        }
+        iframe.contentWindow.postMessage(
+          { type: "opendesk:location", location: loc },
+          widgetOrigin
+        );
+      } catch (e) {
+        /* best-effort — never break the host page */
+      }
+    };
+    try {
+      navigator.geolocation.getCurrentPosition(send, function () {
+        /* denied/unavailable — chat proceeds without location */
+      }, { timeout: GEO_TIMEOUT_MS, maximumAge: GEO_MAX_AGE_MS });
+    } catch (e) {
+      /* geolocation threw synchronously (e.g. permissions policy) — ignore */
+    }
+  }
+
+  // ---------------------------------------------------------------------
   // Iframe loader (unchanged behaviour)
   // ---------------------------------------------------------------------
   function mount(script) {
@@ -164,6 +221,14 @@
     iframe.setAttribute("allow", "microphone");
 
     installActionListener(origin, iframe);
+
+    // SPEC-W11 Part D: opt-in GPS capture — one-shot, after iframe load.
+    if (script.getAttribute("data-location-consent") === "true") {
+      iframe.addEventListener("load", function onLoad() {
+        iframe.removeEventListener("load", onLoad);
+        captureLocationOnce(origin, iframe);
+      });
+    }
 
     var targetSel = script.getAttribute("data-target");
     var target = targetSel ? document.querySelector(targetSel) : null;
