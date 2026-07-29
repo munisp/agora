@@ -27,6 +27,10 @@ type Server struct {
 	TelegramBotUsername   string  // TELEGRAM_BOT_USERNAME (site-map route key)
 	TelegramWebhookSecret string  // TELEGRAM_WEBHOOK_SECRET (optional shared secret)
 
+	// IoT incident ingest (SPEC-W11 Part B §6).
+	IncidentSecrets map[string]string // INCIDENT_WEBHOOK_SECRETS parsed (tenant slug|id → secret)
+	IncidentIngest  IncidentIngester  // nil: forward disabled, posts drop + 200
+
 	Metrics *metrics.Registry
 	Log     *zap.Logger
 }
@@ -61,6 +65,10 @@ func (s *Server) Router() http.Handler {
 		r.Get("/whatsapp", s.handleWhatsAppVerify)
 		r.Post("/whatsapp", s.handleWhatsAppWebhook)
 		r.Post("/telegram", s.handleTelegramWebhook)
+		// IoT incident trigger (SPEC-W11 Part B §6): public via the same
+		// APISIX /webhooks/* route, authenticated by the per-tenant shared
+		// secret in the body.
+		r.Post("/incidents", s.handleIncidentWebhook)
 	})
 	// Future: POST /v1/ussd/session (Termii / AT USSD gateways) — see
 	// docs/integrations/messaging-channels.md.

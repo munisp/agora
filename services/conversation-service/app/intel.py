@@ -53,6 +53,16 @@ _WORD_RE = re.compile(r"[a-z']+")
 _NEGATION_WINDOW = 3
 
 
+def normalize_text(text: str) -> str:
+    """Lowercased, punctuation-stripped, single-spaced token string.
+
+    Shared phrase-matching normalization: app/incidents.py (SPEC-W11
+    emergency classifier) matches multi-word EN/PCM lexicon phrases against
+    this form. Sentiment tokenization above is unchanged.
+    """
+    return " ".join(_WORD_RE.findall(text.lower()))
+
+
 def analyze_sentiment(text: str) -> dict[str, Any]:
     """Lexicon sentiment with negation handling.
 

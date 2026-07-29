@@ -41,26 +41,53 @@ const (
 	// geo-targeted campaign sends, scheduled by booking-service's
 	// GeoCampaignWorkflow on this task queue).
 	PacedSendGeoCampaign = "geo_campaign"
+	// PacedSendIncidentAlert routes to SendIncidentAlert (SPEC-W11 Part B
+	// §5: critical/high-severity incident outreach, scheduled by
+	// booking-service's IncidentAlertWorkflow). Always sent with
+	// Priority=true — the pacer fast-lane bypasses the CPS token bucket
+	// (still metered).
+	PacedSendIncidentAlert = "incident_alert"
 
 	// ActivitySendGeoCampaignMessage is the name of the geo campaign send
 	// activity.
 	ActivitySendGeoCampaignMessage = "SendGeoCampaignMessage"
+
+	// ActivitySendIncidentAlert is the name of the incident alert send
+	// activity (SPEC-W11 Part B §5).
+	ActivitySendIncidentAlert = "SendIncidentAlert"
 )
 
 // PacedSendRequest is the payload of the NotifyPaced activity: which send
 // to perform after the CPS token is granted, plus its arguments.
 type PacedSendRequest struct {
-	Kind         string                     `json:"kind"` // PacedSend* constant
-	Waitlist     *PacedWaitlistSend         `json:"waitlist,omitempty"`
-	Reminder     *PacedReminderSend         `json:"reminder,omitempty"`
-	Deposit      *PacedDepositReminderSend  `json:"deposit,omitempty"`
-	NoShow       *PacedNoShowSend           `json:"noshow,omitempty"`
-	Confirmation *PacedConfirmationSend     `json:"confirmation,omitempty"`
-	Intake       *PacedIntakeReminderSend   `json:"intake,omitempty"`
-	FollowUp     *PacedFollowupSend         `json:"follow_up,omitempty"`
-	Proposal     *PacedProposalReminderSend `json:"proposal,omitempty"`
-	StaffAlert   *PacedStaffAlertSend       `json:"staff_alert,omitempty"`
-	GeoCampaign  *PacedGeoCampaignSend      `json:"geo_campaign,omitempty"`
+	Kind string `json:"kind"` // PacedSend* constant
+	// Priority engages the pacer fast-lane (SPEC-W11 Part B §5): the send
+	// dispatches IMMEDIATELY, bypassing the CPS token bucket — but is still
+	// metered/counted. Reserved for emergency-grade traffic (incident_alert).
+	Priority      bool                       `json:"priority,omitempty"`
+	Waitlist      *PacedWaitlistSend         `json:"waitlist,omitempty"`
+	Reminder      *PacedReminderSend         `json:"reminder,omitempty"`
+	Deposit       *PacedDepositReminderSend  `json:"deposit,omitempty"`
+	NoShow        *PacedNoShowSend           `json:"noshow,omitempty"`
+	Confirmation  *PacedConfirmationSend     `json:"confirmation,omitempty"`
+	Intake        *PacedIntakeReminderSend   `json:"intake,omitempty"`
+	FollowUp      *PacedFollowupSend         `json:"follow_up,omitempty"`
+	Proposal      *PacedProposalReminderSend `json:"proposal,omitempty"`
+	StaffAlert    *PacedStaffAlertSend       `json:"staff_alert,omitempty"`
+	GeoCampaign   *PacedGeoCampaignSend      `json:"geo_campaign,omitempty"`
+	IncidentAlert *PacedIncidentAlertSend    `json:"incident_alert,omitempty"`
+}
+
+// PacedIncidentAlertSend carries the SendIncidentAlert arguments
+// (SPEC-W11 Part B §5). The JSON contract is duplicated by booking-service's
+// internal/incidents package (service boundary: duplicated, not shared) —
+// keep the field tags in sync.
+type PacedIncidentAlertSend struct {
+	TenantSlug string `json:"tenant_slug"`
+	IncidentID string `json:"incident_id"`
+	Channel    string `json:"channel"` // whatsapp | telegram | sms
+	Phone      string `json:"phone"`
+	Text       string `json:"text"` // template rendered by booking-service (ref + type + address)
 }
 
 // PacedGeoCampaignSend carries the SendGeoCampaignMessage arguments

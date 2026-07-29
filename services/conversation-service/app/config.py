@@ -64,6 +64,14 @@ class Config:
     retention_sweep_seconds: int = 3600
     retention_batch_size: int = 1000
 
+    # Emergency-intent IDP emission (SPEC-W11 Part A): user turns scoring >=
+    # incident_min_score emit an Incident Data Packet as CloudEvent
+    # com.opendesk.incidents.IDPCreated to the incidents topic (non-blocking,
+    # failures logged never raised).
+    incident_enabled: bool = True
+    incident_min_score: float = 0.6
+    incidents_topic: str = "opendesk.incidents"
+
     # OpenSearch indexer (SPEC §10, index `conversations`).
     opensearch_addr: str = "http://opensearch:9200"
     conversations_index: str = "conversations"
@@ -120,4 +128,7 @@ def load() -> Config:
         retention_days=int(_env("RETENTION_DAYS", "365")),
         retention_sweep_seconds=int(_env("RETENTION_SWEEP_SECONDS", "3600")),
         retention_batch_size=int(_env("RETENTION_BATCH_SIZE", "1000")),
+        incident_enabled=_env("INCIDENT_ENABLED", "true").lower() == "true",
+        incident_min_score=float(_env("INCIDENT_MIN_SCORE", "0.6")),
+        incidents_topic=_env("INCIDENTS_TOPIC", "opendesk.incidents"),
     )
