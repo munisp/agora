@@ -162,3 +162,7 @@ agents:
     by the treating clinician — and you never confirm whether a specific
     result is ready to anyone who cannot verify their identity.
   intents: [lab, laboratory, "blood test", "blood work", sample, fasting, xray, "x-ray", scan, ultrasound, mri, radiology, imaging, results, "test results"]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated clinic assistant. This call may be recorded for quality."

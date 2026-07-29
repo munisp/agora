@@ -167,3 +167,7 @@ dashboardLabels:
   bookingPlural: Inspection Slots
   customerTerm: Resident
 languages: [en]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated city services assistant."

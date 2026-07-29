@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Annotated, Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
-from . import events, intel, models
+from . import events, incidents, intel, models
 from .db import NotFoundError
 
 router = APIRouter()
@@ -143,11 +144,16 @@ async def add_turn(
         response.status_code = status.HTTP_200_OK
         return models.TurnCreated(turn=turn)
 
-    # Fetch site_slug for the event subject.
+    # Fetch site_slug for the event subject (plus channel/contact for the
+    # SPEC-W11 incident IDP context).
     site_slug = ""
+    conv_channel = "voice"
+    contact_phone = None
     try:
         conv = await st.db.get_conversation(conversation_id, tenant_id)
         site_slug = conv["site_slug"]
+        conv_channel = conv["channel"]
+        contact_phone = conv["contact_phone"]
     except Exception:
         pass
 
@@ -201,5 +207,38 @@ async def add_turn(
     except Exception as exc:
         st.log.error("enriched turn publish failed", error=str(exc),
                      conversation_id=str(conversation_id))
+
+    # 4) SPEC-W11 Part A: emergency-intent detection on USER turns. The
+    #    lexicon classify is cheap and inline; only when the score crosses
+    #    INCIDENT_MIN_SCORE do we schedule IDP build+emit as a background
+    #    asyncio task (non-blocking; emit_for_turn logs and never raises).
+    #    Idempotency-Key replays return above (created=False), so this runs
+    #    exactly once per persisted turn; emission itself also dedupes per
+    #    conversation_id+turn_id.
+    if st.cfg.incident_enabled and turn.role == "user":
+        hit, _ = incidents.is_emergency(turn.text, st.cfg.incident_min_score)
+        if hit:
+            tasks = getattr(st, "background_tasks", None)
+            if tasks is None:
+                tasks = set()
+                st.background_tasks = tasks
+            task = asyncio.create_task(
+                incidents.emit_for_turn(
+                    cfg=st.cfg,
+                    db=st.db,
+                    dapr=st.dapr,
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    turn_id=turn.id,
+                    text=turn.text,
+                    channel=conv_channel,
+                    site_slug=site_slug,
+                    contact_phone=contact_phone,
+                    captured_at=turn.ts,
+                ),
+                name=f"incident-idp-{turn.id}",
+            )
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
 
     return models.TurnCreated(turn=turn)

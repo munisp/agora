@@ -57,6 +57,61 @@ CALLER CONTEXT
 """
 
 
+# SPEC-W11 Part C: location-first addendum, injected as an extra system
+# message the moment the live-turn emergency detector (app/emergency.py)
+# latches. Emergency packs get location-first + reassurance behavior: the
+# agent confirms the EXACT location before anything else, then reassures.
+EMERGENCY_LOCATION_FIRST_ADDENDUM = """
+EMERGENCY MODE ACTIVE (the caller's last message matched the emergency
+lexicon; a human operator has already been notified via warm handoff)
+- LOCATION FIRST: before ANY other question, confirm the caller's exact
+  location (street address, nearest landmark or junction, area/town). Ask
+  one short question at a time and read the location back to confirm it.
+- As soon as the location is clear, call the capture_location tool with it
+  (spoken address in address_text; lat/lng only if the caller gives them).
+- Reassure: stay calm, tell the caller help is being notified, keep them on
+  the line, and do not end the call.
+- Skip all booking/confirmation policies — do NOT ask for phone-number
+  read-back; the emergency flow bypasses them.
+""".strip()
+
+# SPEC-W11 Part C §5: spoken AI disclosure defaults (used when the pack's
+# `disclosure` block does not override `text` / only flags are set).
+AI_DISCLOSURE_LINE = "You're speaking with an automated assistant."
+RECORDING_NOTICE_LINE = "This call may be recorded for quality and safety."
+
+
+def build_greeting(ctx: TenantContext) -> str:
+    """Session-opening greeting, with the SPEC-W11 Part C §5 disclosure.
+
+    Default (no pack ``disclosure`` block on the tenant context) is
+    byte-identical to the pre-W11 greeting. When the pack declares
+    ``disclosure: {spokenAiDisclosure, recordingConsent, text?}`` (Part D
+    contract, read defensively — the field may be absent entirely):
+
+    - ``spokenAiDisclosure`` prepends the AI disclosure line ("You're
+      speaking with an automated assistant." — followed by the optional
+      pack ``text``) to the greeting;
+    - ``recordingConsent`` appends the recording notice.
+    """
+    greeting = (
+        f"Hello, thank you for calling {ctx.display_name}. "
+        "How can I help you today?"
+    )
+    disclosure = getattr(ctx, "disclosure", None)
+    if not isinstance(disclosure, dict):
+        return greeting
+    if disclosure.get("spokenAiDisclosure"):
+        line = AI_DISCLOSURE_LINE
+        extra = str(disclosure.get("text") or "").strip()
+        if extra:
+            line = f"{line} {extra}"
+        greeting = f"{line} {greeting}"
+    if disclosure.get("recordingConsent"):
+        greeting = f"{greeting} {RECORDING_NOTICE_LINE}"
+    return greeting
+
+
 def build_system_prompt(
     ctx: TenantContext,
     *,
@@ -64,13 +119,19 @@ def build_system_prompt(
     agent_name: str = "the front-desk assistant",
     active_agent: dict[str, Any] | None = None,
     extra_tool_names: list[str] | None = None,
+    language: str | None = None,
+    caller_phone: str | None = None,
 ) -> str:
     """Render the system prompt.
 
     SPEC-W3 §4 innovation 6: when ``active_agent`` (a pack ``agents`` entry)
     is set, the specialist's name/persona steer this turn; otherwise the base
     persona applies (fallback). ``extra_tool_names`` lists pack plugin tools
-    registered alongside the built-ins.
+    registered alongside the built-ins. Wave 5 #3: ``language`` (whisper
+    auto-detected, normalized ISO code) appends a per-turn locale instruction
+    when the caller speaks a language other than the tenant default. Wave 5
+    #1: ``caller_phone`` (SIP carrier-asserted caller ID, already confirmed)
+    tells the model to skip the read-back confirmation for that number.
     """
     terminology = (
         json.dumps(ctx.terminology, ensure_ascii=False, indent=2)
@@ -103,6 +164,23 @@ def build_system_prompt(
     # provides one (guarded — absent for tenants without a resolved pack).
     if ctx.agent_persona:
         prompt += f"\nINDUSTRY PERSONA (follow this guidance on tone, policies and domain knowledge)\n{ctx.agent_persona}\n"
+    # Wave 5 #3: per-turn locale instruction when the caller speaks a
+    # non-default language (whisper detection -> MultilangState).
+    if language:
+        from .multilang import default_language_from_locale, locale_instruction
+
+        if language != default_language_from_locale(ctx.locale):
+            prompt += locale_instruction(language)
+    # Wave 5 #1: SIP caller ID is carrier-asserted and server-confirmed at
+    # session bootstrap (app/sip.py policy); the read-back step would only
+    # add friction, so the prompt records the number as already confirmed.
+    if caller_phone:
+        prompt += (
+            f"\nCALLER ID (SIP, carrier-verified)\n- The caller is phoning "
+            f"from {caller_phone}; this number is ALREADY CONFIRMED — use it "
+            "directly for booking, lookup, reschedule and cancel tools and "
+            "do NOT ask the caller to read it back or confirm it.\n"
+        )
     if active_agent is not None:
         persona = str(active_agent.get("persona") or "").strip()
         if persona:
