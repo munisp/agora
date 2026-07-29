@@ -524,7 +524,6 @@ class ToolLayer:
             "message": "Cancellation request accepted and queued.",
             "command_id": event_id,
             "booking_id": booking_id,
-            "starts_at": starts_at,
         }
 
     # -------------------------------------------- location capture (W11 C)
