@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opendesk.dev/schemas/incident-data-packet.json",
+  "title": "Incident Data Packet (IDP)",
+  "description": "Canonical emergency-incident payload (SPEC-W11). Emitted by conversation-service on emergency-intent turns (CloudEvent com.opendesk.incidents.IDPCreated, Kafka topic opendesk.incidents); persisted/served/dispatched by booking-service.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "incident_id",
+    "schema_version",
+    "tenant_id",
+    "captured_at",
+    "channel",
+    "incident_type",
+    "severity",
+    "narrative_summary",
+    "reference_number"
+  ],
+  "properties": {
+    "incident_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Deterministic per (conversation_id, turn_id) so retries dedupe; also the CloudEvent id."
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp of the originating user turn."
+    },
+    "channel": {
+      "type": "string",
+      "enum": ["voice", "whatsapp", "telegram", "web", "sms", "webhook"]
+    },
+    "location": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["lat", "lng", "accuracy_m", "source", "address_text"],
+      "properties": {
+        "lat": {"type": "number", "minimum": -90, "maximum": 90},
+        "lng": {"type": "number", "minimum": -180, "maximum": 180},
+        "accuracy_m": {"type": "number", "minimum": 0},
+        "source": {"type": "string", "enum": ["gps", "address", "caller_id", "manual"]},
+        "address_text": {"type": "string"}
+      }
+    },
+    "callback_number": {
+      "type": ["string", "null"],
+      "description": "E.164 where known (from the conversation's contact_phone); null for anonymous sessions."
+    },
+    "incident_type": {
+      "type": "string",
+      "enum": ["crime", "medical", "fire", "crash", "utility_fault", "security", "other"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low"]
+    },
+    "people_involved": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "hazards": {
+      "type": "array",
+      "items": {"type": "string", "enum": ["weapons", "injuries", "fire", "gas", "traffic"]},
+      "uniqueItems": true,
+      "default": []
+    },
+    "narrative_summary": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "reference_number": {
+      "type": "string",
+      "pattern": "^INC-[0-9]{4}-[0-9]{6}$",
+      "description": "Tenant-facing reference, per-tenant per-year sequence (e.g. INC-2026-000123)."
+    },
+    "contact_id": {
+      "type": ["string", "null"],
+      "format": "uuid"
+    },
+    "conversation_id": {
+      "type": ["string", "null"],
+      "format": "uuid"
+    }
+  }
+}

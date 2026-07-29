@@ -1,0 +1,44 @@
+# STT WER corpus manifest (SPEC-W11 Part E).
+#
+# samples: list of {id, lang, transcript, audio, hypothesis?}
+#   id          unique sample id
+#   lang        BCP-47-ish code used for per-language gating (en, pcm, ...)
+#   transcript  reference transcript (ground truth, normalized spelling)
+#   audio       path to the utterance wav, relative to this directory.
+#               AUDIO IS NOT COMMITTED — see README.md for sourcing and
+#               the capture specs. The path documents what the file must be.
+#   hypothesis  optional committed STT hypothesis. Only the tiny fixture
+#               samples below carry one (so the gate can self-test offline);
+#               real corpora get hypotheses from an STT run passed to
+#               quality_gates.py via --stt-results.
+#
+# The fixture samples below exist ONLY for gate self-test/CI (hand-made
+# reference/hypothesis pairs, no audio). Do not grow this file into a real
+# corpus here — add real samples to corpora.d/*.yaml instead (same shape).
+version: 1
+samples:
+  - id: fixture-en-01
+    lang: en
+    transcript: "good afternoon i would like to book an appointment for tomorrow"
+    audio: audio/fixture-en-01.wav
+    hypothesis: "good afternoon i would like to book an appointment for tomorrow"
+  - id: fixture-en-02
+    lang: en
+    transcript: "what time do you open on saturday"
+    audio: audio/fixture-en-02.wav
+    hypothesis: "what time do you open on a saturday"
+  - id: fixture-pcm-01
+    lang: pcm
+    transcript: "abeg i wan book appointment for tomorrow morning"
+    audio: audio/fixture-pcm-01.wav
+    hypothesis: "abeg i wan book appointment for tomorrow morning"
+  - id: fixture-pcm-02
+    lang: pcm
+    transcript: "how much be haircut for this salon"
+    audio: audio/fixture-pcm-02.wav
+    hypothesis: "how much be air cut for this salon"
+  - id: fixture-pcm-03
+    lang: pcm
+    transcript: "i don try to reach una since morning"
+    audio: audio/fixture-pcm-03.wav
+    hypothesis: "i don try to reach you since morning"

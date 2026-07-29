@@ -22,6 +22,7 @@ TOPICS=(
   opendesk.notifications.outbox    # SendReminder, SendConfirmation
   opendesk.privacy.events          # PrivacyEraseRequested tombstones (GDPR, SPEC-W3 §2)
   opendesk.usage.events            # UsageRecord metering events (Wave 5 #9: bookings, call-minutes, tokens)
+  opendesk.incidents               # IDPCreated Incident Data Packets (SPEC-W11: conversation-service emits, booking-service consumes)
   opendesk.dlq                     # dead letters
 )
 

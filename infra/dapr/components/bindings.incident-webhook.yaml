@@ -1,0 +1,27 @@
+# IoT incident webhook binding (SPEC-W11 Part B §7) — HTTP binding onto the
+# messaging-gateway service, which owns the per-tenant shared-secret check
+# (INCIDENT_WEBHOOK_SECRETS) and forwards validated payloads to
+# booking-service's internal POST /v1/incidents/ingest via Dapr service
+# invocation (IDP completion channel=webhook → persist → auto-dispatch +
+# critical/high outreach).
+#
+# Invoke with operation "post" and data
+# {"tenant_slug|tenant_id": "...", "secret": "...", "incident": {<partial IDP>}}.
+#
+# NOTE: like the WhatsApp/Telegram inbound webhooks (see
+# bindings.whatsapp.yaml), external IoT gateways reach the endpoint directly
+# through the APISIX `webhooks-messaging` route (/webhooks/* →
+# messaging-gateway:7011) — this binding exists so INTERNAL Dapr apps can
+# trigger the same ingest path service-to-service.
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: bindings-incident-webhook
+spec:
+  type: bindings.http
+  version: v1
+  metadata:
+    - name: url
+      value: "http://messaging-gateway:7011/webhooks/incidents"
+scopes:
+  - messaging-gateway
