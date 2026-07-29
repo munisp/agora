@@ -81,6 +81,16 @@ func run() error {
 	convBase, voiceBase := channel.ResolveBases(cfg.ConversationURL, cfg.VoiceRuntimeURL, cfg.DaprHTTPPort)
 	srv.Bridge = channel.NewBridge(siteMap, convBase, voiceBase, srv.WhatsApp, srv.Telegram, logger)
 
+	// IoT incident ingest (SPEC-W11 Part B §6): per-tenant shared secrets +
+	// the booking-service forwarder (BOOKING_URL override or Dapr invoke).
+	incidentSecrets, err := httpapi.ParseIncidentSecrets(cfg.IncidentWebhookSecrets)
+	if err != nil {
+		return err
+	}
+	srv.IncidentSecrets = incidentSecrets
+	srv.IncidentIngest = httpapi.NewIncidentIngester(httpapi.ResolveIncidentBase(cfg.BookingURL, cfg.DaprHTTPPort))
+	logger.Info("incident webhook configured", zap.Int("tenant_secrets", len(incidentSecrets)))
+
 	logger.Info("messaging-gateway configured",
 		zap.Bool("termii", srv.Termii.Configured()),
 		zap.Bool("africastalking", srv.AT.Configured()),

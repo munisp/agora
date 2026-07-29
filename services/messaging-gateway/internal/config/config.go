@@ -40,31 +40,37 @@ type Config struct {
 	ConversationURL string // CONVERSATION_URL override (tests, no-Dapr dev)
 	VoiceRuntimeURL string // VOICE_RUNTIME_URL override (tests, no-Dapr dev)
 	DaprHTTPPort    int    // DAPR_HTTP_PORT, default 3500
+
+	// IoT incident ingest (SPEC-W11 Part B §6): POST /webhooks/incidents.
+	IncidentWebhookSecrets string // INCIDENT_WEBHOOK_SECRETS raw JSON {"<tenant_slug|tenant_id>": "<secret>"}
+	BookingURL             string // BOOKING_URL override (tests, no-Dapr dev); empty = Dapr invoke booking
 }
 
 // Load reads configuration from the environment.
 func Load() Config {
 	return Config{
-		Port:                  envInt("PORT", 7011),
-		TermiiAPIKey:          os.Getenv("TERMII_API_KEY"),
-		TermiiSenderID:        envStr("TERMII_SENDER_ID", "OpenDesk"),
-		TermiiBaseURL:         envStr("TERMII_BASE_URL", "https://v2.api.termii.com"),
-		ATAPIKey:              os.Getenv("AT_API_KEY"),
-		ATUsername:            os.Getenv("AT_USERNAME"),
-		ATBaseURL:             envStr("AT_BASE_URL", "https://api.africastalking.com"),
-		ATFrom:                os.Getenv("AT_FROM"),
-		WhatsAppToken:         os.Getenv("WHATSAPP_TOKEN"),
-		WhatsAppPhoneNumberID: os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
-		WhatsAppBaseURL:       envStr("WHATSAPP_BASE_URL", "https://graph.facebook.com/v21.0"),
-		WhatsAppVerifyToken:   os.Getenv("WHATSAPP_VERIFY_TOKEN"),
-		TelegramBotToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramBotUsername:   os.Getenv("TELEGRAM_BOT_USERNAME"),
-		TelegramWebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
-		TelegramBaseURL:       envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
-		ChannelSiteMap:        os.Getenv("CHANNEL_SITE_MAP"),
-		ConversationURL:       os.Getenv("CONVERSATION_URL"),
-		VoiceRuntimeURL:       os.Getenv("VOICE_RUNTIME_URL"),
-		DaprHTTPPort:          envInt("DAPR_HTTP_PORT", 3500),
+		Port:                   envInt("PORT", 7011),
+		TermiiAPIKey:           os.Getenv("TERMII_API_KEY"),
+		TermiiSenderID:         envStr("TERMII_SENDER_ID", "OpenDesk"),
+		TermiiBaseURL:          envStr("TERMII_BASE_URL", "https://v2.api.termii.com"),
+		ATAPIKey:               os.Getenv("AT_API_KEY"),
+		ATUsername:             os.Getenv("AT_USERNAME"),
+		ATBaseURL:              envStr("AT_BASE_URL", "https://api.africastalking.com"),
+		ATFrom:                 os.Getenv("AT_FROM"),
+		WhatsAppToken:          os.Getenv("WHATSAPP_TOKEN"),
+		WhatsAppPhoneNumberID:  os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
+		WhatsAppBaseURL:        envStr("WHATSAPP_BASE_URL", "https://graph.facebook.com/v21.0"),
+		WhatsAppVerifyToken:    os.Getenv("WHATSAPP_VERIFY_TOKEN"),
+		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramBotUsername:    os.Getenv("TELEGRAM_BOT_USERNAME"),
+		TelegramWebhookSecret:  os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
+		TelegramBaseURL:        envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
+		ChannelSiteMap:         os.Getenv("CHANNEL_SITE_MAP"),
+		ConversationURL:        os.Getenv("CONVERSATION_URL"),
+		VoiceRuntimeURL:        os.Getenv("VOICE_RUNTIME_URL"),
+		DaprHTTPPort:           envInt("DAPR_HTTP_PORT", 3500),
+		IncidentWebhookSecrets: os.Getenv("INCIDENT_WEBHOOK_SECRETS"),
+		BookingURL:             os.Getenv("BOOKING_URL"),
 	}
 }
 

@@ -63,6 +63,26 @@ class DaprClient:
             return None
         return resp.json()
 
+    async def invoke_put(
+        self,
+        app_id: str,
+        method: str,
+        *,
+        payload: Any | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        """PUT /v1.0/invoke/{app_id}/method/{method} (SPEC-W11 Part C:
+        booking-service PUT /v1/contacts/{id}/location)."""
+        url = f"{self._base}/v1.0/invoke/{app_id}/method/{method.lstrip('/')}"
+        resp = await self._client.put(url, json=payload, headers=headers)
+        if resp.status_code >= 300:
+            raise DaprError(
+                f"invoke PUT {app_id}/{method}: status {resp.status_code}: {resp.text[:512]}"
+            )
+        if not resp.content:
+            return None
+        return resp.json()
+
     # -- pub/sub ------------------------------------------------------------
     async def publish(self, pubsub: str, topic: str, event: dict[str, Any]) -> None:
         """POST /v1.0/publish/{pubsub}/{topic} with a CloudEvents envelope.

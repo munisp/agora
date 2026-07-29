@@ -22,7 +22,14 @@ import (
 // payload metadata.
 func (a *Activities) NotifyPaced(ctx context.Context, req workflows.PacedSendRequest) error {
 	if a.Pacer != nil {
-		if err := a.Pacer.Wait(ctx); err != nil {
+		if req.Priority {
+			// SPEC-W11 Part B §5 fast-lane: emergency-grade sends (kind
+			// incident_alert) dispatch immediately, bypassing the CPS token
+			// bucket — but stay metered (pacer priority counter + log).
+			if err := a.Pacer.Priority(ctx); err != nil {
+				return fmt.Errorf("pacer priority: %w", err)
+			}
+		} else if err := a.Pacer.Wait(ctx); err != nil {
 			return fmt.Errorf("pacer wait: %w", err)
 		}
 	}
@@ -77,6 +84,11 @@ func (a *Activities) NotifyPaced(ctx context.Context, req workflows.PacedSendReq
 			return fmt.Errorf("NotifyPaced %s: missing geo_campaign payload", req.Kind)
 		}
 		return a.SendGeoCampaignMessage(ctx, *req.GeoCampaign)
+	case workflows.PacedSendIncidentAlert:
+		if req.IncidentAlert == nil {
+			return fmt.Errorf("NotifyPaced %s: missing incident_alert payload", req.Kind)
+		}
+		return a.SendIncidentAlert(ctx, *req.IncidentAlert)
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
 	}
