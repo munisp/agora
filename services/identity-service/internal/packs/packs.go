@@ -95,6 +95,20 @@ type VoiceDefaults struct {
 	Languages map[string]string `yaml:"languages" json:"languages,omitempty"`
 }
 
+// Disclosure is the optional pack-level spoken AI / recording disclosure
+// block (SPEC-W11 Part D): when present, the voice runtime prepends an
+// automated-assistant disclosure line (plus the optional pack Text) to the
+// greeting when SpokenAIDisclosure is set, and appends a recording notice
+// when RecordingConsent is set. Both booleans are required when the block
+// is present (hence *bool — absent must not read as false); Text is an
+// optional string of at most 200 chars. Passed through to the runtime
+// Summary as camelCase ctx.disclosure.
+type Disclosure struct {
+	SpokenAIDisclosure *bool  `yaml:"spokenAiDisclosure" json:"spokenAiDisclosure"`
+	RecordingConsent   *bool  `yaml:"recordingConsent" json:"recordingConsent"`
+	Text               string `yaml:"text" json:"text,omitempty"`
+}
+
 // Pack is one industry pack definition (industries/<id>.yaml).
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
@@ -115,6 +129,9 @@ type Pack struct {
 	// SPEC-W10 Part D: optional pack-level voice/TTS defaults, validated
 	// when present and passed through to the runtime Summary.
 	Voice *VoiceDefaults `yaml:"voice" json:"voice,omitempty"`
+	// SPEC-W11 Part D: optional disclosure block, validated when present
+	// and passed through to the runtime Summary.
+	Disclosure *Disclosure `yaml:"disclosure" json:"disclosure,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -137,6 +154,7 @@ type Summary struct {
 	CustomTools      []CustomTool      `json:"customTools,omitempty"`
 	MCPServers       []MCPServer       `json:"mcpServers,omitempty"`
 	Voice            *VoiceDefaults    `json:"voice,omitempty"`
+	Disclosure       *Disclosure       `json:"disclosure,omitempty"`
 	ConsentText      string            `json:"consentText,omitempty"`
 	Languages        []string          `json:"languages,omitempty"`
 }
@@ -169,6 +187,7 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		CustomTools:      p.CustomTools,
 		MCPServers:       p.MCPServers,
 		Voice:            p.Voice,
+		Disclosure:       p.Disclosure,
 		ConsentText:      p.ConsentText,
 		Languages:        p.Languages,
 	}
@@ -290,6 +309,9 @@ func (p Pack) Validate() error {
 	if err := validateVoice(p.Voice); err != nil {
 		return err
 	}
+	if err := validateDisclosure(p.Disclosure); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -398,6 +420,27 @@ func validateVoice(voice *VoiceDefaults) error {
 		if !voiceLangValueRe.MatchString(value) {
 			return fmt.Errorf("voice.languages[%q]: value %q must match %s", lang, value, voiceLangValueRe)
 		}
+	}
+	return nil
+}
+
+// validateDisclosure enforces the SPEC-W11 Part D disclosure block: optional
+// mapping; when present, spokenAiDisclosure and recordingConsent are required
+// booleans (nil == absent == invalid — a missing flag must not silently read
+// as false), and text is an optional string of at most 200 chars. Kept in
+// sync with scripts/validate_pack.py.
+func validateDisclosure(d *Disclosure) error {
+	if d == nil {
+		return nil
+	}
+	if d.SpokenAIDisclosure == nil {
+		return fmt.Errorf("disclosure.spokenAiDisclosure is required and must be a boolean")
+	}
+	if d.RecordingConsent == nil {
+		return fmt.Errorf("disclosure.recordingConsent is required and must be a boolean")
+	}
+	if len(d.Text) > 200 {
+		return fmt.Errorf("disclosure.text must be <= 200 chars, got %d", len(d.Text))
 	}
 	return nil
 }
