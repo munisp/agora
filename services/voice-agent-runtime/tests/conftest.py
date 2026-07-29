@@ -136,6 +136,11 @@ class FakeDapr:
     def __init__(self) -> None:
         self.published: list[tuple[str, str, dict]] = []
         self.best_effort: list[tuple[str, str, dict]] = []
+        # SPEC-W11 Part C: scriptable GET responses (method path -> payload
+        # or Exception) + PUT recording, for the capture_location tool.
+        self.get_responses: dict = {}
+        self.invoke_get_calls: list[tuple] = []
+        self.put_calls: list[tuple] = []
 
     async def publish(self, pubsub: str, topic: str, event: dict) -> None:
         self.published.append((pubsub, topic, event))
@@ -144,7 +149,15 @@ class FakeDapr:
         self.best_effort.append((pubsub, topic, event))
 
     async def invoke_get(self, app_id, method, *, params=None, headers=None):
-        return {}
+        self.invoke_get_calls.append((app_id, method, params, headers))
+        resp = self.get_responses.get(method, {})
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
 
     async def invoke_post(self, app_id, method, *, payload=None, headers=None):
         return {}
+
+    async def invoke_put(self, app_id, method, *, payload=None, headers=None):
+        self.put_calls.append((app_id, method, payload, headers))
+        return {"ok": True}

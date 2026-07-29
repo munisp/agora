@@ -27,19 +27,38 @@ var WebhookBackoff = []time.Duration{
 	4 * time.Hour,
 }
 
+// Payload types (SPEC-W11 Part B §4): empty/"cloudevent" is the Wave-5
+// behavior (CloudEvents envelope, sha256=-prefixed signature); "incident"
+// delivers a raw Incident Data Packet with a plain-hex HMAC signature and
+// the X-OpenDesk-Incident header, and persists attempt outcomes to
+// booking-service's incident_deliveries ledger via Dapr invocation.
+const (
+	PayloadTypeCloudEvent = "cloudevent"
+	PayloadTypeIncident   = "incident"
+)
+
 // WebhookDeliveryInput starts a WebhookDeliveryWorkflow.
 type WebhookDeliveryInput struct {
 	DeliveryID string `json:"delivery_id"`
 	URL        string `json:"url"`
 	Secret     string `json:"secret"`
 	EventType  string `json:"event_type"`
-	// Body is the raw CloudEvents envelope, POSTed verbatim.
+	// PayloadType selects the delivery shape: "" / "cloudevent" (default) or
+	// "incident" (SPEC-W11 Part B §4).
+	PayloadType string `json:"payload_type,omitempty"`
+	// IncidentID is set for payload type "incident" (X-OpenDesk-Incident).
+	IncidentID string `json:"incident_id,omitempty"`
+	// Body is the raw CloudEvents envelope (or IDP JSON for payload type
+	// "incident"), POSTed verbatim.
 	Body []byte `json:"body"`
 }
 
 // WebhookDeliveryUpdate is the persistence update after each attempt.
 type WebhookDeliveryUpdate struct {
-	DeliveryID  string     `json:"delivery_id"`
+	DeliveryID string `json:"delivery_id"`
+	// PayloadType routes the persistence path ("" → webhook_deliveries
+	// table; "incident" → booking-service incident_deliveries via Dapr).
+	PayloadType string     `json:"payload_type,omitempty"`
 	Status      string     `json:"status"` // retrying | delivered | dlq
 	Attempts    int        `json:"attempts"`
 	StatusCode  int        `json:"status_code"` // 0 = transport error
@@ -64,7 +83,7 @@ func WebhookDeliveryWorkflow(ctx workflow.Context, in WebhookDeliveryInput) erro
 		if err != nil {
 			statusCode = 0 // transport-level failure (DNS, connect, timeout)
 		}
-		upd := WebhookDeliveryUpdate{DeliveryID: in.DeliveryID, Attempts: attempt, StatusCode: statusCode}
+		upd := WebhookDeliveryUpdate{DeliveryID: in.DeliveryID, PayloadType: in.PayloadType, Attempts: attempt, StatusCode: statusCode}
 		switch {
 		case err == nil && statusCode >= 200 && statusCode < 300:
 			upd.Status = "delivered"
