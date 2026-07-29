@@ -191,6 +191,27 @@ def _validate_voice(voice: Any, errs: list[str]) -> None:
                     )
 
 
+def _validate_disclosure(disclosure: Any, errs: list[str]) -> None:
+    """SPEC-W11 Part D: optional disclosure block — pack-level spoken AI /
+    recording disclosure defaults ({spokenAiDisclosure, recordingConsent,
+    text?}). Both booleans are required when the block is present; text is
+    an optional string of at most 200 chars. Kept in sync with packs.go."""
+    if disclosure is None:
+        return
+    if not isinstance(disclosure, dict):
+        errs.append("disclosure must be a mapping")
+        return
+    for flag in ("spokenAiDisclosure", "recordingConsent"):
+        if not isinstance(disclosure.get(flag), bool):
+            errs.append(f"disclosure.{flag} is required and must be a boolean")
+    text = disclosure.get("text")
+    if text is not None:
+        if not isinstance(text, str):
+            errs.append("disclosure.text must be a string")
+        elif len(text) > 200:
+            errs.append(f"disclosure.text must be <= 200 chars, got {len(text)}")
+
+
 def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     """Validate one parsed pack document; returns the list of errors
     (empty == valid). Mirrors Pack.Validate() in identity-service."""
@@ -285,6 +306,7 @@ def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     _validate_custom_tools(doc.get("customTools"), errs)
     _validate_mcp_servers(doc.get("mcpServers"), errs)
     _validate_voice(doc.get("voice"), errs)
+    _validate_disclosure(doc.get("disclosure"), errs)
     return errs
 
 
