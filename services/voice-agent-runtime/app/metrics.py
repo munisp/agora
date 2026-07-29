@@ -14,6 +14,7 @@ Series:
 - tts_provider_failures_total (counter, label provider) — SPEC-W10 chain
 - voice_tool_calls_total      (counter, labels tool,result)
 - voice_active_sessions       (gauge)
+- voice_emergency_sessions_total (counter) — SPEC-W11 Part C emergency lane
 """
 
 from __future__ import annotations
@@ -178,6 +179,13 @@ class Registry:
         self.active_sessions = Gauge(
             "voice_active_sessions", "Currently active voice/chat sessions."
         )
+        # SPEC-W11 Part C: sessions where the live-turn emergency detector
+        # (app/emergency.py) latched — one increment per emergency session.
+        self.emergency_sessions = Counter(
+            "voice_emergency_sessions_total",
+            "Voice sessions flagged as emergencies (warm-handoff triggered).",
+            (),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -189,6 +197,7 @@ class Registry:
             self.tts_provider_failures,
             self.tool_calls,
             self.active_sessions,
+            self.emergency_sessions,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -224,6 +233,11 @@ def tts_provider_failure(provider: str) -> None:
     _registry.tts_provider_failures.inc(provider=provider)
 
 
+def emergency_session() -> None:
+    """SPEC-W11 Part C: one voice session flagged as an emergency."""
+    _registry.emergency_sessions.inc()
+
+
 # ---------------------------------------------------------------------------
 # Per-session call-quality accumulator (CRM gap fix): while the registry
 # above aggregates process-wide for Prometheus, a SessionMetrics instance
@@ -253,6 +267,10 @@ class SessionMetrics:
         self.stt_calls = 0
         self.tts_calls = 0
         self.llm_fallback_used = False
+        # SPEC-W11 Part C: latched when the live-turn emergency detector
+        # flagged this session (app/emergency.py); flows into the
+        # SessionEnded quality payload as an additive `emergency` bool key.
+        self.emergency = False
         self._llm_latencies_ms: list[float] = []
         self._tool_calls: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -282,6 +300,10 @@ class SessionMetrics:
         with self._lock:
             self.llm_fallback_used = True
 
+    def record_emergency(self) -> None:
+        with self._lock:
+            self.emergency = True
+
     # -------------------------------------------------------------- snapshot
     def tool_calls(self) -> dict[str, int]:
         with self._lock:
@@ -295,6 +317,7 @@ class SessionMetrics:
                 or self.tts_calls
                 or self._llm_latencies_ms
                 or self._tool_calls
+                or self.emergency
             )
 
     def quality_payload(
@@ -313,13 +336,19 @@ class SessionMetrics:
             latencies = list(self._llm_latencies_ms)
             tools = dict(self._tool_calls)
             empty = not (
-                self.turn_count or self.stt_calls or self.tts_calls or latencies or tools
+                self.turn_count
+                or self.stt_calls
+                or self.tts_calls
+                or latencies
+                or tools
+                or self.emergency
             )
             duration_s = round(self._clock() - self.started_at, 1)
             turn_count = self.turn_count
             stt_calls = self.stt_calls
             tts_calls = self.tts_calls
             fallback = self.llm_fallback_used
+            emergency = self.emergency
         if empty:
             return None
         return {
@@ -335,6 +364,9 @@ class SessionMetrics:
             "llm_fallback_used": fallback,
             "escalated": escalated,
             "confirmed_phone": confirmed_phone,
+            # SPEC-W11 Part C (additive key; downstream consumers tolerate
+            # unknown keys): True when the emergency lane fired this session.
+            "emergency": emergency,
         }
 
 
@@ -388,3 +420,9 @@ def session_llm_latency(seconds: float) -> None:
 def session_llm_fallback() -> None:
     if (s := get_active_session()) is not None:
         s.record_llm_fallback()
+
+
+def session_emergency() -> None:
+    """SPEC-W11 Part C: latch the emergency flag on the active session."""
+    if (s := get_active_session()) is not None:
+        s.record_emergency()

@@ -50,7 +50,14 @@ type Activities struct {
 	// Pacer is the outbound CPS limiter + sender rotator (VOICE-SCALING §4);
 	// set by main after New. Nil disables pacing/rotation (tests).
 	Pacer *pacer.Pacer
-	Log   *zap.Logger
+	// Webhooks holds the outbound webhook delivery dependencies (Wave 5 #10);
+	// set by main after New.
+	Webhooks WebhookDeps
+	// Channels resolves the messaging provider per channel + tenant
+	// (MESSAGING_CHANNELS / TENANT_CHANNEL_MAP); set by main after New.
+	// Nil keeps the built-in defaults (email→smtp, sms→twilio).
+	Channels *ChannelRouter
+	Log      *zap.Logger
 
 	hc *http.Client
 }
@@ -223,8 +230,11 @@ func (a *Activities) SendNoShowFollowup(ctx context.Context, in workflows.NoShow
 	return a.notify(ctx, td, in.ContactEmail, in.ContactPhone, "We missed you", noShowEmail)
 }
 
-// notify renders the template and dispatches to the SMTP and Twilio output
-// bindings (operation create). A missing recipient channel is skipped.
+// notify renders the template and dispatches to the output bindings
+// resolved by the channel router (email → bindings-smtp; sms →
+// bindings-twilio or the messaging-gateway HTTP bindings termii /
+// africastalking / whatsapp per tenant). A missing recipient channel is
+// skipped.
 //
 // Sender rotation (VOICE-SCALING §4): when the pacer has an
 // OUTBOUND_FROM_NUMBERS pool, the next round-robin number replaces the
@@ -246,27 +256,48 @@ func (a *Activities) notify(ctx context.Context, td templateData, email, phone, 
 	}
 
 	if email != "" {
-		if err := a.Dapr.InvokeBinding(ctx, a.SMTPBinding, "create", text, map[string]string{
+		// Channel routing (MESSAGING_CHANNELS / TENANT_CHANNEL_MAP): email
+		// currently has a single provider (smtp).
+		emailProvider := a.Channels.Provider(ChannelEmail, td.Tenant)
+		if err := a.Dapr.InvokeBinding(ctx, a.BindingName(emailProvider), "create", text, map[string]string{
 			"emailTo":      email,
 			"emailFrom":    a.SMTPFrom,
 			"subject":      subject,
 			"senderNumber": sender,
 		}); err != nil {
-			return fmt.Errorf("smtp binding: %w", err)
+			return fmt.Errorf("%s binding: %w", emailProvider, err)
 		}
+		a.Log.Info("notification sent", zap.String("subject", subject), zap.String("channel", ChannelEmail),
+			zap.String("provider", emailProvider), zap.String("email", email))
 	}
 	if phone != "" {
-		if err := a.Dapr.InvokeBinding(ctx, a.TwilioBinding, "create", text, map[string]string{
+		smsProvider := a.Channels.Provider(ChannelSMS, td.Tenant)
+		if err := a.sendSMS(ctx, smsProvider, phone, text, sender); err != nil {
+			return fmt.Errorf("%s binding: %w", smsProvider, err)
+		}
+		a.Log.Info("notification sent", zap.String("subject", subject), zap.String("channel", ChannelSMS),
+			zap.String("provider", smsProvider), zap.String("phone", phone),
+			zap.String("sender_number", sender))
+	}
+	return nil
+}
+
+// sendSMS dispatches one SMS/WhatsApp message to the resolved provider. The
+// Nigeria providers (termii/africastalking/whatsapp) are reached through the
+// messaging-gateway HTTP bindings ("bindings-"+provider, operation "post",
+// {"to","message"} data); twilio keeps the native binding + sender rotation.
+func (a *Activities) sendSMS(ctx context.Context, provider, phone, text, sender string) error {
+	if provider == "twilio" {
+		return a.Dapr.InvokeBinding(ctx, a.TwilioBinding, "create", text, map[string]string{
 			"toNumber":     phone,
 			"fromNumber":   sender,
 			"senderNumber": sender,
-		}); err != nil {
-			return fmt.Errorf("twilio binding: %w", err)
-		}
+		})
 	}
-	a.Log.Info("notification sent", zap.String("subject", subject), zap.String("email", email),
-		zap.String("phone", phone), zap.String("sender_number", sender))
-	return nil
+	return a.Dapr.InvokeBinding(ctx, a.BindingName(provider), "post", map[string]string{
+		"to":      phone,
+		"message": text,
+	}, nil)
 }
 
 // ---------------------------------------------------------------------------
