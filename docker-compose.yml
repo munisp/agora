@@ -219,6 +219,11 @@ services:
       # VOICE_RUNTIME_URL: http://voice:7006
       CONVERSATION_URL: ${CONVERSATION_URL:-}
       VOICE_RUNTIME_URL: ${VOICE_RUNTIME_URL:-}
+      # IoT incident ingest (SPEC-W11 Part B §6): per-tenant shared secrets
+      # for POST /webhooks/incidents, JSON {"<tenant_slug|tenant_id>":"<secret>"}.
+      # BOOKING_URL empty = forward via Dapr invoke app-id booking.
+      INCIDENT_WEBHOOK_SECRETS: ${INCIDENT_WEBHOOK_SECRETS:-}
+      BOOKING_URL: ${BOOKING_URL:-}
     ports:
     - 7011:7011
     networks:
