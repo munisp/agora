@@ -48,6 +48,10 @@ type Config struct {
 	GeocodeEnabled   bool   // GEOCODE_ENABLED: Nominatim address geocoding hook (default false)
 	GeocodeBaseURL   string // GEOCODE_BASE_URL (default https://nominatim.openstreetmap.org)
 	GeoCampaignBatch int    // GEO_CAMPAIGN_BATCH: recipients per campaign batch (default 50)
+	// Incidents (SPEC-W11 Part B)
+	IncidentsTopic       string // opendesk.incidents (IDP ingestion)
+	IncidentsGroup       string // consumer group booking-incidents
+	IncidentAutoDispatch bool   // INCIDENT_AUTO_DISPATCH: auto-deliver new incidents to active endpoints (default true)
 }
 
 // Load reads configuration from the environment.
@@ -84,11 +88,14 @@ func Load() (Config, error) {
 		AuthzOutagePolicy:  envStr("AUTHZ_OUTAGE_POLICY", "fail_closed"),
 		ConsumerEnabled:    envStr("CONSUMER_ENABLED", "true") == "true",
 		// Dev fallback keeps the portal bootable locally; prod MUST override.
-		PortalSecret:       envStr("PORTAL_SECRET", "opendesk-dev-portal-secret-change-in-prod"),
-		NotificationsTopic: envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
-		GeocodeEnabled:     envStr("GEOCODE_ENABLED", "false") == "true",
-		GeocodeBaseURL:     envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
-		GeoCampaignBatch:   envInt("GEO_CAMPAIGN_BATCH", 50),
+		PortalSecret:         envStr("PORTAL_SECRET", "opendesk-dev-portal-secret-change-in-prod"),
+		NotificationsTopic:   envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		GeocodeEnabled:       envStr("GEOCODE_ENABLED", "false") == "true",
+		GeocodeBaseURL:       envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
+		GeoCampaignBatch:     envInt("GEO_CAMPAIGN_BATCH", 50),
+		IncidentsTopic:       envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
+		IncidentsGroup:       envStr("INCIDENTS_GROUP", "booking-incidents"),
+		IncidentAutoDispatch: envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

@@ -27,8 +27,8 @@
     },
     {
       "id": "civic-services",
-      "version": "1.0.0",
-      "sha256": "7f91d278ac254018abebb23c1a4fd919186f43bae3aba942e9f53afb7580531d",
+      "version": "1.0.1",
+      "sha256": "09f1ac581ffe729e88b490a2f83b78cfb3eccf05153c5e47e2694de30e3dde66",
       "author": "opendesk",
       "signature": null,
       "path": "civic-services.yaml"
@@ -91,8 +91,8 @@
     },
     {
       "id": "healthcare",
-      "version": "1.0.0",
-      "sha256": "e3ea3683c6c1c88a1e7d0d3939b3b1ddd234cf8dc7b0b03765c07a116b703908",
+      "version": "1.0.1",
+      "sha256": "ebb6b95e3c3fe6e7aa161d77293dc698905cfa271d3fe7fcda958058def9fb5d",
       "author": "opendesk",
       "signature": null,
       "path": "healthcare.yaml"
@@ -123,8 +123,8 @@
     },
     {
       "id": "law-enforcement",
-      "version": "1.0.0",
-      "sha256": "3b97391a576f239916164df3ceeb9b5aa581983458bc37b391644539b4ded9b8",
+      "version": "1.0.1",
+      "sha256": "6374958e073e2f0696ce2cf78e4c4d03f507ab8a0a480b01e20631d621a7b260",
       "author": "opendesk",
       "signature": null,
       "path": "law-enforcement.yaml"

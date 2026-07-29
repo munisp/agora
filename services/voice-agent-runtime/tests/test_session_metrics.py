@@ -21,6 +21,8 @@ QUALITY_KEYS = {
     "llm_fallback_used",
     "escalated",
     "confirmed_phone",
+    # SPEC-W11 Part C: additive emergency flag on the quality payload.
+    "emergency",
 }
 
 
@@ -111,6 +113,31 @@ def test_escalated_and_confirmed_phone_passthrough():
     assert payload is not None
     assert payload["escalated"] is True
     assert payload["confirmed_phone"] == "+1555000111"
+
+
+def test_emergency_flag_defaults_false_and_latches():
+    """SPEC-W11 Part C: additive `emergency` bool in the quality payload."""
+    sm = metrics.SessionMetrics("conv-1")
+    sm.record_turn()
+    payload = sm.quality_payload()
+    assert payload is not None
+    assert payload["emergency"] is False
+
+    sm.record_emergency()
+    payload = sm.quality_payload()
+    assert payload is not None
+    assert payload["emergency"] is True
+
+
+def test_emergency_only_session_still_emits_quality():
+    """An emergency-flagged session must ship a quality payload even if no
+    other signals were recorded."""
+    sm = metrics.SessionMetrics("conv-1")
+    assert sm.quality_payload() is None
+    sm.record_emergency()
+    payload = sm.quality_payload()
+    assert payload is not None
+    assert payload["emergency"] is True
 
 
 def test_payload_shape_is_exactly_the_crm_contract():
