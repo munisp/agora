@@ -156,6 +156,10 @@ func run() error {
 	// SPEC-W8 A2: geo-targeted campaign sends (scheduled by booking-service's
 	// GeoCampaignWorkflow via NotifyPaced kind geo_campaign).
 	w.RegisterActivityWithOptions(acts.SendGeoCampaignMessage, activity.RegisterOptions{Name: workflows.ActivitySendGeoCampaignMessage})
+	// SPEC-W11 Part B §5: incident outreach sends (scheduled by
+	// booking-service's IncidentAlertWorkflow via NotifyPaced kind
+	// incident_alert with priority — the pacer fast-lane).
+	w.RegisterActivityWithOptions(acts.SendIncidentAlert, activity.RegisterOptions{Name: workflows.ActivitySendIncidentAlert})
 	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
 	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
 
@@ -187,7 +191,7 @@ func run() error {
 		}
 		webhookStore = st
 		defer webhookStore.Close()
-		acts.Webhooks = activities.WebhookDeps{Store: webhookStore}
+		acts.Webhooks = activities.WebhookDeps{Store: webhookStore, BookingAppID: cfg.BookingAppID}
 		logger.Info("webhook platform enabled",
 			zap.Bool("signing_required", cfg.WebhookSigningRequired))
 	} else {
