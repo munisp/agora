@@ -113,6 +113,11 @@ type Pacer struct {
 	log   *zap.Logger
 	// redisWarned ensures the fail-open warning is logged once, not per send.
 	redisWarned atomic.Bool
+	// Metering (SPEC-W11 Part B §5): every granted start is counted, and
+	// priority fast-lane bypasses are counted separately so emergency
+	// traffic stays usage-visible despite skipping the token bucket.
+	granted  atomic.Uint64
+	prioLane atomic.Uint64
 }
 
 // New builds the pacer. With Backend "redis" it dials RedisAddr (go-redis
@@ -160,6 +165,7 @@ func (p *Pacer) Wait(ctx context.Context) error {
 				break // fall through to the local limiter
 			}
 			if waitMs <= 0 {
+				p.granted.Add(1)
 				return nil
 			}
 			timer := time.NewTimer(time.Duration(waitMs) * time.Millisecond)
@@ -171,7 +177,34 @@ func (p *Pacer) Wait(ctx context.Context) error {
 			}
 		}
 	}
-	return p.local.Wait(ctx)
+	if err := p.local.Wait(ctx); err != nil {
+		return err
+	}
+	p.granted.Add(1)
+	return nil
+}
+
+// Priority grants an IMMEDIATE outbound start for emergency-grade traffic
+// (SPEC-W11 Part B §5 incident_alert fast-lane), bypassing the token
+// bucket. The bypass is still metered: the priority counter (exposed via
+// Stats and logged on every use) keeps fast-lane sends usage-visible, which
+// is the audit trail the carrier/billing conversation needs when the CPS
+// ceiling is exceeded by design. It never blocks and only fails when ctx
+// is already done.
+func (p *Pacer) Priority(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.prioLane.Add(1)
+	p.log.Info("pacer: priority fast-lane dispatch (token bucket bypassed, metered)",
+		zap.Uint64("priority_total", p.prioLane.Load()))
+	return nil
+}
+
+// Stats returns the metering counters: token-bucket grants and priority
+// fast-lane bypasses since process start.
+func (p *Pacer) Stats() (granted, priority uint64) {
+	return p.granted.Load(), p.prioLane.Load()
 }
 
 // acquireRedis runs the Lua token bucket and returns the retry delay in ms.
