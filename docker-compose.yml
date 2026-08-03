@@ -541,7 +541,7 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
       LLM_BASE_URL: http://ollama:11434/v1
-      LLM_MODEL: qwen3:8b
+      LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
       LLM_API_KEY: ${LLM_API_KEY:-ollama}
       PIPER_URL: http://piper:5500
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
