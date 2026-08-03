@@ -58,6 +58,10 @@ type Config struct {
 	PacerBackend        string   // PACER_BACKEND: redis|local (redis)
 	OutboundFromNumbers []string // OUTBOUND_FROM_NUMBERS: sender rotation pool
 	RedisAddr           string   // REDIS_ADDR: shared pacer state (redis:6379)
+	// SPEC-W12 §8: DND/quiet-hours compliance guards.
+	DNDEnforcement      bool   // DND_ENFORCEMENT: suppress marketing sends on the DND registry (true)
+	QuietHoursDefault   string // QUIET_HOURS_DEFAULT: "HH:MM-HH:MM" ("20:00-08:00")
+	QuietHoursOverrides string // QUIET_HOURS_OVERRIDES: per-channel JSON {"sms":"21:00-07:00"}
 	ShutdownTimeout     time.Duration
 }
 
@@ -107,6 +111,9 @@ func Load() Config {
 		PacerBackend:             envStr("PACER_BACKEND", "redis"),
 		OutboundFromNumbers:      envList("OUTBOUND_FROM_NUMBERS"),
 		RedisAddr:                envStr("REDIS_ADDR", "redis:6379"),
+		DNDEnforcement:           envStr("DND_ENFORCEMENT", "true") == "true",
+		QuietHoursDefault:        envStr("QUIET_HOURS_DEFAULT", "20:00-08:00"),
+		QuietHoursOverrides:      os.Getenv("QUIET_HOURS_OVERRIDES"),
 		ShutdownTimeout:          time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 	}
 }

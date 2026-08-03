@@ -7,6 +7,12 @@ package workflows
 // NotifyPaced activity, which acquires a CPS token and rotates the sender
 // number (internal/pacer) BEFORE dispatching to the underlying send
 // activity. Workflows only build a PacedSendRequest.
+
+import (
+	"github.com/opendesk/notification-worker/internal/pacer"
+	"go.temporal.io/sdk/workflow"
+)
+
 const (
 	// ActivityNotifyPaced is the name of the pacing wrapper activity.
 	ActivityNotifyPaced = "NotifyPaced"
@@ -148,4 +154,113 @@ type PacedProposalReminderSend struct {
 // PacedStaffAlertSend carries the EscalateTicket arguments.
 type PacedStaffAlertSend struct {
 	Input SupportEscalationInput `json:"input"`
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W12 Agent B: DND/quiet-hours compliance guards
+// ---------------------------------------------------------------------------
+
+// Paced send completion statuses.
+const (
+	// PacedSendStatusSent means NotifyPaced dispatched the send to its
+	// channel binding.
+	PacedSendStatusSent = "sent"
+	// PacedSendStatusSuppressedDND means the DND guard (SPEC-W12 §3) stopped
+	// a marketing send: the recipient is on the NCC 2442 global list or the
+	// tenant's opt-out list. The send consumed no CPS token and the
+	// suppression was counted (notifications_suppressed_total{reason}) and
+	// logged. Workflows that record send outcomes should complete the send
+	// with this status.
+	PacedSendStatusSuppressedDND = "suppressed_dnd"
+)
+
+// PacedSendResult is the outcome of one NotifyPaced call (SPEC-W12). It is
+// additive: callers that only care about errors keep using Get(ctx, nil).
+type PacedSendResult struct {
+	Status string `json:"status"` // sent | suppressed_dnd
+	// Reason is the suppression reason (tenant_optout | global_dnd) when
+	// Status is suppressed_dnd.
+	Reason string `json:"reason,omitempty"`
+}
+
+// PacedSendChannel extracts the delivery channel of a paced send (used for
+// per-channel quiet-hours overrides); "" when the kind carries no channel.
+func PacedSendChannel(req PacedSendRequest) string {
+	switch req.Kind {
+	case PacedSendGeoCampaign:
+		if req.GeoCampaign != nil {
+			return req.GeoCampaign.Channel
+		}
+	case PacedSendIncidentAlert:
+		if req.IncidentAlert != nil {
+			return req.IncidentAlert.Channel
+		}
+	}
+	return ""
+}
+
+// GuardedPacedSend executes a paced send with the SPEC-W12 §3 compliance
+// guards applied workflow-side:
+//
+//   - MARKETING kinds (geo_campaign, promo, broadcast, drip — the explicit
+//     classification table lives in internal/pacer/guards.go) arriving inside
+//     the tenant's quiet-hours window are DEFERRED: the workflow durably
+//     Sleeps until the window opens (default 20:00-08:00 Africa/Lagos,
+//     per-channel overrides via quiet.Overrides), then sends.
+//   - TRANSACTIONAL kinds (booking confirmations, reminders, incident_alert,
+//     otp, ...) pass immediately — no sleep, ever.
+//   - The Priority fast-lane (SPEC-W11 Part B §5, incident_alert) is NOT
+//     altered: priority sends skip this deferral exactly as they skip the
+//     CPS token bucket.
+//
+// DND suppression itself is activity-side (NotifyPaced checks the registry
+// before acquiring a CPS token); the result carries suppressed_dnd for the
+// scheduling workflow to record.
+//
+// quiet is passed in by the SCHEDULING workflow (built from its input or the
+// QUIET_HOURS_* env at schedule time) so replay stays deterministic when the
+// env changes between runs of the same workflow. The caller must have
+// configured ActivityOptions on ctx (StartToCloseTimeout etc.), exactly as
+// the existing paced-send workflows do before ExecuteActivity.
+func GuardedPacedSend(ctx workflow.Context, req PacedSendRequest, quiet pacer.QuietHoursConfig) (PacedSendResult, error) {
+	var res PacedSendResult
+	if pacer.ClassifyKind(req.Kind) == pacer.ClassMarketing && !req.Priority {
+		open, inWindow, err := pacer.QuietHoursOpenAt(workflow.Now(ctx), PacedSendChannel(req), quiet)
+		if err != nil {
+			return res, err
+		}
+		if inWindow {
+			delay := open.Sub(workflow.Now(ctx))
+			if delay > 0 {
+				workflow.GetLogger(ctx).Info("quiet hours: deferring marketing send until window opens",
+					"kind", req.Kind, "channel", PacedSendChannel(req),
+					"window_open", open.String(), "delay", delay.String())
+				if err := workflow.Sleep(ctx, delay); err != nil {
+					return res, err
+				}
+			}
+		}
+	}
+	if err := workflow.ExecuteActivity(ctx, ActivityNotifyPaced, req).Get(ctx, &res); err != nil {
+		return res, err
+	}
+	if res.Status == "" {
+		// Older workers returned no result payload; the send happened.
+		res.Status = PacedSendStatusSent
+	}
+	return res, nil
+}
+
+// QuietHoursFromEnv is a convenience for workflows that accept the
+// quiet-hours configuration as plain strings in their input: it builds the
+// config handed to GuardedPacedSend. tz defaults to Africa/Lagos, window to
+// 20:00-08:00 (SPEC-W12 §8).
+func QuietHoursFromEnv(defaultWindow, tz string, overrides map[string]string) pacer.QuietHoursConfig {
+	if defaultWindow == "" {
+		defaultWindow = pacer.DefaultQuietHoursWindow
+	}
+	if tz == "" {
+		tz = pacer.DefaultQuietHoursTimezone
+	}
+	return pacer.QuietHoursConfig{DefaultWindow: defaultWindow, Overrides: overrides, Timezone: tz}
 }
