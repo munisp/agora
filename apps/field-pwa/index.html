@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#b8552f">
+<title>OpenDesk Field</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<style>
+:root{
+  --cream:#faf5ec; --cream-deep:#f3ebdd; --paper:#fffdf8;
+  --ink:#2c2620; --ink-soft:#5d554a;
+  --terra:#b8552f; --terra-dark:#98431f;
+  --olive:#6d7454; --olive-dark:#565e40; --line:#e4dac8;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--cream);color:var(--ink);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+header{display:flex;align-items:center;gap:10px;padding:12px 16px;
+  background:var(--paper);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+header img{width:28px;height:28px;border-radius:6px}
+header h1{font-size:16px;margin:0;font-weight:650}
+#net{margin-left:auto;font-size:12px;padding:2px 8px;border-radius:999px;
+  background:var(--cream-deep);color:var(--ink-soft)}
+#net.off{background:#f0ded8;color:#98431f}
+main{max-width:560px;margin:0 auto;padding:16px}
+.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;
+  padding:16px;margin-bottom:14px}
+h2{font-size:14px;margin:0 0 10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft)}
+label{display:block;font-size:13px;color:var(--ink-soft);margin:10px 0 4px}
+input,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:9px;
+  background:#fff;color:var(--ink);font:inherit}
+input:focus,textarea:focus{outline:2px solid var(--terra);outline-offset:-1px}
+button{font:inherit;cursor:pointer;border:0;border-radius:10px;padding:10px 14px;font-weight:600}
+.btn-primary{background:var(--terra);color:#fff;width:100%;margin-top:12px}
+.btn-primary:active{background:var(--terra-dark)}
+.btn-olive{background:var(--olive);color:#fff;width:100%;margin-top:8px}
+.btn-ghost{background:transparent;color:var(--ink-soft);text-decoration:underline;
+  width:100%;margin-top:8px;font-weight:400;font-size:13px}
+.row{display:flex;gap:8px;align-items:flex-start}
+.consent{display:flex;gap:8px;align-items:flex-start;margin-top:12px;font-size:12.5px;color:var(--ink-soft)}
+.consent input{width:auto;margin-top:2px}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;margin-left:8px}
+.badge.demo{background:#f0e7cf;color:#96762c}
+.badge.live{background:#e4ead9;color:#5e7a52}
+.muted{color:var(--ink-soft);font-size:13px}
+#outbox-list{list-style:none;margin:0;padding:0}
+#outbox-list li{display:flex;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--line);font-size:13.5px}
+#outbox-list li:first-child{border-top:0}
+.kind{flex:0 0 auto;font-size:11px;padding:2px 7px;border-radius:999px;background:var(--cream-deep);color:var(--ink-soft)}
+.kind.checkin{background:#dfe5e8;color:#54697a}
+.st{margin-left:auto;font-size:11.5px;color:var(--ink-soft);white-space:nowrap}
+.st.failed{color:#98431f}
+.del{background:none;color:var(--ink-soft);padding:2px 6px;font-weight:400}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+  background:var(--ink);color:var(--cream);padding:9px 16px;border-radius:999px;
+  font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;max-width:90vw}
+#toast.show{opacity:.95}
+details{margin-top:10px;font-size:13px;color:var(--ink-soft)}
+summary{cursor:pointer}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <img src="icons/icon-192.png" alt="">
+  <h1>OpenDesk Field<span id="mode-badge" class="badge demo hidden">demo</span><span id="live-badge" class="badge live hidden">live</span></h1>
+  <span id="net">…</span>
+</header>
+<main>
+  <!-- Auth / setup -->
+  <section id="view-auth" class="card">
+    <h2>Sign in</h2>
+    <p class="muted">Field capture for your team. Enter your tenant and sign in
+      with your OpenDesk staff account (Keycloak).</p>
+    <label for="f-slug">Tenant slug</label>
+    <input id="f-slug" autocomplete="organization" placeholder="e.g. sunrise-dental">
+    <details>
+      <summary>Server settings</summary>
+      <label for="f-issuer">Keycloak issuer</label>
+      <input id="f-issuer" placeholder="http://localhost:8080/realms/opendesk">
+      <label for="f-client">Client ID</label>
+      <input id="f-client" placeholder="admin-web">
+      <label for="f-api">API base</label>
+      <input id="f-api" placeholder="/api/bookings">
+    </details>
+    <button id="btn-login" class="btn-primary">Sign in with Keycloak</button>
+    <button id="btn-demo" class="btn-ghost">No staff account? Continue in demo mode (offline queue only)</button>
+    <p id="auth-msg" class="muted"></p>
+  </section>
+
+  <!-- Capture -->
+  <section id="view-main" class="hidden">
+    <div class="card">
+      <h2>New lead</h2>
+      <label for="f-name">Name</label>
+      <input id="f-name" autocomplete="off" placeholder="Walk-in customer name">
+      <label for="f-phone">Phone</label>
+      <input id="f-phone" type="tel" autocomplete="off" placeholder="+234…">
+      <label for="f-notes">Notes</label>
+      <textarea id="f-notes" rows="3" placeholder="What do they need?"></textarea>
+      <div class="consent">
+        <input id="f-gps" type="checkbox">
+        <label for="f-gps" style="margin:0">Attach my current location to this lead.
+          Location is used only to route the lead to the nearest team member and
+          is stored with the lead record.</label>
+      </div>
+      <button id="btn-capture" class="btn-primary">Save lead</button>
+      <button id="btn-checkin" class="btn-olive">Geo check-in</button>
+    </div>
+
+    <div class="card">
+      <h2>Outbox <span id="outbox-count" class="muted"></span></h2>
+      <ul id="outbox-list"><li class="muted">Nothing queued.</li></ul>
+      <button id="btn-sync" class="btn-ghost">Sync now</button>
+    </div>
+
+    <button id="btn-logout" class="btn-ghost">Sign out / switch tenant</button>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+<noscript><p style="padding:16px">OpenDesk Field needs JavaScript.</p></noscript>
+<script src="app.js"></script>
+</body>
+</html>
