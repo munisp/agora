@@ -131,6 +131,24 @@ type USSD struct {
 	Menu []USSDMenuItem `yaml:"menu" json:"menu"`
 }
 
+// Growth is the optional pack-level CAC playbook block (SPEC-W15 §2): the
+// referral bounty in naira (0 = no referral programme), the primary
+// acquisition channels and the blended CAC target in naira. Passed through
+// to the runtime Summary as pack.growth so the growth dashboard and
+// referral engine can read the pack defaults without parsing YAML.
+type Growth struct {
+	ReferralBountyNGN int      `yaml:"referral_bounty_ngn" json:"referral_bounty_ngn"`
+	PrimaryChannels   []string `yaml:"primary_channels" json:"primary_channels"`
+	CACTargetNGN      int      `yaml:"cac_target_ngn" json:"cac_target_ngn"`
+}
+
+// I18n is the optional pack-level localisation block (SPEC-W15 §3):
+// locale (en|pcm|ha|yo|ig) -> key -> translated user-facing string
+// (greeting, referral line, …). Passed through to the runtime Summary as
+// pack.i18n so the voice runtime and messaging-gateway can localise
+// pack-owned strings.
+type I18n map[string]map[string]string
+
 // Pack is one industry pack definition (industries/<id>.yaml).
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
@@ -157,6 +175,12 @@ type Pack struct {
 	// SPEC-W12 §1: optional USSD menu block, validated when present and
 	// passed through to the runtime Summary (pack.ussd.menu).
 	USSD *USSD `yaml:"ussd" json:"ussd,omitempty"`
+	// SPEC-W15 §2: optional growth (CAC playbook) block, validated when
+	// present and passed through to the runtime Summary.
+	Growth *Growth `yaml:"growth" json:"growth,omitempty"`
+	// SPEC-W15 §3: optional i18n localisation block, validated when
+	// present and passed through to the runtime Summary.
+	I18n I18n `yaml:"i18n" json:"i18n,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -181,6 +205,8 @@ type Summary struct {
 	Voice            *VoiceDefaults    `json:"voice,omitempty"`
 	Disclosure       *Disclosure       `json:"disclosure,omitempty"`
 	USSD             *USSD             `json:"ussd,omitempty"`
+	Growth           *Growth           `json:"growth,omitempty"`
+	I18n             I18n              `json:"i18n,omitempty"`
 	ConsentText      string            `json:"consentText,omitempty"`
 	Languages        []string          `json:"languages,omitempty"`
 }
@@ -215,6 +241,8 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		Voice:            p.Voice,
 		Disclosure:       p.Disclosure,
 		USSD:             p.USSD,
+		Growth:           p.Growth,
+		I18n:             p.I18n,
 		ConsentText:      p.ConsentText,
 		Languages:        p.Languages,
 	}
@@ -340,6 +368,12 @@ func (p Pack) Validate() error {
 		return err
 	}
 	if err := validateUSSD(p.USSD); err != nil {
+		return err
+	}
+	if err := validateGrowth(p.Growth); err != nil {
+		return err
+	}
+	if err := validateI18n(p.I18n); err != nil {
 		return err
 	}
 	return nil
@@ -522,6 +556,61 @@ func validateUSSD(u *USSD) error {
 		}
 		if item.Action != "" && !ussdMenuActions[item.Action] {
 			return fmt.Errorf("ussd.menu[%d] (%s): action %q must be one of book, handoff, status, sos, info", i, item.Key, item.Action)
+		}
+	}
+	return nil
+}
+
+// i18nLocales is the locale allowlist for the SPEC-W15 §3 i18n block —
+// English plus the Nigerian languages the voice/TTS stack supports
+// (Nigerian Pidgin, Hausa, Yoruba, Igbo). Kept in sync with
+// scripts/validate_pack.py I18N_LOCALES.
+var i18nLocales = map[string]bool{
+	"en":  true,
+	"pcm": true,
+	"ha":  true,
+	"yo":  true,
+	"ig":  true,
+}
+
+// validateGrowth enforces the SPEC-W15 §2 growth block: optional mapping;
+// when present, referral_bounty_ngn is an int >= 0, primary_channels a
+// non-empty list of non-empty strings, and cac_target_ngn an int > 0.
+// Kept in sync with scripts/validate_pack.py.
+func validateGrowth(g *Growth) error {
+	if g == nil {
+		return nil
+	}
+	if g.ReferralBountyNGN < 0 {
+		return fmt.Errorf("growth.referral_bounty_ngn must be >= 0, got %d", g.ReferralBountyNGN)
+	}
+	if len(g.PrimaryChannels) == 0 {
+		return fmt.Errorf("growth.primary_channels must be a non-empty list of strings")
+	}
+	for i, ch := range g.PrimaryChannels {
+		if strings.TrimSpace(ch) == "" {
+			return fmt.Errorf("growth.primary_channels[%d] must be a non-empty string", i)
+		}
+	}
+	if g.CACTargetNGN <= 0 {
+		return fmt.Errorf("growth.cac_target_ngn must be > 0, got %d", g.CACTargetNGN)
+	}
+	return nil
+}
+
+// validateI18n enforces the SPEC-W15 §3 i18n block: optional mapping of
+// locale -> {key: text}; locales are restricted to i18nLocales and every
+// value must be a non-empty string. Kept in sync with
+// scripts/validate_pack.py.
+func validateI18n(i18n I18n) error {
+	for locale, strings0 := range i18n {
+		if !i18nLocales[locale] {
+			return fmt.Errorf("i18n: locale %q must be one of en, pcm, ha, yo, ig", locale)
+		}
+		for key, value := range strings0 {
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("i18n[%q][%q] must be a non-empty string", locale, key)
+			}
 		}
 	}
 	return nil

@@ -213,3 +213,97 @@ def test_ussd_rejects_bad_shapes():
     for ussd, expected in cases:
         errs = vp.validate_pack(_with_ussd(ussd))
         assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+
+
+# ------------------------------------------------------------ growth (SPEC-W15)
+def _with_growth(growth):
+    doc = load("valid_minimal.yaml")
+    doc["growth"] = growth
+    return doc
+
+
+def test_growth_valid_block_accepted():
+    doc = _with_growth({
+        "referral_bounty_ngn": 2000,
+        "primary_channels": ["whatsapp", "ussd"],
+        "cac_target_ngn": 4000,
+    })
+    assert vp.validate_pack(doc) == []
+
+
+def test_growth_absent_and_zero_bounty_accepted():
+    assert vp.validate_pack(load("valid_minimal.yaml")) == []
+    # a zero bounty is valid (no referral programme)
+    assert vp.validate_pack(_with_growth({
+        "referral_bounty_ngn": 0,
+        "primary_channels": ["whatsapp"],
+        "cac_target_ngn": 1,
+    })) == []
+
+
+def test_growth_rejects_bad_shapes():
+    cases = [
+        ("not-a-mapping", "growth must be a mapping"),
+        ({}, "growth.referral_bounty_ngn must be an int >= 0"),
+        ({"referral_bounty_ngn": -1, "primary_channels": ["ussd"],
+          "cac_target_ngn": 100}, "referral_bounty_ngn must be an int >= 0"),
+        ({"referral_bounty_ngn": "2000", "primary_channels": ["ussd"],
+          "cac_target_ngn": 100}, "referral_bounty_ngn must be an int >= 0"),
+        ({"referral_bounty_ngn": True, "primary_channels": ["ussd"],
+          "cac_target_ngn": 100}, "referral_bounty_ngn must be an int >= 0"),
+        ({"referral_bounty_ngn": 0, "cac_target_ngn": 100},
+         "primary_channels must be a non-empty list of strings"),
+        ({"referral_bounty_ngn": 0, "primary_channels": [],
+          "cac_target_ngn": 100}, "primary_channels must be a non-empty list"),
+        ({"referral_bounty_ngn": 0, "primary_channels": "whatsapp",
+          "cac_target_ngn": 100}, "primary_channels must be a non-empty list"),
+        ({"referral_bounty_ngn": 0, "primary_channels": ["whatsapp", ""],
+          "cac_target_ngn": 100}, "primary_channels[1] must be a non-empty string"),
+        ({"referral_bounty_ngn": 0, "primary_channels": ["whatsapp", 7],
+          "cac_target_ngn": 100}, "primary_channels[1] must be a non-empty string"),
+        ({"referral_bounty_ngn": 0, "primary_channels": ["ussd"]},
+         "cac_target_ngn must be an int > 0"),
+        ({"referral_bounty_ngn": 0, "primary_channels": ["ussd"],
+          "cac_target_ngn": 0}, "cac_target_ngn must be an int > 0"),
+        ({"referral_bounty_ngn": 0, "primary_channels": ["ussd"],
+          "cac_target_ngn": -500}, "cac_target_ngn must be an int > 0"),
+    ]
+    for growth, expected in cases:
+        errs = vp.validate_pack(_with_growth(growth))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+
+
+# -------------------------------------------------------------- i18n (SPEC-W15)
+def _with_i18n(i18n):
+    doc = load("valid_minimal.yaml")
+    doc["i18n"] = i18n
+    return doc
+
+
+def test_i18n_valid_block_accepted():
+    doc = _with_i18n({
+        "pcm": {"greeting": "Welcome! How we fit help you today?"},
+        "en": {"greeting": "Welcome! How can we help you today?"},
+        "ha": {"greeting": "Sannu! Yaya za mu taimake ku yau?"},
+        "yo": {"greeting": "Kaabo! Bawo ni a se le ran wo lowo?"},
+        "ig": {"greeting": "Nnoo! Kedu ka anyi ga-esi nyere gi aka?"},
+    })
+    assert vp.validate_pack(doc) == []
+
+
+def test_i18n_absent_accepted():
+    assert vp.validate_pack(load("valid_minimal.yaml")) == []
+
+
+def test_i18n_rejects_bad_shapes():
+    cases = [
+        ("not-a-mapping", "i18n must be a mapping of locale -> strings"),
+        ({"fr": {"greeting": "Bonjour"}}, "locale 'fr' must be one of en, pcm, ha, yo, ig"),
+        ({"pcm": "just a string"}, "i18n['pcm'] must be a mapping of key -> text"),
+        ({"pcm": {"greeting": ""}}, "i18n['pcm']['greeting'] must be a non-empty string"),
+        ({"pcm": {"greeting": "   "}}, "must be a non-empty string"),
+        ({"pcm": {"greeting": 42}}, "must be a non-empty string"),
+    ]
+    for i18n, expected in cases:
+        errs = vp.validate_pack(_with_i18n(i18n))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
