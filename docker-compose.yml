@@ -174,6 +174,10 @@ services:
       # per-tenant provider selection for sms/email sends.
       MESSAGING_CHANNELS: ${MESSAGING_CHANNELS:-email:smtp,sms:twilio}
       TENANT_CHANNEL_MAP: ${TENANT_CHANNEL_MAP:-}
+      # SPEC-W12 §3/§8: DND 2442 suppression + quiet-hours deferral guards.
+      DND_ENFORCEMENT: ${DND_ENFORCEMENT:-true}
+      QUIET_HOURS_DEFAULT: ${QUIET_HOURS_DEFAULT:-20:00-08:00}
+      QUIET_HOURS_OVERRIDES: ${QUIET_HOURS_OVERRIDES:-}
     volumes:
     - ./industries:/industries:ro
     ports:
@@ -200,6 +204,10 @@ services:
       AT_API_KEY: ${AT_API_KEY:-}
       AT_USERNAME: ${AT_USERNAME:-}
       AT_FROM: ${AT_FROM:-}
+      # SPEC-W12 §8: NG SMS aggregator chain (eBulksms + failover order).
+      EBULK_API_KEY: ${EBULK_API_KEY:-}
+      EBULK_USERNAME: ${EBULK_USERNAME:-}
+      SMS_PROVIDER_CHAIN: ${SMS_PROVIDER_CHAIN:-africastalking,termii,ebulksms}
       WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
       WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
       # Omnichannel inbound (SPEC-W6 Part A): provider webhooks terminate on
@@ -259,6 +267,9 @@ services:
       LEDGER_IMPL: ${LEDGER_IMPL:-sim}
       TIGERBEETLE_ADDR: tigerbeetle:3000
       MOJALOOP_ENDPOINT: http://mojaloop:8444
+      # SPEC-W12 §6/§8: Flutterwave mirror of the Paystack path.
+      FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
+      FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:-}
     ports:
     - 7004:7004
     networks:
@@ -530,7 +541,7 @@ services:
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
       LLM_BASE_URL: http://ollama:11434/v1
-      LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
+      LLM_MODEL: qwen3:8b
       LLM_API_KEY: ${LLM_API_KEY:-ollama}
       PIPER_URL: http://piper:5500
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
@@ -615,5 +626,42 @@ services:
     depends_on:
     - postgres
     - kafka
+  # SPEC-W12 §5: KYC verification service (BVN/NIN, consent-gated, mock by
+  # default). Dapr app-id kyc; publishes opendesk.kyc.resolved.v1.
+  kyc:
+    build: ./services/kyc-service
+    env_file:
+    - path: .env
+      required: false
+    environment:
+      DAPR_HOST: daprd-kyc
+      DAPR_HTTP_PORT: '3500'
+      KAFKA_BROKERS: kafka:9092
+      REDIS_ADDR: redis:6379
+      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      PORT: '7013'
+      PG_DATABASE: kyc
+      DATABASE_URL: postgres://opendesk:opendesk@postgres:5432/kyc
+      KYC_MOCK: ${KYC_MOCK:-1}
+      # Consent gate: identity GET /internal/consents/check (Dapr app-id
+      # identity); empty = Dapr invoke via the sidecar.
+      IDENTITY_URL: ${IDENTITY_URL:-}
+      KYC_RESOLVED_TOPIC: opendesk.kyc.resolved.v1
+    ports:
+    - 7013:7013
+    networks:
+    - opendesk
+    depends_on:
+    - postgres
+    - kafka
+    - identity
+  daprd-kyc:
+    image: daprio/daprd:1.14.4
+    command: *id001
+    volumes: *id002
+    networks: *id003
+    environment:
+      DAPR_APP_ID: kyc
+      DAPR_APP_PORT: '7013'
 volumes:
   ollama-models: null
