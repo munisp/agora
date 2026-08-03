@@ -38,6 +38,16 @@ import * as React from "react";
  * JSON body of every /voice/chat request (additive key — the server
  * tolerates unknown keys). Request bodies without a location fix (or
  * without consent) pass through byte-identical.
+ *
+ * Attribution (SPEC-W13, Agent E): embed.js also forwards the host page's
+ * first-touch URL attribution as {type:"opendesk:attribution",
+ * attribution:{utm?, promo_code?, ref?}}. The same fetch tap merges it as
+ * `attribution` into /voice/chat JSON bodies, exactly like client_location
+ * (additive key; the server tolerates unknown keys). Precedence
+ * (promo_code > UTM > QR slug > channel_of_first_touch) and the
+ * first-touch-never-overwritten rule are enforced server-side
+ * (SPEC-W13 §3/§6) — the widget only forwards. Bodies pass through
+ * byte-identical when no attribution was received.
  */
 
 /** GPS fix forwarded by the embed.js loader (host page, consent-gated). */
@@ -87,6 +97,75 @@ function withClientLocation(init?: RequestInit): RequestInit | undefined {
     return {
       ...init,
       body: JSON.stringify({ ...(body as Record<string, unknown>), client_location: clientLocation }),
+    };
+  } catch {
+    return init;
+  }
+}
+
+/** UTM triplet captured from the host page URL (SPEC-W13). */
+interface AttributionUtm {
+  source?: string;
+  medium?: string;
+  campaign?: string;
+}
+
+/** First-touch attribution forwarded by the embed.js loader (SPEC-W13). */
+interface Attribution {
+  utm?: AttributionUtm;
+  promo_code?: string;
+  ref?: string;
+}
+
+/** Latest attribution payload; null until the host page forwards one. */
+let attribution: Attribution | null = null;
+
+const ATTR_MAX_LEN = 120;
+
+/** Trim + length-cap an attribution string; null when unusable. */
+function cleanAttrString(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const v = raw.trim();
+  return v && v.length <= ATTR_MAX_LEN ? v : undefined;
+}
+
+/** Validate an opendesk:attribution payload; returns null when unusable. */
+function sanitizeAttribution(raw: unknown): Attribution | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const a = raw as Record<string, unknown>;
+  const out: Attribution = {};
+  if (a.utm && typeof a.utm === "object" && !Array.isArray(a.utm)) {
+    const u = a.utm as Record<string, unknown>;
+    const utm: AttributionUtm = {};
+    const source = cleanAttrString(u.source);
+    const medium = cleanAttrString(u.medium);
+    const campaign = cleanAttrString(u.campaign);
+    if (source) utm.source = source;
+    if (medium) utm.medium = medium;
+    if (campaign) utm.campaign = campaign;
+    if (utm.source || utm.medium || utm.campaign) out.utm = utm;
+  }
+  const promo = cleanAttrString(a.promo_code);
+  if (promo) out.promo_code = promo;
+  const ref = cleanAttrString(a.ref);
+  if (ref) out.ref = ref;
+  return out.utm || out.promo_code || out.ref ? out : null;
+}
+
+/**
+ * Merge attribution into a /voice/chat request body (SPEC-W13) — same
+ * additive-key contract as withClientLocation. Returns the original init
+ * untouched when there is no attribution, no JSON string body, or the body
+ * is not a plain JSON object — never throws.
+ */
+function withAttribution(init?: RequestInit): RequestInit | undefined {
+  if (!attribution || !init || typeof init.body !== "string") return init;
+  try {
+    const body = JSON.parse(init.body) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return init;
+    return {
+      ...init,
+      body: JSON.stringify({ ...(body as Record<string, unknown>), attribution }),
     };
   } catch {
     return init;
@@ -226,7 +305,10 @@ function acquireFetchTap(listener: ActionListener): () => void {
         if (chatUrl && new URL(chatUrl, window.location.href).pathname.endsWith("/voice/chat")) {
           // SPEC-W11 Part D: merge the consented GPS fix (if any) into the
           // chat payload; bodies pass through untouched without a fix.
-          effectiveInit = withClientLocation(init);
+          // SPEC-W13: then merge first-touch attribution (if any) the same
+          // way. Each merger returns init untouched when it has nothing to
+          // add, so composition stays byte-identical in the empty case.
+          effectiveInit = withAttribution(withClientLocation(init));
         }
       } catch {
         /* never rewrite on error */
@@ -398,9 +480,31 @@ export function UiActionsBridge({ offerings }: { offerings: BridgeOffering[] }) 
     };
     window.addEventListener("message", onLocationMessage);
 
+    // SPEC-W13: receive first-touch URL attribution from the embed.js
+    // loader on the host page. Same trust rules as the location message:
+    // direct parent frame only, origin-checked against the referrer when
+    // available. The latest payload wins locally; the backend enforces the
+    // first-touch-never-overwritten rule on the lead record itself.
+    const onAttributionMessage = (event: MessageEvent) => {
+      try {
+        if (window.parent === window || event.source !== window.parent) return;
+        const data = event.data as { type?: unknown; attribution?: unknown } | null;
+        if (!data || data.type !== "opendesk:attribution") return;
+        if (document.referrer) {
+          if (event.origin !== new URL(document.referrer).origin) return;
+        }
+        const attr = sanitizeAttribution(data.attribution);
+        if (attr) attribution = attr;
+      } catch {
+        /* attribution capture is best-effort */
+      }
+    };
+    window.addEventListener("message", onAttributionMessage);
+
     const release = acquireFetchTap(execute);
     return () => {
       window.removeEventListener("message", onLocationMessage);
+      window.removeEventListener("message", onAttributionMessage);
       release();
     };
   }, []);
