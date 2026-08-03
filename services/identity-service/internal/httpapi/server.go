@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/opendesk/identity-service/internal/apps"
 	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
 	"github.com/opendesk/identity-service/internal/events"
@@ -37,6 +38,9 @@ type Deps struct {
 	// Consents is the NDPA consent registry handler (SPEC-W12 §4); nil
 	// disables the consent routes (tests).
 	Consents *consent.Handler
+	// Apps is the app platform registry handler (SPEC-W18 §1); nil disables
+	// the apps routes (tests).
+	Apps *apps.Handler
 }
 
 // NewRouter builds the chi router with all routes.
@@ -71,6 +75,11 @@ func NewRouter(d Deps) http.Handler {
 	// SPEC-W12 §4: NDPA consent registry (/v1/consents*, /internal/consents/check).
 	if d.Consents != nil {
 		d.Consents.RegisterRoutes(r)
+	}
+	// SPEC-W18 §1: app platform registry (/v1/apps, /v1/tenants/{slug}/apps*,
+	// /internal/entitlements/check).
+	if d.Apps != nil {
+		d.Apps.RegisterRoutes(r)
 	}
 	return r
 }

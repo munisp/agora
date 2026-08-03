@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/opendesk/identity-service/internal/apps"
 	"github.com/opendesk/identity-service/internal/config"
 	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
@@ -78,6 +79,36 @@ func run() error {
 		Logger:       logger,
 	}
 
+	// SPEC-W18 §1/§3: app platform registry. The embedded catalog.yaml is
+	// validated and upserted into platform_apps at boot (idempotent); a
+	// malformed catalog is boot-fatal (packs.Load idiom).
+	appsStore, err := apps.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer appsStore.Close()
+	catalog, err := apps.LoadCatalog()
+	if err != nil {
+		return fmt.Errorf("load app catalog: %w", err)
+	}
+	n, err := appsStore.EnsureCatalog(ctx, catalog)
+	if err != nil {
+		return fmt.Errorf("upsert app catalog: %w", err)
+	}
+	logger.Info("app catalog upserted", zap.Int("apps", n))
+	appsHandler := &apps.Handler{
+		Repo:    appsStore,
+		Tenants: st,
+		Authz:   permify.NewHTTPClient(cfg.PermifyURL),
+		Publisher: &apps.Publisher{
+			Events: daprClient,
+			PubSub: cfg.PubSubName,
+			Topic:  cfg.AppsLifecycleTopic,
+			Logger: logger,
+		},
+		Logger: logger,
+	}
+
 	deps := httpapi.Deps{
 		Store:             st,
 		Keycloak:          keycloak.New(cfg.KeycloakURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret),
@@ -89,6 +120,7 @@ func run() error {
 		Packs:             registry,
 		Logger:            logger,
 		Consents:          consents,
+		Apps:              appsHandler,
 	}
 
 	srv := &http.Server{
