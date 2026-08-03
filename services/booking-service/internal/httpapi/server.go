@@ -15,6 +15,8 @@ import (
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/daprc"
+	"github.com/opendesk/booking-service/internal/devices"
+	"github.com/opendesk/booking-service/internal/fieldcapture"
 	"github.com/opendesk/booking-service/internal/geo"
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/leads"
@@ -79,6 +81,12 @@ type Deps struct {
 	// Payouts serves GET /v1/payouts (SPEC-W14 Agent B: the payout queue
 	// for Agent C's admin page). Nil → 503.
 	Payouts *referrals.PayoutStore
+	// Devices serves the SPEC-W16 push device-token endpoints (contract §1:
+	// /v1/devices + GET /internal/devices?contact_id=). Nil → 503.
+	Devices *devices.Handlers
+	// FieldCapture serves POST /v1/field/capture (SPEC-W16 contract §4:
+	// the offline-queue flush endpoint). Nil → 503.
+	FieldCapture *fieldcapture.Handlers
 }
 
 type ctxKey string
@@ -217,6 +225,20 @@ func NewRouter(d Deps) http.Handler {
 		// SPEC-W14 Agent B (additive): the payout queue read by Agent C's
 		// payouts page — view_analytics like the other commission reads.
 		r.With(s.require("view_analytics")).Get("/payouts", s.listPayouts)
+		// SPEC-W16 Agent B (additive): push device tokens (contract §1).
+		// Register/unregister are manage_bookings (least-privileged
+		// existing write perm — staff register from the field app; there
+		// is no lighter write permission in the Permify schema); the
+		// inventory read is view_analytics like the other CAC reads.
+		r.Route("/devices", func(r chi.Router) {
+			r.With(s.require("manage_bookings")).Post("/", s.devicesHandler((*devices.Handlers).Register))
+			r.With(s.require("manage_bookings")).Delete("/{token}", s.devicesHandler((*devices.Handlers).Unregister))
+			r.With(s.require("view_analytics")).Get("/", s.devicesHandler((*devices.Handlers).List))
+		})
+		// SPEC-W16 Agent B (additive): field PWA / mobile offline-queue
+		// flush (contract §4). manage_bookings — same posture as the lead
+		// capture + contact-location writes it performs.
+		r.With(s.require("manage_bookings")).Post("/field/capture", s.fieldCaptureHandler)
 	})
 
 	// Public promo redemption (SPEC-W13 §6): rate-limited, idempotent per
@@ -293,6 +315,16 @@ func NewRouter(d Deps) http.Handler {
 	r.Route("/internal/campaigns", func(r chi.Router) {
 		r.Use(s.tenantMiddleware)
 		r.Get("/{id}/spend-sum", s.campaignSpendSum)
+	})
+
+	// Internal device-token lookup (SPEC-W16 contract §1): the
+	// notification-worker's SendPushNotification activity invokes this via
+	// Dapr to fan out to a contact's devices. Tenant resolution is the
+	// usual X-Tenant-Slug middleware; no Permify guard (internal only).
+	// Response shape is frozen for Agent A.
+	r.Route("/internal/devices", func(r chi.Router) {
+		r.Use(s.tenantMiddleware)
+		r.Get("/", s.devicesHandler((*devices.Handlers).ListInternal))
 	})
 
 	return r
@@ -406,6 +438,29 @@ func (s *server) geoHandler(fn func(*geo.Handlers, http.ResponseWriter, *http.Re
 func userFrom(ctx context.Context) string {
 	u, _ := ctx.Value(ctxUser).(string)
 	return u
+}
+
+// devicesHandler adapts a devices.Handlers method to http.HandlerFunc,
+// injecting the tenant context (SPEC-W16 Agent B; same pattern as
+// geoHandler). Answers 503 when the devices store is not configured.
+func (s *server) devicesHandler(fn func(*devices.Handlers, http.ResponseWriter, *http.Request, bookingops.TenantInfo)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.d.Devices == nil {
+			writeError(w, http.StatusServiceUnavailable, "devices unavailable")
+			return
+		}
+		fn(s.d.Devices, w, r, tenantFrom(r.Context()))
+	}
+}
+
+// fieldCaptureHandler adapts POST /v1/field/capture (SPEC-W16 Agent B).
+// Answers 503 when the field-capture service is not configured.
+func (s *server) fieldCaptureHandler(w http.ResponseWriter, r *http.Request) {
+	if s.d.FieldCapture == nil {
+		writeError(w, http.StatusServiceUnavailable, "field capture unavailable")
+		return
+	}
+	s.d.FieldCapture.Capture(w, r, tenantFrom(r.Context()))
 }
 
 // ---------------------------------------------------------------------------
