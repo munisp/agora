@@ -31,6 +31,12 @@ type Server struct {
 	IncidentSecrets map[string]string // INCIDENT_WEBHOOK_SECRETS parsed (tenant slug|id → secret)
 	IncidentIngest  IncidentIngester  // nil: forward disabled, posts drop + 200
 
+	// USSD inbound (SPEC-W12 Agent A): POST /webhooks/ussd.
+	USSD *USSDConfig // nil: USSD disabled, callbacks get the fallback END line
+
+	// NG SMS aggregator failover chain (SPEC-W12 Agent A): POST /v1/sms/send.
+	SMSChain *provider.Failover // nil: chain endpoint disabled (503)
+
 	Metrics *metrics.Registry
 	Log     *zap.Logger
 }
@@ -56,6 +62,9 @@ func (s *Server) Router() http.Handler {
 		r.Post("/africastalking/sms", s.handleATSMS)
 		r.Post("/whatsapp/send", s.handleWhatsAppSend)
 		r.Post("/telegram/send", s.handleTelegramSend)
+		// SPEC-W12 Agent A: failover chain across the NG SMS aggregators
+		// (SMS_PROVIDER_CHAIN order, per-provider circuit breaker).
+		r.Post("/sms/send", s.handleChainSMS)
 	})
 
 	// Omnichannel inbound webhooks (SPEC-W6 Part A). Public by design —
@@ -69,9 +78,11 @@ func (s *Server) Router() http.Handler {
 		// APISIX /webhooks/* route, authenticated by the per-tenant shared
 		// secret in the body.
 		r.Post("/incidents", s.handleIncidentWebhook)
+		// USSD session callback (SPEC-W12 Agent A §1): Africa's Talking
+		// posts the session form here; the answer is the text/plain
+		// CON/END line shown to the subscriber. See docs/channels-ussd.md.
+		r.Post("/ussd", s.handleUSSDCallback)
 	})
-	// Future: POST /v1/ussd/session (Termii / AT USSD gateways) — see
-	// docs/integrations/messaging-channels.md.
 	return r
 }
 
@@ -133,6 +144,42 @@ func (s *Server) handleWhatsAppSend(w http.ResponseWriter, r *http.Request) {
 	}
 	status, body, err := s.WhatsApp.SendMessage(r.Context(), req.To, req.Message, req.Template)
 	s.respond(w, r, status, body, err)
+}
+
+// handleChainSMS (SPEC-W12 Agent A) sends via the SMS_PROVIDER_CHAIN
+// failover chain. The response names the provider that accepted the send
+// (reporting); provider 4xx maps to 400 (caller fault, no failover
+// happened), chain exhaustion to 502.
+func (s *Server) handleChainSMS(w http.ResponseWriter, r *http.Request) {
+	var req smsRequest
+	if !decodeJSON(w, r, &req) || !requireToMessage(w, req.To, req.Message) {
+		return
+	}
+	if s.SMSChain == nil || len(s.SMSChain.Entries()) == 0 {
+		writeError(w, http.StatusServiceUnavailable, "sms provider chain not configured (SMS_PROVIDER_CHAIN)")
+		return
+	}
+	name, status, body, err := s.SMSChain.SendSMS(r.Context(), req.To, req.Message, req.SenderID)
+	if err != nil {
+		if provider.ClientError(err) {
+			pe := err.(*provider.Error) //nolint:errcheck // guaranteed by ClientError
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":           "provider rejected the request",
+				"provider":        name,
+				"provider_status": status,
+				"provider_body":   pe.Body,
+			})
+			return
+		}
+		s.Log.Warn("sms failover chain exhausted", zap.String("path", r.URL.Path), zap.Error(err))
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "all sms providers failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provider":        name,
+		"provider_status": status,
+		"provider_body":   string(body),
+	})
 }
 
 // respond maps a provider outcome onto the gateway response: provider 4xx →

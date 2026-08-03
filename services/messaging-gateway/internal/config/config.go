@@ -44,6 +44,22 @@ type Config struct {
 	// IoT incident ingest (SPEC-W11 Part B §6): POST /webhooks/incidents.
 	IncidentWebhookSecrets string // INCIDENT_WEBHOOK_SECRETS raw JSON {"<tenant_slug|tenant_id>": "<secret>"}
 	BookingURL             string // BOOKING_URL override (tests, no-Dapr dev); empty = Dapr invoke booking
+
+	// eBulksSMS (SPEC-W12 Agent A; https://api.ebulksms.com — request shape
+	// is an ASSUMPTION, no live keys this wave).
+	EBulkAPIKey   string // EBULK_API_KEY
+	EBulkUsername string // EBULK_USERNAME
+	EBulkSender   string // EBULK_SENDER default sender id (optional)
+	EBulkBaseURL  string // EBULK_BASE_URL override (tests), default https://api.ebulksms.com
+
+	// SMS failover chain (SPEC-W12 Agent A).
+	SMSProviderChain string // SMS_PROVIDER_CHAIN csv, default "africastalking,termii,ebulksms"
+
+	// USSD inbound (SPEC-W12 Agent A): POST /webhooks/ussd.
+	IdentityURL        string // IDENTITY_URL override (tests, no-Dapr dev); empty = Dapr invoke identity
+	USSDSessionBackend string // USSD_SESSION_BACKEND: "memory" (default) | "dapr"
+	USSDStateStore     string // USSD_STATE_STORE Dapr component name (backend=dapr), default "statestore"
+	USSDSessionTTL     int    // USSD_SESSION_TTL_SECONDS, default 180 (contract §1)
 }
 
 // Load reads configuration from the environment.
@@ -71,6 +87,15 @@ func Load() Config {
 		DaprHTTPPort:           envInt("DAPR_HTTP_PORT", 3500),
 		IncidentWebhookSecrets: os.Getenv("INCIDENT_WEBHOOK_SECRETS"),
 		BookingURL:             os.Getenv("BOOKING_URL"),
+		EBulkAPIKey:            os.Getenv("EBULK_API_KEY"),
+		EBulkUsername:          os.Getenv("EBULK_USERNAME"),
+		EBulkSender:            os.Getenv("EBULK_SENDER"),
+		EBulkBaseURL:           envStr("EBULK_BASE_URL", "https://api.ebulksms.com"),
+		SMSProviderChain:       envStr("SMS_PROVIDER_CHAIN", "africastalking,termii,ebulksms"),
+		IdentityURL:            os.Getenv("IDENTITY_URL"),
+		USSDSessionBackend:     envStr("USSD_SESSION_BACKEND", "memory"),
+		USSDStateStore:         envStr("USSD_STATE_STORE", "statestore"),
+		USSDSessionTTL:         envInt("USSD_SESSION_TTL_SECONDS", 180),
 	}
 }
 

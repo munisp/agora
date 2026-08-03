@@ -91,6 +91,55 @@ func run() error {
 	srv.IncidentIngest = httpapi.NewIncidentIngester(httpapi.ResolveIncidentBase(cfg.BookingURL, cfg.DaprHTTPPort))
 	logger.Info("incident webhook configured", zap.Int("tenant_secrets", len(incidentSecrets)))
 
+	// NG SMS aggregator failover chain (SPEC-W12 Agent A): ordered chain
+	// from SMS_PROVIDER_CHAIN with per-provider circuit breakers; the
+	// price-tier annotations are relative cost hints used for reporting
+	// only. Each provider's Client meters per-provider sends
+	// (messaging_gateway_sends_total{provider,result}).
+	ebulk := &provider.EBulkSMS{
+		Client:   provider.NewClient("ebulksms", reg, logger),
+		BaseURL:  cfg.EBulkBaseURL,
+		APIKey:   cfg.EBulkAPIKey,
+		Username: cfg.EBulkUsername,
+		Sender:   cfg.EBulkSender,
+	}
+	srv.SMSChain = provider.NewFailover(map[string]provider.SMSProvider{
+		"africastalking": srv.AT,
+		"termii":         srv.Termii,
+		"ebulksms":       ebulk,
+	}, cfg.SMSProviderChain, logger)
+	for _, e := range srv.SMSChain.Entries() {
+		logger.Info("sms provider chain entry",
+			zap.String("provider", e.Name),
+			zap.Float64("price_tier", e.PriceTier),
+			zap.Bool("configured", e.Provider.Configured()))
+	}
+
+	// USSD inbound (SPEC-W12 Agent A §1): session store + tenant menu fetch
+	// + the synchronous conversation-service turn client. The conversation
+	// base is the SAME Dapr invoke path the omnichannel bridge uses.
+	var ussdStore channel.USSDSessionStore
+	switch cfg.USSDSessionBackend {
+	case "dapr":
+		ussdStore = channel.NewDaprUSSDStore(cfg.USSDStateStore, cfg.DaprHTTPPort)
+	default:
+		if cfg.USSDSessionBackend != "memory" {
+			logger.Warn("unknown USSD_SESSION_BACKEND, using memory",
+				zap.String("backend", cfg.USSDSessionBackend))
+		}
+		ussdStore = channel.NewMemoryUSSDStore()
+	}
+	srv.USSD = &httpapi.USSDConfig{
+		Sites:        siteMap,
+		Store:        ussdStore,
+		Menus:        channel.NewUSSDMenuFetcher(channel.ResolveInvokeBase(cfg.IdentityURL, "identity", cfg.DaprHTTPPort)),
+		Conversation: channel.NewUSSDConversation(convBase),
+		SessionTTL:   time.Duration(cfg.USSDSessionTTL) * time.Second,
+	}
+	logger.Info("ussd channel configured",
+		zap.String("session_backend", cfg.USSDSessionBackend),
+		zap.Int("session_ttl_s", cfg.USSDSessionTTL))
+
 	logger.Info("messaging-gateway configured",
 		zap.Bool("termii", srv.Termii.Configured()),
 		zap.Bool("africastalking", srv.AT.Configured()),
