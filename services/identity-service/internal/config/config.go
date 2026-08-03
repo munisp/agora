@@ -23,6 +23,7 @@ type Config struct {
 	PubSubName           string        // Dapr pubsub component (default pubsub-kafka)
 	IdentityEventsTopic  string        // Kafka topic for identity events
 	NotificationAppID    string        // Dapr app-id of notification-worker (onboarding trigger)
+	ConsentErasureTopic  string        // Kafka topic for consent erasure CloudEvents (SPEC-W12 §4)
 	IndustriesDir        string        // mounted industry packs dir (INDUSTRIES_DIR, default /industries)
 	ShutdownTimeout      time.Duration // graceful shutdown budget
 }
@@ -43,6 +44,7 @@ func Load() (Config, error) {
 		PubSubName:           envStr("DAPR_PUBSUB_NAME", "pubsub-kafka"),
 		IdentityEventsTopic:  envStr("IDENTITY_EVENTS_TOPIC", "opendesk.identity.events"),
 		NotificationAppID:    envStr("NOTIFICATION_APP_ID", "notification"),
+		ConsentErasureTopic:  envStr("CONSENT_ERASURE_TOPIC", "opendesk.consent.erasure.v1"),
 		IndustriesDir:        envStr("INDUSTRIES_DIR", "/industries"),
 		ShutdownTimeout:      time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 15)) * time.Second,
 	}

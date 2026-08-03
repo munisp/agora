@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/opendesk/identity-service/internal/config"
+	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
 	"github.com/opendesk/identity-service/internal/httpapi"
 	"github.com/opendesk/identity-service/internal/keycloak"
@@ -59,16 +60,35 @@ func run() error {
 	logger.Info("industry packs loaded",
 		zap.String("dir", cfg.IndustriesDir), zap.Strings("packs", registry.IDs()))
 
+	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
+
+	// SPEC-W12 §4: NDPA consent registry (own store/pool with RLS-enforced
+	// consents table; routes registered additively by httpapi).
+	consentStore, err := consent.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer consentStore.Close()
+	consents := &consent.Handler{
+		Repo:         consentStore,
+		Tenants:      st,
+		Events:       daprClient,
+		PubSub:       cfg.PubSubName,
+		ErasureTopic: cfg.ConsentErasureTopic,
+		Logger:       logger,
+	}
+
 	deps := httpapi.Deps{
 		Store:             st,
 		Keycloak:          keycloak.New(cfg.KeycloakURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret),
 		Permify:           permify.NewHTTPClient(cfg.PermifyURL),
-		Dapr:              daprc.New(cfg.DaprHost, cfg.DaprHTTPPort),
+		Dapr:              daprClient,
 		PubSub:            cfg.PubSubName,
 		Topic:             cfg.IdentityEventsTopic,
 		NotificationAppID: cfg.NotificationAppID,
 		Packs:             registry,
 		Logger:            logger,
+		Consents:          consents,
 	}
 
 	srv := &http.Server{
