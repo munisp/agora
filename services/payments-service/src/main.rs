@@ -7,6 +7,7 @@ mod config;
 mod consumer;
 mod dapr;
 mod events;
+mod flutterwave;
 mod ledger;
 mod mojaloop;
 mod routes;
@@ -27,6 +28,10 @@ pub struct AppState {
     pub ledger: Arc<dyn LedgerClient>,
     pub outbox: dapr::DaprOutbox,
     pub mojaloop: mojaloop::MojaloopAdapter,
+    /// SPEC-W12 §6: Flutterwave checkout rail (env-configured; initialize is
+    /// 503 until FLUTTERWAVE_SECRET_KEY is set, webhook 503 until
+    /// FLUTTERWAVE_SECRET_HASH is set).
+    pub flutterwave: flutterwave::FlutterwaveAdapter,
     pub config: Arc<config::Config>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
@@ -125,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ledger,
         outbox,
         mojaloop: mojaloop::MojaloopAdapter::new(cfg.mojaloop_endpoint.clone()),
+        flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
         config: Arc::new(cfg.clone()),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
@@ -137,7 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let app = routes::router(state);
+    // SPEC-W12 §6: Flutterwave routes merged additively (module self-registers
+    // /v1/payments/flutterwave/initialize + /webhooks/flutterwave).
+    let app = routes::router(state.clone()).merge(flutterwave::router(state));
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "payments-service listening");
