@@ -75,6 +75,7 @@ raw casing and lets dbt normalize.
 | `GET /metrics` | Prometheus text: `analytics_messages_consumed_total`, `analytics_rows_written_total`, `analytics_flushes_total{outcome}`, `analytics_flush_duration_seconds`, `analytics_buffer_messages`, `analytics_consumer_lag`, `analytics_consumer_running`. |
 | `GET /v1/recommendations?tenant=<uuid>` | SPEC-W3 §3 innovation 9: latest pricing recommendation per offering for the tenant, read via pyiceberg scan of `gold.reco_pricing` (written by `infra/lakehouse/spark/jobs/revenue_intelligence.py`; uses the same `ICEBERG_REST_URI`/S3 env as the sink). Returns `{"tenant", "recommendations": [...]}` with peak-hour stats, `suggested_peak_multiplier` and `suggested_deposit_pct`; **empty list when the table does not exist yet** (no Spark run), 502 on lakehouse errors. |
 | `GET /v1/metering?tenant=<uuid>&from=<date>&to=<date>` | Wave 5 #9: aggregated usage rows `{tenant_id, date, metric, total_value}` per tenant, read via pyiceberg scan of `bronze.usage_events` (same shape as the dbt `gold.usage_daily` mart, so results are consistent whether or not dbt has run). `from`/`to` are optional inclusive ISO dates; 400 on malformed/inverted ranges, 502 on lakehouse errors. **Empty list when no usage exists yet** — see *Usage metering (Wave 5 #9)* below. |
+| `GET /v1/cac/summary?from=<date>&to=<date>` | SPEC-W13 §5: CAC dashboard summary `{by_channel, by_lga, blended_cac_ngn, ltv_ngn, payback_days_estimate, data_quality}` from the realtime Postgres rollups (`analytics_meta.cac_rollup_*`, tenant-RLS'd) fed by the `cac.events` consumer (group `analytics-cac`, idempotent on `idempotency_key`). Tenant via `X-Tenant-Slug` header (resolved through identity-service) or `?tenant=<uuid>`. Campaign spend is joined from booking-service (`GET /internal/campaigns/{id}/spend-sum` via Dapr) and **never fails the summary** — outages mark `data_quality: "spend_unavailable"` and count as 0. Full contract: `docs/cac-analytics-api.md`. |
 
 ## Usage metering (Wave 5 #9) — monetization hook
 
@@ -118,6 +119,14 @@ already in place).
 | `AUTO_CREATE_TABLES` | `true` | Create `bronze` namespace + tables on boot. |
 | `STARTUP_RETRY_SECONDS` / `STARTUP_MAX_ATTEMPTS` | `5` / `60` | Dependency wait loop. |
 | `PORT` / `HOST` | `7009` / `0.0.0.0` | Sidecar bind. |
+| `CAC_EVENTS_TOPIC` | `cac.events` | SPEC-W13 funnel event topic. |
+| `CAC_EVENTS_GROUP` | `analytics-cac` | SPEC-W13 consumer group. |
+| `PG_DSN` / `PG_DATABASE` | `postgres://opendesk:opendesk@postgres:5432` / `analytics_meta` | CAC rollup store (base DSN + database). |
+| `PG_MIN_SIZE` / `PG_MAX_SIZE` | `1` / `4` | CAC store asyncpg pool. |
+| `DAPR_HOST` / `DAPR_HTTP_PORT` | `daprd-analytics` / `3500` | Dapr sidecar (spend join + tenant resolution). |
+| `BOOKING_APP_ID` / `IDENTITY_APP_ID` | `booking` / `identity` | Dapr app-ids. |
+| `TENANT_CACHE_TTL_SECONDS` | `300` | Tenant slug cache TTL (stale-on-outage). |
+| `CAC_CONSUMER_ENABLED` | `true` | `false` = bronze sink only; `/v1/cac/summary` answers 503. |
 
 ## Run
 

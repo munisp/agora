@@ -39,3 +39,14 @@ CONSUMER_UP = Gauge(
     "analytics_consumer_running",
     "1 when the Kafka consumer loop is running.",
 )
+# SPEC-W13: cac.events -> Postgres rollup consumer.
+CAC_EVENTS_PROCESSED = Counter(
+    "analytics_cac_events_processed_total",
+    "cac.events funnel events applied to the rollups (replay = idempotency dedupe).",
+    ["outcome"],  # applied | replay
+)
+CAC_SPEND_LOOKUPS = Counter(
+    "analytics_cac_spend_lookups_total",
+    "Campaign spend-sum lookups against booking-service by outcome.",
+    ["outcome"],  # ok | unavailable
+)

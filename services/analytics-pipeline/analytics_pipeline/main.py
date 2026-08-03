@@ -12,10 +12,15 @@ import signal
 import structlog
 import uvicorn
 
+from .cac_consumer import CacConsumer
+from .cac_store import CacStore
+from .cac_summary import BookingSpendClient
 from .config import load_settings
 from .consumer import BronzeConsumer
+from .dapr_client import DaprClient
 from .iceberg_tables import IcebergSink, ensure_bronze, load_rest_catalog
-from .server import create_app
+from .server import CacDeps, create_app
+from .tenants import TenantResolver
 
 log = structlog.get_logger()
 
@@ -77,8 +82,29 @@ async def amain() -> None:
     consumer = BronzeConsumer(settings, sink)
     await _with_retry(consumer.start, "kafka", settings)
 
+    # SPEC-W13: CAC rollup module (cac.events -> Postgres analytics_meta).
+    cac_deps: CacDeps | None = None
+    cac_consumer: CacConsumer | None = None
+    dapr: DaprClient | None = None
+    if settings.cac_consumer_enabled:
+        cac_store = CacStore(settings)
+        await _with_retry(cac_store.connect, "postgres", settings)
+        await _with_retry(cac_store.ensure_schema, "postgres-ddl", settings)
+        dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
+        cac_deps = CacDeps(
+            store=cac_store,
+            spend=BookingSpendClient(dapr, settings.booking_app_id),
+            tenants=TenantResolver(
+                dapr, settings.identity_app_id, settings.tenant_cache_ttl_seconds
+            ),
+        )
+        cac_consumer = CacConsumer(settings, cac_store)
+        await _with_retry(cac_consumer.start, "kafka-cac", settings)
+    else:
+        log.info("cac.disabled")
+
     ready_flag = {"ready": True}
-    app = create_app(consumer, ready_flag, settings)
+    app = create_app(consumer, ready_flag, settings, cac_deps)
     server = uvicorn.Server(
         uvicorn.Config(app, host=settings.host, port=settings.port,
                        log_level="info", access_log=False)
@@ -91,13 +117,25 @@ async def amain() -> None:
 
     consumer_task = asyncio.create_task(consumer.run(stop_event))
     server_task = asyncio.create_task(server.serve())
+    cac_task = (
+        asyncio.create_task(cac_consumer.run(stop_event))
+        if cac_consumer is not None
+        else None
+    )
 
     await stop_event.wait()
     log.info("shutdown.requested")
     ready_flag["ready"] = False
     server.should_exit = True
     await consumer.stop()
-    await asyncio.gather(consumer_task, server_task, return_exceptions=True)
+    if cac_consumer is not None:
+        await cac_consumer.stop()
+    tasks = [consumer_task, server_task] + ([cac_task] if cac_task else [])
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if cac_deps is not None:
+        await cac_deps.store.close()
+    if dapr is not None:
+        await dapr.aclose()
     log.info("shutdown.complete")
 
 

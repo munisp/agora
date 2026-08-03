@@ -1,21 +1,26 @@
 """FastAPI sidecar: GET /healthz (consumer lag per topic), GET /metrics,
-GET /v1/recommendations (SPEC-W3 §3) and GET /v1/metering (Wave 5 #9)."""
+GET /v1/recommendations (SPEC-W3 §3), GET /v1/metering (Wave 5 #9) and
+GET /v1/cac/summary (SPEC-W13 contract §5)."""
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 import structlog
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+from .cac_summary import SpendFetcher, fetch_summary
+from .cac_store import CacStore
 from .config import Settings
 from .consumer import BronzeConsumer
 from .metering import fetch_usage
 from .recommendations import fetch_recommendations
+from .tenants import TenantNotFoundError, TenantResolutionError, TenantResolver
 
 log = structlog.get_logger()
 
@@ -31,8 +36,21 @@ def _parse_date(raw: str | None, param: str) -> date | None:
         ) from None
 
 
+@dataclass
+class CacDeps:
+    """SPEC-W13 wiring for GET /v1/cac/summary. None when the CAC module is
+    disabled (CAC_CONSUMER_ENABLED=false) — the route then answers 503."""
+
+    store: CacStore
+    spend: SpendFetcher
+    tenants: TenantResolver
+
+
 def create_app(
-    consumer: BronzeConsumer, ready_flag: dict[str, bool], settings: Settings
+    consumer: BronzeConsumer,
+    ready_flag: dict[str, bool],
+    settings: Settings,
+    cac: CacDeps | None = None,
 ) -> FastAPI:
     app = FastAPI(title="opendesk-analytics-pipeline", version="0.1.0")
 
@@ -89,5 +107,50 @@ def create_app(
             log.warning("metering.failed", error=str(exc))
             raise HTTPException(status_code=502, detail=f"lakehouse error: {exc}") from exc
         return {"tenant": tenant, "usage": items}
+
+    @app.get("/v1/cac/summary")
+    async def cac_summary(
+        from_: str | None = Query(default=None, alias="from"),
+        to: str | None = None,
+        tenant: str | None = Query(default=None),
+        x_tenant_slug: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """CAC dashboard summary (SPEC-W13 contract §5): realtime rollups
+        from cac.events + resilient campaign-spend join against
+        booking-service. Tenant comes from the X-Tenant-Slug header (resolved
+        via identity-service, same as booking-service) or, for parity with
+        the other sidecar routes, a ?tenant=<uuid> query param.
+        `from`/`to` are optional inclusive ISO dates."""
+        if cac is None:
+            raise HTTPException(status_code=503, detail="cac module disabled")
+        date_from = _parse_date(from_, "from")
+        date_to = _parse_date(to, "to")
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise HTTPException(status_code=400, detail="from must be <= to")
+
+        tenant_id: str | None = None
+        if x_tenant_slug:
+            try:
+                tenant_id = (await cac.tenants.by_slug(x_tenant_slug)).id
+            except TenantNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="tenant not found") from exc
+            except TenantResolutionError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+        elif tenant:
+            tenant_id = tenant
+        if not tenant_id:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Tenant-Slug header (or ?tenant=<uuid>) is required",
+            )
+        try:
+            return await fetch_summary(
+                settings, cac.store, cac.spend, tenant_id, date_from, date_to
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 — postgres outage
+            log.warning("cac.summary_failed", error=str(exc))
+            raise HTTPException(status_code=502, detail=f"rollup store error: {exc}") from exc
 
     return app
