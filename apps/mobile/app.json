@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "OpenDesk",
+    "slug": "opendesk-field",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "opendesk-field",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#faf7f1",
+    "splash": {
+      "backgroundColor": "#faf7f1"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.opendesk.field"
+    },
+    "android": {
+      "package": "com.opendesk.field"
+    },
+    "plugins": [
+      "expo-notifications",
+      "expo-secure-store"
+    ],
+    "extra": {
+      "apiBase": "http://localhost:9080/api/bookings",
+      "keycloak": {
+        "issuer": "http://localhost:8080/realms/opendesk",
+        "clientId": "opendesk-field",
+        "scopes": ["openid", "profile", "email", "offline_access"]
+      }
+    }
+  }
+}
