@@ -22,3 +22,7 @@ CREATE DATABASE notifications;
 -- (usage_records, rate_cards, invoices, processed_events) is applied
 -- idempotently by the service itself from services/billing-engine/migrations.
 CREATE DATABASE billing;
+-- Wave 12 (SPEC-W12): kyc-service (:7013) verification-audit database. Schema
+-- (kyc_audit with FORCE ROW LEVEL SECURITY) is applied idempotently by the
+-- service itself from services/kyc-service/internal/store.
+CREATE DATABASE kyc;

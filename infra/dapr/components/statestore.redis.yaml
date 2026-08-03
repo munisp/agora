@@ -29,3 +29,9 @@ scopes:
   - knowledge
   - voice
   - edge
+  # SPEC-W12 §1: messaging-gateway USSD session state (180s TTL) reuses this
+  # generic store — no dedicated state.ussd component needed.
+  - messaging
+  # USSD session store (USSD_SESSION_BACKEND=dapr) runs in the
+  # messaging-gateway sidecar when one is deployed (app-id messaging-gateway).
+  - messaging-gateway

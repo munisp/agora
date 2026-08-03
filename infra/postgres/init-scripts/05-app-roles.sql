@@ -109,3 +109,31 @@ ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_billing;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_billing;
+
+-- ---------------------------------------------------------------------------
+-- Wave 12 (SPEC-W12): kyc-service role
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_kyc') THEN
+        CREATE ROLE app_kyc NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_kyc_login') THEN
+        CREATE ROLE app_kyc_login LOGIN PASSWORD 'app_kyc_dev_password' IN ROLE app_kyc;
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- kyc database
+-- ---------------------------------------------------------------------------
+\c kyc
+
+GRANT CONNECT ON DATABASE kyc TO app_kyc;
+GRANT USAGE ON SCHEMA public TO app_kyc;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_kyc;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_kyc;
+ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_kyc;
+ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_kyc;

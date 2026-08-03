@@ -23,6 +23,9 @@ TOPICS=(
   opendesk.privacy.events          # PrivacyEraseRequested tombstones (GDPR, SPEC-W3 §2)
   opendesk.usage.events            # UsageRecord metering events (Wave 5 #9: bookings, call-minutes, tokens)
   opendesk.incidents               # IDPCreated Incident Data Packets (SPEC-W11: conversation-service emits, booking-service consumes)
+  opendesk.consent.erasure.v1      # consent ErasureRequested tombstones (SPEC-W12 §4: identity-service emits)
+  opendesk.kyc.resolved.v1         # KYC Resolved results (SPEC-W12 §5: kyc-service emits)
+  cac.events                       # CAC program event stream (SPEC-W12 §7)
   opendesk.dlq                     # dead letters
 )
 
