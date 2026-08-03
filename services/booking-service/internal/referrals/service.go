@@ -215,7 +215,6 @@ func (s *Service) UpdateRule(ctx context.Context, r *CommissionRule) error {
 // LedgerEntries lists the tenant's ledger rows in [from,to] (nil =
 // unbounded) — GET /v1/commissions/ledger?from&to.
 func (s *Service) LedgerEntries(ctx context.Context, tenantID uuid.UUID, from, to *time.Time) ([]LedgerEntry, error) {
-
 	return s.Ledger.Entries(ctx, tenantID, from, to)
 }
 
