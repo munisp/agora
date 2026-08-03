@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/config"
@@ -79,6 +80,26 @@ func run() error {
 
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
 	resolver := bookingops.NewTenantResolver(daprClient, cfg.IdentityAppID, cfg.IdentityCacheTTL, logger)
+
+	// SPEC-W18 Agent D — BEGIN (additive): app entitlement gate (contract
+	// §4). APP_GATE_ENABLED=false is the DEFAULT and keeps the gate a pure
+	// pass-through — production behavior is UNCHANGED unless opted in. When
+	// enabled, /v1/leads (catalog app_id "cac") is gated against identity's
+	// GET /internal/entitlements/check via the Dapr sidecar with a 60s TTL
+	// cache + singleflight, failing closed (503 + Retry-After) on
+	// entitlement outages (docs/app-developer-guide.md).
+	appGate := appgate.New(appgate.Options{
+		Enabled:       cfg.AppGateEnabled,
+		IdentityAppID: cfg.IdentityAppID,
+		BaseURL:       fmt.Sprintf("http://%s:%d", cfg.DaprHost, cfg.DaprHTTPPort),
+		CacheTTL:      cfg.AppGateCacheTTL,
+		Logger:        logger,
+	})
+	if cfg.AppGateEnabled {
+		logger.Info("app entitlement gate ENABLED (APP_GATE_ENABLED=true)",
+			zap.String("identity_app_id", cfg.IdentityAppID), zap.Duration("cache_ttl", cfg.AppGateCacheTTL))
+	}
+	// SPEC-W18 Agent D — END
 
 	// Temporal saga starter — optional at boot: when Temporal is unreachable
 	// the service still accepts bookings (they stay `pending` and the saga
@@ -311,6 +332,7 @@ func run() error {
 		Payouts:            payoutStore,          // SPEC-W14 Agent B (additive): GET /v1/payouts
 		Devices:            deviceHandlers,       // SPEC-W16 Agent B (additive): /v1/devices + /internal/devices
 		FieldCapture:       fieldCaptureHandlers, // SPEC-W16 Agent B (additive): POST /v1/field/capture
+		AppGate:            appGate,             // SPEC-W18 Agent D (additive): /v1/leads gated behind app "cac" (opt-in)
 	}
 
 	srv := &http.Server{
