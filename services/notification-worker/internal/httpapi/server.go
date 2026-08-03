@@ -28,6 +28,10 @@ type Server struct {
 	Webhooks               WebhookStore
 	ResolveTenant          func(ctx context.Context, slug string) (TenantRef, error)
 	WebhookSigningRequired bool
+
+	// DND is the SPEC-W12 DND registry (NCC 2442 + tenant opt-outs); nil
+	// disables the /v1/dnd routes (503).
+	DND DNDStore
 }
 
 // NewRouter builds the chi router.
@@ -62,6 +66,14 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/", s.listWebhooks)
 		r.Delete("/{id}", s.deleteWebhook)
 		r.Get("/{id}/deliveries", s.listWebhookDeliveries)
+	})
+
+	// DND registry (SPEC-W12 Agent B): NCC 2442 global import (admin via
+	// APISIX), opt-out honor, suppression check.
+	r.Route("/v1/dnd", func(r chi.Router) {
+		r.Post("/import", s.importDND)
+		r.Delete("/{phone}", s.deleteDND)
+		r.Get("/check", s.checkDND)
 	})
 	return r
 }
