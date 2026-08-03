@@ -27,6 +27,91 @@ Tenant provisioning and identity context for OpenDesk (SPEC §7 identity schema,
 | POST | `/internal/tenants/{slug}/ensure-group` | Idempotent Keycloak group creation (Temporal onboarding) |
 | POST | `/internal/tenants/{slug}/ensure-permify` | Idempotent Permify tenant creation |
 
+## Apps API (SPEC-W18)
+
+Platform app registry (`internal/apps`): the 16-app catalog (`platform_apps`,
+global reference, seeded from `internal/apps/catalog.yaml` via `go:embed` +
+boot upsert) and per-tenant provisioning (`tenant_apps`,
+`tenant_isolation` RLS). Operator walkthrough:
+[docs/apps-platform.md](../../docs/apps-platform.md).
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/v1/apps` | The app catalog (all 16 apps) |
+| GET | `/v1/tenants/{slug}/apps` | Catalog LEFT JOIN tenant_apps — every app with `status` (or `not_provisioned`) + `config` |
+| POST | `/v1/tenants/{slug}/apps/{app_id}` | Provision + enable (idempotent upsert; authenticated owner/admin) |
+| PATCH | `/v1/tenants/{slug}/apps/{app_id}` | Partial update `{status?, config?}` (authenticated owner/admin) |
+| DELETE | `/v1/tenants/{slug}/apps/{app_id}` | Soft disable — row kept for audit, data retained (authenticated owner/admin) |
+| GET | `/internal/entitlements/check?app_id=` | Service-to-service entitlement check (`X-Tenant-ID` or `X-Tenant-Slug` header) |
+
+**Authorization for mutations** (POST/PATCH/DELETE): an authenticated
+subject — JWT `sub` from the `Authorization` bearer or the `X-User-Id`
+header (the `twin.go` trust model) — holding Permify `manage_catalog`
+(owner/admin) on the organization. `401` without a subject, `403` without
+the permission, `502` when the authorization service is unreachable.
+
+Catalog list (`GET /v1/apps` → `200 {"apps": [{...}, ...]}`) — one row:
+
+```json
+{
+  "app_id": "receptionist",
+  "name": "AI Receptionist",
+  "version": "1.0.0",
+  "description": "Voice + text AI concierge that answers questions and books, reschedules and cancels appointments live, with warm handoff to staff.",
+  "category": "Communications",
+  "icon": "📞",
+  "nav_route": "/voice-agent",
+  "required_perms": ["manage_bookings"],
+  "default_plan_tier": "free",
+  "backend_note": "services/voice-agent-runtime + services/conversation-service; escalation call UI at /call (booking-service)."
+}
+```
+
+Tenant app list (`GET /v1/tenants/{slug}/apps` → `200 {"apps": [{...}]}`):
+the catalog rows plus `status`
+(`enabled|disabled|suspended|not_provisioned`) and `config` (`{}` when not
+provisioned).
+
+Provision + enable (`POST /v1/tenants/acme/apps/helpdesk` → `201` on first
+provision, `200` on idempotent replay):
+
+```json
+{
+  "tenant_id": "8f3d2c10-…",
+  "app_id": "helpdesk",
+  "status": "enabled",
+  "config": {},
+  "provisioned_at": "2025-01-01T12:00:00Z",
+  "provisioned_by": "user:…",
+  "updated_at": "2025-01-01T12:00:00Z"
+}
+```
+
+Partial update (`PATCH` with `{"status":"disabled"}` or
+`{"config":{"sla_hours":4}}` — `config` replaces the JSON document
+wholesale → `200` + row). `DELETE` → `200` + row with `status=disabled`;
+the row (and all app data) is retained, re-enabling reuses it.
+
+Entitlement check (`GET /internal/entitlements/check?app_id=helpdesk` with
+`X-Tenant-ID: <uuid>` or `X-Tenant-Slug: acme` — mesh-internal, deliberately
+no auth middleware, same trust level as `/internal/consents/check`): `200`
+for every **known** app, with denials carried in the body:
+
+```json
+{ "app_id": "helpdesk", "allowed": false, "reason": "disabled" }
+```
+
+`reason` ∈ `enabled|disabled|suspended|not_provisioned`. An **unknown**
+`app_id` returns `404 {"error": "unknown app: …"}` — callers must treat
+that as denied. Missing `app_id`/tenant header → `400`.
+
+Lifecycle CloudEvents (`internal/apps/publisher.go`, via the `pubsub-kafka`
+Dapr component on topic `opendesk.apps.lifecycle.v1`):
+`com.opendesk.apps.AppProvisioned` on first provision,
+`com.opendesk.apps.AppStatusChanged` on enable/disable/suspend transitions
+(incl. re-enable and DELETE); an enabled→enabled replay publishes nothing.
+Payload `{tenant_id, app_id, status, actor, ts}`.
+
 ## Environment variables
 
 | Var | Default | Description |
@@ -42,6 +127,7 @@ Tenant provisioning and identity context for OpenDesk (SPEC §7 identity schema,
 | `DAPR_HTTP_PORT` | `3500` | daprd HTTP port |
 | `DAPR_PUBSUB_NAME` | `pubsub-kafka` | Dapr pubsub component |
 | `IDENTITY_EVENTS_TOPIC` | `opendesk.identity.events` | Identity events topic |
+| `APPS_LIFECYCLE_TOPIC` | `opendesk.apps.lifecycle.v1` | App lifecycle CloudEvents topic (SPEC-W18; `AppProvisioned`/`AppStatusChanged`) |
 | `NOTIFICATION_APP_ID` | `notification` | Dapr app-id of notification-worker (fire-and-forget `POST /dev/trigger-onboarding` after provisioning starts the `TenantOnboardingWorkflow`) |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `15` | Graceful shutdown budget |
 

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
+  LayoutGrid,
   CalendarCheck,
   CalendarDays,
   Store,
@@ -64,6 +65,11 @@ const items: NavItem[] = [
   { segment: "voices", label: "Voices", icon: AudioLines },
   { external: CRM_URL, label: "CRM", icon: UsersRound },
   { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
+  // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
+  // roles (read-only); the page hides provision/enable/disable/config
+  // actions for anyone but owner/admin, and identity-service enforces the
+  // same rule on mutations.
+  { segment: "apps", label: "Apps", icon: LayoutGrid },
   { segment: "settings", label: "Settings", icon: Settings },
 ];
 
