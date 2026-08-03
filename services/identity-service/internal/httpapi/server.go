@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
 	"github.com/opendesk/identity-service/internal/events"
 	"github.com/opendesk/identity-service/internal/keycloak"
@@ -33,6 +34,9 @@ type Deps struct {
 	NotificationAppID string // Dapr app-id of notification-worker
 	Packs             *packs.Registry
 	Logger            *zap.Logger
+	// Consents is the NDPA consent registry handler (SPEC-W12 §4); nil
+	// disables the consent routes (tests).
+	Consents *consent.Handler
 }
 
 // NewRouter builds the chi router with all routes.
@@ -64,6 +68,10 @@ func NewRouter(d Deps) http.Handler {
 		// SPEC-W3 §3 innovation 12: digital-twin provisioning.
 		r.Post("/twin", s.createTwin)
 	})
+	// SPEC-W12 §4: NDPA consent registry (/v1/consents*, /internal/consents/check).
+	if d.Consents != nil {
+		d.Consents.RegisterRoutes(r)
+	}
 	return r
 }
 

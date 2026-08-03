@@ -109,6 +109,28 @@ type Disclosure struct {
 	Text               string `yaml:"text" json:"text,omitempty"`
 }
 
+// USSDMenuItem is one entry of the pack ussd.menu list ({key,label,action})
+// — the low-literacy numeric menu the messaging-gateway resolves from the
+// tenant payload (pack.ussd.menu) and conversation-service drives
+// (1/2/… select by key, 0 = back, 00 = main menu; SPEC-W12 §1). Action is
+// the optional pack action echoed back to the gateway in the turn response
+// ("book" for a selected "Book appointment" item); empty means the item is
+// purely informational.
+type USSDMenuItem struct {
+	Key    string `yaml:"key" json:"key"`
+	Label  string `yaml:"label" json:"label"`
+	Action string `yaml:"action" json:"action,omitempty"`
+}
+
+// USSD is the optional pack-level USSD menu block (SPEC-W12 §1): when
+// present, menu is a non-empty list of {key,label,action} items passed
+// through to the runtime Summary as pack.ussd.menu — the exact shape
+// messaging-gateway's ParseUSSDMenu reads (USSDMenuItem key/label/action).
+// Absent block = the gateway runs the SPEC-mandated pass-through text mode.
+type USSD struct {
+	Menu []USSDMenuItem `yaml:"menu" json:"menu"`
+}
+
 // Pack is one industry pack definition (industries/<id>.yaml).
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
@@ -132,6 +154,9 @@ type Pack struct {
 	// SPEC-W11 Part D: optional disclosure block, validated when present
 	// and passed through to the runtime Summary.
 	Disclosure *Disclosure `yaml:"disclosure" json:"disclosure,omitempty"`
+	// SPEC-W12 §1: optional USSD menu block, validated when present and
+	// passed through to the runtime Summary (pack.ussd.menu).
+	USSD *USSD `yaml:"ussd" json:"ussd,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -155,6 +180,7 @@ type Summary struct {
 	MCPServers       []MCPServer       `json:"mcpServers,omitempty"`
 	Voice            *VoiceDefaults    `json:"voice,omitempty"`
 	Disclosure       *Disclosure       `json:"disclosure,omitempty"`
+	USSD             *USSD             `json:"ussd,omitempty"`
 	ConsentText      string            `json:"consentText,omitempty"`
 	Languages        []string          `json:"languages,omitempty"`
 }
@@ -188,6 +214,7 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		MCPServers:       p.MCPServers,
 		Voice:            p.Voice,
 		Disclosure:       p.Disclosure,
+		USSD:             p.USSD,
 		ConsentText:      p.ConsentText,
 		Languages:        p.Languages,
 	}
@@ -310,6 +337,9 @@ func (p Pack) Validate() error {
 		return err
 	}
 	if err := validateDisclosure(p.Disclosure); err != nil {
+		return err
+	}
+	if err := validateUSSD(p.USSD); err != nil {
 		return err
 	}
 	return nil
@@ -441,6 +471,58 @@ func validateDisclosure(d *Disclosure) error {
 	}
 	if len(d.Text) > 200 {
 		return fmt.Errorf("disclosure.text must be <= 200 chars, got %d", len(d.Text))
+	}
+	return nil
+}
+
+// ussdMenuActions is the small action enum the Wave-12 USSD path uses —
+// the values messaging-gateway + conversation-service tests exercise
+// ("book" for a selected "Book appointment" item, "handoff" for "Talk to
+// an agent", "status", "sos", "info"). The action is opaque to both
+// services (echoed back in the turn response), so the enum is enforced
+// here at the pack boundary, not downstream.
+var ussdMenuActions = map[string]bool{
+	"book":    true,
+	"handoff": true,
+	"status":  true,
+	"sos":     true,
+	"info":    true,
+}
+
+// validateUSSD enforces the SPEC-W12 §1 ussd block: optional mapping; when
+// present, menu is a non-empty list of {key,label,action} items — keys
+// non-empty, unique and at most 8 chars (conversation-service's
+// UssdMenuItem bound), labels non-empty and at most 80 chars (USSD screens
+// cap ~160 chars total), action optional but one of ussdMenuActions when
+// set. Kept in sync with scripts/validate_pack.py.
+func validateUSSD(u *USSD) error {
+	if u == nil {
+		return nil
+	}
+	if len(u.Menu) == 0 {
+		return fmt.Errorf("ussd.menu must be a non-empty list when the ussd block is present")
+	}
+	seen := make(map[string]bool, len(u.Menu))
+	for i, item := range u.Menu {
+		if strings.TrimSpace(item.Key) == "" {
+			return fmt.Errorf("ussd.menu[%d]: key is required", i)
+		}
+		if len(item.Key) > 8 {
+			return fmt.Errorf("ussd.menu[%d] (%s): key must be <= 8 chars, got %d", i, item.Key, len(item.Key))
+		}
+		if seen[item.Key] {
+			return fmt.Errorf("ussd.menu[%d]: duplicate menu key %q", i, item.Key)
+		}
+		seen[item.Key] = true
+		if strings.TrimSpace(item.Label) == "" {
+			return fmt.Errorf("ussd.menu[%d] (%s): label is required", i, item.Key)
+		}
+		if len(item.Label) > 80 {
+			return fmt.Errorf("ussd.menu[%d] (%s): label must be <= 80 chars, got %d", i, item.Key, len(item.Label))
+		}
+		if item.Action != "" && !ussdMenuActions[item.Action] {
+			return fmt.Errorf("ussd.menu[%d] (%s): action %q must be one of book, handoff, status, sos, info", i, item.Key, item.Action)
+		}
 	}
 	return nil
 }
