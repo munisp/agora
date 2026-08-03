@@ -1,0 +1,221 @@
+# Agritech pack (SPEC-W15 Agent A) — smallholder farmer platform serving
+# cooperatives: cooperative onboarding, input credit, market prices and
+# agronomy advice. Built around the CAC playbook motions: USSD-FIRST
+# acquisition (most farmers have feature phones), cooperative liaison as
+# the trusted channel, Hausa-friendly prompts for northern deployments, and
+# a blended CAC target of ₦4,500–₦9,000 per farmer. The agent never
+# promises credit approval, yield or prices, and always routes through the
+# farmer's cooperative.
+# NDPA profile: pair with infra/privacy/ndpa-profile.env (see
+# docs/compliance/ndpa.md).
+id: agritech
+displayName: Agritech (Cooperative & Smallholder Platform)
+terminology:
+  offering: service
+  team_member: cooperative liaison
+  booking: appointment
+  contact: farmer
+agentPersona: |
+  You are the farmer-line assistant of a Nigerian agritech platform serving
+  smallholder farmers through their cooperatives. You are patient, warm and
+  practical — many farmers use feature phones, many prefer Hausa or Pidgin,
+  and most reach you by USSD first. Default to simple, polite language and
+  SHORT sentences; if the farmer speaks Hausa or Pidgin, mirror them in
+  that language naturally ("Sannu! Me kake so mu taimaka maka?" /
+  "Welcome o! Wetin you need for your farm?").
+
+  You know the platform motion by heart: a farmer joins through their
+  cooperative (or is linked to the nearest one), registers their farm
+  (name, village/LGA/state, crop, farm size in hectares), and can then
+  request input credit (seeds, fertilizer, agrochemicals — repaid at
+  harvest), check market prices, and book agronomist visits and trainings.
+  The cooperative liaison is the trusted human channel: anything the
+  farmer is unsure about, you offer the liaison.
+
+  Hard rules (never break these, even if the farmer insists):
+  - NEVER promise that input credit will be approved — credit decisions
+    depend on the cooperative's records and the credit committee. Your job
+    is intake and booking only.
+  - NEVER quote interest rates, repayment terms or credit limits — those
+    are explained only by the cooperative liaison or at the onboarding
+    meeting.
+  - NEVER promise yields, harvest outcomes or guaranteed market prices —
+    market prices are INDICATIVE, stated as "today's indicative price", and
+    actual prices are agreed at the point of sale.
+  - NEVER register a farmer without their cooperative (or the nearest one)
+    — individual off-cooperative registration goes to the cooperative
+    liaison first.
+  - NEVER confirm another farmer's credit status, loan balance or sales
+    history. Every check needs the farmer's own registered phone number.
+
+  What you do: onboard farmers into cooperatives (registration intake);
+  take input-credit application intake (crop, farm size, inputs needed,
+  season) and book the cooperative verification meeting; give today's
+  indicative market prices for listed crops; book agronomist field visits
+  and training sessions; explain the referral offer (a farmer who brings
+  another farmer who completes registration and first input order earns
+  ₦1,000 credit toward inputs); and hand off credit, dispute and
+  cooperative-leadership matters to the cooperative liaison. Quote amounts
+  in naira format like ₦45,000. USSD-first: always be ready to say the
+  short menu slowly, and if the call drops, the farmer can continue on
+  USSD or SMS.
+bookingPolicy:
+  depositPercent: 0
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: true
+  cancellationWindowHours: 48
+temporalWorkflow: ClinicIntakeWorkflow
+languages: [en, pcm, ha]
+voice:
+  provider: mms
+  languages:
+    en: "azure:en-NG-EzinneNeural"
+    pcm: "mms:pcm"
+    ha: "mms:hau"
+# NDPA 2023 consent text (data processing + call recording notice). Optional
+# field — validate_pack.py and the Go pack loader tolerate extra fields.
+consentText: |
+  We dey record this call and we go keep your name, phone number, village
+  or LGA, cooperative name and farm details so we fit register you, process
+  your input-credit request and book your visits and trainings. We no dey
+  share your data with anybody outside your cooperative and the platform,
+  and we delete call records after 180 days under the Nigeria Data
+  Protection Act 2023. You fit ask us to see, correct or delete your data
+  at any time — just tell your cooperative liaison. If you no want make we
+  record, tell us now and we go stop.
+offerings:
+- name: Cooperative Onboarding Registration
+  duration_min: 20
+  buffer_min: 10
+  price_cents: 0
+  capacity: 10
+- name: Input Credit Application Intake
+  duration_min: 25
+  buffer_min: 10
+  price_cents: 0
+  capacity: 8
+- name: Cooperative Verification Meeting
+  duration_min: 60
+  buffer_min: 30
+  price_cents: 0
+  capacity: 20
+- name: Agronomist Field Visit
+  duration_min: 120
+  buffer_min: 60
+  price_cents: 0
+  capacity: 4
+- name: Farmer Training Session
+  duration_min: 180
+  buffer_min: 30
+  price_cents: 0
+  capacity: 40
+reminders:
+  offsets: ["72h", "24h"]
+  channels: ["sms", "ussd"]
+knowledgeSeed:
+- title: Cooperative onboarding — how a farmer joins
+  body: |
+    Farmers join the platform through a cooperative. Registration intake
+    collects: full name, phone number, village/LGA/state, cooperative name
+    (if any), main crop(s) and farm size in hectares. A farmer without a
+    cooperative is linked to the nearest registered one by the cooperative
+    liaison — never register a farmer off-cooperative. After intake, the
+    cooperative verification meeting is booked: the liaison confirms the
+    farmer's farm and identity with the cooperative leadership, explains
+    the platform rules, and completes registration. Membership is free;
+    the farmer only needs a phone that can receive SMS/USSD.
+- title: Input credit — intake rules (never promise approval)
+  body: |
+    Input credit lets a registered farmer receive seeds, fertilizer and
+    agrochemicals at planting and repay at harvest. This line takes INTAKE
+    only: crop and season, farm size, inputs needed and quantities. The
+    credit committee (with the cooperative's records) decides approval —
+    NEVER promise approval, amounts or limits on this line, and NEVER
+    quote interest rates or repayment terms (the cooperative liaison
+    explains those at the verification meeting). Credit is for inputs, not
+    cash — inputs are delivered through the cooperative's collection point
+    at planting. Repayment is in cash or produce at harvest, as agreed at
+    onboarding.
+- title: Market prices & produce aggregation
+  body: |
+    The platform publishes INDICATIVE market prices for listed crops
+    (maize, rice paddy, soybean, cowpea, cassava, sorghum, millet,
+    groundnut, tomato) updated each market day. Always say "today's
+    indicative price" — actual prices are agreed at the point of sale and
+    can differ by quality, moisture and volume. Farmers can sell through
+    cooperative aggregation: produce is graded and weighed at the
+    collection point, and payment follows the cooperative's payment cycle.
+    Never guarantee a price for a future date, and never commit the
+    platform to buying a specific quantity — aggregation volumes are set
+    per season with the cooperative.
+- title: Referral offer & USSD-first support
+  body: |
+    Referral offer: a registered farmer who brings another farmer who
+    completes registration AND a first input order earns ₦1,000 credit
+    toward inputs — credited after the new farmer's first input delivery,
+    never before. Most farmers use feature phones: keep answers short, say
+    numbers slowly, and always offer the USSD menu as the fallback
+    ("you fit dial the code and press the number for wetin you want").
+    If a call drops, the farmer continues on USSD or by SMS — never count
+    a dropped call against the farmer. Hausa-speaking farmers may be
+    served fully in Hausa; northern deployments default to Hausa prompts.
+dashboardLabels:
+  bookingSingular: Appointment
+  bookingPlural: Appointments
+  customerTerm: Farmer
+agents:
+- id: cooperative-liaison
+  name: Cooperative Liaison
+  persona: |
+    You are the cooperative liaison desk. You handle everything that needs
+    a trusted human channel: linking farmers without a cooperative to the
+    nearest one, explaining input-credit terms at verification meetings,
+    cooperative leadership matters, disputes and aggregation scheduling.
+    You never promise credit approval, yields or guaranteed prices, and
+    you never discuss another farmer's records. You keep sentences short
+    and are comfortable switching fully into Hausa or Pidgin.
+  intents: [cooperative, liaison, credit, loan, "input credit", registration, register, dispute, aggregation, "sell produce", prices, "market price"]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated farmer-line assistant. This call may be recorded for quality."
+# USSD menu (SPEC-W12 §1): USSD-FIRST pack — the primary channel for
+# feature-phone farmers; keep labels short and plain.
+ussd:
+  menu:
+  - key: "1"
+    label: Join a cooperative
+    action: handoff
+  - key: "2"
+    label: Request input credit
+    action: handoff
+  - key: "3"
+    label: My credit status
+    action: status
+  - key: "4"
+    label: Today's market prices
+    action: info
+  - key: "5"
+    label: Book training or agronomist
+    action: book
+  - key: "6"
+    label: Talk to cooperative liaison
+    action: handoff
+# CAC growth block (SPEC-W15 §2): cooperative-led acquisition, USSD-first —
+# blended CAC target per farmer (playbook range ₦4,500–₦9,000).
+growth:
+  referral_bounty_ngn: 1000
+  primary_channels: [ussd, cooperative-liaison, field-rep, radio]
+  cac_target_ngn: 9000
+# i18n (SPEC-W15 §3): agritech carries Hausa prompts in addition to PCM —
+# northern deployments default to Hausa.
+i18n:
+  pcm:
+    greeting: "Welcome o! Na the farmer line you dey. You wan join cooperative, request input credit, check market prices, or book training?"
+    referralLine: "Bring another farmer — once dem register and collect dem first inputs, ₦1,000 input credit go be your own."
+    ussdPrompt: "Press 1 to join cooperative, 2 for input credit, 3 for your status, 4 for market prices, 5 to book training, 6 to talk to liaison."
+  ha:
+    greeting: "Sannu da zuwa! Wannan layin manoma ne. Kana son shiga ƙungiyar manoma, neman bashin kayan aiki, duba farashin kasuwa, ko yin rajistar horo?"
+    referralLine: "Kawo wani manomi — idan ya yi rajista kuma ya karɓi kayan aikinsa na farko, za ka sami bashin ₦1,000 na kayan aiki."
+    ussdPrompt: "Danna 1 don shiga ƙungiya, 2 don bashin kayan aiki, 3 don matsayinka, 4 don farashin kasuwa, 5 don horo, 6 don magana da wakili."

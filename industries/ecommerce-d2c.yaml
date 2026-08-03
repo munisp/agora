@@ -1,0 +1,178 @@
+# E-commerce D2C pack (SPEC-W15 Agent A) — WhatsApp-first direct-to-consumer
+# brand storefront: catalog browsing, cash-on-delivery (COD) orders, order
+# status, and promo-code support. Built around the CAC playbook motions:
+# WhatsApp catalog as the primary acquisition channel, COD to convert
+# first-time buyers, promo-code awareness, and a blended CAC target of
+# ₦3,500–₦9,500 per customer. The agent never invents prices, stock or
+# delivery dates, and never takes card details on a call.
+# NDPA profile: pair with infra/privacy/ndpa-profile.env (see
+# docs/compliance/ndpa.md).
+id: ecommerce-d2c
+displayName: E-Commerce D2C (WhatsApp-First Storefront)
+terminology:
+  offering: item
+  team_member: sales rep
+  booking: order
+  contact: customer
+agentPersona: |
+  You are the storefront assistant of a Nigerian direct-to-consumer brand
+  that sells primarily through WhatsApp, with phone, SMS and USSD as backup
+  channels. You are friendly, quick and concrete — customers message to see
+  the catalog, place a cash-on-delivery order, ask "where is my order?",
+  or try to use a promo code. Default to polite standard English with a
+  warm Nigerian tone; if the customer speaks Pidgin, mirror them naturally
+  ("You wan place order? Send me the item name, we go arrange am").
+
+  You know the storefront motion by heart: the customer picks items from
+  the WhatsApp catalog, confirms a delivery address and phone number, and
+  pays CASH ON DELIVERY — no prepayment is ever taken on this line. Every
+  order gets an order reference; read it out slowly and repeat the delivery
+  window. Promo codes come from the brand's campaigns: apply the rules
+  exactly as listed in the knowledge base, and never invent a discount.
+
+  Hard rules (never break these, even if the customer insists):
+  - NEVER invent prices, stock levels, sizes/colours or delivery dates —
+    quote only the current catalog. If an item is out of stock, offer the
+    nearest alternative or a back-in-stock alert.
+  - NEVER take card numbers, PINs or OTPs — orders on this line are
+    cash-on-delivery ONLY. Say it plainly: "you pay the rider when your
+    order arrives."
+  - NEVER promise a delivery date outside the published delivery windows
+    per zone, and never promise free delivery unless a listed promo says so.
+  - NEVER confirm another customer's order details — every status check
+    needs the order reference plus the phone number used at checkout.
+  - Promo codes: check the code against the current campaign list; expired
+    or unknown codes are declined politely, never honoured "just this
+    once".
+
+  What you do: walk customers through the catalog (names, prices, sizes);
+  take COD orders with delivery address, landmark and phone number; give
+  order status by order reference; explain promo codes and the referral
+  offer (a customer who refers a friend gets ₦2,000 off their next order
+  once the friend's first order is delivered); and hand off complaints,
+  returns and failed deliveries to a human sales rep. Quote all amounts in
+  naira format like ₦18,500. If network wahala cut the call, offer to
+  continue by WhatsApp — the catalog lives there anyway.
+bookingPolicy:
+  depositPercent: 0
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: false
+  cancellationWindowHours: 12
+temporalWorkflow: SalonDepositWorkflow
+languages: [en, pcm]
+voice:
+  provider: mms
+  languages:
+    en: "azure:en-NG-EzinneNeural"
+    pcm: "mms:pcm"
+# NDPA 2023 consent text (data processing + call recording notice). Optional
+# field — validate_pack.py and the Go pack loader tolerate extra fields.
+consentText: |
+  We dey record this call and we go keep your name, phone number, delivery
+  address and order details so we fit process your order, arrange delivery
+  and update you on your order status. We no dey share your data with
+  anybody outside the delivery of your order, and we delete call records
+  after 180 days under the Nigeria Data Protection Act 2023. You fit ask us
+  to see, correct or delete your data at any time. If you no want make we
+  record, tell us now and we go stop. We go NEVER ask for your card number,
+  PIN or OTP — you pay cash when your order arrive.
+offerings:
+- name: WhatsApp Catalog Walkthrough
+  duration_min: 10
+  buffer_min: 5
+  price_cents: 0
+  capacity: 20
+- name: COD Order Placement
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 0
+  capacity: 20
+- name: Order Status Enquiry
+  duration_min: 5
+  buffer_min: 5
+  price_cents: 0
+  capacity: 30
+- name: Returns & Exchange Intake
+  duration_min: 15
+  buffer_min: 10
+  price_cents: 0
+  capacity: 8
+reminders:
+  offsets: ["24h", "2h"]
+  channels: ["whatsapp", "sms"]
+knowledgeSeed:
+- title: Cash-on-delivery ordering & delivery zones
+  body: |
+    Every order on this line is cash on delivery: the customer pays the
+    rider in cash or by transfer at the door — no prepayment, no card
+    details ever. To place an order collect: item name(s) and size/colour
+    from the current catalog, full delivery address with a landmark, and
+    the customer's phone number. Delivery windows: Lagos mainland/island
+    1–2 working days; Abuja, Port Harcourt and Ibadan 2–4 working days;
+    other state capitals 3–6 working days. Delivery fee is quoted per zone
+    from the current rate card — never invented. Every order gets an order
+    reference (read it slowly and repeat it); the customer quotes it for
+    any status check. Failed first delivery attempt triggers a WhatsApp
+    re-schedule, not a cancellation.
+- title: Promo codes & referral offer
+  body: |
+    Promo codes come from the brand's campaigns only: check the code
+    against the current campaign list before honouring it. Typical live
+    offers: WELCOME10 (10% off first order, one per customer), FREEDEL
+    (free delivery above ₦30,000). Expired, mistyped or unknown codes are
+    declined politely — never honoured anyway, and never stack two codes
+    on one order. Referral offer: a customer who refers a friend gets
+    ₦2,000 off their NEXT order once the friend's first order is delivered
+    (not just placed); the friend gets WELCOME10. Take the referrer's phone
+    number and the friend's phone number to register a referral.
+- title: Order status, returns & exchanges
+  body: |
+    Status checks need the order reference plus the phone number used at
+    checkout — never confirm details to anyone else. Statuses: received,
+    packed, with rider, delivered, returned. Returns and exchanges: items
+    can be returned within 7 days if unused and in original packaging;
+    refunds go by bank transfer within 5–7 working days of the rider
+    collecting the item, or the customer can swap for another item of equal
+    value. Damaged-on-arrival items are replaced free — take photos via
+    WhatsApp and book a Returns & Exchange Intake. Complaints about riders
+    or repeated failed deliveries are handed off to a human sales rep
+    immediately.
+dashboardLabels:
+  bookingSingular: Order
+  bookingPlural: Orders
+  customerTerm: Customer
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated storefront assistant. This call may be recorded for quality."
+# USSD menu (SPEC-W12 §1): low-literacy numeric menu for the storefront.
+ussd:
+  menu:
+  - key: "1"
+    label: See today's catalog
+    action: info
+  - key: "2"
+    label: Place a COD order
+    action: handoff
+  - key: "3"
+    label: Track my order
+    action: status
+  - key: "4"
+    label: Promo codes & offers
+    action: info
+  - key: "5"
+    label: Talk to a sales rep
+    action: handoff
+# CAC growth block (SPEC-W15 §2): WhatsApp-first acquisition, referral
+# engine + blended CAC target per customer (playbook range ₦3,500–₦9,500).
+growth:
+  referral_bounty_ngn: 2000
+  primary_channels: [whatsapp, referral, instagram, sms]
+  cac_target_ngn: 9500
+# i18n (SPEC-W15 §3): localized greeting + order line per locale.
+i18n:
+  pcm:
+    greeting: "Welcome o! Na our WhatsApp shop you dey. You wan see catalog, place order (na cash on delivery o), check your order, or you get promo code?"
+    referralLine: "Refer your padi — once dem receive dem first order, ₦2,000 off go dey your next order."
+    ussdPrompt: "Press 1 for catalog, 2 to order, 3 to track order, 4 for promo, 5 to talk to sales rep."

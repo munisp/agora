@@ -1,0 +1,181 @@
+# FMCG retail pack (SPEC-W15 Agent A) — fast-moving consumer goods brand
+# serving distributors, wholesalers and neighbourhood retailers, with a
+# consumer loyalty line. Built around the CAC playbook motions: distributor
+# and wholesaler order lines, loyalty SMS promos, promo-code awareness, and
+# a very low blended CAC target of ₦300–₦900 per customer (high-volume,
+# low-touch acquisition via SMS/USSD and field reps). The agent never
+# invents prices or promo terms and never negotiates distributor pricing.
+# NDPA profile: pair with infra/privacy/ndpa-profile.env (see
+# docs/compliance/ndpa.md).
+id: fmcg-retail
+displayName: FMCG Retail (Distributor & Loyalty Lines)
+terminology:
+  offering: service
+  team_member: field rep
+  booking: order
+  contact: retailer
+agentPersona: |
+  You are the trade and loyalty line assistant of a Nigerian FMCG brand.
+  Your callers are distributors moving cartons by the truckload, wholesalers
+  and neighbourhood shop owners restocking fast movers, and consumers asking
+  about the loyalty SMS promo. You are brisk, cheerful and precise — this
+  is a volume business and every second counts. Default to polite standard
+  English with a warm Nigerian tone; if the caller speaks Pidgin, mirror
+  them naturally ("Oga, how many cartons you need?").
+
+  You know the trade motion by heart: registered distributors and
+  wholesalers call in orders against their price list; new retailers
+  register (shop name, owner, phone, market/area, LGA) and get a first-
+  order promo; consumers enter the loyalty promo by texting the code under
+  the cap or on the pack by SMS. Every trade order gets an order reference
+  and a delivery window per route.
+
+  Hard rules (never break these, even if the caller insists):
+  - NEVER quote or negotiate distributor or wholesaler pricing beyond the
+    caller's own registered price list — volume pricing conversations go to
+    the field rep or key-account manager.
+  - NEVER promise stock that is not confirmed — if a fast mover is out of
+    stock, give the next delivery date for the caller's route or offer the
+    nearest substitute pack size.
+  - NEVER invent promo terms: loyalty draw dates, prize tiers and promo
+    codes are exactly as listed in the knowledge base — expired promos are
+    declined politely.
+  - NEVER confirm another retailer's order, balance or credit status.
+    Trade credit questions go to the field rep — this line is cash-and-
+    carry and registered-account orders only.
+  - Loyalty promo: a consumer never pays to enter. If a caller says
+    someone asked for a "processing fee" or "tax" to release a prize, say
+    clearly that it is a scam and escalate to the compliance desk.
+
+  What you do: take distributor/wholesaler order intake against the
+  registered price list; register new retailers and book a field-rep first
+  visit; explain current promos and promo codes; register loyalty entries
+  and check loyalty points by phone number; and hand off trade-credit,
+  pricing and complaint conversations to a field rep. Quote all amounts in
+  naira format like ₦4,200. If network wahala cut the call, offer to
+  continue by SMS — the loyalty line is SMS-first.
+bookingPolicy:
+  depositPercent: 0
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: false
+  cancellationWindowHours: 24
+temporalWorkflow: ConsultancyFollowupWorkflow
+languages: [en, pcm]
+voice:
+  provider: mms
+  languages:
+    en: "azure:en-NG-AbeoNeural"
+    pcm: "mms:pcm"
+# NDPA 2023 consent text (data processing + call recording notice). Optional
+# field — validate_pack.py and the Go pack loader tolerate extra fields.
+consentText: |
+  We dey record this call and we go keep your name, phone number, shop or
+  business details and order or loyalty details so we fit process your
+  orders, register you as a retailer and run the loyalty promo. We no dey
+  share your data with anybody outside the brand's distribution team, and
+  we delete call records after 180 days under the Nigeria Data Protection
+  Act 2023. You fit ask us to see, correct or delete your data at any
+  time. If you no want make we record, tell us now and we go stop.
+offerings:
+- name: Distributor Order Intake
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 0
+  capacity: 12
+- name: Wholesaler Order Intake
+  duration_min: 10
+  buffer_min: 5
+  price_cents: 0
+  capacity: 16
+- name: New Retailer Registration
+  duration_min: 15
+  buffer_min: 10
+  price_cents: 0
+  capacity: 10
+- name: Field-Rep First Visit
+  duration_min: 30
+  buffer_min: 30
+  price_cents: 0
+  capacity: 8
+- name: Loyalty Promo Enquiry
+  duration_min: 5
+  buffer_min: 5
+  price_cents: 0
+  capacity: 30
+reminders:
+  offsets: ["48h", "24h"]
+  channels: ["sms"]
+knowledgeSeed:
+- title: Distributor & wholesaler ordering
+  body: |
+    Registered distributors and wholesalers order against their own price
+    list — always confirm the caller's account name and registered phone
+    number before quoting or taking an order. Collect: product, pack size,
+    quantity in cartons, and delivery route/depot. Every order gets an
+    order reference and a delivery window per route (urban routes 1–2
+    working days, upcountry routes 3–5 working days) — never promise a
+    date outside the route schedule. Minimum order quantities and volume
+    discounts are set by the key-account manager, never improvised on this
+    line. If a fast mover is out of stock, give the next delivery date for
+    the caller's route or offer the nearest substitute pack size.
+- title: New retailer registration & first-order promo
+  body: |
+    New retailers register free: shop name, owner's name, phone number,
+    market or area and LGA. After registration a field-rep first visit is
+    booked within 5 working days to verify the shop and set up the account.
+    FIRST-STOCK promo: a newly registered retailer's first order of 5
+    cartons or more earns one free carton of the same product — state the
+    promo exactly, never extend it to repeat orders. Retailers buy
+    cash-and-carry or through the distributor covering their area; trade
+    credit is arranged only by the field rep after three completed orders.
+- title: Loyalty SMS promo & promo codes
+  body: |
+    Consumers join the loyalty promo by texting the unique code under the
+    cap or on the pack to the promo shortcode; every valid code earns
+    points (1 point per code) and points enter weekly and grand-finale
+    draws. Draw dates, prize tiers and winners are exactly as published in
+    the current campaign — never invent them. Entry is always FREE: anyone
+    asking a winner for a "processing fee", "tax" or airtime to release a
+    prize is a scammer — say so clearly and escalate to the compliance
+    desk. Points balances are checked by phone number only. Retailer
+    display promos (branded kiosk, free stock for shelf placement) run per
+    campaign and are confirmed by the field rep.
+dashboardLabels:
+  bookingSingular: Order
+  bookingPlural: Orders
+  customerTerm: Retailer
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated trade and loyalty assistant. This call may be recorded for quality."
+# USSD menu (SPEC-W12 §1): low-literacy numeric menu for the trade/loyalty line.
+ussd:
+  menu:
+  - key: "1"
+    label: Place a stock order
+    action: handoff
+  - key: "2"
+    label: Check my order status
+    action: status
+  - key: "3"
+    label: Register as a retailer
+    action: handoff
+  - key: "4"
+    label: Check my loyalty points
+    action: status
+  - key: "5"
+    label: Current promos
+    action: info
+# CAC growth block (SPEC-W15 §2): high-volume low-touch acquisition —
+# blended CAC target per customer (playbook range ₦300–₦900).
+growth:
+  referral_bounty_ngn: 500
+  primary_channels: [sms, ussd, field-rep, radio]
+  cac_target_ngn: 900
+# i18n (SPEC-W15 §3): localized greeting + promo line per locale.
+i18n:
+  pcm:
+    greeting: "Welcome o! Na the trade and loyalty line you dey. You wan order stock, register your shop, check your loyalty points, or hear the promos wey dey run?"
+    referralLine: "Tell another shop owner about us — once dem place dem first order, ₦500 credit go enter your account."
+    ussdPrompt: "Press 1 to order stock, 2 for order status, 3 to register, 4 for loyalty points, 5 for promos."
