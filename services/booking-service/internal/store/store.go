@@ -85,6 +85,12 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W13 Agent A: leads + promo_codes + promo_redemptions +
+	// campaigns + campaign_spend (idempotent bootstrap, RLS-enabled).
+	if err := s.ensureLeadTables(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// Geo tables (SPEC-W8): best-effort — a missing postgis extension
 	// disables geo features without breaking the rest of the service.
 	if err := s.ensureGeoTables(ctx); err != nil {
@@ -364,7 +370,7 @@ func (s *Store) GetTeamMember(ctx context.Context, tenantID, id uuid.UUID) (Team
 
 // UpdateTeamMember replaces mutable team member fields.
 func (s *Store) UpdateTeamMember(ctx context.Context, m *TeamMember) error {
-	return s.withTenant(ctx, m.TenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE team_members SET name=$3, email=$4, role=$5, active=$6 WHERE tenant_id=$1 AND id=$2`,
 			m.TenantID, m.ID, m.Name, m.Email, m.Role, m.Active)
@@ -509,7 +515,7 @@ func (s *Store) GetContact(ctx context.Context, tenantID, id uuid.UUID) (Contact
 
 // UpdateContact replaces mutable contact fields.
 func (s *Store) UpdateContact(ctx context.Context, c *Contact) error {
-	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE contacts SET name=$3, phone=$4, email=$5, notes=$6 WHERE tenant_id=$1 AND id=$2`,
 			c.TenantID, c.ID, c.Name, c.Phone, c.Email, c.Notes)
