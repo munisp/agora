@@ -778,3 +778,29 @@ img, svg {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ---------- Growth page (CAC App showcase) ---------- */
+
+.cac-target {
+  font-size: 1.25rem;
+  font-weight: 800;
+  color: var(--terracotta-dark);
+  margin: 0.2rem 0 0.7rem;
+}
+
+.cac-target span {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--ink-soft);
+}
+
+.compliance-badges li {
+  font-size: 0.9rem;
+}
+
+@media (min-width: 900px) {
+  .feature-grid-3 {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
