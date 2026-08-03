@@ -193,12 +193,15 @@ def is_emergency(text: str, min_score: float) -> tuple[bool, dict[str, Any]]:
 # IDP assembly
 # ---------------------------------------------------------------------------
 
-# conversation.channel (DB CHECK: voice|chat|phone|api) -> IDP channel enum.
+# conversation.channel (DB CHECK: voice|chat|phone|api|ussd — SPEC-W12)
+# -> IDP channel enum.
 _CHANNEL_MAP = {
     "voice": "voice",
     "phone": "voice",
     "chat": "web",
     "api": "webhook",
+    # SPEC-W12 contract §2: the classifier treats ussd as web-like.
+    "ussd": "web",
 }
 
 _NARRATIVE_MAX = 500

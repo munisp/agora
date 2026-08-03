@@ -104,6 +104,26 @@ class Database:
             )
         log.info("conversation contact_phone column ensured")
 
+    async def ensure_ussd_channel(self) -> None:
+        """SPEC-W12 contract §2: widen the conversations.channel CHECK so
+        "ussd" is a persisted channel value (ussd joins the channel enum).
+
+        Idempotent re-create of the inline CHECK from
+        03-conversation-schema.sql; NOT VALID keeps existing rows out of the
+        scan while new inserts are still validated. Safe on every startup.
+        """
+        async with self._pool_acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE conversations "
+                "DROP CONSTRAINT IF EXISTS conversations_channel_check"
+            )
+            await conn.execute(
+                "ALTER TABLE conversations "
+                "ADD CONSTRAINT conversations_channel_check "
+                "CHECK (channel IN ('voice','chat','phone','api','ussd')) NOT VALID"
+            )
+        log.info("conversation ussd channel check ensured")
+
     def _pool_acquire(self) -> Any:
         assert self._pool is not None, "Database.connect() not called"
         return self._pool.acquire()
@@ -123,33 +143,70 @@ class Database:
     # ------------------------------------------------------------------
 
     async def create_conversation(
-        self, tenant_id: uuid.UUID, site_slug: str, channel: str
+        self,
+        tenant_id: uuid.UUID,
+        site_slug: str,
+        channel: str,
+        contact_phone: str | None = None,
+        conversation_id: uuid.UUID | None = None,
     ) -> asyncpg.Record:
+        """Insert a conversation; optionally with a caller-chosen id.
+
+        SPEC-W12: the USSD hook passes conversation_id=uuid5(tenant,
+        sessionId) — ON CONFLICT DO NOTHING + re-read makes concurrent first
+        callbacks of the same session safe (exactly one row wins).
+        contact_phone is the GDPR contact marker (SPEC-W3 §2) and feeds the
+        incident IDP callback_number.
+        """
         async with self._tenant_tx(tenant_id) as conn:
-            return await conn.fetchrow(
+            row = await conn.fetchrow(
                 """
-                INSERT INTO conversations (tenant_id, site_slug, channel)
-                VALUES ($1, $2, $3)
-                RETURNING id, tenant_id, site_slug, channel, started_at, ended_at
+                INSERT INTO conversations (id, tenant_id, site_slug, channel,
+                                         contact_phone)
+                VALUES (COALESCE($5, gen_random_uuid()), $1, $2, $3, $4)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id, tenant_id, site_slug, channel, contact_phone,
+                          started_at, ended_at
                 """,
                 tenant_id,
                 site_slug,
                 channel,
+                contact_phone,
+                conversation_id,
             )
+            if row is None:  # lost the same-id race — read the winner
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, tenant_id, site_slug, channel, contact_phone,
+                           started_at, ended_at
+                    FROM conversations WHERE id = $1
+                    """,
+                    conversation_id,
+                )
+            return row
 
     async def list_conversations(
-        self, tenant_id: uuid.UUID, limit: int = 50, offset: int = 0
+        self,
+        tenant_id: uuid.UUID,
+        limit: int = 50,
+        offset: int = 0,
+        contact: str | None = None,
     ) -> list[asyncpg.Record]:
+        """List conversations, optionally filtered by the GDPR contact
+        marker (SPEC-W3 §2 ?contact= filter; None = no filter)."""
         async with self._tenant_tx(tenant_id) as conn:
             return await conn.fetch(
                 """
-                SELECT id, tenant_id, site_slug, channel, started_at, ended_at
+                SELECT id, tenant_id, site_slug, channel, contact_phone,
+                       started_at, ended_at
                 FROM conversations
+                WHERE ($3::text IS NULL OR contact_phone = $3)
                 ORDER BY started_at DESC
                 LIMIT $1 OFFSET $2
                 """,
                 limit,
                 offset,
+                contact,
             )
 
     async def get_conversation(
