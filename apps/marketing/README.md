@@ -6,7 +6,8 @@ Dependency-free, no-build-step static marketing site for the OpenDesk platform.
 
 | File | Purpose |
 |---|---|
-| `index.html` | Single-page site: hero, middleware strip, omnichannel strip, feature grid, verticals showcase (filterable), how-it-works, pricing, CTA banner, footer |
+| `index.html` | Single-page site: hero, middleware strip, omnichannel strip, feature grid, verticals showcase (filterable), Growth (CAC App) section, how-it-works, pricing, CTA banner, footer |
+| `growth.html` | OpenDesk Growth (CAC App) showcase: Nigeria-first acquisition hero, 8 sector CAC-target cards, USSD/WhatsApp/SMS/voice/web channel strip, geo-targeting / referral engine / attribution features, NCC DND 2442 + NDPA compliance badges, demo CTA |
 | `styles.css` | All styling — warm low-saturation palette (cream/terracotta/olive/ink), system font stack, mobile-first responsive, `prefers-reduced-motion` support |
 | `main.js` | Tiny progressive-enhancement script: vertical filter chips + mobile nav close behaviour. The page is fully usable without it |
 
