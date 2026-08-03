@@ -251,6 +251,13 @@ export function SettingsClient({ orgSlug }: { orgSlug: string }) {
                   : "No industry pack is associated with this organisation yet."}
               </p>
             )}
+            <div className="mt-4">
+              <Link href={`/app/${orgSlug}/settings/packs`}>
+                <Button variant="outline" size="sm">
+                  Browse pack catalog <ArrowRight className="h-3.5 w-3.5" />
+                </Button>
+              </Link>
+            </div>
           </CardContent>
         </Card>
 
