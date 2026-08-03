@@ -79,10 +79,11 @@ func newGeoTestEnv(t *testing.T, n int) *geoTestEnv {
 		return len(req.Recipients), nil
 	}, activity.RegisterOptions{Name: ActivityGeoRecordSends})
 
-	// NotifyPaced stub (executed by notification-worker in production);
-	// tests override behavior with OnActivity mocks.
-	g.env.RegisterActivityWithOptions(func(ctx context.Context, req PacedSendRequest) error {
-		return nil
+	// NotifyPaced stub (executed by notification-worker in production,
+	// where it returns a PacedSendResult since SPEC-W12); tests override
+	// behavior with OnActivity mocks.
+	g.env.RegisterActivityWithOptions(func(ctx context.Context, req PacedSendRequest) (PacedSendResult, error) {
+		return PacedSendResult{Status: PacedSendStatusSent}, nil
 	}, activity.RegisterOptions{Name: ActivityNotifyPaced})
 
 	g.env.RegisterActivityWithOptions(func(ctx context.Context, req CampaignStatusRequest) error {
@@ -117,7 +118,7 @@ func TestGeoCampaignWorkflowBatchesAudience(t *testing.T) {
 	g.env.OnActivity(ActivityNotifyPaced, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			paced = append(paced, args.Get(1).(PacedSendRequest))
-		}).Return(nil)
+		}).Return(PacedSendResult{Status: PacedSendStatusSent}, nil)
 
 	g.env.ExecuteWorkflow(GeoCampaignWorkflow, g.input(50))
 	require.True(t, g.env.IsWorkflowCompleted())
@@ -148,7 +149,7 @@ func TestGeoCampaignWorkflowPersonalizesNameToken(t *testing.T) {
 		Run(func(args mock.Arguments) {
 			req := args.Get(1).(PacedSendRequest)
 			texts[req.Geo.Phone] = req.Geo.Text
-		}).Return(nil)
+		}).Return(PacedSendResult{Status: PacedSendStatusSent}, nil)
 
 	g.env.ExecuteWorkflow(GeoCampaignWorkflow, g.input(50))
 	require.NoError(t, g.env.GetWorkflowError())
@@ -173,7 +174,7 @@ func TestGeoCampaignWorkflowSkipsAlreadySent(t *testing.T) {
 	g.env.OnActivity(ActivityNotifyPaced, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			pacedPhones = append(pacedPhones, args.Get(1).(PacedSendRequest).Geo.Phone)
-		}).Return(nil)
+		}).Return(PacedSendResult{Status: PacedSendStatusSent}, nil)
 
 	g.env.ExecuteWorkflow(GeoCampaignWorkflow, g.input(50))
 	require.NoError(t, g.env.GetWorkflowError())
@@ -190,10 +191,10 @@ func TestGeoCampaignWorkflowContinuesAfterSendFailure(t *testing.T) {
 
 	g.env.OnActivity(ActivityNotifyPaced, mock.Anything, mock.MatchedBy(func(req PacedSendRequest) bool {
 		return req.Geo != nil && req.Geo.Phone == g.recipients[1].Phone
-	})).Return(errors.New("provider down")).Once()
+	})).Return(PacedSendResult{}, errors.New("provider down")).Once()
 	g.env.OnActivity(ActivityNotifyPaced, mock.Anything, mock.MatchedBy(func(req PacedSendRequest) bool {
 		return req.Geo != nil && req.Geo.Phone != g.recipients[1].Phone
-	})).Return(nil)
+	})).Return(PacedSendResult{Status: PacedSendStatusSent}, nil)
 
 	g.env.ExecuteWorkflow(GeoCampaignWorkflow, g.input(50))
 	require.True(t, g.env.IsWorkflowCompleted())

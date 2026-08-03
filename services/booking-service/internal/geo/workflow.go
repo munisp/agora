@@ -63,6 +63,14 @@ type GeoCampaignInput struct {
 	Channel    string `json:"channel"` // whatsapp | telegram | sms
 	Message    string `json:"message"` // {name} personalization token supported
 	BatchSize  int    `json:"batch_size"`
+	// Quiet-hours configuration captured at SCHEDULE time (from the
+	// QUIET_HOURS_* env by the API handler) so replay stays deterministic
+	// when the env changes mid-campaign (SPEC-W12 §8, SPEC-W14 Agent D).
+	// Empty fields fall back to the contract defaults (20:00-08:00,
+	// Africa/Lagos).
+	QuietHoursWindow    string            `json:"quiet_hours_window,omitempty"`
+	QuietHoursTimezone  string            `json:"quiet_hours_timezone,omitempty"`
+	QuietHoursOverrides map[string]string `json:"quiet_hours_overrides,omitempty"`
 }
 
 // PacedSendRequest mirrors notification-worker's workflows.PacedSendRequest
@@ -122,9 +130,21 @@ type (
 
 // GeoCampaignWorkflow batches the audience of one campaign (GEO_CAMPAIGN_BATCH
 // contacts per batch), sends the personalized message to every recipient via
-// NotifyPaced (kind geo_campaign), records sends for idempotent replay, and
-// finally flips the campaign to completed (or failed). A failed send skips
-// that recipient without aborting the campaign (waitlist backfill pattern).
+// the guarded paced send (kind geo_campaign — marketing, so quiet-hours
+// deferred per SPEC-W12 §8 and DND-suppressed activity-side per §3), records
+// sends for idempotent replay, and finally flips the campaign to completed
+// (or failed). A failed send skips that recipient without aborting the
+// campaign (waitlist backfill pattern).
+//
+// suppressed_dnd outcomes (SPEC-W14 Agent D): a suppressed send is a
+// completion status, not an error — the recipient consumed no CPS token and
+// no message was sent, so it is NOT written to the geo_campaign_sends
+// ledger (which tracks messages actually sent and drives the
+// geo_campaign_message metering) and NOT counted in audience_count. The
+// workflow records the suppression in its logs and campaign totals; a
+// restarted campaign re-evaluates the recipient against the DND registry,
+// which is authoritative at send time (an opt-out honored between runs
+// lifts the suppression).
 func GeoCampaignWorkflow(ctx workflow.Context, in GeoCampaignInput) error {
 	logger := workflow.GetLogger(ctx)
 	ao := workflow.ActivityOptions{
@@ -143,9 +163,13 @@ func GeoCampaignWorkflow(ctx workflow.Context, in GeoCampaignInput) error {
 	if batchSize <= 0 {
 		batchSize = DefaultGeoCampaignBatch
 	}
+	// Quiet-hours config captured at schedule time (SPEC-W12 §8): marketing
+	// sends inside the window are deferred until it opens.
+	quiet := QuietHoursFromEnv(in.QuietHoursWindow, in.QuietHoursTimezone, in.QuietHoursOverrides)
 
 	after := ""
 	sentTotal := 0
+	suppressedTotal := 0
 	var runErr error
 	for {
 		var batch []store.CampaignRecipient
@@ -174,9 +198,22 @@ func GeoCampaignWorkflow(ctx workflow.Context, in GeoCampaignInput) error {
 				Name:       r.Name,
 				Text:       Personalize(in.Message, r.Name),
 			}}
-			if err := workflow.ExecuteActivity(ctx, ActivityNotifyPaced, req).Get(ctx, nil); err != nil {
+			res, err := guardedPacedSend(ctx, req, quiet)
+			if err != nil {
 				logger.Error("geo campaign send failed; skipping recipient",
 					"campaign_id", in.CampaignID, "contact_id", r.ContactID.String(), "error", err)
+				continue
+			}
+			if res.Status == PacedSendStatusSuppressedDND {
+				// suppressed_dnd is a completion status, not an error: no
+				// message was sent, so the recipient is recorded as a
+				// suppression (logs + totals) and kept out of the send
+				// ledger / usage metering.
+				suppressedTotal++
+				logger.Info("geo campaign send suppressed by DND guard",
+					"campaign_id", in.CampaignID, "contact_id", r.ContactID.String(),
+					"phone", MaskPhone(r.Phone), "reason", res.Reason,
+					"status", res.Status)
 				continue
 			}
 			sent = append(sent, r)
@@ -208,7 +245,8 @@ func GeoCampaignWorkflow(ctx workflow.Context, in GeoCampaignInput) error {
 	if runErr != nil {
 		return runErr
 	}
-	logger.Info("geo campaign completed", "campaign_id", in.CampaignID, "sent", sentTotal)
+	logger.Info("geo campaign completed", "campaign_id", in.CampaignID,
+		"sent", sentTotal, "suppressed_dnd", suppressedTotal)
 	return nil
 }
 
