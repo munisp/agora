@@ -4,8 +4,9 @@ package pacer
 //
 // Every paced send kind is classified per SPEC-W12 contract §3:
 //
-//	marketing      — geo_campaign, promo, broadcast, drip
-//	transactional  — booking confirmations, reminders, incident_alert, otp
+//	marketing      — geo_campaign, promo, broadcast, drip, push_marketing
+//	transactional  — booking confirmations, reminders, incident_alert, otp,
+//	                 push_notification (SPEC-W16 §1)
 //	                 (plus every other in-repo kind: waitlist claims, no-show
 //	                 follow-ups, staff alerts, ... — never suppressed, never
 //	                 deferred)
@@ -59,11 +60,18 @@ var kindClasses = map[string]SendClass{
 	"promo":        ClassMarketing,
 	"broadcast":    ClassMarketing,
 	"drip":         ClassMarketing,
+	// SPEC-W16 contract §1: promotional push is marketing-classified
+	// exactly like the sms marketing kinds (DND-suppressed when the
+	// payload carries a phone; quiet-hours deferred on channel "push").
+	"push_marketing": ClassMarketing,
 	// Transactional (contract §3 canonical list).
 	"confirmation":   ClassTransactional, // booking confirmations
 	"reminder":       ClassTransactional, // T-24h / T-1h reminders
 	"incident_alert": ClassTransactional, // + Priority fast-lane exemption
 	"otp":            ClassTransactional,
+	// SPEC-W16 contract §1: transactional push (booking lifecycle /
+	// security) — never DND-suppressed, never quiet-hours deferred.
+	"push_notification": ClassTransactional,
 	// Remaining in-repo kinds, transactional by nature (booking lifecycle /
 	// staff traffic), listed explicitly so the table is auditable.
 	"waitlist_claim":    ClassTransactional,

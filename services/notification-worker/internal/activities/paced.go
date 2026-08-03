@@ -75,6 +75,15 @@ func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
 			in.TenantSlug = req.IncidentAlert.TenantSlug
 			in.Phone = req.IncidentAlert.Phone
 		}
+	case workflows.PacedSendPushNotification, workflows.PacedSendPushMarketing:
+		// SPEC-W16 §1: push_notification is transactional (guard
+		// short-circuits before reading these); push_marketing is checked
+		// only when the payload carries a phone (registries are
+		// phone-keyed) — token-only sends pass with the no-recipient warn.
+		if req.Push != nil {
+			in.TenantSlug = req.Push.TenantSlug
+			in.Phone = req.Push.Phone
+		}
 	}
 	return in
 }
@@ -138,6 +147,15 @@ func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedS
 			return fmt.Errorf("NotifyPaced %s: missing incident_alert payload", req.Kind)
 		}
 		return a.SendIncidentAlert(ctx, *req.IncidentAlert)
+	case workflows.PacedSendPushNotification, workflows.PacedSendPushMarketing:
+		if req.Push == nil {
+			return fmt.Errorf("NotifyPaced %s: missing push payload", req.Kind)
+		}
+		// Per-token results stay activity-local here (logged inside
+		// SendPushNotification); workflows needing them call the
+		// SendPushNotification activity directly.
+		_, err := a.SendPushNotification(ctx, *req.Push)
+		return err
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
 	}

@@ -53,10 +53,23 @@ const (
 	// Priority=true — the pacer fast-lane bypasses the CPS token bucket
 	// (still metered).
 	PacedSendIncidentAlert = "incident_alert"
+	// PacedSendPushNotification routes to SendPushNotification (SPEC-W16
+	// contract §1): TRANSACTIONAL-class mobile/web push (booking lifecycle,
+	// security) — never DND-suppressed, never quiet-hours deferred.
+	PacedSendPushNotification = "push_notification"
+	// PacedSendPushMarketing routes to SendPushNotification (SPEC-W16
+	// contract §1): MARKETING-class push (promos/campaigns) — DND-suppressed
+	// (when the payload carries a phone) and quiet-hours deferred on the
+	// "push" channel, exactly like the sms marketing kinds.
+	PacedSendPushMarketing = "push_marketing"
 
 	// ActivitySendGeoCampaignMessage is the name of the geo campaign send
 	// activity.
 	ActivitySendGeoCampaignMessage = "SendGeoCampaignMessage"
+
+	// ActivitySendPushNotification is the name of the push notification
+	// fan-out activity (SPEC-W16 contract §1).
+	ActivitySendPushNotification = "SendPushNotification"
 
 	// ActivitySendIncidentAlert is the name of the incident alert send
 	// activity (SPEC-W11 Part B §5).
@@ -82,6 +95,71 @@ type PacedSendRequest struct {
 	StaffAlert    *PacedStaffAlertSend       `json:"staff_alert,omitempty"`
 	GeoCampaign   *PacedGeoCampaignSend      `json:"geo_campaign,omitempty"`
 	IncidentAlert *PacedIncidentAlertSend    `json:"incident_alert,omitempty"`
+	// Push carries the SendPushNotification arguments for the push kinds
+	// (push_notification / push_marketing share one payload shape).
+	Push *PacedPushNotificationSend `json:"push,omitempty"`
+}
+
+// PushTarget is one explicit device token in a push payload (SPEC-W16
+// contract §1). An explicit Tokens list skips the booking-service device
+// fetch entirely.
+type PushTarget struct {
+	Token    string `json:"token"`
+	Platform string `json:"platform"` // android | ios | web (empty treated as android/fcm)
+}
+
+// PacedPushNotificationSend carries the SendPushNotification arguments
+// (SPEC-W16 contract §1). The JSON contract is duplicated by any scheduling
+// service (service boundary: duplicated, not shared) — keep the field tags
+// in sync.
+//
+// Tokens are resolved in order:
+//  1. Tokens (explicit list) — used as-is; no booking-service call;
+//  2. ContactID — the activity fetches the contact's device tokens from
+//     booking-service via Dapr invoke GET /internal/devices?contact_id=
+//     (response: JSON array of {tenant_id, contact_id, token, platform,
+//     app}); App then filters client-side.
+type PacedPushNotificationSend struct {
+	TenantSlug string       `json:"tenant_slug"`
+	ContactID  string       `json:"contact_id,omitempty"`
+	Tokens     []PushTarget `json:"tokens,omitempty"`
+	// Phone is OPTIONAL: when present it lets the DND guard check
+	// push_marketing sends against the NCC 2442 / tenant opt-out registries
+	// (which are phone-keyed; device tokens are not). Without it a
+	// push_marketing send passes the DND guard with the existing
+	// no-recipient warn — quiet-hours deferral still applies.
+	Phone string            `json:"phone,omitempty"`
+	Title string            `json:"title"`
+	Body  string            `json:"body"`
+	Data  map[string]string `json:"data,omitempty"`
+	// App optionally restricts fetched device tokens to one app
+	// ("admin" | "field"); empty = all of the contact's devices.
+	App string `json:"app,omitempty"`
+}
+
+// PushTokenResult is the per-token outcome of one SendPushNotification
+// fan-out. Unregistered flags tokens the provider reported as gone
+// (FCM UNREGISTERED / NotRegistered) — callers should prune them via
+// booking-service DELETE /v1/devices/{token}.
+type PushTokenResult struct {
+	Token        string `json:"token"`
+	Platform     string `json:"platform"`
+	Provider     string `json:"provider"` // fcm | apns | "" when unroutable
+	Success      bool   `json:"success"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	Unregistered bool   `json:"unregistered,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// PushNotificationResult is the outcome of one SendPushNotification call:
+// per-token results plus counters. Individual token failures are NOT
+// activity errors (Temporal retries must not re-deliver to the tokens that
+// already succeeded); the activity errors only on contract-level failures
+// (missing payload fields, device-fetch failure).
+type PushNotificationResult struct {
+	Sent    int               `json:"sent"`
+	Failed  int               `json:"failed"`
+	Results []PushTokenResult `json:"results"`
 }
 
 // PacedIncidentAlertSend carries the SendIncidentAlert arguments
@@ -195,6 +273,11 @@ func PacedSendChannel(req PacedSendRequest) string {
 		if req.IncidentAlert != nil {
 			return req.IncidentAlert.Channel
 		}
+	case PacedSendPushNotification, PacedSendPushMarketing:
+		// Fixed channel key: QUIET_HOURS_OVERRIDES may carry a "push"
+		// window (SPEC-W16 §1 — push_marketing is quiet-hours deferred
+		// like the sms marketing kinds).
+		return "push"
 	}
 	return ""
 }
