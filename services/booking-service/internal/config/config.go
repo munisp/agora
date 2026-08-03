@@ -62,6 +62,9 @@ type Config struct {
 	ReconCron          string // RECON_CRON (default "30 2 * * *" — commission-recon-nightly, Africa/Lagos 02:30)
 	// Field capture (SPEC-W16 Agent B, contract §4)
 	FieldCaptureBatchLimit int // FIELD_CAPTURE_BATCH_LIMIT: max offline-queue items per POST /v1/field/capture (default 100)
+	// App entitlement gate (SPEC-W18 Agent D, contract §4)
+	AppGateEnabled  bool          // APP_GATE_ENABLED: DEFAULT false → gate is a pure pass-through; production behavior UNCHANGED unless opted in
+	AppGateCacheTTL time.Duration // APP_GATE_CACHE_TTL_SECONDS: entitlement decision cache TTL (default 60s)
 }
 
 // Load reads configuration from the environment.
@@ -113,6 +116,9 @@ func Load() (Config, error) {
 		PayoutMinNGN:                  int64(envInt("PAYOUT_MIN_NGN", 100)),
 		ReconCron:                     envStr("RECON_CRON", "30 2 * * *"),
 		FieldCaptureBatchLimit:        envInt("FIELD_CAPTURE_BATCH_LIMIT", 100),
+		// SPEC-W18 Agent D (additive): off by default — opt-in only.
+		AppGateEnabled:  envStr("APP_GATE_ENABLED", "false") == "true",
+		AppGateCacheTTL: time.Duration(envInt("APP_GATE_CACHE_TTL_SECONDS", 60)) * time.Second,
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

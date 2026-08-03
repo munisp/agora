@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/daprc"
@@ -87,6 +88,13 @@ type Deps struct {
 	// FieldCapture serves POST /v1/field/capture (SPEC-W16 contract §4:
 	// the offline-queue flush endpoint). Nil → 503.
 	FieldCapture *fieldcapture.Handlers
+	// AppGate (SPEC-W18 Agent D, contract §4): the app entitlement gate
+	// middleware. Nil → no route is gated. When constructed with
+	// APP_GATE_ENABLED=false (the DEFAULT) it is a pure pass-through —
+	// production behavior is UNCHANGED unless explicitly opted in.
+	// Reference wiring: /v1/leads is gated behind app_id "cac"
+	// (docs/app-developer-guide.md).
+	AppGate *appgate.Gate
 }
 
 type ctxKey string
@@ -108,6 +116,18 @@ func NewRouter(d Deps) http.Handler {
 		d.TenantBySlug = d.Resolver.BySlug
 	}
 	s := &server{d: d, portalLimiter: newPortalRateLimiter(), promoLimiter: newPortalRateLimiter()}
+
+	// SPEC-W18 Agent D (additive): the entitlement gate prefers the tenant
+	// resolved by tenantMiddleware (covers the JWT-claim path where no
+	// X-Tenant-Slug header is present), falling back to the raw header.
+	if s.d.AppGate != nil {
+		s.d.AppGate.SetTenantSlugFunc(func(r *http.Request) string {
+			if t := tenantFrom(r.Context()); t.Slug != "" {
+				return t.Slug
+			}
+			return r.Header.Get("X-Tenant-Slug")
+		})
+	}
 
 	r.Get("/healthz", s.healthz)
 
@@ -190,7 +210,15 @@ func NewRouter(d Deps) http.Handler {
 		})
 		// Leads + CAC (SPEC-W13 Agent A): manage_bookings for mutations,
 		// view_analytics for reads (docs/security/roles.md).
+		// SPEC-W18 Agent D (additive): reference wiring of the app
+		// entitlement gate — this route group belongs to catalog app "cac"
+		// and is gated against identity's /internal/entitlements/check when
+		// APP_GATE_ENABLED=true. With the default (false) the gate is a pure
+		// pass-through: production behavior is UNCHANGED unless opted in.
 		r.Route("/leads", func(r chi.Router) {
+			if s.d.AppGate != nil {
+				r.Use(s.d.AppGate.Middleware("cac"))
+			}
 			r.With(s.require("view_analytics")).Get("/", s.listLeads)
 			r.With(s.require("manage_bookings")).Post("/", s.createLead)
 			r.With(s.require("view_analytics")).Get("/{id}", s.getLead)
