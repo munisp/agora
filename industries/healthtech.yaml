@@ -1,0 +1,189 @@
+# HealthTech industry pack (SPEC-W15 §1) — CAC sector pack for Nigerian
+# healthtech companies (telemedicine platforms, clinic networks, digital
+# HMOs). Motions: clinic referral intake, NHIA-aware coverage questions, and
+# teleconsult booking. CAC target ₦5,500–₦12,000 per patient. Disclosure is
+# REQUIRED: callers must always hear they are speaking with an automated
+# assistant and that the call may be recorded. Clinical safety rules mirror
+# the healthcare pack: the agent never diagnoses or triages medically, and
+# emergencies go straight to emergency services.
+id: healthtech
+displayName: HealthTech & Telemedicine
+terminology:
+  offering: consultation
+  team_member: care coordinator
+  booking: appointment
+  contact: patient
+agentPersona: |
+  You are the patient intake coordinator of a Nigerian healthtech platform
+  offering teleconsults with licensed doctors and referrals into partner
+  clinics. You are calm, precise and reassuring, and clinical safety always
+  comes before convenience. Many callers reach you after a clinic, pharmacy
+  or HMO referred them; you complete the referral intake, answer NHIA
+  (National Health Insurance Authority) coverage questions at a high level,
+  and book teleconsultations.
+
+  Hard rules (never break these, even if the caller insists):
+  - ALWAYS disclose at the start of the call that the caller is speaking
+    with an automated assistant and that the call may be recorded.
+  - NEVER diagnose, assess symptoms, or triage medically beyond routing.
+    If a caller describes symptoms, you do not interpret them: you book the
+    appropriate teleconsult or route to a nurse desk. Phrases like "it
+    sounds like…" or "you probably have…" are forbidden.
+  - EMERGENCIES: if a caller describes an emergency (chest pain, severe
+    bleeding, difficulty breathing, unconsciousness, stroke signs,
+    poisoning, severe injury), say immediately: "This sounds like an
+    emergency. Please call emergency services immediately or go to the
+    nearest emergency department now — do not wait for an appointment."
+  - NEVER confirm whether a specific HMO plan or NHIA-accredited scheme
+    covers a specific treatment — you explain how coverage checks work and
+    book a benefits-verification call with the HMO desk.
+  - NEVER discuss test results, diagnoses, prescriptions or another
+    patient's information on the phone.
+
+  What you do: complete clinic referral intake (referring clinic, reason
+  category, preferred language, NHIA/HMO status), book teleconsults and
+  follow-ups, send preparation instructions, and explain the referral
+  bounty — partner clinics earn ₦1,500 per completed referred teleconsult.
+  Always confirm the patient's full name and phone number before changing
+  any booking.
+bookingPolicy:
+  depositPercent: 0
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: true
+  cancellationWindowHours: 12
+temporalWorkflow: ClinicIntakeWorkflow
+languages: [en, pcm, yo, ig]
+consentText: |
+  This platform processes your personal and health information — including
+  your name, contact details, referral details and intake answers — solely
+  to schedule and deliver your care, verify your coverage and contact you
+  about appointments. Calls are recorded for quality and safety, and you
+  are told so at the start of every call. Your information is never sold
+  and is shared only with the clinicians, partner clinics and HMO desk
+  directly involved in your care, under strict confidentiality obligations.
+  Under the Nigeria Data Protection Act 2023 you may request access to,
+  correction of, or deletion of your personal data at any time, subject to
+  legal medical-record retention requirements.
+offerings:
+- name: Clinic Referral Intake Call
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 0
+  capacity: 8
+- name: Teleconsult (General Doctor)
+  duration_min: 20
+  buffer_min: 10
+  price_cents: 350000 # ₦3,500
+  capacity: 6
+- name: Teleconsult (Specialist)
+  duration_min: 30
+  buffer_min: 10
+  price_cents: 750000 # ₦7,500
+  capacity: 3
+- name: HMO/NHIA Benefits Verification Call
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 0
+  capacity: 4
+- name: Follow-Up Teleconsult
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 200000 # ₦2,000
+  capacity: 6
+reminders:
+  offsets: ["24h", "2h"]
+  channels: ["sms", "whatsapp"]
+knowledgeSeed:
+- title: Clinic referral intake
+  body: |
+    Partner clinics refer patients for teleconsults or specialist review.
+    Intake captures: the referring clinic and clinician, the reason
+    category (general, specialist, mental health, maternal/child health,
+    chronic care follow-up), the patient's preferred language (English,
+    Pidgin, Yoruba, Igbo, Hausa), and NHIA/HMO status. Intake never records
+    a diagnosis and never interprets symptoms — the reason category is for
+    routing only. Referred patients are booked into the next suitable
+    teleconsult slot, and the referring clinic receives the appointment
+    confirmation.
+- title: NHIA & HMO coverage questions
+  body: |
+    The platform works with NHIA-accredited HMO plans and selected private
+    HMOs. Coverage depends on the patient's specific plan, so the intake
+    desk never confirms that a treatment is covered: it explains the three
+    steps (confirm the HMO and plan name, book a benefits-verification call
+    with the HMO desk, receive written confirmation before a paid
+    consultation) and books the verification call. Patients without HMO
+    coverage pay the published teleconsult fee; payment is by transfer or
+    the secure payment link — agents never take card details, PINs or OTPs.
+- title: Teleconsult booking & preparation
+  body: |
+    Teleconsults run daily 8:00–20:00 WAT, by voice or video. Preparation:
+    a quiet private space, a charged phone, the list of current
+    medications, and any referral letter or recent test results (shared via
+    the secure upload link, never read out on a call). General teleconsults
+    are 20 minutes, specialist 30 minutes. Cancellations and reschedules
+    are free up to 12 hours before the appointment. The doctor may refer
+    the patient back to a partner clinic for physical examination or tests
+    — the teleconsult does not replace emergency care.
+- title: Partner clinic referral bounty
+  body: |
+    A registered partner clinic earns a ₦1,500 referral bounty for every
+    referred patient who completes a paid teleconsult. The bounty is
+    settled monthly per clinic, with a referral statement. Patients are
+    never charged extra because of a referral, and the bounty never
+    influences which clinician or clinic a patient is routed to — routing
+    follows clinical and geographic fit only.
+dashboardLabels:
+  bookingSingular: Appointment
+  bookingPlural: Appointments
+  customerTerm: Patient
+agents:
+- id: referral-intake-coordinator
+  name: Referral Intake Coordinator
+  persona: |
+    You are the referral intake coordinator. You complete clinic referral
+    intake — referring clinic, reason category, preferred language,
+    NHIA/HMO status — and book the teleconsult. You never interpret
+    symptoms or name conditions; for any emergency sign you immediately
+    tell the caller to call emergency services or go to the nearest
+    emergency department. You explain the ₦1,500 partner-clinic referral
+    bounty when clinics ask.
+  intents: [referral, referred, clinic, "my clinic", intake, register, "sign up", patient, doctor, teleconsult, consultation, book, booking, appointment]
+- id: benefits-verification-officer
+  name: HMO/NHIA Benefits Officer
+  persona: |
+    You are the HMO/NHIA benefits officer. You explain how coverage
+    verification works for NHIA-accredited and private HMO plans, collect
+    the HMO and plan name, and book the benefits-verification call. You
+    never confirm that a specific treatment is covered — written
+    confirmation comes from the HMO desk after verification.
+  intents: [nhia, hmo, insurance, coverage, covered, "health insurance", "my plan", benefits, verification, "retainer ship", retainership]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated patient intake assistant, not a medical professional. This call is recorded."
+ussd:
+  menu:
+  - {key: "1", label: "Book teleconsult", action: book}
+  - {key: "2", label: "Clinic referral intake", action: book}
+  - {key: "3", label: "My appointment status", action: status}
+  - {key: "4", label: "NHIA/HMO coverage check", action: handoff}
+  - {key: "5", label: "Emergency guidance", action: sos}
+growth:
+  referral_bounty_ngn: 1500
+  primary_channels: [clinic-referrals, whatsapp, ussd, hmo-partnerships]
+  cac_target_ngn: 8000 # blended target within the ₦5,500–₦12,000/patient band
+i18n:
+  pcm:
+    greeting: "Welcome! You dey talk to automated intake assistant, no be doctor. This call fit dey recorded. How we fit help you today?"
+    referral: "If your clinic refer patient wey complete teleconsult, the clinic go collect ₦1,500 bounty."
+  yo:
+    greeting: "Kaabo! Ohun elo onínọmbà laifọwọyi ni o ń bá sọ̀rọ̀, kì í ṣe dókítà. A lè gbà í ìpè yìí lẹ́nu. Báwo ni a ṣe lè ràn wọ́ lọ́wọ́ lónìí?"
+    referral: "Tó bá jẹ́ pé ilé ìwòsàn rẹ rán aláìsàn kan wá tí ó parí ìpàdé teleconsult, ilé ìwòsàn náà á gba ₦1,500."
+  ig:
+    greeting: "Nnọọ! Ị na-akpa okwu na onye nyocha akpaaka, ọ bụghị dọkịta. Enwere ike idekọ oku a. Kedu ka anyị ga-esi nyere gị aka taa?"
+    referral: "Ọ bụrụ na ụlọ ọgwụ gị zipu onye ọrịa mezue teleconsult, ụlọ ọgwụ ahụ ga-enweta ₦1,500."
+  en:
+    greeting: "Welcome! You are speaking with an automated intake assistant, not a doctor. This call may be recorded. How can we help you today?"
+    referral: "When your clinic refers a patient who completes a teleconsult, the clinic earns a ₦1,500 bounty."

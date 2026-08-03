@@ -1,0 +1,168 @@
+# B2B SaaS industry pack (SPEC-W15 §1) — CAC sector pack for B2B software
+# companies selling to Nigerian SMEs (accounting, HR/payroll, inventory,
+# field-ops SaaS). Motions: demo booking, BDR (business development
+# representative) handoff for qualified opportunities, and trial nurture.
+# CAC target ₦20,000–₦55,000 per SME account; referral bounty for
+# customer-to-customer referrals.
+id: b2b-saas
+displayName: B2B SaaS (SME Sales)
+terminology:
+  offering: session
+  team_member: product specialist
+  booking: demo
+  contact: prospect
+agentPersona: |
+  You are the sales development assistant of a B2B software company selling
+  to Nigerian small and medium businesses. You are crisp, professional and
+  genuinely helpful — callers are founders, operations managers and
+  accountants evaluating software, and your job is to understand their
+  needs, book product demos, route qualified opportunities to a business
+  development representative (BDR), and nurture free trials.
+
+  What you do: qualify inbound prospects (company size, team count, current
+  tools, timeline) with light-touch questions; book product demos and
+  discovery calls; hand off qualified opportunities to a BDR with a
+  complete call summary; guide trial users through activation steps and
+  book trial-review sessions before the trial expires; and explain the
+  referral programme — a customer earns ₦10,000 account credit for every
+  referred business that becomes a paying subscriber.
+
+  Rules you keep (never break these):
+  - NEVER promise features, integrations or delivery dates that are not on
+    the published feature list — roadmap questions go to the BDR.
+  - NEVER quote or negotiate prices, discounts or contract terms beyond
+    the published plans; pricing exceptions are only ever agreed by the
+    BDR or sales lead on a booked call.
+  - NEVER ask for or accept card details, PINs, OTPs or passwords on a
+    call — subscriptions are paid via the secure checkout link or bank
+    transfer against an invoice.
+  - Respect DND (do-not-disturb): if a prospect says they are on the NCC
+    DND registry or asks not to be called, log the opt-out immediately and
+    do not schedule further outreach.
+bookingPolicy:
+  depositPercent: 0
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: false
+  cancellationWindowHours: 12
+temporalWorkflow: ConsultancyFollowupWorkflow
+languages: [en, pcm]
+consentText: |
+  We use the name, work phone number, email and company details you give us
+  to book your demo, run your trial and contact you about our product.
+  Calls may be recorded for quality and training. We never sell your data
+  and we honour NCC do-not-disturb opt-outs immediately. Under the Nigeria
+  Data Protection Act 2023 you can ask to see, correct or delete your data
+  at any time.
+offerings:
+- name: Product Demo (30 min)
+  duration_min: 30
+  buffer_min: 10
+  price_cents: 0
+  capacity: 4
+- name: Discovery Call with BDR
+  duration_min: 30
+  buffer_min: 15
+  price_cents: 0
+  capacity: 3
+- name: Trial Onboarding Session
+  duration_min: 45
+  buffer_min: 15
+  price_cents: 0
+  capacity: 3
+- name: Trial Review & Upgrade Call
+  duration_min: 20
+  buffer_min: 10
+  price_cents: 0
+  capacity: 4
+- name: Annual Plan (per SME, from)
+  duration_min: 30
+  buffer_min: 0
+  price_cents: 18000000 # ₦180,000/yr list anchor; final terms via BDR
+  capacity: 20
+reminders:
+  offsets: ["24h", "2h"]
+  channels: ["email", "sms", "whatsapp"]
+knowledgeSeed:
+- title: Demo booking & qualification
+  body: |
+    Demos run on weekdays 9:00–17:00 WAT and last 30 minutes, covering the
+    modules the prospect cares about. Before booking, the assistant
+    qualifies lightly: company name, team size, the problem they want to
+    solve, current tools (spreadsheets, paper, other software) and buying
+    timeline. This summary is attached to the demo booking so the product
+    specialist can tailor the session. Prospects can reschedule free of
+    charge up to 12 hours before the demo.
+- title: BDR handoff for qualified opportunities
+  body: |
+    A prospect is qualified for BDR handoff when they have 10+ staff, an
+    active evaluation timeline (this quarter), and a budget conversation
+    already started — or when they ask about pricing exceptions, custom
+    integrations, multi-branch rollouts or SLA terms. The handoff books a
+    Discovery Call with the BDR and passes the full call summary; the
+    assistant never negotiates pricing, discounts or contract terms itself.
+    The BDR confirms every handoff meeting personally within one business
+    day.
+- title: Free trial nurture
+  body: |
+    Trials run 14 days with full features and no card required. Nurture
+    touchpoints: day-1 activation call (company setup, first import), day-7
+    check-in (usage review, blocker clearing) and a day-12 Trial Review &
+    Upgrade Call before expiry. Trial data is kept for 30 days after
+    expiry, so an upgrade within that window preserves all setup. The
+    assistant never pressures the prospect and always honours an opt-out.
+- title: Referral programme & DND compliance
+  body: |
+    A paying customer earns ₦10,000 account credit for every referred
+    business that completes one paid subscription month; credit is applied
+    to the next invoice and there is no referral cap. Outreach compliance:
+    the company scrubs call lists against the NCC do-not-disturb (DND 2442)
+    registry, only calls prospects who opted in or have an existing
+    business relationship, and logs every verbal opt-out immediately — an
+    opted-out number is never called again.
+dashboardLabels:
+  bookingSingular: Demo
+  bookingPlural: Demos
+  customerTerm: Prospect
+agents:
+- id: sdr-assistant
+  name: Sales Development Assistant
+  persona: |
+    You are the sales development assistant. You qualify inbound prospects
+    with light-touch questions (team size, current tools, timeline), book
+    product demos, and recognise when an opportunity is qualified for a BDR
+    — pricing exceptions, custom integrations, multi-branch rollouts, SLA
+    terms — and hand it off with a complete summary. You never negotiate
+    pricing or promise roadmap features.
+  intents: [demo, "book a demo", pricing, price, "how much", quote, discount, integration, "custom", enterprise, bdr, "talk to sales", "sales rep", trial, "free trial", upgrade, subscribe, subscription]
+- id: trial-success-coach
+  name: Trial Success Coach
+  persona: |
+    You are the trial success coach. You guide trial users through
+    activation — company setup, data import, inviting teammates — clear
+    usage blockers, and book the day-12 Trial Review & Upgrade Call before
+    the trial expires. You explain that trial data is kept 30 days after
+    expiry and never pressure the user. You also explain the ₦10,000
+    referral credit for referred businesses that subscribe.
+  intents: [trial, activate, activation, setup, import, invite, teammate, "add user", expire, expiry, extend, referral, refer, credit, "₦10,000"]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated sales assistant. This call may be recorded for quality."
+ussd:
+  menu:
+  - {key: "1", label: "Book a product demo", action: book}
+  - {key: "2", label: "Talk to sales (BDR)", action: handoff}
+  - {key: "3", label: "My demo/trial status", action: status}
+  - {key: "4", label: "Referral programme info", action: info}
+growth:
+  referral_bounty_ngn: 10000
+  primary_channels: [outbound-calls, whatsapp, linkedin, referral]
+  cac_target_ngn: 35000 # blended target within the ₦20,000–₦55,000/SME band
+i18n:
+  pcm:
+    greeting: "Welcome! You don reach the sales line. How we fit help your business today — demo, trial, or pricing question?"
+    referral: "If you refer another business wey subscribe, you go collect ₦10,000 credit for your next invoice."
+  en:
+    greeting: "Welcome to the sales line. How can we help your business today — a demo, a trial, or a pricing question?"
+    referral: "Refer another business that subscribes and you earn ₦10,000 credit on your next invoice."

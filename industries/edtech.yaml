@@ -1,0 +1,167 @@
+# EdTech industry pack (SPEC-W15 §1) — CAC sector pack for Nigerian edtech
+# companies (learning apps, exam-prep platforms, school-management software).
+# Motions: parent enrollment calls, school MoU follow-up with proprietors and
+# head teachers, and termly payment reminders. CAC target ₦2,500–₦5,500 per
+# enrolled parent; referral bounty for parent-to-parent referrals.
+id: edtech
+displayName: EdTech & Learning Platforms
+terminology:
+  offering: programme
+  team_member: learning advisor
+  booking: session
+  contact: parent
+agentPersona: |
+  You are the parent-enrollment advisor of a Nigerian edtech company — a
+  learning platform for children in primary and secondary school. You are
+  warm, patient and encouraging: many callers are parents hearing about the
+  platform for the first time, often via another parent or their child's
+  school, and you make enrollment feel simple and safe. Mirror the caller's
+  register: Nigerian Pidgin if they speak Pidgin ("Your pikin go learn well
+  well, no wahala"), polite standard English if they are formal.
+
+  What you do: enroll parents onto trial and paid plans and book onboarding
+  sessions; follow up on school partnership MoUs with proprietors, head
+  teachers and PTA chairpersons (book the MoU review meeting, never promise
+  signature dates); send term payment reminders and help parents pick a
+  payment plan; and explain the referral bounty — a parent earns ₦2,000 airtime
+  or wallet credit for every referred parent who completes a paid enrollment.
+
+  Rules you keep (never break these):
+  - NEVER guarantee academic results, grades or exam passes — say the
+    platform supports learning, and outcomes depend on practice.
+  - NEVER quote or negotiate prices outside the published plans; discounts,
+    scholarships and school bulk rates are only confirmed by the
+    partnerships team in a booked session.
+  - NEVER take card details, PINs or OTPs on a call — payments are by
+    transfer or the secure payment link sent by SMS/WhatsApp.
+  - Verify the caller's name and phone number before changing any enrollment
+    or payment plan.
+bookingPolicy:
+  depositPercent: 0
+  noShowFeeCents: 0
+  phoneConfirmation: true
+  intakeRequired: false
+  cancellationWindowHours: 24
+temporalWorkflow: ConsultancyFollowupWorkflow
+languages: [en, pcm]
+consentText: |
+  We use the name, phone number and enrollment details you give us to set up
+  your child's learning account, send term payment reminders and contact you
+  about sessions. Calls may be recorded for quality and training. We never
+  sell your data, and we only share it with the tutors and school partners
+  directly involved in your child's programme. Under the Nigeria Data
+  Protection Act 2023 you can ask to see, correct or delete your data at any
+  time.
+offerings:
+- name: Parent Enrollment & Onboarding Call
+  duration_min: 20
+  buffer_min: 10
+  price_cents: 0
+  capacity: 6
+- name: Free Trial Class (Child)
+  duration_min: 45
+  buffer_min: 15
+  price_cents: 0
+  capacity: 8
+- name: School MoU Follow-Up Meeting
+  duration_min: 45
+  buffer_min: 15
+  price_cents: 0
+  capacity: 2
+- name: Term Payment Plan Consultation
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 0
+  capacity: 4
+- name: Monthly Learning Plan (per child)
+  duration_min: 30
+  buffer_min: 0
+  price_cents: 450000 # ₦4,500
+  capacity: 20
+reminders:
+  offsets: ["72h", "24h", "2h"]
+  channels: ["sms", "whatsapp"]
+knowledgeSeed:
+- title: Parent enrollment & plans
+  body: |
+    Enrollment starts with a free onboarding call and one free trial class
+    for the child. Paid plans are per child per month (from ₦4,500) or per
+    term at a discounted rate; the current price list is on the website and
+    is quoted as published — the enrollment desk never invents discounts.
+    Payments are by bank transfer or the secure payment link sent by
+    SMS/WhatsApp; agents never take card details, PINs or OTPs on a call.
+    A parent can pause or cancel at the end of any paid month.
+- title: School partnership (MoU) follow-up
+  body: |
+    The partnerships team signs Memoranda of Understanding (MoUs) with
+    schools: the platform provides after-school learning support and the
+    school introduces it to parents. MoU follow-up calls go to proprietors,
+    head teachers or PTA chairpersons to book or confirm the MoU review
+    meeting, answer questions about the revenue-share and data-safety
+    terms, and agree next steps. The enrollment desk never promises
+    signature dates or changes MoU terms — the partnerships lead owns the
+    document.
+- title: Term payment reminders & plans
+  body: |
+    Termly subscriptions are reminded at 30, 14 and 3 days before expiry by
+    SMS and WhatsApp, and once by call for accounts already expired. A
+    payment plan of up to three instalments per term is available and must
+    be agreed in a Term Payment Plan Consultation before the term begins.
+    Failed or partial payments never suspend a child's access mid-class;
+    access lapses at the end of the paid period.
+- title: Parent referral bounty
+  body: |
+    A registered parent earns a ₦2,000 referral bounty (airtime or wallet
+    credit) for every new parent who names them at enrollment and completes
+    one paid month. The bounty is paid within 7 days of the referred
+    parent's first successful payment. There is no cap on referrals.
+    Self-referrals and duplicate child accounts do not qualify.
+dashboardLabels:
+  bookingSingular: Session
+  bookingPlural: Sessions
+  customerTerm: Parent
+agents:
+- id: enrollment-advisor
+  name: Parent Enrollment Advisor
+  persona: |
+    You are the parent enrollment advisor. You walk parents through plans
+    and prices as published, book the free trial class and onboarding call,
+    explain term payment reminders and instalment plans, and explain the
+    ₦2,000 referral bounty for every referred parent who completes a paid
+    month. You never guarantee grades, never invent discounts, and never
+    take card details or OTPs on a call.
+  intents: [enroll, enrol, enrollment, register, "sign up", price, prices, "how much", plan, plans, trial, "trial class", payment, "payment plan", referral, bounty, "refer a parent"]
+- id: school-partnerships-officer
+  name: School Partnerships Officer
+  persona: |
+    You are the school partnerships officer. You handle calls with
+    proprietors, head teachers and PTA chairpersons about the school MoU:
+    you book or confirm the MoU review meeting, explain the after-school
+    support model, revenue share and data-safety terms at a high level, and
+    record the school's preferred meeting time. You never promise signature
+    dates or alter MoU terms — the partnerships lead owns the document.
+  intents: [school, mou, "m o u", partnership, proprietor, "head teacher", pta, "bulk rate", "school license", "school licence"]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated enrollment assistant. This call may be recorded for quality."
+ussd:
+  menu:
+  - {key: "1", label: "Enroll your child", action: book}
+  - {key: "2", label: "Book free trial class", action: book}
+  - {key: "3", label: "Term payment reminder status", action: status}
+  - {key: "4", label: "School partnership (MoU)", action: handoff}
+  - {key: "5", label: "Referral bounty info", action: info}
+growth:
+  referral_bounty_ngn: 2000
+  primary_channels: [whatsapp, ussd, school-partnerships, referral]
+  cac_target_ngn: 4000 # blended target within the ₦2,500–₦5,500/parent band
+i18n:
+  pcm:
+    greeting: "Welcome! Na the learning platform enrollment line you dey call. How we fit help your pikin today?"
+    referral: "If you refer another parent wey enroll, you go collect ₦2,000 bounty."
+    term_reminder: "Your pikin term plan go soon expire — make you renew am on time."
+  en:
+    greeting: "Welcome to the learning platform enrollment line. How can we help your child today?"
+    referral: "Refer another parent who enrolls and you earn a ₦2,000 bounty."
+    term_reminder: "Your child's term plan expires soon — please renew in time."
