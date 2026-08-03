@@ -16,6 +16,7 @@ import {
   UsersRound,
   BarChart3,
   CircleDollarSign,
+  Gift,
   LineChart,
   Webhook,
   MessagesSquare,
@@ -55,6 +56,7 @@ const items: NavItem[] = [
   { segment: "billing", label: "Billing", icon: CreditCard },
   { segment: "analytics", label: "Analytics", icon: BarChart3 },
   { segment: "cac", label: "CAC", icon: CircleDollarSign },
+  { segment: "growth", label: "Growth", icon: Gift },
   { segment: "webhooks", label: "Webhooks", icon: Webhook },
   { segment: "channels", label: "Channels", icon: MessagesSquare },
   { segment: "locations", label: "Locations", icon: MapPin },
@@ -97,6 +99,12 @@ export function OrgNav({
     // server-side too.
     if ("segment" in item && item.segment === "cac")
       return canViewAnalytics(roles);
+    // SPEC-W14 Agent C: growth (referrals & commissions) mixes
+    // view_analytics reads (referrals, ledger, leaderboard) with
+    // manage_billing pages (rules, payouts) — show the entry to either
+    // audience; each growth page enforces its own gate server-side.
+    if ("segment" in item && item.segment === "growth")
+      return canViewAnalytics(roles) || canViewBilling(roles);
     // SPEC-W8 Part C: locations is owner/admin/staff; geo campaigns is
     // owner/admin only. The pages enforce the same rule server-side.
     if ("segment" in item && item.segment === "locations")
