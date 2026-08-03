@@ -64,6 +64,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.error("idempotency bootstrap failed; keyed turn appends will 500",
                   error=str(exc))
 
+    # SPEC-W12 contract §2: ussd channel enum on conversations + the GDPR
+    # contact column (USSD caller number → incident IDP callback_number).
+    # ensure_contact_column also runs under privacy_enabled below; both are
+    # idempotent.
+    try:
+        await db.ensure_contact_column()
+        await db.ensure_ussd_channel()
+    except Exception as exc:
+        log.error("ussd bootstrap failed; ussd conversations will fail",
+                  error=str(exc))
+
     dapr = DaprClient(cfg.dapr_host, cfg.dapr_http_port, cfg.dapr_pubsub_name)
 
     sink = build_sink(cfg)

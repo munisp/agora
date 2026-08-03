@@ -72,6 +72,18 @@ class Config:
     incident_min_score: float = 0.6
     incidents_topic: str = "opendesk.incidents"
 
+    # USSD inbound (SPEC-W12 contract §1/§2): synchronous hook at
+    # POST /v1/ussd/turns invoked by messaging-gateway via Dapr.
+    # ussd_text_mode_reply is the acknowledgement returned in pass-through
+    # text mode (no tenant-pack ussd.menu); menu mode replies are rendered
+    # from the pack menu. The 180s session TTL (contract §1) is enforced by
+    # messaging-gateway's session store, not here — the session→conversation
+    # mapping (uuid5(tenant, sessionId)) is stateless.
+    ussd_enabled: bool = True
+    ussd_text_mode_reply: str = (
+        "Thank you. Your message has been received; an agent will respond shortly."
+    )
+
     # OpenSearch indexer (SPEC §10, index `conversations`).
     opensearch_addr: str = "http://opensearch:9200"
     conversations_index: str = "conversations"
@@ -131,4 +143,9 @@ def load() -> Config:
         incident_enabled=_env("INCIDENT_ENABLED", "true").lower() == "true",
         incident_min_score=float(_env("INCIDENT_MIN_SCORE", "0.6")),
         incidents_topic=_env("INCIDENTS_TOPIC", "opendesk.incidents"),
+        ussd_enabled=_env("USSD_ENABLED", "true").lower() == "true",
+        ussd_text_mode_reply=_env(
+            "USSD_TEXT_MODE_REPLY",
+            "Thank you. Your message has been received; an agent will respond shortly.",
+        ),
     )

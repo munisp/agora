@@ -9,7 +9,7 @@ from typing import Annotated, Any
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
-from . import events, incidents, intel, models
+from . import events, incidents, intel, models, ussd
 from .db import NotFoundError
 
 router = APIRouter()
@@ -111,15 +111,50 @@ async def add_turn(
     tenant_id: Annotated[uuid.UUID, Depends(_require_tenant)],
     idempotency_key: Annotated[str | None, Header()] = None,
 ) -> models.TurnCreated:
-    st = _state(request)
+    turn, created = await _persist_turn(
+        _state(request),
+        conversation_id,
+        tenant_id,
+        body.role,
+        body.text,
+        tool_calls=body.tool_calls,
+        audio_url=body.audio_url,
+        idempotency_key=idempotency_key,
+    )
+
+    # SPEC-W3 §3: Idempotency-Key replay — return the original turn with
+    # 200 and do NOT re-publish sink/Dapr/enriched events (exactly-once
+    # semantics for the caller).
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return models.TurnCreated(turn=turn)
+
+
+async def _persist_turn(
+    st: Any,
+    conversation_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    role: str,
+    text: str,
+    tool_calls: list[dict[str, Any]] | None = None,
+    audio_url: str | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[models.Turn, bool]:
+    """Enrich + persist + fan out one turn; returns (turn, created).
+
+    Shared by the REST turns endpoint and the SPEC-W12 USSD inbound hook so
+    every channel gets identical enrichment, event publication and incident
+    classification. created=False (Idempotency-Key replay) skips ALL side
+    effects, exactly like the REST path.
+    """
 
     # Call intelligence (SPEC-W3 §4, innovation 3): lexicon sentiment always;
     # optional LLM NER when INTEL_LLM=on (failure degrades to lexicon-only).
-    enrichment = await intel.enrich_turn(body.text, st.cfg)
+    enrichment = await intel.enrich_turn(text, st.cfg)
 
     try:
         row, created = await st.db.add_turn(
-            conversation_id, tenant_id, body.role, body.text, body.tool_calls,
+            conversation_id, tenant_id, role, text, tool_calls,
             sentiment=enrichment["sentiment"],
             intent=enrichment["intent"],
             entities=enrichment["entities"],
@@ -137,12 +172,9 @@ async def add_turn(
 
     turn = models.Turn(**_turn_dict(row))
 
-    # SPEC-W3 §3: Idempotency-Key replay — return the original turn with
-    # 200 and do NOT re-publish sink/Dapr/enriched events (exactly-once
-    # semantics for the caller).
+    # Idempotency-Key replay — no re-publish of sink/Dapr/enriched events.
     if not created:
-        response.status_code = status.HTTP_200_OK
-        return models.TurnCreated(turn=turn)
+        return turn, False
 
     # Fetch site_slug for the event subject (plus channel/contact for the
     # SPEC-W11 incident IDP context).
@@ -179,7 +211,7 @@ async def add_turn(
         role=turn.role,
         text=turn.text,
         ts=turn.ts,
-        audio_url=body.audio_url,
+        audio_url=audio_url,
     )
     try:
         await st.dapr.publish_event(st.cfg.transcripts_topic, event)
@@ -241,4 +273,66 @@ async def add_turn(
             tasks.add(task)
             task.add_done_callback(tasks.discard)
 
-    return models.TurnCreated(turn=turn)
+    return turn, True
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W12: USSD inbound hook (contract §1/§2)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/v1/ussd/turns")
+async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, Any]:
+    """Synchronous USSD callback hook invoked by messaging-gateway via Dapr.
+
+    One Africa's Talking callback in → one user turn appended to the
+    session's conversation (deterministic uuid5(tenant, sessionId) key,
+    channel="ussd") → the reply text out in the response body; the gateway
+    renders ``CON ``/``END `` (see app/ussd.py for the full contract).
+
+    Tenant scope comes from the invoke body (service-to-service call, like
+    the Dapr pubsub deliveries — no X-Tenant-ID header on Dapr invoke).
+    USER turns pass through the unchanged _persist_turn path, so the
+    SPEC-W11 incident classifier applies verbatim (ussd is mapped web-like
+    in the IDP); the agent reply turn is never classified (existing rule).
+    """
+    st = _state(request)
+    if not st.cfg.ussd_enabled:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ussd channel disabled")
+
+    tenant_id = body.tenant_id
+    conv_id = ussd.session_conversation_id(tenant_id, body.session_id)
+
+    # Get-or-create the session conversation (idempotent on the
+    # deterministic key — retried/duplicate first callbacks are safe).
+    try:
+        await st.db.get_conversation(conv_id, tenant_id)
+    except NotFoundError:
+        await st.db.create_conversation(
+            tenant_id, body.site_slug, ussd.CHANNEL, body.phone_number,
+            conversation_id=conv_id,
+        )
+
+    idem = ussd.idempotency_key(body)
+    await _persist_turn(
+        st, conv_id, tenant_id, "user", ussd.user_turn_text(body),
+        idempotency_key=idem,
+    )
+
+    reply, continue_session, selected = ussd.build_reply(
+        body, st.cfg.ussd_text_mode_reply
+    )
+    # Record the reply as an agent turn (deduped on the same callback key),
+    # mirroring the telegram/whatsapp bridge's user-turn → agent-turn pair.
+    await _persist_turn(
+        st, conv_id, tenant_id, "agent", reply,
+        idempotency_key=idem + ":reply",
+    )
+
+    return ussd.response_payload(
+        conversation_id=conv_id,
+        reply=reply,
+        continue_session=continue_session,
+        body=body,
+        selected=selected,
+    )
