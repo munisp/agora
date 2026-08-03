@@ -66,7 +66,7 @@ func TestSendGeoCampaignMessageValidation(t *testing.T) {
 	require.ErrorContains(t, a.SendGeoCampaignMessage(ctx, workflows.PacedGeoCampaignSend{
 		Channel: "sms", Text: "x"}), "phone is required")
 	require.ErrorContains(t, a.SendGeoCampaignMessage(ctx, workflows.PacedGeoCampaignSend{
-		Channel: "sms", Phone: "+1"}), "text is required")
+		Channel: "sms", Phone: "+1", Text: "x"}), "text is required")
 	require.ErrorContains(t, a.SendGeoCampaignMessage(ctx, workflows.PacedGeoCampaignSend{
 		Channel: "pigeon", Phone: "+1", Text: "x"}), "unknown channel")
 }
@@ -75,12 +75,12 @@ func TestSendGeoCampaignMessageValidation(t *testing.T) {
 // rejects a missing payload.
 func TestNotifyPacedGeoCampaignDispatch(t *testing.T) {
 	a := pacedTestActivities(nil)
-	require.ErrorContains(t, a.NotifyPaced(context.Background(),
+	require.ErrorContains(t, notifyPacedErr(a, context.Background(),
 		workflows.PacedSendRequest{Kind: workflows.PacedSendGeoCampaign}), "missing geo_campaign payload")
 
 	// With a payload the dispatch reaches the send (which then fails on the
 	// unreachable fake sidecar — proving it was routed).
-	err := a.NotifyPaced(context.Background(), workflows.PacedSendRequest{
+	err := notifyPacedErr(a, context.Background(), workflows.PacedSendRequest{
 		Kind: workflows.PacedSendGeoCampaign,
 		GeoCampaign: &workflows.PacedGeoCampaignSend{
 			Channel: "telegram", Phone: "+1", Text: "hi",

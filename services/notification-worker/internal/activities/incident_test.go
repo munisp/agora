@@ -65,7 +65,7 @@ func TestNotifyPacedIncidentAlertPriorityLane(t *testing.T) {
 	ctx := context.Background()
 
 	// Drain the single burst token with a normal (non-priority) send.
-	require.NoError(t, a.NotifyPaced(ctx, waitlistClaimReq()))
+	require.NoError(t, notifyPacedErr(a, ctx, waitlistClaimReq()))
 
 	req := workflows.PacedSendRequest{
 		Kind:     workflows.PacedSendIncidentAlert,
@@ -79,7 +79,9 @@ func TestNotifyPacedIncidentAlertPriorityLane(t *testing.T) {
 		},
 	}
 	start := time.Now()
-	require.NoError(t, a.NotifyPaced(ctx, req))
+	res, err := a.NotifyPaced(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, workflows.PacedSendStatusSent, res.Status)
 	require.Less(t, time.Since(start), 500*time.Millisecond,
 		"priority incident_alert must bypass the exhausted bucket (10s refill)")
 
@@ -99,7 +101,7 @@ func TestNotifyPacedIncidentAlertPriorityLane(t *testing.T) {
 func TestNotifyPacedIncidentAlertValidation(t *testing.T) {
 	a := pacedTestActivities(nil)
 	ctx := context.Background()
-	require.ErrorContains(t, a.NotifyPaced(ctx, workflows.PacedSendRequest{Kind: workflows.PacedSendIncidentAlert}),
+	require.ErrorContains(t, notifyPacedErr(a, ctx, workflows.PacedSendRequest{Kind: workflows.PacedSendIncidentAlert}),
 		"missing incident_alert payload")
 	require.ErrorContains(t, a.SendIncidentAlert(ctx, workflows.PacedIncidentAlertSend{Text: "x"}),
 		"phone is required")
