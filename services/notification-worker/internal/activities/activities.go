@@ -50,6 +50,10 @@ type Activities struct {
 	// Pacer is the outbound CPS limiter + sender rotator (VOICE-SCALING §4);
 	// set by main after New. Nil disables pacing/rotation (tests).
 	Pacer *pacer.Pacer
+	// Guards is the SPEC-W12 §3 compliance guard set (DND 2442 suppression +
+	// quiet-hours config); set by main after New. Nil disables the DND
+	// pre-send guard (tests / no DATABASE_URL).
+	Guards *pacer.Guards
 	// Webhooks holds the outbound webhook delivery dependencies (Wave 5 #10);
 	// set by main after New.
 	Webhooks WebhookDeps

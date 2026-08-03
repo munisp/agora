@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/opendesk/notification-worker/internal/activities"
@@ -198,7 +200,50 @@ func run() error {
 		logger.Warn("DATABASE_URL unset: webhook platform disabled (subscriptions/deliveries 503)")
 	}
 
+	// SPEC-W12 Agent B: DND 2442 + quiet-hours compliance guards. The DND
+	// registry shares the notifications DB (no DATABASE_URL → store-less
+	// guards pass marketing sends with a warn log, and /v1/dnd 503s).
+	// Quiet-hours config is validated at boot and handed to marketing
+	// workflows via their input (workflows.GuardedPacedSend).
+	quietOverrides := map[string]string{}
+	if cfg.QuietHoursOverrides != "" {
+		if err := json.Unmarshal([]byte(cfg.QuietHoursOverrides), &quietOverrides); err != nil {
+			return fmt.Errorf("QUIET_HOURS_OVERRIDES: invalid JSON object: %w", err)
+		}
+	}
+	quietHours := pacer.QuietHoursConfig{
+		DefaultWindow: cfg.QuietHoursDefault,
+		Overrides:     quietOverrides,
+		Timezone:      pacer.DefaultQuietHoursTimezone,
+	}
+	// Boot-time validation of the window + overrides (fail fast on typos).
+	if _, _, err := pacer.QuietHoursOpenAt(time.Now(), "", quietHours); err != nil {
+		return fmt.Errorf("quiet hours config: %w", err)
+	}
+	for ch := range quietOverrides {
+		if _, _, err := pacer.QuietHoursOpenAt(time.Now(), ch, quietHours); err != nil {
+			return fmt.Errorf("quiet hours override for channel %q: %w", ch, err)
+		}
+	}
+	var dndChecker pacer.DNDChecker
+	var dndStore httpapi.DNDStore
+	if webhookStore != nil {
+		dndChecker = webhookStore
+		dndStore = webhookStore
+	}
+	acts.Guards = pacer.NewGuards(pacer.GuardConfig{
+		DNDEnforcement: cfg.DNDEnforcement,
+		DND:            dndChecker,
+		QuietHours:     quietHours,
+	}, logger)
+	logger.Info("compliance guards configured (SPEC-W12)",
+		zap.Bool("dnd_enforcement", cfg.DNDEnforcement),
+		zap.Bool("dnd_store", dndChecker != nil),
+		zap.String("quiet_hours_default", quietHours.DefaultWindow),
+		zap.Int("quiet_hours_overrides", len(quietOverrides)))
+
 	// HTTP sidecar: /healthz + /dev triggers + /v1/webhooks (Wave 5 #10)
+	// + /v1/dnd (SPEC-W12).
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.Port),
 		Handler: httpapi.NewRouter(&httpapi.Server{
@@ -221,6 +266,7 @@ func run() error {
 				return httpapi.TenantRef{ID: id, Slug: slug}, nil
 			},
 			WebhookSigningRequired: cfg.WebhookSigningRequired,
+			DND:                    dndStore,
 		}),
 	}
 	errCh := make(chan error, 1)
