@@ -60,6 +60,8 @@ type Config struct {
 	PayoutProvider     string // PAYOUT_PROVIDER (default paystack; Agent B payout execution)
 	PayoutMinNGN       int64  // PAYOUT_MIN_NGN (default 100 — minimum payout, naira)
 	ReconCron          string // RECON_CRON (default "30 2 * * *" — commission-recon-nightly, Africa/Lagos 02:30)
+	// Field capture (SPEC-W16 Agent B, contract §4)
+	FieldCaptureBatchLimit int // FIELD_CAPTURE_BATCH_LIMIT: max offline-queue items per POST /v1/field/capture (default 100)
 }
 
 // Load reads configuration from the environment.
@@ -110,6 +112,7 @@ func Load() (Config, error) {
 		PayoutProvider:                envStr("PAYOUT_PROVIDER", "paystack"),
 		PayoutMinNGN:                  int64(envInt("PAYOUT_MIN_NGN", 100)),
 		ReconCron:                     envStr("RECON_CRON", "30 2 * * *"),
+		FieldCaptureBatchLimit:        envInt("FIELD_CAPTURE_BATCH_LIMIT", 100),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

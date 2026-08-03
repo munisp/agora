@@ -17,6 +17,8 @@ import (
 	"github.com/opendesk/booking-service/internal/config"
 	"github.com/opendesk/booking-service/internal/consumer"
 	"github.com/opendesk/booking-service/internal/daprc"
+	"github.com/opendesk/booking-service/internal/devices"
+	"github.com/opendesk/booking-service/internal/fieldcapture"
 	"github.com/opendesk/booking-service/internal/geo"
 	"github.com/opendesk/booking-service/internal/httpapi"
 	"github.com/opendesk/booking-service/internal/incidents"
@@ -205,6 +207,31 @@ func run() error {
 		Log:            logger,
 	}
 
+	// SPEC-W16 Agent B — BEGIN (additive): push device tokens (contract §1)
+	// + the field offline-queue capture API (contract §4). Each dials a
+	// small dedicated pool (PayoutStore idiom — the shared store.Store does
+	// not expose its pool). A dial failure disables only these endpoints
+	// (503), never the rest of the service.
+	var deviceHandlers *devices.Handlers
+	if ds, dsErr := devices.DialStore(ctx, cfg.DatabaseURL); dsErr != nil {
+		logger.Error("device token store unavailable; /v1/devices + /internal/devices disabled", zap.Error(dsErr))
+	} else {
+		defer ds.Close()
+		deviceHandlers = &devices.Handlers{Store: ds, Log: logger}
+	}
+	var fieldCaptureHandlers *fieldcapture.Handlers
+	if fs, fsErr := fieldcapture.DialStore(ctx, cfg.DatabaseURL); fsErr != nil {
+		logger.Error("field capture store unavailable; /v1/field/capture disabled", zap.Error(fsErr))
+	} else {
+		defer fs.Close()
+		fieldCaptureHandlers = &fieldcapture.Handlers{
+			Svc:        &fieldcapture.Service{Store: fs, Leads: leadSvc, Log: logger},
+			BatchLimit: cfg.FieldCaptureBatchLimit,
+			Log:        logger,
+		}
+	}
+	// SPEC-W16 Agent B — END
+
 	// Referrals + commissions service (SPEC-W14 Agent A): referral capture
 	// with one-open-per-phone dedupe, the verify flow firing rules →
 	// balanced double-entry postings (Postgres ledger today — the
@@ -281,7 +308,9 @@ func run() error {
 		Incidents:          incidentSvc,
 		Leads:              leadSvc,
 		Referrals:          referralSvc,
-		Payouts:            payoutStore, // SPEC-W14 Agent B (additive): GET /v1/payouts
+		Payouts:            payoutStore,          // SPEC-W14 Agent B (additive): GET /v1/payouts
+		Devices:            deviceHandlers,       // SPEC-W16 Agent B (additive): /v1/devices + /internal/devices
+		FieldCapture:       fieldCaptureHandlers, // SPEC-W16 Agent B (additive): POST /v1/field/capture
 	}
 
 	srv := &http.Server{
