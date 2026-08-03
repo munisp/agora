@@ -18,6 +18,22 @@
       "path": "agriculture.yaml"
     },
     {
+      "id": "agritech",
+      "version": "1.0.0",
+      "sha256": "048a86ea552fd5c1bdbb9ba55ad6bf3c881766dd237eb3bac8fc9a5abc00ad69",
+      "author": "opendesk",
+      "signature": null,
+      "path": "agritech.yaml"
+    },
+    {
+      "id": "b2b-saas",
+      "version": "1.0.0",
+      "sha256": "f61525270e1b2427d8311f40cd3db39f1975265b3cf75fe6d8154e2d785e4b25",
+      "author": "opendesk",
+      "signature": null,
+      "path": "b2b-saas.yaml"
+    },
+    {
       "id": "banking",
       "version": "1.0.0",
       "sha256": "81b147842f2919144170a9c7738288d30390a5b3553beb8a3f69e67a811691de",
@@ -58,6 +74,22 @@
       "path": "ecommerce.yaml"
     },
     {
+      "id": "ecommerce-d2c",
+      "version": "1.0.0",
+      "sha256": "f1f23cc536d2cadc2453c9aad11d224c3180dd9af36f24a7bb6871656bef59af",
+      "author": "opendesk",
+      "signature": null,
+      "path": "ecommerce-d2c.yaml"
+    },
+    {
+      "id": "edtech",
+      "version": "1.0.0",
+      "sha256": "748e854362f8f60587550a7b377cf4c46bc2c984f88ea36dade14041728bfbc8",
+      "author": "opendesk",
+      "signature": null,
+      "path": "edtech.yaml"
+    },
+    {
       "id": "education",
       "version": "1.0.0",
       "sha256": "f77e480b41bd0214736a6f98c4fe0d791ac709ba032af2512f8e6f4fdb99d622",
@@ -82,6 +114,22 @@
       "path": "fashion.yaml"
     },
     {
+      "id": "fintech-agent-banking",
+      "version": "1.0.0",
+      "sha256": "4b13e429967e0d500078de571d0754ff6a152b5b9b49c9f0268ec041b7d756bb",
+      "author": "opendesk",
+      "signature": null,
+      "path": "fintech-agent-banking.yaml"
+    },
+    {
+      "id": "fmcg-retail",
+      "version": "1.0.0",
+      "sha256": "4b3e7b232d77fe957e005dcbe47167d93acf9c55562aa95fca40a7bbddcc4b87",
+      "author": "opendesk",
+      "signature": null,
+      "path": "fmcg-retail.yaml"
+    },
+    {
       "id": "government",
       "version": "1.0.0",
       "sha256": "34bbf1444fd6f0ed0ffadc5ed1fac8cc568da468fa5f83ec1447d9b55ded7b81",
@@ -96,6 +144,14 @@
       "author": "opendesk",
       "signature": null,
       "path": "healthcare.yaml"
+    },
+    {
+      "id": "healthtech",
+      "version": "1.0.0",
+      "sha256": "e8442646bb73845e9505566f553918f92dd47d71961c66e76c8d93356311c9e7",
+      "author": "opendesk",
+      "signature": null,
+      "path": "healthtech.yaml"
     },
     {
       "id": "hospitality",
@@ -139,8 +195,8 @@
     },
     {
       "id": "logistics",
-      "version": "1.0.0",
-      "sha256": "145ea76a6ad3b9073401e46fef523b70653dcbcfcd9e4252dc9c3f638b16ace0",
+      "version": "1.1.0",
+      "sha256": "3c18a26449375954e0190b25be3f51f305d8d76252170acdb017b33edf268508",
       "author": "opendesk",
       "signature": null,
       "path": "logistics.yaml"

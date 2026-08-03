@@ -1,6 +1,9 @@
-# Logistics industry pack (SPEC-W6 Part B) — logistics companies and
-# dispatch riders. COD confirmations, pickup/delivery slots, rider KYC
-# onboarding, failed-delivery rescheduling. NGN/kobo, NDPA consent.
+# Logistics industry pack (SPEC-W6 Part B, extended SPEC-W15 §1) — logistics
+# companies and dispatch riders. COD confirmations, pickup/delivery slots,
+# rider KYC onboarding, failed-delivery rescheduling — plus the Wave-15 CAC
+# motions: rider recruitment, bike-inspection scheduling and the ₦5,000
+# rider referral bounty. CAC target ₦5,000–₦9,000 per recruited rider.
+# NGN/kobo, NDPA consent.
 id: logistics
 displayName: Logistics & Dispatch
 terminology:
@@ -11,9 +14,10 @@ terminology:
 agentPersona: |
   You are the dispatch coordinator of a Nigerian logistics and dispatch
   company. You are brisk, clear and reliable — customers want to know where
-  their parcel is and when it will arrive. Mirror the caller's register:
-  Nigerian Pidgin if they speak Pidgin ("Your package dey move, no wahala"),
-  polite standard English if they are formal.
+  their parcel is and when it will arrive, and prospective riders want to
+  know how to join the fleet. Mirror the caller's register: Nigerian Pidgin
+  if they speak Pidgin ("Your package dey move, no wahala"), polite
+  standard English if they are formal.
 
   Hard rules (never break these):
   - NEVER confirm a cash-on-delivery (COD) amount or change a delivery
@@ -23,12 +27,19 @@ agentPersona: |
     only; traffic and weather are real, so say so honestly.
   - NEVER take card details, PINs or OTPs on a call. COD is paid to the
     rider by cash or transfer on delivery, with a receipt.
+  - NEVER collect a "registration fee" from prospective riders — rider
+    onboarding is free; anyone asking for a fee by transfer is a fraudster,
+    and you say so clearly.
   - For lost, damaged or disputed parcels, log the complaint with the
     tracking number and escalate to the operations team — never guess
     compensation amounts.
 
   What you do: make COD confirmation calls, book pickup and delivery slots,
-  take rider KYC onboarding intake, and reschedule failed deliveries.
+  take rider KYC onboarding intake, reschedule failed deliveries, recruit
+  new dispatch riders (requirements, earnings structure, document
+  checklist), schedule the mandatory bike inspection, and explain the rider
+  referral bounty — a registered rider earns ₦5,000 for every referred
+  rider who passes KYC and bike inspection and completes 20 deliveries.
   Always confirm the tracking number and the customer's phone number before
   changing a booking. Quote delivery fees in naira format like ₦3,500.
 bookingPolicy:
@@ -77,6 +88,16 @@ offerings:
   buffer_min: 10
   price_cents: 500000 # ₦5,000
   capacity: 4
+- name: Rider Recruitment Call
+  duration_min: 15
+  buffer_min: 5
+  price_cents: 0
+  capacity: 6
+- name: Bike Inspection Slot
+  duration_min: 30
+  buffer_min: 15
+  price_cents: 0
+  capacity: 4
 reminders:
   offsets: ["24h", "1h"]
   channels: ["sms"]
@@ -117,6 +138,33 @@ knowledgeSeed:
     or disputed parcels are logged with the tracking number and escalated
     to the operations team, which responds within 48 hours — the
     coordinator never guesses compensation or blames the customer.
+- title: Rider recruitment & earnings
+  body: |
+    Recruitment starts with a free Rider Recruitment Call: the coordinator
+    explains the requirements (valid rider's card, own or hired bike with
+    papers, smartphone, guarantor), the earnings structure (per-delivery
+    pay plus weekly bonuses, paid every Friday) and the onboarding steps
+    (recruitment call -> KYC intake -> bike inspection -> first dispatch).
+    Recruitment and onboarding are always free — the company never collects
+    a "registration" or "slot" fee, and callers are warned that anyone
+    asking for one is a fraudster.
+- title: Bike inspection scheduling
+  body: |
+    Every rider's bike passes a mandatory inspection before first dispatch
+    and every six months after: brakes, tyres, lights, mirrors, chain,
+    helmet condition and vehicle papers (plate number matching). Bike
+    Inspection Slots run at the depot on weekdays 9:00–15:00 WAT and are
+    free. A failed inspection is rebooked after repairs at no charge; the
+    rider gets the defect list in plain language. No rider is dispatched on
+    an uninspected bike.
+- title: Rider referral bounty
+  body: |
+    A registered rider earns a ₦5,000 referral bounty for every new rider
+    they refer who completes KYC, passes the bike inspection and finishes
+    20 deliveries. The bounty is paid into the rider's wallet within 7 days
+    of the 20th delivery, and there is no referral cap. The referring
+    rider's own ID is captured at the referred rider's recruitment call —
+    bounties cannot be claimed retroactively.
 dashboardLabels:
   bookingSingular: Slot
   bookingPlural: Slots
@@ -141,3 +189,41 @@ agents:
     where originals are verified. You explain that onboarding is free and
     no "registration fee" is ever collected by transfer.
   intents: [rider, kyc, onboarding, register, registration, guarantor, "rider's card", vehicle, bike, job, work, apply]
+- id: rider-recruiter
+  name: Rider Recruiter
+  persona: |
+    You are the rider recruiter. You run the free Rider Recruitment Call:
+    requirements (rider's card, bike with papers, smartphone, guarantor),
+    the earnings structure (per-delivery pay plus weekly bonuses paid every
+    Friday) and the onboarding steps. You schedule the mandatory Bike
+    Inspection Slot at the depot and explain the ₦5,000 referral bounty a
+    registered rider earns for every referred rider who completes KYC,
+    passes inspection and finishes 20 deliveries. You always warn that
+    recruitment is free and anyone collecting a "registration fee" is a
+    fraudster.
+  intents: [recruit, recruitment, "join the fleet", "become a rider", "rider job", vacancy, hiring, "bike inspection", inspection, bounty, "refer a rider", referral, earnings, salary]
+disclosure:
+  spokenAiDisclosure: true
+  recordingConsent: true
+  text: "You are speaking with an automated dispatch assistant. This call may be recorded for quality."
+ussd:
+  menu:
+  - {key: "1", label: "Track my parcel", action: status}
+  - {key: "2", label: "Book pickup/delivery slot", action: book}
+  - {key: "3", label: "Become a rider (recruitment)", action: book}
+  - {key: "4", label: "Book bike inspection", action: book}
+  - {key: "5", label: "Rider referral bounty info", action: info}
+  - {key: "6", label: "Talk to operations", action: handoff}
+growth:
+  referral_bounty_ngn: 5000
+  primary_channels: [rider-referrals, ussd, whatsapp, depot-posters]
+  cac_target_ngn: 7000 # blended target within the ₦5,000–₦9,000/rider band
+i18n:
+  pcm:
+    greeting: "Welcome! Na the dispatch line you dey call — you wan track parcel, book delivery, or you wan join as rider?"
+    referral: "If you refer rider wey complete KYC, pass bike inspection and do 20 deliveries, you go collect ₦5,000 bounty."
+    rider_free: "Rider registration na free — anybody wey ask you for registration money na thief."
+  en:
+    greeting: "Welcome to the dispatch line — do you want to track a parcel, book a delivery, or join as a rider?"
+    referral: "Refer a rider who completes KYC, passes bike inspection and finishes 20 deliveries, and you earn a ₦5,000 bounty."
+    rider_free: "Rider registration is free — anyone asking you for a registration fee is a fraudster."
