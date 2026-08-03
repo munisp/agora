@@ -9,7 +9,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 Role = Literal["user", "agent", "system", "tool"]
-Channel = Literal["voice", "chat", "phone", "api"]
+# SPEC-W12 contract §2: "ussd" joins the channel enum (DB CHECK widened at
+# startup via Database.ensure_ussd_channel).
+Channel = Literal["voice", "chat", "phone", "api", "ussd"]
 
 
 class ConversationCreate(BaseModel):
