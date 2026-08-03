@@ -48,6 +48,9 @@ VOICE_LANG_VALUE_RE = re.compile(r"^(piper|mms|xtts|azure|spitch):[A-Za-z0-9_\-\
 # SPEC-W12 §1: optional pack ussd.menu action enum (kept in sync with
 # packs.go ussdMenuActions).
 USSD_MENU_ACTIONS = ("book", "handoff", "status", "sos", "info")
+# SPEC-W15 §3: optional pack i18n block locale allowlist (kept in sync
+# with packs.go i18nLocales).
+I18N_LOCALES = ("en", "pcm", "ha", "yo", "ig")
 INDEX_SCHEMA_VERSION = 1
 
 
@@ -263,6 +266,61 @@ def _validate_ussd(ussd: Any, errs: list[str]) -> None:
             )
 
 
+def _validate_growth(growth: Any, errs: list[str]) -> None:
+    """SPEC-W15 §2: optional growth block — the pack-level CAC playbook
+    defaults ({referral_bounty_ngn, primary_channels, cac_target_ngn}).
+    When the block is present, referral_bounty_ngn is an int >= 0,
+    primary_channels is a non-empty list of non-empty strings and
+    cac_target_ngn is an int > 0. Kept in sync with packs.go."""
+    if growth is None:
+        return
+    if not isinstance(growth, dict):
+        errs.append("growth must be a mapping")
+        return
+    bounty = growth.get("referral_bounty_ngn")
+    if not _is_int(bounty) or bounty < 0:
+        errs.append(
+            f"growth.referral_bounty_ngn must be an int >= 0, got {bounty!r}"
+        )
+    channels = growth.get("primary_channels")
+    if not isinstance(channels, list) or not channels:
+        errs.append("growth.primary_channels must be a non-empty list of strings")
+    else:
+        for i, ch in enumerate(channels):
+            if not isinstance(ch, str) or not ch.strip():
+                errs.append(
+                    f"growth.primary_channels[{i}] must be a non-empty string"
+                )
+    cac = growth.get("cac_target_ngn")
+    if not _is_int(cac) or cac <= 0:
+        errs.append(f"growth.cac_target_ngn must be an int > 0, got {cac!r}")
+
+
+def _validate_i18n(i18n: Any, errs: list[str]) -> None:
+    """SPEC-W15 §3: optional i18n block — localized user-facing strings
+    ({locale: {key: text}}). Locales are restricted to I18N_LOCALES
+    (en|pcm|ha|yo|ig) and every value must be a non-empty string. Kept in
+    sync with packs.go."""
+    if i18n is None:
+        return
+    if not isinstance(i18n, dict):
+        errs.append("i18n must be a mapping of locale -> strings")
+        return
+    for locale, strings in i18n.items():
+        if locale not in I18N_LOCALES:
+            errs.append(
+                f"i18n: locale {locale!r} must be one of {', '.join(I18N_LOCALES)}"
+            )
+        if not isinstance(strings, dict):
+            errs.append(f"i18n[{locale!r}] must be a mapping of key -> text")
+            continue
+        for key, value in strings.items():
+            if not isinstance(value, str) or not value.strip():
+                errs.append(
+                    f"i18n[{locale!r}][{key!r}] must be a non-empty string"
+                )
+
+
 def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     """Validate one parsed pack document; returns the list of errors
     (empty == valid). Mirrors Pack.Validate() in identity-service."""
@@ -359,6 +417,8 @@ def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     _validate_voice(doc.get("voice"), errs)
     _validate_disclosure(doc.get("disclosure"), errs)
     _validate_ussd(doc.get("ussd"), errs)
+    _validate_growth(doc.get("growth"), errs)
+    _validate_i18n(doc.get("i18n"), errs)
     return errs
 
 
