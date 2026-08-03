@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/opendesk/notification-worker/internal/pacer"
 	"github.com/opendesk/notification-worker/internal/workflows"
 )
 
@@ -17,22 +18,70 @@ import (
 // activity. Workflows stay deterministic; all waiting happens here,
 // activity-side.
 //
+// SPEC-W12 §3 DND guard: MARKETING kinds (geo_campaign, promo, broadcast,
+// drip — see pacer.ClassifyKind) are checked against the DND registry (NCC
+// 2442 global list + per-tenant opt-outs) BEFORE the CPS token is acquired,
+// so a suppressed send consumes no pacing budget and never touches a channel
+// binding. A suppressed send is NOT an error: the result carries status
+// suppressed_dnd (+ reason) and the suppression is counted
+// (notifications_suppressed_total{reason}) and logged. Transactional kinds
+// skip the guard entirely.
+//
+// The Priority fast-lane (SPEC-W11 Part B §5) is unchanged: priority sends
+// bypass the token bucket exactly as before — they are transactional
+// (incident_alert), so the DND guard passes them instantly.
+//
 // The sender rotation itself happens inside notify(): every paced send
 // picks the next OUTBOUND_FROM_NUMBERS entry and puts it in the binding
 // payload metadata.
-func (a *Activities) NotifyPaced(ctx context.Context, req workflows.PacedSendRequest) error {
+func (a *Activities) NotifyPaced(ctx context.Context, req workflows.PacedSendRequest) (workflows.PacedSendResult, error) {
+	res := workflows.PacedSendResult{Status: workflows.PacedSendStatusSent}
+	if a.Guards != nil {
+		if dec := a.Guards.PreSend(ctx, guardInputFromRequest(req)); dec.Suppress {
+			res.Status = workflows.PacedSendStatusSuppressedDND
+			res.Reason = dec.Reason
+			return res, nil
+		}
+	}
 	if a.Pacer != nil {
 		if req.Priority {
 			// SPEC-W11 Part B §5 fast-lane: emergency-grade sends (kind
 			// incident_alert) dispatch immediately, bypassing the CPS token
 			// bucket — but stay metered (pacer priority counter + log).
 			if err := a.Pacer.Priority(ctx); err != nil {
-				return fmt.Errorf("pacer priority: %w", err)
+				return res, fmt.Errorf("pacer priority: %w", err)
 			}
 		} else if err := a.Pacer.Wait(ctx); err != nil {
-			return fmt.Errorf("pacer wait: %w", err)
+			return res, fmt.Errorf("pacer wait: %w", err)
 		}
 	}
+	return res, a.dispatchPacedSend(ctx, req)
+}
+
+// guardInputFromRequest extracts the guard view of a paced send. Only
+// marketing kinds (and incident_alert, for completeness) carry recipient
+// phone/channel today; the guard short-circuits on transactional kinds
+// before reading any of these fields.
+func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
+	in := pacer.GuardInput{Kind: req.Kind, Channel: workflows.PacedSendChannel(req)}
+	switch req.Kind {
+	case workflows.PacedSendGeoCampaign:
+		if req.GeoCampaign != nil {
+			in.TenantSlug = req.GeoCampaign.TenantSlug
+			in.Phone = req.GeoCampaign.Phone
+		}
+	case workflows.PacedSendIncidentAlert:
+		if req.IncidentAlert != nil {
+			in.TenantSlug = req.IncidentAlert.TenantSlug
+			in.Phone = req.IncidentAlert.Phone
+		}
+	}
+	return in
+}
+
+// dispatchPacedSend routes the granted send to its underlying send
+// activity. Unchanged by SPEC-W12 except for extraction from NotifyPaced.
+func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedSendRequest) error {
 	switch req.Kind {
 	case workflows.PacedSendWaitlistClaim:
 		if req.Waitlist == nil {
