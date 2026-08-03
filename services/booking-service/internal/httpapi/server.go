@@ -17,6 +17,7 @@ import (
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/geo"
 	"github.com/opendesk/booking-service/internal/incidents"
+	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
@@ -68,6 +69,9 @@ type Deps struct {
 	// Incidents serves the SPEC-W11 Part B incident endpoints (list/detail,
 	// dispatch, endpoint CRUD, ingest). Nil → those routes answer 503.
 	Incidents *incidents.Service
+	// Leads serves the SPEC-W13 CAC endpoints (leads, promo codes +
+	// redeem, campaigns + spend, internal spend-sum). Nil → 503.
+	Leads *leads.Service
 }
 
 type ctxKey string
@@ -88,7 +92,7 @@ func NewRouter(d Deps) http.Handler {
 	if d.TenantBySlug == nil && d.Resolver != nil {
 		d.TenantBySlug = d.Resolver.BySlug
 	}
-	s := &server{d: d, portalLimiter: newPortalRateLimiter()}
+	s := &server{d: d, portalLimiter: newPortalRateLimiter(), promoLimiter: newPortalRateLimiter()}
 
 	r.Get("/healthz", s.healthz)
 
@@ -169,7 +173,29 @@ func NewRouter(d Deps) http.Handler {
 			r.Get("/dispatch-endpoints", s.listDispatchEndpoints)
 			r.With(s.require("manage_bookings")).Delete("/dispatch-endpoints", s.deleteDispatchEndpoint)
 		})
+		// Leads + CAC (SPEC-W13 Agent A): manage_bookings for mutations,
+		// view_analytics for reads (docs/security/roles.md).
+		r.Route("/leads", func(r chi.Router) {
+			r.With(s.require("view_analytics")).Get("/", s.listLeads)
+			r.With(s.require("manage_bookings")).Post("/", s.createLead)
+			r.With(s.require("view_analytics")).Get("/{id}", s.getLead)
+			r.With(s.require("manage_bookings")).Post("/{id}/status", s.transitionLead)
+		})
+		r.Route("/promo", func(r chi.Router) {
+			r.With(s.require("manage_bookings")).Post("/", s.createPromoCode)
+			r.With(s.require("view_analytics")).Get("/", s.listPromoCodes)
+		})
+		r.Route("/campaigns", func(r chi.Router) {
+			r.With(s.require("view_analytics")).Get("/", s.listCampaigns)
+			r.With(s.require("manage_bookings")).Post("/", s.createCampaign)
+			r.With(s.require("manage_bookings")).Post("/{id}/spend", s.recordCampaignSpend)
+		})
 	})
+
+	// Public promo redemption (SPEC-W13 §6): rate-limited, idempotent per
+	// code+phone. No tenant middleware — the unguessable code resolves the
+	// owning tenant server-side (public site-slug resolution pattern).
+	r.Post("/v1/promo/redeem", s.redeemPromo)
 
 	// IoT/webhook incident ingest (SPEC-W11 Part B §6): invoked
 	// service-to-service via Dapr by the messaging-gateway, which already
@@ -233,12 +259,22 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/{id}/crm-note", s.addBookingCRMNoteInternal)
 	})
 
+	// Internal spend-sum (SPEC-W13 §4/§5): analytics-service (Agent B)
+	// invokes this via Dapr to join campaign spend into the CAC rollups.
+	// Tenant resolution is the usual X-Tenant-Slug middleware; no Permify
+	// guard (internal only).
+	r.Route("/internal/campaigns", func(r chi.Router) {
+		r.Use(s.tenantMiddleware)
+		r.Get("/{id}/spend-sum", s.campaignSpendSum)
+	})
+
 	return r
 }
 
 type server struct {
 	d             Deps
 	portalLimiter *portalRateLimiter
+	promoLimiter  *portalRateLimiter // SPEC-W13 §6: public promo redeem guard
 }
 
 func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
