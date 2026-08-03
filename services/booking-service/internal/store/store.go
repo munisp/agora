@@ -269,7 +269,7 @@ func (s *Store) UpdateOffering(ctx context.Context, o *Offering) error {
 
 // DeleteOffering removes an offering.
 func (s *Store) DeleteOffering(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, o.TenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM offerings WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		if err != nil {
 			return err
