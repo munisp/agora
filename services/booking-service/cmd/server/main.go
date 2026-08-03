@@ -20,6 +20,7 @@ import (
 	"github.com/opendesk/booking-service/internal/geo"
 	"github.com/opendesk/booking-service/internal/httpapi"
 	"github.com/opendesk/booking-service/internal/incidents"
+	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/store"
@@ -141,6 +142,16 @@ func run() error {
 		Log:          logger,
 	}
 
+	// Leads service (SPEC-W13 Agent A): CAC lead capture with first-touch
+	// attribution, the status machine emitting FunnelEvents to cac.events,
+	// promo codes/redemption and campaign spend.
+	leadSvc := &leads.Service{
+		Store:          st,
+		CACEventsTopic: cfg.CACEventsTopic,
+		FirstTouchOnly: cfg.LeadAttributionFirstTouchOnly,
+		Log:            logger,
+	}
+
 	// Outbox dispatcher goroutine: outbox → Dapr pubsub `pubsub-kafka` →
 	// topic opendesk.booking.events.
 	dispatcher := outbox.New(st, daprClient, cfg.PubSubName, cfg.OutboxPollInterval, logger)
@@ -196,6 +207,7 @@ func run() error {
 		NotificationsTopic: cfg.NotificationsTopic,
 		Geo:                geoHandlers,
 		Incidents:          incidentSvc,
+		Leads:              leadSvc,
 	}
 
 	srv := &http.Server{

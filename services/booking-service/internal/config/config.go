@@ -52,6 +52,9 @@ type Config struct {
 	IncidentsTopic       string // opendesk.incidents (IDP ingestion)
 	IncidentsGroup       string // consumer group booking-incidents
 	IncidentAutoDispatch bool   // INCIDENT_AUTO_DISPATCH: auto-deliver new incidents to active endpoints (default true)
+	// Leads / CAC (SPEC-W13 Agent A)
+	CACEventsTopic                string // cac.events funnel topic (CAC_EVENTS_TOPIC; empty disables emission)
+	LeadAttributionFirstTouchOnly bool   // LEAD_ATTRIBUTION_FIRST_TOUCH_ONLY (default true)
 }
 
 // Load reads configuration from the environment.
@@ -88,14 +91,16 @@ func Load() (Config, error) {
 		AuthzOutagePolicy:  envStr("AUTHZ_OUTAGE_POLICY", "fail_closed"),
 		ConsumerEnabled:    envStr("CONSUMER_ENABLED", "true") == "true",
 		// Dev fallback keeps the portal bootable locally; prod MUST override.
-		PortalSecret:         envStr("PORTAL_SECRET", "opendesk-dev-portal-secret-change-in-prod"),
-		NotificationsTopic:   envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
-		GeocodeEnabled:       envStr("GEOCODE_ENABLED", "false") == "true",
-		GeocodeBaseURL:       envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
-		GeoCampaignBatch:     envInt("GEO_CAMPAIGN_BATCH", 50),
-		IncidentsTopic:       envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
-		IncidentsGroup:       envStr("INCIDENTS_GROUP", "booking-incidents"),
-		IncidentAutoDispatch: envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",
+		PortalSecret:                  envStr("PORTAL_SECRET", "opendesk-dev-portal-secret-change-in-prod"),
+		NotificationsTopic:            envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		GeocodeEnabled:                envStr("GEOCODE_ENABLED", "false") == "true",
+		GeocodeBaseURL:                envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
+		GeoCampaignBatch:              envInt("GEO_CAMPAIGN_BATCH", 50),
+		IncidentsTopic:                envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
+		IncidentsGroup:                envStr("INCIDENTS_GROUP", "booking-incidents"),
+		IncidentAutoDispatch:          envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",
+		CACEventsTopic:                envStr("CAC_EVENTS_TOPIC", "cac.events"),
+		LeadAttributionFirstTouchOnly: envStr("LEAD_ATTRIBUTION_FIRST_TOUCH_ONLY", "true") == "true",
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
