@@ -529,3 +529,63 @@ export interface VoicesCatalog {
 export interface VoiceEnrollResponse {
   voice_id: string;
 }
+
+
+/* ------------------------------------------------------------------ */
+/* SPEC-W18 — app platform registry (identity-service, contract §1)    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Plan tier an app defaults to (drives the tier badge in the apps portal).
+ * Contract §1 names starter | growth | scale; the seeded catalog ships the
+ * real billing-engine tiers free | standard | pro (starter→free,
+ * growth→standard, scale→pro) — accept both spellings.
+ */
+export type AppPlanTier =
+  | "starter"
+  | "growth"
+  | "scale"
+  | "free"
+  | "standard"
+  | "pro"
+  | string;
+
+/** Lifecycle status of a tenant's app installation (tenant_apps.status). */
+export type TenantAppStatus =
+  | "enabled"
+  | "disabled"
+  | "suspended"
+  | "not_provisioned"
+  | string;
+
+/** Platform app catalog row (identity-service platform_apps, GET /v1/apps). */
+export interface PlatformApp {
+  app_id: string;
+  name: string;
+  version?: string;
+  description?: string;
+  category: string;
+  /** emoji or short text glyph shown as the app icon */
+  icon?: string;
+  nav_route?: string;
+  required_perms?: string[];
+  default_plan_tier: AppPlanTier;
+  /**
+   * Honest provisioning note, e.g. "backend lands W19" — the portal renders
+   * it as a subtle "module ships separately" hint when present.
+   */
+  backend_note?: string;
+}
+
+/**
+ * Tenant-scoped app row (GET /v1/tenants/{slug}/apps): the catalog row LEFT
+ * JOINed with tenant_apps, so every catalog app is present and status falls
+ * back to "not_provisioned" when the tenant has no tenant_apps row.
+ */
+export interface TenantApp extends PlatformApp {
+  status: TenantAppStatus;
+  config?: Record<string, unknown>;
+  provisioned_at?: string | null;
+  provisioned_by?: string | null;
+  updated_at?: string | null;
+}
