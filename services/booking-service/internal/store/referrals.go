@@ -70,7 +70,7 @@ type LedgerEntry struct {
 	AccountCode   int       `json:"account_code"`
 	BeneficiaryID string    `json:"beneficiary_id"`
 	DebitNGN      int64     `json:"debit_ngn"`  // kobo
-	CreditNGN     int64     `json:"credit_ngn"` // kobo
+	CreditNGN     int64    `json:"credit_ngn"` // kobo
 	RefType       string    `json:"ref_type"`
 	RefID         string    `json:"ref_id"`
 	CreatedAt     time.Time `json:"created_at"`
