@@ -57,6 +57,10 @@ type Activities struct {
 	// Webhooks holds the outbound webhook delivery dependencies (Wave 5 #10);
 	// set by main after New.
 	Webhooks WebhookDeps
+	// Push holds the push notification provider set (SPEC-W16 §1: fcm +
+	// apns stub); set by main after New. Nil Providers disables push —
+	// tokens resolve to unroutable per-token failures, never panics.
+	Push PushDeps
 	// Channels resolves the messaging provider per channel + tenant
 	// (MESSAGING_CHANNELS / TENANT_CHANNEL_MAP); set by main after New.
 	// Nil keeps the built-in defaults (email→smtp, sms→twilio).
