@@ -15,6 +15,7 @@ import {
   CreditCard,
   UsersRound,
   BarChart3,
+  CircleDollarSign,
   LineChart,
   Webhook,
   MessagesSquare,
@@ -53,6 +54,7 @@ const items: NavItem[] = [
   { segment: "public-site", label: "Public Site", icon: Globe },
   { segment: "billing", label: "Billing", icon: CreditCard },
   { segment: "analytics", label: "Analytics", icon: BarChart3 },
+  { segment: "cac", label: "CAC", icon: CircleDollarSign },
   { segment: "webhooks", label: "Webhooks", icon: Webhook },
   { segment: "channels", label: "Channels", icon: MessagesSquare },
   { segment: "locations", label: "Locations", icon: MapPin },
@@ -89,6 +91,11 @@ export function OrgNav({
     if ("segment" in item && item.segment === "billing")
       return canViewBilling(roles);
     if ("segment" in item && item.segment === "analytics")
+      return canViewAnalytics(roles);
+    // SPEC-W13 Agent D: CAC dashboards read the same view_analytics-gated
+    // rollup API — same visibility rule as analytics; the page enforces it
+    // server-side too.
+    if ("segment" in item && item.segment === "cac")
       return canViewAnalytics(roles);
     // SPEC-W8 Part C: locations is owner/admin/staff; geo campaigns is
     // owner/admin only. The pages enforce the same rule server-side.
