@@ -45,6 +45,9 @@ MCP_SERVER_NAME_RE = AGENT_ID_RE  # slug rule, kept in sync with packs.go
 # SPEC-W10 Part D: optional pack-level voice defaults.
 VOICE_PROVIDERS = ("piper", "mms", "xtts", "azure", "spitch")
 VOICE_LANG_VALUE_RE = re.compile(r"^(piper|mms|xtts|azure|spitch):[A-Za-z0-9_\-\.]+$")
+# SPEC-W12 §1: optional pack ussd.menu action enum (kept in sync with
+# packs.go ussdMenuActions).
+USSD_MENU_ACTIONS = ("book", "handoff", "status", "sos", "info")
 INDEX_SCHEMA_VERSION = 1
 
 
@@ -212,6 +215,54 @@ def _validate_disclosure(disclosure: Any, errs: list[str]) -> None:
             errs.append(f"disclosure.text must be <= 200 chars, got {len(text)}")
 
 
+def _validate_ussd(ussd: Any, errs: list[str]) -> None:
+    """SPEC-W12 §1: optional ussd block — the pack-level low-literacy
+    numeric menu ({menu: [{key, label, action?}]}) messaging-gateway
+    resolves as pack.ussd.menu. When the block is present, menu is a
+    non-empty list; keys are non-empty, unique and <= 8 chars; labels are
+    non-empty and <= 80 chars; action is optional but must be one of
+    USSD_MENU_ACTIONS when set. Kept in sync with packs.go."""
+    if ussd is None:
+        return
+    if not isinstance(ussd, dict):
+        errs.append("ussd must be a mapping")
+        return
+    menu = ussd.get("menu")
+    if not isinstance(menu, list) or not menu:
+        errs.append("ussd.menu must be a non-empty list when the ussd block is present")
+        return
+    seen: set[str] = set()
+    for i, item in enumerate(menu):
+        if not isinstance(item, dict):
+            errs.append(f"ussd.menu[{i}] must be a mapping")
+            continue
+        key = item.get("key")
+        if not isinstance(key, str) or not key.strip():
+            errs.append(f"ussd.menu[{i}]: key is required")
+            continue
+        if len(key) > 8:
+            errs.append(f"ussd.menu[{i}] ({key}): key must be <= 8 chars, got {len(key)}")
+        if key in seen:
+            errs.append(f"ussd.menu[{i}]: duplicate menu key {key!r}")
+        seen.add(key)
+        label = item.get("label")
+        if not isinstance(label, str) or not label.strip():
+            errs.append(f"ussd.menu[{i}] ({key}): label is required")
+        elif len(label) > 80:
+            errs.append(
+                f"ussd.menu[{i}] ({key}): label must be <= 80 chars, got {len(label)}"
+            )
+        action = item.get("action")
+        if action is not None and (
+            not isinstance(action, str)
+            or (action != "" and action not in USSD_MENU_ACTIONS)
+        ):
+            errs.append(
+                f"ussd.menu[{i}] ({key}): action {action!r} must be one of "
+                f"{', '.join(sorted(USSD_MENU_ACTIONS))}"
+            )
+
+
 def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     """Validate one parsed pack document; returns the list of errors
     (empty == valid). Mirrors Pack.Validate() in identity-service."""
@@ -307,6 +358,7 @@ def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     _validate_mcp_servers(doc.get("mcpServers"), errs)
     _validate_voice(doc.get("voice"), errs)
     _validate_disclosure(doc.get("disclosure"), errs)
+    _validate_ussd(doc.get("ussd"), errs)
     return errs
 
 

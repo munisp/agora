@@ -174,3 +174,42 @@ def test_mcp_servers_rejects_bad_shapes():
     for servers, expected in cases:
         errs = vp.validate_pack(_with_mcp(servers))
         assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+
+
+# -------------------------------------------------------------- ussd (SPEC-W12)
+def _with_ussd(ussd):
+    doc = load("valid_minimal.yaml")
+    doc["ussd"] = ussd
+    return doc
+
+
+def test_ussd_valid_block_accepted():
+    doc = _with_ussd({"menu": [
+        {"key": "1", "label": "Book appointment", "action": "book"},
+        {"key": "2", "label": "Talk to an agent", "action": "handoff"},
+        {"key": "3", "label": "Opening hours"},  # action optional
+    ]})
+    assert vp.validate_pack(doc) == []
+
+
+def test_ussd_absent_accepted():
+    assert vp.validate_pack(load("valid_minimal.yaml")) == []
+
+
+def test_ussd_rejects_bad_shapes():
+    cases = [
+        ("not-a-mapping", "ussd must be a mapping"),
+        ({}, "ussd.menu must be a non-empty list"),
+        ({"menu": []}, "ussd.menu must be a non-empty list"),
+        ({"menu": [{"label": "No key", "action": "book"}]}, "key is required"),
+        ({"menu": [{"key": "123456789", "label": "Long key"}]}, "key must be <= 8 chars"),
+        ({"menu": [{"key": "1", "action": "book"}]}, "label is required"),
+        ({"menu": [{"key": "1", "label": "x" * 81}]}, "label must be <= 80 chars"),
+        ({"menu": [{"key": "1", "label": "A"}, {"key": "1", "label": "B"}]},
+         "duplicate menu key"),
+        ({"menu": [{"key": "1", "label": "A", "action": "teleport"}]},
+         "must be one of book, handoff, info, sos, status"),
+    ]
+    for ussd, expected in cases:
+        errs = vp.validate_pack(_with_ussd(ussd))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
