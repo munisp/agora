@@ -23,6 +23,7 @@ import (
 	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
+	"github.com/opendesk/booking-service/internal/referrals" // SPEC-W14 Agent B (additive import)
 	"github.com/opendesk/booking-service/internal/store"
 	"github.com/opendesk/booking-service/internal/temporalclient"
 	"go.temporal.io/sdk/activity"
@@ -58,6 +59,21 @@ func run() error {
 		return err
 	}
 	defer st.Close()
+
+	// SPEC-W14 Agent B — BEGIN (additive): the commission payout store,
+	// shared by the payout/recon Temporal worker registration below and by
+	// GET /v1/payouts. Gated on COMMISSIONS_ENABLED=true (contract §7).
+	var payoutStore *referrals.PayoutStore
+	if os.Getenv("COMMISSIONS_ENABLED") == "true" {
+		ps, psErr := referrals.DialPayoutStore(ctx, cfg.DatabaseURL)
+		if psErr != nil {
+			logger.Error("commission payout store unavailable; payouts API + payout/recon workflows disabled", zap.Error(psErr))
+		} else {
+			payoutStore = ps
+			defer payoutStore.Close()
+		}
+	}
+	// SPEC-W14 Agent B — END
 
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
 	resolver := bookingops.NewTenantResolver(daprClient, cfg.IdentityAppID, cfg.IdentityCacheTTL, logger)
@@ -97,6 +113,43 @@ func run() error {
 		// to the notification-worker paced fast-lane via NotifyPaced (kind
 		// incident_alert, priority=true).
 		w.RegisterWorkflowWithOptions(incidents.IncidentAlertWorkflow, workflow.RegisterOptions{Name: incidents.WorkflowTypeAlert})
+		// SPEC-W14 Agent B — BEGIN (additive): commission payout + nightly
+		// recon workflows on the same worker, plus the recon schedule
+		// bootstrap (contract §5/§7). Uses the hoisted payoutStore (nil when
+		// COMMISSIONS_ENABLED != true or the dial failed).
+		// Ledger: Agent A's Postgres impl (reconciled after A landed).
+		if payoutStore != nil {
+			provider := referrals.ProviderFromEnv()
+			payoutActs := &referrals.PayoutActivities{
+				Store:      payoutStore,
+				Ledger:     referrals.NewPostgresLedger(st), // Agent A's Postgres Ledger (SPEC-W14 reconciled)
+				Provider:   provider,
+				MinKobo:    referrals.MinPayoutFromEnv(),
+				UsageTopic: cfg.UsageEventsTopic,
+				Logger:     logger,
+			}
+			reconActs := &referrals.ReconActivities{
+				Store:              payoutStore,
+				Provider:           provider,
+				UsageTopic:         cfg.UsageEventsTopic,
+				NotificationsTopic: cfg.NotificationsTopic,
+				Logger:             logger,
+			}
+			w.RegisterWorkflowWithOptions(referrals.CommissionPayoutWorkflow, workflow.RegisterOptions{Name: referrals.WorkflowTypePayout})
+			w.RegisterWorkflowWithOptions(referrals.CommissionReconWorkflow, workflow.RegisterOptions{Name: referrals.WorkflowTypeRecon})
+			w.RegisterActivityWithOptions(payoutActs.ExecuteTransfer, activity.RegisterOptions{Name: referrals.ActivityPayoutTransfer})
+			w.RegisterActivityWithOptions(payoutActs.FinalizePaid, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkPaid})
+			w.RegisterActivityWithOptions(payoutActs.MarkFailed, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkFailed})
+			w.RegisterActivityWithOptions(reconActs.FetchCandidates, activity.RegisterOptions{Name: referrals.ActivityReconFetch})
+			w.RegisterActivityWithOptions(reconActs.CheckTransfer, activity.RegisterOptions{Name: referrals.ActivityReconCheck})
+			if err := tc.EnsureCommissionReconSchedule(ctx, os.Getenv("RECON_CRON")); err != nil {
+				logger.Error("commission recon schedule bootstrap failed", zap.Error(err))
+			} else {
+				logger.Info("commission recon schedule ensured",
+					zap.String("schedule_id", referrals.ReconScheduleID), zap.String("provider", provider.Name()))
+			}
+		}
+		// SPEC-W14 Agent B — END
 		if err := w.Start(); err != nil {
 			logger.Error("geo campaign worker failed to start", zap.Error(err))
 		} else {
@@ -150,6 +203,25 @@ func run() error {
 		CACEventsTopic: cfg.CACEventsTopic,
 		FirstTouchOnly: cfg.LeadAttributionFirstTouchOnly,
 		Log:            logger,
+	}
+
+	// Referrals + commissions service (SPEC-W14 Agent A): referral capture
+	// with one-open-per-phone dedupe, the verify flow firing rules →
+	// balanced double-entry postings (Postgres ledger today — the
+	// TigerBeetle adapter seam is documented in referrals/ledger.go), the
+	// §6 lead-conversion hook via the leads service and funnel hooks on
+	// cac.events. COMMISSIONS_ENABLED=false disables the endpoints (503).
+	var referralSvc *referrals.Service
+	if cfg.CommissionsEnabled {
+		referralSvc = &referrals.Service{
+			Store:          st,
+			Ledger:         referrals.NewPostgresLedger(st),
+			Leads:          leadSvc,
+			CACEventsTopic: cfg.CACEventsTopic,
+			// SPEC-W14 Agent D (additive): referral_verified metering.
+			UsageTopic: cfg.UsageEventsTopic,
+			Log:        logger,
+		}
 	}
 
 	// Outbox dispatcher goroutine: outbox → Dapr pubsub `pubsub-kafka` →
@@ -208,6 +280,8 @@ func run() error {
 		Geo:                geoHandlers,
 		Incidents:          incidentSvc,
 		Leads:              leadSvc,
+		Referrals:          referralSvc,
+		Payouts:            payoutStore, // SPEC-W14 Agent B (additive): GET /v1/payouts
 	}
 
 	srv := &http.Server{

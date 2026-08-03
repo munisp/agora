@@ -55,6 +55,11 @@ type Config struct {
 	// Leads / CAC (SPEC-W13 Agent A)
 	CACEventsTopic                string // cac.events funnel topic (CAC_EVENTS_TOPIC; empty disables emission)
 	LeadAttributionFirstTouchOnly bool   // LEAD_ATTRIBUTION_FIRST_TOUCH_ONLY (default true)
+	// Referrals + commissions (SPEC-W14, contract §7)
+	CommissionsEnabled bool   // COMMISSIONS_ENABLED (default true; false → referral/commission endpoints 503)
+	PayoutProvider     string // PAYOUT_PROVIDER (default paystack; Agent B payout execution)
+	PayoutMinNGN       int64  // PAYOUT_MIN_NGN (default 100 — minimum payout, naira)
+	ReconCron          string // RECON_CRON (default "30 2 * * *" — commission-recon-nightly, Africa/Lagos 02:30)
 }
 
 // Load reads configuration from the environment.
@@ -101,6 +106,10 @@ func Load() (Config, error) {
 		IncidentAutoDispatch:          envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",
 		CACEventsTopic:                envStr("CAC_EVENTS_TOPIC", "cac.events"),
 		LeadAttributionFirstTouchOnly: envStr("LEAD_ATTRIBUTION_FIRST_TOUCH_ONLY", "true") == "true",
+		CommissionsEnabled:            envStr("COMMISSIONS_ENABLED", "true") == "true",
+		PayoutProvider:                envStr("PAYOUT_PROVIDER", "paystack"),
+		PayoutMinNGN:                  int64(envInt("PAYOUT_MIN_NGN", 100)),
+		ReconCron:                     envStr("RECON_CRON", "30 2 * * *"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

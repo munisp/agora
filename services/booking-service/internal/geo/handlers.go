@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -437,13 +438,26 @@ func (h *Handlers) CreateGeoCampaign(w http.ResponseWriter, r *http.Request, ten
 		writeError(w, http.StatusServiceUnavailable, "campaign created but workflow engine unavailable")
 		return
 	}
+	// SPEC-W14 Agent D: capture the quiet-hours configuration at schedule
+	// time (QUIET_HOURS_* env, SPEC-W12 §8) so the workflow's deferral
+	// replay stays deterministic if the env changes mid-campaign. A
+	// malformed overrides value is ignored with a warn (defaults apply) —
+	// the workflow validates the resolved window when it runs.
+	quietOverrides, err := ParseQuietHoursOverrides(os.Getenv("QUIET_HOURS_OVERRIDES"))
+	if err != nil {
+		h.Log.Warn("ignoring malformed QUIET_HOURS_OVERRIDES; default quiet-hours window applies",
+			zap.Error(err))
+		quietOverrides = nil
+	}
 	if _, err := h.Starter.StartGeoCampaign(r.Context(), GeoCampaignInput{
-		CampaignID: campaign.ID.String(),
-		TenantID:   tenant.ID.String(),
-		TenantSlug: tenant.Slug,
-		Channel:    campaign.Channel,
-		Message:    campaign.Message,
-		BatchSize:  h.BatchSize,
+		CampaignID:          campaign.ID.String(),
+		TenantID:            tenant.ID.String(),
+		TenantSlug:          tenant.Slug,
+		Channel:             campaign.Channel,
+		Message:             campaign.Message,
+		BatchSize:           h.BatchSize,
+		QuietHoursWindow:    os.Getenv("QUIET_HOURS_DEFAULT"),
+		QuietHoursOverrides: quietOverrides,
 	}); err != nil {
 		h.mapErr(w, err)
 		return
