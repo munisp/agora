@@ -51,6 +51,11 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W12 Agent B: DND registry (dnd.go), same bootstrap pattern.
+	if err := s.ensureDNDSchema(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
