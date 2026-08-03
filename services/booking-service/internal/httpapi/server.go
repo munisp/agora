@@ -19,6 +19,7 @@ import (
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/permify"
+	"github.com/opendesk/booking-service/internal/referrals"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
 )
@@ -72,6 +73,12 @@ type Deps struct {
 	// Leads serves the SPEC-W13 CAC endpoints (leads, promo codes +
 	// redeem, campaigns + spend, internal spend-sum). Nil → 503.
 	Leads *leads.Service
+	// Referrals serves the SPEC-W14 referral & commission endpoints
+	// (referrals CRUD + verify, rules CRUD, ledger, balances). Nil → 503.
+	Referrals *referrals.Service
+	// Payouts serves GET /v1/payouts (SPEC-W14 Agent B: the payout queue
+	// for Agent C's admin page). Nil → 503.
+	Payouts *referrals.PayoutStore
 }
 
 type ctxKey string
@@ -190,6 +197,26 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_bookings")).Post("/", s.createCampaign)
 			r.With(s.require("manage_bookings")).Post("/{id}/spend", s.recordCampaignSpend)
 		})
+		// Referrals + commissions (SPEC-W14 Agent A): manage_bookings for
+		// mutations, view_analytics for reads (same posture as /leads).
+		r.Route("/referrals", func(r chi.Router) {
+			r.With(s.require("view_analytics")).Get("/", s.listReferrals)
+			r.With(s.require("manage_bookings")).Post("/", s.createReferral)
+			r.With(s.require("view_analytics")).Get("/{id}", s.getReferral)
+			r.With(s.require("manage_bookings")).Post("/{id}/verify", s.verifyReferral)
+			r.With(s.require("manage_bookings")).Post("/{id}/reject", s.rejectReferral)
+		})
+		r.Route("/commissions", func(r chi.Router) {
+			r.With(s.require("view_analytics")).Get("/rules", s.listCommissionRules)
+			r.With(s.require("manage_bookings")).Post("/rules", s.createCommissionRule)
+			r.With(s.require("manage_bookings")).Put("/rules/{id}", s.updateCommissionRule)
+			r.With(s.require("manage_bookings")).Delete("/rules/{id}", s.deleteCommissionRule)
+			r.With(s.require("view_analytics")).Get("/ledger", s.listCommissionLedger)
+			r.With(s.require("view_analytics")).Get("/balance/{beneficiary}", s.commissionBalance)
+		})
+		// SPEC-W14 Agent B (additive): the payout queue read by Agent C's
+		// payouts page — view_analytics like the other commission reads.
+		r.With(s.require("view_analytics")).Get("/payouts", s.listPayouts)
 	})
 
 	// Public promo redemption (SPEC-W13 §6): rate-limited, idempotent per
