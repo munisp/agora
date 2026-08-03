@@ -25,6 +25,7 @@ import (
 	"github.com/opendesk/notification-worker/internal/notifyoutbox"
 	"github.com/opendesk/notification-worker/internal/pacer"
 	"github.com/opendesk/notification-worker/internal/packs"
+	"github.com/opendesk/notification-worker/internal/provider"
 	"github.com/opendesk/notification-worker/internal/signals"
 	"github.com/opendesk/notification-worker/internal/store"
 	"github.com/opendesk/notification-worker/internal/webhooks"
@@ -162,6 +163,9 @@ func run() error {
 	// booking-service's IncidentAlertWorkflow via NotifyPaced kind
 	// incident_alert with priority — the pacer fast-lane).
 	w.RegisterActivityWithOptions(acts.SendIncidentAlert, activity.RegisterOptions{Name: workflows.ActivitySendIncidentAlert})
+	// SPEC-W16 §1: push notification fan-out (kinds push_notification /
+	// push_marketing via NotifyPaced, or scheduled directly).
+	w.RegisterActivityWithOptions(acts.SendPushNotification, activity.RegisterOptions{Name: workflows.ActivitySendPushNotification})
 	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
 	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
 
@@ -241,6 +245,37 @@ func run() error {
 		zap.Bool("dnd_store", dndChecker != nil),
 		zap.String("quiet_hours_default", quietHours.DefaultWindow),
 		zap.Int("quiet_hours_overrides", len(quietOverrides)))
+
+	// SPEC-W16 §1: push notification providers. FCM_MOCK=1 (default) is a
+	// deterministic no-network mock; FCM_CREDENTIALS_JSON selects HTTP v1,
+	// FCM_SERVER_KEY the legacy API. APNs is a documented STUB (interface +
+	// config only): iOS tokens surface honest "not implemented" per-token
+	// failures until the provider/apns.go TODO lands.
+	fcm, err := provider.NewFCM(provider.FCMConfig{
+		Mock:            cfg.FCMMock,
+		ServerKey:       cfg.FCMServerKey,
+		CredentialsJSON: cfg.FCMCredentialsJSON,
+		ProjectID:       cfg.FCMProjectID,
+		BaseURL:         cfg.FCMBaseURL,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("fcm provider: %w", err)
+	}
+	apns := &provider.APNS{
+		KeyID:  cfg.APNSKeyID,
+		TeamID: cfg.APNSTeamID,
+		KeyP8:  cfg.APNSKeyP8,
+		Topic:  cfg.APNSTopic,
+	}
+	acts.Push = activities.PushDeps{Providers: map[string]provider.PushProvider{
+		"fcm":  fcm,
+		"apns": apns,
+	}}
+	logger.Info("push providers configured (SPEC-W16)",
+		zap.Bool("fcm_mock", cfg.FCMMock),
+		zap.Bool("fcm_configured", fcm.Configured()),
+		zap.String("fcm_mode", fcmMode(cfg)),
+		zap.Bool("apns_configured", apns.Configured()))
 
 	// HTTP sidecar: /healthz + /dev triggers + /v1/webhooks (Wave 5 #10)
 	// + /v1/dnd (SPEC-W12).
@@ -343,6 +378,20 @@ func run() error {
 	shutCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	return srv.Shutdown(shutCtx)
+}
+
+// fcmMode describes the active FCM auth mode for the boot log (SPEC-W16).
+func fcmMode(cfg config.Config) string {
+	switch {
+	case cfg.FCMMock:
+		return "mock"
+	case cfg.FCMCredentialsJSON != "":
+		return "http-v1"
+	case cfg.FCMServerKey != "":
+		return "legacy-server-key"
+	default:
+		return "unconfigured"
+	}
 }
 
 // temporalZapAdapter bridges Temporal's log.Logger to zap.

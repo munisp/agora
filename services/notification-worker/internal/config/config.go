@@ -62,6 +62,16 @@ type Config struct {
 	DNDEnforcement      bool   // DND_ENFORCEMENT: suppress marketing sends on the DND registry (true)
 	QuietHoursDefault   string // QUIET_HOURS_DEFAULT: "HH:MM-HH:MM" ("20:00-08:00")
 	QuietHoursOverrides string // QUIET_HOURS_OVERRIDES: per-channel JSON {"sms":"21:00-07:00"}
+	// SPEC-W16 §1: push notification providers.
+	FCMMock            bool   // FCM_MOCK: deterministic mock, no network (true)
+	FCMServerKey       string // FCM_SERVER_KEY: legacy FCM API key (deprecated upstream)
+	FCMCredentialsJSON string // FCM_CREDENTIALS_JSON: service-account JSON (HTTP v1)
+	FCMProjectID       string // FCM_PROJECT_ID: GCP project (creds project_id wins)
+	FCMBaseURL         string // FCM_BASE_URL: endpoint override (tests)
+	APNSKeyID          string // APNS_KEY_ID (stub config only — see provider/apns.go TODO)
+	APNSTeamID         string // APNS_TEAM_ID (stub)
+	APNSKeyP8          string // APNS_KEY_P8 (stub)
+	APNSTopic          string // APNS_TOPIC (stub)
 	ShutdownTimeout     time.Duration
 }
 
@@ -114,6 +124,17 @@ func Load() Config {
 		DNDEnforcement:           envStr("DND_ENFORCEMENT", "true") == "true",
 		QuietHoursDefault:        envStr("QUIET_HOURS_DEFAULT", "20:00-08:00"),
 		QuietHoursOverrides:      os.Getenv("QUIET_HOURS_OVERRIDES"),
+		// Push providers (SPEC-W16 §1): FCM_MOCK unset or "1" → mock
+		// (mirrors the KYC_MOCK / PAYOUT_MOCK env idiom).
+		FCMMock:            envStr("FCM_MOCK", "1") != "0",
+		FCMServerKey:       os.Getenv("FCM_SERVER_KEY"),
+		FCMCredentialsJSON: os.Getenv("FCM_CREDENTIALS_JSON"),
+		FCMProjectID:       os.Getenv("FCM_PROJECT_ID"),
+		FCMBaseURL:         os.Getenv("FCM_BASE_URL"),
+		APNSKeyID:          os.Getenv("APNS_KEY_ID"),
+		APNSTeamID:         os.Getenv("APNS_TEAM_ID"),
+		APNSKeyP8:          os.Getenv("APNS_KEY_P8"),
+		APNSTopic:          os.Getenv("APNS_TOPIC"),
 		ShutdownTimeout:          time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 	}
 }
