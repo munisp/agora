@@ -1,0 +1,209 @@
+# OpenDesk platform app catalog (SPEC-W18, contract §1/§3).
+# Embedded via go:embed by internal/apps/catalog.go and upserted into the
+# global platform_apps table at identity-service boot (idempotent).
+#
+# Field contract (binds Agents A/B/C):
+#   app_id            stable slug, PK of platform_apps
+#   name              display name
+#   version           catalog entry version (semver string)
+#   description       one-line operator-facing summary
+#   category          grouping for the portal catalog grid
+#   icon              emoji/text icon for the catalog grid
+#   nav_route         portal route relative to /app/{orgSlug}; "/apps/<app_id>"
+#                     is the planned per-app section route (lands with the
+#                     app's portal UI, see backend_note)
+#   required_perms    middleware permission strings a caller needs to use the
+#                     app's backend. manage_bookings / manage_catalog /
+#                     view_analytics are enforced today (booking-service
+#                     internal/httpapi/server.go); manage_billing is enforced
+#                     as the owner|billing realm-role guard in admin-web
+#                     (lib/roles.ts) and becomes a first-class perm with the
+#                     W19 gate rollout.
+#   default_plan_tier minimum billing plan that includes the app by default.
+#                     Real billing-engine plan_presets tiers are
+#                     free|standard|pro (services/billing-engine/migrations/
+#                     0001_init.sql) — the contract names map starter→free,
+#                     growth→standard, scale→pro.
+#   backend_note      honest pointer to the backing module(s) / landing wave.
+apps:
+  # -------------------------------------------------------------------------
+  # Existing platform apps (backends shipped, portal-manageable today)
+  # -------------------------------------------------------------------------
+  - app_id: receptionist
+    name: AI Receptionist
+    version: 1.0.0
+    description: Voice + text AI concierge that answers questions and books, reschedules and cancels appointments live, with warm handoff to staff.
+    category: Communications
+    icon: "\U0001F4DE"
+    nav_route: /voice-agent
+    required_perms: [manage_bookings]
+    default_plan_tier: free
+    backend_note: services/voice-agent-runtime + services/conversation-service; escalation call UI at /call (booking-service).
+
+  - app_id: messaging
+    name: Omnichannel Messaging
+    version: 1.0.0
+    description: Outbound SMS/WhatsApp customer messaging with provider failover, DND and quiet-hours compliance.
+    category: Communications
+    icon: "\U0001F4AC"
+    nav_route: /channels
+    required_perms: [manage_bookings]
+    default_plan_tier: free
+    backend_note: services/messaging-gateway (Termii / Africa's Talking / WhatsApp Cloud API) + notification-worker; channel setup UI at /channels.
+
+  - app_id: cac
+    name: Customer Acquisition
+    version: 1.0.0
+    description: Lead capture, promo codes, campaign attribution and CAC analytics across channels.
+    category: Growth
+    icon: "\U0001F9F2"
+    nav_route: /cac
+    required_perms: [manage_bookings, view_analytics]
+    default_plan_tier: standard
+    backend_note: services/booking-service/internal/leads + analytics-pipeline (docs/cac-analytics-api.md).
+
+  - app_id: payments
+    name: Payments & Billing
+    version: 1.0.0
+    description: Double-entry ledger payments, invoices, rate cards, payouts and QR payment links.
+    category: Payments
+    icon: "\U0001F4B3"
+    nav_route: /billing
+    required_perms: [manage_billing]
+    default_plan_tier: standard
+    backend_note: services/payments-service (:7004, TigerBeetle-compatible ledger) + services/billing-engine plan_presets/invoices; portal section /billing is owner|billing role-guarded today.
+
+  - app_id: kyc-compliance
+    name: KYC & Compliance
+    version: 1.0.0
+    description: Consent-gated BVN/NIN identity resolution and compliance audit trail for regulated onboarding.
+    category: Compliance
+    icon: "\U0001FAAA"
+    nav_route: /apps/kyc-compliance
+    required_perms: [manage_bookings]
+    default_plan_tier: standard
+    backend_note: services/kyc-service (:7013) shipped in W12; dedicated portal section lands W19 — until then managed from the apps grid (docs/kyc.md).
+
+  - app_id: analytics
+    name: Analytics
+    version: 1.0.0
+    description: KPI dashboards, trends and text-to-SQL over the lakehouse, with per-tenant isolation.
+    category: Analytics
+    icon: "\U0001F4CA"
+    nav_route: /analytics
+    required_perms: [view_analytics]
+    default_plan_tier: standard
+    backend_note: services/analytics-pipeline (:7009, direct BFF route /api/analytics/* — not via APISIX, see admin-web BFF proxy).
+
+  - app_id: incidents
+    name: Incidents & Emergency Lane
+    version: 1.0.0
+    description: Incident data packets, signed dispatch endpoints, IoT webhook ingest and the voice emergency lane.
+    category: Operations
+    icon: "\U0001F6A8"
+    nav_route: /apps/incidents
+    required_perms: [manage_bookings]
+    default_plan_tier: pro
+    backend_note: services/booking-service/internal/httpapi/incidents.go + IoT ingest (W11, docs/incidents.md); portal section lands W19.
+
+  - app_id: geo-campaigns
+    name: Geo Campaigns
+    version: 1.0.0
+    description: Geofenced audience previews and location-targeted messaging campaigns with spend controls.
+    category: Growth
+    icon: "\U0001F4CD"
+    nav_route: /geo-campaigns
+    required_perms: [manage_bookings, view_analytics]
+    default_plan_tier: pro
+    backend_note: services/booking-service/internal/geo (service areas, audience preview, geo campaign CRUD); owner|admin role-guarded in admin-web.
+
+  # -------------------------------------------------------------------------
+  # New enterprise apps (catalog entries NOW; backends land W19/W20)
+  # -------------------------------------------------------------------------
+  - app_id: helpdesk
+    name: Helpdesk
+    version: 0.1.0
+    description: SLA ticketing with queues, priorities, escalations and customer-facing status tracking.
+    category: Support
+    icon: "\U0001F3AB"
+    nav_route: /apps/helpdesk
+    required_perms: [manage_bookings]
+    default_plan_tier: standard
+    backend_note: backend module lands W19; conversation threads reusable from services/conversation-service.
+
+  - app_id: field-service
+    name: Field Service
+    version: 0.1.0
+    description: Field job dispatch, on-site capture (photos, forms, signatures) and technician tracking.
+    category: Operations
+    icon: "\U0001F6E0\uFE0F"
+    nav_route: /apps/field-service
+    required_perms: [manage_bookings]
+    default_plan_tier: pro
+    backend_note: backend module lands W19; field-capture primitives exist in services/booking-service/internal/fieldcapture.
+
+  - app_id: loyalty-wallet
+    name: Loyalty Wallet
+    version: 0.1.0
+    description: Points, stamps and stored-value wallets with earn/burn rules tied to bookings and payments.
+    category: Growth
+    icon: "\U0001F381"
+    nav_route: /apps/loyalty-wallet
+    required_perms: [manage_bookings, view_analytics]
+    default_plan_tier: pro
+    backend_note: backend module lands W19; ledger accounts reusable from services/payments-service.
+
+  - app_id: campaign-studio
+    name: Campaign Studio
+    version: 0.1.0
+    description: Multi-step campaign builder with audience segments, templates, scheduling and A/B tests.
+    category: Growth
+    icon: "\U0001F4E3"
+    nav_route: /apps/campaign-studio
+    required_perms: [manage_bookings, view_analytics]
+    default_plan_tier: pro
+    backend_note: backend module lands W19; send path via services/messaging-gateway + notification-worker.
+
+  - app_id: crm-360
+    name: CRM 360
+    version: 0.1.0
+    description: Unified customer profile across bookings, conversations, payments and campaigns.
+    category: Sales
+    icon: "\U0001F465"
+    nav_route: /apps/crm-360
+    required_perms: [manage_bookings, view_analytics]
+    default_plan_tier: pro
+    backend_note: backend module lands W19; bidirectional Twenty CRM sync exists in services/crm-sync-service.
+
+  - app_id: surveys-voc
+    name: Surveys & VoC
+    version: 0.1.0
+    description: Post-interaction surveys, NPS/CSAT tracking and voice-of-customer analytics.
+    category: Feedback
+    icon: "\U0001F4DD"
+    nav_route: /apps/surveys-voc
+    required_perms: [view_analytics]
+    default_plan_tier: standard
+    backend_note: backend module lands W19; delivery via services/messaging-gateway, results via analytics-pipeline.
+
+  - app_id: lending
+    name: Lending
+    version: 0.1.0
+    description: Merchant cash advances and micro-loans underwritten on platform revenue history.
+    category: Fintech
+    icon: "\U0001F4B8"
+    nav_route: /apps/lending
+    required_perms: [manage_billing, view_analytics]
+    default_plan_tier: pro
+    backend_note: backend module lands W20; payment-rail interop infrastructure in deploy/mojaloop (W17).
+
+  - app_id: workforce
+    name: Workforce
+    version: 0.1.0
+    description: Shift planning, team availability, roles and utilization across locations.
+    category: Operations
+    icon: "\U0001F5D3\uFE0F"
+    nav_route: /apps/workforce
+    required_perms: [manage_catalog]
+    default_plan_tier: pro
+    backend_note: backend module lands W19; team/availability CRUD primitives exist in services/booking-service (manage_catalog).
