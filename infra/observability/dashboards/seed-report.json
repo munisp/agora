@@ -1,0 +1,196 @@
+{
+  "uid": "opendesk-seed-report",
+  "title": "OpenDesk — Seed Report",
+  "description": "Platform data seeding health (SPEC-W17 §8.7): last-run completion and per-table rowcounts from cac.seed_run_log in the analytics_meta Postgres database. A healthy full run shows 7 logged tables; lgas=774, wards=8812, channels=32, channel_unit_costs=768 (32x24), fx_series>=365, agents/customers scale with SEED_SCALE. NOTE: the W17 spec path infra/grafana/dashboards/ maps to this provisioning dir (infra/observability/dashboards — see grafana/provisioning/dashboards/dashboards.yml). Requires the provisioned 'opendesk-postgres' datasource.",
+  "tags": ["opendesk", "seeding", "cac"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": {"from": "now-7d", "to": "now"},
+  "refresh": "5m",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Last seed run",
+      "description": "Most recent seeded_at across cac.seed_run_log. Red when older than the staging refresh trigger (§8.6: 24h).",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "postgres", "uid": "opendesk-postgres"},
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT max(seeded_at) AS last_run FROM cac.seed_run_log"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeFromNow",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "textMode": "value"}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Seed tables logged",
+      "description": "Distinct tables in cac.seed_run_log. A complete 9-step bootstrap logs 7 data tables (lgas, wards, channels, channel_unit_costs, agents, customers, fx_series).",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "postgres", "uid": "opendesk-postgres"},
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS logged FROM cac.seed_run_log"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "mappings": [
+            {"type": "value", "options": {"7": {"text": "7 (complete)", "color": "green"}}}
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "green", "value": 7}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "textMode": "value"}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "cac schema tables present",
+      "description": "Contract-D tables existing in schema cac (8 expected). Anything less = apply sql/postgres/ddl (bootstrap step 1).",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "postgres", "uid": "opendesk-postgres"},
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS present FROM information_schema.tables WHERE table_schema = 'cac'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 1},
+              {"color": "green", "value": 8}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "textMode": "value"}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Non-synthetic rows in seed tables",
+      "description": "§8.8 compliance: every cac.* row must carry is_synthetic=true. MUST be 0 — anything else is a compliance incident (run collision_guard.py + investigate).",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "postgres", "uid": "opendesk-postgres"},
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT (SELECT count(*) FROM cac.lgas WHERE NOT is_synthetic) + (SELECT count(*) FROM cac.wards WHERE NOT is_synthetic) + (SELECT count(*) FROM cac.channels WHERE NOT is_synthetic) + (SELECT count(*) FROM cac.channel_unit_costs WHERE NOT is_synthetic) + (SELECT count(*) FROM cac.agents WHERE NOT is_synthetic) + (SELECT count(*) FROM cac.customers WHERE NOT is_synthetic) + (SELECT count(*) FROM cac.fx_series WHERE NOT is_synthetic) AS non_synthetic"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "textMode": "value"}
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "seed_report_summary",
+      "description": "Last-run completion per table: rowcount as logged by _lib.log_seed_run, run timestamp, runner and git sha — straight from cac.seed_run_log.",
+      "gridPos": {"h": 8, "w": 14, "x": 0, "y": 4},
+      "datasource": {"type": "postgres", "uid": "opendesk-postgres"},
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT table_name, rowcount, seeded_at AS last_run_at, runner_id, git_sha FROM cac.seed_run_log ORDER BY table_name"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "displayMode": "auto"},
+          "unit": "none",
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "last_run_at"},
+            "properties": [{"id": "unit", "value": "dateTimeAsIso"}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "rowcount"},
+            "properties": [{"id": "unit", "value": "short"}]
+          }
+        ]
+      },
+      "options": {"showHeader": true, "sortBy": [{"displayName": "table_name", "desc": false}]}
+    },
+    {
+      "id": 6,
+      "type": "bargauge",
+      "title": "Rows per seed table",
+      "description": "Per-table rowcounts from cac.seed_run_log. Reference expectations: lgas 774, wards 8,812, channels 32, channel_unit_costs 768, fx_series >=365; agents=5,000xSEED_SCALE, customers=200,000xSEED_SCALE.",
+      "gridPos": {"h": 8, "w": 10, "x": 14, "y": 4},
+      "datasource": {"type": "postgres", "uid": "opendesk-postgres"},
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT table_name, rowcount FROM cac.seed_run_log ORDER BY rowcount DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "short", "decimals": 0, "min": 0},
+        "overrides": []
+      },
+      "options": {"displayMode": "gradient", "orientation": "horizontal", "showUnfilled": true, "text": {"valueSize": 14}}
+    }
+  ]
+}

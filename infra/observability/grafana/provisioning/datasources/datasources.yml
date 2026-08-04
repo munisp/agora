@@ -12,3 +12,21 @@ datasources:
     access: proxy
     url: http://loki:3100
     editable: false
+  # SPEC-W17 (Agent D): read-only Grafana access to the platform seed registry
+  # (cac.seed_run_log) for the "OpenDesk — Seed Report" dashboard. Dev-compose
+  # credentials mirror the compose dev fallbacks (opendesk/opendesk); override
+  # via secret-provisioned copies of this file outside local dev.
+  - name: opendesk-postgres
+    uid: opendesk-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: opendesk
+    database: analytics_meta
+    basicAuth: false
+    jsonData:
+      postgresVersion: 1600
+      sslmode: disable
+    secureJsonData:
+      password: opendesk
+    editable: false

@@ -51,3 +51,16 @@ ab-test:       ## A/B persona eval (needs EVAL_PERSONA_OVERRIDE=true runtime): m
 
 loadtest-voice: ## Voice load ramp 5->10->25->50 (needs live stack: make up-voice; see tests/load/README.md)
 	python3 tests/load/voice_ramp.py $(LOADTEST_ARGS)
+
+.PHONY: seed-all seed-ci seed-drift
+
+seed-all:      ## Seed ALL platform CAC data (SPEC-W17 §8.5 9-step; needs postgres up): SEED_SCALE=1.0 make seed-all
+	./scripts/seeds/bootstrap.sh
+
+seed-ci:       ## CI seed at SEED_SCALE=0.05 with Kafka off (SEED_KAFKA=on make seed-ci to publish events)
+	SEED_SCALE=0.05 SEED_KAFKA=off ./scripts/seeds/bootstrap.sh
+
+seed-drift:    ## §8.7 #5 drift gate — fails if scripts/seeds/drift.sql returns any row (forwards SEED_SCALE)
+	@out="$$(psql "$${SEED_DATABASE_URL:-postgres://opendesk:opendesk@localhost:5432/analytics_meta}" -At -v seed_scale="$${SEED_SCALE:-1.0}" -f scripts/seeds/drift.sql)"; \
+	if [ -n "$$out" ]; then echo "$$out"; echo "seed-drift: DRIFT DETECTED (§8.7 #5)" >&2; exit 1; fi; \
+	echo "seed-drift: OK (0 rows)"
