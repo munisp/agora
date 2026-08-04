@@ -1,0 +1,8 @@
+# Seed stack (SPEC-W17 contract F) — Python 3.11+, stdlib-first.
+# Install: pip install -r scripts/seeds/requirements-seeds.txt
+# (pypi.org; use -i https://mirrors.aliyun.com/pypi/simple/ or npmmirror as fallback)
+mimesis>=11,<19           # MIT — the ONLY synthetic-data generator (no faker)
+psycopg[binary]>=3.1      # psycopg v3 driver; _lib falls back to psycopg2-binary if absent
+argon2-cffi>=23.1         # contract-A hash_pii (fallback: hashlib.scrypt, logged loudly)
+kafka-python>=2.0.2       # optional — only used when SEED_KAFKA=on (import guarded)
+pytest>=8.0               # tests/seeds
