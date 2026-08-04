@@ -38,8 +38,11 @@ rejected, values are always bound parameters, never interpolated):
 `steps[]` — validated on write:
 
 - `wait` — `wait_hours >= 0` (only field allowed)
-- `send` — `kind sms|push_marketing|ussd` + `template` (`{name}` token,
-  ≤ 4096 bytes)
+- `send` — `kind sms|push_marketing|ussd|whatsapp` + `template` (`{name}`
+  token, ≤ 4096 bytes; **whatsapp:** `template_name` REQUIRED instead —
+  Meta-approved template; `template` is repurposed as an optional params
+  hint and is NOT sent; `language` optional, default `en`; `params`
+  positional body params, max 10 — see the WhatsApp section below)
 - `branch` — `condition` (same filter shape as segments, evaluated on the
   contact's attributes; **false → enrollment exits** with reason
   `branch_condition_false`)
@@ -123,13 +126,60 @@ deferred workflow-side by `StudioSendWorkflow` (mirror of
 |---|---|---|
 | `sms` | `geo_campaign` | `{kind:"geo_campaign", geo_campaign:{tenant_slug, campaign_id:<journey id>, channel:"sms", phone, name, text}}` — the notification-worker's only SMS marketing route (`SendGeoCampaignMessage`) |
 | `push_marketing` | `push_marketing` | `{kind:"push_marketing", push:{tenant_slug, contact_id, phone, title:<journey name>, body, data:{journey_id, enrollment_id}}}` — `SendPushNotification` fan-out; `phone` lets the DND guard check the phone-keyed registries |
+| `whatsapp` | `whatsapp_campaign` | `{kind:"whatsapp_campaign", whatsapp_campaign:{tenant_slug, contact_id, phone, template_name, language, params, campaign_id:<journey id>}}` — `SendWhatsAppCampaignMessage` (SPEC-W21; see below) |
 | `ussd` | — | **No outbound USSD binding exists**: ussd steps advance and count as `skipped` (limitation) |
 
 Outcomes are recorded per enrollment (`send_sent` / `send_suppressed` /
 `send_failed` step events) by the `StudioRecordSendOutcome` activity and
-surface in the stats endpoint. Contacts without a phone skip SMS steps
-(`send_skipped`, reason `missing_phone`); contacts that vanished exit with
-reason `contact_missing`.
+surface in the stats endpoint. Contacts without a phone skip SMS and
+WhatsApp steps (`send_skipped`, reason `missing_phone`); contacts that
+vanished exit with reason `contact_missing`.
+
+## WhatsApp template sends (SPEC-W21 Agent A)
+
+`send` steps with `kind: "whatsapp"` deliver a **business-initiated
+WhatsApp TEMPLATE message** through the notification-worker's paced
+`whatsapp_campaign` kind — same guarantees as SMS marketing (CPS pacing,
+DND/NCC 2442 + tenant opt-out suppression activity-side, quiet-hours
+deferral workflow-side on the `whatsapp` channel key, so
+`QUIET_HOURS_OVERRIDES` may carry a `"whatsapp"` window).
+
+Step shape:
+
+```json
+{"type":"send","kind":"whatsapp",
+ "template_name":"vote_reminder",   // REQUIRED — Meta-approved template (400 otherwise)
+ "language":"en",                   // optional, default "en"
+ "params":["{name}","Ward 3"],      // optional positional body params ({{1}}, {{2}}, …), max 10
+ "template":"Hi {name} — …"}        // optional: author-facing params HINT only; NOT sent
+```
+
+Transport: the worker calls the **Meta Cloud API directly**
+(`POST {base}/{phone_number_id}/messages`, bearer token) from
+`internal/provider/whatsapp.go` — the messaging-gateway is not involved
+(its `/v1/whatsapp/send` endpoint predates this contract and carries
+neither language nor positional params). The send returns the provider
+message id (`wamid`) which is logged for audit.
+
+| Env | Default | Purpose |
+|---|---|---|
+| `WHATSAPP_MOCK` | `1` | deterministic mock: logs the send + returns a fake `wamid.mock-*`, no network (FCM_MOCK posture). Set `0` for live sends |
+| `WHATSAPP_CLOUD_API_TOKEN` | — | Meta system-user access token (live) |
+| `WHATSAPP_PHONE_NUMBER_ID` | — | sender phone-number id (live) |
+| `WHATSAPP_BUSINESS_ACCOUNT_ID` | — | WhatsApp Business Account id (optional; reporting only) |
+| `WHATSAPP_CLOUD_API_BASE_URL` | `https://graph.facebook.com/v21.0` | Cloud API base (tests/override) |
+
+Mock test hooks (mirroring the FCM mock): recipient phone `mock-fail` →
+provider 500; anything else → 200 with a deterministic wamid.
+
+**External prerequisites (honest note):** a live template send only
+delivers when (1) the template (`template_name` + language) is **approved
+in the WhatsApp Business Manager** — Meta's review is an external process,
+typically hours-to-days — and (2) the sender number's **quality rating /
+messaging-limit tier** allows business-initiated traffic (new numbers ramp
+from 250 business-initiated conversations/24h upward based on Meta's
+quality signals). Neither is controlled by this repo; `WHATSAPP_MOCK=1`
+keeps journeys fully testable before they complete.
 
 ## Events & metering
 
@@ -192,6 +242,10 @@ tenantMiddleware form the variadic group chain.
   filters.
 - **ussd send steps are skipped** (no outbound USSD binding in
   notification-worker).
+- **WhatsApp sends are template-only** (business-initiated; no free-text
+  outside the 24h customer-service window) and require the Meta template
+  approval + quality-rating ramp described above; delivery runs against
+  the deterministic mock until real `WHATSAPP_*` credentials are wired.
 - **No automatic scheduler** (see the Temporal-cron follow-up above):
   nothing advances enrollments until the step endpoint is called.
 - **Segment/event triggers** (`trigger_kind: segment|event`) are accepted
