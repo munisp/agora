@@ -1,6 +1,6 @@
 # Runbook — Operations
 
-Day-2 procedures for the OpenDesk data plane: DLQ replay, outbox monitoring,
+Day-2 procedures for the Agora data plane: DLQ replay, outbox monitoring,
 Temporal workflow surgery, ledger reconciliation, lakehouse backfill, backups.
 All commands assume the dev compose stack is up (`make up`) and run from the
 repo root.

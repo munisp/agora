@@ -1,4 +1,4 @@
-name: opendesk
+name: agora
 include:
 - infra/docker-compose.core.yml
 - infra/docker-compose.edge.yml
