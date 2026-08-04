@@ -36,6 +36,12 @@ TOPICS=(
   opendesk.fsm.events.v1           # field-service WorkOrderAssigned/WorkOrderCompleted (SPEC-W19 Agent B)
   opendesk.loyalty.events.v1       # loyalty PointsIssued/PointsRedeemed (SPEC-W19 Agent C)
   opendesk.studio.events.v1        # campaign-studio journey lifecycle events (SPEC-W19 Agent D)
+  # SPEC-W20 (additive): batch-2 enterprise app lifecycle event streams
+  # (booking-service emits via the transactional outbox).
+  opendesk.crm.events.v1           # crm-360 note/pin/tag changes (SPEC-W20 Agent A)
+  opendesk.surveys.events.v1       # surveys sent/answered (SPEC-W20 Agent B)
+  opendesk.lending.events.v1       # lending application decided/disbursed/repaid + disbursement intent (SPEC-W20 Agent C)
+  opendesk.workforce.events.v1     # workforce shift assigned/leave decided (SPEC-W20 Agent D)
   # CAC seed report pattern (scripts/seeds/_lib.py emit_seed_report):
   # topic is f"cac.seed.report.{table}.v1" — the seed scripts pass their
   # schema-qualified TABLE constant, so the declared names below match the
