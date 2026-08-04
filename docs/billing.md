@@ -66,7 +66,7 @@ minor units — no floats, no rounding drift.
 
 ```
 draft ──issue──> issued ──webhook──> paid
-  │                │  └──dunning (older than INVOICE_DUE_DAYS)──> past_due ──webhook──> paid
+  │                │  └─dunning (older than INVOICE_DUE_DAYS)──> past_due ──webhook──> paid
   └──void──> void  └──void──> void                                └──void──> void
 ```
 
