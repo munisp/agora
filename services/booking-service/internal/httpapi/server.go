@@ -28,6 +28,7 @@ import (
 	"github.com/opendesk/booking-service/internal/loyalty"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/referrals"
+	"github.com/opendesk/booking-service/internal/socialpub"
 	"github.com/opendesk/booking-service/internal/store"
 	"github.com/opendesk/booking-service/internal/surveys"
 	"github.com/opendesk/booking-service/internal/workforce"
@@ -133,6 +134,15 @@ type Deps struct {
 	Lending *lending.Deps
 	// Workforce serves /v1/workforce (appgate app_id "workforce").
 	Workforce *workforce.Deps
+
+	// SPEC-W21 integrator (additive): the social-publisher app package.
+	// Same wiring posture as W19/W20 — the Deps bundle is built in
+	// cmd/server/main.go (store + topics + provider mocks); the tenant
+	// accessor and permission middleware are attached here in NewRouter.
+	// Nil → the app's routes are not registered (partial deployments stay
+	// intact).
+	// Social serves /v1/social (appgate app_id "social-publisher").
+	Social *socialpub.Deps
 }
 
 type ctxKey string
@@ -391,6 +401,24 @@ func NewRouter(d Deps) http.Handler {
 		workforce.RegisterRoutes(r, s.d.Workforce, mw...)
 	}
 	// SPEC-W20 integrator — END
+
+	// SPEC-W21 integrator — BEGIN (additive): the social-publisher route
+	// group. Same posture as W19 helpdesk (the package reads the tenant
+	// via the accessor below): httpapi's tenantMiddleware runs first
+	// (resolves ctxTenant/ctxUser), then the appgate entitlement gate
+	// (pass-through unless APP_GATE_ENABLED=true), then method-aware
+	// perms (GET/HEAD → view_analytics, writes → manage_bookings). Nil
+	// Deps → not registered.
+	if s.d.Social != nil {
+		s.d.Social.TenantFromContext = func(ctx context.Context) (bookingops.TenantInfo, bool) {
+			t := tenantFrom(ctx)
+			return t, t.ID != uuid.Nil
+		}
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("social-publisher", s.requireReadWrite())...)
+		socialpub.RegisterRoutes(r, s.d.Social, mw...)
+	}
+	// SPEC-W21 integrator — END
 
 	// Public promo redemption (SPEC-W13 §6): rate-limited, idempotent per
 	// code+phone. No tenant middleware — the unguessable code resolves the
