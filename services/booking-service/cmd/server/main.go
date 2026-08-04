@@ -15,20 +15,24 @@ import (
 	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
+	"github.com/opendesk/booking-service/internal/campaignstudio" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/config"
 	"github.com/opendesk/booking-service/internal/consumer"
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/devices"
 	"github.com/opendesk/booking-service/internal/fieldcapture"
 	"github.com/opendesk/booking-service/internal/geo"
+	"github.com/opendesk/booking-service/internal/helpdesk" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/httpapi"
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/leads"
+	"github.com/opendesk/booking-service/internal/loyalty" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/referrals" // SPEC-W14 Agent B (additive import)
 	"github.com/opendesk/booking-service/internal/store"
 	"github.com/opendesk/booking-service/internal/temporalclient"
+	"github.com/opendesk/booking-service/internal/workorders" // SPEC-W19 integrator (additive import)
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
@@ -78,6 +82,26 @@ func run() error {
 	}
 	// SPEC-W14 Agent B — END
 
+	// SPEC-W19 integrator — BEGIN (additive): campaign-studio store, hoisted
+	// like payoutStore because the Temporal worker block below registers the
+	// StudioSendWorkflow + its outcome activity on the shared worker
+	// (booking-service DOES run an in-process Temporal worker — see below).
+	// STUDIO_DATABASE_URL falls back to DATABASE_URL (routes.go sketch).
+	// A dial failure disables only /v1/studio (routes stay unregistered).
+	var studioStore *campaignstudio.Store
+	studioURL := cfg.StudioDatabaseURL
+	if studioURL == "" {
+		studioURL = cfg.DatabaseURL
+	}
+	if ss, ssErr := campaignstudio.DialStore(ctx, studioURL); ssErr != nil {
+		logger.Error("campaign studio store unavailable; /v1/studio disabled", zap.Error(ssErr))
+	} else {
+		defer ss.Close()
+		studioStore = ss
+	}
+	// SPEC-W19 integrator — END (hoisted half; the remaining three app
+	// stores are dialed next to the W16 stores below)
+
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
 	resolver := bookingops.NewTenantResolver(daprClient, cfg.IdentityAppID, cfg.IdentityCacheTTL, logger)
 
@@ -108,6 +132,10 @@ func run() error {
 	var gdpr httpapi.GdprStarter
 	var geoStarter geo.CampaignStarter
 	var incidentStarter incidents.Starter
+	// SPEC-W19 integrator (additive): campaign-studio send starter. nil when
+	// Temporal is unreachable → journey send steps defer (sends_deferred)
+	// instead of erroring (campaignstudio.Handlers contract).
+	var studioStarter campaignstudio.SendStarter
 	tc, err := temporalclient.Dial(cfg.TemporalHostPort, cfg.TemporalNamespace, cfg.TemporalTaskQueue)
 	if err != nil {
 		logger.Warn("temporal unavailable at boot; saga starts will fail until redeploy",
@@ -118,6 +146,9 @@ func run() error {
 		gdpr = tc
 		geoStarter = tc
 		incidentStarter = tc
+		// SPEC-W19 integrator (additive): the studio step endpoint starts
+		// StudioSendWorkflow batches via this starter.
+		studioStarter = campaignstudio.TemporalStarter{Client: tc.Underlying(), TaskQueue: cfg.TemporalTaskQueue}
 
 		// SPEC-W8 A2: booking-service hosts the GeoCampaignWorkflow and its
 		// DB activities on the shared opendesk-main task queue. Recipient
@@ -173,6 +204,14 @@ func run() error {
 			}
 		}
 		// SPEC-W14 Agent B — END
+		// SPEC-W19 integrator — BEGIN (additive): campaign-studio send
+		// workflow + outcome activity on the same in-process worker (the
+		// step endpoint works via the Starter even without this; the
+		// registration is required for queued sends to actually dispatch).
+		if studioStore != nil {
+			campaignstudio.RegisterWorker(w, &campaignstudio.SendActivities{Store: studioStore, Logger: logger})
+		}
+		// SPEC-W19 integrator — END
 		if err := w.Start(); err != nil {
 			logger.Error("geo campaign worker failed to start", zap.Error(err))
 		} else {
@@ -253,6 +292,64 @@ func run() error {
 	}
 	// SPEC-W16 Agent B — END
 
+	// SPEC-W19 integrator — BEGIN (additive): the helpdesk, field-service
+	// and loyalty app stores (campaign-studio is hoisted above for the
+	// Temporal worker registration). Same DialStore idiom as W16 — small
+	// dedicated pools; a dial failure disables only that app's routes
+	// (httpapi leaves the group unregistered on nil Deps), never the rest
+	// of the service. The tenant/user accessors and perms middleware are
+	// attached by httpapi.NewRouter (its context keys are package-private).
+	var helpdeskDeps *helpdesk.Deps
+	if hs, hsErr := helpdesk.DialStore(ctx, cfg.DatabaseURL, cfg.HelpdeskDBMaxConns); hsErr != nil {
+		logger.Error("helpdesk store unavailable; /v1/helpdesk disabled", zap.Error(hsErr))
+	} else {
+		defer hs.Close()
+		helpdeskDeps = &helpdesk.Deps{
+			Store:       hs,
+			Log:         logger,
+			EventsTopic: cfg.HelpdeskEventsTopic,
+			UsageTopic:  cfg.HelpdeskUsageTopic,
+		}
+	}
+	var workordersDeps *workorders.Deps
+	if ws, wsErr := workorders.DialStore(ctx, cfg.DatabaseURL); wsErr != nil {
+		logger.Error("work orders store unavailable; /v1/field-service disabled", zap.Error(wsErr))
+	} else {
+		defer ws.Close()
+		workordersDeps = &workorders.Deps{
+			Store:              ws,
+			Resolver:           resolver,
+			Logger:             logger,
+			NotificationsTopic: cfg.WorkordersNotificationsTopic,
+			UsageTopic:         cfg.WorkordersUsageTopic,
+			FSMEventsTopic:     cfg.WorkordersFSMEventsTopic,
+		}
+	}
+	var loyaltyDeps *loyalty.Deps
+	if ls, lsErr := loyalty.DialStore(ctx, cfg.DatabaseURL); lsErr != nil {
+		logger.Error("loyalty store unavailable; /v1/loyalty disabled", zap.Error(lsErr))
+	} else {
+		defer ls.Close()
+		loyaltyDeps = &loyalty.Deps{
+			Store:       ls,
+			Log:         logger,
+			EventsTopic: cfg.LoyaltyEventsTopic,
+			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W19 Agent C: metering rides USAGE_EVENTS_TOPIC
+		}
+	}
+	var studioDeps *campaignstudio.Deps
+	if studioStore != nil {
+		studioDeps = &campaignstudio.Deps{
+			Store:         studioStore,
+			Log:           logger,
+			Starter:       studioStarter, // nil when Temporal was unreachable at boot → send steps defer
+			UsageTopic:    cfg.UsageEventsTopic,
+			EventsTopic:   cfg.StudioEventsTopic,
+			StepBatchSize: cfg.StudioStepBatch,
+		}
+	}
+	// SPEC-W19 integrator — END
+
 	// Referrals + commissions service (SPEC-W14 Agent A): referral capture
 	// with one-open-per-phone dedupe, the verify flow firing rules →
 	// balanced double-entry postings (Postgres ledger today — the
@@ -332,7 +429,11 @@ func run() error {
 		Payouts:            payoutStore,          // SPEC-W14 Agent B (additive): GET /v1/payouts
 		Devices:            deviceHandlers,       // SPEC-W16 Agent B (additive): /v1/devices + /internal/devices
 		FieldCapture:       fieldCaptureHandlers, // SPEC-W16 Agent B (additive): POST /v1/field/capture
-		AppGate:            appGate,             // SPEC-W18 Agent D (additive): /v1/leads gated behind app "cac" (opt-in)
+		AppGate:            appGate,              // SPEC-W18 Agent D (additive): /v1/leads gated behind app "cac" (opt-in)
+		Helpdesk:           helpdeskDeps,         // SPEC-W19 integrator (additive): /v1/helpdesk gated behind app "helpdesk" (opt-in)
+		Workorders:         workordersDeps,       // SPEC-W19 integrator (additive): /v1/field-service gated behind app "field-service" (opt-in)
+		Loyalty:            loyaltyDeps,          // SPEC-W19 integrator (additive): /v1/loyalty gated behind app "loyalty-wallet" (opt-in)
+		Studio:             studioDeps,           // SPEC-W19 integrator (additive): /v1/studio gated behind app "campaign-studio" (opt-in)
 	}
 
 	srv := &http.Server{
