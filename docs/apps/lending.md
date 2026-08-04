@@ -28,7 +28,7 @@ All five tables are FORCE-RLS `tenant_isolation` (embedded idempotent
   ```
   draft → submitted → under_review → approved → disbursed → repaid
                         │              │            └──────┐
-                        └───────────────┴──→ defaulted ←───┘
+                        └──────────────┴──→ defaulted ←────┘
   ```
 
   `declined`, `repaid`, `defaulted` are terminal. `→disbursed` happens
