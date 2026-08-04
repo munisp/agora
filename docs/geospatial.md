@@ -1,6 +1,6 @@
 # Geospatial: location intelligence, map dashboards and geo-targeted campaigns
 
-Wave 8 (SPEC-W8) adds end-to-end geospatial capability to OpenDesk: contacts
+Wave 8 (SPEC-W8) adds end-to-end geospatial capability to Agora: contacts
 carry locations, demand is aggregated into analytical geo tables in the
 lakehouse, operators explore everything on maps, and any audience you can draw
 on a map can be activated with a paced omnichannel campaign.
