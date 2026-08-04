@@ -17,6 +17,10 @@ package campaignstudio
 //                           fan-out; the payload carries the contact phone
 //                           so the DND guard can check the phone-keyed
 //                           registries)
+//   - kind whatsapp       → paced kind "whatsapp_campaign" (SPEC-W21 Agent A:
+//                           SendWhatsAppCampaignMessage — Meta-approved
+//                           TEMPLATE send via the worker's WhatsApp Cloud
+//                           API provider, WHATSAPP_MOCK=1 default)
 //
 // Both kinds are marketing-class in the notification-worker pacer table,
 // so DND suppression applies ACTIVITY-SIDE automatically and quiet-hours
@@ -68,6 +72,10 @@ const (
 	// PacedSendPushMarketing is the NotifyPaced kind for marketing push
 	// (mirror of notification-worker workflows.PacedSendPushMarketing).
 	PacedSendPushMarketing = "push_marketing"
+	// PacedSendWhatsAppCampaign is the NotifyPaced kind for WhatsApp
+	// business-initiated template sends (SPEC-W21 Agent A; mirror of
+	// notification-worker workflows.PacedSendWhatsAppCampaign).
+	PacedSendWhatsAppCampaign = "whatsapp_campaign"
 
 	// PacedSendStatusSent / PacedSendStatusSuppressedDND mirror the
 	// NotifyPaced result contract (geo re-exports the same strings; kept
@@ -84,9 +92,10 @@ const (
 
 // PacedSendRequest is the NotifyPaced payload for the marketing kinds.
 type PacedSendRequest struct {
-	Kind string                     `json:"kind"` // geo_campaign | push_marketing
-	Geo  *PacedGeoCampaignSend      `json:"geo_campaign,omitempty"`
-	Push *PacedPushNotificationSend `json:"push,omitempty"`
+	Kind     string                     `json:"kind"` // geo_campaign | push_marketing | whatsapp_campaign
+	Geo      *PacedGeoCampaignSend      `json:"geo_campaign,omitempty"`
+	Push     *PacedPushNotificationSend `json:"push,omitempty"`
+	WhatsApp *PacedWhatsAppCampaignSend `json:"whatsapp_campaign,omitempty"`
 }
 
 // PacedGeoCampaignSend carries the SendGeoCampaignMessage arguments
@@ -109,6 +118,20 @@ type PacedPushNotificationSend struct {
 	Title      string            `json:"title"`
 	Body       string            `json:"body"`
 	Data       map[string]string `json:"data,omitempty"`
+}
+
+// PacedWhatsAppCampaignSend mirrors the notification-worker's
+// SendWhatsAppCampaignMessage arguments (SPEC-W21 Agent A; keep the field
+// tags in sync with workflows.PacedWhatsAppCampaignSend — duplicated, not
+// shared).
+type PacedWhatsAppCampaignSend struct {
+	TenantSlug   string   `json:"tenant_slug"`
+	ContactID    string   `json:"contact_id,omitempty"`
+	Phone        string   `json:"phone"`
+	TemplateName string   `json:"template_name"`
+	Language     string   `json:"language,omitempty"`    // empty defaults to "en" worker-side
+	Params       []string `json:"params,omitempty"`      // positional body params, max 10
+	CampaignID   string   `json:"campaign_id,omitempty"` // studio: the JOURNEY id
 }
 
 // PacedSendResult mirrors the NotifyPaced outcome contract.
@@ -177,6 +200,20 @@ func buildPacedRequest(in StudioSendBatchInput, send QueuedSend) (PacedSendReque
 				"enrollment_id": send.EnrollmentID.String(),
 			},
 		}}, nil
+	case KindWhatsApp:
+		// SPEC-W21: WhatsApp business-initiated TEMPLATE send. The
+		// template name was validated at journey save; the language
+		// default ("en") is applied worker-side. campaign_id carries the
+		// journey id for the worker's audit log.
+		return PacedSendRequest{Kind: PacedSendWhatsAppCampaign, WhatsApp: &PacedWhatsAppCampaignSend{
+			TenantSlug:   in.TenantSlug,
+			ContactID:    send.ContactID.String(),
+			Phone:        send.Phone,
+			TemplateName: send.TemplateName,
+			Language:     send.Language,
+			Params:       send.Params,
+			CampaignID:   in.JourneyID,
+		}}, nil
 	}
 	return PacedSendRequest{}, fmt.Errorf("studio send kind %q has no paced route", send.Kind)
 }
@@ -192,6 +229,8 @@ func pacedSendChannel(req PacedSendRequest) string {
 		}
 	case PacedSendPushMarketing:
 		return "push" // fixed channel key (SPEC-W16 §1)
+	case PacedSendWhatsAppCampaign:
+		return "whatsapp" // fixed channel key (SPEC-W21)
 	}
 	return ""
 }
