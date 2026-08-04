@@ -84,6 +84,13 @@ func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
 			in.TenantSlug = req.Push.TenantSlug
 			in.Phone = req.Push.Phone
 		}
+	case workflows.PacedSendWhatsAppCampaign:
+		// SPEC-W21: whatsapp_campaign is marketing-class; the payload is
+		// phone-addressed so the phone-keyed registries always apply.
+		if req.WhatsApp != nil {
+			in.TenantSlug = req.WhatsApp.TenantSlug
+			in.Phone = req.WhatsApp.Phone
+		}
 	}
 	return in
 }
@@ -155,6 +162,12 @@ func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedS
 		// SendPushNotification); workflows needing them call the
 		// SendPushNotification activity directly.
 		_, err := a.SendPushNotification(ctx, *req.Push)
+		return err
+	case workflows.PacedSendWhatsAppCampaign:
+		if req.WhatsApp == nil {
+			return fmt.Errorf("NotifyPaced %s: missing whatsapp_campaign payload", req.Kind)
+		}
+		_, err := a.SendWhatsAppCampaignMessage(ctx, *req.WhatsApp)
 		return err
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
