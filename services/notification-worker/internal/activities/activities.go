@@ -61,6 +61,11 @@ type Activities struct {
 	// apns stub); set by main after New. Nil Providers disables push —
 	// tokens resolve to unroutable per-token failures, never panics.
 	Push PushDeps
+	// WhatsApp holds the WhatsApp campaign provider (SPEC-W21 Agent A);
+	// set by main after New. A nil Provider falls back to the env-derived
+	// provider at send time (WHATSAPP_MOCK=1 default — see
+	// activities/whatsapp.go).
+	WhatsApp WhatsAppDeps
 	// Channels resolves the messaging provider per channel + tenant
 	// (MESSAGING_CHANNELS / TENANT_CHANNEL_MAP); set by main after New.
 	// Nil keeps the built-in defaults (email→smtp, sms→twilio).

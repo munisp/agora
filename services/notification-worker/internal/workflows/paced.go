@@ -65,6 +65,12 @@ const (
 	// (when the payload carries a phone) and quiet-hours deferred on the
 	// "push" channel, exactly like the sms marketing kinds.
 	PacedSendPushMarketing = "push_marketing"
+	// PacedSendWhatsAppCampaign routes to SendWhatsAppCampaignMessage
+	// (SPEC-W21 Agent A): MARKETING-class WhatsApp business-initiated
+	// TEMPLATE sends (campaign-studio whatsapp steps) — DND-suppressed and
+	// quiet-hours deferred on the "whatsapp" channel, exactly like the sms
+	// marketing kinds.
+	PacedSendWhatsAppCampaign = "whatsapp_campaign"
 
 	// ActivitySendGeoCampaignMessage is the name of the geo campaign send
 	// activity.
@@ -73,6 +79,13 @@ const (
 	// ActivitySendPushNotification is the name of the push notification
 	// fan-out activity (SPEC-W16 contract §1).
 	ActivitySendPushNotification = "SendPushNotification"
+
+	// ActivitySendWhatsAppCampaignMessage is the name of the WhatsApp
+	// campaign template-send activity (SPEC-W21 Agent A). NotifyPaced
+	// invokes it in-process, so the paced path needs no separate
+	// registration; the constant exists for deployments that also register
+	// it for direct execution (mirrors ActivitySendGeoCampaignMessage).
+	ActivitySendWhatsAppCampaignMessage = "SendWhatsAppCampaignMessage"
 
 	// ActivitySendIncidentAlert is the name of the incident alert send
 	// activity (SPEC-W11 Part B §5).
@@ -101,6 +114,9 @@ type PacedSendRequest struct {
 	// Push carries the SendPushNotification arguments for the push kinds
 	// (push_notification / push_marketing share one payload shape).
 	Push *PacedPushNotificationSend `json:"push,omitempty"`
+	// WhatsApp carries the SendWhatsAppCampaignMessage arguments for the
+	// whatsapp_campaign kind (SPEC-W21 Agent A).
+	WhatsApp *PacedWhatsAppCampaignSend `json:"whatsapp_campaign,omitempty"`
 }
 
 // PushTarget is one explicit device token in a push payload (SPEC-W16
@@ -188,6 +204,36 @@ type PacedGeoCampaignSend struct {
 	Phone      string `json:"phone"`
 	Name       string `json:"name"`
 	Text       string `json:"text"` // {name} already substituted by the workflow
+}
+
+// PacedWhatsAppCampaignSend carries the SendWhatsAppCampaignMessage
+// arguments (SPEC-W21 Agent A): one WhatsApp business-initiated TEMPLATE
+// message. The JSON contract is duplicated by booking-service's
+// internal/campaignstudio package (service boundary: duplicated, not
+// shared) — keep the field tags in sync.
+type PacedWhatsAppCampaignSend struct {
+	TenantSlug string `json:"tenant_slug"`
+	// ContactID is optional audit context (studio enrollment contact); the
+	// send itself is phone-addressed.
+	ContactID string `json:"contact_id,omitempty"`
+	Phone     string `json:"phone"`
+	// TemplateName is the Meta-APPROVED template name (external
+	// prerequisite — see docs/apps/campaign-studio.md).
+	TemplateName string `json:"template_name"`
+	// Language is the template language code; empty defaults to "en"
+	// (contract default, applied activity-side).
+	Language string `json:"language,omitempty"`
+	// Params are the positional body parameters ({{1}}..{{n}}); max 10
+	// (provider.MaxWhatsAppTemplateParams, enforced activity-side).
+	Params []string `json:"params,omitempty"`
+	// CampaignID is optional audit context (studio: the journey id).
+	CampaignID string `json:"campaign_id,omitempty"`
+}
+
+// WhatsAppCampaignResult is the outcome of one SendWhatsAppCampaignMessage
+// call: the provider message id (wamid) for audit/logs.
+type WhatsAppCampaignResult struct {
+	MessageID string `json:"message_id"`
 }
 
 // PacedWaitlistSend carries the SendWaitlistClaimNotification arguments.
@@ -281,6 +327,11 @@ func PacedSendChannel(req PacedSendRequest) string {
 		// window (SPEC-W16 §1 — push_marketing is quiet-hours deferred
 		// like the sms marketing kinds).
 		return "push"
+	case PacedSendWhatsAppCampaign:
+		// Fixed channel key: QUIET_HOURS_OVERRIDES may carry a "whatsapp"
+		// window (SPEC-W21 — whatsapp_campaign is quiet-hours deferred
+		// like the sms marketing kinds).
+		return "whatsapp"
 	}
 	return ""
 }
