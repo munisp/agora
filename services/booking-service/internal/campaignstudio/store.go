@@ -1,38 +1,21 @@
 package campaignstudio
 
-// Store: studio_segments / studio_journeys / studio_enrollments /
-// studio_step_events, all FORCE-RLS tenant_isolation (the devices/store.go
-// idiom: idempotent ensureSchema, pg_policies-guarded policy, SET LOCAL
-// app.tenant_id inside withTenant). Packaging mirrors internal/helpdesk:
-// NewStore wraps an existing pool (tests), DialStore opens a small
-// dedicated pool (main wiring path). maxConns 4: studio is a low-QPS
-// operator path (segment counts + step batches, not hot traffic).
-
 import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ErrNotFound is returned when a row does not exist (mirrors
-// store.ErrNotFound so httpapi can map both to 404).
-var ErrNotFound = errors.New("not found")
-
-// segmentCountCeiling bounds one segment-count evaluation: a scan cap of
-// 100k rows keeps interactive previews predictable (bounded LIMIT
-// subquery); truncated reports the ceiling was hit.
-const segmentCountCeiling = 100000
-
-// StepBatchSizeDefault is the default enrollment advance limit per step
-// call (STUDIO_STEP_BATCH env overrides via the integrator config).
-const StepBatchSizeDefault = 200
-
-// Store persists the campaign-studio tables.
+// Store persists Campaign Studio rows. Same packaging idiom as the W16
+// devices.Store: NewStore wraps an existing pool (tests), DialStore opens
+// a small dedicated pool (integrator wiring path — the shared store.Store
+// does not expose its pool). maxConns 4: studio is an operator-driven
+// low-QPS surface (the CRON step endpoint is the hot caller and it is
+// batch-bounded).
 type Store struct {
 	pool    *pgxpool.Pool
 	ownPool bool // true when opened via DialStore
@@ -74,24 +57,27 @@ func (s *Store) Close() {
 	}
 }
 
-// ensureSchema bootstraps the campaign-studio tables idempotently: RLS
-// enabled + forced with the tenant_isolation policy, guarded by a
-// pg_policies existence check (the devices/store.go pattern).
+// ensureSchema bootstraps the studio tables idempotently (mirrors the W16
+// devices idiom): RLS enabled + forced with the tenant_isolation policy,
+// guarded by a pg_policies existence check. The outbox guard row creates
+// the shared transactional outbox ONLY when absent (standalone/tests);
+// the base schema (infra/postgres init-scripts) already owns it in real
+// deployments, with the identical shape, so this is a no-op there.
 //
 // NOTE (RLS): bootstrap DDL is a superuser migration path, not a tenant
 // query — it intentionally runs outside withTenant.
 func (s *Store) ensureSchema(ctx context.Context) error {
 	const ddl = `
 CREATE TABLE IF NOT EXISTS studio_segments (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id   UUID NOT NULL,
-    name        TEXT NOT NULL,
-    definition  JSONB NOT NULL DEFAULT '{}',
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id    UUID NOT NULL,
+    name         TEXT NOT NULL,
+    definition   JSONB NOT NULL,
     approx_count BIGINT NOT NULL DEFAULT 0,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_studio_segments_tenant ON studio_segments (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_studio_segments_tenant ON studio_segments (tenant_id, created_at);
 ALTER TABLE studio_segments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE studio_segments FORCE ROW LEVEL SECURITY;
 DO $$
@@ -110,12 +96,12 @@ CREATE TABLE IF NOT EXISTS studio_journeys (
                  CHECK (status IN ('draft','active','paused','archived')),
     trigger_kind TEXT NOT NULL DEFAULT 'manual'
                  CHECK (trigger_kind IN ('segment','manual','event')),
-    segment_id   UUID REFERENCES studio_segments (id),
-    steps        JSONB NOT NULL DEFAULT '[]',
+    segment_id   UUID,
+    steps        JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_studio_journeys_tenant ON studio_journeys (tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_studio_journeys_tenant ON studio_journeys (tenant_id, status, created_at);
 ALTER TABLE studio_journeys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE studio_journeys FORCE ROW LEVEL SECURITY;
 DO $$
@@ -129,9 +115,9 @@ END $$;
 CREATE TABLE IF NOT EXISTS studio_enrollments (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id     UUID NOT NULL,
-    journey_id    UUID NOT NULL REFERENCES studio_journeys (id),
+    journey_id    UUID NOT NULL,
     contact_id    UUID NOT NULL,
-    step_idx      INT NOT NULL DEFAULT 0,
+    step_idx      INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT 'active'
                   CHECK (state IN ('active','completed','exited')),
     enrolled_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -139,7 +125,7 @@ CREATE TABLE IF NOT EXISTS studio_enrollments (
     exited_reason TEXT,
     UNIQUE (tenant_id, journey_id, contact_id)
 );
-CREATE INDEX IF NOT EXISTS idx_studio_enrollments_due ON studio_enrollments (tenant_id, journey_id, state, step_idx);
+CREATE INDEX IF NOT EXISTS idx_studio_enrollments_due ON studio_enrollments (tenant_id, journey_id, state, enrolled_at);
 ALTER TABLE studio_enrollments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE studio_enrollments FORCE ROW LEVEL SECURITY;
 DO $$
@@ -153,14 +139,14 @@ END $$;
 CREATE TABLE IF NOT EXISTS studio_step_events (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id     UUID NOT NULL,
-    journey_id    UUID NOT NULL REFERENCES studio_journeys (id),
-    enrollment_id UUID NOT NULL REFERENCES studio_enrollments (id),
-    step_idx      INT NOT NULL,
+    journey_id    UUID NOT NULL,
+    enrollment_id UUID NOT NULL,
+    step_idx      INTEGER NOT NULL,
     kind          TEXT NOT NULL,
-    payload       JSONB NOT NULL DEFAULT '{}',
+    payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_studio_step_events_journey ON studio_step_events (tenant_id, journey_id, step_idx);
+CREATE INDEX IF NOT EXISTS idx_studio_step_events_journey ON studio_step_events (tenant_id, journey_id, step_idx, kind);
 ALTER TABLE studio_step_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE studio_step_events FORCE ROW LEVEL SECURITY;
 DO $$
@@ -169,17 +155,28 @@ BEGIN
         CREATE POLICY tenant_isolation ON studio_step_events
             USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
     END IF;
-END $$;`
+END $$;
+
+-- Shared transactional outbox (identical shape to the base schema; the
+-- IF NOT EXISTS makes standalone tests self-sufficient and real
+-- deployments a no-op). Not RLS-scoped: the dispatcher drains cross-tenant.
+CREATE TABLE IF NOT EXISTS outbox (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_id UUID NOT NULL,
+    topic        TEXT NOT NULL,
+    payload      JSONB NOT NULL,
+    sent_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox (id) WHERE sent_at IS NULL;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
-		return fmt.Errorf("ensure campaign-studio tables: %w", err)
+		return fmt.Errorf("ensure campaign studio tables: %w", err)
 	}
 	return nil
 }
 
 // withTenant runs fn inside a transaction with `SET LOCAL app.tenant_id`
-// applied (mirrors store.Store.withTenant — same parameter-binding-safe
-// set_config call) so the RLS tenant_isolation policy scopes every
-// statement of fn to the given tenant.
+// applied (mirrors devices.Store.withTenant) so the RLS tenant_isolation
+// policy scopes every statement of fn to the given tenant.
 func (s *Store) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -195,9 +192,12 @@ func (s *Store) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(tx p
 	return tx.Commit(ctx)
 }
 
-// EnqueueOutbox appends one row to the shared transactional outbox
-// (drained to Kafka by the W5 outbox dispatcher via Dapr; mirrors
-// helpdesk.Store.EnqueueOutbox).
+// ErrNotFound is returned when a row does not exist (mirrors
+// devices.ErrNotFound so the API maps it to 404 like the sibling stores).
+var ErrNotFound = errors.New("not found")
+
+// EnqueueOutbox appends one row to the transactional outbox (mirrors
+// referrals.PayoutStore.EnqueueOutbox).
 //
 // NOTE (RLS): the outbox table is not tenant-scoped (no RLS policy — the
 // dispatcher drains it cross-tenant by design).
@@ -223,49 +223,29 @@ func scanSegment(row pgx.Row) (Segment, error) {
 	return seg, err
 }
 
-// CreateSegment inserts one segment after validating its definition.
+// CreateSegment inserts one segment (name/definition validated by the
+// caller) and returns it with id/timestamps stamped.
 func (s *Store) CreateSegment(ctx context.Context, seg *Segment) error {
-	if err := ValidateSegmentDefinition(&seg.Definition); err != nil {
-		return err
-	}
-	seg.Name = strings.TrimSpace(seg.Name)
-	if seg.Name == "" {
-		return fmt.Errorf("%w: name is required", ErrInvalidInput)
-	}
-	if len(seg.Name) > 200 {
-		return fmt.Errorf("%w: name exceeds 200 bytes", ErrInvalidInput)
-	}
+	const q = `INSERT INTO studio_segments (tenant_id, name, definition)
+		           VALUES ($1,$2,$3)
+		           RETURNING ` + segmentCols
 	return s.withTenant(ctx, seg.TenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx,
-			`INSERT INTO studio_segments (tenant_id, name, definition)
-			 VALUES ($1,$2,$3) RETURNING `+segmentCols,
-			seg.TenantID, seg.Name, seg.Definition).
-			Scan(&seg.ID, &seg.TenantID, &seg.Name, &seg.Definition,
-				&seg.ApproxCount, &seg.CreatedAt, &seg.UpdatedAt)
+		row, err := scanSegment(tx.QueryRow(ctx, q, seg.TenantID, seg.Name, seg.Definition))
+		if err != nil {
+			return fmt.Errorf("insert segment: %w", err)
+		}
+		*seg = row
+		return nil
 	})
 }
 
-// GetSegment fetches one segment by id (tenant-scoped).
-func (s *Store) GetSegment(ctx context.Context, tenantID, id uuid.UUID) (Segment, error) {
-	var seg Segment
-	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var err error
-		seg, err = scanSegment(tx.QueryRow(ctx,
-			`SELECT `+segmentCols+` FROM studio_segments WHERE id=$1`, id))
-		return err
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Segment{}, ErrNotFound
-	}
-	return seg, err
-}
-
-// ListSegments lists all segments of a tenant (newest first).
+// ListSegments returns the tenant's segments (newest first).
 func (s *Store) ListSegments(ctx context.Context, tenantID uuid.UUID) ([]Segment, error) {
 	out := []Segment{}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
-			`SELECT `+segmentCols+` FROM studio_segments ORDER BY created_at DESC`)
+			`SELECT `+segmentCols+` FROM studio_segments WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT 500`,
+			tenantID)
 		if err != nil {
 			return err
 		}
@@ -282,60 +262,84 @@ func (s *Store) ListSegments(ctx context.Context, tenantID uuid.UUID) ([]Segment
 	return out, err
 }
 
-// UpdateSegment replaces name/definition of one segment (the count is a
-// derived value — refreshed by CountSegment).
-func (s *Store) UpdateSegment(ctx context.Context, seg *Segment) error {
-	if err := ValidateSegmentDefinition(&seg.Definition); err != nil {
+// GetSegment loads one segment scoped to the tenant (ErrNotFound when
+// missing or cross-tenant).
+func (s *Store) GetSegment(ctx context.Context, tenantID, segmentID uuid.UUID) (Segment, error) {
+	var seg Segment
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		row, err := scanSegment(tx.QueryRow(ctx,
+			`SELECT `+segmentCols+` FROM studio_segments WHERE tenant_id=$1 AND id=$2`,
+			tenantID, segmentID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		seg = row
 		return err
-	}
-	seg.Name = strings.TrimSpace(seg.Name)
-	if seg.Name == "" || len(seg.Name) > 200 {
-		return fmt.Errorf("%w: name must be 1-200 bytes", ErrInvalidInput)
-	}
-	return s.withTenant(ctx, seg.TenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx,
-			`UPDATE studio_segments SET name=$2, definition=$3, updated_at=now() WHERE id=$1`,
-			seg.ID, seg.Name, seg.Definition)
+	})
+	return seg, err
+}
+
+// UpdateSegment applies a name/definition patch (nil leaves the column
+// untouched). ErrNotFound when missing or cross-tenant.
+func (s *Store) UpdateSegment(ctx context.Context, tenantID, segmentID uuid.UUID, name *string, def *SegmentDefinition) (Segment, error) {
+	var seg Segment
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		row, err := scanSegment(tx.QueryRow(ctx,
+			`UPDATE studio_segments
+			    SET name       = COALESCE($3, name),
+			        definition = COALESCE($4, definition),
+			        updated_at = now()
+			  WHERE tenant_id=$1 AND id=$2
+			  RETURNING `+segmentCols,
+			tenantID, segmentID, name, def))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		seg = row
+		return err
+	})
+	return seg, err
+}
+
+// CountSegment evaluates the segment definition against booking.contacts
+// (read-only RLS-safe query; lead_* fields via the EXISTS phone join).
+// The evaluation scans at most segmentCountRowCeiling (100k) contacts:
+// truncated=true reports the ceiling was hit (approx_count stores the
+// bounded value). The fresh count is persisted to approx_count in the
+// same transaction (the only write — a cache stamp, not evaluation state).
+func (s *Store) CountSegment(ctx context.Context, tenantID, segmentID uuid.UUID) (count int64, truncated bool, err error) {
+	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		seg, err := scanSegment(tx.QueryRow(ctx,
+			`SELECT `+segmentCols+` FROM studio_segments WHERE tenant_id=$1 AND id=$2`,
+			tenantID, segmentID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return ErrNotFound
-		}
-		return nil
-	})
-}
-
-// CountSegment evaluates a segment definition against contacts and stores
-// the result in approx_count. The scan is capped at segmentCountCeiling
-// rows (100k) via a bounded subquery; truncated=true reports the ceiling
-// was hit so operators can narrow the definition.
-func (s *Store) CountSegment(ctx context.Context, tenantID, id uuid.UUID) (count int64, truncated bool, err error) {
-	seg, err := s.GetSegment(ctx, tenantID, id)
-	if err != nil {
-		return 0, false, err
-	}
-	sql, args, err := buildCountQuery(&seg.Definition, segmentCountCeiling+1)
-	if err != nil {
-		return 0, false, err
-	}
-	var n int64
-	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		if err := tx.QueryRow(ctx, sql, args...).Scan(&n); err != nil {
+		where, args, err := buildSegmentQuery(&seg.Definition)
+		if err != nil {
 			return err
 		}
-		if n > segmentCountCeiling {
-			n = segmentCountCeiling
+		q := `SELECT count(*) FROM (SELECT c.id FROM contacts c
+		         WHERE c.tenant_id=$1 AND ` + where +
+			fmt.Sprintf(` LIMIT %d) bounded`, segmentCountRowCeiling+1)
+		var n int64
+		if err := tx.QueryRow(ctx, q, append([]any{tenantID}, args...)...).Scan(&n); err != nil {
+			return fmt.Errorf("count segment: %w", err)
+		}
+		if n > segmentCountRowCeiling {
+			n = segmentCountRowCeiling
 			truncated = true
 		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE studio_segments SET approx_count=$2, updated_at=now() WHERE id=$1`,
-			id, n); err != nil {
-			return err
-		}
-		return nil
+		count = n
+		_, err = tx.Exec(ctx,
+			`UPDATE studio_segments SET approx_count=$3, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
+			tenantID, segmentID, n)
+		return err
 	})
-	return n, truncated, err
+	return count, truncated, err
 }
 
 // ---------------------------------------------------------------------------
@@ -351,64 +355,34 @@ func scanJourney(row pgx.Row) (Journey, error) {
 	return j, err
 }
 
-// CreateJourney inserts one journey (status draft).
+// CreateJourney inserts one journey in draft status.
 func (s *Store) CreateJourney(ctx context.Context, j *Journey) error {
-	if err := ValidateSteps(j.Steps); err != nil {
-		return err
-	}
-	j.Name = strings.TrimSpace(j.Name)
-	if j.Name == "" || len(j.Name) > 200 {
-		return fmt.Errorf("%w: name must be 1-200 bytes", ErrInvalidInput)
-	}
-	if !validTriggerKind(j.TriggerKind) {
-		return fmt.Errorf("%w: trigger_kind %q (want segment|manual|event)", ErrInvalidInput, j.TriggerKind)
-	}
-	if j.TriggerKind == TriggerSegment && j.SegmentID == nil {
-		return fmt.Errorf("%w: segment_id is required for trigger_kind segment", ErrInvalidInput)
-	}
-	j.Status = StatusDraft
+	const q = `INSERT INTO studio_journeys (tenant_id, name, trigger_kind, segment_id, steps)
+		           VALUES ($1,$2,$3,$4,$5)
+		           RETURNING ` + journeyCols
 	return s.withTenant(ctx, j.TenantID, func(tx pgx.Tx) error {
-		if j.SegmentID != nil {
-			var exists bool
-			if err := tx.QueryRow(ctx,
-				`SELECT EXISTS(SELECT 1 FROM studio_segments WHERE id=$1)`, *j.SegmentID).Scan(&exists); err != nil {
-				return err
-			}
-			if !exists {
-				return fmt.Errorf("%w: segment %s not found", ErrInvalidInput, *j.SegmentID)
-			}
+		row, err := scanJourney(tx.QueryRow(ctx, q, j.TenantID, j.Name, j.TriggerKind, j.SegmentID, j.Steps))
+		if err != nil {
+			return fmt.Errorf("insert journey: %w", err)
 		}
-		return tx.QueryRow(ctx,
-			`INSERT INTO studio_journeys (tenant_id, name, trigger_kind, segment_id, steps)
-			 VALUES ($1,$2,$3,$4,$5) RETURNING `+journeyCols,
-			j.TenantID, j.Name, j.TriggerKind, j.SegmentID, j.Steps).
-			Scan(&j.ID, &j.TenantID, &j.Name, &j.Status, &j.TriggerKind,
-				&j.SegmentID, &j.Steps, &j.CreatedAt, &j.UpdatedAt)
+		*j = row
+		return nil
 	})
 }
 
-// GetJourney fetches one journey by id (tenant-scoped).
-func (s *Store) GetJourney(ctx context.Context, tenantID, id uuid.UUID) (Journey, error) {
-	var j Journey
-	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var err error
-		j, err = scanJourney(tx.QueryRow(ctx,
-			`SELECT `+journeyCols+` FROM studio_journeys WHERE id=$1`, id))
-		return err
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Journey{}, ErrNotFound
-	}
-	return j, err
-}
-
-// ListJourneys lists journeys, optionally filtered by status.
+// ListJourneys returns the tenant's journeys (newest first), optionally
+// filtered by status ("" disables the filter).
 func (s *Store) ListJourneys(ctx context.Context, tenantID uuid.UUID, status string) ([]Journey, error) {
 	out := []Journey{}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx,
-			`SELECT `+journeyCols+` FROM studio_journeys
-			 WHERE ($1='' OR status=$1) ORDER BY created_at DESC`, status)
+		q := `SELECT ` + journeyCols + ` FROM studio_journeys WHERE tenant_id=$1`
+		args := []any{tenantID}
+		if status != "" {
+			q += ` AND status=$2`
+			args = append(args, status)
+		}
+		q += ` ORDER BY created_at DESC LIMIT 500`
+		rows, err := tx.Query(ctx, q, args...)
 		if err != nil {
 			return err
 		}
@@ -425,82 +399,78 @@ func (s *Store) ListJourneys(ctx context.Context, tenantID uuid.UUID, status str
 	return out, err
 }
 
-// UpdateJourney replaces the mutable fields of one journey (name,
-// trigger_kind, segment_id, steps) — allowed only while draft|paused.
-// Status transitions go through SetJourneyStatus.
-func (s *Store) UpdateJourney(ctx context.Context, j *Journey) error {
-	if err := ValidateSteps(j.Steps); err != nil {
-		return err
-	}
-	j.Name = strings.TrimSpace(j.Name)
-	if j.Name == "" || len(j.Name) > 200 {
-		return fmt.Errorf("%w: name must be 1-200 bytes", ErrInvalidInput)
-	}
-	if !validTriggerKind(j.TriggerKind) {
-		return fmt.Errorf("%w: trigger_kind %q (want segment|manual|event)", ErrInvalidInput, j.TriggerKind)
-	}
-	if j.TriggerKind == TriggerSegment && j.SegmentID == nil {
-		return fmt.Errorf("%w: segment_id is required for trigger_kind segment", ErrInvalidInput)
-	}
-	return s.withTenant(ctx, j.TenantID, func(tx pgx.Tx) error {
-		var status string
-		err := tx.QueryRow(ctx,
-			`SELECT status FROM studio_journeys WHERE id=$1 FOR UPDATE`, j.ID).Scan(&status)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
-			return err
-		}
-		if status != StatusDraft && status != StatusPaused {
-			return fmt.Errorf("%w: structural edits require draft|paused (status is %s)", ErrConflict, status)
-		}
-		if j.SegmentID != nil {
-			var exists bool
-			if err := tx.QueryRow(ctx,
-				`SELECT EXISTS(SELECT 1 FROM studio_segments WHERE id=$1)`, *j.SegmentID).Scan(&exists); err != nil {
-				return err
-			}
-			if !exists {
-				return fmt.Errorf("%w: segment %s not found", ErrInvalidInput, *j.SegmentID)
-			}
-		}
-		_, err = tx.Exec(ctx,
-			`UPDATE studio_journeys SET name=$2, trigger_kind=$3, segment_id=$4, steps=$5, updated_at=now()
-			 WHERE id=$1`,
-			j.ID, j.Name, j.TriggerKind, j.SegmentID, j.Steps)
-		return err
-	})
-}
-
-// SetJourneyStatus applies a status-machine transition (409 on illegal
-// edges; same-status is a no-op success).
-func (s *Store) SetJourneyStatus(ctx context.Context, tenantID, id uuid.UUID, to string) (Journey, error) {
+// GetJourney loads one journey scoped to the tenant.
+func (s *Store) GetJourney(ctx context.Context, tenantID, journeyID uuid.UUID) (Journey, error) {
 	var j Journey
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var from string
-		err := tx.QueryRow(ctx,
-			`SELECT status FROM studio_journeys WHERE id=$1 FOR UPDATE`, id).Scan(&from)
+		row, err := scanJourney(tx.QueryRow(ctx,
+			`SELECT `+journeyCols+` FROM studio_journeys WHERE tenant_id=$1 AND id=$2`,
+			tenantID, journeyID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		j = row
+		return err
+	})
+	return j, err
+}
+
+// UpdateJourney applies a mutable-fields patch (name / trigger_kind /
+// segment_id / steps; nil leaves the column untouched). The caller
+// enforces the edit-state rule (draft|paused only for structural edits).
+func (s *Store) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, name *string, triggerKind *string, segmentID **uuid.UUID, steps *Steps) (Journey, error) {
+	var j Journey
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		row, err := scanJourney(tx.QueryRow(ctx,
+			`UPDATE studio_journeys
+			    SET name         = COALESCE($3, name),
+			        trigger_kind = COALESCE($4, trigger_kind),
+			        segment_id   = COALESCE($5, segment_id),
+			        steps        = COALESCE($6, steps),
+			        updated_at   = now()
+			  WHERE tenant_id=$1 AND id=$2
+			  RETURNING `+journeyCols,
+			tenantID, journeyID, name, triggerKind, segmentID, steps))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		j = row
+		return err
+	})
+	return j, err
+}
+
+// TransitionJourney moves a journey through the status machine
+// (CanTransition). Illegal transitions yield ErrConflict (409 at the API);
+// missing/cross-tenant rows yield ErrNotFound.
+func (s *Store) TransitionJourney(ctx context.Context, tenantID, journeyID uuid.UUID, to string) (Journey, error) {
+	var j Journey
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		cur, err := scanJourney(tx.QueryRow(ctx,
+			`SELECT `+journeyCols+` FROM studio_journeys WHERE tenant_id=$1 AND id=$2 FOR UPDATE`,
+			tenantID, journeyID))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		if err != nil {
 			return err
 		}
-		if from == to {
-			var err error
-			j, err = scanJourney(tx.QueryRow(ctx,
-				`SELECT `+journeyCols+` FROM studio_journeys WHERE id=$1`, id))
+		if cur.Status == to {
+			j = cur
+			return nil // same-state no-op
+		}
+		if !CanTransition(cur.Status, to) {
+			return fmt.Errorf("%w: journey status %s → %s is not allowed", ErrConflict, cur.Status, to)
+		}
+		row, err := scanJourney(tx.QueryRow(ctx,
+			`UPDATE studio_journeys SET status=$3, updated_at=now()
+			  WHERE tenant_id=$1 AND id=$2 RETURNING `+journeyCols,
+			tenantID, journeyID, to))
+		if err != nil {
 			return err
 		}
-		if !CanTransition(from, to) {
-			return fmt.Errorf("%w: journey status %s → %s", ErrConflict, from, to)
-		}
-		return tx.QueryRow(ctx,
-			`UPDATE studio_journeys SET status=$2, updated_at=now() WHERE id=$1 RETURNING `+journeyCols,
-			id, to).
-			Scan(&j.ID, &j.TenantID, &j.Name, &j.Status, &j.TriggerKind,
-				&j.SegmentID, &j.Steps, &j.CreatedAt, &j.UpdatedAt)
+		j = row
+		return nil
 	})
 	return j, err
 }
@@ -509,173 +479,157 @@ func (s *Store) SetJourneyStatus(ctx context.Context, tenantID, id uuid.UUID, to
 // Enrollments
 // ---------------------------------------------------------------------------
 
-// Enroll inserts enrollments for the given contacts, idempotently
-// (UNIQUE(tenant_id, journey_id, contact_id) + ON CONFLICT DO NOTHING).
-// Returns (enrolled, existing) counts. The journey must be active.
-func (s *Store) Enroll(ctx context.Context, tenantID, journeyID uuid.UUID, contactIDs []uuid.UUID) (enrolled, existing int, err error) {
-	if len(contactIDs) == 0 {
-		return 0, 0, fmt.Errorf("%w: at least one contact_id is required", ErrInvalidInput)
-	}
-	if len(contactIDs) > 10000 {
-		return 0, 0, fmt.Errorf("%w: at most 10000 contacts per call", ErrInvalidInput)
-	}
+const enrollmentCols = `id, tenant_id, journey_id, contact_id, step_idx, state, enrolled_at, last_step_at, exited_reason`
+
+func scanEnrollment(row pgx.Row) (Enrollment, error) {
+	var e Enrollment
+	err := row.Scan(&e.ID, &e.TenantID, &e.JourneyID, &e.ContactID, &e.StepIdx,
+		&e.State, &e.EnrolledAt, &e.LastStepAt, &e.ExitedReason)
+	return e, err
+}
+
+// Enroll inserts enrollments idempotently per (journey, contact): the
+// UNIQUE(tenant_id, journey_id, contact_id) anchor + ON CONFLICT DO
+// NOTHING make replays safe. Returns the NEWLY created enrollments
+// (callers meter/event exactly those, so a replayed enroll can never
+// double-meter) plus the count of pre-existing ones.
+func (s *Store) Enroll(ctx context.Context, tenantID, journeyID uuid.UUID, contactIDs []uuid.UUID) (created []Enrollment, existing int, err error) {
+	created = []Enrollment{}
 	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var status string
-		err := tx.QueryRow(ctx,
-			`SELECT status FROM studio_journeys WHERE id=$1 FOR UPDATE`, journeyID).Scan(&status)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
-			return err
-		}
-		if status != StatusActive {
-			return fmt.Errorf("%w: enrollments require an active journey (status is %s)", ErrConflict, status)
-		}
 		for _, cid := range contactIDs {
-			tag, err := tx.Exec(ctx,
+			row, err := scanEnrollment(tx.QueryRow(ctx,
 				`INSERT INTO studio_enrollments (tenant_id, journey_id, contact_id)
-				 VALUES ($1,$2,$3) ON CONFLICT (tenant_id, journey_id, contact_id) DO NOTHING`,
-				tenantID, journeyID, cid)
-			if err != nil {
-				return err
-			}
-			if tag.RowsAffected() == 1 {
-				enrolled++
-			} else {
+				 VALUES ($1,$2,$3)
+				 ON CONFLICT (tenant_id, journey_id, contact_id) DO NOTHING
+				 RETURNING `+enrollmentCols,
+				tenantID, journeyID, cid))
+			if errors.Is(err, pgx.ErrNoRows) {
 				existing++
+				continue
 			}
+			if err != nil {
+				return fmt.Errorf("enroll contact %s: %w", cid, err)
+			}
+			created = append(created, row)
 		}
 		return nil
 	})
-	return enrolled, existing, err
+	return created, existing, err
 }
 
-// JourneyStats is the GET /journeys/{id}/stats payload.
-type JourneyStats struct {
-	Enrolled  int64             `json:"enrolled"`
-	Active    int64             `json:"active"`
-	Completed int64             `json:"completed"`
-	Exited    int64             `json:"exited"`
-	PerStep   []JourneyStepStat `json:"per_step"`
-}
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
 
-// JourneyStepStat aggregates per-step outcomes from studio_step_events +
-// the active residencies from studio_enrollments.
-type JourneyStepStat struct {
+// StepStat is the per-step breakdown of GET /journeys/{id}/stats.
+type StepStat struct {
 	StepIdx    int    `json:"step_idx"`
 	Type       string `json:"type"`
-	Active     int64  `json:"active"`
-	Passed     int64  `json:"passed"`
-	Sent       int64  `json:"sent"`
-	Suppressed int64  `json:"suppressed"`
-	Skipped    int64  `json:"skipped"`
-	Failed     int64  `json:"failed"`
-	Exited     int64  `json:"exited"`
+	Active     int64  `json:"active"`     // enrollments currently waiting at this step
+	Passed     int64  `json:"passed"`     // wait_passed + branch_true + send_queued/skipped events
+	Sent       int64  `json:"sent"`       // send_sent outcomes (paced dispatch confirmed)
+	Suppressed int64  `json:"suppressed"` // send_suppressed (DND guard)
+	Skipped    int64  `json:"skipped"`    // send_skipped (ussd / missing address)
+	Failed     int64  `json:"failed"`     // send_failed
+	Exited     int64  `json:"exited"`     // branch_false / exited events at this step
 }
 
-// Stats aggregates the journey funnel: enrollment states + per-step event
-// counts (send_sent / send_suppressed / send_skipped / send_failed /
-// wait_passed / branch_* / exited).
-func (s *Store) Stats(ctx context.Context, tenantID, journeyID uuid.UUID) (JourneyStats, error) {
-	var out JourneyStats
-	out.PerStep = []JourneyStepStat{}
+// JourneyStats is the response shape of GET /journeys/{id}/stats.
+type JourneyStats struct {
+	Enrolled  int64      `json:"enrolled"`
+	Active    int64      `json:"active"`
+	Completed int64      `json:"completed"`
+	Exited    int64      `json:"exited"`
+	PerStep   []StepStat `json:"per_step"`
+}
+
+// Stats aggregates enrollment totals + per-step counts for one journey.
+func (s *Store) Stats(ctx context.Context, tenantID uuid.UUID, j Journey) (JourneyStats, error) {
+	stats := JourneyStats{PerStep: []StepStat{}}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		j, err := scanJourney(tx.QueryRow(ctx,
-			`SELECT `+journeyCols+` FROM studio_journeys WHERE id=$1`, journeyID))
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
+		if err := tx.QueryRow(ctx,
+			`SELECT count(*),
+			        count(*) FILTER (WHERE state='active'),
+			        count(*) FILTER (WHERE state='completed'),
+			        count(*) FILTER (WHERE state='exited')
+			   FROM studio_enrollments WHERE tenant_id=$1 AND journey_id=$2`,
+			tenantID, j.ID).Scan(&stats.Enrolled, &stats.Active, &stats.Completed, &stats.Exited); err != nil {
 			return err
+		}
+
+		perStep := map[int]*StepStat{}
+		for i, st := range j.Steps {
+			perStep[i] = &StepStat{StepIdx: i, Type: st.Type}
 		}
 		rows, err := tx.Query(ctx,
-			`SELECT state, COUNT(*) FROM studio_enrollments WHERE journey_id=$1 GROUP BY state`,
-			journeyID)
+			`SELECT step_idx, count(*) FROM studio_enrollments
+			  WHERE tenant_id=$1 AND journey_id=$2 AND state='active'
+			  GROUP BY step_idx`,
+			tenantID, j.ID)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
-			var state string
+			var idx int
 			var n int64
-			if err := rows.Scan(&state, &n); err != nil {
+			if err := rows.Scan(&idx, &n); err != nil {
+				rows.Close()
 				return err
 			}
-			out.Enrolled += n
-			switch state {
-			case EnrollActive:
-				out.Active = n
-			case EnrollCompleted:
-				out.Completed = n
-			case EnrollExited:
-				out.Exited = n
+			if ss, ok := perStep[idx]; ok {
+				ss.Active = n
 			}
 		}
+		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
 
-		// Per-step: event counts joined with active residencies, in step order.
-		eventRows, err := tx.Query(ctx,
-			`SELECT step_idx,
-			        COUNT(*) FILTER (WHERE kind IN ('wait_passed','branch_true','branch_false')) AS passed,
-			        COUNT(*) FILTER (WHERE kind = 'send_sent') AS sent,
-			        COUNT(*) FILTER (WHERE kind = 'send_suppressed') AS suppressed,
-			        COUNT(*) FILTER (WHERE kind = 'send_skipped') AS skipped,
-			        COUNT(*) FILTER (WHERE kind = 'send_failed') AS failed,
-			        COUNT(*) FILTER (WHERE kind = 'exited') AS exited
-			   FROM studio_step_events WHERE journey_id=$1 GROUP BY step_idx`,
-			journeyID)
+		evRows, err := tx.Query(ctx,
+			`SELECT step_idx, kind, count(*) FROM studio_step_events
+			  WHERE tenant_id=$1 AND journey_id=$2
+			  GROUP BY step_idx, kind`,
+			tenantID, j.ID)
 		if err != nil {
 			return err
 		}
-		defer eventRows.Close()
-		byStep := map[int]*JourneyStepStat{}
-		for eventRows.Next() {
-			st := JourneyStepStat{}
-			if err := eventRows.Scan(&st.StepIdx, &st.Passed, &st.Sent, &st.Suppressed,
-				&st.Skipped, &st.Failed, &st.Exited); err != nil {
-				return err
-			}
-			byStep[st.StepIdx] = &st
-		}
-		if err := eventRows.Err(); err != nil {
-			return err
-		}
-		resRows, err := tx.Query(ctx,
-			`SELECT step_idx, COUNT(*) FROM studio_enrollments
-			   WHERE journey_id=$1 AND state='active' GROUP BY step_idx`,
-			journeyID)
-		if err != nil {
-			return err
-		}
-		defer resRows.Close()
-		for resRows.Next() {
+		for evRows.Next() {
 			var idx int
+			var kind string
 			var n int64
-			if err := resRows.Scan(&idx, &n); err != nil {
+			if err := evRows.Scan(&idx, &kind, &n); err != nil {
+				evRows.Close()
 				return err
 			}
-			st := byStep[idx]
-			if st == nil {
-				st = &JourneyStepStat{StepIdx: idx}
-				byStep[idx] = st
+			ss, ok := perStep[idx]
+			if !ok {
+				continue
 			}
-			st.Active = n
+			switch kind {
+			case EventWaitPassed, EventBranchTrue, EventSendQueued:
+				ss.Passed += n
+			case EventSendSent:
+				ss.Sent += n
+			case EventSendSuppressed:
+				ss.Suppressed += n
+			case EventSendSkipped:
+				ss.Skipped += n
+				ss.Passed += n
+			case EventSendFailed:
+				ss.Failed += n
+			case EventBranchFalse, EventExited:
+				ss.Exited += n
+			}
 		}
-		if err := resRows.Err(); err != nil {
+		evRows.Close()
+		if err := evRows.Err(); err != nil {
 			return err
 		}
-		for i, step := range j.Steps {
-			st := byStep[i]
-			if st == nil {
-				st = &JourneyStepStat{StepIdx: i}
-			}
-			st.Type = step.Type
-			out.PerStep = append(out.PerStep, *st)
+
+		for i := range j.Steps {
+			stats.PerStep = append(stats.PerStep, *perStep[i])
 		}
 		return nil
 	})
-	return out, err
+	return stats, err
 }
