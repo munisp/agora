@@ -239,6 +239,28 @@ func (h *Handler) erasure(w http.ResponseWriter, r *http.Request) {
 		h.tenantError(w, err)
 		return
 	}
+	// Erasure eligibility (SPEC-W17 §8.8 / Agent D — additive): a data subject
+	// whose id is seed-tagged (is_synthetic record) is immediate-eligible and
+	// skips any waiting period. No waiting period exists today (erasure is
+	// tombstone-only immediate for everyone), so this is behaviour-preserving
+	// for real subjects; EvaluateErasureEligibility is the seam the NDPA
+	// waiting period plugs into.
+	eligibility := EvaluateErasureEligibility(req.Subject)
+	if !eligibility.Immediate {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"status":          "erasure_pending",
+			"data_subject_id": req.Subject,
+			"synthetic":       false,
+			"eligibility":     eligibility.Reason,
+			"retry_after":     eligibility.WaitingPeriod.String(),
+		})
+		return
+	}
+	if eligibility.Synthetic {
+		h.Logger.Info("erasure fast-path: synthetic seed data subject",
+			zap.String("subject", req.Subject), zap.String("tenant_id", tenantID.String()))
+	}
+
 	n, err := h.Repo.Erase(r.Context(), tenantID, req.Subject, req.Purpose)
 	if err != nil {
 		h.internal(w, err)
@@ -258,6 +280,7 @@ func (h *Handler) erasure(w http.ResponseWriter, r *http.Request) {
 		"purpose":         req.Purpose,
 		"erased_records":  n,
 		"erasure_ts":      time.Now().UTC(),
+		"synthetic":       eligibility.Synthetic, // SPEC-W17 §8.8: downstream anonymizers may fast-path too
 	})
 	if err := h.Events.PublishEvent(r.Context(), h.PubSub, h.ErasureTopic, evt); err != nil {
 		h.Logger.Error("failed to publish ErasureRequested",
@@ -268,6 +291,8 @@ func (h *Handler) erasure(w http.ResponseWriter, r *http.Request) {
 		"status":          "erasure_recorded",
 		"data_subject_id": req.Subject,
 		"erased_records":  n,
+		"eligibility":     "immediate",
+		"synthetic":       eligibility.Synthetic,
 	})
 }
 
