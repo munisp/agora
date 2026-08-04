@@ -18,6 +18,7 @@ import (
 	"github.com/opendesk/booking-service/internal/campaignstudio" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/config"
 	"github.com/opendesk/booking-service/internal/consumer"
+	"github.com/opendesk/booking-service/internal/crm360" // SPEC-W20 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/devices"
 	"github.com/opendesk/booking-service/internal/fieldcapture"
@@ -26,12 +27,15 @@ import (
 	"github.com/opendesk/booking-service/internal/httpapi"
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/leads"
+	"github.com/opendesk/booking-service/internal/lending" // SPEC-W20 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/loyalty" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/referrals" // SPEC-W14 Agent B (additive import)
 	"github.com/opendesk/booking-service/internal/store"
+	"github.com/opendesk/booking-service/internal/surveys" // SPEC-W20 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/temporalclient"
+	"github.com/opendesk/booking-service/internal/workforce"  // SPEC-W20 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/workorders" // SPEC-W19 integrator (additive import)
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/worker"
@@ -350,6 +354,72 @@ func run() error {
 	}
 	// SPEC-W19 integrator — END
 
+	// SPEC-W20 integrator — BEGIN (additive): the crm-360, surveys, lending
+	// and workforce app stores. Same DialStore idiom as W19 — small
+	// dedicated pools; a dial failure disables only that app's routes
+	// (httpapi leaves the group unregistered on nil Deps), never the rest
+	// of the service. The tenant/user accessors and perms middleware are
+	// attached by httpapi.NewRouter (its context keys are package-private).
+	var crm360Deps *crm360.Deps
+	if cs, csErr := crm360.DialStore(ctx, cfg.DatabaseURL); csErr != nil {
+		logger.Error("crm360 store unavailable; /v1/crm disabled", zap.Error(csErr))
+	} else {
+		defer cs.Close()
+		crm360Deps = &crm360.Deps{
+			Store:           cs,
+			Resolver:        resolver,
+			Logger:          logger,
+			CRMEventsTopic:  cfg.CRM360EventsTopic,
+			ConsentResolver: nil, // consent lives in identity's DB — no clean seam yet; profiles degrade to consent=null by design
+		}
+	}
+	var surveysDeps *surveys.Deps
+	surveysURL := cfg.SurveysDatabaseURL
+	if surveysURL == "" {
+		surveysURL = cfg.DatabaseURL
+	}
+	if ss, ssErr := surveys.DialStore(ctx, surveysURL); ssErr != nil {
+		logger.Error("surveys store unavailable; /v1/surveys disabled", zap.Error(ssErr))
+	} else {
+		defer ss.Close()
+		surveysDeps = &surveys.Deps{
+			Store:              ss,
+			Resolver:           resolver,
+			Logger:             logger,
+			NotificationsTopic: cfg.SurveysNotificationsTopic,
+			UsageTopic:         cfg.UsageEventsTopic, // SPEC-W20 Agent B: metering rides USAGE_EVENTS_TOPIC
+			EventsTopic:        cfg.SurveysEventsTopic,
+			PublicBaseURL:      cfg.SurveysPublicBaseURL,
+		}
+	}
+	var lendingDeps *lending.Deps
+	if ls, lsErr := lending.DialStore(ctx, cfg.DatabaseURL); lsErr != nil {
+		logger.Error("lending store unavailable; /v1/lending disabled", zap.Error(lsErr))
+	} else {
+		defer ls.Close()
+		lendingDeps = &lending.Deps{
+			Store:       ls,
+			Resolver:    resolver,
+			Logger:      logger,
+			EventsTopic: cfg.LendingEventsTopic,
+			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W20 Agent C: metering rides USAGE_EVENTS_TOPIC
+			KYCURL:      cfg.LendingKYCURL,    // empty = override-only approval mode (documented in docs/apps/lending.md)
+		}
+	}
+	var workforceDeps *workforce.Deps
+	if ws, wsErr := workforce.DialStore(ctx, cfg.DatabaseURL); wsErr != nil {
+		logger.Error("workforce store unavailable; /v1/workforce disabled", zap.Error(wsErr))
+	} else {
+		defer ws.Close()
+		workforceDeps = &workforce.Deps{
+			Store:       ws,
+			Resolver:    resolver,
+			Logger:      logger,
+			EventsTopic: cfg.WorkforceEventsTopic,
+		}
+	}
+	// SPEC-W20 integrator — END
+
 	// Referrals + commissions service (SPEC-W14 Agent A): referral capture
 	// with one-open-per-phone dedupe, the verify flow firing rules →
 	// balanced double-entry postings (Postgres ledger today — the
@@ -434,6 +504,10 @@ func run() error {
 		Workorders:         workordersDeps,       // SPEC-W19 integrator (additive): /v1/field-service gated behind app "field-service" (opt-in)
 		Loyalty:            loyaltyDeps,          // SPEC-W19 integrator (additive): /v1/loyalty gated behind app "loyalty-wallet" (opt-in)
 		Studio:             studioDeps,           // SPEC-W19 integrator (additive): /v1/studio gated behind app "campaign-studio" (opt-in)
+		CRM360:             crm360Deps,           // SPEC-W20 integrator (additive): /v1/crm gated behind app "crm-360" (opt-in)
+		Surveys:            surveysDeps,          // SPEC-W20 integrator (additive): /v1/surveys gated behind app "surveys-voc" (opt-in; respond stays public)
+		Lending:            lendingDeps,          // SPEC-W20 integrator (additive): /v1/lending gated behind app "lending" (opt-in)
+		Workforce:          workforceDeps,        // SPEC-W20 integrator (additive): /v1/workforce gated behind app "workforce" (opt-in)
 	}
 
 	srv := &http.Server{

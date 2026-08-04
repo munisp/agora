@@ -80,6 +80,23 @@ type Config struct {
 	StudioDatabaseURL string // STUDIO_DATABASE_URL (default "" → falls back to DATABASE_URL)
 	StudioStepBatch   int    // STUDIO_STEP_BATCH: enrollments advanced per step call (default 200)
 	StudioEventsTopic string // STUDIO_EVENTS_TOPIC (default opendesk.studio.events.v1; empty disables events)
+	// CRM-360 app (SPEC-W20 Agent A; integrator-wired). No metering
+	// (internal-ops app, contract §4).
+	CRM360EventsTopic string // CRM360_EVENTS_TOPIC (default opendesk.crm.events.v1; empty disables events)
+	// Surveys/VoC app (SPEC-W20 Agent B; integrator-wired). Metering
+	// (survey_response_received) rides the existing UsageEventsTopic
+	// (USAGE_EVENTS_TOPIC) — same posture as loyalty (SPEC-W19 Agent C).
+	SurveysEventsTopic        string // SURVEYS_EVENTS_TOPIC (default opendesk.surveys.events.v1; empty disables events)
+	SurveysNotificationsTopic string // SURVEYS_NOTIFICATIONS_TOPIC (default opendesk.notifications.outbox; empty disables invite sends)
+	SurveysPublicBaseURL      string // SURVEYS_PUBLIC_BASE_URL (default https://app.opendesk.ng/s — invite link base)
+	SurveysDatabaseURL        string // SURVEYS_DATABASE_URL (default "" → falls back to DATABASE_URL)
+	// Lending app (SPEC-W20 Agent C; integrator-wired). Metering
+	// (loan_disbursed) rides UsageEventsTopic.
+	LendingEventsTopic string // LENDING_EVENTS_TOPIC (default opendesk.lending.events.v1; empty disables events)
+	LendingKYCURL      string // LENDING_KYC_URL (default "" → kyc-service not wired; approvals require explicit kyc_override)
+	// Workforce app (SPEC-W20 Agent D; integrator-wired). No metering
+	// (internal-ops app, contract §4).
+	WorkforceEventsTopic string // WORKFORCE_EVENTS_TOPIC (default opendesk.workforce.events.v1; empty disables events)
 }
 
 // Load reads configuration from the environment.
@@ -147,6 +164,19 @@ func Load() (Config, error) {
 		StudioDatabaseURL:            os.Getenv("STUDIO_DATABASE_URL"),
 		StudioStepBatch:              envInt("STUDIO_STEP_BATCH", 200),
 		StudioEventsTopic:            envStr("STUDIO_EVENTS_TOPIC", "opendesk.studio.events.v1"),
+		// SPEC-W20 integrator (additive): the four batch-2 enterprise apps
+		// are functional with zero config — every default matches the
+		// package doc contracts; empty string disables the corresponding
+		// emission (or, for LENDING_KYC_URL, switches approvals to
+		// override-only mode).
+		CRM360EventsTopic:         envStr("CRM360_EVENTS_TOPIC", "opendesk.crm.events.v1"),
+		SurveysEventsTopic:        envStr("SURVEYS_EVENTS_TOPIC", "opendesk.surveys.events.v1"),
+		SurveysNotificationsTopic: envStr("SURVEYS_NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		SurveysPublicBaseURL:      envStr("SURVEYS_PUBLIC_BASE_URL", "https://app.opendesk.ng/s"),
+		SurveysDatabaseURL:        os.Getenv("SURVEYS_DATABASE_URL"),
+		LendingEventsTopic:        envStr("LENDING_EVENTS_TOPIC", "opendesk.lending.events.v1"),
+		LendingKYCURL:             os.Getenv("LENDING_KYC_URL"),
+		WorkforceEventsTopic:      envStr("WORKFORCE_EVENTS_TOPIC", "opendesk.workforce.events.v1"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
