@@ -127,6 +127,10 @@ func run() error {
 	w.RegisterWorkflowWithOptions(workflows.TenantOnboardingWorkflow, workflow.RegisterOptions{Name: "TenantOnboardingWorkflow"})
 	// SPEC-W3 §3 innovation 7: waitlist backfill on BookingCancelled.
 	w.RegisterWorkflowWithOptions(workflows.WaitlistBackfillWorkflow, workflow.RegisterOptions{Name: "WaitlistBackfillWorkflow"})
+	// SPEC-W19 integrator (additive): fire-and-forget paced sends from the
+	// notifications outbox (notifyoutbox consumer starts one per PacedSend
+	// command — e.g. field-service dispatch push).
+	w.RegisterWorkflowWithOptions(workflows.PacedSendWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypePacedSend})
 	// SPEC-W3 §3 innovation 12: digital-twin 24h cleanup.
 	w.RegisterWorkflowWithOptions(workflows.TwinCleanupWorkflow, workflow.RegisterOptions{Name: "TwinCleanupWorkflow"})
 
@@ -329,13 +333,18 @@ func run() error {
 	// Notifications outbox consumer (Wave 5 #7): delivers SendPortalCode and
 	// future fire-and-forget notification commands via the smtp/twilio
 	// bindings (booking-service publishes; this worker owns the bindings).
+	// SPEC-W19 integrator (additive): PacedSend commands (e.g. field-service
+	// dispatch push) start one PacedSendWorkflow each on this task queue —
+	// the send rides the NotifyPaced activity (CPS pacer + sender rotation
+	// + SPEC-W12 guards), never a raw binding call.
 	outboxConsumer := notifyoutbox.New(
 		strings.Split(cfg.KafkaBrokers, ","),
 		cfg.NotificationsOutboxTopic, cfg.NotificationsOutboxGroup,
 		notifyoutbox.BindingSender{
 			Dapr: daprClient, SMTPBinding: cfg.SMTPBinding, TwilioBinding: cfg.TwilioBinding,
 			SMTPFrom: cfg.SMTPFrom, TwilioFrom: cfg.TwilioFrom,
-		}, logger)
+		}, logger,
+		notifyoutbox.WithStarter(tc, cfg.TemporalTaskQueue))
 	defer outboxConsumer.Close() //nolint:errcheck
 	go func() {
 		if err := outboxConsumer.Run(ctx); err != nil {
