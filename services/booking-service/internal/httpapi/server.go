@@ -16,6 +16,7 @@ import (
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/campaignstudio"
+	"github.com/opendesk/booking-service/internal/crm360"
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/devices"
 	"github.com/opendesk/booking-service/internal/fieldcapture"
@@ -23,10 +24,13 @@ import (
 	"github.com/opendesk/booking-service/internal/helpdesk"
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/leads"
+	"github.com/opendesk/booking-service/internal/lending"
 	"github.com/opendesk/booking-service/internal/loyalty"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/referrals"
 	"github.com/opendesk/booking-service/internal/store"
+	"github.com/opendesk/booking-service/internal/surveys"
+	"github.com/opendesk/booking-service/internal/workforce"
 	"github.com/opendesk/booking-service/internal/workorders"
 	"go.uber.org/zap"
 )
@@ -113,6 +117,22 @@ type Deps struct {
 	Loyalty *loyalty.Deps
 	// Studio serves /v1/studio (appgate app_id "campaign-studio").
 	Studio *campaignstudio.Deps
+
+	// SPEC-W20 integrator (additive): the four batch-2 enterprise app
+	// packages. Same wiring posture as W19 — each Deps bundle is built in
+	// cmd/server/main.go (store + topics); the tenant/user accessors and
+	// permission middleware are attached here in NewRouter. Nil → the
+	// app's routes are not registered (partial deployments stay intact).
+	// CRM360 serves /v1/crm (appgate app_id "crm-360").
+	CRM360 *crm360.Deps
+	// Surveys serves /v1/surveys (appgate app_id "surveys-voc"). The
+	// package itself registers POST /v1/surveys/respond OUTSIDE the gated
+	// group (public token-resolved submit path — see surveys/handlers.go).
+	Surveys *surveys.Deps
+	// Lending serves /v1/lending (appgate app_id "lending").
+	Lending *lending.Deps
+	// Workforce serves /v1/workforce (appgate app_id "workforce").
+	Workforce *workforce.Deps
 }
 
 type ctxKey string
@@ -333,6 +353,44 @@ func NewRouter(d Deps) http.Handler {
 		campaignstudio.RegisterRoutes(r, s.d.Studio, mw...)
 	}
 	// SPEC-W19 integrator — END
+
+	// SPEC-W20 integrator — BEGIN (additive): the four batch-2 enterprise
+	// app route groups. Identical posture to W19: each package resolves
+	// the tenant itself first (its own tenant middleware wraps the
+	// integrator chain), then httpapi's tenantMiddleware runs ahead of the
+	// appgate/perms middleware so the slug extractor and require() see
+	// ctxTenant/ctxUser. Perms are method-aware via requireReadWrite
+	// (GET/HEAD → view_analytics, writes → manage_bookings, SPEC-W20
+	// contract §3); the appgate gate is a pass-through unless
+	// APP_GATE_ENABLED=true. Nil Deps → not registered.
+	if s.d.CRM360 != nil {
+		s.d.CRM360.UserFromContext = userFrom
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("crm-360", s.requireReadWrite())...)
+		crm360.RegisterRoutes(r, s.d.CRM360, mw...)
+	}
+	if s.d.Surveys != nil {
+		// POST /v1/surveys/respond is registered by the PACKAGE OUTSIDE
+		// this gated group — public submit path, no tenant header, no JWT,
+		// no appgate (the loud comment in surveys/handlers.go; the invite
+		// token resolves the tenant via the invite_token_access RLS
+		// policy). Only the tenant-scoped group gets the chain below.
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("surveys-voc", s.requireReadWrite())...)
+		surveys.RegisterRoutes(r, s.d.Surveys, mw...)
+	}
+	if s.d.Lending != nil {
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("lending", s.requireReadWrite())...)
+		lending.RegisterRoutes(r, s.d.Lending, mw...)
+	}
+	if s.d.Workforce != nil {
+		s.d.Workforce.UserFromContext = userFrom
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("workforce", s.requireReadWrite())...)
+		workforce.RegisterRoutes(r, s.d.Workforce, mw...)
+	}
+	// SPEC-W20 integrator — END
 
 	// Public promo redemption (SPEC-W13 §6): rate-limited, idempotent per
 	// code+phone. No tenant middleware — the unguessable code resolves the
