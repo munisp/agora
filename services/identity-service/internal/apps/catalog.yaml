@@ -207,3 +207,14 @@ apps:
     required_perms: [manage_catalog]
     default_plan_tier: pro
     backend_note: backend module lands W19; team/availability CRUD primitives exist in services/booking-service (manage_catalog).
+
+  - app_id: social-publisher
+    name: Social Publisher
+    version: 0.1.0
+    description: Publish posts and run gated paid ads (incl. political-ads authorization gates) on Meta, TikTok and X.
+    category: Marketing
+    icon: "\U0001F4E3"
+    nav_route: /apps/social-publisher
+    required_perms: [manage_bookings, view_analytics]
+    default_plan_tier: pro
+    backend_note: backend module lands W21 in services/booking-service (internal/socialpub); provider mocks are the default, real API wiring is a documented follow-up (docs/apps/social-publisher.md).

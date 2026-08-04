@@ -32,6 +32,8 @@ import (
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/referrals" // SPEC-W14 Agent B (additive import)
+	"github.com/opendesk/booking-service/internal/socialpub"
+	"github.com/opendesk/booking-service/internal/socialpub/provider" // SPEC-W21 integrator (additive imports)
 	"github.com/opendesk/booking-service/internal/store"
 	"github.com/opendesk/booking-service/internal/surveys" // SPEC-W20 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/temporalclient"
@@ -420,6 +422,39 @@ func run() error {
 	}
 	// SPEC-W20 integrator — END
 
+	// SPEC-W21 integrator — BEGIN (additive): the social-publisher store.
+	// Same DialStore idiom as W19/W20 — a small dedicated pool; a dial
+	// failure disables only this app's routes (httpapi leaves the group
+	// unregistered on nil Deps), never the rest of the service. Providers
+	// resolve through the mock switches: the deterministic mock is the
+	// zero-config default (both switches truthy); *_MOCK=0 selects the
+	// honest real-API stub ("not configured" until the credential
+	// follow-up lands — docs/apps/social-publisher.md).
+	var socialDeps *socialpub.Deps
+	if sp, spErr := socialpub.DialStore(ctx, cfg.DatabaseURL); spErr != nil {
+		logger.Error("socialpub store unavailable; /v1/social disabled", zap.Error(spErr))
+	} else {
+		defer sp.Close()
+		publishers := map[string]provider.Publisher{}
+		for id, mockEnv := range map[string]string{
+			"meta":   cfg.MetaMock,
+			"tiktok": cfg.TikTokMock,
+			"x":      cfg.XMock,
+		} {
+			if pub, ok := provider.New(id, provider.MockEnabled(cfg.SocialMock, mockEnv)); ok {
+				publishers[id] = pub
+			}
+		}
+		socialDeps = &socialpub.Deps{
+			Store:       sp,
+			Log:         logger,
+			EventsTopic: cfg.SocialEventsTopic,
+			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W21 Agent B: social_ad_launched metering rides USAGE_EVENTS_TOPIC
+			Publishers:  publishers,
+		}
+	}
+	// SPEC-W21 integrator — END
+
 	// Referrals + commissions service (SPEC-W14 Agent A): referral capture
 	// with one-open-per-phone dedupe, the verify flow firing rules →
 	// balanced double-entry postings (Postgres ledger today — the
@@ -508,6 +543,7 @@ func run() error {
 		Surveys:            surveysDeps,          // SPEC-W20 integrator (additive): /v1/surveys gated behind app "surveys-voc" (opt-in; respond stays public)
 		Lending:            lendingDeps,          // SPEC-W20 integrator (additive): /v1/lending gated behind app "lending" (opt-in)
 		Workforce:          workforceDeps,        // SPEC-W20 integrator (additive): /v1/workforce gated behind app "workforce" (opt-in)
+		Social:             socialDeps,           // SPEC-W21 integrator (additive): /v1/social gated behind app "social-publisher" (opt-in)
 	}
 
 	srv := &http.Server{
