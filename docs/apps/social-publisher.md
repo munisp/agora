@@ -47,7 +47,7 @@ are **kobo int64** (₦1 = 100 kobo).
 
   ```
   draft → review → active ⇄ paused
-     │        └──────┴──→ rejected (terminal)
+     │        └─────┴──→ rejected (terminal)
      └───────→ rejected
   ```
 
@@ -171,7 +171,7 @@ fail fast and honestly. The external prerequisites:
    the approved disclaimer; Meta's review rejects ads without it (and may
    restrict the account on repeat violations).
 5. Only AFTER steps 1–4 show green in Meta's UI does an operator tick
-   `political_ads_authorized` on the OpenDesk account record and copy the
+   `political_ads_authorized` on the Agora account record and copy the
    approved "Paid for by …" string into the ad/creative disclaimer.
 
 TikTok and X have their own political-ad policies (TikTok broadly
