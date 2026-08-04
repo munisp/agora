@@ -218,7 +218,7 @@ const (
 	StepBranch = "branch"
 )
 
-// Send step kinds. sms and push_marketing dispatch through the
+// Send step kinds. sms, push_marketing and whatsapp dispatch through the
 // notification-worker paced contract (marketing class — DND-suppressed
 // activity-side, quiet-hours deferred workflow-side). ussd is accepted in
 // journey definitions (the channel exists for inbound) but there is NO
@@ -228,6 +228,11 @@ const (
 	KindSMS           = "sms"
 	KindPushMarketing = "push_marketing"
 	KindUSSD          = "ussd"
+	// KindWhatsApp (SPEC-W21 Agent A) sends a Meta-approved WhatsApp
+	// TEMPLATE message via the paced whatsapp_campaign kind. It REQUIRES
+	// template_name; the free-text template field is repurposed as an
+	// optional params hint for the journey author (it is not sent).
+	KindWhatsApp = "whatsapp"
 )
 
 // maxJourneySteps bounds one journey definition.
@@ -236,14 +241,30 @@ const maxJourneySteps = 50
 // maxTemplateLen bounds one send template.
 const maxTemplateLen = 4096
 
+// maxTemplateNameLen bounds a WhatsApp template name (SPEC-W21).
+const maxTemplateNameLen = 512
+
+// maxWhatsAppParams bounds the positional template params of a whatsapp
+// step (SPEC-W21 contract: max 10).
+const maxWhatsAppParams = 10
+
 // JourneyStep is one entry of journeys.steps jsonb.
 type JourneyStep struct {
 	Type      string             `json:"type"`                 // wait | send | branch
-	Kind      string             `json:"kind,omitempty"`       // sms | push_marketing | ussd (send only)
-	Template  string             `json:"template,omitempty"`   // send only; {name} token supported
+	Kind      string             `json:"kind,omitempty"`       // sms | push_marketing | ussd | whatsapp (send only)
+	Template  string             `json:"template,omitempty"`   // send only; {name} token supported (whatsapp: optional params hint, not sent)
 	WaitHours int                `json:"wait_hours,omitempty"` // wait only; >= 0
 	Condition *SegmentDefinition `json:"condition,omitempty"`  // branch only
 	AbVariant string             `json:"ab_variant,omitempty"` // optional A|B tag
+	// TemplateName is the Meta-approved WhatsApp template name (kind
+	// whatsapp only, REQUIRED there — SPEC-W21).
+	TemplateName string `json:"template_name,omitempty"`
+	// Language is the WhatsApp template language code (kind whatsapp
+	// only; empty defaults to "en" at send time).
+	Language string `json:"language,omitempty"`
+	// Params are the positional WhatsApp template body parameters (kind
+	// whatsapp only; max 10).
+	Params []string `json:"params,omitempty"`
 }
 
 // Steps is the journeys.steps jsonb shape.
@@ -290,17 +311,35 @@ func ValidateSteps(steps Steps) error {
 		}
 		switch st.Type {
 		case StepWait:
-			if st.Kind != "" || st.Template != "" || st.Condition != nil {
+			if st.Kind != "" || st.Template != "" || st.Condition != nil ||
+				st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 {
 				return fmt.Errorf("%w: steps[%d] wait takes only wait_hours", ErrInvalidInput, i)
 			}
 		case StepSend:
 			switch st.Kind {
-			case KindSMS, KindPushMarketing, KindUSSD:
+			case KindSMS, KindPushMarketing, KindUSSD, KindWhatsApp:
 			default:
-				return fmt.Errorf("%w: steps[%d].kind %q (want sms|push_marketing|ussd)", ErrInvalidInput, i, st.Kind)
+				return fmt.Errorf("%w: steps[%d].kind %q (want sms|push_marketing|ussd|whatsapp)", ErrInvalidInput, i, st.Kind)
+			}
+			if st.Kind == KindWhatsApp {
+				// SPEC-W21: whatsapp sends a Meta-approved TEMPLATE —
+				// template_name is REQUIRED (400 otherwise); the free-text
+				// template field is repurposed as an optional params hint.
+				st.TemplateName = strings.TrimSpace(st.TemplateName)
+				if st.TemplateName == "" {
+					return fmt.Errorf("%w: steps[%d].template_name is required for kind whatsapp", ErrInvalidInput, i)
+				}
+				if len(st.TemplateName) > maxTemplateNameLen {
+					return fmt.Errorf("%w: steps[%d].template_name exceeds %d bytes", ErrInvalidInput, i, maxTemplateNameLen)
+				}
+				if len(st.Params) > maxWhatsAppParams {
+					return fmt.Errorf("%w: steps[%d].params exceeds %d entries", ErrInvalidInput, i, maxWhatsAppParams)
+				}
+			} else if st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 {
+				return fmt.Errorf("%w: steps[%d] template_name/language/params are whatsapp-only", ErrInvalidInput, i)
 			}
 			st.Template = strings.TrimSpace(st.Template)
-			if st.Template == "" {
+			if st.Kind != KindWhatsApp && st.Template == "" {
 				return fmt.Errorf("%w: steps[%d].template is required for send", ErrInvalidInput, i)
 			}
 			if len(st.Template) > maxTemplateLen {
@@ -310,7 +349,8 @@ func ValidateSteps(steps Steps) error {
 				return fmt.Errorf("%w: steps[%d] send takes only kind/template", ErrInvalidInput, i)
 			}
 		case StepBranch:
-			if st.Kind != "" || st.Template != "" || st.WaitHours != 0 {
+			if st.Kind != "" || st.Template != "" || st.WaitHours != 0 ||
+				st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 {
 				return fmt.Errorf("%w: steps[%d] branch takes only condition", ErrInvalidInput, i)
 			}
 			if err := ValidateSegmentDefinition(st.Condition); err != nil {
