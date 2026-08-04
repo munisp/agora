@@ -1,0 +1,775 @@
+lga_name,state,zone
+Aba North,Abia,South East
+Aba South,Abia,South East
+Arochukwu,Abia,South East
+Bende,Abia,South East
+Ikwuano,Abia,South East
+Isiala Ngwa North,Abia,South East
+Isiala Ngwa South,Abia,South East
+Isuikwuato,Abia,South East
+Obi Ngwa,Abia,South East
+Ohafia,Abia,South East
+Osisioma,Abia,South East
+Ugwunagbo,Abia,South East
+Ukwa East,Abia,South East
+Ukwa West,Abia,South East
+Umuahia North,Abia,South East
+Umuahia South,Abia,South East
+Umu Nneochi,Abia,South East
+Demsa,Adamawa,North East
+Fufure,Adamawa,North East
+Ganye,Adamawa,North East
+Girei,Adamawa,North East
+Gombi,Adamawa,North East
+Guyuk,Adamawa,North East
+Hong,Adamawa,North East
+Jada,Adamawa,North East
+Lamurde,Adamawa,North East
+Madagali,Adamawa,North East
+Maiha,Adamawa,North East
+Mayo Belwa,Adamawa,North East
+Michika,Adamawa,North East
+Mubi North,Adamawa,North East
+Mubi South,Adamawa,North East
+Numan,Adamawa,North East
+Shelleng,Adamawa,North East
+Song,Adamawa,North East
+Toungo,Adamawa,North East
+Yola North,Adamawa,North East
+Yola South,Adamawa,North East
+Abak,Akwa Ibom,South South
+Eastern Obolo,Akwa Ibom,South South
+Eket,Akwa Ibom,South South
+Esit Eket,Akwa Ibom,South South
+Essien Udim,Akwa Ibom,South South
+Etim Ekpo,Akwa Ibom,South South
+Etinan,Akwa Ibom,South South
+Ibeno,Akwa Ibom,South South
+Ibesikpo Asutan,Akwa Ibom,South South
+Ibiono-Ibom,Akwa Ibom,South South
+Ika,Akwa Ibom,South South
+Ikono,Akwa Ibom,South South
+Ikot Abasi,Akwa Ibom,South South
+Ikot Ekpene,Akwa Ibom,South South
+Ini,Akwa Ibom,South South
+Itu,Akwa Ibom,South South
+Mbo,Akwa Ibom,South South
+Mkpat-Enin,Akwa Ibom,South South
+Nsit-Atai,Akwa Ibom,South South
+Nsit-Ibom,Akwa Ibom,South South
+Nsit-Ubium,Akwa Ibom,South South
+Obot Akara,Akwa Ibom,South South
+Okobo,Akwa Ibom,South South
+Onna,Akwa Ibom,South South
+Oron,Akwa Ibom,South South
+Oruk Anam,Akwa Ibom,South South
+Udung-Uko,Akwa Ibom,South South
+Ukanafun,Akwa Ibom,South South
+Uruan,Akwa Ibom,South South
+Urue-Offong/Oruko,Akwa Ibom,South South
+Uyo,Akwa Ibom,South South
+Aguata,Anambra,South East
+Awka North,Anambra,South East
+Awka South,Anambra,South East
+Anambra East,Anambra,South East
+Anambra West,Anambra,South East
+Anaocha,Anambra,South East
+Ayamelum,Anambra,South East
+Dunukofia,Anambra,South East
+Ekwusigo,Anambra,South East
+Idemili North,Anambra,South East
+Idemili South,Anambra,South East
+Ihiala,Anambra,South East
+Njikoka,Anambra,South East
+Nnewi North,Anambra,South East
+Nnewi South,Anambra,South East
+Ogbaru,Anambra,South East
+Onitsha North,Anambra,South East
+Onitsha South,Anambra,South East
+Orumba North,Anambra,South East
+Orumba South,Anambra,South East
+Oyi,Anambra,South East
+Alkaleri,Bauchi,North East
+Bauchi,Bauchi,North East
+Bogoro,Bauchi,North East
+Damban,Bauchi,North East
+Darazo,Bauchi,North East
+Dass,Bauchi,North East
+Gamawa,Bauchi,North East
+Ganjuwa,Bauchi,North East
+Giade,Bauchi,North East
+Itas/Gadau,Bauchi,North East
+Jama'are,Bauchi,North East
+Katagum,Bauchi,North East
+Kirfi,Bauchi,North East
+Misau,Bauchi,North East
+Ningi,Bauchi,North East
+Shira,Bauchi,North East
+Tafawa Balewa,Bauchi,North East
+Toro,Bauchi,North East
+Warji,Bauchi,North East
+Zaki,Bauchi,North East
+Brass,Bayelsa,South South
+Ekeremor,Bayelsa,South South
+Kolokuma/Opokuma,Bayelsa,South South
+Nembe,Bayelsa,South South
+Ogbia,Bayelsa,South South
+Sagbama,Bayelsa,South South
+Southern Ijaw,Bayelsa,South South
+Yenagoa,Bayelsa,South South
+Ado,Benue,North Central
+Agatu,Benue,North Central
+Apa,Benue,North Central
+Buruku,Benue,North Central
+Gboko,Benue,North Central
+Guma,Benue,North Central
+Gwer East,Benue,North Central
+Gwer West,Benue,North Central
+Katsina-Ala,Benue,North Central
+Konshisha,Benue,North Central
+Kwande,Benue,North Central
+Logo,Benue,North Central
+Makurdi,Benue,North Central
+Obi,Benue,North Central
+Ogbadibo,Benue,North Central
+Ohimini,Benue,North Central
+Oju,Benue,North Central
+Okpokwu,Benue,North Central
+Otukpo,Benue,North Central
+Tarka,Benue,North Central
+Ukum,Benue,North Central
+Ushongo,Benue,North Central
+Vandeikya,Benue,North Central
+Abadam,Borno,North East
+Askira/Uba,Borno,North East
+Bama,Borno,North East
+Bayo,Borno,North East
+Biu,Borno,North East
+Chibok,Borno,North East
+Damboa,Borno,North East
+Dikwa,Borno,North East
+Gubio,Borno,North East
+Guzamala,Borno,North East
+Gwoza,Borno,North East
+Hawul,Borno,North East
+Jere,Borno,North East
+Kaga,Borno,North East
+Kala/Balge,Borno,North East
+Konduga,Borno,North East
+Kukawa,Borno,North East
+Kwaya Kusar,Borno,North East
+Mafa,Borno,North East
+Magumeri,Borno,North East
+Maiduguri,Borno,North East
+Marte,Borno,North East
+Mobbar,Borno,North East
+Monguno,Borno,North East
+Ngala,Borno,North East
+Nganzai,Borno,North East
+Shani,Borno,North East
+Abi,Cross River,South South
+Akamkpa,Cross River,South South
+Akpabuyo,Cross River,South South
+Bakassi,Cross River,South South
+Bekwarra,Cross River,South South
+Biase,Cross River,South South
+Boki,Cross River,South South
+Calabar Municipal,Cross River,South South
+Calabar South,Cross River,South South
+Etung,Cross River,South South
+Ikom,Cross River,South South
+Obanliku,Cross River,South South
+Obubra,Cross River,South South
+Obudu,Cross River,South South
+Odukpani,Cross River,South South
+Ogoja,Cross River,South South
+Yakurr,Cross River,South South
+Yala,Cross River,South South
+Aniocha North,Delta,South South
+Aniocha South,Delta,South South
+Bomadi,Delta,South South
+Burutu,Delta,South South
+Ethiope East,Delta,South South
+Ethiope West,Delta,South South
+Ika North East,Delta,South South
+Ika South,Delta,South South
+Isoko North,Delta,South South
+Isoko South,Delta,South South
+Ndokwa East,Delta,South South
+Ndokwa West,Delta,South South
+Okpe,Delta,South South
+Oshimili North,Delta,South South
+Oshimili South,Delta,South South
+Patani,Delta,South South
+Sapele,Delta,South South
+Udu,Delta,South South
+Ughelli North,Delta,South South
+Ughelli South,Delta,South South
+Ukwuani,Delta,South South
+Uvwie,Delta,South South
+Warri North,Delta,South South
+Warri South,Delta,South South
+Warri South West,Delta,South South
+Abakaliki,Ebonyi,South East
+Afikpo North,Ebonyi,South East
+Afikpo South,Ebonyi,South East
+Ebonyi,Ebonyi,South East
+Ezza North,Ebonyi,South East
+Ezza South,Ebonyi,South East
+Ikwo,Ebonyi,South East
+Ishielu,Ebonyi,South East
+Ivo,Ebonyi,South East
+Izzi,Ebonyi,South East
+Ohaozara,Ebonyi,South East
+Ohaukwu,Ebonyi,South East
+Onicha,Ebonyi,South East
+Akoko-Edo,Edo,South South
+Egor,Edo,South South
+Esan Central,Edo,South South
+Esan North-East,Edo,South South
+Esan South-East,Edo,South South
+Esan West,Edo,South South
+Etsako Central,Edo,South South
+Etsako East,Edo,South South
+Etsako West,Edo,South South
+Igueben,Edo,South South
+Ikpoba-Okha,Edo,South South
+Oredo,Edo,South South
+Orhionmwon,Edo,South South
+Ovia North-East,Edo,South South
+Ovia South-West,Edo,South South
+Owan East,Edo,South South
+Owan West,Edo,South South
+Uhunmwonde,Edo,South South
+Ado Ekiti,Ekiti,South West
+Efon,Ekiti,South West
+Ekiti East,Ekiti,South West
+Ekiti South-West,Ekiti,South West
+Ekiti West,Ekiti,South West
+Emure,Ekiti,South West
+Gbonyin,Ekiti,South West
+Ido Osi,Ekiti,South West
+Ijero,Ekiti,South West
+Ikere,Ekiti,South West
+Ikole,Ekiti,South West
+Ilejemeje,Ekiti,South West
+Irepodun/Ifelodun,Ekiti,South West
+Ise/Orun,Ekiti,South West
+Moba,Ekiti,South West
+Oye,Ekiti,South West
+Aninri,Enugu,South East
+Awgu,Enugu,South East
+Enugu East,Enugu,South East
+Enugu North,Enugu,South East
+Enugu South,Enugu,South East
+Ezeagu,Enugu,South East
+Igbo Etiti,Enugu,South East
+Igbo Eze North,Enugu,South East
+Igbo Eze South,Enugu,South East
+Isi Uzo,Enugu,South East
+Nkanu East,Enugu,South East
+Nkanu West,Enugu,South East
+Nsukka,Enugu,South East
+Oji River,Enugu,South East
+Udenu,Enugu,South East
+Udi,Enugu,South East
+Uzo Uwani,Enugu,South East
+Abaji,FCT,North Central
+Abuja Municipal,FCT,North Central
+Bwari,FCT,North Central
+Gwagwalada,FCT,North Central
+Kuje,FCT,North Central
+Kwali,FCT,North Central
+Akko,Gombe,North East
+Balanga,Gombe,North East
+Billiri,Gombe,North East
+Dukku,Gombe,North East
+Funakaye,Gombe,North East
+Gombe,Gombe,North East
+Kaltungo,Gombe,North East
+Kwami,Gombe,North East
+Nafada,Gombe,North East
+Shongom,Gombe,North East
+Yamaltu/Deba,Gombe,North East
+Aboh Mbaise,Imo,South East
+Ahiazu Mbaise,Imo,South East
+Ehime Mbano,Imo,South East
+Ezinihitte,Imo,South East
+Ideato North,Imo,South East
+Ideato South,Imo,South East
+Ihitte/Uboma,Imo,South East
+Ikeduru,Imo,South East
+Isiala Mbano,Imo,South East
+Isu,Imo,South East
+Mbaitoli,Imo,South East
+Ngor Okpala,Imo,South East
+Njaba,Imo,South East
+Nkwerre,Imo,South East
+Nwangele,Imo,South East
+Obowo,Imo,South East
+Oguta,Imo,South East
+Ohaji/Egbema,Imo,South East
+Okigwe,Imo,South East
+Onuimo,Imo,South East
+Orlu,Imo,South East
+Orsu,Imo,South East
+Oru East,Imo,South East
+Oru West,Imo,South East
+Owerri Municipal,Imo,South East
+Owerri North,Imo,South East
+Owerri West,Imo,South East
+Auyo,Jigawa,North West
+Babura,Jigawa,North West
+Biriniwa,Jigawa,North West
+Birnin Kudu,Jigawa,North West
+Buji,Jigawa,North West
+Dutse,Jigawa,North West
+Gagarawa,Jigawa,North West
+Garki,Jigawa,North West
+Gumel,Jigawa,North West
+Guri,Jigawa,North West
+Gwaram,Jigawa,North West
+Gwiwa,Jigawa,North West
+Hadejia,Jigawa,North West
+Jahun,Jigawa,North West
+Kafin Hausa,Jigawa,North West
+Kaugama,Jigawa,North West
+Kazaure,Jigawa,North West
+Kiri Kasama,Jigawa,North West
+Kiyawa,Jigawa,North West
+Maigatari,Jigawa,North West
+Malam Madori,Jigawa,North West
+Miga,Jigawa,North West
+Ringim,Jigawa,North West
+Roni,Jigawa,North West
+Sule Tankarkar,Jigawa,North West
+Taura,Jigawa,North West
+Yankwashi,Jigawa,North West
+Birnin Gwari,Kaduna,North West
+Chikun,Kaduna,North West
+Giwa,Kaduna,North West
+Igabi,Kaduna,North West
+Ikara,Kaduna,North West
+Jaba,Kaduna,North West
+Jema'a,Kaduna,North West
+Kachia,Kaduna,North West
+Kaduna North,Kaduna,North West
+Kaduna South,Kaduna,North West
+Kagarko,Kaduna,North West
+Kajuru,Kaduna,North West
+Kaura,Kaduna,North West
+Kauru,Kaduna,North West
+Kubau,Kaduna,North West
+Kudan,Kaduna,North West
+Lere,Kaduna,North West
+Makarfi,Kaduna,North West
+Sabon Gari,Kaduna,North West
+Sanga,Kaduna,North West
+Soba,Kaduna,North West
+Zangon Kataf,Kaduna,North West
+Zaria,Kaduna,North West
+Ajingi,Kano,North West
+Albasu,Kano,North West
+Bagwai,Kano,North West
+Bebeji,Kano,North West
+Bichi,Kano,North West
+Bunkure,Kano,North West
+Dala,Kano,North West
+Dambatta,Kano,North West
+Dawakin Kudu,Kano,North West
+Dawakin Tofa,Kano,North West
+Doguwa,Kano,North West
+Fagge,Kano,North West
+Gabasawa,Kano,North West
+Garko,Kano,North West
+Garun Mallam,Kano,North West
+Gaya,Kano,North West
+Gezawa,Kano,North West
+Gwale,Kano,North West
+Gwarzo,Kano,North West
+Kabo,Kano,North West
+Kano Municipal,Kano,North West
+Karaye,Kano,North West
+Kibiya,Kano,North West
+Kiru,Kano,North West
+Kumbotso,Kano,North West
+Kunchi,Kano,North West
+Kura,Kano,North West
+Madobi,Kano,North West
+Makoda,Kano,North West
+Minjibir,Kano,North West
+Nasarawa,Kano,North West
+Rano,Kano,North West
+Rimin Gado,Kano,North West
+Rogo,Kano,North West
+Shanono,Kano,North West
+Sumaila,Kano,North West
+Takai,Kano,North West
+Tarauni,Kano,North West
+Tofa,Kano,North West
+Tsanyawa,Kano,North West
+Tudun Wada,Kano,North West
+Ungogo,Kano,North West
+Warawa,Kano,North West
+Wudil,Kano,North West
+Bakori,Katsina,North West
+Batagarawa,Katsina,North West
+Batsari,Katsina,North West
+Baure,Katsina,North West
+Bindawa,Katsina,North West
+Charanchi,Katsina,North West
+Dan Musa,Katsina,North West
+Dandume,Katsina,North West
+Danja,Katsina,North West
+Daura,Katsina,North West
+Dutsi,Katsina,North West
+Dutsin Ma,Katsina,North West
+Faskari,Katsina,North West
+Funtua,Katsina,North West
+Ingawa,Katsina,North West
+Jibia,Katsina,North West
+Kafur,Katsina,North West
+Kaita,Katsina,North West
+Kankara,Katsina,North West
+Kankia,Katsina,North West
+Katsina,Katsina,North West
+Kurfi,Katsina,North West
+Kusada,Katsina,North West
+Mai'Adua,Katsina,North West
+Malumfashi,Katsina,North West
+Mani,Katsina,North West
+Mashi,Katsina,North West
+Matazu,Katsina,North West
+Musawa,Katsina,North West
+Rimi,Katsina,North West
+Sabuwa,Katsina,North West
+Safana,Katsina,North West
+Sandamu,Katsina,North West
+Zango,Katsina,North West
+Aleiro,Kebbi,North West
+Arewa Dandi,Kebbi,North West
+Argungu,Kebbi,North West
+Augie,Kebbi,North West
+Bagudo,Kebbi,North West
+Birnin Kebbi,Kebbi,North West
+Bunza,Kebbi,North West
+Dandi,Kebbi,North West
+Fakai,Kebbi,North West
+Gwandu,Kebbi,North West
+Jega,Kebbi,North West
+Kalgo,Kebbi,North West
+Koko/Besse,Kebbi,North West
+Maiyama,Kebbi,North West
+Ngaski,Kebbi,North West
+Sakaba,Kebbi,North West
+Shanga,Kebbi,North West
+Suru,Kebbi,North West
+Wasagu/Danko,Kebbi,North West
+Yauri,Kebbi,North West
+Zuru,Kebbi,North West
+Adavi,Kogi,North Central
+Ajaokuta,Kogi,North Central
+Ankpa,Kogi,North Central
+Bassa,Kogi,North Central
+Dekina,Kogi,North Central
+Ibaji,Kogi,North Central
+Idah,Kogi,North Central
+Igalamela Odolu,Kogi,North Central
+Ijumu,Kogi,North Central
+Kabba/Bunu,Kogi,North Central
+Kogi,Kogi,North Central
+Lokoja,Kogi,North Central
+Mopa Muro,Kogi,North Central
+Ofu,Kogi,North Central
+Ogori/Magongo,Kogi,North Central
+Okehi,Kogi,North Central
+Okene,Kogi,North Central
+Olamaboro,Kogi,North Central
+Omala,Kogi,North Central
+Yagba East,Kogi,North Central
+Yagba West,Kogi,North Central
+Asa,Kwara,North Central
+Baruten,Kwara,North Central
+Edu,Kwara,North Central
+Ekiti,Kwara,North Central
+Ifelodun,Kwara,North Central
+Ilorin East,Kwara,North Central
+Ilorin South,Kwara,North Central
+Ilorin West,Kwara,North Central
+Irepodun,Kwara,North Central
+Isin,Kwara,North Central
+Kaiama,Kwara,North Central
+Moro,Kwara,North Central
+Offa,Kwara,North Central
+Oke Ero,Kwara,North Central
+Oyun,Kwara,North Central
+Pategi,Kwara,North Central
+Agege,Lagos,South West
+Ajeromi-Ifelodun,Lagos,South West
+Alimosho,Lagos,South West
+Amuwo-Odofin,Lagos,South West
+Apapa,Lagos,South West
+Badagry,Lagos,South West
+Epe,Lagos,South West
+Eti Osa,Lagos,South West
+Ibeju-Lekki,Lagos,South West
+Ifako-Ijaiye,Lagos,South West
+Ikeja,Lagos,South West
+Ikorodu,Lagos,South West
+Kosofe,Lagos,South West
+Lagos Island,Lagos,South West
+Lagos Mainland,Lagos,South West
+Mushin,Lagos,South West
+Ojo,Lagos,South West
+Oshodi-Isolo,Lagos,South West
+Shomolu,Lagos,South West
+Surulere,Lagos,South West
+Akwanga,Nasarawa,North Central
+Awe,Nasarawa,North Central
+Doma,Nasarawa,North Central
+Karu,Nasarawa,North Central
+Keana,Nasarawa,North Central
+Keffi,Nasarawa,North Central
+Kokona,Nasarawa,North Central
+Lafia,Nasarawa,North Central
+Nasarawa,Nasarawa,North Central
+Nasarawa Egon,Nasarawa,North Central
+Obi,Nasarawa,North Central
+Toto,Nasarawa,North Central
+Wamba,Nasarawa,North Central
+Agaie,Niger,North Central
+Agwara,Niger,North Central
+Bida,Niger,North Central
+Borgu,Niger,North Central
+Bosso,Niger,North Central
+Chanchaga,Niger,North Central
+Edati,Niger,North Central
+Gbako,Niger,North Central
+Gurara,Niger,North Central
+Katcha,Niger,North Central
+Kontagora,Niger,North Central
+Lapai,Niger,North Central
+Lavun,Niger,North Central
+Magama,Niger,North Central
+Mariga,Niger,North Central
+Mashegu,Niger,North Central
+Mokwa,Niger,North Central
+Moya,Niger,North Central
+Paikoro,Niger,North Central
+Rafi,Niger,North Central
+Rijau,Niger,North Central
+Shiroro,Niger,North Central
+Suleja,Niger,North Central
+Tafa,Niger,North Central
+Wushishi,Niger,North Central
+Abeokuta North,Ogun,South West
+Abeokuta South,Ogun,South West
+Ado-Odo/Ota,Ogun,South West
+Egbado North,Ogun,South West
+Egbado South,Ogun,South West
+Ewekoro,Ogun,South West
+Ifo,Ogun,South West
+Ijebu East,Ogun,South West
+Ijebu North,Ogun,South West
+Ijebu North East,Ogun,South West
+Ijebu Ode,Ogun,South West
+Ikenne,Ogun,South West
+Imeko Afon,Ogun,South West
+Ipokia,Ogun,South West
+Obafemi Owode,Ogun,South West
+Odeda,Ogun,South West
+Odogbolu,Ogun,South West
+Ogun Waterside,Ogun,South West
+Remo North,Ogun,South West
+Sagamu,Ogun,South West
+Akoko North-East,Ondo,South West
+Akoko North-West,Ondo,South West
+Akoko South-East,Ondo,South West
+Akoko South-West,Ondo,South West
+Akure North,Ondo,South West
+Akure South,Ondo,South West
+Ese Odo,Ondo,South West
+Idanre,Ondo,South West
+Ifedore,Ondo,South West
+Ilaje,Ondo,South West
+Ile Oluji/Okeigbo,Ondo,South West
+Irele,Ondo,South West
+Odigbo,Ondo,South West
+Okitipupa,Ondo,South West
+Ondo East,Ondo,South West
+Ondo West,Ondo,South West
+Ose,Ondo,South West
+Owo,Ondo,South West
+Aiyedaade,Osun,South West
+Aiyedire,Osun,South West
+Atakumosa East,Osun,South West
+Atakumosa West,Osun,South West
+Boluwaduro,Osun,South West
+Boripe,Osun,South West
+Ede North,Osun,South West
+Ede South,Osun,South West
+Egbedore,Osun,South West
+Ejigbo,Osun,South West
+Ife Central,Osun,South West
+Ife East,Osun,South West
+Ife North,Osun,South West
+Ife South,Osun,South West
+Ifedayo,Osun,South West
+Ifelodun,Osun,South West
+Ila,Osun,South West
+Ilesa East,Osun,South West
+Ilesa West,Osun,South West
+Irepodun,Osun,South West
+Irewole,Osun,South West
+Isokan,Osun,South West
+Iwo,Osun,South West
+Obokun,Osun,South West
+Odo Otin,Osun,South West
+Ola Oluwa,Osun,South West
+Olorunda,Osun,South West
+Oriade,Osun,South West
+Orolu,Osun,South West
+Osogbo,Osun,South West
+Afijio,Oyo,South West
+Akinyele,Oyo,South West
+Atiba,Oyo,South West
+Atisbo,Oyo,South West
+Egbeda,Oyo,South West
+Ibadan North,Oyo,South West
+Ibadan North-East,Oyo,South West
+Ibadan North-West,Oyo,South West
+Ibadan South-East,Oyo,South West
+Ibadan South-West,Oyo,South West
+Ibarapa Central,Oyo,South West
+Ibarapa East,Oyo,South West
+Ibarapa North,Oyo,South West
+Ido,Oyo,South West
+Irepo,Oyo,South West
+Iseyin,Oyo,South West
+Itesiwaju,Oyo,South West
+Iwajowa,Oyo,South West
+Kajola,Oyo,South West
+Lagelu,Oyo,South West
+Ogbomosho North,Oyo,South West
+Ogbomosho South,Oyo,South West
+Ogo Oluwa,Oyo,South West
+Olorunsogo,Oyo,South West
+Oluyole,Oyo,South West
+Ona Ara,Oyo,South West
+Orelope,Oyo,South West
+Ori Ire,Oyo,South West
+Oyo East,Oyo,South West
+Oyo West,Oyo,South West
+Saki East,Oyo,South West
+Saki West,Oyo,South West
+Surulere,Oyo,South West
+Barkin Ladi,Plateau,North Central
+Bassa,Plateau,North Central
+Bokkos,Plateau,North Central
+Jos East,Plateau,North Central
+Jos North,Plateau,North Central
+Jos South,Plateau,North Central
+Kanam,Plateau,North Central
+Kanke,Plateau,North Central
+Langtang North,Plateau,North Central
+Langtang South,Plateau,North Central
+Mangu,Plateau,North Central
+Mikang,Plateau,North Central
+Pankshin,Plateau,North Central
+Qua'an Pan,Plateau,North Central
+Riyom,Plateau,North Central
+Shendam,Plateau,North Central
+Wase,Plateau,North Central
+Abua/Odual,Rivers,South South
+Ahoada East,Rivers,South South
+Ahoada West,Rivers,South South
+Akuku-Toru,Rivers,South South
+Andoni,Rivers,South South
+Asari-Toru,Rivers,South South
+Bonny,Rivers,South South
+Degema,Rivers,South South
+Eleme,Rivers,South South
+Emohua,Rivers,South South
+Etche,Rivers,South South
+Gokana,Rivers,South South
+Ikwerre,Rivers,South South
+Khana,Rivers,South South
+Obio/Akpor,Rivers,South South
+Ogba/Egbema/Ndoni,Rivers,South South
+Ogu/Bolo,Rivers,South South
+Okrika,Rivers,South South
+Omuma,Rivers,South South
+Opobo/Nkoro,Rivers,South South
+Oyigbo,Rivers,South South
+Port Harcourt,Rivers,South South
+Tai,Rivers,South South
+Binji,Sokoto,North West
+Bodinga,Sokoto,North West
+Dange Shuni,Sokoto,North West
+Gada,Sokoto,North West
+Goronyo,Sokoto,North West
+Gudu,Sokoto,North West
+Gwadabawa,Sokoto,North West
+Illela,Sokoto,North West
+Isa,Sokoto,North West
+Kebbe,Sokoto,North West
+Kware,Sokoto,North West
+Rabah,Sokoto,North West
+Sabon Birni,Sokoto,North West
+Shagari,Sokoto,North West
+Silame,Sokoto,North West
+Sokoto North,Sokoto,North West
+Sokoto South,Sokoto,North West
+Tambuwal,Sokoto,North West
+Tangaza,Sokoto,North West
+Tureta,Sokoto,North West
+Wamako,Sokoto,North West
+Wurno,Sokoto,North West
+Yabo,Sokoto,North West
+Ardo Kola,Taraba,North East
+Bali,Taraba,North East
+Donga,Taraba,North East
+Gashaka,Taraba,North East
+Gassol,Taraba,North East
+Ibi,Taraba,North East
+Jalingo,Taraba,North East
+Karim Lamido,Taraba,North East
+Kurmi,Taraba,North East
+Lau,Taraba,North East
+Sardauna,Taraba,North East
+Takum,Taraba,North East
+Ussa,Taraba,North East
+Wukari,Taraba,North East
+Yorro,Taraba,North East
+Zing,Taraba,North East
+Bade,Yobe,North East
+Bursari,Yobe,North East
+Damaturu,Yobe,North East
+Fika,Yobe,North East
+Fune,Yobe,North East
+Geidam,Yobe,North East
+Gujba,Yobe,North East
+Gulani,Yobe,North East
+Jakusko,Yobe,North East
+Karasuwa,Yobe,North East
+Machina,Yobe,North East
+Nangere,Yobe,North East
+Nguru,Yobe,North East
+Potiskum,Yobe,North East
+Tarmuwa,Yobe,North East
+Yunusari,Yobe,North East
+Yusufari,Yobe,North East
+Anka,Zamfara,North West
+Bakura,Zamfara,North West
+Birnin Magaji/Kiyaw,Zamfara,North West
+Bukkuyum,Zamfara,North West
+Bungudu,Zamfara,North West
+Gummi,Zamfara,North West
+Gusau,Zamfara,North West
+Kaura Namoda,Zamfara,North West
+Maradun,Zamfara,North West
+Maru,Zamfara,North West
+Shinkafi,Zamfara,North West
+Talata Mafara,Zamfara,North West
+Tsafe,Zamfara,North West
+Zurmi,Zamfara,North West
