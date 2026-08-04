@@ -4,7 +4,8 @@ package pacer
 //
 // Every paced send kind is classified per SPEC-W12 contract §3:
 //
-//	marketing      — geo_campaign, promo, broadcast, drip, push_marketing
+//	marketing      — geo_campaign, promo, broadcast, drip, push_marketing,
+//	                 whatsapp_campaign (SPEC-W21)
 //	transactional  — booking confirmations, reminders, incident_alert, otp,
 //	                 push_notification (SPEC-W16 §1)
 //	                 (plus every other in-repo kind: waitlist claims, no-show
@@ -64,6 +65,10 @@ var kindClasses = map[string]SendClass{
 	// exactly like the sms marketing kinds (DND-suppressed when the
 	// payload carries a phone; quiet-hours deferred on channel "push").
 	"push_marketing": ClassMarketing,
+	// SPEC-W21 Agent A: WhatsApp business-initiated template campaign
+	// sends are marketing-classified exactly like the sms marketing kinds
+	// (DND-suppressed; quiet-hours deferred on channel "whatsapp").
+	"whatsapp_campaign": ClassMarketing,
 	// Transactional (contract §3 canonical list).
 	"confirmation":   ClassTransactional, // booking confirmations
 	"reminder":       ClassTransactional, // T-24h / T-1h reminders
