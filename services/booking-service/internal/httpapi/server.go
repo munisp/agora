@@ -15,15 +15,19 @@ import (
 	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
+	"github.com/opendesk/booking-service/internal/campaignstudio"
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/devices"
 	"github.com/opendesk/booking-service/internal/fieldcapture"
 	"github.com/opendesk/booking-service/internal/geo"
+	"github.com/opendesk/booking-service/internal/helpdesk"
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/leads"
+	"github.com/opendesk/booking-service/internal/loyalty"
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/referrals"
 	"github.com/opendesk/booking-service/internal/store"
+	"github.com/opendesk/booking-service/internal/workorders"
 	"go.uber.org/zap"
 )
 
@@ -95,6 +99,20 @@ type Deps struct {
 	// Reference wiring: /v1/leads is gated behind app_id "cac"
 	// (docs/app-developer-guide.md).
 	AppGate *appgate.Gate
+
+	// SPEC-W19 integrator (additive): the four enterprise app packages.
+	// Each Deps bundle is built in cmd/server/main.go (store + topics); the
+	// tenant/user accessors and permission middleware are attached here in
+	// NewRouter (they read this package's private context keys). Nil → the
+	// app's routes are not registered (partial deployments stay intact).
+	// Helpdesk serves /v1/helpdesk (appgate app_id "helpdesk").
+	Helpdesk *helpdesk.Deps
+	// Workorders serves /v1/field-service (appgate app_id "field-service").
+	Workorders *workorders.Deps
+	// Loyalty serves /v1/loyalty (appgate app_id "loyalty-wallet").
+	Loyalty *loyalty.Deps
+	// Studio serves /v1/studio (appgate app_id "campaign-studio").
+	Studio *campaignstudio.Deps
 }
 
 type ctxKey string
@@ -267,7 +285,54 @@ func NewRouter(d Deps) http.Handler {
 		// flush (contract §4). manage_bookings — same posture as the lead
 		// capture + contact-location writes it performs.
 		r.With(s.require("manage_bookings")).Post("/field/capture", s.fieldCaptureHandler)
+		// SPEC-W19 integrator (additive): loyalty self-mounts "/loyalty"
+		// INSIDE this /v1 group (chi panics on a second Mount("/v1"), and
+		// this way the group inherits the tenant middleware for free);
+		// per-route perms come from Deps.Require, the appgate gate for
+		// app_id "loyalty-wallet" wraps the whole group.
+		if s.d.Loyalty != nil {
+			s.d.Loyalty.TenantFromContext = tenantFrom
+			s.d.Loyalty.Require = s.require
+			loyalty.RegisterRoutes(r, s.d.Loyalty, s.appGateChain("loyalty-wallet")...)
+		}
 	})
+
+	// SPEC-W19 integrator — BEGIN (additive): the remaining three enterprise
+	// app route groups (loyalty is wired inside the /v1 group above). Each
+	// package self-mounts its /v1-prefixed routes; the chain is
+	// tenantMiddleware (resolves ctxTenant/ctxUser the packages read via the
+	// accessors below) → appgate entitlement gate (pass-through unless
+	// APP_GATE_ENABLED=true) → perms (GET/HEAD → view_analytics, writes →
+	// manage_bookings, per SPEC-W19 contract §3). Nil Deps → not registered.
+	if s.d.Helpdesk != nil {
+		s.d.Helpdesk.TenantFromContext = func(ctx context.Context) (bookingops.TenantInfo, bool) {
+			t := tenantFrom(ctx)
+			return t, t.ID != uuid.Nil
+		}
+		s.d.Helpdesk.UserFromContext = userFrom
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("helpdesk", s.requireReadWrite())...)
+		helpdesk.RegisterRoutes(r, s.d.Helpdesk, mw...)
+	}
+	if s.d.Workorders != nil {
+		// The package resolves the tenant itself first (its own tenant
+		// middleware wraps the integrator chain — RegisterRoutes contract);
+		// httpapi's tenantMiddleware then runs ahead of the appgate/perms
+		// middleware so the slug extractor and require() see
+		// ctxTenant/ctxUser. Both resolutions ride the resolver cache.
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("field-service", s.requireReadWrite())...)
+		workorders.RegisterRoutes(r, s.d.Workorders, mw...)
+	}
+	if s.d.Studio != nil {
+		s.d.Studio.TenantFromContext = tenantFrom
+		s.d.Studio.RequireRead = s.require("view_analytics")
+		s.d.Studio.RequireWrite = s.require("manage_bookings")
+		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("campaign-studio")...)
+		campaignstudio.RegisterRoutes(r, s.d.Studio, mw...)
+	}
+	// SPEC-W19 integrator — END
 
 	// Public promo redemption (SPEC-W13 §6): rate-limited, idempotent per
 	// code+phone. No tenant middleware — the unguessable code resolves the
@@ -443,6 +508,37 @@ func (s *server) require(permission string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// requireReadWrite (SPEC-W19 integrator) dispatches the perms middleware by
+// method: GET/HEAD → view_analytics, everything else → manage_bookings
+// (contract §3). Used by app packages whose RegisterRoutes applies the
+// integrator middleware group-wide over mixed-method routes.
+func (s *server) requireReadWrite() func(http.Handler) http.Handler {
+	read := s.require("view_analytics")
+	write := s.require("manage_bookings")
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				read(next).ServeHTTP(w, r)
+				return
+			}
+			write(next).ServeHTTP(w, r)
+		})
+	}
+}
+
+// appGateChain (SPEC-W19 integrator) returns the appgate entitlement
+// middleware for appID followed by any extra middleware — an empty slice
+// prefix when the gate is not configured (nil Deps.AppGate keeps behavior
+// identical to pre-W18; with APP_GATE_ENABLED=false the middleware itself
+// is a pass-through).
+func (s *server) appGateChain(appID string, extra ...func(http.Handler) http.Handler) []func(http.Handler) http.Handler {
+	var chain []func(http.Handler) http.Handler
+	if s.d.AppGate != nil {
+		chain = append(chain, s.d.AppGate.Middleware(appID))
+	}
+	return append(chain, extra...)
 }
 
 func tenantFrom(ctx context.Context) bookingops.TenantInfo {

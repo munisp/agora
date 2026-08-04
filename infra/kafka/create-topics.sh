@@ -27,6 +27,28 @@ TOPICS=(
   opendesk.kyc.resolved.v1         # KYC Resolved results (SPEC-W12 §5: kyc-service emits)
   cac.events                       # CAC program event stream (SPEC-W12 §7)
   opendesk.dlq                     # dead letters
+  # SPEC-W18 (additive): app lifecycle events (identity-service emits;
+  # portal/app-catalog consumers) — was missing from the declarations.
+  opendesk.apps.lifecycle.v1       # AppProvisioned/Enabled/Disabled/Suspended (SPEC-W18)
+  # SPEC-W19 (additive): enterprise app lifecycle event streams
+  # (booking-service emits via the transactional outbox).
+  opendesk.helpdesk.events.v1      # helpdesk TicketEvent: ticket_created/ticket_resolved (SPEC-W19 Agent A)
+  opendesk.fsm.events.v1           # field-service WorkOrderAssigned/WorkOrderCompleted (SPEC-W19 Agent B)
+  opendesk.loyalty.events.v1       # loyalty PointsIssued/PointsRedeemed (SPEC-W19 Agent C)
+  opendesk.studio.events.v1        # campaign-studio journey lifecycle events (SPEC-W19 Agent D)
+  # CAC seed report pattern (scripts/seeds/_lib.py emit_seed_report):
+  # topic is f"cac.seed.report.{table}.v1" — the seed scripts pass their
+  # schema-qualified TABLE constant, so the declared names below match the
+  # emitted topics EXACTLY (verified against scripts/seeds/seed_*.py).
+  cac.seed.report.cac.lgas.v1              # seed_lgas.py (TABLE=cac.lgas)
+  cac.seed.report.cac.wards.v1             # seed_wards.py (TABLE=cac.wards)
+  cac.seed.report.cac.channels.v1          # seed_channels.py (TABLE=cac.channels)
+  cac.seed.report.cac.channel_unit_costs.v1 # seed_channel_costs.py (TABLE=cac.channel_unit_costs)
+  cac.seed.report.cac.agents.v1            # seed_agents.py (TABLE=cac.agents)
+  cac.seed.report.cac.customers.v1         # seed_customers.py (TABLE=cac.customers)
+  cac.seed.report.cac.fx_series.v1         # seed_fx.py (TABLE=cac.fx_series)
+  cac.seed.report.locale_coverage.v1       # seed_locale.py (TABLE=locale_coverage)
+  cac.seed.report.cac.events.v1            # seed_events.py (reports with table=cac.events)
 )
 
 echo "[kafka-topics] waiting for broker at ${BOOTSTRAP}..."
