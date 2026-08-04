@@ -70,7 +70,7 @@ type LedgerEntry struct {
 	AccountCode   int       `json:"account_code"`
 	BeneficiaryID string    `json:"beneficiary_id"`
 	DebitNGN      int64     `json:"debit_ngn"`  // kobo
-	CreditNGN     int64    `json:"credit_ngn"` // kobo
+	CreditNGN     int64     `json:"credit_ngn"` // kobo
 	RefType       string    `json:"ref_type"`
 	RefID         string    `json:"ref_id"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -80,7 +80,7 @@ type LedgerEntry struct {
 // payout STORE (queries + Temporal activities) is owned by Wave-14 Agent B
 // (internal/referrals/payouts.go); the row shape + table bootstrap live here
 // so A and B share ONE schema — field-for-field identical to Agent B's
-// PayoutStore row (paid_at, NOT NULL DEFAULT '' provider_ref/failure_reason)
+// PayoutStore row (paid_at, NOT NULL DEFAULT ” provider_ref/failure_reason)
 // so B's ensureSchema and this bootstrap are interchangeable. AmountNGN is
 // kobo (contract §2 unit).
 type Payout struct {
