@@ -36,13 +36,14 @@ import (
 //   - Balance() = TB lookup_accounts debits/credits (credit-posted minus
 //     debit-posted, same formula as Postgres);
 //   - amounts are already integer kobo (uint64-safe) — no unit conversion.
+//
 // Swap point: main.go wires PostgresLedger today; a TBLedger{Client: ...}
 // satisfying Ledger drops in without touching service/handler code. The
 // verify path additionally couples the accrual to the referral status flip
 // (store.VerifyReferralTx) — under TB that coupling moves to an outbox row
 // committed with the status flip and a relay calling Ledger.Post, the same
 // at-least-once + idempotent-consumer posture the cac.events outbox uses.
-// ──────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────
 type Ledger interface {
 	// Post commits one balanced journal. Entries must share journalID,
 	// carry a valid account code (300..303), exactly one non-zero side and

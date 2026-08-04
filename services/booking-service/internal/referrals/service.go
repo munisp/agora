@@ -92,7 +92,7 @@ type VerifyResult struct {
 	Referral Referral `json:"referral"`
 	// AlreadyVerified is true on idempotent replays (the referral was
 	// already verified/converted/paid — no new postings, no new events).
-	AlreadyVerified bool   `json:"already_verified"`
+	AlreadyVerified bool    `json:"already_verified"`
 	Awards          []Award `json:"awards"`
 }
 
