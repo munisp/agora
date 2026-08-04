@@ -65,6 +65,21 @@ type Config struct {
 	// App entitlement gate (SPEC-W18 Agent D, contract §4)
 	AppGateEnabled  bool          // APP_GATE_ENABLED: DEFAULT false → gate is a pure pass-through; production behavior UNCHANGED unless opted in
 	AppGateCacheTTL time.Duration // APP_GATE_CACHE_TTL_SECONDS: entitlement decision cache TTL (default 60s)
+	// Helpdesk app (SPEC-W19 Agent A; integrator-wired)
+	HelpdeskEventsTopic string // HELPDESK_EVENTS_TOPIC (default opendesk.helpdesk.events.v1; empty disables emission)
+	HelpdeskUsageTopic  string // HELPDESK_USAGE_TOPIC (default opendesk.usage.events; empty disables metering)
+	HelpdeskDBMaxConns  int32  // HELPDESK_DB_MAX_CONNS: dedicated pool size (default 4, devices idiom)
+	// Field-service app (SPEC-W19 Agent B; integrator-wired)
+	WorkordersNotificationsTopic string // WORKORDERS_NOTIFICATIONS_TOPIC (default opendesk.notifications.outbox; empty disables dispatch push)
+	WorkordersUsageTopic         string // WORKORDERS_USAGE_TOPIC (default opendesk.usage.events; empty disables metering)
+	WorkordersFSMEventsTopic     string // WORKORDERS_FSM_EVENTS_TOPIC (default opendesk.fsm.events.v1; empty disables events)
+	// Loyalty-wallet app (SPEC-W19 Agent C; integrator-wired). Metering rides
+	// the existing UsageEventsTopic (USAGE_EVENTS_TOPIC).
+	LoyaltyEventsTopic string // LOYALTY_EVENTS_TOPIC (default opendesk.loyalty.events.v1; empty disables events)
+	// Campaign-studio app (SPEC-W19 Agent D; integrator-wired)
+	StudioDatabaseURL string // STUDIO_DATABASE_URL (default "" → falls back to DATABASE_URL)
+	StudioStepBatch   int    // STUDIO_STEP_BATCH: enrollments advanced per step call (default 200)
+	StudioEventsTopic string // STUDIO_EVENTS_TOPIC (default opendesk.studio.events.v1; empty disables events)
 }
 
 // Load reads configuration from the environment.
@@ -119,6 +134,19 @@ func Load() (Config, error) {
 		// SPEC-W18 Agent D (additive): off by default — opt-in only.
 		AppGateEnabled:  envStr("APP_GATE_ENABLED", "false") == "true",
 		AppGateCacheTTL: time.Duration(envInt("APP_GATE_CACHE_TTL_SECONDS", 60)) * time.Second,
+		// SPEC-W19 integrator (additive): the four enterprise apps are
+		// functional with zero config — every default matches the package
+		// doc contracts; empty string disables the corresponding emission.
+		HelpdeskEventsTopic:          envStr("HELPDESK_EVENTS_TOPIC", "opendesk.helpdesk.events.v1"),
+		HelpdeskUsageTopic:           envStr("HELPDESK_USAGE_TOPIC", "opendesk.usage.events"),
+		HelpdeskDBMaxConns:           int32(envInt("HELPDESK_DB_MAX_CONNS", 4)),
+		WorkordersNotificationsTopic: envStr("WORKORDERS_NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		WorkordersUsageTopic:         envStr("WORKORDERS_USAGE_TOPIC", "opendesk.usage.events"),
+		WorkordersFSMEventsTopic:     envStr("WORKORDERS_FSM_EVENTS_TOPIC", "opendesk.fsm.events.v1"),
+		LoyaltyEventsTopic:           envStr("LOYALTY_EVENTS_TOPIC", "opendesk.loyalty.events.v1"),
+		StudioDatabaseURL:            os.Getenv("STUDIO_DATABASE_URL"),
+		StudioStepBatch:              envInt("STUDIO_STEP_BATCH", 200),
+		StudioEventsTopic:            envStr("STUDIO_EVENTS_TOPIC", "opendesk.studio.events.v1"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
