@@ -1,0 +1,53 @@
+# simulator-participants.yaml — Mojaloop simulator seed manifest
+# (SPEC-W17, Agent C; §8 adaptation: config/manifest + docs ONLY — there is
+# no live Mojaloop cluster in this environment; see seed-simulator.md).
+#
+# ISOLATION WARNING (§8.9): these participants are SYNTHETIC seed entities
+# for a Mojaloop *simulator* deployment in the `staging` namespace only.
+#   * NEVER apply this manifest against a production hub or any scheme
+#     connected to real DFSPs / real settlement accounts.
+#   * All ids carry the `seed` marker; every seeded transfer must stay inside
+#     the simulator (no external ALS/oracle wiring).
+#   * Pair with TigerBeetle synthetic accounts (account_type=90, §8.8 — Agent
+#     B's tigerbeetle_accounts.json) on the ledger seam; the same
+#     is_synthetic/account_type=90 convention marks non-production money.
+apiVersion: opendesk.ng/v1
+kind: MojaloopSimulatorSeed
+metadata:
+  name: mojaloop-simulator-seed
+  labels:
+    env: staging            # staging namespace ONLY — see warning above
+    is-synthetic: "true"
+    seeded-by: spec-w17-agent-c
+  namespace: staging
+spec:
+  hub:
+    # Single simulated hub operator (central ledger + ALS in the simulator).
+    participantId: hub-seed-1
+    name: "Seed Hub (simulator)"
+    currency: NGN
+  dfsps:
+    # Deterministic participant ids dfsp-seed-1..5 (spec-mandated).
+    - participantId: dfsp-seed-1
+      name: "Seed DFSP 1 (simulator)"
+      currency: NGN
+    - participantId: dfsp-seed-2
+      name: "Seed DFSP 2 (simulator)"
+      currency: NGN
+    - participantId: dfsp-seed-3
+      name: "Seed DFSP 3 (simulator)"
+      currency: NGN
+    - participantId: dfsp-seed-4
+      name: "Seed DFSP 4 (simulator)"
+      currency: NGN
+    - participantId: dfsp-seed-5
+      name: "Seed DFSP 5 (simulator)"
+      currency: NGN
+  defaults:
+    currency: NGN
+    # Synthetic payer/payee MSISDN pool for simulator transfers (Nigerian
+    # +23480[0-9]XXXXXXX-shaped, non-allocated test range).
+    msisdnPrefix: "+2348000"
+    transferCurrency: NGN
+    # Deterministic amounts keep simulator quotes/quiesce checks reproducible.
+    fixedTransferAmountMinor: 100000   # ₦1,000.00 in kobo
