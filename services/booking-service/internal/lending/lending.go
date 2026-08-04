@@ -376,7 +376,7 @@ func ValidateRepaymentInput(amountKobo int64, refID string) error {
 //
 //   - Tenure: +3 points per started 30-day month since the contact's
 //     earliest known activity (first booking; contacts.created_at when a
-//     schema carries it), capped at 30 (≤10 months).
+//     schema carries it), capped at 30 (≈10 months).
 //   - Completed bookings: +4 per completed booking, capped at 40
 //     (10 bookings).
 //   - Prior repaid loans: +10 per repaid loan application of this contact,
