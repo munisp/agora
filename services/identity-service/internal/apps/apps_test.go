@@ -236,9 +236,10 @@ func TestLoadCatalogEmbedded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
-	// Agent C's 16-row catalog (contract §1: 8 shipped + 8 enterprise).
-	if len(apps) != 16 {
-		t.Fatalf("catalog rows = %d, want 16", len(apps))
+	// Agent C's catalog + the W19/W20/W21 additive rows (contract §1:
+	// 8 shipped + 9 enterprise; W21 integrator added social-publisher).
+	if len(apps) != 17 {
+		t.Fatalf("catalog rows = %d, want 17", len(apps))
 	}
 	byID := map[string]PlatformApp{}
 	for _, a := range apps {
@@ -254,7 +255,7 @@ func TestLoadCatalogEmbedded(t *testing.T) {
 	}
 	for _, id := range []string{"receptionist", "messaging", "cac", "payments", "kyc-compliance",
 		"analytics", "incidents", "geo-campaigns", "helpdesk", "field-service", "loyalty-wallet",
-		"campaign-studio", "crm-360", "surveys-voc", "lending", "workforce"} {
+		"campaign-studio", "crm-360", "surveys-voc", "lending", "workforce", "social-publisher"} {
 		if _, ok := byID[id]; !ok {
 			t.Errorf("contract app %q missing from catalog", id)
 		}

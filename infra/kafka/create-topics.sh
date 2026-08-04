@@ -42,6 +42,9 @@ TOPICS=(
   opendesk.surveys.events.v1       # surveys sent/answered (SPEC-W20 Agent B)
   opendesk.lending.events.v1       # lending application decided/disbursed/repaid + disbursement intent (SPEC-W20 Agent C)
   opendesk.workforce.events.v1     # workforce shift assigned/leave decided (SPEC-W20 Agent D)
+  # SPEC-W21 (additive): social-publisher lifecycle events
+  # (booking-service emits via the transactional outbox).
+  opendesk.social.events.v1        # social-publisher PostPublished/AdLaunched/AdRejected (SPEC-W21 Agent B)
   # CAC seed report pattern (scripts/seeds/_lib.py emit_seed_report):
   # topic is f"cac.seed.report.{table}.v1" — the seed scripts pass their
   # schema-qualified TABLE constant, so the declared names below match the
