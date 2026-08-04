@@ -396,7 +396,7 @@ func TestRecordSendOutcome(t *testing.T) {
 		{EventSendFailed, "provider boom"},
 	} {
 		if err := st.RecordSendOutcome(ctx, tenantID, j.ID, e.ID, 0, outcome.kind, outcome.reason); err != nil {
-		t.Fatalf("record %s: %v", outcome.kind, err)
+			t.Fatalf("record %s: %v", outcome.kind, err)
 		}
 	}
 	stats, err := st.Stats(ctx, tenantID, j)
