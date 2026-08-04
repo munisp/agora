@@ -97,6 +97,16 @@ type Config struct {
 	// Workforce app (SPEC-W20 Agent D; integrator-wired). No metering
 	// (internal-ops app, contract §4).
 	WorkforceEventsTopic string // WORKFORCE_EVENTS_TOPIC (default opendesk.workforce.events.v1; empty disables events)
+	// Social Publisher app (SPEC-W21 Agent B; integrator-wired). Metering
+	// (social_ad_launched) rides UsageEventsTopic — same posture as
+	// lending. The mock switches are strings (not bools) so the provider
+	// package's MockEnabled can apply its "both falsy → real stub" rule;
+	// every provider defaults to the deterministic mock (no network).
+	SocialEventsTopic string // SOCIAL_EVENTS_TOPIC (default opendesk.social.events.v1; empty disables events)
+	SocialMock        string // SOCIAL_MOCK (default "1" — master provider mock switch)
+	MetaMock          string // META_MOCK (default "1")
+	TikTokMock        string // TIKTOK_MOCK (default "1")
+	XMock             string // X_MOCK (default "1")
 }
 
 // Load reads configuration from the environment.
@@ -177,6 +187,15 @@ func Load() (Config, error) {
 		LendingEventsTopic:        envStr("LENDING_EVENTS_TOPIC", "opendesk.lending.events.v1"),
 		LendingKYCURL:             os.Getenv("LENDING_KYC_URL"),
 		WorkforceEventsTopic:      envStr("WORKFORCE_EVENTS_TOPIC", "opendesk.workforce.events.v1"),
+		// SPEC-W21 integrator (additive): social-publisher — functional
+		// with zero config; the events default matches the package doc
+		// contract (empty disables emission) and every provider defaults
+		// to the deterministic mock (both switches truthy).
+		SocialEventsTopic: envStr("SOCIAL_EVENTS_TOPIC", "opendesk.social.events.v1"),
+		SocialMock:        envStr("SOCIAL_MOCK", "1"),
+		MetaMock:          envStr("META_MOCK", "1"),
+		TikTokMock:        envStr("TIKTOK_MOCK", "1"),
+		XMock:             envStr("X_MOCK", "1"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
