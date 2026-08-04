@@ -273,7 +273,7 @@ export function SurveyEditor({
                             type: e.target.value as QuestionType,
                           })
                         }
-              >
+                      >
                         {QUESTION_TYPES.map((t) => (
                           <option key={t} value={t}>
                             {t}
