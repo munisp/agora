@@ -115,7 +115,7 @@ var CreativeKinds = []string{CreativeText, CreativeImage, CreativeVideo}
 // Post statuses (SPEC-W21 state machine):
 //
 //	draft → queued → publishing → published
-//	                  └───────→ failed
+//	                  └────────→ failed
 //
 // failed may be retried via the publish endpoint (→ publishing).
 const (
