@@ -74,6 +74,11 @@ type Deps struct {
 	// KYCHTTP is the HTTP client for the KYC call (nil → a 5s-timeout
 	// default). Tests inject a client against httptest servers.
 	KYCHTTP *http.Client
+	// UserFromContext extracts the caller subject (JWT sub) for the
+	// applications.decided_by column; may be nil (X-User-Id header
+	// fallback, then the body-supplied decided_by). Mirrors
+	// workforce.Deps.UserFromContext.
+	UserFromContext func(ctx context.Context) string
 }
 
 // Handlers serves the lending endpoints. Constructed by RegisterRoutes;
@@ -85,6 +90,9 @@ type Handlers struct {
 	UsageTopic  string
 	KYCURL      string
 	KYCHTTP     *http.Client
+	// UserFromContext extracts the caller subject (JWT sub) for
+	// decided_by; may be nil (see Deps).
+	UserFromContext func(ctx context.Context) string
 }
 
 func (h *Handlers) log() *zap.Logger {
@@ -114,12 +122,13 @@ func TenantFromContext(ctx context.Context) bookingops.TenantInfo {
 // comment for the integrator's recommended authZ shape).
 func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler) {
 	h := &Handlers{
-		Store:       d.Store,
-		Log:         d.Logger,
-		EventsTopic: d.EventsTopic,
-		UsageTopic:  d.UsageTopic,
-		KYCURL:      d.KYCURL,
-		KYCHTTP:     d.KYCHTTP,
+		Store:           d.Store,
+		Log:             d.Logger,
+		EventsTopic:     d.EventsTopic,
+		UsageTopic:      d.UsageTopic,
+		KYCURL:          d.KYCURL,
+		KYCHTTP:         d.KYCHTTP,
+		UserFromContext: d.UserFromContext,
 	}
 	r.Route("/v1/lending", func(r chi.Router) {
 		r.Use(tenantMiddleware(d.Resolver, d.Logger))
@@ -200,6 +209,33 @@ func (h *Handlers) tenantOr400(w http.ResponseWriter, r *http.Request) (bookingo
 		return t, false
 	}
 	return t, true
+}
+
+// callerSub resolves the caller subject for decided_by: JWT sub via the
+// integrator-wired UserFromContext, X-User-Id fallback, else "" (mirrors
+// workforce.Handlers.callerSub).
+func (h *Handlers) callerSub(r *http.Request) string {
+	if h.UserFromContext != nil {
+		if sub := strings.TrimSpace(h.UserFromContext(r.Context())); sub != "" {
+			return sub
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("X-User-Id"))
+}
+
+// decidedBy resolves the operator identity stamped on approve/decline
+// (SPEC-W24 WS-A2). Precedence follows the workforce leave-decision
+// convention (leave_requests.decided_by is ALWAYS the caller identity,
+// never client input): the authenticated caller (JWT sub via
+// UserFromContext, X-User-Id fallback) WINS over any body-supplied
+// decided_by. The body value remains only as a fallback for callers
+// without an authenticated identity (unwired middleware in dev/tests) so
+// the pre-W24 request shape keeps working.
+func (h *Handlers) decidedBy(r *http.Request, bodyValue *string) *string {
+	if sub := h.callerSub(r); sub != "" {
+		return &sub
+	}
+	return bodyValue
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +435,8 @@ func (h *Handlers) CreateApplication(w http.ResponseWriter, r *http.Request) {
 //
 //	status:         submitted|under_review|approved|declined|defaulted
 //	decline_reason: required for →declined
-//	decided_by:     optional operator handle, stamped on approve/decline
+//	decided_by:     fallback operator handle for approve/decline — the
+//	                authenticated identity (JWT sub) wins when resolvable
 //	kyc_override + kyc_reason: approve gate when LENDING_KYC_URL is unset
 //	kyc:            {subject_phone, id_type, id_value} for the kyc-service
 //	                call when LENDING_KYC_URL IS set
@@ -425,7 +462,8 @@ type kycInput struct {
 // submitted→under_review; under_review→approved (KYC-gated) | declined
 // (reason required); approved|disbursed|submitted|under_review→defaulted
 // (operator-driven; flips the active loan too). decided_at/decided_by are
-// stamped on approve/decline.
+// stamped on approve/decline; decided_by is the authenticated operator
+// identity (see decidedBy).
 func (h *Handlers) PatchApplication(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := h.tenantOr400(w, r)
 	if !ok {
@@ -468,7 +506,7 @@ func (h *Handlers) PatchApplication(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.DeclineReason = &reason
-		a.DecidedBy = req.DecidedBy
+		a.DecidedBy = h.decidedBy(r, req.DecidedBy)
 		now := time.Now().UTC()
 		a.DecidedAt = &now
 	case StatusApproved:
@@ -478,7 +516,7 @@ func (h *Handlers) PatchApplication(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.DeclineReason = nil
-		a.DecidedBy = req.DecidedBy
+		a.DecidedBy = h.decidedBy(r, req.DecidedBy)
 		now := time.Now().UTC()
 		a.DecidedAt = &now
 	}
