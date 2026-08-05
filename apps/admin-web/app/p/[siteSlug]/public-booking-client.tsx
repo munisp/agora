@@ -453,7 +453,7 @@ export function PublicBookingClient({
 
       {!embed ? (
         <footer className="border-t border-border py-6 text-center text-xs text-muted-foreground">
-          {brandName} · Powered by OpenDesk — open-source AI receptionist
+          {brandName} · Powered by Agora — open-source AI receptionist
         </footer>
       ) : null}
 

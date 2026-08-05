@@ -21,7 +21,7 @@ export default function OfflinePage() {
       >
         <h1 className="text-xl font-semibold">You&rsquo;re offline</h1>
         <p className="mt-2 max-w-sm text-sm" style={{ color: "#6e6558" }}>
-          OpenDesk can&rsquo;t reach the network right now and this page
+          Agora can&rsquo;t reach the network right now and this page
           isn&rsquo;t cached yet. Reconnect and try again — pages you&rsquo;ve
           visited before remain available offline.
         </p>
