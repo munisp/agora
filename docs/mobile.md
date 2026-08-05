@@ -1,6 +1,6 @@
 # Mobile app (apps/mobile) — setup, build, push
 
-The OpenDesk field app is an Expo React Native app (SDK 51, expo-router)
+The Agora field app is an Expo React Native app (SDK 51, expo-router)
 covering the field surfaces of the CAC program: today dashboard, lead
 capture, referrals + leaderboard, incidents inbox, and push registration
 (SPEC-W16 contract §5). Source and developer docs live in

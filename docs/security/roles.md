@@ -1,6 +1,6 @@
 # Roles & Capabilities
 
-OpenDesk access control is layered: **Keycloak** issues realm roles in the JWT,
+Agora access control is layered: **Keycloak** issues realm roles in the JWT,
 **APISIX** authenticates requests at the gateway and injects identity headers,
 **Permify** authorizes tenant-scoped mutations in the services, and the
 **admin-web dashboard** gates which sections a user can see and reach.

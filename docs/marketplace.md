@@ -1,4 +1,4 @@
-# OpenDesk Pack Marketplace (Wave 5 #6)
+# Agora Pack Marketplace (Wave 5 #6)
 
 Industry packs (`industries/*.yaml`, SPEC-CRM §C) configure terminology, the
 agent persona, booking policy, Temporal workflow, catalog seed, reminders,
@@ -92,13 +92,13 @@ identity bound to the publisher's OIDC account, Rekor transparency log):
 3. `install-pack.sh` verifies the bundle offline with the embedded Rekor key
    before installing; `validate_pack.py validate-index` gains a `--verify`
    mode that re-verifies every signed entry. Built-in packs are signed with
-   the OpenDesk release identity; unsigned community packs keep installing
+   the Agora release identity; unsigned community packs keep installing
    with a warning (policy flag `--require-signed` for regulated deployments).
 
 ## Revenue share (policy placeholder)
 
 Paid packs sold through the marketplace are subject to the platform revenue
-share defined in **STRATEGY.md §2 item 1** (15–30% to OpenDesk, rest to the
+share defined in **STRATEGY.md §2 item 1** (15–30% to Agora, rest to the
 publisher). Free packs are always permitted and drive adoption. Payout
 cadence, refund policy and tax handling are TBD and will be documented with
 the marketplace launch; pack authors should treat this section as a pointer,

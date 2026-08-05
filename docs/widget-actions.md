@@ -20,7 +20,7 @@ widget. Nothing is ever executed server-side.
   (`//evil.example`, `https://…`, `javascript:…` are all rejected);
   no whitespace; ≤2048 chars. Same-origin only.
 - **highlight** — `selector` may only contain
-  `[a-zA-Z0-9\-_#. :\[\]="'>]` and is capped at 120 chars — enough for
+  `[a-zA-Z0-9\-_#. :\[\]=\"'>]` and is capped at 120 chars — enough for
   id/class/attribute/descendant selectors, excluding everything that could
   smuggle markup or script.
 - **prefill_booking** — `offering_id` must be a UUID (normalized to
@@ -81,7 +81,7 @@ action never breaks the widget or the host page):
   action before executing (defense in depth against a compromised
   transport).
 - **postMessage trust**: the loader only honors messages whose `origin`
-  matches the OpenDesk host and whose `source` is the widget iframe it
+  matches the Agora host and whose `source` is the widget iframe it
   created.
 - **Graceful degradation**: unknown action types, missing elements and DOM
   errors are all no-ops.

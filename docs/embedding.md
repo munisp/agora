@@ -1,6 +1,6 @@
 # Embedding the booking widget (I20)
 
-OpenDesk ships a chromeless booking + chat page at `/embed/{siteSlug}` and a
+Agora ships a chromeless booking + chat page at `/embed/{siteSlug}` and a
 tiny iframe loader at `/embed.js`, so tenants can put their AI receptionist on
 their own website — the self-hosted equivalent of the baseline's ElevenLabs
 widget.
@@ -49,12 +49,12 @@ Example with a container:
 ## Notes & limits
 
 - **Self-hosted**: no third-party scripts or cookies; everything is served
-  from the OpenDesk web app origin.
+  from the Agora web app origin.
 - **Chat**: the embedded chat widget talks to the same receptionist
   (`POST /voice/chat`, streamed over SSE when available) as the public page.
 - **Voice**: the voice button is hidden in embed mode; if enabled in the
   future, the iframe already carries `allow="microphone"`.
 - **Sizing**: the iframe does not auto-resize; pick a fixed `data-height`
   that fits the booking flow.
-- **CSP**: host pages need `frame-src` allowing the OpenDesk origin if a
+- **CSP**: host pages need `frame-src` allowing the Agora origin if a
   Content-Security-Policy is in place.
