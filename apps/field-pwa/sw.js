@@ -10,7 +10,7 @@
  */
 "use strict";
 
-var OPENDESK_SW_V = "field-pwa-v1";
+var OPENDESK_SW_V = "field-pwa-v2";
 var SHELL = "opendesk-field-" + OPENDESK_SW_V;
 
 var PRECACHE = [
@@ -18,8 +18,7 @@ var PRECACHE = [
   "index.html",
   "app.js",
   "manifest.webmanifest",
-  "icons/icon-192.png",
-  "icons/icon-512.png",
+  "icons/agora-icon.svg",
 ];
 
 self.addEventListener("install", function (event) {
@@ -48,7 +47,7 @@ self.addEventListener("fetch", function (event) {
   if (req.mode === "navigate") {
     event.respondWith(
       fetch(req).catch(function () {
-        return caches.match("index.html").then(function (m) { return m || Response.error(); });
+        return caches.match("index.html").then(function (m) { return m || Response.error(); })
       })
     );
     return;

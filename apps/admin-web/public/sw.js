@@ -13,7 +13,7 @@
  */
 "use strict";
 
-const OPENDESK_SW_V = "admin-web-v1";
+const OPENDESK_SW_V = "admin-web-v2";
 const SHELL_CACHE = `opendesk-shell-${OPENDESK_SW_V}`;
 const RUNTIME_CACHE = `opendesk-runtime-${OPENDESK_SW_V}`;
 
@@ -22,8 +22,7 @@ const API_TIMEOUT_MS = 3000;
 const PRECACHE_URLS = [
   "/offline",
   "/manifest.webmanifest",
-  "/icons/icon-192.png",
-  "/icons/icon-512.png",
+  "/icons/agora-icon.svg",
 ];
 
 /** Paths that must never be cached or intercepted with fallbacks. */
