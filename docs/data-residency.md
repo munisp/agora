@@ -1,16 +1,16 @@
 # Data Residency — Lagos Primary + af-south-1 DR (SPEC-W15, Agent D)
 
-Deployment and residency guide for running the OpenDesk stack for Nigerian
+Deployment and residency guide for running the Agora stack for Nigerian
 tenants under two regulatory drivers:
 
 - **CBN data-residency directive (compliance deadline June 2026)** — payment
   and financial-ledger data of Nigerian data subjects must be stored and
-  processed on infrastructure physically located in Nigeria. For OpenDesk
+  processed on infrastructure physically located in Nigeria. For Agora
   this covers the payments ledger (TigerBeetle), the payment/consent/PII
   rows in Postgres, and any object or log storage that carries payment or
   personal data.
 - **NDPA 2023** — personal-data processing must be lawful, consent-based
-  where required, and erasable on request. OpenDesk's NDPA machinery
+  where required, and erasable on request. Agora's NDPA machinery
   (consent registry + tombstone erasure events, SPEC-W12 §4) is described in
   `docs/compliance-ndpa.md`; this document only covers the *residency*
   dimension — where bytes physically live.

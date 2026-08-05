@@ -1,9 +1,9 @@
-# OpenDesk — Strategy: Use Cases, Monetization & Innovation Wave 5
+# Agora — Strategy: Use Cases, Monetization & Innovation Wave 5
 
 ## 1. Use cases (who this platform serves)
 
 ### Core verticals (industry packs already shipped)
-| Vertical | Receptionist jobs | Why OpenDesk wins |
+| Vertical | Receptionist jobs | Why Agora wins |
 |---|---|---|
 | **Salons / barbers / spas** | Book cuts & treatments, deposits, stylist matching, no-show fees | Deposit policy engine + no-show fee workflow + waitlist backfill |
 | **Clinics / dental / physio / mental health** | Patient intake, consent forms, triage questions, PII care | ClinicIntake workflow, PII redaction (Fluvio), self-hosted = data stays in-house |
@@ -29,14 +29,14 @@
 
 ## 2. Monetization with 3rd-party apps
 
-OpenDesk is open-source (Apache-2.0) — monetize the open-core way:
+Agora is open-source (Apache-2.0) — monetize the open-core way:
 
 1. **Integration marketplace (revenue share)** — the plugin SDK (Wave 4) + pack registry (Wave 5 #6) let 3rd parties publish packs/tools (e.g. "Shopify order lookup", "HubSpot sync", "Stripe payments"). Platform takes 15–30% of paid-pack sales; free packs drive adoption.
 2. **Usage-metered API (Wave 5 #9)** — gold.usage_daily tracks call-minutes, bookings, messages, AI tokens per tenant → sell API access to 3rd-party apps (scheduling aggregators, booking marketplaces) at $/1k calls with tiered rate limits (the APISIX plan-tier limits are already in place).
 3. **Outbound webhooks / Zapier-style connector (Wave 5 #10)** — 3rd-party apps subscribe to booking/conversation events with HMAC-signed webhooks; premium tiers get higher event quotas + retry SLAs. Publish an official Zapier/Make app on top.
 4. **Payments margin** — deposits/no-show fees flow through TigerBeetle + Mojaloop; hosted version can take 0.5–1% processing margin above rail cost.
 5. **Telephony resale** — SIP trunks (Wave 5 #1) bundled per-tenant with markup on minutes; the CPS pacer is already the compliance feature carriers require.
-6. **White-label / OEM for agencies** — marketing agencies deploy OpenDesk under their brand for local-business clients; license = annual support + priority packs.
+6. **White-label / OEM for agencies** — marketing agencies deploy Agora under their brand for local-business clients; license = annual support + priority packs.
 7. **Premium vertical packs** — regulated-industry packs (clinic HIPAA-style, legal intake) as paid add-ons with compliance documentation.
 8. **Support & SLA** — production topology (ADR-0008), backup/restore, and upgrade runbooks as paid support contracts; trainings for self-hosters.
 9. **Marketplace of AI models/personas** — tuned persona prompts + voice models per vertical (voice biometrics, whisper-copilot packs), sold per-tenant.

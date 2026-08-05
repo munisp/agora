@@ -1,15 +1,15 @@
 # Twenty CRM Integration
 
-OpenDesk syncs tenants, contacts and bookings **bidirectionally** with a
-self-hosted [Twenty](https://twenty.com) CRM: forward (OpenDesk → Twenty)
-via Kafka event consumers, and reverse (Twenty → OpenDesk) via HMAC-verified
+Agora syncs tenants, contacts and bookings **bidirectionally** with a
+self-hosted [Twenty](https://twenty.com) CRM: forward (Agora → Twenty)
+via Kafka event consumers, and reverse (Twenty → Agora) via HMAC-verified
 webhooks and a dedicated reverse worker. This guide covers the architecture,
 setup, event mapping, loop prevention, rate limits and day-2 operations.
 
 ## Architecture
 
 ```
-                        ┌────────────────────────── OpenDesk compose ──────────────────────────┐
+                        ┌───────────────────────── OpenDesk compose ──────────────────────────┐
                         │                                                                      │
  identity-service ──┐   │                                                                      │
  booking-service  ──┼──►│  Kafka topics                                                        │
@@ -45,7 +45,7 @@ setup, event mapping, loop prevention, rate limits and day-2 operations.
 | `twenty-api` | `twentycrm/twenty:v1.3.2` | `3100:3000` | Twenty server (REST + frontend) |
 | `twenty-worker` | `twentycrm/twenty:v1.3.2` (`yarn worker:prod`) | — | Background job worker (Bull-MQ) |
 | `twenty-redis` | `redis:7-alpine` | internal | Queue + cache for Twenty |
-| `crm-sync` | `services/crm-sync-service` (Go 1.23) | `7010` | OpenDesk ⇄ Twenty bridge |
+| `crm-sync` | `services/crm-sync-service` (Go 1.23) | `7010` | Agora ⇄ Twenty bridge |
 | `daprd-crm-sync` | daprd sidecar (`DAPR_APP_ID=crm-sync`) | internal | Pub/sub + service invocation |
 
 Twenty stores its data in the shared `postgres` container (database
@@ -78,7 +78,7 @@ plus token secrets with `-dev` fallbacks
 All Twenty calls use `Authorization: Bearer <key>` against
 `TWENTY_API_URL` (`http://twenty-api:3000` in-compose).
 
-## Sync mapping (OpenDesk → Twenty)
+## Sync mapping (Agora → Twenty)
 
 | Kafka topic | CloudEvent type | Twenty action | sync_map rows |
 |---|---|---|---|
@@ -92,7 +92,7 @@ All Twenty calls use `Authorization: Bearer <key>` against
 Every forward-sync `sync_map` write also stamps `last_synced_at` — the input
 for reverse echo suppression (below). `kind=booking_task` (booking id → task
 id) exists so the reverse worker can resolve a `task.updated` webhook back to
-its OpenDesk booking.
+its Agora booking.
 
 Upserts are keyed by `sync_map`
 `UNIQUE(kind, opendesk_id, tenant_id)`, so re-delivered events are idempotent.
@@ -182,7 +182,7 @@ The note is created via `POST /rest/notes` and linked to the person via
   (`user_speech_committed`); if the LiveKit event surface changes, turns
   degrade to 0 rather than breaking session teardown.
 
-## Reverse sync (Twenty → OpenDesk)
+## Reverse sync (Twenty → Agora)
 
 The reverse direction is fully wired: Twenty webhook → HMAC intake →
 `opendesk.crm.events` → reverse worker (Kafka consumer group
@@ -241,7 +241,7 @@ booking-service schema additions are bootstrapped idempotently at startup
   (`REVERSE_ECHO_WINDOW_SECONDS`) is our own write echoing back and is
   skipped + acked (metric `reverse_echo_suppressed`).
 * **`task.updated` gating.** Only tasks with a `sync_map kind=booking_task`
-  mapping (i.e. tasks OpenDesk created) produce crm-notes; tasks created
+  mapping (i.e. tasks Agora created) produce crm-notes; tasks created
   inside Twenty are ignored.
 
 **Remaining race (accepted, documented):** a person edited by a human in
