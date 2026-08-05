@@ -12,7 +12,7 @@ export const metadata: Metadata = {
   description:
     "Agora is the open-source, multi-tenant AI receptionist platform: voice + text concierge, bookings, catalog, knowledge base and payments.",
   manifest: "/manifest.webmanifest",
-  icons: { apple: "/icons/icon-192.png" },
+  icons: { icon: "/icons/agora-icon.svg" },
   appleWebApp: { capable: true, title: "Agora Admin" },
 };
 
