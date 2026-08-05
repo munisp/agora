@@ -188,8 +188,8 @@ export function VoiceAgentClient({ orgSlug }: { orgSlug: string }) {
             <CardHeader>
               <CardTitle>Terminology</CardTitle>
               <CardDescription>
-                Map generic words to your vocabulary — e.g. "appointment" →
-                "session". Applied to prompts and the public site.
+                Map generic words to your vocabulary — e.g. “appointment” →
+                “session”. Applied to prompts and the public site.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -257,8 +257,8 @@ export function VoiceAgentClient({ orgSlug }: { orgSlug: string }) {
             >
               {turns.length === 0 ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">
-                  Try: "What are your opening hours?" or "Book a consultation
-                  tomorrow at 10."
+                  Try: “What are your opening hours?” or “Book a consultation
+                  tomorrow at 10.”
                 </p>
               ) : (
                 turns.map((t, i) => (

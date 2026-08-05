@@ -206,8 +206,8 @@ export function ChatWidget({
           >
             {turns.length === 0 ? (
               <p className="py-6 text-center text-xs text-muted-foreground">
-                Hi! Ask me about services, hours, or say "book me in Friday
-                morning".
+                Hi! Ask me about services, hours, or say “book me in Friday
+                morning”.
               </p>
             ) : (
               turns.map((t, i) => (

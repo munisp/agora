@@ -449,7 +449,7 @@ function SuggestionsPanel({
               Questions customers asked that the knowledge base could not answer.
             </CardDescription>
           </div>
-          <Badge variant="secondary">suggestions.length}</Badge>
+          <Badge variant="secondary">{suggestions.length}</Badge>
         </CardHeader>
       </Card>
 
