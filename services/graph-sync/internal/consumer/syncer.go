@@ -499,7 +499,6 @@ func (s *Syncer) HandleEnrichment(ctx context.Context, evt events.CloudEvent) er
 	return nil
 }
 
-
 // normalizeEnrichmentProps normalizes RFC3339 timestamp VALUES inside the
 // opaque property map to UTC (dual-TZ safety: offsets emitted by the spark
 // job never leak into the graph). Non-timestamp values pass through
