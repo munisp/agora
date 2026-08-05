@@ -1,7 +1,7 @@
 # Apps Platform — Operator Guide (SPEC-W18)
 
 How enterprise apps are modeled, provisioned, entitled and observed on
-OpenDesk. The registry lives in **identity-service** (`internal/apps`,
+Agora. The registry lives in **identity-service** (`internal/apps`,
 shipped in W18; catalog content in
 `services/identity-service/internal/apps/catalog.yaml`).
 
