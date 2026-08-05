@@ -49,6 +49,24 @@ class Settings:
     jwt_public_key: str = field(default_factory=lambda: os.getenv("JWT_PUBLIC_KEY", ""))
     jwt_algorithm: str = field(default_factory=lambda: os.getenv("JWT_ALGORITHM", "RS256"))
 
+    # Internal service-to-service write-back API (SPEC-W29 §3 WS-B): the
+    # X-Internal-Token header must equal this value (constant-time compare).
+    # Empty -> every internal call answers 401 (fail-closed).
+    internal_token: str = field(default_factory=lambda: os.getenv("INTERNAL_TOKEN", ""))
+
+    # Dev/e2e fixture seeder (SPEC-W30 WS-C addendum): the fixtures router is
+    # mounted ONLY when E2E_FIXTURES=1; production images leave it unset.
+    e2e_fixtures: bool = field(default_factory=lambda: _bool("E2E_FIXTURES", False))
+
+    # Fraud alert audit events (SPEC-W30 §4 WS-C): CloudEvents published to
+    # Kafka when configured; otherwise a no-op logger publisher is used.
+    kafka_bootstrap_servers: str = field(
+        default_factory=lambda: os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
+    )
+    fraud_alerts_topic: str = field(
+        default_factory=lambda: os.getenv("FRAUD_ALERTS_TOPIC", "opendesk.fraud.alerts.v1")
+    )
+
     # Ollama NL->Cypher (OpenAI-compatible chat API).
     ollama_base_url: str = field(
         default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")

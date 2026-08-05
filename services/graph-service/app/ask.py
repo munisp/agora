@@ -64,15 +64,21 @@ def build_prompt(question: str) -> list[dict[str, str]]:
     ]
     schema = (
         "Graph schema (per-tenant; every node carries tenant_id):\n"
-        "Nodes: Person{person_id,name,phone_hash,channels,consent_summary,quarantine}, "
+        "Nodes: Person{person_id,name,phone_hash,channels,consent_summary,quarantine,"
+        "propensity_churn,propensity_convert,propensity_turnout,risk_score,"
+        "scored_at,model_version,name_embedding}, "
         "Contact{lead_id,channel_of_first_touch,source,captured_at}, "
         "Consent{consent_id,purpose,granted_at,revoked_at}, "
         "Booking{booking_id,status,created_at,showed}, Offering{offering_id,name}, "
-        "Location{lga,ward}, Campaign{campaign_id,kind}.\n"
+        "Location{lga,ward}, Campaign{campaign_id,kind}, "
+        "Alert{alert_id,type,severity,status,person_id,agent_id,evidence,created_at,"
+        "resolved_at,resolved_by,resolve_reason}.\n"
         "Edges: (Person)-[:CONSENTED]->(Consent), (Person)-[:HAS_CONTACT]->(Contact), "
         "(Contact)-[:CAPTURED_AT]->(Location), (Person)-[:BOOKED]->(Booking), "
         "(Booking)-[:FOR]->(Offering), (Person)-[:REFERRED]->(Person), "
-        "(Person)-[:MESSAGED]->(Campaign)."
+        "(Person)-[:MESSAGED]->(Campaign), "
+        "(Person)-[:RECOMMENDED_FOR{score,rank,reason}]->(Offering), "
+        "(Alert)-[:FLAGGED]->(Person)."
     )
     system = (
         "You translate analytics questions about a tenant knowledge graph into one of "

@@ -22,9 +22,52 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _PURPOSE_RE = r"^[a-z][a-z0-9_\-]{0,63}$"
+
+# SPEC-W29 §3 WS-B: numeric score filters over the predictive layer (W29)
+# and the fraud risk head (W30). Unknown fields are rejected at validation
+# time (-> 422 at the API layer); values are always bound as parameters by
+# the compiler, never interpolated.
+SCORE_FILTER_FIELDS: tuple[str, ...] = (
+    "propensity_churn",
+    "propensity_convert",
+    "propensity_turnout",
+    "risk_score",
+)
+SCORE_FILTER_OPS: tuple[str, ...] = (">=", "<=", "between")
+
+
+class ScoreFilter(BaseModel):
+    """One numeric score predicate, e.g.
+    ``{"field": "propensity_churn", "op": ">=", "value": 0.7}`` or
+    ``{"field": "risk_score", "op": "between", "value": [0.2, 0.8]}``."""
+
+    field: Literal[
+        "propensity_churn", "propensity_convert", "propensity_turnout", "risk_score"
+    ]
+    op: Literal[">=", "<=", "between"]
+    value: float | list[float]
+
+    @model_validator(mode="after")
+    def _value_matches_op(self) -> "ScoreFilter":
+        if self.op == "between":
+            if (
+                not isinstance(self.value, list)
+                or len(self.value) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in self.value)
+            ):
+                raise ValueError("op 'between' requires value [lo, hi] (two numbers)")
+            lo, hi = float(self.value[0]), float(self.value[1])
+            if lo > hi:
+                raise ValueError("op 'between' requires lo <= hi")
+            self.value = [lo, hi]
+        else:
+            if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
+                raise ValueError(f"op {self.op!r} requires a single numeric value")
+            self.value = float(self.value)
+        return self
 
 
 class SegmentFilter(BaseModel):
@@ -43,6 +86,9 @@ class SegmentFilter(BaseModel):
     )
     lga: str | None = Field(default=None, max_length=200)
     not_messaged_since_days: int | None = Field(default=None, ge=0, le=3650)
+    # SPEC-W29 §3 WS-B: optional numeric score predicates. Persons without a
+    # stored score never match a score filter (null comparisons are false).
+    score_filters: list[ScoreFilter] = Field(default_factory=list, max_length=8)
     # Compliance gate 4: quarantined persons are query-visible elsewhere but
     # NEVER segment/audience eligible. This flag exists only to make the
     # handling explicit in saved DSL; true is rejected.

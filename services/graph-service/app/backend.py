@@ -21,8 +21,39 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .plans import CompiledQuery, PersonFilterPlan, TemplatePlan, parse_instant
+from .plans import (
+    CompiledQuery,
+    PersonFilterPlan,
+    ScoreFilterSpec,
+    TemplatePlan,
+    parse_instant,
+)
 from .templates import TEMPLATES, GraphView, has_valid_consent
+from .writes import (
+    AlertResolvePlan,
+    CompiledWrite,
+    CrossTenantWriteError,
+    FixtureSeedPlan,
+    RecommendationWritePlan,
+    ScoreWritePlan,
+    WriteTargetMissing,
+)
+
+
+def _score_matches(raw: Any, spec: ScoreFilterSpec) -> bool:
+    """Mirror of the compiled Cypher's comparison semantics: a missing or
+    non-numeric score never matches (null comparisons are false)."""
+    if raw is None or isinstance(raw, bool):
+        return False
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if spec.op == ">=":
+        return value >= spec.lo
+    if spec.op == "<=":
+        return value <= spec.lo
+    return spec.hi is not None and spec.lo <= value <= spec.hi
 
 
 class GraphError(Exception):
@@ -74,6 +105,44 @@ class FalkorBackend:
             return await asyncio.to_thread(_run)
         except Exception as exc:  # noqa: BLE001 — driver/redis outage
             raise GraphError(f"falkordb query failed: {type(exc).__name__}: {exc}") from exc
+
+    async def execute_write(self, write: CompiledWrite, tenant_id: str) -> dict[str, Any]:
+        def _run() -> dict[str, Any]:
+            if write.check_cypher:
+                check_rows = self._query_rows(
+                    write.check_cypher, {**write.check_params, "tenant_id": tenant_id}
+                )
+                for row in check_rows:
+                    row_tenant = row.get("tenant_id")
+                    if row_tenant is not None and row_tenant != tenant_id:
+                        raise CrossTenantWriteError(
+                            f"target node belongs to tenant {row_tenant!r}, "
+                            f"refusing write from {tenant_id!r}"
+                        )
+            rows = self._query_rows(write.cypher, {**write.params, "tenant_id": tenant_id})
+            if write.require_rows and not rows:
+                raise WriteTargetMissing("write target node not found for tenant")
+            followup_rows: list[dict[str, Any]] = []
+            if write.followup_cypher:
+                followup_rows = self._query_rows(
+                    write.followup_cypher,
+                    {**write.followup_params, "tenant_id": tenant_id},
+                )
+            for cypher, params in write.statements:
+                self._graph.query(cypher, {**params, "tenant_id": tenant_id})
+            return {"rows": rows, "followup_rows": followup_rows}
+
+        try:
+            return await asyncio.to_thread(_run)
+        except (CrossTenantWriteError, WriteTargetMissing):
+            raise
+        except Exception as exc:  # noqa: BLE001 — driver/redis outage
+            raise GraphError(f"falkordb write failed: {type(exc).__name__}: {exc}") from exc
+
+    def _query_rows(self, cypher: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        result = self._graph.query(cypher, params)
+        columns = [col[1] for col in result.header]
+        return [dict(zip(columns, row)) for row in result.result_set]
 
     async def ping(self) -> bool:
         try:
@@ -173,6 +242,177 @@ class InMemoryBackend:
             return template.evaluate(self.graph, plan.params, tenant_id, 10000)
         raise GraphError(f"unsupported plan {type(plan).__name__}")
 
+    async def execute_write(self, write: CompiledWrite, tenant_id: str) -> dict[str, Any]:
+        """Apply a CompiledWrite's plan with the SAME semantics the Cypher
+        encodes (tenant verification before MERGE, conditional unquarantine)."""
+        plan = write.plan
+        if isinstance(plan, ScoreWritePlan):
+            return self._apply_score_write(plan, tenant_id)
+        if isinstance(plan, RecommendationWritePlan):
+            return self._apply_recommendation_write(plan, tenant_id)
+        if isinstance(plan, AlertResolvePlan):
+            return self._apply_alert_resolve(plan, tenant_id)
+        if isinstance(plan, FixtureSeedPlan):
+            return self._apply_fixture_seed(plan, tenant_id)
+        raise GraphError(f"unsupported write plan {type(plan).__name__}")
+
+    # --- write plan semantics (mirror writes.py's Cypher) -------------------
+    def _nodes_by_prop(self, label: str, prop: str, value: Any) -> list[GNode]:
+        return [
+            n
+            for n in self.graph.nodes.values()
+            if label in n.labels and n.props.get(prop) == value
+        ]
+
+    def _apply_score_write(self, plan: ScoreWritePlan, tenant_id: str) -> dict[str, Any]:
+        existing = self._nodes_by_prop("Person", "person_id", plan.person_id)
+        for node in existing:
+            if node.props.get("tenant_id") != tenant_id:
+                raise CrossTenantWriteError(
+                    f"person {plan.person_id!r} belongs to tenant "
+                    f"{node.props.get('tenant_id')!r}, refusing write from {tenant_id!r}"
+                )
+        if not existing:
+            # MATCH-not-MERGE semantics: unknown persons are never created
+            # as bare stubs (verification gate WARN #4).
+            raise WriteTargetMissing(
+                f"person {plan.person_id!r} not found for tenant {tenant_id!r}"
+            )
+        node = existing[0]
+        node.props.update(plan.scores)
+        node.props["model_version"] = plan.model_version
+        node.props["scored_at"] = plan.scored_at
+        return {"rows": [{"person_id": plan.person_id, "created": False}]}
+
+    def _apply_recommendation_write(
+        self, plan: RecommendationWritePlan, tenant_id: str
+    ) -> dict[str, Any]:
+        persons = self._nodes_by_prop("Person", "person_id", plan.person_id)
+        offerings = self._nodes_by_prop("Offering", "offering_id", plan.offering_id)
+        for node in persons + offerings:
+            if node.props.get("tenant_id") != tenant_id:
+                raise CrossTenantWriteError(
+                    f"recommendation endpoint belongs to tenant "
+                    f"{node.props.get('tenant_id')!r}, refusing write from {tenant_id!r}"
+                )
+        if not persons or not offerings:
+            raise WriteTargetMissing(
+                f"person {plan.person_id!r} or offering {plan.offering_id!r} "
+                f"not found for tenant {tenant_id!r}"
+            )
+        person, offering = persons[0], offerings[0]
+        props = {
+            "score": plan.score,
+            "rank": plan.rank,
+            "reason": plan.reason,
+            "model_version": plan.model_version,
+            "scored_at": plan.scored_at,
+        }
+        for edge in self.graph.edges_from(person.node_id, "RECOMMENDED_FOR"):
+            if edge.dst == offering.node_id:
+                edge.props.update(props)  # MERGE-overwrite keeps the latest
+                return {
+                    "rows": [
+                        {"person_id": plan.person_id, "offering_id": plan.offering_id}
+                    ]
+                }
+        self.graph.add_edge(person.node_id, offering.node_id, "RECOMMENDED_FOR", **props)
+        return {
+            "rows": [{"person_id": plan.person_id, "offering_id": plan.offering_id}]
+        }
+
+    def _apply_alert_resolve(self, plan: AlertResolvePlan, tenant_id: str) -> dict[str, Any]:
+        matches = self._nodes_by_prop("Alert", "alert_id", plan.alert_id)
+        for node in matches:
+            if node.props.get("tenant_id") != tenant_id:
+                raise CrossTenantWriteError(
+                    f"alert {plan.alert_id!r} belongs to tenant "
+                    f"{node.props.get('tenant_id')!r}, refusing write from {tenant_id!r}"
+                )
+        if not matches:
+            raise WriteTargetMissing(f"alert {plan.alert_id!r} not found")
+        alert = matches[0]
+        alert.props["status"] = plan.decision
+        alert.props["resolved_at"] = plan.resolved_at
+        alert.props["resolved_by"] = plan.resolved_by
+        alert.props["resolve_reason"] = plan.reason
+
+        unquarantined = False
+        person_id = alert.props.get("person_id")
+        if plan.decision == "dismissed" and person_id:
+            persons = [
+                p
+                for p in self._nodes_by_prop("Person", "person_id", person_id)
+                if p.props.get("tenant_id") == tenant_id
+            ]
+            person = persons[0] if persons else None
+            if person is not None and not self._other_open_high_alerts(
+                tenant_id, plan.alert_id, person
+            ):
+                person.props["quarantine"] = False  # canonical W28 property
+                unquarantined = True
+        return {
+            "rows": [
+                {
+                    "alert_id": plan.alert_id,
+                    "person_id": person_id,
+                    "type": alert.props.get("type"),
+                    "severity": alert.props.get("severity"),
+                    "status": plan.decision,
+                }
+            ],
+            "unquarantined": unquarantined,
+        }
+
+    def _other_open_high_alerts(
+        self, tenant_id: str, resolved_alert_id: str, person: GNode
+    ) -> bool:
+        for alert in self.graph.nodes_with("Alert", tenant_id):
+            if alert.props.get("alert_id") == resolved_alert_id:
+                continue
+            if alert.props.get("status") != "open":
+                continue
+            if alert.props.get("severity") != "high":
+                continue
+            # Flag linkage: FLAGGED edge to the person, or a person_id prop.
+            if alert.props.get("person_id") == person.props.get("person_id"):
+                return True
+            if any(
+                e.dst == person.node_id
+                for e in self.graph.edges_from(alert.node_id, "FLAGGED")
+            ):
+                return True
+        return False
+
+    def _apply_fixture_seed(self, plan: FixtureSeedPlan, tenant_id: str) -> dict[str, Any]:
+        key_to_node: dict[str, GNode] = {}
+        for spec in plan.nodes:
+            node_id = f"{tenant_id}:{spec.key}"
+            props = {**spec.props, "tenant_id": tenant_id}
+            existing = self.graph.nodes.get(node_id)
+            if existing is not None:
+                existing.props.update(props)
+                key_to_node[spec.key] = existing
+            else:
+                key_to_node[spec.key] = self.graph.add_node(node_id, set(spec.labels), **props)
+        for edge in plan.edges:
+            src = key_to_node.get(edge.src_key) or self.graph.nodes.get(
+                f"{tenant_id}:{edge.src_key}"
+            )
+            dst = key_to_node.get(edge.dst_key) or self.graph.nodes.get(
+                f"{tenant_id}:{edge.dst_key}"
+            )
+            if src is None or dst is None:
+                raise WriteTargetMissing(
+                    f"fixture edge endpoint missing: {edge.src_key}->{edge.dst_key}"
+                )
+            self.graph.add_edge(src.node_id, dst.node_id, edge.type, **dict(edge.props))
+        return {
+            "rows": [],
+            "nodes_written": len(plan.nodes),
+            "edges_written": len(plan.edges),
+        }
+
     async def ping(self) -> bool:
         return True
 
@@ -228,6 +468,14 @@ class InMemoryBackend:
                     for m in view.edges_from(person.node_id, "MESSAGED")
                 )
                 if recent:
+                    continue
+            # SPEC-W29 §3 WS-B: numeric score predicates. A person without a
+            # stored score never matches (mirrors Cypher null semantics).
+            if plan.score_filters:
+                if not all(
+                    _score_matches(person.props.get(spec.field), spec)
+                    for spec in plan.score_filters
+                ):
                     continue
             matched.append(person)
 
