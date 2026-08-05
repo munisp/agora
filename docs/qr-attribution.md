@@ -1,137 +1,117 @@
-# QR / promo landing attribution (SPEC-W13, Agent E)
+# QR / `?ref=` attribution — embed.js & public landing (SPEC-W13 §3, Agent E)
 
-How a QR scan, UTM link or `?promo=` share link becomes first-touch lead
-attribution — entirely on the frontend/edge side. Backend lead storage,
-precedence and dedupe are owned by booking-service (Agent A, SPEC-W13 §1/§3/§6);
-the frontend **only forwards** what it observes.
+Offline-to-online attribution for QR campaigns: a flyer/standee QR encodes the
+public site URL with a `?ref=<slug>` query param; the landing preserves the tag
+through navigation and chat, and the backend applies first-touch attribution
+(promo → UTM → QR ref → bare channel, per SPEC-W13 §3) when the visitor's
+details reach `POST /v1/leads`.
 
-## Contract bindings
-
-- **§3 precedence**: `promo_code` > UTM (`utm_source/medium/campaign`) >
-  QR slug > `channel_of_first_touch`. First-touch wins and is **never
-  overwritten** — enforced server-side. The widget may forward a newer
-  payload on a later visit; the backend ignores it for attribution.
-- **§6 promo redemption**: `?promo=` captured here is forwarded as
-  `attribution.promo_code`. Actual redemption (`POST /v1/promo/redeem`,
-  idempotent per code+phone) is a booking-service endpoint and unchanged.
-
-## Pieces
-
-### 1. `apps/admin-web/public/embed.js` — host-page URL capture
-
-On widget init (after iframe load, one-shot) the loader reads the **host
-page** URL and, if any of these are present, postMessages them into the
-widget:
+## 1. What a QR code should encode
 
 ```
-{type:"opendesk:attribution",
- attribution:{utm:{source?, medium?, campaign?}, promo_code?, ref?}}
+https://<your-gateway-or-site-host>/p/<siteSlug>?ref=<campaign-slug>
 ```
 
-| URL param      | Forwarded as                  |
-| -------------- | ----------------------------- |
-| `utm_source`   | `attribution.utm.source`      |
-| `utm_medium`   | `attribution.utm.medium`      |
-| `utm_campaign` | `attribution.utm.campaign`    |
-| `promo`        | `attribution.promo_code`      |
-| `ref`          | `attribution.ref` (QR slug)   |
+Example: `https://bookings.glowhaven.example/p/glowhaven?ref=lekki-flyer-march`.
+Any slug is accepted (print a different one per placement — `mall-standee`,
+`church-flyer`, …); no pre-registration is required. `?ref=` survives alongside
+other params (e.g. `?ref=lekki-flyer-march&utm_source=instagram` — both are
+captured; UTM keeps precedence over `ref` per the precedence list).
 
-Framework-free, dependency-free, silent no-op when the URL carries none of
-them (nothing is sent). Values are trimmed and capped at 120 chars. No PII
-beyond URL params the host page already exposes. Mirrors the Wave 11
-`opendesk:location` pattern; failures never break the host page or widget.
+## 2. Public booking site capture (apps/admin-web `app/p/[siteSlug]`)
 
-### 2. `apps/admin-web/app/embed/ui-actions-bridge.tsx` — fetch-tap merge
+Server-side, before any redirect or client JS:
 
-The bridge listens for `opendesk:attribution` with the same trust rules as
-the Wave 11 location message (direct parent frame only, origin-checked
-against `document.referrer` when available), sanitizes it, and the existing
-namespaced fetch tap merges it as an additive `attribution` key into the
-JSON body of every `/voice/chat` request — **exactly like
-`client_location`** (Wave 11). The two mergers compose:
-`withAttribution(withClientLocation(init))`; each returns the init
-untouched when it has nothing to add, so bodies pass through byte-identical
-when neither is present. The server tolerates unknown keys.
+1. `buildAttributionSearchParams(searchParams)` — allowlist-parses the incoming
+   query: `ref` (slug pattern `[a-z0-9][a-z0-9._-]{0,63}`) + the five standard
+   `utm_*` params; everything else is dropped.
+2. If any tag is present the page issues `redirect(307)` to a **canonical URL**
+   `/p/<siteSlug>?ref=…&utm_…` — a stable, lowercase, sorted URL that is safe
+   to share/bookmark and that analytics tools see once.
+3. The client (`PublicSitePage`) reads the canonical tag with a tiny
+   `useSearchParams` helper (`lib/attribution-client.ts`) and:
+   - renders a dismissalable "via _slug_" pill (honest UX: the visitor can
+     see and dismiss the attribution);
+   - emits one best-effort beacon `POST /api/attribution {site_slug, ref,
+     utm, landing_path}` (fire-and-forget, 1 s timeout — see §5);
+   - passes `ref`+`utm` to the chat widget.
 
-Wave 9 `ui_actions` response scanning and Wave 11 `client_location` merge
-are untouched: the tap's URL matching, clone-scanning, listener fan-out and
-fetch restore logic are unchanged; attribution only adds one message
-listener and one body-merge step.
+## 3. Chat-widget propagation (embed.js host path)
 
-### 3. `apps/admin-web/app/l/[slug]/route.ts` — QR landing redirect
+`apps/admin-web/public/embed.js`:
 
-Printed QR codes point at `https://<host>/l/{slug}` where `{slug}` is the
-tenant's **public site slug** (same slug as `/p/{siteSlug}`). The route:
+- On init it snapshots `window.location.search` (the **landing page's** URL —
+  for embed.js hosts this is the only attribution source) with the same
+  allowlist parser. Explicit `data-ref` / `data-utm-*` attributes on the
+  `<script>` tag override the landing query.
+- The tags ride the iframe URL as query params (`/embed/<slug>?ref=…`) so the
+  embedded app sees them identically to the public page.
+- On the `opendesk:lead` postMessage (chat lead capture) it rewrites the
+  message data to `{phone, channel, ref, utm}` **before** handing it to the
+  page's `onLeadCaptured` callback. `data.attribution_source` is set to
+  `"landing"` (or `"script"` when only script attrs were present); a
+  server-provided `attribution_source` in the payload always wins.
+- When a page-level `data-api-base` is configured it also beacons
+  `POST {apiBase}/v1/leads` with that body (202-tolerant).
 
-1. Validates the slug (`^[a-z0-9][a-z0-9-]{0,62}$`, else 404 `invalid_slug`).
-2. 302-redirects to the tenant booking page with first-touch QR attribution:
-   `/p/{slug}?utm_source=qr&utm_medium=offline&utm_campaign={slug}`.
-3. Fires a **best-effort server-side funnel ping** so scans are countable
-   even if the visitor bounces before any widget loads.
+## 4. Chat API metadata (additive, optional)
 
-The route does not look up the site (the booking page itself 404s unknown
-or unpublished slugs), keeps no state, and never blocks the redirect on the
-ping. It is public — `middleware.ts` only guards `/app/*`.
-
-> **Slug assumption**: there is no QR-slug registry table in the platform
-> today, so the QR slug IS the public site slug. If booking-service later
-> adds a slug→tenant alias table, only this route's target resolution
-> changes; the redirect and ping shape stay the same.
-
-#### Funnel ping configuration
-
-The platform currently has **no HTTP analytics-ingest endpoint** —
-analytics-pipeline consumes Kafka bronze topics and serves only read-only
-REST (`/healthz`, `/metrics`, `/v1/recommendations`, `/v1/metering`). Per
-SPEC-W13 scope ("do not invent backend changes"), the ping target is
-opt-in:
-
-- `QR_FUNNEL_PING_URL` set → `POST <url>` with JSON body, fire-and-forget,
-  1.5 s abort timeout, failures swallowed (the redirect is never affected).
-  Point it at a future ingest route or the BFF `/api/analytics/*` proxy
-  (`ANALYTICS_BASE_URL`) once Agent B's service exposes event ingest.
-- unset → a structured JSON line is logged
-  (`{"msg":"qr_landing", ...}`), scrapeable by the log pipeline.
-
-Ping payload (field names follow the §2 funnel envelope where applicable):
+The widget bridge (`embed/ui-actions-bridge.tsx`) and the public chat widget
+include attribution in the **existing** `meta` field of `POST /voice/chat`
+(non-breaking — the voice runtime echoes `meta` through):
 
 ```json
 {
-  "event_name": "qr_landing",
-  "channel": "qr",
-  "campaign": "<slug>",
-  "tenant_site_slug": "<slug>",
-  "event_ts": "2025-01-01T00:00:00.000Z",
-  "idempotency_key": "qr:<slug>:<epoch-ms>"
+  "session_id": "…", "site_slug": "glowhaven", "text": "…",
+  "meta": {
+    "attribution": {
+      "ref": "lekki-flyer-march",
+      "utm": {"utm_source": "qr", "utm_medium": "offline",
+              "utm_campaign": "lekki-flyer-march"},
+      "landing_path": "/p/glowhaven"
+    }
+  }
 }
 ```
 
-This is a scan-count signal, not a lead: lead creation and the §2
-`cac.events` FunnelEvent emission happen backend-side when the visitor
-actually engages (chat/booking/promo redeem).
+A `ref` with no explicit UTM is surfaced as the derived triple
+`utm_source=qr / utm_medium=offline / utm_campaign=<slug>` (documented
+synthesis — the same mapping the backend applies when only `ref` is given).
 
-## End-to-end flow
+## 5. The attribution beacon (honest scope)
 
+`apps/admin-web/app/api/attribution/route.ts` is a tiny BFF route that
+accepts the beacon and answers `202` immediately. **Scope, explicitly:**
+first-touch lead attribution happens **server-side in booking-service** when
+the lead is actually created (chat contact form, public booking POST, promo
+redeem — see `docs/leads-attribution.md` §3). There is no
+`POST /v1/leads/attribution` write endpoint in Wave 13, so the route does not
+forward upstream; it is the intake point for raw landing telemetry (which
+landing paths carry which tags) ahead of any such endpoint. It validates the
+body (slug pattern for `site_slug` and `ref`, utm map of strings), and returns
+`400` on garbage. Visitors' tags are never trusted for anything else.
+
+## 6. Files
+
+| File | Change |
+|---|---|
+| `apps/admin-web/lib/attribution.ts` | allowlist parser, canonical URL builder, derived `utm_source=qr` triple (shared, tested) |
+| `apps/admin-web/lib/attribution-client.ts` | tiny client hook reading canonical tags via `useSearchParams` |
+| `apps/admin-web/app/p/[siteSlug]/page.tsx` | canonical-URL redirect + tags passed to client |
+| `apps/admin-web/app/p/[siteSlug]/public-site-client.tsx` | "via _slug_" pill + beacon + chat handoff |
+| `apps/admin-web/public/embed.js` | landing-query capture, script-attr overrides, iframe propagation, lead-callback rewrite |
+| `apps/admin-web/app/embed/ui-actions-bridge.tsx` | `meta.attribution` on `/voice/chat` |
+| `apps/admin-web/components/chat-widget.tsx` | `attribution` prop → `meta.attribution` |
+| `apps/admin-web/app/api/attribution/route.ts` | beacon route (202/400) |
+| `apps/admin-web/lib/__tests__/attribution.test.ts` | vitest: parser, canonical URL, derived triple |
+
+## 7. Test
+
+```bash
+cd apps/admin-web && npx vitest run lib/__tests__/attribution.test.ts
 ```
-QR print ──scan──> GET /l/{slug}
-                     ├─ 302 /p/{slug}?utm_source=qr&utm_medium=offline
-                     │           &utm_campaign={slug}
-                     └─ fire-and-forget funnel ping (or structured log)
 
-Embed host page ──> embed.js reads utm_*/promo/ref from host URL
-                     └─ postMessage opendesk:attribution ──> widget
-
-Widget chat ──> fetch tap merges {attribution:{...}} (+ client_location)
-                into POST /voice/chat body ──> backend applies §3
-                precedence, first-touch never overwritten
-```
-
-## Verification
-
-- `node --check apps/admin-web/public/embed.js` — syntax clean.
-- `npx tsc --noEmit` (repo tsconfig) — clean, no new dependencies.
-- Regression reasoning: embed.js additions are a new section + one
-  `load` listener; the Wave 9 action listener and Wave 11 GPS capture are
-  untouched. The bridge diff is additive-only around the two Wave 9/11
-  merge/listen points; the fetch tap's structure (namespacing, ref-counted
-  restore, clone-scanning) is unchanged.
+Manual smoke: open `/p/acme?ref=standee-1&utm_source=qr` → URL canonicalises,
+pill shows "via standee-1", `/api/attribution` receives the beacon (network
+tab), chat posts carry `meta.attribution`. Print a QR pointing at the same URL
+(e.g. `qrencode`) and scan with a phone to verify end-to-end.
