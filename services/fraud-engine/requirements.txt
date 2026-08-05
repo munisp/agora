@@ -1,0 +1,12 @@
+# fraud-engine runtime deps (SPEC-W30 §4 WS-B: FastAPI + confluent-kafka + redis)
+fastapi==0.116.1
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+# FalkorDB speaks the Redis protocol; graph.py uses redis-py's
+# execute_command("GRAPH.QUERY", ...) directly.
+redis>=5.2,<9
+# Kafka producer/consumer for CloudEvents (imported lazily; only required
+# when KAFKA_ENABLED=true).
+confluent-kafka>=2.6,<3
+
+# --- dev/test (pip install -r requirements.txt -r requirements-dev.txt) ---
