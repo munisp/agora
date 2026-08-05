@@ -132,6 +132,10 @@ type Contact struct {
 	ChannelOfFirstTouch string
 	Source              string
 	CapturedAt          time.Time
+	// CapturedBy is optional staff/agent attribution (SPEC-W30 fraud
+	// detectors D2/D3/D4). Populated only when the source event carries
+	// agent_id / staff_id / captured_by; empty when upstream omits it.
+	CapturedBy string
 	// Geo (CAPTURED_AT Location): optional. HasGeo=false skips the Location.
 	LGA, Ward string
 	Lat, Lon  float64
@@ -157,6 +161,11 @@ type Booking struct {
 	OfferingName string
 	CreatedAt    time.Time
 	Showed       *bool
+	// CreatedBy is optional staff attribution (SPEC-W30 detector D6);
+	// CancelledAt is stamped on booking.cancelled events (D6 flash
+	// create->cancel detection).
+	CreatedBy   string
+	CancelledAt *time.Time
 }
 
 // PhoneHash computes the salted SHA-256 phone hash (SPEC-W28 §3: "same

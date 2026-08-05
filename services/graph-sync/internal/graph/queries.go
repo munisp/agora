@@ -97,10 +97,27 @@ RETURN p.person_id AS person_id`,
 // upsertContactQuery upserts the Contact and wires HAS_CONTACT + PART_OF.
 // tenant_id is set on BOTH edges (belt and braces, §5 gate 1).
 func upsertContactQuery(c Contact, personID, tenantSlug string) q {
-	return q{
-		text: `MERGE (c:Contact {tenant_id: $tenant_id, lead_id: $lead_id})
+	text := `MERGE (c:Contact {tenant_id: $tenant_id, lead_id: $lead_id})
 SET c.channel_of_first_touch = $channel, c.source = $source,
-    c.captured_at = $captured_at, c.updated_at = $now
+    c.captured_at = $captured_at, c.updated_at = $now`
+	params := map[string]any{
+		"tenant_id":   c.TenantID,
+		"tenant_slug": tenantSlug,
+		"lead_id":     c.LeadID,
+		"person_id":   personID,
+		"channel":     c.ChannelOfFirstTouch,
+		"source":      c.Source,
+		"captured_at": FormatTime(c.CapturedAt),
+		"now":         FormatTime(time.Now()),
+	}
+	// SPEC-W30: optional staff/agent attribution for fraud detectors
+	// (D2/D3/D4). Set only when the source event carried it — no empty
+	// properties on the node.
+	if strings.TrimSpace(c.CapturedBy) != "" {
+		text += `, c.captured_by = $captured_by`
+		params["captured_by"] = strings.TrimSpace(c.CapturedBy)
+	}
+	text += `
 WITH c
 MATCH (p:Person {tenant_id: $tenant_id, person_id: $person_id})
 MERGE (p)-[h:HAS_CONTACT]->(c)
@@ -109,18 +126,8 @@ WITH c
 MERGE (t:Tenant {tenant_id: $tenant_id})
 ON CREATE SET t.slug = $tenant_slug
 MERGE (c)-[pt:PART_OF]->(t)
-SET pt.tenant_id = $tenant_id`,
-		params: map[string]any{
-			"tenant_id":   c.TenantID,
-			"tenant_slug": tenantSlug,
-			"lead_id":     c.LeadID,
-			"person_id":   personID,
-			"channel":     c.ChannelOfFirstTouch,
-			"source":      c.Source,
-			"captured_at": FormatTime(c.CapturedAt),
-			"now":         FormatTime(time.Now()),
-		},
-	}
+SET pt.tenant_id = $tenant_id`
+	return q{text: text, params: params}
 }
 
 // captureLocationQuery wires (Contact)-[:CAPTURED_AT]->(Location) (only
@@ -191,6 +198,16 @@ SET b.status = $status, b.offering_id = $offering_id, b.updated_at = $now`
 	if b.Showed != nil {
 		text += `, b.showed = $showed`
 		params["showed"] = *b.Showed
+	}
+	// SPEC-W30: optional staff attribution + cancellation timestamp for
+	// ghost-booking detection (D6). Set only when present.
+	if strings.TrimSpace(b.CreatedBy) != "" {
+		text += `, b.created_by = $created_by`
+		params["created_by"] = strings.TrimSpace(b.CreatedBy)
+	}
+	if b.CancelledAt != nil {
+		text += `, b.cancelled_at = $cancelled_at`
+		params["cancelled_at"] = FormatTime(*b.CancelledAt)
 	}
 	text += `
 WITH b
