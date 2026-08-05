@@ -26,6 +26,7 @@ import {
   AudioLines,
   Settings,
   Filter,
+  Shield,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -64,6 +65,8 @@ const items: NavItem[] = [
   { segment: "locations", label: "Locations", icon: MapPin },
   { segment: "geo-campaigns", label: "Geo campaigns", icon: Target },
   { segment: "segments", label: "Segments", icon: Filter },
+  // SPEC-W30: fraud & trust alert queue — same gate as segments.
+  { segment: "alerts", label: "Alerts", icon: Shield },
   { segment: "voices", label: "Voices", icon: AudioLines },
   { external: CRM_URL, label: "CRM", icon: UsersRound },
   { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
@@ -122,6 +125,10 @@ export function OrgNav({
     // SPEC-W28: segments (graph audiences) gates messaging spend the same
     // way as geo campaigns — owner/admin only; pages enforce server-side.
     if ("segment" in item && item.segment === "segments")
+      return canViewGeoCampaigns(roles);
+    // SPEC-W30: fraud alert queue adjudicates audience eligibility — same
+    // owner/admin gate as segments; the page enforces it server-side too.
+    if ("segment" in item && item.segment === "alerts")
       return canViewGeoCampaigns(roles);
     // SPEC-W10 Part C: voices studio is owner/admin/staff; the page enforces
     // the same rule server-side.
