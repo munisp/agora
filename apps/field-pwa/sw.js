@@ -47,7 +47,7 @@ self.addEventListener("fetch", function (event) {
   if (req.mode === "navigate") {
     event.respondWith(
       fetch(req).catch(function () {
-        return caches.match("index.html").then(function (m) { return m || Response.error(); })
+        return caches.match("index.html").then(function (m) { return m || Response.error(); });
       })
     );
     return;
