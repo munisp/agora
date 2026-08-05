@@ -46,7 +46,7 @@ type leadPhoneGetter interface {
 	GetLead(ctx context.Context, tenantID, id uuid.UUID) (store.Lead, error)
 }
 
-// leadsResolveRequest is the POST /v1/leads/resolve body.
+// resolveLeadPhonesRequest is the POST /v1/leads/resolve body.
 type resolveLeadPhonesRequest struct {
 	LeadIDs []string `json:"lead_ids"`
 }
