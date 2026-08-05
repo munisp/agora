@@ -9,7 +9,7 @@ setup, event mapping, loop prevention, rate limits and day-2 operations.
 ## Architecture
 
 ```
-                        ┌───────────────────────── OpenDesk compose ──────────────────────────┐
+                        ┌────────────────────────── OpenDesk compose ──────────────────────────┐
                         │                                                                      │
  identity-service ──┐   │                                                                      │
  booking-service  ──┼──►│  Kafka topics                                                        │
