@@ -66,7 +66,7 @@ func TestSendGeoCampaignMessageValidation(t *testing.T) {
 	require.ErrorContains(t, a.SendGeoCampaignMessage(ctx, workflows.PacedGeoCampaignSend{
 		Channel: "sms", Text: "x"}), "phone is required")
 	require.ErrorContains(t, a.SendGeoCampaignMessage(ctx, workflows.PacedGeoCampaignSend{
-		Channel: "sms", Phone: "+1", Text: "x"}), "text is required")
+		Channel: "sms", Phone: "+1"}), "text is required")
 	require.ErrorContains(t, a.SendGeoCampaignMessage(ctx, workflows.PacedGeoCampaignSend{
 		Channel: "pigeon", Phone: "+1", Text: "x"}), "unknown channel")
 }

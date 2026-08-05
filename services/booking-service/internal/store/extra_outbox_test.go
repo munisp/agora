@@ -94,7 +94,13 @@ func TestSetBookingStatusWritesExtraOutboxRows(t *testing.T) {
 	if len(rows) != 3 { // created + confirmed + usage
 		t.Fatalf("outbox rows = %d, want 3", len(rows))
 	}
-	if rows[2].Topic != "opendesk.usage.events" {
-		t.Fatalf("last outbox topic = %q, want usage events", rows[2].Topic)
+	// Order-independent: outbox ids are random UUIDs, so FetchUnsentOutbox's
+	// ORDER BY id is NOT insertion order.
+	topics := map[string]int{}
+	for _, r := range rows {
+		topics[r.Topic]++
+	}
+	if topics["opendesk.usage.events"] != 1 || topics["opendesk.booking.events"] != 2 {
+		t.Fatalf("outbox topics = %v, want 2 booking events + 1 usage record", topics)
 	}
 }

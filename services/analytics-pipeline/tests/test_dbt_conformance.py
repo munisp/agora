@@ -15,6 +15,7 @@ from analytics_pipeline.mapping import (  # noqa: E402
     BOOKING_EVENT_COLUMNS,
     PAYMENT_EVENT_COLUMNS,
     TRANSCRIPT_COLUMNS,
+    USAGE_EVENT_COLUMNS,
 )
 
 DBT_SCHEMA = os.path.join(
@@ -58,6 +59,13 @@ def test_transcripts_columns_match_dbt():
         print("SKIP: dbt schema.yml not present in this checkout")
         return
     assert list(TRANSCRIPT_COLUMNS) == _dbt_source_columns("transcripts")
+
+
+def test_usage_events_columns_match_dbt():
+    if not os.path.exists(DBT_SCHEMA):
+        print("SKIP: dbt schema.yml not present in this checkout")
+        return
+    assert list(USAGE_EVENT_COLUMNS) == _dbt_source_columns("usage_events")
 
 
 if __name__ == "__main__":

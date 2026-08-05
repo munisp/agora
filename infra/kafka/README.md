@@ -19,7 +19,7 @@
 | `opendesk.payments.commands` | ChargeDeposit, Refund, NoShowFee |
 | `opendesk.payments.events` | PaymentPosted(ledgerRef) |
 | `opendesk.identity.events` | TenantProvisioned, MemberInvited, RoleChanged |
-| `opendesk.notifications.outbox` | SendReminder, SendConfirmation |
+| `opendesk.notifications.outbox` | SendReminder, SendConfirmation, SendPortalCode (Wave 5 #7: booking-service publishes the 6-digit portal login code; notification-worker consumes it via group `notification-outbox` and delivers it through the smtp/twilio bindings) |
 | `opendesk.dlq` | dead letters |
 
 All messages use the **CloudEvents 1.0** envelope:

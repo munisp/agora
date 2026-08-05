@@ -1,19 +1,19 @@
-# --- build stage ---------------------------------------------------------------
+# ---------- build ----------
 FROM golang:1.23-alpine AS build
+RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /src
-RUN apk add --no-cache ca-certificates
-
-# Cache modules first for layer reuse.
 COPY go.mod go.sum ./
 RUN go mod download
-
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/booking-service ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/server ./cmd/server
 
-# --- runtime stage -------------------------------------------------------------
+# ---------- run ----------
 FROM gcr.io/distroless/static-debian12:nonroot
-WORKDIR /app
-COPY --from=build /out/booking-service /app/booking-service
+# tzdata is required: the availability engine evaluates weekly rules in the
+# tenant's IANA timezone (time.LoadLocation).
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=build /out/server /server
 EXPOSE 7002
 USER nonroot:nonroot
-ENTRYPOINT ["/app/booking-service"]
+ENTRYPOINT ["/server"]

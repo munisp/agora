@@ -55,6 +55,8 @@ func (s *callQualityStub) handler() http.Handler {
 			write("createNote", map[string]any{"id": fmt.Sprintf("note-%d", n)})
 		case r.Method == http.MethodPost && r.URL.Path == "/rest/noteTargets":
 			write("created", map[string]any{"id": "target-1"})
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/rest/notes/"):
+			write("updateNote", map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/rest/notes/")})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

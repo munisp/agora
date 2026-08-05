@@ -5,15 +5,17 @@ Each stage sits behind a small interface so implementations can be replaced
 the agent wiring.
 """
 
-from .llm import LLMInterface, OpenAICompatibleLLM
+from .llm import FallbackLLM, LLMInterface, OpenAICompatibleLLM, build_llm
 from .stt import FasterWhisperSTT, STTInterface
 from .tts import PiperTTS, TTSInterface
 
 __all__ = [
+    "FallbackLLM",
     "FasterWhisperSTT",
     "LLMInterface",
     "OpenAICompatibleLLM",
     "PiperTTS",
     "STTInterface",
     "TTSInterface",
+    "build_llm",
 ]
