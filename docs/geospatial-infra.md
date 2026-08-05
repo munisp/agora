@@ -1,6 +1,6 @@
 # Geospatial lakehouse infrastructure — Apache Sedona + GeoLibre (SPEC-W8 Part B)
 
-Operational/analytical geospatial stack for OpenDesk. PostGIS in booking-service
+Operational/analytical geospatial stack for Agora. PostGIS in booking-service
 owns the *operational* model (Part A); this document covers the *analytical*
 side: Apache Sedona jobs in the lakehouse, the gold geo tables they produce,
 the GeoLibre GIS workbench, and Trino query recipes.

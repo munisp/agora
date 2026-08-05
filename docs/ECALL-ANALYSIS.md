@@ -2,7 +2,7 @@
 
 Source video: *Next Generation eCall* — Rohde & Schwarz (https://www.youtube.com/watch?v=7q7sjcrXDq8)
 Scope: automotive emergency-call systems and their conformance testing — NOT an AI receptionist
-product. This document extracts the transferable design patterns and maps them onto OpenDesk.
+product. This document extracts the transferable design patterns and maps them onto Agora.
 
 ## 1. What eCall actually is
 
@@ -25,7 +25,7 @@ product. This document extracts the transferable design patterns and maps them o
 
 ### P1 — Structured emergency data packet (the MSD idea)
 eCall's genius is that the *data travels with the call* in a rigid, machine-readable schema.
-**OpenDesk analog:** our law-enforcement / civic-services / healthcare packs currently capture
+**Agora analog:** our law-enforcement / civic-services / healthcare packs currently capture
 incidents conversationally. An "MSD-analog" would emit a standardized **Incident Data Packet (IDP)**
 JSON for every emergency-flavored interaction:
 `{incident_id, schema_version, captured_at, channel, location:{lat,lng,accuracy,source,address_text},
@@ -41,7 +41,7 @@ cell/landmark fallback), store it as a point, and attach it to the IDP — inste
 location as one more intake field.
 
 ### P3 — Automatic triggering (sensor → call, no human initiation)
-eCall fires without human action. OpenDesk analog: **IoT/event-triggered outreach** — Dapr input
+eCall fires without human action. Agora analog: **IoT/event-triggered outreach** — Dapr input
 bindings (MQTT/Kafka topics/webhooks) from telematics, PAYG-solar inverters, fleet trackers,
 panic buttons → the platform auto-initiates a voice/WhatsApp session to the affected person or a
 technician ("We've detected X — confirm you're OK / book a repair"), creating the booking or IDP
@@ -50,7 +50,7 @@ differentiator for utilities-payg, logistics, transportation, and healthcare pac
 
 ### P4 — Guaranteed, prioritized voice path + conformance-grade quality
 eCall calls get network priority and the video shows voice quality being *lab-certified*.
-OpenDesk analogs:
+Agora analogs:
 - **Emergency priority lane**: emergency-intent sessions skip queue/pacing, get prewarmed agent
   processes first, and trigger immediate warm-handoff to humans (we have all the primitives:
   load gating, prewarming, escalation.py — they need an `emergency` priority class).
@@ -71,12 +71,12 @@ inbound (Wave 5) is already on that path.
 
 NG eCall becomes mandatory in 2026 — regulation creates markets. The same wave is coming for AI
 voice agents: the **EU AI Act transparency obligation** (people must be told they're talking to an
-AI) and emerging robocall/AI-disclosure rules (US FCC, Nigeria NCC). OpenDesk should treat
+AI) and emerging robocall/AI-disclosure rules (US FCC, Nigeria NCC). Agora should treat
 **AI-disclosure-at-call-start** and **recording-consent capture** as first-class, per-pack toggles
 (we have consentText — extend to spoken disclosure). Being compliance-first is a sales feature,
 not overhead.
 
-## 4. Concrete benefit assessment for OpenDesk
+## 4. Concrete benefit assessment for Agora
 
 | Pattern | Platform benefit | Verticals impacted | Effort |
 |---|---|---|---|
@@ -89,7 +89,7 @@ not overhead.
 | Spoken AI-disclosure + recording consent toggles | EU AI Act / FCC / NCC readiness; sales enabler | all | Small |
 
 **Bottom line:** eCall is not a competitor — it's a 25-year-refined blueprint for *machine-initiated,
-data-first, quality-certified emergency communication*. OpenDesk already has ~80% of the substrate
+data-first, quality-certified emergency communication*. Agora already has ~80% of the substrate
 (omnichannel, PostGIS, SIP, eval harness, public-safety packs). Adopting the five patterns converts
 our public-safety packs from "AI that takes a message" into "infrastructure that dispatches help" —
 and differentiates every emergency-adjacent vertical we ship.

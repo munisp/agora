@@ -1,6 +1,6 @@
 # Runbook — Local development bring-up
 
-Audience: developers running the full OpenDesk stack on a laptop.
+Audience: developers running the full Agora stack on a laptop.
 Prereqs: Docker with compose v2 (`docker compose version`), `make`, `curl`, `jq`.
 First build pulls/builds ~15 images — expect 10–20 minutes.
 
