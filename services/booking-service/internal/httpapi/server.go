@@ -390,6 +390,7 @@ func NewRouter(d Deps) http.Handler {
 		surveys.RegisterRoutes(r, s.d.Surveys, mw...)
 	}
 	if s.d.Lending != nil {
+		s.d.Lending.UserFromContext = userFrom
 		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
 			s.appGateChain("lending", s.requireReadWrite())...)
 		lending.RegisterRoutes(r, s.d.Lending, mw...)

@@ -52,11 +52,13 @@
       "serviceAccountsEnabled": false,
       "redirectUris": [
         "http://localhost:3001/*",
-        "http://localhost:9080/*"
+        "http://localhost:9080/*",
+        "http://localhost:8000/*"
       ],
       "webOrigins": [
         "http://localhost:3001",
-        "http://localhost:9080"
+        "http://localhost:9080",
+        "http://localhost:8000"
       ],
       "attributes": {
         "pkce.code.challenge.method": "S256",
