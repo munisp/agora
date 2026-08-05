@@ -1,9 +1,10 @@
-"""SPEC-W30 §4 WS-C: fraud alert triage/resolve API.
+"""SPEC-W30 §4 WS-C: fraud alerts router.
 
-Covers: tenant isolation of list/detail (cross-tenant id -> 404), resolve
-validation (reason mandatory >=10 chars, decision enum, 409 on re-resolve),
-dismissed unquarantines ONLY when no other open high alert remains,
-confirmed keeps quarantine, and the audit CloudEvent emission.
+Covers: tenant isolation of list/detail, status/type/severity filters,
+resolve validation (decision enum, mandatory reason min 10 chars),
+resolve bookkeeping (status/resolved_at/resolved_by/resolve_reason),
+unquarantine ONLY when no other open high-severity alert flags the person,
+confirmed keeps quarantine, audit CloudEvent emission, and 409 on re-resolve.
 """
 
 from __future__ import annotations
@@ -11,164 +12,238 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.backend import InMemoryBackend
+from app.backend import InMemoryBackend, InMemoryGraph
 from app.config import Settings
 from app.main import create_app
 from app.store import SegmentStore
 from conftest import HDR_A, HDR_B, StubLLM, build_graph
 
 
-def _alert(graph, tenant, alert_id, *, status="open", severity="high",
-           person_id="pa1", type="referral_cycle", agent_id=None):
-    graph.add_node(
-        alert_id,
-        {"Alert"},
-        tenant_id=tenant,
-        alert_id=alert_id,
-        type=type,
-        severity=severity,
-        status=status,
-        person_id=person_id,
-        agent_id=agent_id,
-        evidence='{"cycle": ["pa1", "pa2"]}',
-        created_at="2026-08-05T00:00:00+00:00",
-    )
+class FakePublisher:
+    def __init__(self):
+        self.events: list[tuple[str, dict]] = []
+
+    async def publish(self, topic, event):
+        self.events.append((topic, event))
+
+
+def _add_alert(
+    g: InMemoryGraph,
+    alert_id: str,
+    tenant: str,
+    *,
+    type="referral_cycle",
+    severity="high",
+    status="open",
+    person_id=None,
+    flag_node=None,
+    created_at="2026-08-05T10:00:00+00:00",
+):
+    props = {
+        "alert_id": alert_id,
+        "tenant_id": tenant,
+        "type": type,
+        "severity": severity,
+        "status": status,
+        "evidence": '{"cycle": ["pa1", "pa2"]}',
+        "created_at": created_at,
+    }
+    if person_id is not None:
+        props["person_id"] = person_id
+    node = g.add_node(f"{tenant}:{alert_id}", {"Alert"}, **props)
+    if flag_node is not None:
+        g.add_edge(node.node_id, flag_node, "FLAGGED")
+    return node
 
 
 @pytest.fixture()
-def alerts_client(tmp_path):
+def alerts_env(tmp_path):
+    g = build_graph()
+    a, b = "tenant-a", "tenant-b"
+    # Quarantined person pa4 flagged by a high-severity open alert.
+    _add_alert(g, "al-high-1", a, person_id="pa4", flag_node=f"{a}:pa4")
+    # A medium-severity open alert on pa1.
+    _add_alert(g, "al-med-1", a, type="ghost_booking", severity="medium",
+               person_id="pa1", flag_node=f"{a}:pa1",
+               created_at="2026-08-05T11:00:00+00:00")
+    # An already-dismissed alert.
+    _add_alert(g, "al-old-1", a, type="gnn_anomaly", severity="low",
+               status="dismissed", created_at="2026-08-04T09:00:00+00:00")
+    # Tenant B alert (must never leak into tenant A).
+    _add_alert(g, "al-b-1", b, person_id="pb1", flag_node=f"{b}:pb1")
+
     settings = Settings(
         graph_backend="memory",
         segment_store_dir=str(tmp_path / "store"),
         jwt_public_key="",
+        internal_token="tok",
     )
-    backend = InMemoryBackend(build_graph())
-    g = backend.graph
-    _alert(g, "tenant-a", "ra1", person_id="pa1")
-    _alert(g, "tenant-a", "ra2", severity="medium", type="ghost_booking", person_id=None,
-           agent_id="staff-1")
-    _alert(g, "tenant-b", "rb1", person_id="pb1")
+    events = FakePublisher()
     app = create_app(
         settings,
-        backend=backend,
+        backend=InMemoryBackend(g),
         llm=StubLLM(),
         store=SegmentStore(str(tmp_path / "seg")),
+        events=events,
     )
-    return TestClient(app), backend
+    return TestClient(app), g, events
 
 
 # ------------------------------------------------------------------ list
-
-def test_list_alerts_tenant_scoped(alerts_client):
-    client, _ = alerts_client
-    rows = client.get("/v1/graph/alerts", headers=HDR_A).json()["alerts"]
-    assert {r["alert_id"] for r in rows} == {"ra1", "ra2"}
-    rows_b = client.get("/v1/graph/alerts", headers=HDR_B).json()["alerts"]
-    assert {r["alert_id"] for r in rows_b} == {"rb1"}
-
-
-def test_list_alerts_filters(alerts_client):
-    client, _ = alerts_client
-    open_rows = client.get("/v1/graph/alerts?status=open", headers=HDR_A).json()["alerts"]
-    assert {r["alert_id"] for r in open_rows} == {"ra1", "ra2"}
-    high = client.get("/v1/graph/alerts?severity=high", headers=HDR_A).json()["alerts"]
-    assert {r["alert_id"] for r in high} == {"ra1"}
-    ghost = client.get("/v1/graph/alerts?type=ghost_booking", headers=HDR_A).json()["alerts"]
-    assert {r["alert_id"] for r in ghost} == {"ra2"}
+def test_list_alerts_tenant_isolated(alerts_env):
+    client, _, _ = alerts_env
+    body = client.get("/v1/graph/alerts", headers=HDR_A).json()
+    ids = {a["alert_id"] for a in body["alerts"]}
+    assert ids == {"al-high-1", "al-med-1", "al-old-1"}
+    body_b = client.get("/v1/graph/alerts", headers=HDR_B).json()
+    assert {a["alert_id"] for a in body_b["alerts"]} == {"al-b-1"}
 
 
-def test_list_alerts_bad_enum_422(alerts_client):
-    client, _ = alerts_client
+def test_list_alerts_filters(alerts_env):
+    client, _, _ = alerts_env
+    open_only = client.get("/v1/graph/alerts?status=open", headers=HDR_A).json()
+    assert {a["alert_id"] for a in open_only["alerts"]} == {"al-high-1", "al-med-1"}
+    high = client.get("/v1/graph/alerts?severity=high", headers=HDR_A).json()
+    assert {a["alert_id"] for a in high["alerts"]} == {"al-high-1"}
+    ghost = client.get("/v1/graph/alerts?type=ghost_booking", headers=HDR_A).json()
+    assert {a["alert_id"] for a in ghost["alerts"]} == {"al-med-1"}
+
+
+def test_list_alerts_invalid_filter_422(alerts_env):
+    client, _, _ = alerts_env
     assert client.get("/v1/graph/alerts?status=bogus", headers=HDR_A).status_code == 422
+    assert client.get("/v1/graph/alerts?severity=extreme", headers=HDR_A).status_code == 422
 
 
-# ------------------------------------------------------------------ detail
-
-def test_alert_detail_tenant_scoped(alerts_client):
-    client, _ = alerts_client
-    resp = client.get("/v1/graph/alerts/ra1", headers=HDR_A)
-    assert resp.status_code == 200
-    assert resp.json()["alert_id"] == "ra1"
-    assert resp.json()["evidence"] == '{"cycle": ["pa1", "pa2"]}'
-    # Cross-tenant detail answers 404 (no existence leak).
-    assert client.get("/v1/graph/alerts/rb1", headers=HDR_A).status_code == 404
-    assert client.get("/v1/graph/alerts/nope", headers=HDR_A).status_code == 404
+def test_list_alerts_requires_auth(alerts_env):
+    client, _, _ = alerts_env
+    assert client.get("/v1/graph/alerts").status_code == 401
 
 
-# ------------------------------------------------------------------ resolve
+# ----------------------------------------------------------------- detail
+def test_get_alert_detail(alerts_env):
+    client, _, _ = alerts_env
+    body = client.get("/v1/graph/alerts/al-med-1", headers=HDR_A).json()
+    assert body["alert_id"] == "al-med-1"
+    assert body["type"] == "ghost_booking"
+    assert body["evidence"] == '{"cycle": ["pa1", "pa2"]}'
 
-def _resolve(client, alert_id, *, decision="dismissed", reason="false positive confirmed",
-             headers=HDR_A):
-    return client.post(
-        f"/v1/graph/alerts/{alert_id}/resolve",
-        json={"decision": decision, "reason": reason},
-        headers=headers,
+
+def test_get_alert_cross_tenant_404(alerts_env):
+    client, _, _ = alerts_env
+    assert client.get("/v1/graph/alerts/al-b-1", headers=HDR_A).status_code == 404
+    assert client.get("/v1/graph/alerts/al-high-1", headers=HDR_B).status_code == 404
+
+
+# ---------------------------------------------------------------- resolve
+def test_resolve_requires_reason_min_10(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed", "reason": "short"},
+        headers=HDR_A,
     )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed"},
+        headers=HDR_A,
+    )
+    assert resp.status_code == 422
 
 
-def test_resolve_dismissed_clears_quarantine_and_emits_event(alerts_client):
-    client, backend = alerts_client
-    backend.graph.nodes["tenant-a:pa1"].props["quarantine"] = True
-    resp = _resolve(client, "ra1")
+def test_resolve_invalid_decision_422(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "maybe", "reason": "not a valid decision"},
+        headers=HDR_A,
+    )
+    assert resp.status_code == 422
+
+
+def test_resolve_dismissed_clears_quarantine_when_no_other_open_high(alerts_env):
+    client, g, events = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-high-1/resolve",
+        json={"decision": "dismissed", "reason": "false positive, reviewed by hand"},
+        headers=HDR_A,
+    )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["status"] == "dismissed"
     assert body["quarantine_cleared"] is True
-    assert body["event_type"] == "com.opendesk.fraud.AlertResolved"
-    assert body["topic"] == "opendesk.fraud.alerts.v1"
-    alert = backend.graph.nodes["ra1"].props
+    alert = g.nodes["tenant-a:al-high-1"].props
     assert alert["status"] == "dismissed"
-    assert alert["resolve_reason"] == "false positive confirmed"
+    assert alert["resolved_by"] == "tenant-a"  # dev seam: JWT sub equivalent
+    assert alert["resolve_reason"] == "false positive, reviewed by hand"
     assert alert["resolved_at"]
-    assert backend.graph.nodes["tenant-a:pa1"].props["quarantine"] is False
-    events = client.app.state.deps.events.published
-    assert len(events) == 1
-    topic, event = events[0]
+    assert g.nodes["tenant-a:pa4"].props["quarantine"] is False
+    # Audit CloudEvent emitted to the fraud alerts topic.
+    assert len(events.events) == 1
+    topic, event = events.events[0]
     assert topic == "opendesk.fraud.alerts.v1"
     assert event["type"] == "com.opendesk.fraud.AlertResolved"
+    assert event["specversion"] == "1.0"
     assert event["tenantid"] == "tenant-a"
+    assert event["data"]["alert_id"] == "al-high-1"
     assert event["data"]["decision"] == "dismissed"
-    assert event["data"]["alert_id"] == "ra1"
+    assert event["data"]["resolved_by"] == "tenant-a"
 
 
-def test_resolve_confirmed_keeps_quarantine(alerts_client):
-    client, backend = alerts_client
-    backend.graph.nodes["tenant-a:pa1"].props["quarantine"] = True
-    resp = _resolve(client, "ra1", decision="confirmed", reason="verified referral ring")
+def test_resolve_dismissed_keeps_quarantine_with_other_open_high(alerts_env):
+    client, g, _ = alerts_env
+    # Second open high-severity alert on pa4.
+    _add_alert(g, "al-high-2", "tenant-a", type="sybil_cluster",
+               person_id="pa4", flag_node="tenant-a:pa4")
+    resp = client.post(
+        "/v1/graph/alerts/al-high-1/resolve",
+        json={"decision": "dismissed", "reason": "duplicate of al-high-2"},
+        headers=HDR_A,
+    )
     assert resp.status_code == 200
     assert resp.json()["quarantine_cleared"] is False
-    assert backend.graph.nodes["tenant-a:pa1"].props["quarantine"] is True
+    assert g.nodes["tenant-a:pa4"].props["quarantine"] is True
 
 
-def test_resolve_dismissed_keeps_quarantine_with_other_open_high(alerts_client):
-    client, backend = alerts_client
-    backend.graph.nodes["tenant-a:pa1"].props["quarantine"] = True
-    # A second open HIGH alert flags the same person.
-    _alert(backend.graph, "tenant-a", "ra9", person_id="pa1", type="sybil_cluster")
-    resp = _resolve(client, "ra1")
+def test_resolve_confirmed_keeps_quarantine(alerts_env):
+    client, g, events = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-high-1/resolve",
+        json={"decision": "confirmed", "reason": "verified referral ring of 3"},
+        headers=HDR_A,
+    )
     assert resp.status_code == 200
     assert resp.json()["quarantine_cleared"] is False
-    assert backend.graph.nodes["tenant-a:pa1"].props["quarantine"] is True
+    assert g.nodes["tenant-a:pa4"].props["quarantine"] is True
+    assert g.nodes["tenant-a:al-high-1"].props["status"] == "confirmed"
+    assert events.events[0][1]["data"]["decision"] == "confirmed"
 
 
-def test_resolve_requires_reason_min_length(alerts_client):
-    client, _ = alerts_client
-    resp = _resolve(client, "ra1", reason="short")
-    assert resp.status_code == 422
+def test_resolve_already_resolved_409(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-old-1/resolve",
+        json={"decision": "dismissed", "reason": "re-resolving an old alert"},
+        headers=HDR_A,
+    )
+    assert resp.status_code == 409
 
 
-def test_resolve_rejects_bad_decision(alerts_client):
-    client, _ = alerts_client
-    resp = _resolve(client, "ra1", decision="banish")
-    assert resp.status_code == 422
+def test_resolve_cross_tenant_404(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-b-1/resolve",
+        json={"decision": "dismissed", "reason": "cross tenant attempt here"},
+        headers=HDR_A,
+    )
+    assert resp.status_code == 404
 
 
-def test_resolve_cross_tenant_404(alerts_client):
-    client, _ = alerts_client
-    assert _resolve(client, "rb1").status_code == 404
-
-
-def test_resolve_already_resolved_409(alerts_client):
-    client, _ = alerts_client
-    assert _resolve(client, "ra1").status_code == 200
-    assert _resolve(client, "ra1").status_code == 409
+def test_resolve_requires_auth(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "confirmed", "reason": "no auth header present"},
+    )
+    assert resp.status_code == 401

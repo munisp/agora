@@ -20,7 +20,7 @@ FalkorDB (agora_tenants graph)          graph-service (:7014)
 | `propensity_churn` | Person property | `sigmoid(days_since_last_booking / tenant_median_interval)` |
 | `propensity_convert` | Person property | `0.45·recency_term + 0.35·response_rate + 0.20·referral_in_term` |
 | `propensity_turnout` | Person property | `0.5·response_rate + 0.5·(MESSAGED→BOOKED rate)`; cold prior 0.5 |
-| `risk_score` | Person property | anomaly head (SPEC-W30 §1/§2): mean of robust median/MAD |z| over structural features (referral degrees, booking counts, intervals, response rates), `min(z/6, 1)` squash. Tenants with <5 persons or zero variance → 0.0. Calibrated so only genuine structural outliers cross 0.9 (fraud-engine D7 threshold) |
+| `risk_score` | Person property | anomaly head (SPEC-W30 §1/§2): mean of robust median/MAD \|z\| over structural features (referral degrees, booking counts, intervals, response rates), `min(z/6, 1)` squash. Tenants with <5 persons or zero variance → 0.0. Calibrated so only genuine structural outliers cross 0.9 (fraud-engine D7 threshold) |
 | `RECOMMENDED_FOR {score, rank, reason, model_version, scored_at}` | Person→Offering edge | offering co-occurrence lift, minus already-booked, top-K |
 
 Every score/edge carries `model_version` (`heuristic-v1`, `graphsage-v{N}`)
