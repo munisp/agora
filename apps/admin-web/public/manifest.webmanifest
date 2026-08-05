@@ -1,39 +1,27 @@
 {
-  "name": "OpenDesk",
-  "short_name": "OpenDesk Admin",
+  "name": "Agora",
+  "short_name": "Agora Admin",
   "description": "Open-source, multi-tenant AI receptionist: voice + text concierge, bookings, catalog, knowledge base and payments.",
   "id": "/",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "background_color": "#faf7f1",
-  "theme_color": "#7c5b3e",
+  "background_color": "#FAF6F0",
+  "theme_color": "#C0562F",
   "lang": "en",
   "categories": ["business", "productivity"],
   "icons": [
     {
-      "src": "/icons/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png",
+      "src": "/icons/agora-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
       "purpose": "any"
     },
     {
-      "src": "/icons/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png",
-      "purpose": "maskable"
-    },
-    {
-      "src": "/icons/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "any"
-    },
-    {
-      "src": "/icons/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png",
+      "src": "/icons/agora-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
       "purpose": "maskable"
     }
   ]
