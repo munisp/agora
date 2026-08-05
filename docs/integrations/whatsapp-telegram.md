@@ -1,156 +1,114 @@
-# WhatsApp & Telegram channels — SPEC-W5 Agent C
+# Omnichannel inbound: WhatsApp + Telegram (SPEC-W6 Part A)
 
-WhatsApp Cloud API and Telegram Bot API as first-class inbound/outbound
-channels, wired **channel → conversation bridge → voice agent → tools**.
-Outbound rides the paced notification lane (`PacedSend`) — it does not
-short-circuit the pacer.
+The messaging-gateway (`:7011`) terminates inbound provider webhooks
+directly and bridges messages into the platform: it resolves the tenant via
+`CHANNEL_SITE_MAP`, resolves-or-creates a conversation in
+conversation-service, records the user turn (idempotency-keyed), calls the
+voice runtime buffered chat path (`POST /voice/chat`), records the
+assistant turn, and replies via the same-channel provider.
 
-## Components
+```
+Meta/Telegram ──webhook──► APISIX /webhooks/* ──► messaging-gateway ──► conversation-service
+  (verify token / shared secret)                  :7011                ──► voice-agent-runtime
+                                                       └──────────────► WhatsApp / Telegram (reply)
+```
 
-| Component | Path | Notes |
+**Reliability contract:** webhook handlers always answer `200` fast —
+Meta and Telegram retry-storm on non-200. The only non-200 answers are
+`403` for a bad WhatsApp verify token or Telegram shared secret. All
+internal failures (conversation-service down, LLM error, provider send
+failure) are logged and swallowed into `200`. Turn writes use
+`Idempotency-Key: <channel>:<message_id>` (and `…:reply` for the assistant
+turn), so provider webhook retries never duplicate turns.
+
+## Webhook endpoints (public, via APISIX route `webhooks-messaging`)
+
+| Endpoint | Purpose | Auth |
 |---|---|---|
-| messaging-gateway | `services/messaging-gateway` (Go, :7011) | Webhook verification + signature checks, idempotent ingress, per-tenant channel config, Dapr invoke to conversation bridge |
-| conversation bridge | `services/conversation-service/app/bridge.py` | `POST /v1/channels/{whatsapp,telegram}/messages`: map (channel, sender) → conversation, append user turn, run `/voice/chat`, persist + return reply |
-| notification-worker | `internal/provider/{whatsapp,telegram}.go`, `internal/workflows/paced.go` | `PacedSend` kinds `whatsapp` / `telegram` |
-| tenant config | booking-service `channel_configs` | `GET/PUT /v1/channels/{channel}/config` (RLS; `manage_bookings`) |
+| `GET /webhooks/whatsapp` | Meta verification handshake | `hub.verify_token` = `WHATSAPP_VERIFY_TOKEN` → echoes `hub.challenge`, else 403 |
+| `POST /webhooks/whatsapp` | Meta Cloud API messages | always 200; `statuses[]` receipts and non-text messages ignored |
+| `POST /webhooks/telegram` | Telegram Bot API updates | `X-Telegram-Bot-Api-Secret-Token` = `TELEGRAM_WEBHOOK_SECRET` when set, else 403 |
+| `POST /v1/telegram/send` | Outbound parity endpoint `{to, message}` | same as other `/v1/*` sends |
 
-## Infra deltas (additive only)
+Base URL in dev through APISIX: `http://localhost:9080` (so the webhook URL
+Meta/Telegram call is e.g. `https://<your-host>/webhooks/whatsapp`).
 
-- **APISIX** — routes are already covered by the catch-all `/webhooks/*`
-  route in `infra/apisix/apisix.yaml` (public, upstream `messaging:7011`);
-  **no file change needed** (decision recorded here per SPEC-W5 §Deliverables).
-- **Kafka** — no new topics. Replies go through the existing paced-send
-  command topic `opendesk.notifications.outbox` (notification-worker's
-  `notifyoutbox` consumer, forward-compatible).
-- **Dapr** — `infra/dapr/components/bindings.whatsapp.yaml` and
-  `bindings.telegram.yaml` input bindings (declarative; the app polls
-  `webhooks/messaging-gateway/{channel}` only when `MESSAGING_BINDINGS=true`,
-  otherwise APISIX proxies directly — both supported).
+## Environment
 
-## Env vars
+| Var | Purpose |
+|---|---|
+| `WHATSAPP_VERIFY_TOKEN` | Random string you invent; Meta sends it back during verification |
+| `TELEGRAM_BOT_TOKEN` | BotFather token (also enables outbound `sendMessage`) |
+| `TELEGRAM_BOT_USERNAME` | Bot username — the Telegram key in `CHANNEL_SITE_MAP` (single bot per gateway deployment) |
+| `TELEGRAM_WEBHOOK_SECRET` | Optional shared secret; pass as `secret_token` in `setWebhook` |
+| `CHANNEL_SITE_MAP` | Channel identity → tenant/site routing JSON (below) |
+| `CONVERSATION_URL` / `VOICE_RUNTIME_URL` | Direct-base overrides (tests / sidecar-less dev, e.g. `http://conversation:7007`). Empty = Dapr sidecar invoke on `DAPR_HTTP_PORT` (default 3500) |
 
-| Var | Default | Purpose |
-|---|---|---|
-| `WHATSAPP_ACCESS_TOKEN` | — | Meta Cloud API token (sends + media download) |
-| `WHATSAPP_PHONE_NUMBER_ID` | — | Cloud API phone-number id |
-| `WHATSAPP_APP_SECRET` | — | enables `X-Hub-Signature-256` HMAC verification |
-| `WHATSAPP_VERIFY_TOKEN` | `opendesk-dev-verify` | Meta GET-challenge token |
-| `WHATSAPP_API_BASE` | `https://graph.facebook.com/v19.0` | override for tests |
-| `TELEGRAM_BOT_TOKEN` | — | Bot API token (sends + getFile/download) |
-| `TELEGRAM_SECRET_TOKEN` | — | enables `X-Telegram-Bot-Api-Secret-Token` verification |
-| `TELEGRAM_API_BASE` | `https://api.telegram.org` | override for tests |
-| `CHANNEL_SITE_MAP` | `{}` | JSON route map, see below |
-| `MESSAGING_BINDINGS` | `false` | also expose Dapr-binding endpoint paths |
-| `MESSAGING_EVENT_TIMEOUT_SECONDS` | `10` | Dapr publish timeout on the ingest path |
-| `VOICE_AGENT_URL` | `http://voice-agent-runtime:7006` | conversation bridge → agent base |
-| `CHANNEL_MEDIA_MAX_BYTES` | `8388608` | voice-note download cap |
-| `CHANNEL_SESSION_IDLE_MINUTES` | `30` | new conversation after idle gap |
+### `CHANNEL_SITE_MAP` format
 
-## CHANNEL_SITE_MAP (tenant routing)
-
-The route key is `whatsapp:<phone_number_id>` / `telegram:<bot_token>`:
+WhatsApp is keyed by the **phone number id** from the payload
+(`entry[].changes[].value.metadata.phone_number_id`), Telegram by
+`TELEGRAM_BOT_USERNAME`:
 
 ```json
 {
-  "whatsapp:771234567890123": {"site_slug": "acme-salon", "tenant_id": "<uuid>"},
-  "telegram:8321456789:AAH...": {"site_slug": "acme-salon", "tenant_id": "<uuid>"}
+  "whatsapp:109876543210987": {"site_slug": "acme-ng", "tenant_id": "11111111-2222-3333-4444-555555555555"},
+  "telegram:acme_ng_bot":     {"site_slug": "acme-ng", "tenant_id": "11111111-2222-3333-4444-555555555555"}
 }
 ```
 
-Unknown routes are ACKed with 200 and dropped (`{"accepted": false,
-"reason": "unknown_route"}`) so Meta/Telegram never retry-storm us.
+Unmapped identities are logged and dropped (webhook still answers 200).
 
-## Webhook registration
+## Meta (WhatsApp Cloud API) setup
 
-- **WhatsApp** (Meta App → WhatsApp → Configuration): callback URL
-  `https://<gateway>/webhooks/messaging-gateway/whatsapp`, verify token =
-  `WHATSAPP_VERIFY_TOKEN`. The gateway answers the GET challenge and verifies
-  `X-Hub-Signature-256` (HMAC-SHA256 over the raw body with
-  `WHATSAPP_APP_SECRET`) on POSTs when the secret is set.
-- **Telegram**: `setWebhook` to
-  `https://<gateway>/webhooks/messaging-gateway/telegram` with
-  `secret_token` = `TELEGRAM_SECRET_TOKEN`; the gateway verifies the
-  `X-Telegram-Bot-Api-Secret-Token` header when configured.
+1. Follow `docs/integrations/messaging-channels.md` → *WhatsApp Cloud API*
+   to get `WHATSAPP_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID`.
+2. Pick a verify token: `openssl rand -hex 16` → `WHATSAPP_VERIFY_TOKEN`.
+3. Meta app → **WhatsApp → Configuration → Webhook**:
+   - Callback URL: `https://<your-host>/webhooks/whatsapp`
+   - Verify token: the value from step 2 → **Verify and save** (Meta issues
+     the `GET` handshake; the gateway echoes `hub.challenge`).
+4. Subscribe to the **`messages`** webhook field (skip `statuses`-only
+   subscriptions unless you want the extra traffic — they are ignored).
+5. Add the phone number id to `CHANNEL_SITE_MAP` as shown above.
+6. Test: send a WhatsApp message to the business number; the reply should
+   arrive in the same chat and both turns appear under the conversation in
+   conversation-service.
 
-Both POST endpoints **always answer 200 fast** on well-formed payloads
-(processing continues inline but the response shape never leaks internal
-errors); 401/400 only for failed verification or garbage bodies.
+## Telegram setup
 
-## Reply flow (paced, never short-circuited)
+1. Talk to [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token
+   into `TELEGRAM_BOT_TOKEN` and the bot username (without `@`) into
+   `TELEGRAM_BOT_USERNAME`.
+2. Pick a webhook secret: `openssl rand -hex 16` → `TELEGRAM_WEBHOOK_SECRET`.
+3. Register the webhook:
+   ```bash
+   curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+     -d url="https://<your-host>/webhooks/telegram" \
+     -d secret_token="$TELEGRAM_WEBHOOK_SECRET"
+   ```
+4. Verify: `curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"`.
+5. Add `telegram:<bot_username>` to `CHANNEL_SITE_MAP`.
+6. Test: DM the bot; the reply comes from the voice runtime in the same
+   chat.
 
-1. messaging-gateway verifies + dedupes (`message_id`, Redis
-   `statestore-messaging`, 24h TTL) and Dapr-invokes the conversation bridge
-   with `ChannelMessage{channel, sender_id, site_slug, tenant_id, text,
-   media_id, message_id}`.
-2. Bridge maps `(channel, sender_id)` → conversation (`channel_conversations`
-   upsert; idle > 30 min ⇒ new conversation; conversation row carries
-   `channel`, `external_user_id`), appends the user turn, calls the voice
-   agent's `/voice/chat` (`site_slug`, `session_id=channel:sender`), and
-   persists the reply as the agent turn.
-3. The gateway publishes one CloudEvent `com.opendesk.notifications.PacedSend`
-   to `opendesk.notifications.outbox` whose data is a `PacedSendRequest`:
-   - **text** → `kind: "whatsapp"` with `whatsapp.to = E.164 phone`, or
-     `kind: "telegram"` with `telegram.chat_id`.
-   - **voice note** (WhatsApp `audio` / Telegram `voice`): the bridge
-     downloads the media (capped), transcribes it via voice-runtime
-     `POST /voice/stt` (whisper, multipart — new control-plane endpoint), and
-     if a transcript is produced, the gateway sends a *preview* PacedSend:
-     "🎤 Voice note: \"<transcript excerpt>\" — reply processing…"; the real
-     reply follows as the normal kind. If the STT preview send was emitted,
-     the reply is suppressed when empty.
-4. notification-worker's `notifyoutbox` consumer starts one
-   `PacedSendWorkflow` per event (workflow id `paced-send-<cloudevent id>`;
-   already-started ⇒ ACK = idempotent), which paces and delivers through the
-   channel provider.
+## Troubleshooting
 
-Failure policy: provider send failures are **not** retried by the paced
-workflow today (same as other kinds); the bridge/user turns are already
-durable, and ingest ACKs are independent of downstream delivery.
-
-## Providers (notification-worker)
-
-`internal/provider/whatsapp.go` — Cloud API `POST
-/{phone-number-id}/messages` (`messaging_product=whatsapp`, `text.body` ≤4096
-chars, preview_url disabled). `internal/provider/telegram.go` — Bot API
-`sendMessage` (`disable_web_page_preview`). Both:
-
-- 2 attempts (1 retry, 100ms backoff), transport/5xx/429 retried, 4xx not;
-- token redacted from errors and logs (never logged in full);
-- `whatsapp` requires `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID`;
-  `telegram` requires `TELEGRAM_BOT_TOKEN`. Both providers must be configured
-  for their kinds or sends fail fast.
-
-Classification (SPEC-W5 contract): both kinds are **transactional** —
-they carry the AI receptionist's direct replies, so DND/quiet-hours do not
-suppress or defer them.
-
-## Per-tenant channel config (booking-service)
-
-`channel_configs(tenant_id, channel, enabled, config jsonb)` with RLS
-(`SET LOCAL app.tenant_id`), upsert semantics on PUT:
-
-```
-GET /v1/channels/whatsapp/config   → {"channel":"whatsapp","enabled":false,"config":{}}
-PUT /v1/channels/telegram/config   {"enabled": true, "config": {"greeting": "..."}}
-```
-
-Permission `manage_bookings`; channel must be `whatsapp|telegram`; config ≤16KB.
-
-## Voice notes (STT endpoint)
-
-`POST /voice/stt` on voice-agent-runtime: multipart `file` (webm/ogg/mp4/amr
-etc.), whisper-only, hard timeout 4s, 503 when STT isn't local whisper,
-413 over `STT_MAX_UPLOAD_MB` (default 25MB). Best-effort: bridge continues
-with a placeholder when transcription fails.
-
-## Tests & verification
-
-- Go: `go test ./...` in messaging-gateway (webhook verify, dedupe, route
-  map, PacedSend publish, handler paths) and notification-worker (providers,
-  paced classification, consumer idempotency).
-- Python: `pytest` in conversation-service (bridge mapping, idle-gap new
-  conversation, turns, reply persistence) and voice-agent-runtime (STT
-  endpoint).
-- Idempotency proven at three layers: ingress dedupe (message_id), workflow
-  start dedupe (deterministic workflow id), conversation upsert
-  (unique `(tenant_id, channel, external_user_id)`).
+- **403 on Meta verification** — `hub.verify_token` ≠ `WHATSAPP_VERIFY_TOKEN`,
+  or the env var is empty (the gateway refuses to verify when unset).
+- **403 on every Telegram update** — the `secret_token` passed to
+  `setWebhook` ≠ `TELEGRAM_WEBHOOK_SECRET`. Re-run `setWebhook`.
+- **200 but nothing happens** — check gateway logs for
+  `inbound message dropped: no CHANNEL_SITE_MAP entry`: the WhatsApp key
+  must be the *phone number id* (not the display number) and the Telegram
+  key must match `TELEGRAM_BOT_USERNAME` exactly.
+- **Turn recorded but no reply** — look for `agent reply failed` /
+  `channel reply failed` in the gateway logs: voice runtime unreachable
+  (set `CONVERSATION_URL`/`VOICE_RUNTIME_URL` when running without a Dapr
+  sidecar) or provider send failing (outside the 24h WhatsApp window a
+  template is required — free-form replies are then rejected by Meta).
+- **Duplicate-looking messages** — provider retries are expected; turn
+  writes are deduped by conversation-service on the
+  `Idempotency-Key: <channel>:<message_id>` header.
+- **Health** — `GET /healthz` on the gateway; send metrics at
+  `GET /metrics` (`messaging_gateway_sends_total{provider="telegram",…}`).

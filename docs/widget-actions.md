@@ -20,7 +20,7 @@ widget. Nothing is ever executed server-side.
   (`//evil.example`, `https://…`, `javascript:…` are all rejected);
   no whitespace; ≤2048 chars. Same-origin only.
 - **highlight** — `selector` may only contain
-  `[a-zA-Z0-9\-_#. :\[\]=\"'>]` and is capped at 120 chars — enough for
+  `[a-zA-Z0-9\-_#. :\[\]="'>]` and is capped at 120 chars — enough for
   id/class/attribute/descendant selectors, excluding everything that could
   smuggle markup or script.
 - **prefill_booking** — `offering_id` must be a UUID (normalized to

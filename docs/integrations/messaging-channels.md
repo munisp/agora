@@ -1,151 +1,130 @@
-# Messaging channels — Termii, Africa's Talking, WhatsApp (SPEC-W4 §4)
+# Messaging channels (Nigeria)
 
-Nigeria-first outbound messaging: pluggable providers behind Dapr HTTP output
-bindings, per-tenant channel routing (Termii / Africa's Talking / WhatsApp
-Cloud API), and opt-in PII redaction of outbound bodies. Delivered by
-`services/messaging-gateway` (Go, port 7011, Dapr app-id `messaging`) plus
-provider/route additions to `services/notification-worker`.
-
-## Architecture
+Agora's default notification channels are email (Dapr `bindings.smtp`)
+and SMS via Twilio (`bindings.twilio.sms`). For Nigerian deployments, SMS
+delivery through Twilio is expensive and unreliable (DND filtering, sender-id
+registration), so the stack ships a **messaging-gateway** service that fronts
+the providers that actually deliver in Nigeria — **Termii**, **Africa's
+Talking** and the **WhatsApp Cloud API** — plus per-tenant channel routing
+in the notification-worker.
 
 ```
-notification-worker                messaging-gateway (:7011)
-┌───────────────────────┐  Dapr    ┌───────────────────────────────┐
-│ NotifyPaced activity  │ invoke   │ POST /v1/sms/send             │
-│ kind=sms|whatsapp     │─────────▶│  {to,message,sender_id?}      │
-└───────────────────────┘          │    ↓ provider chain (mock/live)│
-                                   │    POST /v1.0/bindings/termii │
-                                   │    POST /v1.0/bindings/…      │
-                                   └───────────────────────────────┘
-                                              │ Dapr HTTP bindings
-                            ┌─────────────────┼──────────────────┐
-                            ▼                 ▼                  ▼
-                     bindings.termii   bindings.africastalking  bindings.whatsapp
-                     (Termii JSON)     (AT form POST)           (Meta Cloud API)
+notification-worker ──Dapr output binding──► messaging-gateway ──► Termii
+                    (bindings-termii,        :7011                 Africa's Talking
+                     bindings-africastalking,                      WhatsApp Cloud API
+                     bindings-whatsapp)
 ```
 
-The worker treats messaging-gateway as the SMS/WhatsApp "provider":
-`messaging.Send` Dapr-invokes `POST /v1/sms/send` and maps the gateway's
-`provider_status` to success/failure, so pacing/metering/audit all stay in
-the worker. The gateway owns vendor specifics.
+The gateway owns all provider credentials, the retry policy (2 retries on
+5xx/429, no retry on 4xx), the provider error mapping (4xx → `400` with the
+provider body, persistent 5xx → `502`) and the per-provider metrics
+(`messaging_gateway_sends_total{provider,result}` on `/metrics`). Logs never
+include the message body (PII).
 
-## Tenant channel routing (`TenantChannelResolver`)
+## Provider setup
 
-Resolution order for `notification.sendRouting` (workflow
-`resolveChannelsForTenant`):
+### Termii (SMS)
 
-1. **`TENANT_CHANNELS`** env JSON — highest precedence:
-   `{"acme": {"sms": "termii", "whatsapp": "whatsapp"}}`
-2. **Tenant row `country` via Dapr invoke identity** —
-   `GET /v1.0/invoke/identity/method/v1/tenants/{slug}` reads
-   `country` (and `channels` if the tenant payload carries one; both keys
-   are optional and the resolver tolerates their absence).
-3. **`COUNTRY_CHANNELS`** env JSON — e.g.
-   `{"NG": {"sms": "africastalking", "whatsapp": "whatsapp"}}`
-   (shipped default: NG → africastalking sms).
-4. **Static defaults** — sms `termii`, whatsapp `whatsapp`.
+1. Sign up at <https://termii.com> and verify the business account.
+2. Dashboard → **API** to copy your API key → `TERMII_API_KEY`.
+3. Register a sender id (Dashboard → **Sender ID**; Nigerian carriers require
+   registration, approval typically takes a few days). Set it as
+   `TERMII_SENDER_ID` (default `OpenDesk`).
+4. Fund the wallet; the gateway uses the `generic` channel with `type:
+   plain` against `POST https://v2.api.termii.com/api/sms/send`.
 
-The chosen **provider name is stamped on `notification.deliveries.provider`**
-for billing/audit (so rows say `termii`/`africastalking`/`whatsapp`, not the
-transport). Delivery **status remains pending→sent only** — Nigeria carrier
-DLR webhooks are out of scope for W4 and are a documented follow-up
-(`docs/ARCHITECTURE.md` notification section).
+### Africa's Talking (SMS)
 
-## Providers
+1. Sign up at <https://account.africastalking.com> and create an app.
+2. **Sandbox first**: switch the app to the sandbox, use username `sandbox`
+   (`AT_USERNAME=sandbox`) and the sandbox API key (`AT_API_KEY`). Point
+   `AT_BASE_URL=https://api.sandbox.africastalking.com` and test against the
+   sandbox simulator numbers — no real SMS is sent.
+3. Go live: create a production app, copy its username + API key, leave
+   `AT_BASE_URL` at the default `https://api.africastalking.com`.
+4. Optionally register an alphanumeric sender id (`AT_FROM`); Nigerian
+   sender ids require carrier approval, without one messages go out on a
+   shared route.
+5. The gateway posts form-encoded `username/to/message/from` to
+   `POST /version1/messaging` with the `apiKey` header.
 
-### Termii (Dapr binding `termii`)
+### WhatsApp Cloud API
 
-Component: `infra/dapr/components/bindings.termii.yaml` → `POST
-https://api.ng.termii.com/api/sms/send` with body
-`{api_key,to,from,sms,type:"plain",channel:"generic"}`. Live when
-`TERMII_API_KEY` is set; otherwise **mock mode** (default) — no binding call,
-logs the send, returns a synthetic `provider_status: 200`.
+1. Create a Meta developer app at <https://developers.facebook.com> and add
+   the **WhatsApp** product.
+2. In *WhatsApp → API Setup* you get a **test phone number** and a temporary
+   token — add up to 5 recipient numbers (each must verify an OTP) and test
+   immediately. Copy the **phone number id** (not the display number) into
+   `WHATSAPP_PHONE_NUMBER_ID` and the token into `WHATSAPP_TOKEN`.
+3. Production: add a real business number, create a **permanent token** via
+   a system user, and submit message templates for approval.
+4. Free-form text only works inside the 24h customer-service window; outside
+   it you must send an approved **template** (`POST /v1/whatsapp/send` with
+   `{"to": "...", "template": "<name>"}`).
+5. The gateway posts to
+   `POST https://graph.facebook.com/v21.0/{phone_number_id}/messages` with a
+   bearer token.
 
-### Africa's Talking (Dapr binding `africastalking`)
+## Dapr binding mechanics
 
-Component: `bindings.africastalking.yaml` → `POST
-https://api.africastalking.com/version1/messaging` with
-`Content-Type: application/x-www-form-urlencoded`, `apiKey` header, body
-`username,to,message,from`. Live when `AT_API_KEY` + `AT_USERNAME` set;
-otherwise mock mode. Sender id from `AT_FROM` (or per-request `sender_id`).
+Each provider is a `bindings.http` component pointing at the gateway
+(`infra/dapr/components/bindings.{termii,africastalking,whatsapp}.yaml`):
 
-### WhatsApp Cloud API (Dapr binding `whatsapp`)
+```yaml
+metadata:
+  name: bindings-termii
+spec:
+  type: bindings.http
+  metadata:
+    - name: url
+      value: "http://messaging-gateway:7011/v1/termii/sms"
+scopes:
+  - notification
+```
 
-Component: `bindings.whatsapp.yaml` → `POST
-https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_NUMBER_ID}/messages` with
-bearer `WHATSAPP_ACCESS_TOKEN`, body
-`{messaging_product:"whatsapp",to,type:"text",text:{body,preview_url:false}}`.
-Live when both envs set; otherwise mock mode.
+The `scopes: [notification]` means the component only loads on the
+notification-worker's daprd sidecar (`DAPR_APP_ID=notification`) — the
+gateway itself needs **no sidecar**. The worker invokes the binding with
+operation `post` (the `bindings.http` operation set is HTTP verbs, not
+`create`) and data `{"to": "+234…", "message": "…"}`; Dapr forwards the data
+as the request body to the gateway URL.
 
-### Twilio (unchanged)
+## Channel routing
 
-The pre-existing Twilio SMS/WhatsApp path stays exactly as before —
-messaging-gateway is simply another provider option; nothing was removed.
+`notification-worker` picks the provider per send:
 
-## PII redaction (`REDACT_PII=1`)
-
-`gateway/redact.go` — opt-in, applied to the message body **before** the
-binding call, and mirrored by notification-worker's `provider.RedactPII` so
-both layers can scrub independently (defense in depth; each off by default):
-
-| Pattern | Replacement |
-|---|---|
-| E.164-ish phone numbers (`+2348012345678`) | `[phone]` |
-| Email addresses | `[email]` |
-| 11-digit BVNs | `[bvn]` |
-| 11-digit NINs (same shape, label split so audits can tell) | `[nin]` |
-
-Heuristic by design: it targets the common leak vectors (a confirmation
-echoing the caller's phone, a staff note with an ID number) and errs toward
-over-redaction. Redaction events are counted
-(`messaging_gateway_redactions_total{kind}`) and logged at debug level with
-the pattern name only — never the original text.
-
-## Metering
-
-The gateway meters every accepted send onto the existing usage topic
-(`USAGE_TOPIC`, default `opendesk.usage.events`) as CloudEvents:
-
-- `com.opendesk.usage.UsageRecord{metric:"sms_send", value:1,
-  meta:{provider, mock, redacted}}`
-- `com.opendesk.usage.UsageRecord{metric:"whatsapp_send", …}` for the
-  whatsapp provider label.
-
-These are **additive** to the worker's `email_sent`/`sms_sent`/… usage
-records (worker meters its own send activity; the gateway meters vendor
-dispatch). Publisher is a no-op when no Dapr sidecar is present (dev/test
-friendly).
-
-## Configuration
-
-messaging-gateway env:
-
-| Var | Default | Purpose |
+| Env var | Default | Meaning |
 |---|---|---|
-| `PORT` | `7011` | HTTP listen |
-| `TERMII_API_KEY` | — | Termii live mode when set |
-| `AT_API_KEY`, `AT_USERNAME`, `AT_FROM` | — | Africa's Talking live mode |
-| `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` | — | WhatsApp live mode |
-| `REDACT_PII` | `0` | `1` scrubs bodies before vendor dispatch |
-| `USAGE_TOPIC` | `opendesk.usage.events` | metering topic |
-| `DAPR_HTTP_PORT` | `3500` | sidecar port |
+| `MESSAGING_CHANNELS` | `email:smtp,sms:twilio` | Fleet defaults per channel |
+| `TENANT_CHANNEL_MAP` | — | JSON per-tenant overrides |
 
-notification-worker env (additive):
+```json
+{"acme-ng": {"sms": "termii"}, "lagos-clinic": {"sms": "whatsapp"}, "default": {"sms": "africastalking"}}
+```
 
-| Var | Default | Purpose |
-|---|---|---|
-| `MESSAGING_GATEWAY_APP_ID` | `messaging` | Dapr app-id to invoke |
-| `TENANT_CHANNELS` | `{}` | per-slug channel overrides (JSON) |
-| `COUNTRY_CHANNELS` | NG→africastalking | country→channel map (JSON) |
-| `IDENTITY_APP_ID` | `identity` | tenant lookup for routing |
+- `sms` providers: `twilio`, `termii`, `africastalking`, `whatsapp`.
+  `email`: `smtp`.
+- Resolution: tenant entry → `"default"` entry → `MESSAGING_CHANNELS`.
+  Unknown tenants fall back to the defaults; invalid entries fail fast at
+  worker boot.
+- The binding invoke name is `bindings-<provider>`; `smtp`/`twilio` keep the
+  existing native bindings, the Nigeria providers hit the gateway.
+- Routing applies to every workflow-driven send (confirmations, reminders,
+  no-show, waitlist claims, industry-pack messages) because all of them flow
+  through the paced `NotifyPaced` → `notify` path with the tenant slug.
 
-## Verification
+## Nigeria notes
 
-- `go build/vet/test ./...` green in both services (go1.23.4).
-- Provider/binding/mock tests: `messaging-gateway/internal/provider/*_test.go`.
-- Routing tests: `notification-worker/internal/workflows/channels_test.go`
-  (precedence, fallback, mixed-case country).
-- Redaction tests: phone/email/BVN/NIN tables in `gateway/redact_test.go` and
-  `provider/redact_test.go`.
-- Manual: `curl -X POST localhost:7011/v1/sms/send -d '{"to":"+234…","message":"hi"}'`
-  → `{"provider":"termii","provider_status":200,"mock":true}` with no keys set.
+- **DND (Do-Not-Disturb)**: Nigerian carriers block generic-route SMS to DND
+  numbers. Termii's `dnd` channel / transactional routes and registered
+  sender ids mitigate this; WhatsApp bypasses SMS DND entirely and is often
+  the most reliable OTP/reminder channel.
+- **Sender ids** must be pre-registered per carrier (MTN/Airtel/Glo/9mobile)
+  on both Termii and Africa's Talking — plan days of lead time.
+- **Phone numbers**: the gateway passes `to` through unchanged; send
+  E.164 (`+2348012345678`). Termii also accepts local `234…` format.
+- **Cost**: Termii/AT bill per SMS segment in NGN; keep templates under
+  160 GSM characters to avoid multi-segment billing.
+- **Future**: `POST /v1/ussd/session` — USSD session handling for
+  feature-phone journeys (Termii / Africa's Talking USSD gateways) is
+  intentionally not implemented yet.
