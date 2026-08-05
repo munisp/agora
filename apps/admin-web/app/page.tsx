@@ -156,8 +156,8 @@ export default function MarketingPage() {
         <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-6 text-sm text-muted-foreground">
           <span>Agora — open-source AI receptionist platform</span>
           <span>Apache-2.0</span>
-        </footer>
+        </div>
+      </footer>
     </div>
-  </div>
   );
 }
