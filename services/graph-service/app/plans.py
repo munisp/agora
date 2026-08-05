@@ -41,6 +41,19 @@ def parse_instant(value: Any) -> datetime:
 
 
 @dataclass(frozen=True)
+class ScoreFilterSpec:
+    """One normalized numeric score predicate (SPEC-W29 §3 WS-B).
+
+    ``hi`` is set only for op ``between``; ``lo`` carries the single bound
+    for ``>=`` / ``<=``."""
+
+    field: str
+    op: str  # ">=" | "<=" | "between"
+    lo: float
+    hi: float | None = None
+
+
+@dataclass(frozen=True)
 class PersonFilterPlan:
     """Segment matching semantics for the in-memory backend."""
 
@@ -49,6 +62,7 @@ class PersonFilterPlan:
     lga: str | None = None
     not_messaged_since: datetime | None = None
     projection: Literal["ids", "count"] = "ids"
+    score_filters: tuple[ScoreFilterSpec, ...] = ()
 
 
 @dataclass(frozen=True)

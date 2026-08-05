@@ -10,6 +10,12 @@ X-Tenant-Id in dev mode; every query injects the tenant filter):
   POST /v1/graph/ask                         NL->Cypher GraphRAG via Ollama (allowlisted shapes)
   GET  /v1/graph/persons/{id}                person 360 (404 cross-tenant)
   POST /v1/graph/cypher                      template-allowlisted queries ONLY (gate 5)
+  GET  /v1/graph/segments/schema             filterable-field catalog (incl. score filters)
+  POST /v1/graph/internal/scores             W29 score write-back (X-Internal-Token only)
+  POST /v1/graph/internal/recommendations    W29 RECOMMENDED_FOR write-back (internal)
+  GET  /v1/graph/alerts[/{id}]               W30 fraud alert list/detail
+  POST /v1/graph/alerts/{id}/resolve         W30 adjudication + audit CloudEvent
+  POST /v1/graph/internal/fixtures/seed      dev/e2e fixture seeder (E2E_FIXTURES=1 only)
   GET  /healthz, GET /metrics
 """
 
@@ -38,10 +44,19 @@ from .ask import (
 )
 from .auth import current_tenant
 from .backend import FalkorBackend, GraphBackend, GraphError, InMemoryBackend
-from .compiler import compile_segment_query
 from .config import Settings, load_settings
 from .dsl import SegmentCreate
+from .events import (
+    AlertEventPublisher,
+    KafkaAlertEventPublisher,
+    NoopAlertEventPublisher,
+)
 from .plans import CompiledQuery
+from .routers import alerts as alerts_router
+from .routers import internal_fixtures as internal_fixtures_router
+from .routers import internal_scores as internal_scores_router
+from .routers import segments as segments_router
+from .segment.compiler import compile_segment_query
 from .store import SegmentStore
 from .templates import TemplateError, compile_template
 
@@ -54,6 +69,7 @@ class Deps:
     backend: GraphBackend
     llm: AskLLM | None
     store: SegmentStore
+    events: AlertEventPublisher | None = None
 
 
 class AskRequest(BaseModel):
@@ -81,6 +97,7 @@ def create_app(
     backend: GraphBackend | None = None,
     llm: AskLLM | None = None,
     store: SegmentStore | None = None,
+    events: AlertEventPublisher | None = None,
 ) -> FastAPI:
     if backend is None:
         if settings.graph_backend == "memory":
@@ -102,10 +119,25 @@ def create_app(
         )
     if store is None:
         store = SegmentStore(settings.segment_store_dir)
+    if events is None:
+        if settings.kafka_bootstrap_servers:
+            events = KafkaAlertEventPublisher(settings.kafka_bootstrap_servers)
+        else:
+            events = NoopAlertEventPublisher()
 
     app = FastAPI(title="opendesk-graph-service", version="0.1.0")
     app.state.settings = settings
-    app.state.deps = Deps(settings=settings, backend=backend, llm=llm, store=store)
+    app.state.deps = Deps(
+        settings=settings, backend=backend, llm=llm, store=store, events=events
+    )
+
+    # W29 internal write-back + W30 alerts/fixtures routers. The fixture
+    # seeder exists ONLY in dev/e2e (E2E_FIXTURES=1); production 404s it.
+    app.include_router(internal_scores_router.router)
+    app.include_router(alerts_router.router)
+    app.include_router(segments_router.router)
+    if settings.e2e_fixtures:
+        app.include_router(internal_fixtures_router.router)
 
     @app.middleware("http")
     async def _metrics_middleware(request: Request, call_next):

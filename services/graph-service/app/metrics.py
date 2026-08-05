@@ -30,3 +30,16 @@ audience_members = Histogram(
     "Materialized audience sizes",
     buckets=(0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000),
 )
+# SPEC-W29 §3 WS-B: predictive score/recommendation write-back volume.
+# Metric name is exactly "scores_written_total" per the spec contract.
+scores_written = Counter(
+    "scores_written_total",
+    "Predictive scores/recommendations written via the internal API",
+    ["tenant"],
+)
+# SPEC-W30 §4 WS-C: fraud alert adjudication outcomes.
+alerts_resolved = Counter(
+    "graph_alerts_resolved_total",
+    "Fraud alerts resolved via the alerts API",
+    ["tenant", "decision"],  # decision: confirmed | dismissed
+)
