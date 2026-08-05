@@ -92,6 +92,10 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `PLUGIN_ALLOWED_HOSTS` | `booking,knowledge,identity` | SSRF allowlist for pack `customTools` |
 | `VOICEPRINTS` | `off` | consent gate for the voice-biometrics scaffold |
 | `VOICEPRINT_THRESHOLD` | `0.75` | cosine-similarity verify threshold |
+| `TENANT_PHONE_MAP` | `{}` | SIP inbound (Wave 5 #1): JSON `{"+1555…":"tenant-slug"}` dialed-number→tenant map (dev-mode; production = `phone_numbers` table, see docs/telephony.md) |
+| `SIP_DEFAULT_SITE` | _(unset)_ | fallback site slug for unmapped dialed numbers (empty = reject) |
+| `PIPER_VOICE_MAP` | `{}` | multilingual (Wave 5 #3): JSON `{"es":"es_ES-sharvard-medium"}` language→piper voice; unmapped languages fall back to `PIPER_VOICE` |
+| `EVAL_PERSONA_OVERRIDE` | `false` | A/B eval (Wave 5 #8): allow `persona_override` on POST /voice/chat — eval only, prompt-injection surface otherwise |
 | `HF_HOME` | `/models` (image) | whisper model cache dir |
 
 ## Local models
@@ -238,4 +242,28 @@ sampling + a persistent store) is the next step.
 
 `eval/` replays `eval/scenarios/*.yaml` against `/voice/chat`, asserts
 expected tool calls and scores turns with an LLM judge; see `eval/README.md`
-and `make eval`.
+and `make eval`. `eval/ab_test.py` (Wave 5 #8) A/B-tests persona variants
+(`make ab-test`, requires `EVAL_PERSONA_OVERRIDE=true`).
+
+## SIP telephony inbound (Wave 5 #1)
+
+Inbound PSTN calls land via LiveKit SIP: an inbound trunk claims the
+provisioned numbers and a callee dispatch rule creates one room per dialed
+number (`call-{number}`). `app/sip.py` detects `call-*` rooms / SIP
+participants, resolves the tenant from the dialed number
+(`TENANT_PHONE_MAP`, dev-mode static JSON; production = `phone_numbers`
+table), and attaches the carrier-asserted caller ID as the session's
+confirmed phone — the two-step read-back confirmation is bypassed for SIP
+calls only (policy documented in `app/sip.py`). Provisioning:
+`deploy/livekit-sip/setup.sh` + docs/telephony.md.
+
+## Multilingual receptionist (Wave 5 #3)
+
+Whisper auto-detects the caller's language per utterance;
+`app/multilang.py` switches the turn language (tenant identity locale is the
+default, pack `languages: [en, es]` bounds the switch set), injects a
+per-turn "respond in {language}" instruction into the system prompt, and
+swaps the piper voice via `PIPER_VOICE_MAP` with graceful fallback to
+`PIPER_VOICE`. Pack `languages` is validated at the voice runtime's pack
+consumption point (`tenant_context._apply_pack`) because identity passes
+pack fields through unchecked.
