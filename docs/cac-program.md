@@ -1,6 +1,6 @@
 # CAC Program — End-to-End Overview (Waves 12–14)
 
-The **CAC App** is OpenDesk's customer-acquisition-cost program: acquire
+The **CAC App** is Agora's customer-acquisition-cost program: acquire
 customers through every Nigerian channel that matters (USSD, SMS, WhatsApp,
 QR/promo links, referrals), attribute each one to its first touch, measure
 blended CAC and payback in realtime and batch, and reward the referrers and
@@ -19,11 +19,11 @@ This page is the map. Each wave's deep-dive doc is linked from its section.
  │ QR / promo / UTM │   │ First-touch channel│  │ Realtime rollups:    │  │ refer a phone, verify │
  │ Geo campaigns    │   │ + campaign + LGA   │  │ analytics-pipeline   │  │ on signup/first txn   │
  │ (W8, guarded W14)│   │ (W13)              │  │ (W13)                │  │ Commissions (W14):    │
- └──────────────────┘   └────────────────────┘  │ Lakehouse gold       │  │ rules engine →        │
+ └──────────────────┘   └───────────────────┘  │ Lakehouse gold       │  │ rules engine →        │
         │                                       │ tables (W13)         │  │ double-entry ledger → │
         ▼                                       │ Admin dashboards     │  │ Paystack payouts +    │
  COMPLIANCE GUARDS (W12): NCC 2442 DND           │ (W13)                │  │ nightly recon (W14)   │
- suppression + quiet-hours deferral for ALL     └──────────────────────┘  └───────────────────────┘
+ suppression + quiet-hours deferral for ALL     └──────────────────────┘  └──────────────────────┘
  marketing sends; transactional never blocked
 ```
 

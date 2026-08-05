@@ -1,7 +1,7 @@
 # Platform Data Seeding (SPEC-W17)
 
 Master doc for the CAC platform data seeding strategy (uploaded spec "Section
-8: Platform Data Seeding Strategy") as implemented against the real OpenDesk
+8: Platform Data Seeding Strategy") as implemented against the real Agora
 repo. Covers: spec→implementation mapping with **every adaptation**, the
 schema contract, per-environment runbook, refresh triggers (§8.6), acceptance
 gates (§8.7), compliance (§8.8) and risks (§8.9).
@@ -14,7 +14,7 @@ orchestration, compliance, docs, acceptance gates (this doc).
 
 ## 1. Spec §8.x → implementation mapping (incl. all adaptations)
 
-Standing OpenDesk rulings override the uploaded spec's tool choices. Every
+Standing Agora rulings override the uploaded spec's tool choices. Every
 substitution is deliberate and listed here.
 
 | Uploaded spec §8 | CAC-doc tool/approach | Implementation (actual) | Why |
@@ -148,7 +148,7 @@ report event → `seed_run_log` upsert; fail-loud on any exception.
 | 6 | FX contiguity | drift.sql arm + `seed_fx.py` self-gate | gap-free daily series |
 | 7 | FunnelEvent shape | Agent B entity tests vs `analytics_pipeline/cac_events.py` fields | envelope match |
 | 8 | TB manifest | Agent B tests | `account_type=90` |
-| 9 | Dashboard loads | Grafana → "OpenDesk — Seed Report" | panels green, `seed_report_summary` populated |
+| 9 | Dashboard loads | Grafana → "Agora — Seed Report" | panels green, `seed_report_summary` populated |
 | 10 | Suite | `pytest tests/seeds tests/lakehouse` (DB-free) | all green |
 
 ## 7. Compliance (§8.8)
