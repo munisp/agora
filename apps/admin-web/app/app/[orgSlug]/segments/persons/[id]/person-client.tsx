@@ -7,17 +7,33 @@
  * graph-service injects the tenant filter, so a cross-tenant id answers 404
  * exactly like an unknown id — SPEC-W28 §5 gate 1). 404 renders an explicit
  * not-found state with a way back to segments.
+ *
+ * SPEC-W29 WS-C: propensity chips (churn/convert/turnout) + the ranked
+ * "Recommended next services" panel mount alongside the W28 view; scores
+ * render only when the tenant's scoring sweep has written them.
+ *
+ * SPEC-W30 WS-D: fraud risk chip (risk_score) + active risk_flags render
+ * beside the propensity badges, with a deep link into the alerts queue
+ * pre-filtered to this person.
  */
 import * as React from "react";
 import Link from "next/link";
-import { ArrowLeft, RefreshCw } from "lucide-react";
+import { ArrowLeft, RefreshCw, ShieldAlert } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import { formatDateTime } from "@/lib/utils";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Person360View } from "@/components/segments/person-360";
+import { RecommendationsPanel } from "@/components/segments/recommendations-panel";
 import {
+  PropensityBadge,
+  PropensityBadges,
+} from "@/components/segments/propensity-badge";
+import {
+  BRAND,
   GRAPH_API,
+  humanizeReason,
   normalizePerson360,
   type Person360,
 } from "@/components/segments/types";
@@ -116,7 +132,66 @@ export function PersonClient({
           Loading person…
         </p>
       ) : person ? (
-        <Person360View person={person} />
+        <div className="space-y-4">
+          {/* SPEC-W29/W30: predictive + fraud-trust header row. Chips render
+              only for scores the sweep has actually written. */}
+          <div className="flex flex-wrap items-center gap-2">
+            <PropensityBadges
+              churn={person.propensity_churn}
+              convert={person.propensity_convert}
+              turnout={person.propensity_turnout}
+            />
+            {person.risk_score !== undefined ? (
+              <PropensityBadge
+                label="Risk"
+                score={person.risk_score}
+                title="Fraud risk score from the tenant scoring sweep (graph-neighborhood outlier detection)."
+              />
+            ) : null}
+            {(person.risk_flags ?? []).map((flag) => (
+              <span
+                key={flag}
+                title={`Active fraud detector flag: ${flag}`}
+                className="inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-xs font-medium"
+                style={{
+                  color: BRAND.terracotta,
+                  backgroundColor: `${BRAND.terracotta}1a`,
+                  borderColor: `${BRAND.terracotta}59`,
+                }}
+              >
+                <ShieldAlert className="h-3 w-3" />
+                {humanizeReason(flag)}
+              </span>
+            ))}
+            {person.risk_score !== undefined ||
+            (person.risk_flags ?? []).length > 0 ? (
+              <Link
+                href={`/app/${orgSlug}/alerts?person_id=${encodeURIComponent(person.person_id || personId)}`}
+                className="text-xs text-primary underline-offset-4 hover:underline"
+              >
+                View this person&apos;s alerts
+              </Link>
+            ) : null}
+            {person.model_version || person.scored_at ? (
+              <span className="text-xs text-muted-foreground">
+                {person.model_version ? `Model ${person.model_version}` : ""}
+                {person.model_version && person.scored_at ? " · " : ""}
+                {person.scored_at ? `scored ${formatDateTime(person.scored_at)}` : ""}
+              </span>
+            ) : null}
+          </div>
+
+          <Person360View person={person} />
+
+          <RecommendationsPanel
+            orgSlug={orgSlug}
+            // Surfaced from the person_by_id projection (envelope-unwrapped
+            // in normalizePerson360); the route id is the fallback so the
+            // panel never queries with an empty person_id.
+            personId={person.person_id || personId}
+            personName={person.name}
+          />
+        </div>
       ) : null}
     </div>
   );
