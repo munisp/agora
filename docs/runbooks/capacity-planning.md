@@ -12,18 +12,18 @@ simultaneously holds: 1 SFU room + 1 worker job process + 1 STT stream +
 LLM rate share + 1 TTS stream + (optionally) 1 SIP channel + per-turn
 downstream calls (booking availability, knowledge RAG, identity context).
 
-Live view: Grafana → **OpenDesk — Concurrency Ceilings**
+Live view: Grafana → **Agora — Concurrency Ceilings**
 (`infra/observability/dashboards/concurrency-ceilings.json`).
 
 ---
 
-## 1. Per-layer worksheet (pre-filled with OpenDesk components)
+## 1. Per-layer worksheet (pre-filled with Agora components)
 
 Fill the **Ceiling now** column from load tests (`tests/load/voice_ramp.py`)
 and the Concurrency Ceilings dashboard. The demand column is per *N
 concurrent calls*.
 
-| # | Layer | OpenDesk component | Ceiling unit | Demand per concurrent call | Ceiling now | Lift lever |
+| # | Layer | Agora component | Ceiling unit | Demand per concurrent call | Ceiling now | Lift lever |
 |---|-------|--------------------|--------------|----------------------------|-------------|------------|
 | 1 | Media plane (SFU) | LiveKit DaemonSet (`deploy/k3s/livekit-server.yaml`), 1 pod/node, hostNetwork | concurrent **rooms** per node; node CPU/bandwidth | 1 room + 1–2 participant streams | _fill_ (start: ~50–100 calls/node on 4 dedicated cores, UDP hostPorts 50000-50100) | add `livekit=true` nodes (rooms mesh across nodes); budget old+new capacity during 5h drain rollouts |
 | 2 | Worker plane | `voice-worker` Deployment + HPA (`deploy/k3s/voice-worker*.yaml`) | concurrent **job processes** per pod | 1 job (1 warm subprocess) | _fill_ (start: 10–25 jobs per 4cpu/8Gi pod; HPA 2–20 pods) | raise `maxReplicas` + add compute-optimized nodes (**never burstable t3-class**); `AGENT_IDLE_PROCESSES` prewarming |
@@ -55,7 +55,7 @@ concurrent calls*.
 ## 2. Worked example — 500 concurrent calls (article's scenario)
 
 Article conclusion: ~20–50 workers suffice; the binding constraints are
-**inference caps and SIP channels**, not CPU. Filled with OpenDesk
+**inference caps and SIP channels**, not CPU. Filled with Agora
 components:
 
 | Layer | Arithmetic for N=500 | What binds |
@@ -91,7 +91,7 @@ Simplified rule of thumb: `pool_max_conns ≈ peak_calls × peak_mid-call_turns`
 then divide across service replicas. Keep `sum(all services' MaxConns)` under
 Postgres `max_connections` with ~20% headroom for migrations/jobs.
 
-**OpenDesk defaults (env-documented):**
+**Agora defaults (env-documented):**
 
 | Service | Env | Default | Rationale |
 |---|---|---|---|
@@ -111,7 +111,7 @@ postgres_exporter scraped — empty panel = monitoring gap, not headroom).
 Article model: **cost per concurrent-call-hour ≈ $1.15–$3.55 rented**;
 compute is the smallest line item; inference + telephony dominate.
 Self-hosting models converts per-minute cost into fixed GPU cost — the
-OpenDesk open-model-first design. The calculator is parametric: plug in your
+Agora open-model-first design. The calculator is parametric: plug in your
 own numbers in the *you* column.
 
 ### 4a. Inputs (edit for your deployment)
@@ -127,7 +127,7 @@ own numbers in the *you* column.
 | Calls one GPU serves (whisper+piper CPU-offload, ollama 8 slots) | n_gpu | ~25 | |
 | SIP trunk per channel-hour | S | $0.01–0.02 + per-min carrier rate | |
 
-### 4b. Self-hosted (OpenDesk default: qwen3 via Ollama + faster-whisper + Piper)
+### 4b. Self-hosted (Agora default: qwen3 via Ollama + faster-whisper + Piper)
 
 | Line item | Formula | @ N=100, defaults |
 |---|---|---|
@@ -156,7 +156,7 @@ utilization of one GPU; above that self-host wins.
 
 * **~60× gap** between self-hosted (~$0.05) and full-API (~$3.2) per
   call-hour at steady volume — the article's "self-host wins at steady
-  volume" made concrete with the OpenDesk stack.
+  volume" made concrete with the Agora stack.
 * API mode still makes sense as a **fallback adapter** (Ollama→MiniMax on
   429/timeout; Piper→ElevenLabs when enabled): you pay API rates only for
   overflow/degraded minutes — degraded latency, not dead calls.
