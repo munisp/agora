@@ -202,9 +202,22 @@ func TestBoardAndToday(t *testing.T) {
 	tenantID := uuid.New()
 	ada := addTeamMember(t, st, tenantID, "Ada Field", true)
 
-	now := time.Now()
-	start := now.Add(2 * time.Hour)
-	tomorrow := now.Add(26 * time.Hour)
+	// SPEC-W24 WS-A1: pin the whole scenario to ONE explicit location.
+	// Store.Today windows on an explicit [dayStart, dayEnd) instant range
+	// (the HTTP handler buckets it in the tenant location — see
+	// Handlers.Today), so the test must derive BOTH the window and the
+	// scheduled instants from the same explicit time.Location. The old
+	// version mixed time.Now()'s implicit local-time date components with
+	// a time.UTC midnight (flaky under TZ=Asia/Shanghai: the local date
+	// is not the UTC date around the day boundary) and anchored the
+	// schedule to now (flaky near midnight under ANY TZ: now+2h can fall
+	// into the next day). Anchoring the instants to the pinned window
+	// makes the test deterministic regardless of process TZ and wall time.
+	now := time.Now().UTC()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	dayEnd := dayStart.AddDate(0, 0, 1)
+	start := dayStart.Add(12 * time.Hour) // midday — always inside the window
+	tomorrow := dayEnd.Add(2 * time.Hour) // always outside the window
 
 	todayWO := mkOrder(tenantID, "Today job")
 	todayWO.ScheduledStart = &start
@@ -235,8 +248,6 @@ func TestBoardAndToday(t *testing.T) {
 		t.Fatalf("assignee name join: %+v", board)
 	}
 
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	dayEnd := dayStart.AddDate(0, 0, 1)
 	today, err := st.Today(ctx, tenantID, dayStart, dayEnd, nil)
 	if err != nil {
 		t.Fatalf("today: %v", err)

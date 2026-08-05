@@ -509,6 +509,34 @@ func run() error {
 			}
 		}()
 		defer incidentsConsumer.Close() //nolint:errcheck
+
+		// SPEC-W24 Agent B (WS-B2) — BEGIN (additive): lending
+		// DisbursementIntent → TigerBeetle rail consumer (group
+		// booking-lending-disbursements) on LENDING_EVENTS_TOPIC. The rail
+		// follows the payments ledger's mock posture: LENDING_TB_BRIDGE_URL
+		// empty → deterministic mock (no money movement); set it to the
+		// payments-service Dapr invoke gateway for live TB transfers.
+		// Exactly-once under redelivery via the deterministic transfer ID
+		// (anchor: intent ref_id = application id). Skipped when lending
+		// events are disabled (empty topic).
+		if cfg.LendingEventsTopic != "" {
+			lendingGroup := os.Getenv("LENDING_DISBURSEMENTS_GROUP")
+			if lendingGroup == "" {
+				lendingGroup = consumer.DefaultLendingDisbursementsGroup
+			}
+			lendingRail := consumer.RailFromEnv(logger)
+			lendingConsumer := consumer.NewLendingDisbursements(cfg.KafkaBrokers, cfg.LendingEventsTopic, lendingGroup, cfg.DLQTopic, lendingRail, logger)
+			go func() {
+				if err := lendingConsumer.Run(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("lending disbursement consumer exited", zap.Error(err))
+				}
+			}()
+			defer lendingConsumer.Close() //nolint:errcheck
+			logger.Info("lending disbursement consumer started",
+				zap.String("topic", cfg.LendingEventsTopic), zap.String("group", lendingGroup),
+				zap.String("rail", lendingRail.Name()))
+		}
+		// SPEC-W24 Agent B (WS-B2) — END
 	}
 
 	deps := httpapi.Deps{
