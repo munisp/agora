@@ -47,7 +47,7 @@ are **kobo int64** (₦1 = 100 kobo).
 
   ```
   draft → review → active ⇄ paused
-     │        └─────┴──→ rejected (terminal)
+     │        └──────┴──→ rejected (terminal)
      └───────→ rejected
   ```
 
