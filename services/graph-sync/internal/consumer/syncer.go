@@ -161,6 +161,17 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 		f := false
 		showed = &f
 	}
+	// SPEC-W30: optional staff attribution (D6 ghost bookings) and the
+	// cancellation timestamp (flash create->cancel detection).
+	var createdBy string
+	if v, ok := evt.Data["created_by"].(string); ok {
+		createdBy = strings.TrimSpace(v)
+	}
+	var cancelledAt *time.Time
+	if evt.Type == events.TypeBookingCancelled {
+		t := orEventTime(time.Time{}, evt, s.now())
+		cancelledAt = &t
+	}
 	return s.Graph.UpsertBooking(ctx, graph.Booking{
 		BookingID:    d.BookingID,
 		TenantID:     tenantID,
@@ -169,6 +180,8 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 		OfferingName: d.OfferingName,
 		CreatedAt:    orEventTime(d.StartsAt, evt, s.now()),
 		Showed:       showed,
+		CreatedBy:    createdBy,
+		CancelledAt:  cancelledAt,
 	}, personID)
 }
 
@@ -233,12 +246,23 @@ func (s *Syncer) contactCaptured(ctx context.Context, evt events.CloudEvent, ten
 		return err
 	}
 	capturedAt := parseTimeOr(d.CapturedAt, evt.Time, s.now())
+	// SPEC-W30: optional staff/agent attribution rides the raw event map
+	// (same pattern as referred_by_person_id below) — the typed struct
+	// predates it. Detectors D2/D3/D4 stay silent when upstream omits it.
+	var capturedBy string
+	for _, k := range []string{"agent_id", "staff_id", "captured_by"} {
+		if v, ok := evt.Data[k].(string); ok && strings.TrimSpace(v) != "" {
+			capturedBy = strings.TrimSpace(v)
+			break
+		}
+	}
 	if err := s.Graph.UpsertContact(ctx, graph.Contact{
 		LeadID:              leadID,
 		TenantID:            tenantID,
 		ChannelOfFirstTouch: channelOr(d.Channel, "field"),
 		Source:              d.Source,
 		CapturedAt:          capturedAt,
+		CapturedBy:          capturedBy,
 		LGA:                 d.LGA,
 		Ward:                d.Ward,
 		Lat:                 d.Lat,
@@ -474,6 +498,7 @@ func (s *Syncer) HandleEnrichment(ctx context.Context, evt events.CloudEvent) er
 	s.metrics().Inc("enrichment_applied")
 	return nil
 }
+
 
 // normalizeEnrichmentProps normalizes RFC3339 timestamp VALUES inside the
 // opaque property map to UTC (dual-TZ safety: offsets emitted by the spark
