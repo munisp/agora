@@ -1,6 +1,6 @@
 # MCP tools (SPEC-W9 Part C)
 
-OpenDesk's voice/chat tool layer can consume external **MCP (Model Context
+Agora's voice/chat tool layer can consume external **MCP (Model Context
 Protocol)** servers — the open protocol (Anthropic, now broadly adopted) for
 exposing tools to LLM agents over JSON-RPC 2.0. An MCP server advertises a
 tool catalog (`tools/list`); the agent calls them (`tools/call`). This lets a
@@ -105,7 +105,7 @@ Expose an n8n workflow as MCP tools for the receptionist:
    Request: check order status*, *Postgres: lookup customer*). Each becomes
    one MCP tool with its own input schema.
 3. Protect the endpoint (n8n MCP trigger auth → Bearer token or header auth).
-4. Point OpenDesk at it:
+4. Point Agora at it:
 
    ```bash
    MCP_SERVERS='[{"name":"n8n","url":"https://n8n.example.com/mcp/front-desk/sse","headers":{"authorization":"Bearer <token>"}}]'

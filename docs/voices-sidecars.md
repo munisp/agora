@@ -1,6 +1,6 @@
 # Voice TTS sidecars — MMS & XTTS (SPEC-W10 Part B)
 
-Two standalone FastAPI sidecars extend OpenDesk TTS beyond piper:
+Two standalone FastAPI sidecars extend Agora TTS beyond piper:
 
 | Sidecar | Port | Purpose | Mock default | Real inference |
 |---|---|---|---|---|
