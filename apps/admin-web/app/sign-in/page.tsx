@@ -27,7 +27,7 @@ export default async function SignInPage({
           <span className="mb-2 flex h-10 w-10 items-center justify-center rounded-md bg-primary text-sm font-bold text-primary-foreground">
             OD
           </span>
-          <CardTitle className="text-xl">Welcome to OpenDesk</CardTitle>
+          <CardTitle className="text-xl">Welcome to Agora</CardTitle>
           <CardDescription>
             Sign in with your organisation account to manage your AI
             receptionist.

@@ -1,4 +1,4 @@
-# apps/admin-web — OpenDesk dashboard + public booking page
+# apps/admin-web — Agora dashboard + public booking page
 
 Next.js 15 (App Router) + TypeScript (strict) + Tailwind CSS v4 with a small
 hand-written shadcn-style component set (`components/ui`). No Clerk, no

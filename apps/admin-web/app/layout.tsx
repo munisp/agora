@@ -6,14 +6,14 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: {
-    default: "OpenDesk — Open-source AI receptionist",
-    template: "%s · OpenDesk",
+    default: "Agora — Open-source AI receptionist",
+    template: "%s · Agora",
   },
   description:
-    "OpenDesk is the open-source, multi-tenant AI receptionist platform: voice + text concierge, bookings, catalog, knowledge base and payments.",
+    "Agora is the open-source, multi-tenant AI receptionist platform: voice + text concierge, bookings, catalog, knowledge base and payments.",
   manifest: "/manifest.webmanifest",
   icons: { apple: "/icons/icon-192.png" },
-  appleWebApp: { capable: true, title: "OpenDesk Admin" },
+  appleWebApp: { capable: true, title: "Agora Admin" },
 };
 
 // PWA theme color (Next.js requires themeColor under viewport, not metadata).

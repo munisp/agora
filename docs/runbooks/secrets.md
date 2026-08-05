@@ -1,6 +1,6 @@
 # Secrets management runbook
 
-How OpenDesk handles secrets in dev vs production, and how to rotate them.
+How Agora handles secrets in dev vs production, and how to rotate them.
 
 ---
 

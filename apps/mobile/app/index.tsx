@@ -13,7 +13,7 @@ export default function Index() {
   if (!ready) {
     return (
       <View style={styles.root}>
-        <Text style={styles.logo}>OpenDesk</Text>
+        <Text style={styles.logo}>Agora</Text>
         <ActivityIndicator size="large" color={colors.primary} />
       </View>
     );
