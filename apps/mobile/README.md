@@ -1,6 +1,6 @@
-# OpenDesk Field (apps/mobile)
+# Agora Field (apps/mobile)
 
-Expo React Native field app for OpenDesk tenants — today dashboard, lead
+Expo React Native field app for Agora tenants — today dashboard, lead
 capture, referrals + leaderboard, incidents inbox, push registration.
 SPEC-W16 Agent D (contract §5).
 

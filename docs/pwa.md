@@ -4,8 +4,8 @@ Two installable Progressive Web Apps:
 
 | App | Kind | Path |
 | --- | --- | --- |
-| OpenDesk Admin | Next.js 15 app + PWA layer | `apps/admin-web` |
-| OpenDesk Field | Dependency-free static PWA (no framework) | `apps/field-pwa` |
+| Agora Admin | Next.js 15 app + PWA layer | `apps/admin-web` |
+| Agora Field | Dependency-free static PWA (no framework) | `apps/field-pwa` |
 
 ## Architecture
 
