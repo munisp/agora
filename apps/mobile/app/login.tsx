@@ -21,7 +21,7 @@ export default function LoginScreen() {
 
   const onSignIn = async () => {
     if (!tenantSlug.trim()) {
-      setError("Enter your tenant slug (the subdomain of your OpenDesk site).");
+      setError("Enter your tenant slug (the subdomain of your Agora site).");
       return;
     }
     setError(null);
@@ -42,7 +42,7 @@ export default function LoginScreen() {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
       <View style={styles.card}>
-        <Text style={styles.logo}>OpenDesk</Text>
+        <Text style={styles.logo}>Agora</Text>
         <Text style={styles.tagline}>Field app — leads, referrals, incidents</Text>
         {error ? <ErrorBox message={error} /> : null}
         <Field

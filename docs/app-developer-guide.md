@@ -1,6 +1,6 @@
-# App Developer Guide — Building Enterprise Apps on OpenDesk
+# App Developer Guide — Building Enterprise Apps on Agora
 
-Audience: teams building enterprise apps that plug into the OpenDesk app
+Audience: teams building enterprise apps that plug into the Agora app
 platform (SPEC-W18 foundation; W19/W20 app backends). This guide covers the
 catalog manifest, the entitlement model, the three-layer gating pattern,
 lifecycle events, per-tenant app config conventions, and a testing recipe.

@@ -1,4 +1,4 @@
-# OpenDesk — Gaps, Improvements & Innovation Roadmap
+# Agora — Gaps, Improvements & Innovation Roadmap
 
 Assessment of the current codebase (Phase 1 + Phase 2). Items are grounded in the actual tree, not generic advice. Priority: **P0** = do before any real deployment, **P1** = production hardening, **P2** = differentiation.
 
