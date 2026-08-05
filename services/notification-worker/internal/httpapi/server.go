@@ -32,6 +32,10 @@ type Server struct {
 	// DND is the SPEC-W12 DND registry (NCC 2442 + tenant opt-outs); nil
 	// disables the /v1/dnd routes (503).
 	DND DNDStore
+
+	// AudienceIntake is the SPEC-W28 graph audience intake; nil degrades
+	// POST /v1/audiences to 503.
+	AudienceIntake AudienceIntaker
 }
 
 // NewRouter builds the chi router.
@@ -75,6 +79,9 @@ func NewRouter(s *Server) http.Handler {
 		r.Delete("/{phone}", s.deleteDND)
 		r.Get("/check", s.checkDND)
 	})
+
+	// SPEC-W28: consent-gated graph audiences → existing pacer path.
+	RegisterAudienceRoutes(r, NewAudienceHandler(s.AudienceIntake, s.Log))
 	return r
 }
 

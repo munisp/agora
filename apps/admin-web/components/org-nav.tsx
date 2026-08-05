@@ -25,6 +25,7 @@ import {
   Target,
   AudioLines,
   Settings,
+  Filter,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -62,6 +63,7 @@ const items: NavItem[] = [
   { segment: "channels", label: "Channels", icon: MessagesSquare },
   { segment: "locations", label: "Locations", icon: MapPin },
   { segment: "geo-campaigns", label: "Geo campaigns", icon: Target },
+  { segment: "segments", label: "Segments", icon: Filter },
   { segment: "voices", label: "Voices", icon: AudioLines },
   { external: CRM_URL, label: "CRM", icon: UsersRound },
   { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
@@ -116,6 +118,10 @@ export function OrgNav({
     if ("segment" in item && item.segment === "locations")
       return canViewLocations(roles);
     if ("segment" in item && item.segment === "geo-campaigns")
+      return canViewGeoCampaigns(roles);
+    // SPEC-W28: segments (graph audiences) gates messaging spend the same
+    // way as geo campaigns — owner/admin only; pages enforce server-side.
+    if ("segment" in item && item.segment === "segments")
       return canViewGeoCampaigns(roles);
     // SPEC-W10 Part C: voices studio is owner/admin/staff; the page enforces
     // the same rule server-side.
