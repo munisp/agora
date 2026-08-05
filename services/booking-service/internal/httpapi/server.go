@@ -507,6 +507,11 @@ func NewRouter(d Deps) http.Handler {
 		r.Get("/", s.devicesHandler((*devices.Handlers).ListInternal))
 	})
 
+	// Internal lead phone resolution (SPEC-W28): the notification-worker's
+	// audience intake invokes this via Dapr to resolve lead_id → phone for
+	// graph audiences. Tenant via X-Tenant-Slug middleware; internal only.
+	r.With(s.tenantMiddleware).Post("/v1/leads/resolve", s.resolveLeadPhones)
+
 	return r
 }
 
