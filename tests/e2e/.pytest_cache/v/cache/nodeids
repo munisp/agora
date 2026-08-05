@@ -1,9 +1,0 @@
-[
-  "test_full_flow.py::test_01_tenant_provisioned_and_seeded",
-  "test_full_flow.py::test_02_availability_has_slots",
-  "test_full_flow.py::test_03_public_booking_created",
-  "test_full_flow.py::test_04_saga_confirms_booking_and_emits_events",
-  "test_full_flow.py::test_05_crm_sync_map_row",
-  "test_full_flow.py::test_06_conversation_turn_indexed_in_opensearch",
-  "test_full_flow.py::test_07_lakehouse_bronze_row"
-]
