@@ -42,6 +42,7 @@ networks:
 volumes:
   falkordb-data: null   # FalkorDB RDB snapshots (backup story: docs/graph.md §ops)
   ollama-graph-data: null     # pulled model blobs (qwen2.5:7b-instruct, nomic-embed-text)
+  graph-ml-models: null       # SPEC-W29 versioned model artifacts (graphsage-vN/)
 
 services:
   # ------------------------- FalkorDB graph store --------------------------
@@ -212,6 +213,17 @@ services:
       JWT_AUDIENCE: ${JWT_AUDIENCE:-opendesk}
       # Phone hashing (leads dedupe scheme) for person lookups by phone.
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
+      # SPEC-W29: internal service-to-service token guarding the score /
+      # recommendation / alert write-back routes (X-Internal-Token). JWTs are
+      # never accepted on /v1/graph/internal/*. Rotate per environment.
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-opendesk-dev-internal-token}
+      # SPEC-W30: fraud alert audit events.
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BROKERS:-kafka:9092}
+      FRAUD_ALERTS_TOPIC: ${FRAUD_ALERTS_TOPIC:-opendesk.fraud.alerts.v1}
+      # Dev/e2e only: enables POST /v1/graph/internal/fixtures/seed (fixed,
+      # server-side-allowlisted fixture scenarios — NOT raw client Cypher).
+      # NEVER set in production, same posture as AUTHZ_DISABLED.
+      E2E_FIXTURES: ${E2E_FIXTURES:-1}
     ports:
       - "7014:7014/tcp"
     networks:
@@ -220,5 +232,75 @@ services:
       graph-db:
         condition: service_healthy
       ollama-graph:
+        condition: service_started
+    restart: unless-stopped
+
+  # ----------- graph-ml (SPEC-W29: propensity + recommendations) -----------
+  graph-ml:
+    # Batch scorer: reads each tenant's subgraph, writes propensity scores
+    # and RECOMMENDED_FOR edges back through graph-service's internal API
+    # (single write path). Heuristic mode has zero ML deps; the optional
+    # GraphSAGE backend activates with GRAPH_ML_BACKEND=gnn + torch/PyG.
+    build: ../services/graph-ml
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "7016"
+      FALKORDB_HOST: graph-db
+      FALKORDB_PORT: "6379"
+      FALKORDB_DB: ${FALKORDB_GRAPH:-agora_tenants}
+      GRAPH_SERVICE_URL: http://graph-service:7014
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-opendesk-dev-internal-token}
+      GRAPH_ML_BACKEND: ${GRAPH_ML_BACKEND:-heuristic}
+      GRAPH_ML_TOP_K: ${GRAPH_ML_TOP_K:-5}
+      SCORE_INTERVAL_MINUTES: ${SCORE_INTERVAL_MINUTES:-60}
+      GRAPH_ML_MODEL_DIR: /data/graph-ml-models
+    ports:
+      - "7016:7016/tcp"   # dev/e2e reachability; not routed through APISIX
+    volumes:
+      - graph-ml-models:/data/graph-ml-models
+    networks:
+      - opendesk
+    depends_on:
+      graph-service:
+        condition: service_started
+    restart: unless-stopped
+
+  # ----------- fraud-engine (SPEC-W30: fraud & trust intelligence) ---------
+  fraud-engine:
+    # Deterministic graph detectors (referral rings, sybil clusters, capture
+    # velocity, geo-impossibility, consent backdating, ghost bookings) plus
+    # the GNN-anomaly consumer. Writes Alert nodes + quarantine flags;
+    # adjudication happens in graph-service/admin-web. Never auto-erases.
+    build: ../services/fraud-engine
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "7017"
+      FALKORDB_HOST: graph-db
+      FALKORDB_PORT: "6379"
+      FALKORDB_GRAPH: ${FALKORDB_GRAPH:-agora_tenants}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_ENABLED: ${FRAUD_KAFKA_ENABLED:-true}
+      FRAUD_ALERTS_TOPIC: ${FRAUD_ALERTS_TOPIC:-opendesk.fraud.alerts.v1}
+      FRAUD_SWEEP_MINUTES: ${FRAUD_SWEEP_MINUTES:-15}
+      FRAUD_KAFKA_TOPICS: ${FRAUD_KAFKA_TOPICS:-opendesk.booking.events,opendesk.identity.events}
+      CAPTURE_VELOCITY_MAX: ${CAPTURE_VELOCITY_MAX:-30}
+      SYBIL_WINDOW_MIN: ${SYBIL_WINDOW_MIN:-60}
+      SYBIL_SIM_THRESHOLD: ${SYBIL_SIM_THRESHOLD:-0.98}
+      MAX_TRAVEL_KMH: ${MAX_TRAVEL_KMH:-120}
+      GHOST_MIN: ${GHOST_MIN:-3}
+      GHOST_WINDOW_MIN: ${GHOST_WINDOW_MIN:-10}
+      ANOMALY_ALERT_THRESHOLD: ${ANOMALY_ALERT_THRESHOLD:-0.9}
+    ports:
+      - "7017:7017/tcp"   # dev/e2e reachability; not routed through APISIX
+    networks:
+      - opendesk
+    depends_on:
+      graph-db:
+        condition: service_healthy
+      graph-ml:
         condition: service_started
     restart: unless-stopped

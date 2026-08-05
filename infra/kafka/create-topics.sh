@@ -61,6 +61,8 @@ TOPICS=(
   # SPEC-W28 (additive): tenant knowledge graph streams.
   opendesk.graph.enrichment.v1     # gold→graph enrichment rows (spark graph_enrichment.py → graph-sync)
   opendesk.graph.erasure.done.v1   # graph erasure audit events (graph-sync emits)
+  # SPEC-W30 (additive): fraud & trust intelligence.
+  opendesk.fraud.alerts.v1         # fraud-engine AlertRaised + graph-service AlertResolved audit events
 )
 
 echo "[kafka-topics] waiting for broker at ${BOOTSTRAP}..."
