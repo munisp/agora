@@ -283,6 +283,7 @@ func run() error {
 
 	// HTTP sidecar: /healthz + /dev triggers + /v1/webhooks (Wave 5 #10)
 	// + /v1/dnd (SPEC-W12).
+	audienceIntake := activities.NewAudienceIntake(daprClient, cfg.BookingAppID, tc, cfg.TemporalTaskQueue, strings.Split(cfg.KafkaBrokers, ","), logger)
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.Port),
 		Handler: httpapi.NewRouter(&httpapi.Server{
@@ -306,6 +307,7 @@ func run() error {
 			},
 			WebhookSigningRequired: cfg.WebhookSigningRequired,
 			DND:                    dndStore,
+			AudienceIntake:         audienceIntake,
 		}),
 	}
 	errCh := make(chan error, 1)

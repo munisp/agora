@@ -1,0 +1,224 @@
+name: opendesk-graph
+# ============================================================================
+# docker-compose.graph.yml — W28 tenant knowledge graph overlay (SPEC-W28, WS-D).
+#
+# Adds, additively (no existing compose file is edited):
+#   * graph-db       — FalkorDB graph store (Cypher), the per-tenant
+#                      knowledge graph (graph name default `agora_tenants`).
+#   * ollama-graph         — local LLM + embeddings (CPU profile default).
+#                            Named ollama-graph (not the SPEC-W28 plain
+#                            `ollama`) because the root stack already owns an
+#                            `ollama` service (voice profile, pinned 0.5.7);
+#                            the graph stack must not merge into it.
+#   * ollama-graph-gpu     — GPU variant, only with `--profile gpu` (see §GPU below).
+#   * ollama-graph-models  — one-shot idempotent model bootstrap (runs
+#                      scripts/graph/ollama_bootstrap.sh).
+#   * graph-sync     — Go consumer: Kafka topics -> FalkorDB upserts
+#                      (WS-A contract, env GRAPH_SYNC_*).
+#   * graph-service  — FastAPI :7014 Cypher/segment/ask API
+#                      (WS-B contract, env FALKORDB_* + OLLAMA_BASE_URL).
+#
+# Usage (overlay on the main stack — compose v2 resolves relative paths
+# against THIS file's location, so `../x` below means repo-root/x):
+#
+#   docker compose -f docker-compose.yml -f infra/docker-compose.graph.yml up -d
+#
+# The file is also valid standalone for `config` validation
+# (docker compose -f infra/docker-compose.graph.yml config -q); standalone
+# `up` is NOT supported because graph-sync/graph-service expect the core
+# stack (kafka, postgres) on the shared `opendesk` network.
+#
+# GPU profile: the default `ollama-graph` service is CPU-only. For NVIDIA GPUs run
+#   docker compose -f docker-compose.yml -f infra/docker-compose.graph.yml \
+#     --profile gpu up -d ollama-graph-gpu ollama-graph-models
+# and point OLLAMA_BASE_URL at http://ollama-graph-gpu:11434 (requires the NVIDIA
+# container toolkit on the host; `gpus: all` deploy reservation below).
+# ============================================================================
+
+networks:
+  # Merges into the shared network declared by the root compose project.
+  opendesk: null
+
+volumes:
+  falkordb-data: null   # FalkorDB RDB snapshots (backup story: docs/graph.md §ops)
+  ollama-graph-data: null     # pulled model blobs (qwen2.5:7b-instruct, nomic-embed-text)
+
+services:
+  # ------------------------- FalkorDB graph store --------------------------
+  graph-db:
+    # Official FalkorDB image (Redis-protocol compatible, Cypher via
+    # GRAPH.QUERY). Pin an exact tag in production deploys.
+    image: falkordb/falkordb:latest
+    container_name: opendesk-graph-db
+    # Persist + snapshot every 60s when >=1 write (RDB snapshot = the backup
+    # primitive documented in docs/graph.md).
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      # Host 6380 (NOT 6379 — that is the platform redis in
+      # infra/docker-compose.core.yml). In-cluster address: graph-db:6379.
+      - "6380:6379/tcp"
+    volumes:
+      - falkordb-data:/data
+    networks:
+      - opendesk
+    healthcheck:
+      # FalkorDB speaks the Redis protocol; PING is the liveness probe.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    restart: unless-stopped
+
+  # ------------------- Ollama (local LLM + embeddings) ---------------------
+  ollama-graph:
+    # Pin an exact tag in production deploys. CPU profile: no GPU reservation.
+    image: ollama/ollama:latest
+    container_name: opendesk-ollama-graph
+    ports:
+      - "11435:11434/tcp"
+    volumes:
+      - ollama-graph-data:/root/.ollama
+    networks:
+      - opendesk
+    healthcheck:
+      # `ollama list` talks to the local server (defaults to
+      # 127.0.0.1:11434) and fails until the API is up.
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  ollama-graph-gpu:
+    # GPU profile twin of `ollama-graph` (SPEC-W28 §1: GPU profile documented).
+    # Starts only under `--profile gpu`; shares the model volume so models
+    # pulled by the CPU service are reused.
+    image: ollama/ollama:latest
+    container_name: opendesk-ollama-graph-gpu
+    profiles: ["gpu"]
+    ports:
+      - "11436:11434/tcp"
+    volumes:
+      - ollama-graph-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - opendesk
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  ollama-graph-models:
+    # One-shot, idempotent model bootstrap (SPEC-W28 WS-D): pulls the chat +
+    # embedding models graph-service/graph-sync need. Re-runnable — the
+    # script skips models that are already present.
+    image: ollama/ollama:latest
+    container_name: opendesk-ollama-graph-models
+    entrypoint: ["/bin/sh", "/bootstrap/ollama_bootstrap.sh"]
+    environment:
+      # Talk to the CPU service by default; set OLLAMA_HOST=http://ollama-graph-gpu:11434
+      # when running the gpu profile.
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama-graph:11434}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+    volumes:
+      - ../scripts/graph/ollama_bootstrap.sh:/bootstrap/ollama_bootstrap.sh:ro
+    networks:
+      - opendesk
+    depends_on:
+      ollama-graph:
+        condition: service_healthy
+    restart: "no"
+
+  # -------------- graph-sync (WS-A contract: Go consumer) ------------------
+  graph-sync:
+    # Consumes the W28 §2 topic set (booking/cac/identity/transcripts/
+    # consent-erasure) and upserts the per-tenant graph. Built by WS-A;
+    # every knob is GRAPH_SYNC_* with the documented defaults — nothing
+    # hardcoded.
+    build: ../services/graph-sync
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      PORT: "7015"
+      GRAPH_SYNC_KAFKA_BROKERS: kafka:9092
+      GRAPH_SYNC_GROUP_ID: ${GRAPH_SYNC_GROUP_ID:-graph-sync}
+      GRAPH_SYNC_FALKORDB_ADDR: graph-db:6379
+      GRAPH_SYNC_GRAPH_NAME: ${GRAPH_SYNC_GRAPH_NAME:-agora_tenants}
+      GRAPH_SYNC_OLLAMA_BASE_URL: ${GRAPH_SYNC_OLLAMA_BASE_URL:-http://ollama-graph:11434}
+      GRAPH_SYNC_OLLAMA_EMBED_MODEL: ${GRAPH_SYNC_OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      # Topic names: env-configured with the SPEC-W28 §2 documented defaults.
+      GRAPH_SYNC_BOOKING_TOPIC: ${GRAPH_SYNC_BOOKING_TOPIC:-opendesk.booking.events}
+      # Default matches infra/kafka/create-topics.sh exactly ("cac.events",
+      # no opendesk. prefix — broker auto-create is OFF).
+      GRAPH_SYNC_CAC_TOPIC: ${GRAPH_SYNC_CAC_TOPIC:-cac.events}
+      GRAPH_SYNC_IDENTITY_TOPIC: ${GRAPH_SYNC_IDENTITY_TOPIC:-opendesk.identity.events}
+      GRAPH_SYNC_TRANSCRIPTS_TOPIC: ${GRAPH_SYNC_TRANSCRIPTS_TOPIC:-opendesk.conversation.transcripts}
+      GRAPH_SYNC_ERASURE_TOPIC: ${GRAPH_SYNC_ERASURE_TOPIC:-opendesk.consent.erasure.v1}
+      GRAPH_SYNC_ENRICHMENT_TOPIC: ${GRAPH_SYNC_ENRICHMENT_TOPIC:-opendesk.graph.enrichment.v1}
+      # graph-sync config reads GRAPH_ERASURE_DONE_TOPIC (no _SYNC_ infix).
+      GRAPH_ERASURE_DONE_TOPIC: ${GRAPH_ERASURE_DONE_TOPIC:-opendesk.graph.erasure.done.v1}
+      GRAPH_SYNC_DLQ_TOPIC: ${GRAPH_SYNC_DLQ_TOPIC:-opendesk.dlq}
+      # Phone hashing: same SHA-256+salt scheme as leads dedupe (SPEC-W28 §3).
+      GRAPH_SYNC_PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
+    ports:
+      - "7015:7015/tcp"
+    networks:
+      - opendesk
+    depends_on:
+      graph-db:
+        condition: service_healthy
+      ollama-graph:
+        condition: service_started
+    restart: unless-stopped
+
+  # ----------- graph-service (WS-B contract: FastAPI :7014) ----------------
+  graph-service:
+    # Tenant-scoped Cypher API: segments, consent-gated audiences, NL->Cypher
+    # GraphRAG via Ollama. Built by WS-B; every query injects the tenant
+    # filter from the auth context (compliance gate 1).
+    build: ../services/graph-service
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "7014"
+      FALKORDB_HOST: graph-db
+      FALKORDB_PORT: "6379"
+      FALKORDB_ADDR: graph-db:6379
+      FALKORDB_GRAPH: ${FALKORDB_GRAPH:-agora_tenants}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama-graph:11434}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      KEYCLOAK_URL: http://keycloak:8080
+      # Dev auth seam (same pattern as booking-service in dev compose):
+      # AUTHZ_DISABLED=true lets e2e/dev callers pass X-Tenant-Slug /
+      # X-Tenant-Id headers directly instead of a Keycloak JWT. NEVER set in
+      # production — compliance gate 1 depends on the tenant claim.
+      AUTHZ_DISABLED: ${AUTHZ_DISABLED:-true}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-opendesk}
+      # Phone hashing (leads dedupe scheme) for person lookups by phone.
+      PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
+    ports:
+      - "7014:7014/tcp"
+    networks:
+      - opendesk
+    depends_on:
+      graph-db:
+        condition: service_healthy
+      ollama-graph:
+        condition: service_started
+    restart: unless-stopped
