@@ -447,6 +447,90 @@ func TestTenantHandling(t *testing.T) {
 	}
 }
 
+// decided_by wiring (SPEC-W24 WS-A2): the decision stamp carries the
+// authenticated operator identity, following the workforce leave-decision
+// convention (the caller identity wins over client input).
+//
+//	(a) JWT sub resolvable (integrator-wired UserFromContext) → decided_by
+//	    = JWT identity; a body-supplied decided_by CANNOT spoof it.
+//	(b) no UserFromContext subject → X-User-Id header fallback (mirrors
+//	    workforce.callerSub); still wins over the body.
+//	(c) no identity at all → body decided_by fallback (pre-W24 behavior).
+func TestDecidedByIdentity(t *testing.T) {
+	var jwtUser string
+	r, st, tenant := testRouter(t, &Deps{
+		UserFromContext: func(context.Context) string { return jwtUser },
+	})
+	contact := addContact(t, st, tenant.ID, "Ada")
+
+	underReview := func(t *testing.T) Application {
+		t.Helper()
+		prod := createProduct(t, r)
+		app := createApplication(t, r, prod.ID, contact, 1000000, "submitted")
+		if rec := patchApp(t, r, app.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
+			t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
+		}
+		return app
+	}
+	patchWithUser := func(t *testing.T, id uuid.UUID, body, xUserID string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPatch, "/v1/lending/applications/"+id.String(), strings.NewReader(body))
+		req.Header.Set("X-Tenant-Slug", "acme")
+		if xUserID != "" {
+			req.Header.Set("X-User-Id", xUserID)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	decidedByOf := func(t *testing.T, rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("decision = %d (%s)", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Application Application `json:"application"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decision body: %v", err)
+		}
+		if resp.Application.DecidedBy == nil {
+			t.Fatalf("decided_by not stamped: %+v", resp.Application)
+		}
+		return *resp.Application.DecidedBy
+	}
+
+	// (a) JWT identity wins on approve AND decline; the body cannot spoof.
+	jwtUser = "ops-jwt-7"
+	app := underReview(t)
+	if got := decidedByOf(t, patchWithUser(t, app.ID,
+		`{"status":"approved","kyc_override":true,"kyc_reason":"branch visit","decided_by":"spoofed-body"}`, "")); got != "ops-jwt-7" {
+		t.Fatalf("approve decided_by = %q, want JWT identity ops-jwt-7", got)
+	}
+	app = underReview(t)
+	if got := decidedByOf(t, patchWithUser(t, app.ID,
+		`{"status":"declined","decline_reason":"thin file","decided_by":"spoofed-body"}`, "")); got != "ops-jwt-7" {
+		t.Fatalf("decline decided_by = %q, want JWT identity ops-jwt-7", got)
+	}
+
+	// (b) No JWT subject → the X-User-Id header is the fallback identity
+	// (mirrors workforce.callerSub) and still wins over the body.
+	jwtUser = ""
+	app = underReview(t)
+	if got := decidedByOf(t, patchWithUser(t, app.ID,
+		`{"status":"declined","decline_reason":"thin file","decided_by":"spoofed-body"}`, "ops-header-3")); got != "ops-header-3" {
+		t.Fatalf("header fallback decided_by = %q, want ops-header-3", got)
+	}
+
+	// (c) No identity at all → the body-supplied decided_by remains the
+	// fallback (pre-W24 behavior preserved).
+	app = underReview(t)
+	if got := decidedByOf(t, patchWithUser(t, app.ID,
+		`{"status":"declined","decline_reason":"thin file","decided_by":"ops-body-9"}`, "")); got != "ops-body-9" {
+		t.Fatalf("body fallback decided_by = %q, want ops-body-9", got)
+	}
+}
+
 func mustTime(t *testing.T) (tm time.Time) {
 	t.Helper()
 	tm, err := time.Parse(time.RFC3339, "2025-06-01T10:00:00Z")
