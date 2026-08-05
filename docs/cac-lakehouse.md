@@ -80,12 +80,12 @@ dual-format reader as `geo_analytics.py`'s service-areas extract:
 ## 3. Delta → Iceberg port mapping
 
 The CAC program doc specifies Databricks/Delta tables
-(`cac.gold.daily_cac_by_channel`, `cac.gold.daily_cac_by_lga`). OpenDesk's
+(`cac.gold.daily_cac_by_channel`, `cac.gold.daily_cac_by_lga`). Agora's
 lakehouse is **Iceberg-only** (SPEC-W13 §4: "Iceberg — NOT Delta"), surfaced
 through the `iceberg` Spark catalog and Trino. The port is name- and
 column-faithful:
 
-| CAC doc (Delta) | OpenDesk (Iceberg) | Mapping notes |
+| CAC doc (Delta) | Agora (Iceberg) | Mapping notes |
 |---|---|---|
 | catalog `cac`, schema `gold` | Spark catalog `iceberg`, namespace `cac_gold` | Dot-namespaces flatten to `_` (Trino: `iceberg.cac_gold`) |
 | `cac.gold.daily_cac_by_channel` | `iceberg.cac_gold.daily_cac_by_channel` | columns identical: `day, tenant_id, channel, spend_ngn, leads, conversions, cac_ngn` |

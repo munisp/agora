@@ -1,8 +1,10 @@
-# OpenDesk — Open-Source AI Receptionist Platform (SOTA)
+# Agora — Open-Source AI Receptionist Platform (SOTA)
+
+> Agora (formerly OpenDesk) — internal module paths, Kafka topics, and env vars retain the opendesk identifier; see SPEC-W23.md.
 
 A fully open-source, multi-tenant **AI receptionist / front-desk SaaS**: every appointment-based business gets a branded public booking page with a **voice + text AI concierge** that answers questions and books, reschedules, and cancels appointments live — plus a tenant dashboard for staff.
 
-OpenDesk is a state-of-the-art superset of the YouTube demo
+Agora is a state-of-the-art superset of the YouTube demo
 [`sonnysangha/AI-Receptionist-Live-YouTube-Demo`](https://github.com/sonnysangha/AI-Receptionist-Live-YouTube-Demo)
 (Next.js + Clerk + Convex + ElevenLabs). Same product, zero proprietary dependencies, plus an enterprise middleware backbone: **Kafka · Dapr · Fluvio · Temporal · Postgres · Keycloak · Permify · Redis · Mojaloop · OpenSearch · OpenAppSec · APISIX · TigerBeetle · Lakehouse (Iceberg/MinIO/Spark/Trino/dbt)**.
 
@@ -10,7 +12,7 @@ Services are written in **Go** (identity, booking, notification), **Rust** (paym
 
 ## Why it supersedes the baseline
 
-| Baseline | OpenDesk |
+| Baseline | Agora |
 |---|---|
 | Clerk auth/orgs/billing | Keycloak OIDC + Permify ReBAC + TigerBeetle ledger + Mojaloop rails |
 | Convex black-box reactivity | Postgres (RLS) + Kafka events + Rust WebSocket edge |

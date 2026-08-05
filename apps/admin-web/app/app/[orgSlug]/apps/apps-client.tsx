@@ -187,7 +187,7 @@ export function AppsClient({
     <div className="max-w-6xl">
       <PageHeader
         title="Apps"
-        description="The OpenDesk app catalog for this organisation — provision apps, toggle them on or off, and edit their per-tenant configuration. Disabling an app always retains its data."
+        description="The Agora app catalog for this organisation — provision apps, toggle them on or off, and edit their per-tenant configuration. Disabling an app always retains its data."
         actions={
           <Button
             variant="outline"
