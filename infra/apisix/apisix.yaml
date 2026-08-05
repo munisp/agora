@@ -146,6 +146,26 @@ upstreams:
         healthy: {http_statuses: [200, 201, 204, 301, 302, 400, 401, 403, 404]}
         unhealthy: {http_statuses: [500, 502, 503, 504], http_failures: 3, tcp_failures: 2}
 
+  # SPEC-W28: tenant knowledge graph API (FastAPI; service name per
+  # infra/docker-compose.graph.yml).
+  - id: graph-service
+    type: roundrobin
+    nodes:
+      "graph-service:7014": 1
+    retries: 1
+    timeout: {connect: 5, send: 30, read: 30}
+    checks:
+      active:
+        type: http
+        http_path: /healthz
+        healthy: {interval: 5, successes: 1, http_statuses: [200]}
+        unhealthy: {interval: 5, http_failures: 2, http_statuses: [500, 502, 503, 504]}
+        timeout: 2
+      passive:
+        type: http
+        healthy: {http_statuses: [200, 201, 204, 301, 302, 400, 401, 403, 404]}
+        unhealthy: {http_statuses: [500, 502, 503, 504], http_failures: 3, tcp_failures: 2}
+
   - id: edge
     type: roundrobin
     nodes:
@@ -557,6 +577,45 @@ routes:
       proxy-rewrite:
         regex_uri:
           - "^/api/notifications/?(.*)"
+          - "/$1"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      limit-count:
+        count: 300
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  # ---- Tenant knowledge graph (SPEC-W28): /api/graph/* -> graph-service:7014 ----
+  # Same jwt + rewrite pattern as /api/notifications. Serves the admin-web
+  # Segment Builder / Ask box / Person 360 (tenant filter enforced
+  # server-side by graph-service on every path).
+  - id: api-graph
+    uris:
+      - /api/graph/*
+      - /api/graph
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    upstream_id: graph-service
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/graph/?(.*)"
           - "/$1"
       openid-connect:
         discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
