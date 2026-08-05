@@ -1,0 +1,8 @@
+# OPTIONAL GNN backend (SPEC-W29 §3 WS-A: GRAPH_ML_BACKEND=gnn).
+# Install ONLY on the GPU profile; never part of the base image:
+#   pip install -r requirements-gnn.txt
+# graph_ml.gnn import-guards both packages — without them the service runs
+# pure heuristic mode with a logged warning (SPEC-W29 §4 gate 5).
+-r requirements.txt
+torch==2.5.1
+torch-geometric==2.6.1
