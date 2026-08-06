@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import importlib.util
+
 import pytest
 
 from graph_ml.extract import (
@@ -88,3 +90,54 @@ def tenant_graph() -> TenantGraph:
             ContactRec("p1", "lead1", captured_at=iso(90), channel="field", source="agent"),
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# torch marker plumbing (SPEC-W31 §0 invariant 5 / §3 G5)
+# ---------------------------------------------------------------------------
+
+#: Tests that assume torch/torch-geometric are ABSENT (W29 degraded-path
+#: semantics). They cannot pass when the GNN overlay is installed, so they
+#: skip on torch boxes; the requires_torch suite covers the same gates with
+#: torch present.
+TORCH_ABSENT_TESTS = frozenset(
+    {
+        "test_resolve_backend_gnn_falls_back_with_warning",
+        "test_graphsage_backend_unavailable_raises",
+        "test_gnn_backend_requested_degrades_to_heuristic",
+        # asserts /healthz reports gnn_available is False (W29 heuristic image)
+        "test_healthz",
+        # asserts backend=gnn request degrades to heuristic in /healthz
+        "test_healthz_reports_gnn_fallback_backend",
+    }
+)
+
+
+def _torch_stack_present() -> bool:
+    return (
+        importlib.util.find_spec("torch") is not None
+        and importlib.util.find_spec("torch_geometric") is not None
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "requires_torch: test needs torch + torch-geometric; skips cleanly "
+        "when the optional GNN stack is absent (SPEC-W31 §0 invariant 5)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    torch_present = _torch_stack_present()
+    skip_no_torch = pytest.mark.skip(
+        reason="torch/torch-geometric not installed (heuristic-only deployment)"
+    )
+    skip_torch_present = pytest.mark.skip(
+        reason="assumes torch is absent; GNN overlay is installed here"
+    )
+    for item in items:
+        if "requires_torch" in item.keywords and not torch_present:
+            item.add_marker(skip_no_torch)
+        if torch_present and item.name in TORCH_ABSENT_TESTS:
+            item.add_marker(skip_torch_present)
