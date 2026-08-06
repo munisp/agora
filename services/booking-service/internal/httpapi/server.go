@@ -181,11 +181,11 @@ func NewRouter(d Deps) http.Handler {
 	// X-Tenant-Slug header is present), falling back to the raw header.
 	if s.d.AppGate != nil {
 		s.d.AppGate.SetTenantSlugFunc(func(r *http.Request) string {
-		if t := tenantFrom(r.Context()); t.Slug != "" {
-			return t.Slug
-		}
-		return r.Header.Get("X-Tenant-Slug")
-	})
+			if t := tenantFrom(r.Context()); t.Slug != "" {
+				return t.Slug
+			}
+			return r.Header.Get("X-Tenant-Slug")
+		})
 	}
 
 	r.Get("/healthz", s.healthz)
