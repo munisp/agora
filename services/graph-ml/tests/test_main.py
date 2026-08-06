@@ -101,7 +101,7 @@ def test_score_status_reports_last_sweep(tenant_graph):
     assert after["run_count"] == 1
     assert after["running"] is False
     assert after["last_sweep"]["ok"] is True
-    assert after["last_sweep"]["tenants"]["tenant_id"] == "t1"
+    assert after["last_sweep"]["tenants"][0]["tenant_id"] == "t1"
     assert after["backend"] == "heuristic"
 
 
