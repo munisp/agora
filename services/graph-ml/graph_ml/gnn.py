@@ -10,17 +10,27 @@ dirs ``{model_dir}/{tenant_id}/graphsage-v{N}/`` (SPEC-W31 §0 invariant 3 —
 a tenant's model never scores another tenant). The heuristic test-suite never
 touches torch; the torch-dependent helpers (``gnn_data``, ``gnn_train``) are
 imported lazily inside methods only.
+
+W33-C (SPEC-W33 §4 C1 consumer clause, ADDITIVE): the load seam in
+:meth:`GraphSAGEBackend.score_tenant` now resolves (a) the model-registry
+service record (``graph_ml.registry_client``, env ``MODEL_REGISTRY_URL``)
+translated to a local artifact scope dir, then (b) EXACTLY the W31 bootstrap
+``gnn_train.load_latest(model_dir, tenant_id)`` scan. Any registry failure
+mode yields None and the bootstrap path runs unchanged (I1). When resolution
+came from the registry, the stamped ``model_version`` is the registry
+record's ``version`` (I2 provenance honesty).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
 from typing import Any
 
-from . import MODEL_VERSION_GNN_PREFIX
+from . import MODEL_VERSION_GNN_PREFIX, registry_client
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +57,50 @@ def next_model_version(model_dir: str) -> str:
             if match:
                 highest = max(highest, int(match.group(1)))
     return f"{MODEL_VERSION_GNN_PREFIX}{highest + 1}"
+
+
+def _load_latest_from_scope(
+    scope_dir: str,
+) -> "tuple[dict[str, Any], dict[str, Any], int] | None":
+    """Highest-N ``graphsage-v{N}`` inside one registry-resolved scope dir.
+
+    W33-C (ADDITIVE): same layout/semantics as the tail of
+    ``gnn_train.load_latest``, but the scope dir comes from the
+    model-registry record instead of a ``{model_dir}/{tenant_id}`` join.
+    Raise-free (I1): missing files, corrupt artifacts, or a missing torch
+    stack all return None — the caller falls back to the bootstrap scan.
+    """
+    if not GNN_AVAILABLE or not os.path.isdir(scope_dir):
+        return None
+    prefix = MODEL_VERSION_GNN_PREFIX
+    versions = sorted(
+        (
+            entry
+            for entry in os.listdir(scope_dir)
+            if entry.startswith(prefix)
+            and entry[len(prefix) :].isdigit()
+            and os.path.isdir(os.path.join(scope_dir, entry))
+        ),
+        key=lambda e: int(e[len(prefix) :]),
+    )
+    for version in reversed(versions):
+        artifact_dir = os.path.join(scope_dir, version)
+        model_path = os.path.join(artifact_dir, "model.pt")
+        meta_path = os.path.join(artifact_dir, "meta.json")
+        if not (os.path.isfile(model_path) and os.path.isfile(meta_path)):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            feature_dim = int(meta["feature_dim"])
+        except Exception as exc:  # noqa: BLE001 - corrupt artifact -> fallback
+            log.warning(
+                "registry artifact %s unreadable (%s); trying older versions", artifact_dir, exc
+            )
+            continue
+        return state_dict, meta, feature_dim
+    return None
 
 
 class GNNBackendUnavailable(RuntimeError):
@@ -94,7 +148,33 @@ class GraphSAGEBackend:
         from .gnn_train import GraphSAGEModel, load_latest
 
         now = now or datetime.now(timezone.utc)
-        loaded = load_latest(self.model_dir, graph.tenant_id)
+        # (a) W33-C: model-registry service first (env MODEL_REGISTRY_URL).
+        # Never raises; any failure mode returns None and falls through to
+        # the W31 bootstrap scan unchanged (I1).
+        registry_version: str | None = None
+        loaded = None
+        resolved = registry_client.resolve_artifact_dir(graph.tenant_id)
+        if resolved is not None:
+            scope_dir, record = resolved
+            loaded = _load_latest_from_scope(scope_dir)
+            if loaded is not None:
+                registry_version = record.version
+                log.info(
+                    "resolved %s for tenant %s via model-registry (version=%s)",
+                    registry_client.FAMILY,
+                    graph.tenant_id,
+                    record.version,
+                )
+            else:
+                log.warning(
+                    "registry artifact dir %s unusable for tenant %s; "
+                    "bootstrap fallback",
+                    scope_dir,
+                    graph.tenant_id,
+                )
+        # (b) bootstrap local-dir scan (W31 behavior, unchanged).
+        if loaded is None:
+            loaded = load_latest(self.model_dir, graph.tenant_id)
         if loaded is None:
             raise GNNModelNotFound(
                 f"no trained GraphSAGE model for tenant {graph.tenant_id} "
@@ -136,7 +216,9 @@ class GraphSAGEBackend:
         for b in graph.bookings:
             booked_by_person.setdefault(b.person_id, set()).add(b.offering_id)
 
-        model_version = str(meta["model_version"])
+        # I2: registry-resolved artifacts stamp the registry record's
+        # version; bootstrap artifacts keep the dir-derived meta version.
+        model_version = registry_version or str(meta["model_version"])
         scored_at = now.isoformat()
         recommendations = []
         for i, person_id in enumerate(data.person_ids):

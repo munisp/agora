@@ -18,6 +18,7 @@ volumes:
   permify-data:
   mojaloop-data:
   fluvio-data:
+  model-registry-manifests:
 
 services:
 
@@ -319,6 +320,46 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8444/health || wget -q -O /dev/null http://localhost:8444/ || exit 1"]
       interval: 15s
+      timeout: 5s
+      retries: 30
+    networks: [opendesk]
+
+  # ---------------- model-registry (SPEC-W33 §4 C1/C2/C3/C5) ----------------
+  model-registry:
+    # Model version registry + drift sweep + A/B + nightly training scheduler
+    # on the `platform` DB (init-scripts/30-model-registry.sql, FORCE RLS).
+    # Slim image: no torch/sklearn/MLflow (I5); Kafka alerts degrade to
+    # log-only when the broker or kafka-python is absent (I1).
+    # Inactive unless the `model-registry` profile is enabled:
+    #   docker compose --profile model-registry up model-registry
+    profiles: [model-registry]
+    build: ../services/model-registry
+    container_name: model-registry
+    restart: unless-stopped
+    environment:
+      PORT: "7019"
+      MODEL_REGISTRY_PG_DSN: postgresql://app_model_registry_login:app_model_registry_dev_password@postgres:5432/platform
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_ENABLED: ${MODEL_REGISTRY_KAFKA_ENABLED:-true}
+      ALERTS_TOPIC: ${ALERTS_TOPIC:-ops.alerts}
+      DRIFT_INTERVAL_MINUTES: ${DRIFT_INTERVAL_MINUTES:-15}
+      DRIFT_PSI_THRESHOLD: ${DRIFT_PSI_THRESHOLD:-0.25}
+      DRIFT_MANIFEST_DIR: /data/manifests
+      TRAIN_ENABLED: ${MODEL_REGISTRY_TRAIN_ENABLED:-false}
+      TRAIN_CRON_HOUR: ${TRAIN_CRON_HOUR:-2}
+      GIT_SHA: ${GIT_SHA:-unknown}
+    ports:
+      # 7016 graph-ml, 7017 fraud-engine, 7018 graph-ml-gpu host are taken;
+      # 7019 is the lowest free.
+      - "7019:7019"   # dev/e2e reachability; not routed through APISIX
+    volumes:
+      - model-registry-manifests:/data/manifests
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:7019/healthz',timeout=4)\""]
+      interval: 10s
       timeout: 5s
       retries: 30
     networks: [opendesk]
