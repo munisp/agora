@@ -9,6 +9,15 @@ answers with the ported Go rule score (``heuristic-v1``).
 Tenant scoping (I4): resolution order is
 ``{registry}/{tenant_id}/credit-ml-v{N}`` (highest N), then
 ``{registry}/global/credit-ml-v{N}``. There is no cross-tenant read.
+
+W33-C (SPEC-W33 §4 C1 consumer clause, ADDITIVE): resolution order in
+:meth:`LearnedScorer.load` is now (a) the model-registry service record
+(``credit_bureau.ml.registry_client``, env ``MODEL_REGISTRY_URL`` — read
+inside ``load``, no signature change) translated to a local artifact scope
+dir, then (b) EXACTLY the bootstrap local-dir scan above. Any registry
+failure mode yields None and the bootstrap scan runs unchanged (I1). When
+resolution came from the registry, ``model_version`` is the registry
+record's ``version`` (I2 provenance honesty).
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ from typing import Any
 import numpy as np
 
 from .. import MODEL_VERSION_ML_PREFIX
+from . import registry_client
 from .features import FEATURE_SCHEMA, FEATURE_DIM, build_feature_vector
 from .model import TORCH_AVAILABLE, CreditMLP
 
@@ -54,19 +64,15 @@ class LearnedScorer:
         self.meta = meta
 
     @classmethod
-    def load(cls, registry_dir: str, tenant_id: str = "global") -> "LearnedScorer | None":
-        """Resolve + load the tenant's artifact; None when absent (I1)."""
-        if not TORCH_AVAILABLE:
-            log.warning("torch unavailable — learned credit scorer disabled (rules fallback)")
-            return None
-        if not registry_dir:
-            return None
-        resolved = _latest_version_dir(os.path.join(registry_dir, tenant_id))
-        if resolved is None:
-            resolved = _latest_version_dir(os.path.join(registry_dir, "global"))
-        if resolved is None:
-            return None
-        artifact_dir, _n = resolved
+    def _load_artifact_dir(
+        cls, artifact_dir: str, version_override: str | None = None
+    ) -> "LearnedScorer | None":
+        """Load one versioned artifact dir (model.pt + meta.json); None (I1).
+
+        ``version_override`` is set only when the dir came from the
+        model-registry service (W33-C): the scorer then stamps the registry
+        record's ``version`` instead of the dir-derived version (I2).
+        """
         try:
             with open(os.path.join(artifact_dir, "meta.json"), encoding="utf-8") as f:
                 meta = json.load(f)
@@ -81,7 +87,57 @@ class LearnedScorer:
         except Exception as exc:  # noqa: BLE001 — any corrupt artifact falls back to rules
             log.warning("credit-ml artifact %s unreadable (%s) — rules fallback", artifact_dir, exc)
             return None
-        return cls(model, str(meta.get("model_version") or os.path.basename(artifact_dir)), meta)
+        version = version_override or str(meta.get("model_version") or os.path.basename(artifact_dir))
+        return cls(model, version, meta)
+
+    @classmethod
+    def _load_scope(
+        cls, scope_dir: str, version_override: str | None = None
+    ) -> "LearnedScorer | None":
+        """Highest-N ``credit-ml-v{N}`` inside one scope dir; None (I1)."""
+        latest = _latest_version_dir(scope_dir)
+        if latest is None:
+            return None
+        return cls._load_artifact_dir(latest[0], version_override=version_override)
+
+    @classmethod
+    def load(cls, registry_dir: str, tenant_id: str = "global") -> "LearnedScorer | None":
+        """Resolve + load the tenant's artifact; None when absent (I1).
+
+        Resolution order (W33-C, ADDITIVE): (a) the model-registry service
+        record (env ``MODEL_REGISTRY_URL`` read inside, via
+        :mod:`credit_bureau.ml.registry_client`) translated to a local
+        artifact scope dir; (b) on None — service unset/empty/404/timeout/
+        error/unsupported scheme — EXACTLY the W33-B bootstrap scan
+        (``{registry}/{tenant_id}``, then ``{registry}/global``).
+        """
+        if not TORCH_AVAILABLE:
+            log.warning("torch unavailable — learned credit scorer disabled (rules fallback)")
+            return None
+        # (a) model-registry service (W33-C). Never raises; any failure mode
+        # returns None and falls through to the bootstrap scan unchanged.
+        resolved = registry_client.resolve_artifact_dir(tenant_id)
+        if resolved is not None:
+            scope_dir, record = resolved
+            scorer = cls._load_scope(scope_dir, version_override=record.version)
+            if scorer is not None:
+                log.info(
+                    "resolved %s for tenant %s via model-registry (version=%s)",
+                    registry_client.FAMILY,
+                    tenant_id,
+                    record.version,
+                )
+                return scorer
+            log.warning(
+                "registry artifact dir %s unusable; bootstrap fallback", scope_dir
+            )
+        # (b) bootstrap local-dir scan (W33-B behavior, unchanged).
+        if not registry_dir:
+            return None
+        scorer = cls._load_scope(os.path.join(registry_dir, tenant_id))
+        if scorer is None:
+            scorer = cls._load_scope(os.path.join(registry_dir, "global"))
+        return scorer
 
     def score(self, signals: dict[str, Any] | None) -> tuple[float, float]:
         """(bureau score in [300,900], P(default-in-12m)) for one payload."""
