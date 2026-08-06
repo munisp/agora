@@ -1,0 +1,14 @@
+# model-registry runtime deps (SPEC-W33 §4, I5 slim image).
+# Deliberately ABSENT: torch, sklearn, pandas, mlflow (slim-image discipline),
+# kafka-python (producer import-guarded in model_registry/alerts.py; install
+# kafka-python==2.0.2 in deployments that publish to ops.alerts).
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+psycopg[binary]==3.2.3
+APScheduler==3.11.0
+prometheus-client==0.21.1
+
+# tests
+httpx==0.27.2
+pytest==8.3.4
