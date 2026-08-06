@@ -77,6 +77,29 @@ USAGE_EVENT_COLUMNS = (
     "meta",
 )
 
+# SPEC-W33 §2 A2: one row per CAC FunnelEvent emitted on ``cac.events``
+# (CloudEvent type ``com.opendesk.cac.FunnelEvent``, SPEC-W13 §2) with the
+# ``data`` payload flattened — the input contract documented in
+# infra/lakehouse/spark/jobs/cac_analytics.py (bronze.cac_events). The bronze
+# sink is deliberately tolerant (it keeps the raw copy; strict contract
+# enforcement — event_name enum, mandatory fields — lives in the CAC rollup
+# consumer, cac_events.py, and the Spark gold job). amount_ngn is a double
+# and lga_id a long, matching the Spark contract. event_ts falls back to the
+# CloudEvent ``time`` like the other mappers.
+CAC_EVENT_COLUMNS = (
+    "event_id",
+    "tenant_id",
+    "entity_type",
+    "entity_id",
+    "event_name",
+    "event_ts",
+    "channel",
+    "campaign_id",
+    "lga_id",
+    "amount_ngn",
+    "idempotency_key",
+)
+
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 
@@ -236,4 +259,31 @@ def map_usage_event(message: Mapping[str, Any]) -> dict[str, Any]:
         "occurred_at": parse_ts(_get(data, "ts", "timestamp", "occurred_at", "occurredAt"))
         or parse_ts(envelope.get("time")),
         "meta": json.dumps(meta, sort_keys=True) if meta is not None else None,
+    }
+
+
+def map_cac_event(message: Mapping[str, Any]) -> dict[str, Any]:
+    """CAC FunnelEvent (SPEC-W13 §2 / SPEC-W33 §2 A2) -> bronze.cac_events.
+
+    Bare payloads of the data shape are the contract; CloudEvent envelopes
+    (type ``com.opendesk.cac.FunnelEvent``) are unwrapped via split_envelope
+    like every other bronze mapper. All fields are nullable at this layer —
+    bronze keeps the raw copy and the Spark gold job dedupes/filters
+    (idempotency_key, event_name enum) downstream."""
+    envelope, data = split_envelope(message)
+    return {
+        "event_id": _as_str(envelope.get("id") or _get(data, "event_id", "eventId")),
+        "tenant_id": _as_str(
+            envelope.get("tenantid") or _get(data, "tenant_id", "tenantId")
+        ),
+        "entity_type": _as_str(_get(data, "entity_type", "entityType")),
+        "entity_id": _as_str(_get(data, "entity_id", "entityId")),
+        "event_name": _as_str(_get(data, "event_name", "eventName")),
+        "event_ts": parse_ts(_get(data, "event_ts", "eventTs"))
+        or parse_ts(envelope.get("time")),
+        "channel": _as_str(_get(data, "channel")),
+        "campaign_id": _as_str(_get(data, "campaign_id", "campaignId")),
+        "lga_id": _as_int(_get(data, "lga_id", "lgaId")),
+        "amount_ngn": _as_float(_get(data, "amount_ngn", "amountNgn")),
+        "idempotency_key": _as_str(_get(data, "idempotency_key", "idempotencyKey")),
     }

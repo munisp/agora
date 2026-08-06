@@ -4,8 +4,10 @@ Reads:
 
   * iceberg.bronze.cac_events — raw funnel events from the Kafka topic
     `cac.events` (CloudEvent type `com.opendesk.cac.FunnelEvent`, SPEC-W13 §2).
-    INPUT CONTRACT (TODO producer — the analytics-pipeline bronze sink does not
-    yet cover `cac.events`; mirror of geo_analytics.py's extract contracts):
+    INPUT CONTRACT (producer LANDED, SPEC-W33 §2 A2: the analytics-pipeline
+    bronze sink now covers `cac.events` — analytics_pipeline.consumer
+    topic_registry -> bronze.cac_events, auto-created like the other 4;
+    mirror of geo_analytics.py's extract contracts):
     one row per funnel event with the CloudEvent `data` payload flattened:
       event_id string, tenant_id string, entity_type string ("lead|customer|agent"),
       entity_id string,
