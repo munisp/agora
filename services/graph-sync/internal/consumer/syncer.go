@@ -450,6 +450,139 @@ func (s *Syncer) emitErasureDone(ctx context.Context, src events.CloudEvent, ten
 }
 
 // ---------------------------------------------------------------------------
+// civic case events (opendesk.civic.events.v1, SPEC-W32 §3 WS-D)
+// ---------------------------------------------------------------------------
+
+// HandleCivic consumes opendesk.civic.events.v1: the civic Case projection.
+// Case nodes are PII-free (ref/category/ward/status only, SPEC-W32 §5 gate
+// 5); the reporter's phone is used ONLY to resolve/create the Person via
+// the existing salted-hash path (raw phone never touches the graph), and
+// the REPORTED edge dies with the Person on W28 erasure.
+func (s *Syncer) HandleCivic(ctx context.Context, evt events.CloudEvent) error {
+	switch evt.Type {
+	case events.TypeCivicReportReceived, events.TypeCivicStatusChanged, events.TypeCivicMerged:
+	default:
+		return nil // forward-compatible: ack unknown types on the topic
+	}
+	tenantID, err := s.tenantOf(evt)
+	if err != nil {
+		return err
+	}
+	if dup, err := s.processed(ctx, evt, tenantID); err != nil {
+		return err
+	} else if dup {
+		return nil
+	}
+	switch evt.Type {
+	case events.TypeCivicReportReceived:
+		return s.civicReportReceived(ctx, evt, tenantID)
+	case events.TypeCivicStatusChanged:
+		return s.civicStatusChanged(ctx, evt, tenantID)
+	default:
+		return s.civicMerged(ctx, evt, tenantID)
+	}
+}
+
+// civicReportReceived MERGEs the Case (+REPORTED edge when the reporter
+// phone is present, +AT Location edge when geo is present).
+func (s *Syncer) civicReportReceived(ctx context.Context, evt events.CloudEvent, tenantID string) error {
+	var d events.CivicReportData
+	if err := evt.DecodeData(&d); err != nil {
+		return Permanent(fmt.Errorf("malformed civic report data: %v", err))
+	}
+	if strings.TrimSpace(d.Ref) == "" {
+		return Permanent(errors.New("civic report event carries no ref"))
+	}
+	if err := s.Graph.UpsertTenant(ctx, tenantID, evt.Subject, s.now()); err != nil {
+		return err
+	}
+	// Reporter resolution: only when the phone is present (SPEC-W32 §3
+	// WS-D). The existing personFromPhone path hashes the phone BEFORE the
+	// graph and auto-merges on exact phone_hash (W28 §4).
+	personID := ""
+	if strings.TrimSpace(d.ReporterPhone) != "" {
+		person := s.personFromPhone(tenantID, "", d.ReporterName, d.ReporterPhone,
+			channelOr(d.Channel, "web"), false, "")
+		id, err := s.upsertResolvedPerson(ctx, person)
+		if err != nil {
+			return err
+		}
+		personID = id
+	}
+	c := graph.Case{
+		Ref:       strings.TrimSpace(d.Ref),
+		TenantID:  tenantID,
+		Category:  strings.TrimSpace(d.Category),
+		Status:    channelOr(d.Status, "new"),
+		Ward:      strings.TrimSpace(d.Ward),
+		CreatedAt: parseTimeOr(d.CreatedAt, evt.Time, s.now()),
+		LGA:       strings.TrimSpace(d.LGA),
+		Lat:       d.Lat,
+		Lon:       d.Lon,
+		HasGeo:    d.Lat != 0 || d.Lon != 0,
+	}
+	if err := s.Graph.UpsertCase(ctx, c, personID); err != nil {
+		return err
+	}
+	s.metrics().Inc("civic_cases_projected")
+	return nil
+}
+
+// civicStatusChanged mirrors the case status (+ acked_at/resolved_at when
+// the event carries them).
+func (s *Syncer) civicStatusChanged(ctx context.Context, evt events.CloudEvent, tenantID string) error {
+	var d events.CivicStatusData
+	if err := evt.DecodeData(&d); err != nil {
+		return Permanent(fmt.Errorf("malformed civic status data: %v", err))
+	}
+	if strings.TrimSpace(d.Ref) == "" || strings.TrimSpace(d.Status) == "" {
+		return Permanent(errors.New("civic status event requires ref and status"))
+	}
+	var ackedAt, resolvedAt *time.Time
+	if t, err := time.Parse(time.RFC3339, strings.TrimSpace(d.AckedAt)); err == nil && !t.IsZero() {
+		u := t.UTC()
+		ackedAt = &u
+	}
+	if t, err := time.Parse(time.RFC3339, strings.TrimSpace(d.ResolvedAt)); err == nil && !t.IsZero() {
+		u := t.UTC()
+		resolvedAt = &u
+	}
+	if err := s.Graph.SetCaseStatus(ctx, tenantID, strings.TrimSpace(d.Ref),
+		strings.TrimSpace(d.Status), ackedAt, resolvedAt); err != nil {
+		return err
+	}
+	s.metrics().Inc("civic_status_mirrored")
+	return nil
+}
+
+// civicMerged wires (cs)-[:MERGED_INTO]->(canonical). The canonical ref is
+// accepted as canonical_ref / merged_into / canonical_id (producer-contract
+// drift tolerance, same posture as captured_by above).
+func (s *Syncer) civicMerged(ctx context.Context, evt events.CloudEvent, tenantID string) error {
+	var d events.CivicMergedData
+	if err := evt.DecodeData(&d); err != nil {
+		return Permanent(fmt.Errorf("malformed civic merged data: %v", err))
+	}
+	canonical := strings.TrimSpace(d.CanonicalRef)
+	if canonical == "" {
+		for _, k := range []string{"merged_into", "canonical_id"} {
+			if v, ok := evt.Data[k].(string); ok && strings.TrimSpace(v) != "" {
+				canonical = strings.TrimSpace(v)
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(d.Ref) == "" || canonical == "" {
+		return Permanent(errors.New("civic merged event requires ref and canonical_ref"))
+	}
+	if err := s.Graph.LinkCaseMerged(ctx, tenantID, strings.TrimSpace(d.Ref), canonical); err != nil {
+		return err
+	}
+	s.metrics().Inc("civic_cases_merged")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // graph enrichment (opendesk.graph.enrichment.v1, nightly spark job)
 // ---------------------------------------------------------------------------
 
