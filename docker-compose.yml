@@ -114,6 +114,10 @@ services:
       # Dev default keeps the stack bootable; prod MUST override via .env.
       PORTAL_SECRET: ${PORTAL_SECRET:-opendesk-dev-portal-secret-change-in-prod}
       NOTIFICATIONS_TOPIC: opendesk.notifications.outbox
+      # SPEC-W32 civic reporting: CloudEvents topic + public intake throttle.
+      CIVIC_EVENTS_TOPIC: opendesk.civic.events.v1
+      CIVIC_PUBLIC_RATE_PER_HOUR: ${CIVIC_PUBLIC_RATE_PER_HOUR:-10}
+      CIVIC_PUBLIC_RATE_PER_DAY: ${CIVIC_PUBLIC_RATE_PER_DAY:-50}
       # SPEC-W8 A1 geospatial: optional Nominatim geocoding hook (off by
       # default) + geo campaign send batch size.
       GEOCODE_ENABLED: ${GEOCODE_ENABLED:-false}
@@ -160,6 +164,12 @@ services:
       # GDPR workflows (SPEC-W3 §2): export collection + MinIO bundle upload.
       CONVERSATION_APP_ID: conversation
       PRIVACY_EVENTS_TOPIC: opendesk.privacy.events
+      # SPEC-W32 WS-B civic SLA/status: case events consumer + escalation
+      # topic + citizen status channel (transactional, DND-bypass).
+      CIVIC_EVENTS_TOPIC: opendesk.civic.events.v1
+      CIVIC_EVENTS_GROUP: notification-civic
+      CIVIC_ESCALATION_TOPIC: opendesk.civic.events.v1
+      CIVIC_STATUS_CHANNEL: ${CIVIC_STATUS_CHANNEL:-sms}
       S3_ENDPOINT: http://minio:9000
       S3_REGION: us-east-1
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
