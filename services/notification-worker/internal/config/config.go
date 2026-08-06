@@ -11,25 +11,25 @@ import (
 
 // Config holds all runtime configuration for notification-worker.
 type Config struct {
-	Port               int    // HTTP listen port for /healthz + /dev endpoints (7003)
-	TemporalHostPort   string // temporal:7233
-	TemporalNamespace  string // opendesk
-	TemporalTaskQueue  string // opendesk-main
-	DaprHost           string // daprd-notification
-	DaprHTTPPort       int    // 3500
-	BookingAppID       string // Dapr app-id of booking-service
-	PaymentsAppID      string // Dapr app-id of payments-service
-	IdentityAppID      string // Dapr app-id of identity-service
-	KnowledgeAppID     string // Dapr app-id of knowledge-service (pack knowledge seed)
-	CRMSyncAppID       string // Dapr app-id of crm-sync-service (CRM task helper)
-	PubSubName         string // Dapr pubsub component for CRM events
-	CRMEventsTopic     string // topic for escalation priority flags
-	IndustriesDir      string // mounted industry packs dir (INDUSTRIES_DIR, default /industries)
-	SMTPBinding        string // Dapr output binding for email (bindings-smtp)
-	TwilioBinding      string // Dapr output binding for SMS (bindings-twilio)
+	Port              int    // HTTP listen port for /healthz + /dev endpoints (7003)
+	TemporalHostPort  string // temporal:7233
+	TemporalNamespace string // opendesk
+	TemporalTaskQueue string // opendesk-main
+	DaprHost          string // daprd-notification
+	DaprHTTPPort      int    // 3500
+	BookingAppID      string // Dapr app-id of booking-service
+	PaymentsAppID     string // Dapr app-id of payments-service
+	IdentityAppID     string // Dapr app-id of identity-service
+	KnowledgeAppID    string // Dapr app-id of knowledge-service (pack knowledge seed)
+	CRMSyncAppID      string // Dapr app-id of crm-sync-service (CRM task helper)
+	PubSubName        string // Dapr pubsub component for CRM events
+	CRMEventsTopic    string // topic for escalation priority flags
+	IndustriesDir     string // mounted industry packs dir (INDUSTRIES_DIR, default /industries)
+	SMTPBinding       string // Dapr output binding for email (bindings-smtp)
+	TwilioBinding     string // Dapr output binding for SMS (bindings-twilio)
 	// Messaging channel routing (docs/integrations/messaging-channels.md).
-	MessagingChannels string // MESSAGING_CHANNELS: "email:smtp,sms:twilio"
-	TenantChannelMap  string // TENANT_CHANNEL_MAP: per-tenant provider JSON
+	MessagingChannels  string // MESSAGING_CHANNELS: "email:smtp,sms:twilio"
+	TenantChannelMap   string // TENANT_CHANNEL_MAP: per-tenant provider JSON
 	SMTPFrom           string // sender address
 	TwilioFrom         string // sender phone number
 	OpenSearchURL      string // used by the tenant onboarding search-alias activity
@@ -43,7 +43,13 @@ type Config struct {
 	WebhookGroup             string // consumer group of the webhook dispatcher
 	NotificationsOutboxTopic string // opendesk.notifications.outbox (SendPortalCode etc.)
 	NotificationsOutboxGroup string // consumer group of the outbox consumer
-	WebhookSigningRequired   bool   // require a signing secret on subscription create
+	// SPEC-W32 WS-B: civic case events (CIVIC_EVENTS_TOPIC; unset →
+	// opendesk.civic.events.v1, "off" disables the consumer entirely).
+	CivicEventsTopic       string // opendesk.civic.events.v1
+	CivicEventsGroup       string // consumer group of the civic consumer
+	CivicEscalationTopic   string // SLA-breach escalation events (default = civic events topic)
+	CivicStatusChannel     string // citizen status notification channel (sms)
+	WebhookSigningRequired bool   // require a signing secret on subscription create
 	// GDPR (SPEC-W3 §2 innovation 13)
 	ConversationAppID  string // Dapr app-id of conversation-service (export collector)
 	PrivacyEventsTopic string // opendesk.privacy.events (erase tombstones)
@@ -72,7 +78,7 @@ type Config struct {
 	APNSTeamID         string // APNS_TEAM_ID (stub)
 	APNSKeyP8          string // APNS_KEY_P8 (stub)
 	APNSTopic          string // APNS_TOPIC (stub)
-	ShutdownTimeout     time.Duration
+	ShutdownTimeout    time.Duration
 }
 
 // Load reads configuration from the environment.
@@ -108,6 +114,10 @@ func Load() Config {
 		WebhookGroup:             envStr("WEBHOOK_GROUP", "notification-webhooks"),
 		NotificationsOutboxTopic: envStr("NOTIFICATIONS_OUTBOX_TOPIC", "opendesk.notifications.outbox"),
 		NotificationsOutboxGroup: envStr("NOTIFICATIONS_OUTBOX_GROUP", "notification-outbox"),
+		CivicEventsTopic:         envStr("CIVIC_EVENTS_TOPIC", "opendesk.civic.events.v1"),
+		CivicEventsGroup:         envStr("CIVIC_EVENTS_GROUP", "notification-civic"),
+		CivicEscalationTopic:     envStr("CIVIC_ESCALATION_TOPIC", "opendesk.civic.events.v1"),
+		CivicStatusChannel:       envStr("CIVIC_STATUS_CHANNEL", "sms"),
 		WebhookSigningRequired:   envStr("WEBHOOK_SIGNING_REQUIRED", "false") == "true",
 		ConversationAppID:        envStr("CONVERSATION_APP_ID", "conversation"),
 		PrivacyEventsTopic:       envStr("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
@@ -135,7 +145,7 @@ func Load() Config {
 		APNSTeamID:         os.Getenv("APNS_TEAM_ID"),
 		APNSKeyP8:          os.Getenv("APNS_KEY_P8"),
 		APNSTopic:          os.Getenv("APNS_TOPIC"),
-		ShutdownTimeout:          time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
+		ShutdownTimeout:    time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 	}
 }
 

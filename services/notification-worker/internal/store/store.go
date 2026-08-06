@@ -56,6 +56,11 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W32 WS-B: civic delivery ledger (civic_ledger.go), same pattern.
+	if err := s.ensureCivicLedgerSchema(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	return s, nil
 }
 

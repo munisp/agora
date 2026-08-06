@@ -86,6 +86,10 @@ var kindClasses = map[string]SendClass{
 	"follow_up":         ClassTransactional,
 	"proposal_reminder": ClassTransactional,
 	"staff_alert":       ClassTransactional,
+	// SPEC-W32 §0.4: citizen case status updates are service requests
+	// (transactional-class) — never DND-suppressed; the quiet-hours hold
+	// is workflow-side (CivicStatusNotifyWorkflow).
+	"civic_status": ClassTransactional,
 }
 
 // ClassifyKind returns the compliance class of a paced send kind. Unknown
