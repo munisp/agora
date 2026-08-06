@@ -117,6 +117,9 @@ type PacedSendRequest struct {
 	// WhatsApp carries the SendWhatsAppCampaignMessage arguments for the
 	// whatsapp_campaign kind (SPEC-W21 Agent A).
 	WhatsApp *PacedWhatsAppCampaignSend `json:"whatsapp_campaign,omitempty"`
+	// Civic carries the SendCivicStatusUpdate arguments for the civic_status
+	// kind (SPEC-W32 WS-B): TRANSACTIONAL-class citizen case updates.
+	Civic *PacedCivicStatusSend `json:"civic,omitempty"`
 }
 
 // PushTarget is one explicit device token in a push payload (SPEC-W16
@@ -332,6 +335,12 @@ func PacedSendChannel(req PacedSendRequest) string {
 		// window (SPEC-W21 — whatsapp_campaign is quiet-hours deferred
 		// like the sms marketing kinds).
 		return "whatsapp"
+	case PacedSendCivicStatus:
+		// SPEC-W32 WS-B: per-payload channel (sms default); the quiet-hours
+		// hold itself is workflow-side (CivicStatusNotifyWorkflow).
+		if req.Civic != nil {
+			return req.Civic.Channel
+		}
 	}
 	return ""
 }

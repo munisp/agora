@@ -97,6 +97,12 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W32 WS-A: civic_categories + civic_routing_rules + civic_cases +
+	// civic_ref_seqs (idempotent bootstrap, RLS-enabled).
+	if err := s.ensureCivicTables(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// Geo tables (SPEC-W8): best-effort — a missing postgis extension
 	// disables geo features without breaking the rest of the service.
 	if err := s.ensureGeoTables(ctx); err != nil {
@@ -351,7 +357,7 @@ func (s *Store) GetTeamMemberByEmail(ctx context.Context, tenantID uuid.UUID, em
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
 			`SELECT id, tenant_id, name, email, role, active FROM team_members
-			 WHERE tenant_id=$1 AND lower(email)=lower($2) ORDER BY name LIMIT 1`,
+				 WHERE tenant_id=$1 AND lower(email)=lower($2) ORDER BY name LIMIT 1`,
 			tenantID, email).Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -431,7 +437,7 @@ func (s *Store) ListAvailabilityRules(ctx context.Context, tenantID, teamMemberI
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
 			`SELECT id, tenant_id, team_member_id, weekday, start_min, end_min, effective_from, effective_to
-			 FROM availability_rules WHERE tenant_id=$1 AND team_member_id=$2 ORDER BY weekday, start_min`,
+				 FROM availability_rules WHERE tenant_id=$1 AND team_member_id=$2 ORDER BY weekday, start_min`,
 			tenantID, teamMemberID)
 		if err != nil {
 			return err
