@@ -56,13 +56,15 @@ TOPICS=(
   cac.seed.report.cac.agents.v1            # seed_agents.py (TABLE=cac.agents)
   cac.seed.report.cac.customers.v1         # seed_customers.py (TABLE=cac.customers)
   cac.seed.report.cac.fx_series.v1         # seed_fx.py (TABLE=cac.fx_series)
-  cac.seed.report.locale_coverage.v1       # seed_locale.py (TABLE=locale_coverage)
+  cac.seed.report.cac.locale_coverage.v1   # seed_locale.py (TABLE=locale_coverage)
   cac.seed.report.cac.events.v1            # seed_events.py (reports with table=cac.events)
   # SPEC-W28 (additive): tenant knowledge graph streams.
   opendesk.graph.enrichment.v1     # gold→graph enrichment rows (spark graph_enrichment.py → graph-sync)
   opendesk.graph.erasure.done.v1   # graph erasure audit events (graph-sync emits)
   # SPEC-W30 (additive): fraud & trust intelligence.
   opendesk.fraud.alerts.v1         # fraud-engine AlertRaised + graph-service AlertResolved audit events
+  # SPEC-W32 (additive): civic reporting.
+  opendesk.civic.events.v1         # civic case lifecycle (booking-service → notify/graph/fraud/analytics)
 )
 
 echo "[kafka-topics] waiting for broker at ${BOOTSTRAP}..."
