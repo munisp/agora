@@ -54,6 +54,16 @@ class Settings:
         default_factory=lambda: _int("GRAPH_ML_GNN_MIN_PERSONS", 20)
     )
     gnn_min_edges: int = field(default_factory=lambda: _int("GRAPH_ML_GNN_MIN_EDGES", 30))
+    # Supervised head opt-in (SPEC-W33 §3 B3): "link" (default, exact W31
+    # link-prediction behavior) or "classifier" (A1-labeled node
+    # classification; graph_ml/gnn_head.py).
+    gnn_head: str = field(default_factory=lambda: _str("GNN_HEAD", "link"))
+    gnn_head_patience: int = field(
+        default_factory=lambda: _int("GNN_HEAD_PATIENCE", 20)
+    )
+    gnn_head_val_fraction: float = field(
+        default_factory=lambda: float(os.getenv("GNN_HEAD_VAL_FRACTION") or 0.2)
+    )
     # Nightly retrain scheduler interval; 0 = off (default).
     train_interval_minutes: int = field(
         default_factory=lambda: _int("GRAPH_ML_TRAIN_INTERVAL_MINUTES", 0)
