@@ -16,7 +16,16 @@ type jwtClaims struct {
 	// Email carries the caller's email claim when the IdP includes one —
 	// used by GET /v1/bookings?mine=true to resolve the team member.
 	Email string `json:"email"`
+	// RealmAccess carries the Keycloak realm roles (docs/security/roles.md)
+	// — SPEC-W32 WS-A uses them for role-based reporter masking on civic
+	// cases (owner/admin see reporter PII on detail views).
+	RealmAccess struct {
+		Roles []string `json:"roles"`
+	} `json:"realm_access"`
 }
+
+// roles returns the caller's Keycloak realm roles (empty when absent).
+func (c jwtClaims) roles() []string { return c.RealmAccess.Roles }
 
 // parseBearerClaims decodes the payload segment of a JWT without verifying
 // the signature (verified upstream at the gateway).
