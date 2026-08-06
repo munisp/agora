@@ -109,3 +109,49 @@ The e2e suites (`tests/e2e/test_graph_predictive_wave.py`, `test_graph_fraud_wav
 | GNN backend silently heuristic | torch/PyG not installed | expected; install from requirements-gnn.txt or accept heuristic |
 | Alert flood after data import | D3/D5 tripped by bulk historical import | run import with detectors paused (`POST /v1/detect/run` per-detector control), or raise thresholds temporarily |
 | Person unexpectedly audience-ineligible | quarantined by F1/F2/F3-high | check `/alerts` queue for that person; adjudicate |
+
+## 7. GNN backend (W31)
+
+The W29 `gnn` backend is now real: per-tenant unsupervised GraphSAGE training + link-prediction inference for RECOMMENDED_FOR edges. It **replaces only the recommendation half** of scoring — propensity scores stay `heuristic-v1` this wave (calibration gate below). Heuristic remains the permanent cold-start/degradation path.
+
+### 7.1 Install & run
+
+torch/torch-geometric never enter the base image; they install from the `requirements-gnn.txt` overlay into the `Dockerfile.gnn` variant only:
+
+```
+docker compose -f infra/docker-compose.graph.yml build graph-ml graph-ml-gpu
+docker compose -f infra/docker-compose.graph.yml --profile gnn up graph-ml-gpu
+```
+
+The pinned wheels are the CPU variant (`GRAPH_ML_DEVICE=auto` → cuda-if-available-else-cpu). A CUDA base swap (e.g. `pytorch/pytorch:*-runtime` or the `+cu121` wheel index in `requirements-gnn.txt`) is documented-not-built: GPU is never mandatory. The profiled service shares the `graph-ml-models` volume with the heuristic one and serves on host port **7018**.
+
+### 7.2 Train / score flow
+
+- **Train:** `POST :7018/v1/score/train` with `{"tenant_id": "..."}` (omit for all tenants). Response `{run_id, trained: [{tenant_id, model_version, final_loss}], skipped: [{tenant_id, reason}], ok}` — undersized graphs, missing data, and per-tenant train errors land in `skipped`; the run never fails on them. On the heuristic base image the endpoint honestly refuses with `409 {"error": "gnn backend not enabled"}` (the e2e asserts exactly this).
+- **Nightly train:** `GRAPH_ML_TRAIN_INTERVAL_MINUTES > 0` adds an APScheduler interval job alongside the untouched score sweep (default 0 = off). It is a no-op in heuristic mode.
+- **Score:** unchanged — the interval sweep (or `POST /v1/score/run`) uses the latest trained model per tenant when one exists.
+- **Min-size gate:** tenants below `GRAPH_ML_GNN_MIN_PERSONS` (20) / `GRAPH_ML_GNN_MIN_EDGES` (30) are skipped at train time and score heuristically — small tenants never get a half-trained model.
+
+### 7.3 Model registry layout
+
+```
+{GRAPH_ML_MODEL_DIR}/{tenant_id}/graphsage-v{N}/model.pt
+                                            meta.json
+```
+
+One model lineage per tenant; `N` increments per successful training. `meta.json` carries tenant_id, model_version, trained_at, feature/hidden dims, epochs, final_loss, node/edge counts, device, seed. A tenant's model never scores another tenant (paths and loads are tenant-scoped). `/healthz` reports `gnn_models_dir` + `gnn_tenants_with_models` (best-effort — omitted, never a 500, on filesystem errors).
+
+### 7.4 Fallback ladder (W29 gate-5 semantics, unchanged)
+
+Every GNN failure mode degrades that tenant to heuristic, logged, and the sweep still exits 0:
+
+1. **no torch/PyG** → heuristic (import guard, startup warning)
+2. **no trained model** for the tenant → heuristic
+3. **undersized graph** (below the min-size gate) → heuristic
+4. **training/inference error** → heuristic
+
+Heuristic output is always correct; the GNN is purely additive. GNN-written RECOMMENDED_FOR edges carry `model_version=graphsage-v{N}` + `reason` + `scored_at` for provenance; heuristic edges keep `heuristic-v1`.
+
+### 7.5 Propensity calibration gate (roadmap R5)
+
+GNN propensity heads are explicitly deferred: propensity scores stay `heuristic-v1` until a calibration report shows **Brier < 0.2** for the GNN heads against held-out outcomes. Do not enable GNN propensity before that report exists — the gate is the honest-ML doctrine, not a performance question.

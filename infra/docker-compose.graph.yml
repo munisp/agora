@@ -267,6 +267,46 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # ----------- graph-ml-gpu (SPEC-W31: GraphSAGE GNN backend, opt-in) ------
+  graph-ml-gpu:
+    # GNN variant of graph-ml: same service, built from Dockerfile.gnn
+    # (base image + torch/torch-geometric overlay). Inactive unless the
+    # `gnn` profile is enabled:
+    #   docker compose --profile gnn up graph-ml-gpu
+    # Build the base first so FROM graph-ml:latest resolves:
+    #   docker compose build graph-ml graph-ml-gpu
+    profiles: [gnn]
+    build:
+      context: ../services/graph-ml
+      dockerfile: Dockerfile.gnn
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: "7016"
+      FALKORDB_HOST: graph-db
+      FALKORDB_PORT: "6379"
+      FALKORDB_DB: ${FALKORDB_GRAPH:-agora_tenants}
+      GRAPH_SERVICE_URL: http://graph-service:7014
+      INTERNAL_TOKEN: ${INTERNAL_TOKEN:-opendesk-dev-internal-token}
+      GRAPH_ML_BACKEND: gnn
+      GRAPH_ML_DEVICE: ${GRAPH_ML_DEVICE:-auto}
+      GRAPH_ML_TRAIN_INTERVAL_MINUTES: ${GRAPH_ML_TRAIN_INTERVAL_MINUTES:-0}
+      GRAPH_ML_TOP_K: ${GRAPH_ML_TOP_K:-5}
+      SCORE_INTERVAL_MINUTES: ${SCORE_INTERVAL_MINUTES:-60}
+      GRAPH_ML_MODEL_DIR: /data/graph-ml-models
+    ports:
+      # 7016 graph-ml, 7017 fraud-engine are taken; 7018 is the lowest free.
+      - "7018:7016/tcp"   # dev/e2e reachability; not routed through APISIX
+    volumes:
+      - graph-ml-models:/data/graph-ml-models
+    networks:
+      - opendesk
+    depends_on:
+      graph-service:
+        condition: service_started
+    restart: unless-stopped
+
   # ----------- fraud-engine (SPEC-W30: fraud & trust intelligence) ---------
   fraud-engine:
     # Deterministic graph detectors (referral rings, sybil clusters, capture

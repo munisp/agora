@@ -1,0 +1,24 @@
+# graph-ml GNN variant (SPEC-W31 §2): base heuristic image + the optional
+# torch/torch-geometric overlay. The base image (Dockerfile) stays torch-free
+# (SPEC-W31 §0 invariant 5); this file is the ONLY way the deps land.
+#
+# requirements-gnn.txt pins the default PyPI wheels, which are the CPU
+# variant on linux slim images. A CUDA base swap (pytorch/pytorch:*-runtime
+# or the +cu121 wheel index) is documented in docs/graph-intel.md but
+# deliberately NOT built here — CPU-first per SPEC-W31 §4.
+#
+# Build (base image must exist first):
+#   docker compose -f infra/docker-compose.graph.yml build graph-ml
+#   docker compose -f infra/docker-compose.graph.yml build graph-ml-gpu
+FROM graph-ml:latest
+
+USER root
+COPY requirements-gnn.txt ./
+RUN pip install --no-cache-dir -r requirements-gnn.txt
+USER graphml
+
+ENV GRAPH_ML_BACKEND=gnn \
+    GRAPH_ML_DEVICE=auto
+
+# Same entrypoint/healthcheck as the base image.
+CMD ["python", "-m", "uvicorn", "graph_ml.main:app", "--host", "0.0.0.0", "--port", "7016"]
