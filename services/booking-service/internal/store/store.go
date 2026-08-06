@@ -258,8 +258,8 @@ func (s *Store) GetOffering(ctx context.Context, tenantID, id uuid.UUID) (Offeri
 // UpdateOffering replaces mutable offering fields.
 func (s *Store) UpdateOffering(ctx context.Context, o *Offering) error {
 	const q = `UPDATE offerings SET name=$3, description=$4, duration_min=$5, buffer_min=$6,
-           price_cents=$7, currency=$8, capacity=$9, bookable=$10
-           WHERE tenant_id=$1 AND id=$2`
+	           price_cents=$7, currency=$8, capacity=$9, bookable=$10
+	           WHERE tenant_id=$1 AND id=$2`
 	return s.withTenant(ctx, o.TenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, q, o.TenantID, o.ID, o.Name, o.Description, o.DurationMin,
 			o.BufferMin, o.PriceCents, o.Currency, o.Capacity, o.Bookable)
@@ -275,7 +275,7 @@ func (s *Store) UpdateOffering(ctx context.Context, o *Offering) error {
 
 // DeleteOffering removes an offering.
 func (s *Store) DeleteOffering(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, o.TenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM offerings WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		if err != nil {
 			return err
@@ -398,7 +398,7 @@ func (s *Store) UpdateTeamMember(ctx context.Context, m *TeamMember) error {
 
 // DeleteTeamMember removes a team member.
 func (s *Store) DeleteTeamMember(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, m.TenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM team_members WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		if err != nil {
 			return err
@@ -480,7 +480,7 @@ func (s *Store) CreateContact(ctx context.Context, c *Contact) error {
 		c.ID = uuid.New()
 	}
 	const q = `INSERT INTO contacts (id, tenant_id, name, phone, email, notes, source, external_id)
-           VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,''))`
+	           VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,''))`
 	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, q, c.ID, c.TenantID, c.Name, c.Phone, c.Email, c.Notes, c.Source, c.ExternalID); err != nil {
 			return fmt.Errorf("insert contact: %w", err)
