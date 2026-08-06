@@ -14,6 +14,17 @@ to [0, 1]. ``model_version`` is stamped ``fraud-ae-vN+fraud-clf-vN`` and
 ABSENT WEIGHTS -> None (never an exception): torch missing, registry dir
 missing/empty, or an incomplete family pair all degrade to the pure D1-D8
 rule path (I1 honest degradation). All torch loads use map_location="cpu".
+
+W33-C (SPEC-W33 §4 C1 consumer clause, ADDITIVE): resolution order in
+:meth:`LearnedScorer.load` is now (a) the model-registry service record
+(``fraud_engine.ml.registry_client``, env ``MODEL_REGISTRY_URL`` — read
+inside ``load``, no signature change) translated to a local artifact scope
+dir, then (b) EXACTLY the W31/W33-B bootstrap local-dir scan above. Any
+registry failure mode (unset/404/timeout/error/unsupported scheme) yields
+None and the bootstrap scan runs unchanged. When resolution came from the
+registry, ``model_version`` is the registry record's ``version`` (I2
+provenance honesty); otherwise it stays the dir-derived
+``fraud-ae-vN+fraud-clf-vN``.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ from . import (
     MODEL_VERSION_CLF_PREFIX,
     _TORCH_AVAILABLE,
     load_latest,
+    registry_client,
 )
 from .features import FEATURE_SCHEMA, build_feature_vector
 
@@ -68,6 +80,7 @@ class LearnedScorer:
         clf_model: Any,
         clf_meta: Mapping[str, Any],
         tenant_id: str,
+        registry_version: str | None = None,
     ) -> None:
         self._ae = ae_model
         self._clf = clf_model
@@ -79,42 +92,90 @@ class LearnedScorer:
         self._err_max = float(err_stats.get("err_max") or 0.0)
         self.feature_schema = str(ae_meta.get("feature_schema") or FEATURE_SCHEMA)
         self.model_version = f"{self.ae_version}+{self.clf_version}"
+        if registry_version:  # W33-C: registry-resolved provenance (I2)
+            self.model_version = registry_version
+            self.registry_version = registry_version
+        else:
+            self.registry_version = None
         self._ae.eval()
         self._clf.eval()
 
     # -- loading -----------------------------------------------------------
     @classmethod
-    def load(cls, registry_dir: str | None, tenant_id: str) -> "LearnedScorer | None":
-        """Latest AE+CLF pair for ``tenant_id`` (tenant dir, then ``_global``).
+    def _load_scope(
+        cls,
+        scope_dir: str,
+        tenant_id: str,
+        registry_version: str | None = None,
+    ) -> "LearnedScorer | None":
+        """AE+CLF pair from one scope dir (W33-B layout), or None (I1).
 
-        Returns None when torch is absent, the registry is missing/empty, or
-        no complete family pair exists — the caller stays on pure rules (I1).
+        ``registry_version`` is set only when ``scope_dir`` came from the
+        model-registry service (W33-C): the scorer then stamps the registry
+        record's ``version`` instead of the dir-derived pair version (I2).
+        """
+        from .autoencoder import FraudAE
+        from .classifier import FraudCLF
+
+        ae_loaded = load_latest(scope_dir, MODEL_VERSION_AE_PREFIX)
+        clf_loaded = load_latest(scope_dir, MODEL_VERSION_CLF_PREFIX)
+        if ae_loaded is None or clf_loaded is None:
+            return None
+        ae_state, ae_meta = ae_loaded
+        clf_state, clf_meta = clf_loaded
+        try:
+            ae_model = FraudAE()
+            ae_model.load_state_dict(ae_state)
+            clf_model = FraudCLF()
+            clf_model.load_state_dict(clf_state)
+        except Exception as exc:  # noqa: BLE001 - corrupt artifact -> fallback
+            log.warning("unusable artifacts in %s: %s (rule fallback)", scope_dir, exc)
+            return None
+        return cls(
+            ae_model, ae_meta, clf_model, clf_meta, tenant_id,
+            registry_version=registry_version,
+        )
+
+    @classmethod
+    def load(cls, registry_dir: str | None, tenant_id: str) -> "LearnedScorer | None":
+        """Latest AE+CLF pair for ``tenant_id`` (registry, then local scan).
+
+        Resolution order (W33-C, ADDITIVE): (a) the model-registry service
+        record (env ``MODEL_REGISTRY_URL`` read inside, via
+        :mod:`fraud_engine.ml.registry_client`) translated to a local
+        artifact scope dir; (b) on None — service unset/empty/404/timeout/
+        error/unsupported scheme — EXACTLY the W31/W33-B bootstrap scan
+        (tenant dir, then ``_global``). Returns None when torch is absent,
+        no registry/local artifact resolves, or no complete family pair
+        exists — the caller stays on pure rules (I1).
         """
         if not _TORCH_AVAILABLE:
             log.info("torch absent: learned scorer disabled (rule fallback, I1)")
             return None
+        # (a) model-registry service (W33-C). Never raises; any failure mode
+        # returns None and falls through to the bootstrap scan unchanged.
+        resolved = registry_client.resolve_artifact_dir(tenant_id)
+        if resolved is not None:
+            scope_dir, record = resolved
+            scorer = cls._load_scope(scope_dir, tenant_id, registry_version=record.version)
+            if scorer is not None:
+                log.info(
+                    "resolved %s for tenant %s via model-registry (version=%s)",
+                    registry_client.FAMILY,
+                    tenant_id,
+                    record.version,
+                )
+                return scorer
+            log.warning(
+                "registry artifact dir %s unusable; bootstrap fallback", scope_dir
+            )
+        # (b) bootstrap local-dir scan (W31/W33-B behavior, unchanged).
         if not registry_dir or not os.path.isdir(registry_dir):
             return None
-        from .autoencoder import FraudAE
-        from .classifier import FraudCLF
-
         for scope in (tenant_id, GLOBAL_TENANT_DIR):
-            scope_dir = os.path.join(registry_dir, scope)
-            ae_loaded = load_latest(scope_dir, MODEL_VERSION_AE_PREFIX)
-            clf_loaded = load_latest(scope_dir, MODEL_VERSION_CLF_PREFIX)
-            if ae_loaded is None or clf_loaded is None:
-                continue
-            ae_state, ae_meta = ae_loaded
-            clf_state, clf_meta = clf_loaded
-            try:
-                ae_model = FraudAE()
-                ae_model.load_state_dict(ae_state)
-                clf_model = FraudCLF()
-                clf_model.load_state_dict(clf_state)
-            except Exception as exc:  # noqa: BLE001 - corrupt artifact -> fallback
-                log.warning("unusable artifacts in %s: %s (rule fallback)", scope_dir, exc)
-                continue
-            return cls(ae_model, ae_meta, clf_model, clf_meta, tenant_id)
+            scorer = cls._load_scope(os.path.join(registry_dir, scope), tenant_id)
+            if scorer is not None:
+                return scorer
         return None
 
     # -- scoring -----------------------------------------------------------
