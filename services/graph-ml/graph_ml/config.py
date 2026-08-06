@@ -45,6 +45,20 @@ class Settings:
     backend: str = field(default_factory=lambda: _str("GRAPH_ML_BACKEND", "heuristic"))
     model_dir: str = field(default_factory=lambda: _str("GRAPH_ML_MODEL_DIR", "./models"))
 
+    # GNN training/inference knobs (SPEC-W31 §1; safe CPU-first defaults).
+    device: str = field(default_factory=lambda: _str("GRAPH_ML_DEVICE", "auto"))
+    seed: int = field(default_factory=lambda: _int("GRAPH_ML_SEED", 42))
+    gnn_epochs: int = field(default_factory=lambda: _int("GRAPH_ML_EPOCHS", 200))
+    gnn_hidden_dim: int = field(default_factory=lambda: _int("GRAPH_ML_HIDDEN_DIM", 64))
+    gnn_min_persons: int = field(
+        default_factory=lambda: _int("GRAPH_ML_GNN_MIN_PERSONS", 20)
+    )
+    gnn_min_edges: int = field(default_factory=lambda: _int("GRAPH_ML_GNN_MIN_EDGES", 30))
+    # Nightly retrain scheduler interval; 0 = off (default).
+    train_interval_minutes: int = field(
+        default_factory=lambda: _int("GRAPH_ML_TRAIN_INTERVAL_MINUTES", 0)
+    )
+
     # Scoring knobs.
     top_k: int = field(default_factory=lambda: _int("GRAPH_ML_TOP_K", 5))
     score_interval_minutes: int = field(

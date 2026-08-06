@@ -65,7 +65,11 @@ def score_one_tenant(
     try:
         graph = graph_client.fetch_tenant_graph(tenant_id)
         if backend == "gnn":  # pragma: no cover - requires torch
-            from .gnn import GraphSAGEBackend
+            from .gnn import (
+                GraphSAGEBackend,
+                GNNInsufficientData,
+                GNNModelNotFound,
+            )
 
             gnn = GraphSAGEBackend(settings.model_dir)
             try:
@@ -73,13 +77,14 @@ def score_one_tenant(
                     graph, now=datetime.now(timezone.utc), top_k=settings.top_k
                 )
                 model_version = gnn.model_version
-            except NotImplementedError:
-                # Training/inference lands with the W31 GPU profile. Degrade
-                # to heuristic for this tenant rather than erroring every
-                # tenant in the sweep when torch/PyG happen to be installed.
+            except (NotImplementedError, GNNModelNotFound, GNNInsufficientData) as exc:
+                # W31 gate-5 semantics: no model / undersized graph / not yet
+                # implemented -> degrade to heuristic for THIS tenant rather
+                # than erroring every tenant in the sweep.
                 log.warning(
-                    "gnn backend selected but training is not implemented "
-                    "yet; scoring tenant with heuristic backend",
+                    "gnn backend unavailable for tenant (%s); scoring with "
+                    "heuristic backend",
+                    exc,
                     extra={"tenant_id": tenant_id},
                 )
                 scores, recommendations = score_tenant(
