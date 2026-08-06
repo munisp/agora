@@ -13,6 +13,8 @@ X-Tenant-Id in dev mode; every query injects the tenant filter):
   GET  /v1/graph/segments/schema             filterable-field catalog (incl. score filters)
   POST /v1/graph/internal/scores             W29 score write-back (X-Internal-Token only)
   POST /v1/graph/internal/recommendations    W29 RECOMMENDED_FOR write-back (internal)
+  GET  /v1/graph/internal/export/nodes       W33-A2 tenant node export (JSONL, PII-hashed)
+  GET  /v1/graph/internal/export/edges       W33-A2 tenant edge export (JSONL, PII-hashed)
   GET  /v1/graph/alerts[/{id}]               W30 fraud alert list/detail
   POST /v1/graph/alerts/{id}/resolve         W30 adjudication + audit CloudEvent
   POST /v1/graph/internal/fixtures/seed      dev/e2e fixture seeder (E2E_FIXTURES=1 only)
@@ -53,6 +55,7 @@ from .events import (
 )
 from .plans import CompiledQuery
 from .routers import alerts as alerts_router
+from .routers import internal_export as internal_export_router
 from .routers import internal_fixtures as internal_fixtures_router
 from .routers import internal_scores as internal_scores_router
 from .routers import segments as segments_router
@@ -134,6 +137,7 @@ def create_app(
     # W29 internal write-back + W30 alerts/fixtures routers. The fixture
     # seeder exists ONLY in dev/e2e (E2E_FIXTURES=1); production 404s it.
     app.include_router(internal_scores_router.router)
+    app.include_router(internal_export_router.router)
     app.include_router(alerts_router.router)
     app.include_router(segments_router.router)
     if settings.e2e_fixtures:
