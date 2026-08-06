@@ -69,6 +69,37 @@ func TestQueries_TenantIDOnEveryStatement(t *testing.T) {
 	}
 }
 
+// TestCivicQueries_TenantScoped pins the W32 §5 gate-1 static side for the
+// civic Case projection: every statement binds $tenant_id on node AND edge.
+func TestCivicQueries_TenantScoped(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	acked, resolved := now, now
+	c := Case{Ref: "GOV-X-1", TenantID: "t1", Category: "roads", Status: "new", Ward: "W3", CreatedAt: now, Lat: 6.6, Lon: 3.3, HasGeo: true}
+	stmts := []q{
+		upsertCaseQuery(c, "p1"),
+		upsertCaseQuery(c, ""), // anonymous: no REPORTED branch
+		caseLocationQuery(c),
+		setCaseStatusQuery("t1", "GOV-X-1", "resolved", &acked, &resolved, now),
+		setCaseStatusQuery("t1", "GOV-X-1", "triaged", nil, nil, now),
+		linkCaseMergedQuery("t1", "GOV-X-1", "GOV-X-0", now),
+	}
+	for i, stmt := range stmts {
+		require.Contains(t, stmt.text, "tenant_id", "civic statement %d must be tenant-scoped", i)
+		require.Equal(t, "t1", stmt.params["tenant_id"], "civic statement %d tenant param", i)
+	}
+	withReporter := upsertCaseQuery(c, "p1")
+	require.Contains(t, withReporter.text, "REPORTED")
+	require.Contains(t, withReporter.text, "MERGE (p)-[r:REPORTED]->(cs)")
+	require.Contains(t, withReporter.text, "r.tenant_id = $tenant_id", "edge carries tenant_id")
+	anon := upsertCaseQuery(c, "")
+	require.NotContains(t, anon.text, "REPORTED", "anonymous reports never create a person edge")
+	require.NotContains(t, withReporter.text, "phone", "Case node carries no PII fields")
+	require.Contains(t, caseLocationQuery(c).text, "MERGE (cs)-[r:AT]->(l)")
+	merged := linkCaseMergedQuery("t1", "GOV-X-1", "GOV-X-0", now)
+	require.Contains(t, merged.text, "MERGED_INTO")
+	require.Contains(t, merged.text, "m.tenant_id = $tenant_id")
+}
+
 // TestEraseQuery_DetachDelete pins the erasure shape (SPEC §4: DETACH
 // DELETE the Person subgraph).
 func TestEraseQuery_DetachDelete(t *testing.T) {

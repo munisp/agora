@@ -296,6 +296,107 @@ RETURN count(p) AS n`,
 	}
 }
 
+// upsertCaseQuery upserts the civic Case node (SPEC-W32 §3 WS-D; PII-free)
+// and wires (Person)-[:REPORTED]->(Case) when personID is non-empty. Every
+// node and edge carries tenant_id (SPEC-W28 §5 gate 1). Status/category are
+// refreshed on re-delivery (MERGE idempotency).
+func upsertCaseQuery(c Case, personID string) q {
+	text := `MERGE (cs:Case {tenant_id: $tenant_id, case_id: $case_id})
+ON CREATE SET cs.created_at = $created_at
+SET cs.category = CASE WHEN $category <> '' THEN $category ELSE cs.category END,
+    cs.status = CASE WHEN $status <> '' THEN $status ELSE cs.status END,
+    cs.ward = CASE WHEN $ward <> '' THEN $ward ELSE cs.ward END,
+    cs.updated_at = $now`
+	params := map[string]any{
+		"tenant_id":  c.TenantID,
+		"case_id":    c.Ref,
+		"person_id":  personID,
+		"category":   c.Category,
+		"status":     c.Status,
+		"ward":       c.Ward,
+		"created_at": FormatTime(c.CreatedAt),
+		"now":        FormatTime(time.Now()),
+	}
+	if personID != "" {
+		text += `
+WITH cs
+MATCH (p:Person {tenant_id: $tenant_id, person_id: $person_id})
+MERGE (p)-[r:REPORTED]->(cs)
+SET r.tenant_id = $tenant_id`
+	}
+	return q{text: text, params: params}
+}
+
+// caseLocationQuery wires (Case)-[:AT]->(Location) (only issued when the
+// case carries geo). The Location MERGE key mirrors captureLocationQuery
+// ({tenant_id, lga, ward}); lat/lon are SET as properties.
+func caseLocationQuery(c Case) q {
+	return q{
+		text: `MATCH (cs:Case {tenant_id: $tenant_id, case_id: $case_id})
+MERGE (l:Location {tenant_id: $tenant_id, lga: $lga, ward: $ward})
+SET l.lat = $lat, l.lon = $lon, l.updated_at = $now
+MERGE (cs)-[r:AT]->(l)
+SET r.tenant_id = $tenant_id`,
+		params: map[string]any{
+			"tenant_id": c.TenantID,
+			"case_id":   c.Ref,
+			"lga":       c.LGA,
+			"ward":      c.Ward,
+			"lat":       c.Lat,
+			"lon":       c.Lon,
+			"now":       FormatTime(time.Now()),
+		},
+	}
+}
+
+// setCaseStatusQuery mirrors the civic status (StatusChanged). acked_at /
+// resolved_at are stamped only when the event carried them (empty string
+// keeps the existing property — CASE-guarded).
+func setCaseStatusQuery(tenantID, ref, status string, ackedAt, resolvedAt *time.Time, at time.Time) q {
+	acked, resolved := "", ""
+	if ackedAt != nil {
+		acked = FormatTime(*ackedAt)
+	}
+	if resolvedAt != nil {
+		resolved = FormatTime(*resolvedAt)
+	}
+	return q{
+		text: `MERGE (cs:Case {tenant_id: $tenant_id, case_id: $case_id})
+SET cs.status = $status,
+    cs.acked_at = CASE WHEN $acked_at <> '' THEN $acked_at ELSE cs.acked_at END,
+    cs.resolved_at = CASE WHEN $resolved_at <> '' THEN $resolved_at ELSE cs.resolved_at END,
+    cs.updated_at = $now`,
+		params: map[string]any{
+			"tenant_id":   tenantID,
+			"case_id":     ref,
+			"status":      status,
+			"acked_at":    acked,
+			"resolved_at": resolved,
+			"now":         FormatTime(at),
+		},
+	}
+}
+
+// linkCaseMergedQuery wires (Case)-[:MERGED_INTO]->(canonical Case). The
+// canonical node is MERGEd (stub) so an out-of-order Merged event that
+// precedes the canonical ReportReceived is still safe; cs.merged_into keeps
+// the pointer on the merged case itself.
+func linkCaseMergedQuery(tenantID, ref, canonicalRef string, at time.Time) q {
+	return q{
+		text: `MERGE (cs:Case {tenant_id: $tenant_id, case_id: $case_id})
+MERGE (cn:Case {tenant_id: $tenant_id, case_id: $canonical_id})
+MERGE (cs)-[m:MERGED_INTO]->(cn)
+SET m.tenant_id = $tenant_id, m.at = $now,
+    cs.merged_into = $canonical_id, cs.updated_at = $now`,
+		params: map[string]any{
+			"tenant_id":    tenantID,
+			"case_id":      ref,
+			"canonical_id": canonicalRef,
+			"now":          FormatTime(at),
+		},
+	}
+}
+
 // personExistsQuery is the pre-delete check (erasure must be idempotent and
 // report found/not-found for the audit event).
 func personExistsQuery(tenantID, personID string) q {

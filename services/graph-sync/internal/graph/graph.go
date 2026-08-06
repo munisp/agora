@@ -89,6 +89,22 @@ type Client interface {
 	// (docs/graph.md §4).
 	ApplyEnrichment(ctx context.Context, tenantID, personID string, props map[string]any, snapshotDay string, at time.Time) (applied bool, err error)
 
+	// UpsertCase upserts a civic Case node (SPEC-W32 §3 WS-D; PII-free:
+	// ref/category/ward/status only) and wires
+	// (Person)-[:REPORTED {tenant_id}]->(Case) when reporterPersonID is
+	// non-empty, plus (Case)-[:AT {tenant_id}]->(Location) when the case
+	// carries geo (HasGeo).
+	UpsertCase(ctx context.Context, c Case, reporterPersonID string) error
+
+	// SetCaseStatus mirrors the civic case status (StatusChanged): SET
+	// cs.status and stamp acked_at / resolved_at when non-nil.
+	SetCaseStatus(ctx context.Context, tenantID, ref, status string, ackedAt, resolvedAt *time.Time) error
+
+	// LinkCaseMerged wires (Case)-[:MERGED_INTO {tenant_id}]->(canonical
+	// Case) for a duplicate merge (SPEC-W32 §2 merged_into). The canonical
+	// node is MERGEd so an out-of-order Merged event is safe.
+	LinkCaseMerged(ctx context.Context, tenantID, ref, canonicalRef string) error
+
 	// FindPersonByPhoneHash resolves the person_id of an exact phone_hash
 	// match within the tenant ("" when none) — used by phone-only erasure
 	// tombstones.
@@ -166,6 +182,23 @@ type Booking struct {
 	// create->cancel detection).
 	CreatedBy   string
 	CancelledAt *time.Time
+}
+
+// Case mirrors the SPEC-W32 §3 WS-D civic Case node. The node is PII-free
+// by contract (SPEC-W32 §5 gate 5): ref, category, ward, status and
+// lifecycle timestamps only — reporter identity lives on the Person side of
+// the REPORTED edge (phone as salted hash) and dies with it on erasure.
+type Case struct {
+	Ref       string // case_id: the public reference (GOV-{LGA}-{WARD}-YYYY-{seq6})
+	TenantID  string
+	Category  string // category slug (roads|water|power|waste|...)
+	Status    string // new|triaged|assigned|in_progress|resolved|closed
+	Ward      string
+	CreatedAt time.Time
+	// Geo (AT Location): optional. HasGeo=false skips the Location.
+	LGA     string // optional; ward already lives on the Case node itself
+	Lat, Lon float64
+	HasGeo  bool
 }
 
 // PhoneHash computes the salted SHA-256 phone hash (SPEC-W28 §3: "same
