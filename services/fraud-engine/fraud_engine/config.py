@@ -129,6 +129,20 @@ class Settings:
         default_factory=lambda: _float("ANOMALY_MEDIUM_THRESHOLD", 0.97)
     )
 
+    # W33-B learned scorer (SPEC-W33 §3 B1). Default UNSET = OFF: detection
+    # output is then byte-equal to the pre-W33-B pure-rule pipeline (GB3).
+    # When set to a registry dir, each finding's person is blended with the
+    # fraud-ae+fraud-clf score and the alert evidence gains an
+    # "ml_blend ae=<x> clf=<y>" reason; severities may be raised UPWARD only
+    # (low -> medium; the high band and auto-quarantine stay rule-only), so a
+    # rule verdict is never weakened (I1 UNION).
+    ml_registry_dir: str = field(
+        default_factory=lambda: os.getenv("FRAUD_ML_REGISTRY_DIR", "")
+    )
+    ml_score_threshold: float = field(
+        default_factory=lambda: _float("FRAUD_ML_SCORE_THRESHOLD", 0.9)
+    )
+
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
 
