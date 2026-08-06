@@ -86,6 +86,12 @@ CREATE TABLE IF NOT EXISTS field_captures (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, client_id)
 );
+-- SPEC-W32 WS-A: the kind enum gains 'civic_report'. CREATE TABLE IF NOT
+-- EXISTS never updates an existing CHECK constraint, so it is rebuilt
+-- idempotently (drop + re-add with the full enum).
+ALTER TABLE field_captures DROP CONSTRAINT IF EXISTS field_captures_kind_check;
+ALTER TABLE field_captures ADD CONSTRAINT field_captures_kind_check
+    CHECK (kind IN ('lead_capture','checkin','civic_report'));
 ALTER TABLE field_captures ENABLE ROW LEVEL SECURITY;
 ALTER TABLE field_captures FORCE ROW LEVEL SECURITY;
 DO $$
