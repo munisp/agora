@@ -9,7 +9,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/bookingops"
+	"github.com/opendesk/booking-service/internal/civic"
 	"github.com/opendesk/booking-service/internal/leads"
+	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
 )
 
@@ -21,7 +23,17 @@ type Service struct {
 	// honoring the leads service's own 24h first-touch dedupe). Nil →
 	// lead_capture items fail with a deterministic error.
 	Leads *leads.Service
+	// Civic creates the civic case for kind=civic_report (SPEC-W32 WS-A,
+	// channel "pwa" — an agent filing on behalf of a citizen). Nil →
+	// civic_report items fail with a deterministic error.
+	Civic CivicSubmitter
 	Log   *zap.Logger
+}
+
+// CivicSubmitter abstracts the civic module's report intake so the capture
+// pipe stays decoupled (civic.Service satisfies it; tests use a fake).
+type CivicSubmitter interface {
+	Submit(ctx context.Context, tenantID uuid.UUID, tenantSlug, channel string, in civic.ReportInput) (store.CivicCase, error)
 }
 
 func (s *Service) log() *zap.Logger {
@@ -75,6 +87,8 @@ func (s *Service) apply(ctx context.Context, tenant bookingops.TenantInfo, it Ca
 			if err := json.Unmarshal(anchorResult, &stored); err == nil {
 				res.LeadID = stored.LeadID
 				res.CheckinID = stored.CheckinID
+				res.CaseID = stored.CaseID
+				res.CaseRef = stored.CaseRef
 				res.Error = stored.Error
 			}
 		}
@@ -88,11 +102,13 @@ func (s *Service) apply(ctx context.Context, tenant bookingops.TenantInfo, it Ca
 		applyErr = s.applyLeadCapture(ctx, tenant, it, &res)
 	case KindCheckin:
 		applyErr = s.applyCheckin(ctx, tenant, it, &res)
+	case KindCivicReport:
+		applyErr = s.applyCivicReport(ctx, tenant, it, &res)
 	}
 	switch {
 	case applyErr == nil:
 		res.Status = StatusApplied
-	case errors.Is(applyErr, leads.ErrInvalidInput), errors.Is(applyErr, ErrInvalidInput):
+	case errors.Is(applyErr, leads.ErrInvalidInput), errors.Is(applyErr, civic.ErrInvalidInput), errors.Is(applyErr, ErrInvalidInput):
 		// Deterministic failure: record it — replays dedupe to the same
 		// outcome instead of re-running validation side effects.
 		res.Status = StatusError
@@ -181,9 +197,50 @@ func (s *Service) applyCheckin(ctx context.Context, tenant bookingops.TenantInfo
 	return nil
 }
 
+// applyCivicReport creates the civic case for kind=civic_report (SPEC-W32
+// WS-A): payload = the public report body, channel=pwa (agent capturing on
+// behalf of a citizen; agent attribution rides the device/user context of
+// the capture request, the anchor row preserves the raw payload).
+func (s *Service) applyCivicReport(ctx context.Context, tenant bookingops.TenantInfo, it CaptureItem, res *ItemResult) error {
+	if s.Civic == nil {
+		return errCivicUnavailable
+	}
+	var p CivicReportPayload
+	if err := json.Unmarshal(it.Payload, &p); err != nil {
+		return errInvalidPayload("civic_report payload: " + err.Error())
+	}
+	in := civic.ReportInput{
+		CategorySlug:      p.CategorySlug,
+		Description:       p.Description,
+		Ward:              p.Ward,
+		LGA:               p.LGA,
+		LocationText:      p.LocationText,
+		ReporterPhoneE164: p.ReporterPhoneE164,
+		ReporterName:      p.ReporterName,
+		Anonymous:         p.Anonymous,
+		PhotoURL:          p.PhotoURL,
+	}
+	// The item-level GPS fix supplies the case location when the payload
+	// carries none (field agents capture the fix on-site).
+	if it.GPS != nil {
+		lat, lng := it.GPS.Lat, it.GPS.Lng
+		in.Lat, in.Lon = &lat, &lng
+	}
+	c, err := s.Civic.Submit(ctx, tenant.ID, tenant.Slug, civic.ChannelPWA, in)
+	if err != nil {
+		return err
+	}
+	res.CaseID = &c.ID
+	res.CaseRef = c.Ref
+	return nil
+}
+
 // errLeadsUnavailable is deterministic within a deployment (wiring gap) —
 // recorded like a validation error so replays dedupe instead of hammering.
 var errLeadsUnavailable = fmt.Errorf("%w: leads service unavailable", ErrInvalidInput)
+
+// errCivicUnavailable mirrors errLeadsUnavailable for kind=civic_report.
+var errCivicUnavailable = fmt.Errorf("%w: civic service unavailable", ErrInvalidInput)
 
 // errInvalidPayload wraps ErrInvalidInput for payload-schema failures.
 func errInvalidPayload(msg string) error { return fmt.Errorf("%w: %s", ErrInvalidInput, msg) }
