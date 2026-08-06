@@ -56,7 +56,8 @@ class Settings:
     # events) consume the same topics as graph-sync.
     kafka_trigger_topics: str = field(
         default_factory=lambda: os.getenv(
-            "FRAUD_KAFKA_TOPICS", "opendesk.cac.events,opendesk.identity.events"
+            "FRAUD_KAFKA_TOPICS",
+            "opendesk.cac.events,opendesk.identity.events,opendesk.civic.events.v1",
         )
     )
     alerts_topic: str = field(
@@ -95,6 +96,29 @@ class Settings:
     ghost_min: int = field(default_factory=lambda: _int("GHOST_MIN", 3))
     ghost_window_min: int = field(default_factory=lambda: _int("GHOST_WINDOW_MIN", 10))
     ghost_lookback_days: int = field(default_factory=lambda: _int("GHOST_LOOKBACK_DAYS", 7))
+
+    # D8 report_spam (SPEC-W32 §3 WS-D). Severity is ALWAYS medium and D8
+    # NEVER auto-quarantines — citizens are never banned from reporting;
+    # alerts inform operator triage only.
+    # (a) one reporter opening > CIVIC_REPORT_MAX_PER_DAY cases per UTC day.
+    civic_report_max_per_day: int = field(
+        default_factory=lambda: _int("CIVIC_REPORT_MAX_PER_DAY", 5)
+    )
+    civic_report_lookback_days: int = field(
+        default_factory=lambda: _int("CIVIC_REPORT_LOOKBACK_DAYS", 7)
+    )
+    # (b) coordinated spam: > CIVIC_COORD_CASE_THRESHOLD open cases of the
+    # same category within CIVIC_COORD_RADIUS_M metres AND
+    # CIVIC_COORD_WINDOW_HOURS hours across DIFFERENT reporters.
+    civic_coord_case_threshold: int = field(
+        default_factory=lambda: _int("CIVIC_COORD_CASE_THRESHOLD", 3)
+    )
+    civic_coord_radius_m: float = field(
+        default_factory=lambda: _float("CIVIC_COORD_RADIUS_M", 500.0)
+    )
+    civic_coord_window_hours: int = field(
+        default_factory=lambda: _int("CIVIC_COORD_WINDOW_HOURS", 24)
+    )
 
     # D7 gnn_anomaly (SPEC-W30 §3: consume risk_score >= 0.9 from the W29 sweep).
     anomaly_alert_threshold: float = field(

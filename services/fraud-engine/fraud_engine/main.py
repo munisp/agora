@@ -34,10 +34,12 @@ from .graph import GraphClient, client_from_settings
 log = logging.getLogger("fraud_engine")
 
 # Event-type substring -> detectors to trigger (SPEC-W30 §3: D3 on capture
-# events, D5 on consent/messaging events).
+# events, D5 on consent/messaging events; SPEC-W32 §3 WS-D: D8 on civic
+# case events).
 EVENT_TRIGGERS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("capture", "lead"), ("d3_capture_velocity",)),
     (("consent", "messag"), ("d5_consent_backdating",)),
+    (("civic",), ("d8_report_spam",)),
 )
 
 
@@ -197,6 +199,10 @@ def create_app(
                 "GHOST_MIN": settings.ghost_min,
                 "GHOST_WINDOW_MIN": settings.ghost_window_min,
                 "ANOMALY_ALERT_THRESHOLD": settings.anomaly_alert_threshold,
+                "CIVIC_REPORT_MAX_PER_DAY": settings.civic_report_max_per_day,
+                "CIVIC_COORD_CASE_THRESHOLD": settings.civic_coord_case_threshold,
+                "CIVIC_COORD_RADIUS_M": settings.civic_coord_radius_m,
+                "CIVIC_COORD_WINDOW_HOURS": settings.civic_coord_window_hours,
                 "FRAUD_SWEEP_MINUTES": settings.sweep_minutes,
             },
             "last_run": state["last_run"],
