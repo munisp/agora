@@ -65,6 +65,11 @@ const (
 	// infra/lakehouse/spark/jobs/graph_enrichment.py — the event shape
 	// mirrors build_enrichment_event there, kept in sync by contract)
 	TypePersonEnrichment = "com.opendesk.graph.PersonEnrichment"
+
+	// civic case events (opendesk.civic.events.v1, SPEC-W32 §0.3 / §3 WS-D).
+	TypeCivicReportReceived = "com.opendesk.civic.ReportReceived"
+	TypeCivicStatusChanged  = "com.opendesk.civic.StatusChanged"
+	TypeCivicMerged         = "com.opendesk.civic.Merged"
 )
 
 // BookingData mirrors booking-service bookingops.marshalEvent payloads
@@ -150,6 +155,41 @@ type EnrichmentData struct {
 	PersonID    string         `json:"person_id"`
 	SnapshotDay string         `json:"snapshot_day"` // YYYY-MM-DD
 	Properties  map[string]any `json:"properties"`
+}
+
+// CivicReportData mirrors the booking-service civic module ReportReceived
+// payload (SPEC-W32 §3 WS-A/WS-D). The reporter phone is used ONLY to derive
+// the salted phone_hash for Person resolution — raw PII never touches the
+// graph; the Case node itself is PII-free (ref/category/ward/status only).
+type CivicReportData struct {
+	Ref           string  `json:"ref"`
+	Category      string  `json:"category"` // category slug (roads|water|...)
+	Status        string  `json:"status"`   // "new" at intake
+	Ward          string  `json:"ward"`
+	LGA           string  `json:"lga"`
+	Lat           float64 `json:"lat"`
+	Lon           float64 `json:"lon"`
+	Channel       string  `json:"channel"` // web|pwa|whatsapp
+	ReporterPhone string  `json:"reporter_phone"`
+	ReporterName  string  `json:"reporter_name"`
+	CreatedAt     string  `json:"created_at"`
+}
+
+// CivicStatusData mirrors the civic StatusChanged payload (SPEC-W32 §3:
+// data carries ref, status, optional acked_at/resolved_at, reporter_phone
+// when wants_updates — the phone is NOT used for graph writes here).
+type CivicStatusData struct {
+	Ref        string `json:"ref"`
+	Status     string `json:"status"`
+	AckedAt    string `json:"acked_at"`
+	ResolvedAt string `json:"resolved_at"`
+}
+
+// CivicMergedData mirrors the civic Merged payload: ref points at the
+// canonical case ref (duplicate merge, SPEC-W32 §2 merged_into).
+type CivicMergedData struct {
+	Ref          string `json:"ref"`
+	CanonicalRef string `json:"canonical_ref"`
 }
 
 // Data decodes the event's data payload into v.

@@ -309,6 +309,45 @@ func (f *FalkorDB) ApplyEnrichment(ctx context.Context, tenantID, personID strin
 	return false, nil
 }
 
+// UpsertCase implements Client (civic case projection, SPEC-W32 §3 WS-D).
+func (f *FalkorDB) UpsertCase(ctx context.Context, c Case, reporterPersonID string) error {
+	if c.TenantID == "" {
+		return ErrTenantRequired
+	}
+	if c.Ref == "" {
+		return fmt.Errorf("case ref is required")
+	}
+	if err := f.exec(ctx, upsertCaseQuery(c, reporterPersonID)); err != nil {
+		return err
+	}
+	if c.HasGeo {
+		return f.exec(ctx, caseLocationQuery(c))
+	}
+	return nil
+}
+
+// SetCaseStatus implements Client.
+func (f *FalkorDB) SetCaseStatus(ctx context.Context, tenantID, ref, status string, ackedAt, resolvedAt *time.Time) error {
+	if tenantID == "" {
+		return ErrTenantRequired
+	}
+	if ref == "" || status == "" {
+		return fmt.Errorf("case ref and status are required")
+	}
+	return f.exec(ctx, setCaseStatusQuery(tenantID, ref, status, ackedAt, resolvedAt, time.Now()))
+}
+
+// LinkCaseMerged implements Client.
+func (f *FalkorDB) LinkCaseMerged(ctx context.Context, tenantID, ref, canonicalRef string) error {
+	if tenantID == "" {
+		return ErrTenantRequired
+	}
+	if ref == "" || canonicalRef == "" || ref == canonicalRef {
+		return fmt.Errorf("merged case requires two distinct refs")
+	}
+	return f.exec(ctx, linkCaseMergedQuery(tenantID, ref, canonicalRef, time.Now()))
+}
+
 // FindPersonByPhoneHash implements Client.
 func (f *FalkorDB) FindPersonByPhoneHash(ctx context.Context, tenantID, phoneHash string) (string, error) {
 	if tenantID == "" {

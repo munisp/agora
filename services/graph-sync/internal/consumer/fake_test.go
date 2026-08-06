@@ -23,12 +23,17 @@ type fakeGraph struct {
 	contacts  map[string]*graph.Contact
 	consents  map[string]*graph.Consent
 	bookings  map[string]*graph.Booking
+	cases     map[string]*graph.Case
+	caseExtra map[string]map[string]string // tenant|ref -> extra props (acked_at/resolved_at/merged_into)
 
 	// edges: person_id -> set of ids (all tenant-scoped by construction:
 	// nodes are keyed tenant|id and lookups always pass tenantID).
 	hasContact map[string]map[string]bool
 	consented  map[string]map[string]bool
 	booked     map[string]map[string]bool
+	reported   map[string]map[string]bool // person key -> case refs
+	caseAt     map[string]map[string]bool // case key -> location keys
+	caseMerged map[string]string          // case key -> canonical case key
 	referred   [][2]string
 
 	embeddings      map[string][]float32 // tenant|person_id -> embedding
@@ -52,9 +57,14 @@ func newFakeGraph() *fakeGraph {
 		contacts:   map[string]*graph.Contact{},
 		consents:   map[string]*graph.Consent{},
 		bookings:   map[string]*graph.Booking{},
+		cases:      map[string]*graph.Case{},
+		caseExtra:  map[string]map[string]string{},
 		hasContact: map[string]map[string]bool{},
 		consented:  map[string]map[string]bool{},
 		booked:     map[string]map[string]bool{},
+		reported:   map[string]map[string]bool{},
+		caseAt:     map[string]map[string]bool{},
+		caseMerged: map[string]string{},
 		embeddings: map[string][]float32{},
 	}
 }
@@ -256,6 +266,87 @@ func (f *fakeGraph) ApplyEnrichment(_ context.Context, tenantID, personID string
 	return true, nil
 }
 
+// UpsertCase mirrors upsertCaseQuery: MERGE by (tenant, ref), SET
+// category/status/ward (never clearing on empty), REPORTED edge when a
+// reporter is resolved, AT edge when geo is present.
+func (f *fakeGraph) UpsertCase(_ context.Context, c graph.Case, reporterPersonID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c.TenantID == "" {
+		return graph.ErrTenantRequired
+	}
+	k := key(c.TenantID, c.Ref)
+	if existing, ok := f.cases[k]; ok {
+		if c.Category != "" {
+			existing.Category = c.Category
+		}
+		if c.Status != "" {
+			existing.Status = c.Status
+		}
+		if c.Ward != "" {
+			existing.Ward = c.Ward
+		}
+	} else {
+		cp := c
+		f.cases[k] = &cp
+	}
+	if reporterPersonID != "" {
+		link(f.reported, key(c.TenantID, reporterPersonID), c.Ref)
+	}
+	if c.HasGeo {
+		locKey := key(c.TenantID, c.LGA+"|"+c.Ward)
+		link(f.caseAt, k, locKey)
+	}
+	return nil
+}
+
+func (f *fakeGraph) SetCaseStatus(_ context.Context, tenantID, ref, status string, ackedAt, resolvedAt *time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if tenantID == "" {
+		return graph.ErrTenantRequired
+	}
+	k := key(tenantID, ref)
+	cs, ok := f.cases[k]
+	if !ok {
+		cs = &graph.Case{Ref: ref, TenantID: tenantID}
+		f.cases[k] = cs
+	}
+	cs.Status = status
+	if f.caseExtra[k] == nil {
+		f.caseExtra[k] = map[string]string{}
+	}
+	if ackedAt != nil {
+		f.caseExtra[k]["acked_at"] = graph.FormatTime(*ackedAt)
+	}
+	if resolvedAt != nil {
+		f.caseExtra[k]["resolved_at"] = graph.FormatTime(*resolvedAt)
+	}
+	return nil
+}
+
+func (f *fakeGraph) LinkCaseMerged(_ context.Context, tenantID, ref, canonicalRef string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if tenantID == "" {
+		return graph.ErrTenantRequired
+	}
+	k := key(tenantID, ref)
+	ck := key(tenantID, canonicalRef)
+	if _, ok := f.cases[k]; !ok {
+		f.cases[k] = &graph.Case{Ref: ref, TenantID: tenantID}
+	}
+	if _, ok := f.cases[ck]; !ok {
+		f.cases[ck] = &graph.Case{Ref: canonicalRef, TenantID: tenantID}
+	}
+	f.caseMerged[k] = ck
+	if f.caseExtra[k] == nil {
+		f.caseExtra[k] = map[string]string{}
+	}
+	f.caseExtra[k]["merged_into"] = canonicalRef
+	return nil
+}
+
 func (f *fakeGraph) FindPersonByPhoneHash(_ context.Context, tenantID, phoneHash string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -284,6 +375,7 @@ func (f *fakeGraph) ErasePerson(_ context.Context, tenantID, personID string) (b
 	delete(f.consented, k)
 	delete(f.hasContact, k)
 	delete(f.booked, k)
+	delete(f.reported, k) // REPORTED edges die with the Person (SPEC-W32 §3 WS-D)
 	delete(f.embeddings, k)
 	delete(f.enrichment, k)
 	delete(f.persons, k)
