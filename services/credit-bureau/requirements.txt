@@ -1,0 +1,11 @@
+# credit-bureau base deps (SPEC-W33 §3 B2). Rules-only mode needs ZERO ML
+# deps beyond numpy — torch lives ONLY in requirements-ml.txt (overlay,
+# mirroring services/graph-ml/requirements-gnn.txt; invariant I5).
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+httpx==0.27.2
+numpy==2.2.1
+
+# tests
+pytest==8.3.4

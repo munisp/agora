@@ -1,0 +1,8 @@
+# OPTIONAL learned-scorer backend (SPEC-W33 §3 B2, invariant I5).
+# Install ONLY for training / ML-enabled deployments; never part of the
+# base image:
+#   pip install -r requirements-ml.txt
+# credit_bureau.ml.* import-guards torch — without it the service runs
+# pure rules mode (model_version "heuristic-v1", invariant I1).
+-r requirements.txt
+torch==2.8.0
