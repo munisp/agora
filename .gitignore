@@ -6,3 +6,4 @@ dist/
 .next/
 *.tsbuildinfo
 .pytest_cache/
+scripts/seeds/out/
