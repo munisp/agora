@@ -70,7 +70,11 @@ type Activities struct {
 	// (MESSAGING_CHANNELS / TENANT_CHANNEL_MAP); set by main after New.
 	// Nil keeps the built-in defaults (email→smtp, sms→twilio).
 	Channels *ChannelRouter
-	Log      *zap.Logger
+	// Civic holds the SPEC-W32 civic dependencies (delivery ledger +
+	// SLA-breach escalation producer); set by main after New. Zero value
+	// degrades to log-only ledger + no escalation emission.
+	Civic CivicDeps
+	Log   *zap.Logger
 
 	hc *http.Client
 }

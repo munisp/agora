@@ -91,6 +91,13 @@ func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
 			in.TenantSlug = req.WhatsApp.TenantSlug
 			in.Phone = req.WhatsApp.Phone
 		}
+	case workflows.PacedSendCivicStatus:
+		// SPEC-W32: civic_status is transactional-class (guard short-
+		// circuits before reading these); carried for audit completeness.
+		if req.Civic != nil {
+			in.TenantSlug = req.Civic.TenantSlug
+			in.Phone = req.Civic.Phone
+		}
 	}
 	return in
 }
@@ -169,6 +176,11 @@ func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedS
 		}
 		_, err := a.SendWhatsAppCampaignMessage(ctx, *req.WhatsApp)
 		return err
+	case workflows.PacedSendCivicStatus:
+		if req.Civic == nil {
+			return fmt.Errorf("NotifyPaced %s: missing civic payload", req.Kind)
+		}
+		return a.SendCivicStatusUpdate(ctx, *req.Civic)
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
 	}
