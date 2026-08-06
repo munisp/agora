@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/opendesk/notification-worker/internal/activities"
+	"github.com/opendesk/notification-worker/internal/civicoutbox"
 	"github.com/opendesk/notification-worker/internal/config"
 	"github.com/opendesk/notification-worker/internal/daprc"
 	"github.com/opendesk/notification-worker/internal/httpapi"
@@ -131,6 +132,11 @@ func run() error {
 	// notifications outbox (notifyoutbox consumer starts one per PacedSend
 	// command — e.g. field-service dispatch push).
 	w.RegisterWorkflowWithOptions(workflows.PacedSendWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypePacedSend})
+	// SPEC-W32 WS-B: civic case SLA timers + citizen status notifications
+	// (the civicoutbox consumer starts/signals these from
+	// opendesk.civic.events.v1).
+	w.RegisterWorkflowWithOptions(workflows.CivicSLAWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypeCivicSLA})
+	w.RegisterWorkflowWithOptions(workflows.CivicStatusNotifyWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypeCivicStatusNotify})
 	// SPEC-W3 §3 innovation 12: digital-twin 24h cleanup.
 	w.RegisterWorkflowWithOptions(workflows.TwinCleanupWorkflow, workflow.RegisterOptions{Name: "TwinCleanupWorkflow"})
 
@@ -170,6 +176,11 @@ func run() error {
 	// SPEC-W16 §1: push notification fan-out (kinds push_notification /
 	// push_marketing via NotifyPaced, or scheduled directly).
 	w.RegisterActivityWithOptions(acts.SendPushNotification, activity.RegisterOptions{Name: workflows.ActivitySendPushNotification})
+	// SPEC-W32 WS-B: citizen status updates (via NotifyPaced kind
+	// civic_status) + SLA-breach reporting (booking-service internal
+	// callback + escalation event).
+	w.RegisterActivityWithOptions(acts.SendCivicStatusUpdate, activity.RegisterOptions{Name: workflows.ActivitySendCivicStatusUpdate})
+	w.RegisterActivityWithOptions(acts.ReportCivicSLABreach, activity.RegisterOptions{Name: workflows.ActivityReportCivicSLABreach})
 	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
 	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
 
@@ -206,6 +217,21 @@ func run() error {
 			zap.Bool("signing_required", cfg.WebhookSigningRequired))
 	} else {
 		logger.Warn("DATABASE_URL unset: webhook platform disabled (subscriptions/deliveries 503)")
+	}
+
+	// SPEC-W32 WS-B: civic delivery ledger + SLA-breach escalation producer.
+	// No DATABASE_URL → ledger degrades to log-only (same posture as the
+	// webhook platform); CIVIC_ESCALATION_TOPIC="off" disables emission.
+	acts.Civic = activities.CivicDeps{EscalationTopic: civicoutbox.TopicEnabled(cfg.CivicEscalationTopic)}
+	if webhookStore != nil {
+		acts.Civic.Ledger = webhookStore
+	}
+	if acts.Civic.EscalationTopic != "" {
+		if brokers := strings.Split(cfg.KafkaBrokers, ","); len(brokers) > 0 && brokers[0] != "" {
+			acts.Civic.Escalations = activities.NewKafkaTrajectoryProducer(brokers)
+		} else {
+			logger.Warn("CIVIC_ESCALATION_TOPIC set but no Kafka brokers; civic escalation emission disabled")
+		}
 	}
 
 	// SPEC-W12 Agent B: DND 2442 + quiet-hours compliance guards. The DND
@@ -353,6 +379,27 @@ func run() error {
 			errCh <- fmt.Errorf("notifications outbox consumer: %w", err)
 		}
 	}()
+
+	// Civic events consumer (SPEC-W32 WS-B): ReportReceived starts the
+	// case's CivicSLAWorkflow; StatusChanged signals it and starts the
+	// citizen status notification workflow; Merged cancels the merged
+	// case's timers. CIVIC_EVENTS_TOPIC empty/"off" disables the consumer.
+	if topic := civicoutbox.TopicEnabled(cfg.CivicEventsTopic); topic != "" {
+		civicConsumer := civicoutbox.New(
+			strings.Split(cfg.KafkaBrokers, ","),
+			topic, cfg.CivicEventsGroup, tc, cfg.TemporalTaskQueue, logger,
+			civicoutbox.WithNotifyChannel(cfg.CivicStatusChannel))
+		defer civicConsumer.Close() //nolint:errcheck
+		go func() {
+			if err := civicConsumer.Run(ctx); err != nil {
+				errCh <- fmt.Errorf("civic events consumer: %w", err)
+			}
+		}()
+		logger.Info("civic events consumer enabled", zap.String("topic", topic),
+			zap.String("group", cfg.CivicEventsGroup))
+	} else {
+		logger.Info("civic events consumer disabled (CIVIC_EVENTS_TOPIC off)")
+	}
 
 	// Outbound webhook dispatcher (Wave 5 #10): booking + conversation
 	// events → matching subscriptions → WebhookDeliveryWorkflow per delivery.
