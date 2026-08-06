@@ -272,3 +272,13 @@ def test_08_similar_persons_tenant_scoped(pstack, pflow):
     assert pid not in {row.get("person_id") for row in rows}
     for row in rows:
         assert row.get("tenant_id", slug) == slug
+
+
+def test_09_train_endpoint_honest_in_heuristic_mode(pstack):
+    """W31: POST /v1/score/train must honestly refuse on the heuristic base
+    image — 409, never a silent no-op or a 500 (SPEC-W31 G6). GNN training
+    requires the `gnn` compose profile (Dockerfile.gnn); the live stack runs
+    the heuristic base image, so 409 is the correct live assertion."""
+    r = requests.post(f"{GRAPH_ML}/v1/score/train", json={}, timeout=60)
+    assert r.status_code == 409
+    assert "gnn" in r.json().get("error", "")
