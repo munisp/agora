@@ -56,7 +56,7 @@ TOPICS=(
   cac.seed.report.cac.agents.v1            # seed_agents.py (TABLE=cac.agents)
   cac.seed.report.cac.customers.v1         # seed_customers.py (TABLE=cac.customers)
   cac.seed.report.cac.fx_series.v1         # seed_fx.py (TABLE=cac.fx_series)
-  cac.seed.report.cac.locale_coverage.v1   # seed_locale.py (TABLE=locale_coverage)
+  cac.seed.report.locale_coverage.v1       # seed_locale.py (TABLE=locale_coverage)
   cac.seed.report.cac.events.v1            # seed_events.py (reports with table=cac.events)
   # SPEC-W28 (additive): tenant knowledge graph streams.
   opendesk.graph.enrichment.v1     # gold→graph enrichment rows (spark graph_enrichment.py → graph-sync)
