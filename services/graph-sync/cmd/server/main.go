@@ -130,6 +130,14 @@ func run() error {
 		} else {
 			logger.Info("GRAPH_SYNC_ENRICHMENT_TOPIC is empty; enrichment consumer skipped")
 		}
+		// W32 civic case projection (SPEC-W32 §3 WS-D). Empty topic =
+		// skipped (logged) — same pattern as the CAC/enrichment topics.
+		if cfg.CivicTopic != "" {
+			consumers = append(consumers,
+				consumer.New(brokers, cfg.CivicTopic, cfg.ConsumerGroup, cfg.DLQTopic, syncer.HandleCivic, reg, logger))
+		} else {
+			logger.Info("GRAPH_SYNC_CIVIC_TOPIC is empty; civic consumer skipped")
+		}
 		for _, c := range consumers {
 			c := c
 			g.Go(func() error { return c.Run(gctx) })

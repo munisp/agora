@@ -29,6 +29,11 @@ type Config struct {
 	// opendesk.graph.enrichment.v1; empty = skip, logged — same pattern as
 	// the CAC topic).
 	EnrichmentTopic string
+	// CivicTopic carries the W32 civic case events (SPEC-W32 §3 WS-D:
+	// com.opendesk.civic.ReportReceived / StatusChanged / Merged).
+	// GRAPH_SYNC_CIVIC_TOPIC, default opendesk.civic.events.v1; empty =
+	// the civic consumer is skipped (same pattern as the CAC topic).
+	CivicTopic string
 	// DLQTopic receives poison messages after 3 attempts (GRAPH_SYNC_DLQ_TOPIC,
 	// default opendesk.dlq).
 	DLQTopic string
@@ -72,6 +77,7 @@ func Load() Config {
 		ErasureTopic:     envStr("GRAPH_SYNC_ERASURE_TOPIC", "opendesk.consent.erasure.v1"),
 		CACTopic:         envStr("GRAPH_SYNC_CAC_TOPIC", ""),
 		EnrichmentTopic:  envStr("GRAPH_SYNC_ENRICHMENT_TOPIC", "opendesk.graph.enrichment.v1"),
+		CivicTopic:       envStrExplicit("GRAPH_SYNC_CIVIC_TOPIC", "opendesk.civic.events.v1"),
 		DLQTopic:         envStr("GRAPH_SYNC_DLQ_TOPIC", "opendesk.dlq"),
 		ErasureDoneTopic: envStr("GRAPH_ERASURE_DONE_TOPIC", "opendesk.graph.erasure.done.v1"),
 		FalkorDBAddr:     envStr("FALKORDB_ADDR", "graph-db:6379"),
@@ -87,6 +93,16 @@ func Load() Config {
 
 func envStr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// envStrExplicit is envStr but honors an explicitly-set EMPTY value (LookupEnv
+// semantics): GRAPH_SYNC_CIVIC_TOPIC="" disables the civic consumer (empty =
+// skip, SPEC-W32 §3 WS-D) while an unset variable falls back to the default.
+func envStrExplicit(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def
