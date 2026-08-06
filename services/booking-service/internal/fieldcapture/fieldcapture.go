@@ -30,10 +30,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// Capture kinds (contract §4 enum).
+// Capture kinds (contract §4 enum; SPEC-W32 WS-A adds civic_report).
 const (
 	KindLeadCapture = "lead_capture"
 	KindCheckin     = "checkin"
+	// KindCivicReport (SPEC-W32 WS-A): a field agent files a civic report
+	// on behalf of a citizen — payload = the public report body; the civic
+	// module creates a case with channel=pwa.
+	KindCivicReport = "civic_report"
 )
 
 // Item result statuses.
@@ -95,9 +99,9 @@ func (it *CaptureItem) Validate() error {
 		return fmt.Errorf("%w: client_id exceeds %d bytes", ErrInvalidInput, maxClientIDLen)
 	}
 	switch it.Kind {
-	case KindLeadCapture, KindCheckin:
+	case KindLeadCapture, KindCheckin, KindCivicReport:
 	default:
-		return fmt.Errorf("%w: kind %q (want lead_capture|checkin)", ErrInvalidInput, it.Kind)
+		return fmt.Errorf("%w: kind %q (want lead_capture|checkin|civic_report)", ErrInvalidInput, it.Kind)
 	}
 	if len(it.Payload) == 0 {
 		it.Payload = json.RawMessage(`{}`)
@@ -135,15 +139,32 @@ type CheckinPayload struct {
 	Note      string     `json:"note,omitempty"`
 }
 
+// CivicReportPayload is the kind=civic_report payload schema (SPEC-W32
+// WS-A): the same shape as the public report body — it flows through the
+// existing capture pipe and creates a civic case with channel=pwa.
+type CivicReportPayload struct {
+	CategorySlug      string `json:"category_slug"`
+	Description       string `json:"description"`
+	Ward              string `json:"ward,omitempty"`
+	LGA               string `json:"lga,omitempty"`
+	LocationText      string `json:"location_text,omitempty"`
+	ReporterPhoneE164 string `json:"reporter_phone_e164,omitempty"`
+	ReporterName      string `json:"reporter_name,omitempty"`
+	Anonymous         bool   `json:"anonymous,omitempty"`
+	PhotoURL          string `json:"photo_url,omitempty"`
+}
+
 // ItemResult is the per-item outcome of a batch. On a deduped replay the
-// ORIGINAL result (lead_id / checkin_id / error) is returned unchanged so
-// the client can reconcile its outbox without side effects.
+// ORIGINAL result (lead_id / checkin_id / case_ref / error) is returned
+// unchanged so the client can reconcile its outbox without side effects.
 type ItemResult struct {
 	ClientID  string     `json:"client_id"`
 	Kind      string     `json:"kind"`
 	Status    string     `json:"status"` // applied | deduped | error
 	LeadID    *uuid.UUID `json:"lead_id,omitempty"`
 	CheckinID *uuid.UUID `json:"checkin_id,omitempty"`
+	CaseID    *uuid.UUID `json:"case_id,omitempty"`  // SPEC-W32: civic_report outcome
+	CaseRef   string     `json:"case_ref,omitempty"` // SPEC-W32: GOV-... reference
 	Error     string     `json:"error,omitempty"`
 }
 

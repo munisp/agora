@@ -16,6 +16,7 @@ import (
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/campaignstudio" // SPEC-W19 integrator (additive import)
+	"github.com/opendesk/booking-service/internal/civic"          // SPEC-W32 WS-A (additive import)
 	"github.com/opendesk/booking-service/internal/config"
 	"github.com/opendesk/booking-service/internal/consumer"
 	"github.com/opendesk/booking-service/internal/crm360" // SPEC-W20 integrator (additive import)
@@ -273,6 +274,19 @@ func run() error {
 		Log:            logger,
 	}
 
+	// SPEC-W32 WS-A — BEGIN (additive): the civic reporting module — public
+	// citizen intake (throttled, honeypot-guarded), operator triage console
+	// and CloudEvents on opendesk.civic.events.v1 via the outbox. Shares the
+	// main store (civic tables are bootstrapped by store.New).
+	civicSvc := &civic.Service{
+		Store:       st,
+		EventsTopic: cfg.CivicEventsTopic,
+		RatePerHour: cfg.CivicPublicRatePerHour,
+		RatePerDay:  cfg.CivicPublicRatePerDay,
+		Log:         logger,
+	}
+	// SPEC-W32 WS-A — END
+
 	// SPEC-W16 Agent B — BEGIN (additive): push device tokens (contract §1)
 	// + the field offline-queue capture API (contract §4). Each dials a
 	// small dedicated pool (PayoutStore idiom — the shared store.Store does
@@ -291,7 +305,7 @@ func run() error {
 	} else {
 		defer fs.Close()
 		fieldCaptureHandlers = &fieldcapture.Handlers{
-			Svc:        &fieldcapture.Service{Store: fs, Leads: leadSvc, Log: logger},
+			Svc:        &fieldcapture.Service{Store: fs, Leads: leadSvc, Civic: civicSvc, Log: logger},
 			BatchLimit: cfg.FieldCaptureBatchLimit,
 			Log:        logger,
 		}
@@ -572,6 +586,7 @@ func run() error {
 		Lending:            lendingDeps,          // SPEC-W20 integrator (additive): /v1/lending gated behind app "lending" (opt-in)
 		Workforce:          workforceDeps,        // SPEC-W20 integrator (additive): /v1/workforce gated behind app "workforce" (opt-in)
 		Social:             socialDeps,           // SPEC-W21 integrator (additive): /v1/social gated behind app "social-publisher" (opt-in)
+		Civic:              civicSvc,             // SPEC-W32 WS-A (additive): /v1/civic public intake + operator console
 	}
 
 	srv := &http.Server{
