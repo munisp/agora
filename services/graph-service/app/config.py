@@ -54,6 +54,12 @@ class Settings:
     # Empty -> every internal call answers 401 (fail-closed).
     internal_token: str = field(default_factory=lambda: os.getenv("INTERNAL_TOKEN", ""))
 
+    # SPEC-W33 §2 A2 graph export: salt for the W28 sha256(salt|tenant|id)
+    # person-identifier hash — SAME env var and scheme as graph-sync
+    # (PHONE_HASH_SALT, SPEC-W28 §3). Person node ids never leave the
+    # internal export endpoints unhashed (I6).
+    phone_hash_salt: str = field(default_factory=lambda: os.getenv("PHONE_HASH_SALT", ""))
+
     # Dev/e2e fixture seeder (SPEC-W30 WS-C addendum): the fixtures router is
     # mounted ONLY when E2E_FIXTURES=1; production images leave it unset.
     e2e_fixtures: bool = field(default_factory=lambda: _bool("E2E_FIXTURES", False))

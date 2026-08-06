@@ -63,6 +63,17 @@ class GraphError(Exception):
 class GraphBackend(Protocol):
     async def execute(self, query: CompiledQuery, tenant_id: str) -> list[dict[str, Any]]: ...
 
+    async def export_nodes(self, tenant_id: str) -> list[dict[str, Any]]:
+        """SPEC-W33 §2 A2 bulk export: every node carrying ``tenant_id`` as
+        ``{"key", "labels", "props"}`` dicts. Read-only, tenant-scoped."""
+        ...
+
+    async def export_edges(self, tenant_id: str) -> list[dict[str, Any]]:
+        """SPEC-W33 §2 A2 bulk export: every edge whose endpoints BOTH carry
+        ``tenant_id`` as ``{"type", "props", "src_key", "src_labels",
+        "src_props", "dst_key", "dst_labels", "dst_props"}`` dicts."""
+        ...
+
     async def ping(self) -> bool: ...
 
     async def close(self) -> None: ...
@@ -143,6 +154,36 @@ class FalkorBackend:
         result = self._graph.query(cypher, params)
         columns = [col[1] for col in result.header]
         return [dict(zip(columns, row)) for row in result.result_set]
+
+    # SPEC-W33 §2 A2: fixed server-side parameterized read queries only
+    # (compliance gate 5 — no client-supplied Cypher on this path either).
+    _EXPORT_NODES_CYPHER = (
+        "MATCH (n) WHERE n.tenant_id = $tenant_id "
+        "RETURN id(n) AS key, labels(n) AS labels, properties(n) AS props"
+    )
+    _EXPORT_EDGES_CYPHER = (
+        "MATCH (a)-[e]->(b) "
+        "WHERE a.tenant_id = $tenant_id AND b.tenant_id = $tenant_id "
+        "RETURN type(e) AS type, properties(e) AS props, "
+        "id(a) AS src_key, labels(a) AS src_labels, properties(a) AS src_props, "
+        "id(b) AS dst_key, labels(b) AS dst_labels, properties(b) AS dst_props"
+    )
+
+    async def export_nodes(self, tenant_id: str) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(
+                self._query_rows, self._EXPORT_NODES_CYPHER, {"tenant_id": tenant_id}
+            )
+        except Exception as exc:  # noqa: BLE001 — driver/redis outage
+            raise GraphError(f"falkordb export failed: {type(exc).__name__}: {exc}") from exc
+
+    async def export_edges(self, tenant_id: str) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.to_thread(
+                self._query_rows, self._EXPORT_EDGES_CYPHER, {"tenant_id": tenant_id}
+            )
+        except Exception as exc:  # noqa: BLE001 — driver/redis outage
+            raise GraphError(f"falkordb export failed: {type(exc).__name__}: {exc}") from exc
 
     async def ping(self) -> bool:
         try:
@@ -263,6 +304,40 @@ class InMemoryBackend:
             for n in self.graph.nodes.values()
             if label in n.labels and n.props.get(prop) == value
         ]
+
+    # --- SPEC-W33 §2 A2 bulk export (same semantics as FalkorBackend) -------
+    async def export_nodes(self, tenant_id: str) -> list[dict[str, Any]]:
+        return [
+            {"key": n.node_id, "labels": sorted(n.labels), "props": dict(n.props)}
+            for n in self.graph.nodes.values()
+            if n.props.get("tenant_id") == tenant_id
+        ]
+
+    async def export_edges(self, tenant_id: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for edge in self.graph.edges:
+            src = self.graph.nodes.get(edge.src)
+            dst = self.graph.nodes.get(edge.dst)
+            if src is None or dst is None:
+                continue
+            if (
+                src.props.get("tenant_id") != tenant_id
+                or dst.props.get("tenant_id") != tenant_id
+            ):
+                continue
+            out.append(
+                {
+                    "type": edge.type,
+                    "props": dict(edge.props),
+                    "src_key": src.node_id,
+                    "src_labels": sorted(src.labels),
+                    "src_props": dict(src.props),
+                    "dst_key": dst.node_id,
+                    "dst_labels": sorted(dst.labels),
+                    "dst_props": dict(dst.props),
+                }
+            )
+        return out
 
     def _apply_score_write(self, plan: ScoreWritePlan, tenant_id: str) -> dict[str, Any]:
         existing = self._nodes_by_prop("Person", "person_id", plan.person_id)
