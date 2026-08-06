@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,6 +17,7 @@ import (
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
 	"github.com/opendesk/booking-service/internal/campaignstudio"
+	"github.com/opendesk/booking-service/internal/civic"
 	"github.com/opendesk/booking-service/internal/crm360"
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/devices"
@@ -143,6 +145,12 @@ type Deps struct {
 	// intact).
 	// Social serves /v1/social (appgate app_id "social-publisher").
 	Social *socialpub.Deps
+
+	// Civic serves the SPEC-W32 WS-A civic reporting endpoints: public
+	// intake/tracking/stats (no tenant middleware), operator triage console
+	// (tenant auth + manage_bookings) and the internal sla-breach callback.
+	// Nil → those routes answer 503.
+	Civic *civic.Service
 }
 
 type ctxKey string
@@ -150,6 +158,9 @@ type ctxKey string
 const (
 	ctxTenant ctxKey = "tenant"
 	ctxUser   ctxKey = "user"
+	// ctxRoles carries the caller's Keycloak realm roles (SPEC-W32 WS-A:
+	// role-based reporter masking on civic cases).
+	ctxRoles ctxKey = "roles"
 )
 
 // NewRouter builds the chi router with all routes.
@@ -170,11 +181,11 @@ func NewRouter(d Deps) http.Handler {
 	// X-Tenant-Slug header is present), falling back to the raw header.
 	if s.d.AppGate != nil {
 		s.d.AppGate.SetTenantSlugFunc(func(r *http.Request) string {
-			if t := tenantFrom(r.Context()); t.Slug != "" {
-				return t.Slug
-			}
-			return r.Header.Get("X-Tenant-Slug")
-		})
+		if t := tenantFrom(r.Context()); t.Slug != "" {
+			return t.Slug
+		}
+		return r.Header.Get("X-Tenant-Slug")
+	})
 	}
 
 	r.Get("/healthz", s.healthz)
@@ -255,6 +266,31 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_bookings")).Post("/dispatch-endpoints", s.createDispatchEndpoint)
 			r.Get("/dispatch-endpoints", s.listDispatchEndpoints)
 			r.With(s.require("manage_bookings")).Delete("/dispatch-endpoints", s.deleteDispatchEndpoint)
+		})
+		// Civic reporting (SPEC-W32 WS-A): operator console routes — tenant
+		// auth + manage_bookings, same pattern as the incidents routes. The
+		// public intake half lives OUTSIDE this group (below, no tenant
+		// middleware); the internal sla-breach callback carries the tenant
+		// middleware but no Permify guard (service-to-service).
+		r.Route("/civic", func(r chi.Router) {
+			r.With(s.require("manage_bookings")).Get("/cases", s.listCivicCases)
+			r.With(s.require("manage_bookings")).Get("/cases/{id}", s.getCivicCase)
+			r.With(s.require("manage_bookings")).Post("/cases/{id}/triage", s.triageCivicCase)
+			r.With(s.require("manage_bookings")).Post("/cases/{id}/assign", s.assignCivicCase)
+			r.With(s.require("manage_bookings")).Post("/cases/{id}/status", s.statusCivicCase)
+			r.With(s.require("manage_bookings")).Post("/cases/{id}/merge", s.mergeCivicCase)
+			r.With(s.require("manage_bookings")).Get("/cases/{id}/duplicates", s.civicCaseDuplicates)
+			r.Get("/categories", s.listCivicCategories)
+			r.With(s.require("manage_bookings")).Post("/categories", s.createCivicCategory)
+			r.With(s.require("manage_bookings")).Patch("/categories/{id}", s.patchCivicCategory)
+			r.Get("/routing-rules", s.listCivicRoutingRules)
+			r.With(s.require("manage_bookings")).Post("/routing-rules", s.createCivicRoutingRule)
+			r.With(s.require("manage_bookings")).Patch("/routing-rules/{id}", s.patchCivicRoutingRule)
+			r.With(s.require("manage_bookings")).Delete("/routing-rules/{id}", s.deleteCivicRoutingRule)
+			// Internal SLA-breach callback (SPEC-W32 WS-B → booking-service):
+			// X-Tenant-Slug only, no Permify guard — invoked via Dapr by the
+			// notification-worker's CivicSLAWorkflow.
+			r.Post("/internal/cases/{ref}/sla-breach", s.civicSLABreach)
 		})
 		// Leads + CAC (SPEC-W13 Agent A): manage_bookings for mutations,
 		// view_analytics for reads (docs/security/roles.md).
@@ -432,6 +468,17 @@ func NewRouter(d Deps) http.Handler {
 	// middleware here; the body carries tenant_id / tenant_slug.
 	r.Post("/v1/incidents/ingest", s.ingestIncident)
 
+	// Public civic reporting endpoints (SPEC-W32 WS-A): registered WITHOUT
+	// the tenant middleware — citizens have no accounts (§0.2); the APISIX
+	// public route supplies rate limiting and the handlers validate the
+	// tenant slug exists. Tracking binds case ref + reporter phone.
+	r.Route("/v1/civic/public/tenants/{slug}", func(r chi.Router) {
+		r.Post("/reports", s.publicCivicReport)
+		r.Get("/reports/{ref}", s.publicCivicTrack)
+		r.Get("/categories", s.publicCivicCategories)
+		r.Get("/stats", s.publicCivicStats)
+	})
+
 	// Delivery-ledger update (SPEC-W11 Part B §4): notification-worker's
 	// UpdateWebhookDelivery activity (payload type "incident") records each
 	// attempt outcome here via Dapr service invocation.
@@ -559,6 +606,20 @@ func (s *server) tenantMiddleware(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), ctxTenant, tenant)
 		ctx = context.WithValue(ctx, ctxUser, claims.Sub)
+		// SPEC-W32 WS-A: realm roles for role-based reporter masking. JWT
+		// realm_access.roles wins; the X-User-Roles header (comma-separated,
+		// injected by trusted internal callers / tests) is the fallback.
+		roles := claims.roles()
+		if len(roles) == 0 {
+			if h := r.Header.Get("X-User-Roles"); h != "" {
+				for _, p := range strings.Split(h, ",") {
+					if p = strings.TrimSpace(p); p != "" {
+						roles = append(roles, p)
+					}
+				}
+			}
+		}
+		ctx = context.WithValue(ctx, ctxRoles, roles)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -654,6 +715,14 @@ func (s *server) geoHandler(fn func(*geo.Handlers, http.ResponseWriter, *http.Re
 func userFrom(ctx context.Context) string {
 	u, _ := ctx.Value(ctxUser).(string)
 	return u
+}
+
+// rolesFrom returns the caller's realm roles from the request context
+// (SPEC-W32 WS-A; empty slice when the tenant middleware did not run or no
+// roles were resolved).
+func rolesFrom(ctx context.Context) []string {
+	r, _ := ctx.Value(ctxRoles).([]string)
+	return r
 }
 
 // devicesHandler adapts a devices.Handlers method to http.HandlerFunc,
