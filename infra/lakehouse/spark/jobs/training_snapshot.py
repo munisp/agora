@@ -51,8 +51,8 @@ pattern). Unit tests: test_training_snapshot.py.
 
 Run (packages are injected by the job; no --packages needed):
 
-  docker exec opendesk-spark-master /opt/bitnami/spark/bin/spark-submit \
-    --master spark://spark-master:7077 \
+  docker exec opendesk-spark-master /opt/bitnami/spark/bin/spark-submit \\
+    --master spark://spark-master:7077 \\
     /opt/spark-jobs/training_snapshot.py
 """
 
