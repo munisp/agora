@@ -65,6 +65,9 @@ TOPICS=(
   opendesk.fraud.alerts.v1         # fraud-engine AlertRaised + graph-service AlertResolved audit events
   # SPEC-W32 (additive): civic reporting.
   opendesk.civic.events.v1         # civic case lifecycle (booking-service → notify/graph/fraud/analytics)
+  # SPEC-W33 (additive): ML platform ops alerts (model-registry emits drift
+  # sweep PSI breaches + nightly training-gate failures; SPEC-W33 §4 C2/C5).
+  ops.alerts                       # model_drift / training_gate_failed / training_tick_error alerts
 )
 
 echo "[kafka-topics] waiting for broker at ${BOOTSTRAP}..."

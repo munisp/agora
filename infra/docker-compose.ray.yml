@@ -1,0 +1,136 @@
+name: opendesk-ray
+# ============================================================================
+# docker-compose.ray.yml — W33-C Ray multi-tenant training overlay (SPEC-W33 §4 C4).
+#
+# HONEST FRAMING: Ray here is for MULTI-TENANT PARALLELISM and future
+# horizontal scale — one tenant's GraphSAGE trains fine in a single process
+# (services/graph-ml/graph_ml/gnn_train.py); this cluster trains a FLEET of
+# tenants concurrently (services/graph-ml/graph_ml/ray_train.py). The dev
+# topology below is a SINGLE-NODE CPU cluster; multi-node is one RAY_ADDRESS
+# away (run the head on one host, ray-worker services on others pointing at
+# RAY_HEAD_ADDR, and pass --ray-address to the driver).
+#
+# Adds, additively (no existing compose file is edited):
+#   * ray-head     — Ray head node (1 CPU, tunable via RAY_HEAD_CPUS),
+#                    GCS :6379 + dashboard :8265.
+#   * ray-worker   — Ray worker(s), 1 CPU each (RAY_WORKER_CPUS), scaled via
+#                    RAY_WORKER_REPLICAS (default 2) or --scale.
+#
+# Image (I5 discipline — the graph-ml torch overlay pattern, NOT base
+# images): both services build an overlay ON TOP of graph-ml:latest that
+# adds torch/torch-geometric (requirements-gnn.txt — the exact
+# Dockerfile.gnn overlay) plus ray. The heuristic base image
+# (services/graph-ml/Dockerfile) stays torch-free and ray-free. Build order:
+#
+#   docker compose -f infra/docker-compose.graph.yml build graph-ml
+#   docker compose -f infra/docker-compose.ray.yml build
+#   docker compose -f infra/docker-compose.ray.yml up -d
+#
+# The file is also valid standalone for `config` validation
+# (docker compose -f infra/docker-compose.ray.yml config -q); standalone
+# `up` IS supported — the cluster has no dependency on the core stack
+# (training reads offline A1 dataset dirs, not Kafka/FalkorDB).
+#
+# Driver usage (batch, from any box with the datasets + model volume):
+#   docker compose -f infra/docker-compose.ray.yml run --rm ray-head \
+#     python -m graph_ml.ray_train --all-tenants \
+#       --datasets-root /datasets --model-dir /data/graph-ml-models \
+#       --ray-address ray-head:6379
+# or with the serial fallback (no cluster): --ray-address local.
+# ============================================================================
+
+networks:
+  # Merges into the shared network declared by the root compose project.
+  opendesk: null
+
+volumes:
+  graph-ml-models: null  # shared with the graph stack: graphsage-vN artifacts
+
+services:
+  # --------------------------- Ray head node -------------------------------
+  ray-head:
+    # Overlay on the graph-ml torch overlay pattern (I5): graph-ml:latest
+    # (heuristic base) + requirements-gnn.txt (torch/PyG — the Dockerfile.gnn
+    # stack) + ray. Build the base first (see header). Pin an exact ray tag
+    # in production deploys, same posture as the other overlays.
+    build:
+      context: ../services/graph-ml
+      dockerfile_inline: |
+        FROM graph-ml:latest
+        USER root
+        COPY requirements-gnn.txt ./
+        RUN pip install --no-cache-dir -r requirements-gnn.txt \
+            && pip install --no-cache-dir "ray[default]>=2.9,<3"
+        USER graphml
+    environment:
+      # Driver-facing training env (same conventions as graph-ml services).
+      GRAPH_ML_MODEL_DIR: /data/graph-ml-models
+      RAY_DATASETS_ROOT: /datasets
+      GRAPH_ML_BACKEND: gnn
+      GRAPH_ML_DEVICE: ${GRAPH_ML_DEVICE:-cpu}
+      # Workers connect here; override when the head runs on another host.
+      RAY_ADDRESS: ${RAY_ADDRESS:-ray-head:6379}
+    # 1 CPU for the head (tunable): the head schedules, workers train.
+    command: >
+      ray start --head
+      --port=6379
+      --dashboard-host=0.0.0.0
+      --num-cpus=${RAY_HEAD_CPUS:-1}
+      --disable-usage-stats
+      --block
+    ports:
+      - "6379:6379/tcp"   # GCS; workers + --ray-address clients
+      - "8265:8265/tcp"   # dashboard (dev observability; not routed via APISIX)
+    volumes:
+      - graph-ml-models:/data/graph-ml-models
+      - ${RAY_DATASETS_HOST_DIR:-../datasets}:/datasets:ro
+    networks:
+      - opendesk
+    healthcheck:
+      # `ray status` exits non-zero until the GCS answers.
+      test: ["CMD-SHELL", "ray status --address=127.0.0.1:6379 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # --------------------------- Ray workers ---------------------------------
+  ray-worker:
+    # Same overlay image as ray-head (one build, two roles).
+    build:
+      context: ../services/graph-ml
+      dockerfile_inline: |
+        FROM graph-ml:latest
+        USER root
+        COPY requirements-gnn.txt ./
+        RUN pip install --no-cache-dir -r requirements-gnn.txt \
+            && pip install --no-cache-dir "ray[default]>=2.9,<3"
+        USER graphml
+    # 2 workers by default; tune with RAY_WORKER_REPLICAS or
+    # `docker compose up -d --scale ray-worker=N`. No container_name /
+    # port mappings so replicas are legal.
+    deploy:
+      replicas: ${RAY_WORKER_REPLICAS:-2}
+    environment:
+      GRAPH_ML_MODEL_DIR: /data/graph-ml-models
+      RAY_DATASETS_ROOT: /datasets
+      GRAPH_ML_BACKEND: gnn
+      GRAPH_ML_DEVICE: ${GRAPH_ML_DEVICE:-cpu}
+    # 1 CPU each (tunable): CPU bit-identity comes from
+    # ray_train._pin_cpu_threads (torch threads pinned to 1 per task).
+    command: >
+      ray start
+      --address=${RAY_HEAD_ADDR:-ray-head:6379}
+      --num-cpus=${RAY_WORKER_CPUS:-1}
+      --disable-usage-stats
+      --block
+    volumes:
+      - graph-ml-models:/data/graph-ml-models
+      - ${RAY_DATASETS_HOST_DIR:-../datasets}:/datasets:ro
+    networks:
+      - opendesk
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    restart: unless-stopped
