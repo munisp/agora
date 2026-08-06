@@ -303,6 +303,56 @@ class FakeGraphClient:
             )
         return rows
 
+    def _h_detector_ml_person_activity(self, cypher, params):
+        """W33-B learned-scorer activity projection (detectors/base.py
+        ML_ACTIVITY_CYPHER): per wanted person, captures with geo,
+        bookings, and REFERRED degree — tenant-scoped like FalkorDB."""
+        tenant = params["tenant_id"]
+        wanted = set(params["person_ids"])
+        rows = []
+        for key, props in self.g.persons(tenant):
+            if props.get("person_id") not in wanted:
+                continue
+            captures = []
+            for e in self.g.out_edges(key, "HAS_CONTACT"):
+                contact = self.g.nodes[e["dst"]]["props"]
+                loc = None
+                for le in self.g.out_edges(e["dst"], "CAPTURED_AT"):
+                    loc = self.g.nodes[le["dst"]]["props"]
+                captures.append(
+                    {
+                        "ts": contact.get("captured_at"),
+                        "lat": loc.get("lat") if loc else None,
+                        "lon": loc.get("lon") if loc else None,
+                        "reference_id": contact.get("lead_id"),
+                    }
+                )
+            bookings = []
+            for e in self.g.out_edges(key, "BOOKED"):
+                b = self.g.nodes[e["dst"]]["props"]
+                bookings.append(
+                    {
+                        "created_at": b.get("created_at"),
+                        "status": b.get("status"),
+                        "cancelled_at": b.get("cancelled_at"),
+                        "reference_id": b.get("booking_id"),
+                    }
+                )
+            referral_degree = sum(
+                1
+                for e in self.g.edges
+                if e["type"] == "REFERRED" and (e["src"] == key or e["dst"] == key)
+            )
+            rows.append(
+                {
+                    "person_id": props.get("person_id"),
+                    "captures": captures,
+                    "bookings": bookings,
+                    "referral_degree": referral_degree,
+                }
+            )
+        return rows
+
     def _h_detector_d7_gnn_anomaly(self, cypher, params):
         tenant = params["tenant_id"]
         threshold = params["threshold"]
