@@ -58,6 +58,9 @@ class PropertyGraph:
             {"Booking"}, tenant_id=tenant_id, booking_id=booking_id, **props
         )
 
+    def add_case(self, tenant_id: str, ref: str, **props: Any) -> str:
+        return self.add_node({"Case"}, tenant_id=tenant_id, case_id=ref, **props)
+
     def add_campaign(self, tenant_id: str, campaign_id: str) -> str:
         return self.add_node(
             {"Campaign"}, tenant_id=tenant_id, campaign_id=campaign_id, kind="outreach"
@@ -308,6 +311,66 @@ class FakeGraphClient:
             for _, p in self.g.persons(tenant)
             if p.get("risk_score") is not None and float(p.get("risk_score")) >= threshold
         ]
+
+    def _h_detector_d8_report_velocity(self, cypher, params):
+        tenant = params["tenant_id"]
+        since = params.get("since")
+        rows = []
+        for e in self.g.edges:
+            if e["type"] != "REPORTED":
+                continue
+            person = self.g.nodes[e["src"]]
+            case = self.g.nodes[e["dst"]]
+            if "Person" not in person["labels"] or "Case" not in case["labels"]:
+                continue
+            if person["props"].get("tenant_id") != tenant or case["props"].get("tenant_id") != tenant:
+                continue
+            created = case["props"].get("created_at")
+            if since is not None and not _ge(created, since):
+                continue
+            rows.append(
+                {
+                    "person_id": person["props"].get("person_id"),
+                    "case_ref": case["props"].get("case_id"),
+                    "created_at": created,
+                }
+            )
+        return rows
+
+    def _h_detector_d8_coordinated_spam(self, cypher, params):
+        tenant = params["tenant_id"]
+        since = params.get("since")
+        rows = []
+        for key, node in self.g.nodes.items():
+            if "Case" not in node["labels"]:
+                continue
+            cs = node["props"]
+            if cs.get("tenant_id") != tenant:
+                continue
+            if since is not None and not _ge(cs.get("created_at"), since):
+                continue
+            loc = None
+            for e in self.g.out_edges(key, "AT"):
+                loc = self.g.nodes[e["dst"]]["props"]
+            if loc is None or loc.get("lat") is None or loc.get("lon") is None:
+                continue
+            reporter = None
+            for e in self.g.in_edges(key, "REPORTED"):
+                src = self.g.nodes[e["src"]]
+                if "Person" in src["labels"] and src["props"].get("tenant_id") == tenant:
+                    reporter = src["props"].get("person_id")
+            rows.append(
+                {
+                    "case_ref": cs.get("case_id"),
+                    "category": cs.get("category"),
+                    "status": cs.get("status"),
+                    "created_at": cs.get("created_at"),
+                    "lat": loc.get("lat"),
+                    "lon": loc.get("lon"),
+                    "reporter_id": reporter,
+                }
+            )
+        return rows
 
     # -- writers -------------------------------------------------------------
     def _h_write_alert_merge(self, cypher, params):

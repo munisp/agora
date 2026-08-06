@@ -48,7 +48,7 @@ def test_detect_run_full_sweep_for_tenant(api, client, graph):
     assert set(body["detectors"]) == {
         "d1_referral_cycle", "d2_sybil_cluster", "d3_capture_velocity",
         "d4_geo_impossibility", "d5_consent_backdating", "d6_ghost_booking",
-        "d7_gnn_anomaly",
+        "d7_gnn_anomaly", "d8_report_spam",
     }
 
 
@@ -64,6 +64,8 @@ def test_detect_status(api):
     body = resp.json()
     assert body["sweep_minutes"] == 15
     assert body["alerts_topic"] == "opendesk.fraud.alerts.v1"
-    assert len(body["detectors"]) == 7
+    assert len(body["detectors"]) == 8
     assert body["thresholds"]["CAPTURE_VELOCITY_MAX"] == 30
     assert body["thresholds"]["ANOMALY_ALERT_THRESHOLD"] == 0.9
+    assert body["thresholds"]["CIVIC_REPORT_MAX_PER_DAY"] == 5
+    assert body["thresholds"]["CIVIC_COORD_RADIUS_M"] == 500.0

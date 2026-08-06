@@ -245,6 +245,7 @@ from .d4_geo import GeoImpossibilityDetector  # noqa: E402
 from .d5_consent import ConsentBackdatingDetector  # noqa: E402
 from .d6_ghost import GhostBookingDetector  # noqa: E402
 from .d7_anomaly import AnomalyDetector  # noqa: E402
+from .d8_civic import ReportSpamDetector  # noqa: E402
 
 ALL_DETECTORS: tuple[Detector, ...] = (
     ReferralCycleDetector(),
@@ -254,6 +255,9 @@ ALL_DETECTORS: tuple[Detector, ...] = (
     ConsentBackdatingDetector(),
     GhostBookingDetector(),
     AnomalyDetector(),
+    # SPEC-W32 §3 WS-D: report_spam is medium-only and NEVER auto-quarantines
+    # (citizens are never banned from reporting) — see d8_civic/quarantine.
+    ReportSpamDetector(),
 )
 
 DETECTORS_BY_NAME: dict[str, Detector] = {d.name: d for d in ALL_DETECTORS}
