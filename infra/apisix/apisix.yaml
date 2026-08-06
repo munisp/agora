@@ -641,6 +641,74 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- Civic reporting (SPEC-W32) ------------------------------------------------
+  # Public citizen intake/tracking/stats — anonymous like api-bookings-public,
+  # with the stricter limit-count of an abuse-exposed surface. Tenant-safe by
+  # construction (ref+phone binding; aggregate-only stats).
+  - id: api-civic-public
+    uris:
+      - /api/civic/public/*
+    methods: [GET, POST, OPTIONS]
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/civic/(.*)"
+          - "/v1/civic/$1"
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  # Operator console API (triage/assign/merge/categories) — standard OIDC.
+  - id: api-civic
+    uris:
+      - /api/civic/*
+      - /api/civic
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/civic/?(.*)"
+          - "/v1/civic/$1"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      limit-count:
+        count: 300
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
   # ---- Omnichannel inbound webhooks (SPEC-W6 Part A): /webhooks/* -> messaging-gateway ----
   # PUBLIC by design: Meta/Telegram cannot present Keycloak tokens. Auth is
   # provider-native instead — the Meta verify-token handshake (GET) and the

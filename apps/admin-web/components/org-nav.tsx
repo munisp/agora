@@ -27,6 +27,7 @@ import {
   Settings,
   Filter,
   Shield,
+  FileWarning,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -67,6 +68,8 @@ const items: NavItem[] = [
   { segment: "segments", label: "Segments", icon: Filter },
   // SPEC-W30: fraud & trust alert queue — same gate as segments.
   { segment: "alerts", label: "Alerts", icon: Shield },
+  // SPEC-W32: civic case triage console — operational, owner/admin/staff.
+  { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
   { external: CRM_URL, label: "CRM", icon: UsersRound },
   { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
@@ -130,6 +133,10 @@ export function OrgNav({
     // owner/admin gate as segments; the page enforces it server-side too.
     if ("segment" in item && item.segment === "alerts")
       return canViewGeoCampaigns(roles);
+    // SPEC-W32: civic cases are operational — owner/admin/staff, same gate
+    // as locations; the page enforces it server-side too.
+    if ("segment" in item && item.segment === "cases")
+      return canViewLocations(roles);
     // SPEC-W10 Part C: voices studio is owner/admin/staff; the page enforces
     // the same rule server-side.
     if ("segment" in item && item.segment === "voices")
