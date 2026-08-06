@@ -20,7 +20,13 @@ from aiokafka import AIOKafkaConsumer, TopicPartition
 from . import metrics
 from .config import Settings
 from .iceberg_tables import IcebergSink
-from .mapping import map_booking_event, map_payment_event, map_transcript, map_usage_event
+from .mapping import (
+    map_booking_event,
+    map_cac_event,
+    map_payment_event,
+    map_transcript,
+    map_usage_event,
+)
 
 log = structlog.get_logger()
 
@@ -35,6 +41,11 @@ def topic_registry(settings: Settings) -> dict[str, tuple[str, Mapper]]:
         settings.topic_transcripts: ("transcripts", map_transcript),
         # Wave 5 #9: usage metering records -> bronze.usage_events.
         settings.topic_usage_events: ("usage_events", map_usage_event),
+        # SPEC-W33 §2 A2: CAC funnel events -> bronze.cac_events. Same
+        # consumer group (kafka_group_id) and commit-after-append semantics
+        # as the other bronze topics; the realtime rollup path keeps its own
+        # group (cac_events_group) in cac_consumer.py.
+        settings.cac_events_topic: ("cac_events", map_cac_event),
     }
 
 

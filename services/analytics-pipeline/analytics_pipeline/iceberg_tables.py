@@ -18,6 +18,7 @@ from pyiceberg.types import DoubleType, LongType, NestedField, StringType, Times
 from .config import Settings
 from .mapping import (
     BOOKING_EVENT_COLUMNS,
+    CAC_EVENT_COLUMNS,
     PAYMENT_EVENT_COLUMNS,
     TRANSCRIPT_COLUMNS,
     USAGE_EVENT_COLUMNS,
@@ -53,6 +54,16 @@ _COLUMN_TYPES: dict[str, Any] = {
     "metric": _STR,
     "value": _DOUBLE,
     "meta": _STR,
+    # SPEC-W33 §2 A2: cac.events -> bronze.cac_events (CAC_EVENT_COLUMNS).
+    "entity_type": _STR,
+    "entity_id": _STR,
+    "event_name": _STR,
+    "event_ts": _TS,
+    "channel": _STR,
+    "campaign_id": _STR,
+    "lga_id": _LONG,
+    "amount_ngn": _DOUBLE,
+    "idempotency_key": _STR,
 }
 
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -60,6 +71,8 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "payment_events": PAYMENT_EVENT_COLUMNS,
     "transcripts": TRANSCRIPT_COLUMNS,
     "usage_events": USAGE_EVENT_COLUMNS,
+    # SPEC-W33 §2 A2: closes the cac_analytics.py TODO producer.
+    "cac_events": CAC_EVENT_COLUMNS,
 }
 
 
