@@ -15,9 +15,12 @@ SEAMS only (SPEC-W28 §6: no GNN training, no ART training):
 Inputs (ALL optional — graceful degradation, cac_analytics.py pattern):
 
   * NODE EXPORT (parquet on MinIO) — bulk node dump from FalkorDB.
-    INPUT CONTRACT (TODO producer: graph-service `GET /internal/export/nodes`
-    or a graph-sync periodic dump; until then the job logs a warning and
-    writes empty tables). Path: env GRAPH_EXPORT_NODES_PATH
+    INPUT CONTRACT (producer LANDED, SPEC-W33 §2 A2: graph-service
+    `GET /v1/graph/internal/export/nodes` — X-Internal-Token, tenant-scoped
+    JSONL stream, Person ids W28-hashed; the JSONL is landed to this parquet
+    path by the export driver. Graceful degradation unchanged: while no
+    export has landed the job logs a warning and writes empty tables).
+    Path: env GRAPH_EXPORT_NODES_PATH
     (default s3://lake/extracts/graph_nodes/). Columns:
       snapshot_date date, tenant_id string, label string, node_id string,
       in_degree int, out_degree int,
@@ -28,7 +31,10 @@ Inputs (ALL optional — graceful degradation, cac_analytics.py pattern):
     Only Person/Contact/Offering/Campaign node labels are expected; rows
     without tenant_id or node_id are dropped (compliance gate 1: tenant_id
     is mandatory on every node — feature rows inherit the invariant).
-  * EDGE EXPORT (parquet on MinIO) — bulk edge dump, same producer seam.
+  * EDGE EXPORT (parquet on MinIO) — bulk edge dump, same producer seam
+    (graph-service `GET /v1/graph/internal/export/edges`, SPEC-W33 §2 A2;
+    Person endpoint ids carry the SAME W28 hash as the node stream so the
+    two exports join).
     Path: env GRAPH_EXPORT_EDGES_PATH (default s3://lake/extracts/graph_edges/).
     Columns:
       snapshot_date date, tenant_id string, edge_type string,
