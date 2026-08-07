@@ -10,7 +10,7 @@ widget.
 Paste this snippet into any HTML page:
 
 ```html
-<script src="http://localhost:3001/embed.js" data-site="acme" async></script>
+<script src="http://localhost:9080/embed.js" data-site="acme" async></script>  <!-- via APISIX catch-all → web (web :3001 not host-published since W34 GF4) -->
 ```
 
 The dashboard shows a ready-to-copy snippet (with the correct origin and slug)
@@ -42,7 +42,7 @@ Example with a container:
 
 ```html
 <div id="booking"></div>
-<script src="http://localhost:3001/embed.js"
+<script src="http://localhost:9080/embed.js"
         data-site="acme" data-target="#booking" data-height="720px" async></script>
 ```
 

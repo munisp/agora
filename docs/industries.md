@@ -140,19 +140,22 @@ are registered alongside the existing saga/reminder workflows.
    ids found in `INDUSTRIES_DIR`; a new file is picked up on restart
    (`docker compose restart identity notification`).
 
-5. **Seed a demo tenant** with the new pack:
+5. **Seed a demo tenant** with the new pack (export `$TOKEN` first — see
+   `docs/runbooks/local-dev.md` §3; service ports are not host-published, so
+   all calls go through the gateway on :9080):
 
    ```bash
-   curl -sf -X POST http://localhost:7001/v1/tenants \
-     -H 'content-type: application/json' \
+   curl -sf -X POST http://localhost:9080/api/identity/v1/tenants \
+     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
      -d '{"slug":"acme-barber","name":"Acme Barbershop","industry":"barbershop",
           "timezone":"Europe/London","currency":"GBP","locale":"en-GB","plan":"pro"}' | jq .
    ```
 
 6. **Verify:** the onboarding workflow's `ApplyIndustryPack` activity seeded
-   offerings/knowledge (`GET http://localhost:7002/v1/offerings` with
-   `X-Tenant-Slug: acme-barber`), and
-   `GET http://localhost:7001/v1/tenants/acme-barber` shows the resolved pack
+   offerings/knowledge (`GET http://localhost:9080/api/bookings/v1/offerings`
+   with `Authorization: Bearer $TOKEN` and `X-Tenant-Slug: acme-barber`), and
+   `GET http://localhost:9080/api/identity/v1/tenants/acme-barber` shows the
+   resolved pack
    summary. New bookings run the pack's workflow — visible in the Temporal UI
    (http://localhost:8233) as a child of `BookingSagaWorkflow`.
 

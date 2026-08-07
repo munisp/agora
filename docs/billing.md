@@ -153,7 +153,8 @@ checks above are the service-side enforcement floor.
 ## API reference
 
 Base path through the gateway: `/api/billing` (rewritten to `/` upstream).
-Direct: `http://localhost:7012`.
+Direct access: not host-published since W34 GF4 — in-network probe e.g.
+`docker compose exec apisix curl -sf http://billing-engine:7012/healthz`.
 
 ### `PUT /v1/rate-cards/{tenant_id}`
 ```json
