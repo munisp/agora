@@ -33,8 +33,14 @@ pub struct AppState {
     /// FLUTTERWAVE_SECRET_HASH is set).
     pub flutterwave: flutterwave::FlutterwaveAdapter,
     pub config: Arc<config::Config>,
+    /// SPEC-W34 GF11: dead-letter sink for failed payments commands
+    /// (`opendesk.dlq`, booking-service idiom). When the Kafka producer could
+    /// not be created this is the fail-closed `UnavailableDlqSink`.
+    pub dlq: Arc<dyn consumer::DlqSink>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
+    /// GF11 error metric: commands dead-lettered after bounded retries.
+    pub commands_dead_lettered: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -112,7 +118,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
 
-    let cfg = config::Config::from_env();
+    let cfg = match config::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            // Fail-closed startup (GF11): no silent sim-ledger default.
+            tracing::error!(error = %e, "invalid configuration; refusing to start");
+            return Err(e.into());
+        }
+    };
     info!(
         port = cfg.port,
         ledger_impl = %cfg.ledger_impl,
@@ -126,14 +139,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.dapr_pubsub.clone(),
         cfg.events_topic.clone(),
     );
+    // GF11: DLQ producer for failed payments commands. If the producer cannot
+    // be created, the sink fails closed (failed commands are then never
+    // offset-committed, so they redeliver instead of being lost).
+    let dlq: Arc<dyn consumer::DlqSink> = match rdkafka::config::ClientConfig::new()
+        .set("bootstrap.servers", &cfg.kafka_brokers)
+        .set("message.timeout.ms", "10000")
+        .create::<rdkafka::producer::FutureProducer>()
+    {
+        Ok(p) => Arc::new(consumer::KafkaDlqSink::new(p, cfg.dlq_topic.clone())),
+        Err(e) => {
+            tracing::error!(error = %e, topic = %cfg.dlq_topic,
+                "failed to create DLQ kafka producer; failed commands will rely on redelivery");
+            Arc::new(consumer::UnavailableDlqSink)
+        }
+    };
     let state = AppState {
         ledger,
         outbox,
         mojaloop: mojaloop::MojaloopAdapter::new(cfg.mojaloop_endpoint.clone()),
         flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
         config: Arc::new(cfg.clone()),
+        dlq,
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
+        commands_dead_lettered: Arc::new(AtomicU64::new(0)),
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

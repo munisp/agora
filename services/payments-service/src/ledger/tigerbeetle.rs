@@ -1,25 +1,41 @@
 //! Live TigerBeetle client (`LEDGER_IMPL=tigerbeetle`), compiled only with the
 //! `tb-live` cargo feature (ADR-0007).
 //!
-//! Written against a documented minimal subset of the `tigerbeetle-unofficial`
-//! crate (the community-published official Rust client for TigerBeetle):
-//!   - `tigerbeetle_unofficial::Client::new(cluster_id: u128, addresses: &str)`
-//!   - `Client::create_accounts(Vec<Account>)`, `Client::create_transfers(Vec<Transfer>)`,
-//!     `Client::lookup_accounts(Vec<u128>)`
-//!   - `Account::new(id: u128, ledger: u32, code: u16)` with builder
-//!     `.with_flags(AccountFlags { .. })`
-//!   - `Transfer::new(id, debit_account_id, credit_account_id, amount)` with
-//!     builders `.with_ledger(..)`, `.with_code(..)`, `.with_pending_id(..)`,
-//!     `.with_flags(TransferFlags::PENDING / POST_PENDING_TRANSFER / VOID_PENDING_TRANSFER)`
+//! Written against the pinned `tigerbeetle-unofficial 0.8.0+0.16.28` crate
+//! (community-published official Rust client for TigerBeetle); the relevant
+//! surface, verified against the vendored crate source:
+//!   - `tigerbeetle_unofficial::Client::new(cluster_id: u128, addresses: impl AsRef<[u8]>)`
+//!   - `Client::{create_accounts, create_transfers}(Vec<_>) -> Result<(), {CreateAccounts,CreateTransfers}Error>`
+//!     where the `Api` variant carries per-item errors with `.kind()`
+//!     (`error::Create{Account,Transfer}ErrorKind`); `exists` means idempotent replay.
+//!   - `Account::new(id: u128, ledger: u32, code: u16)`
+//!   - `Transfer::new(id: u128)` with builders `.with_debit_account_id(..)`,
+//!     `.with_credit_account_id(..)`, `.with_amount(u128)`, `.with_ledger(..)`,
+//!     `.with_code(..)`, `.with_pending_id(..)`, `.with_flags(transfer::Flags::{LINKED,
+//!     PENDING, POST_PENDING_TRANSFER, VOID_PENDING_TRANSFER, ..})` (bitflags).
+//!   - `Client::lookup_accounts(Vec<u128>)`; balance accessors return `u128`.
 //! If the pinned crate version drifts from this surface, this module is the
-//! single integration point to adjust. The default build does NOT compile it,
-//! so the service always builds green (ADR-0007 fallback to the sim ledger).
+//! single integration point to adjust. The default build does NOT compile it
+//! (the sys crate's build script needs the Zig toolchain/network), so the
+//! service always builds green (ADR-0007 fallback to the sim ledger).
+//!
+//! SPEC-W34 GF11 hardening:
+//!   * `submit()` treats TigerBeetle's `exists` result as SUCCESS (idempotent
+//!     replay of the same transfer id) — previously any per-item result was
+//!     reported as an error, so at-least-once replays of a committed transfer
+//!     looked like ledger failures and got dead-lettered;
+//!   * capture/no-show-fee post + revenue/fee split is ONE linked
+//!     `create_transfers` batch — TigerBeetle applies linked batches
+//!     atomically, so a partial capture (hold posted, split lost) can no
+//!     longer happen.
 
 use async_trait::async_trait;
 use tigerbeetle_unofficial as tb;
 use uuid::Uuid;
 
 use super::*;
+use tb::error::{CreateAccountErrorKind, CreateAccountsError, CreateTransferErrorKind, CreateTransfersError};
+use tb::transfer::Flags as TbFlags;
 
 pub struct TigerBeetleClient {
     client: tb::Client,
@@ -54,23 +70,33 @@ impl TigerBeetleClient {
         amount: u64,
         code: u16,
     ) -> tb::Transfer {
-        tb::Transfer::new(id, account_id(debit), account_id(credit), amount)
+        tb::Transfer::new(id)
+            .with_debit_account_id(account_id(debit))
+            .with_credit_account_id(account_id(credit))
+            .with_amount(amount as u128)
             .with_ledger(self.ledger_id)
             .with_code(code)
     }
 
+    /// Submit one batch. GF11: TigerBeetle reports idempotent replays of an
+    /// already-committed transfer id as per-item `exists` results — those are
+    /// SUCCESS (the money is already where this batch puts it). Only genuine
+    /// rejections (including `exists_with_different_*` conflicts) are errors.
     async fn submit(&self, transfers: Vec<tb::Transfer>) -> Result<(), LedgerError> {
-        let results = self
-            .client
-            .create_transfers(transfers)
-            .await
-            .map_err(map_err)?;
-        if let Some(first) = results.first() {
-            return Err(LedgerError::Backend(format!(
-                "tigerbeetle transfer rejected: {first:?}"
-            )));
+        match self.client.create_transfers(transfers).await {
+            Ok(()) => Ok(()),
+            Err(CreateTransfersError::Api(api))
+                if api
+                    .as_slice()
+                    .iter()
+                    .all(|e| e.kind() == CreateTransferErrorKind::Exists) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(LedgerError::Backend(format!(
+                "tigerbeetle transfer rejected: {e}"
+            ))),
         }
-        Ok(())
     }
 
     fn wrap(
@@ -119,19 +145,19 @@ impl LedgerClient for TigerBeetleClient {
             .iter()
             .map(|(name, code)| tb::Account::new(account_id(name), self.ledger_id, *code))
             .collect();
-        let results = self
-            .client
-            .create_accounts(tb_accounts)
-            .await
-            .map_err(map_err)?;
-        // `exists` results are expected on idempotent re-creation; anything
-        // else is a real error.
-        for r in &results {
-            let msg = format!("{r:?}");
-            if !msg.contains("exists") {
+        match self.client.create_accounts(tb_accounts).await {
+            Ok(()) => {}
+            // `exists` results are expected on idempotent re-creation;
+            // anything else is a real error.
+            Err(CreateAccountsError::Api(api))
+                if api
+                    .as_slice()
+                    .iter()
+                    .all(|e| e.kind() == CreateAccountErrorKind::Exists) => {}
+            Err(e) => {
                 return Err(LedgerError::Backend(format!(
-                    "tigerbeetle account creation failed: {msg}"
-                )));
+                    "tigerbeetle account creation failed: {e}"
+                )))
             }
         }
         Ok(defs
@@ -162,7 +188,7 @@ impl LedgerClient for TigerBeetleClient {
         let credit = deposits_account(tenant_id);
         let t = self
             .tb_transfer(transfer_id.as_u128(), &debit, &credit, amount, CODE_DEPOSIT_HOLD)
-            .with_flags(tb::TransferFlags::PENDING);
+            .with_flags(TbFlags::PENDING);
         self.submit(vec![t]).await?;
         Ok(self.wrap(
             transfer_id.as_u128(),
@@ -195,14 +221,17 @@ impl LedgerClient for TigerBeetleClient {
         amount: u64,
     ) -> Result<Transfer, LedgerError> {
         if let Some(h) = hold_id {
-            // Void the pending hold; TigerBeetle ignores amount for voids and
-            // fails with `pending_transfer_not_pending` if already resolved.
+            // Void the pending hold. Amount 0 tells TigerBeetle to void the
+            // full pending amount; TB fails with `pending_transfer_not_pending`
+            // if the hold was already resolved (then we fall through to a
+            // posted refund). A replayed void reports `exists` and is treated
+            // as success by submit() (GF11).
             let debit = PLATFORM_CLEARING_ACCOUNT.to_string();
             let credit = deposits_account(tenant_id);
             let t = self
-                .tb_transfer(transfer_id.as_u128(), &debit, &credit, u64::MAX, CODE_REFUND)
+                .tb_transfer(transfer_id.as_u128(), &debit, &credit, 0, CODE_REFUND)
                 .with_pending_id(h.as_u128())
-                .with_flags(tb::TransferFlags::VOID_PENDING_TRANSFER);
+                .with_flags(TbFlags::VOID_PENDING_TRANSFER);
             match self.submit(vec![t]).await {
                 Ok(()) => {
                     return Ok(self.wrap(
@@ -280,10 +309,12 @@ impl LedgerClient for TigerBeetleClient {
         let accounts = self.client.lookup_accounts(ids).await.map_err(map_err)?;
         let mut out = Vec::new();
         for (i, a) in accounts.iter().enumerate() {
-            let debits_posted = a.debits_posted();
-            let credits_posted = a.credits_posted();
-            let debits_pending = a.debits_pending();
-            let credits_pending = a.credits_pending();
+            // TB balance counters are u128; the public model uses u64 (values
+            // far below 2^64 in any realistic deployment).
+            let debits_posted = a.debits_posted() as u64;
+            let credits_posted = a.credits_posted() as u64;
+            let debits_pending = a.debits_pending() as u64;
+            let credits_pending = a.credits_pending() as u64;
             out.push(AccountBalance {
                 account: names[i].clone(),
                 id: format!("{:032x}", a.id()),
@@ -313,31 +344,19 @@ impl TigerBeetleClient {
     ) -> Result<CaptureResult, LedgerError> {
         let deposits = deposits_account(tenant_id);
         let revenue = revenue_account(tenant_id);
-        // Amount `0` on a post tells TigerBeetle to post the full pending amount.
-        let post_amount = amount.unwrap_or(0);
-
-        let post = self
-            .tb_transfer(
-                transfer_id.as_u128(),
-                PLATFORM_CLEARING_ACCOUNT,
-                &deposits,
-                post_amount,
-                code,
-            )
-            .with_pending_id(hold_id.as_u128())
-            .with_flags(tb::TransferFlags::POST_PENDING_TRANSFER);
-        self.submit(vec![post]).await?;
-
-        // The exact posted amount is unknown when `amount` was None; for the
-        // split we need it, so look the hold up via the transfer query would
-        // be required. Keep it simple: require explicit amounts from callers
-        // of the live client, or treat full-capture splits as the posted
-        // amount supplied by the caller (routes always pass one).
+        // The split needs the exact posted amount, so the live client
+        // requires explicit amounts from callers (routes always pass one).
+        // Amount `0` on a post would tell TigerBeetle to post the full
+        // pending amount, but then the split amounts would be unknowable
+        // without an extra lookup.
         let posted = amount.ok_or_else(|| {
             LedgerError::Backend(
                 "live client requires explicit capture amount for fee split".into(),
             )
         })?;
+        if posted == 0 {
+            return Err(LedgerError::InvalidAmount);
+        }
         let fee = posted * self.fee_bps / 10_000;
         let net = posted - fee;
 
@@ -349,7 +368,29 @@ impl TigerBeetleClient {
             &Uuid::NAMESPACE_URL,
             format!("capture-fee:{:032x}", transfer_id.as_u128()).as_bytes(),
         );
-        let mut batch = vec![self.tb_transfer(rev_id.as_u128(), &deposits, &revenue, net, code)];
+
+        // GF11: post + revenue split (+ platform fee) as ONE linked
+        // create_transfers batch. TigerBeetle applies linked batches
+        // atomically (all-or-nothing), eliminating the previous two-batch
+        // window where the hold was posted but the split was lost.
+        let mut batch = Vec::with_capacity(3);
+        let post = self
+            .tb_transfer(
+                transfer_id.as_u128(),
+                PLATFORM_CLEARING_ACCOUNT,
+                &deposits,
+                posted,
+                code,
+            )
+            .with_pending_id(hold_id.as_u128())
+            .with_flags(TbFlags::POST_PENDING_TRANSFER | TbFlags::LINKED);
+        batch.push(post);
+        let mut rev = self.tb_transfer(rev_id.as_u128(), &deposits, &revenue, net, code);
+        if fee > 0 {
+            // Not the last event in the chain: keep the link open.
+            rev = rev.with_flags(TbFlags::LINKED);
+        }
+        batch.push(rev);
         if fee > 0 {
             batch.push(self.tb_transfer(
                 fee_id.as_u128(),
