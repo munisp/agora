@@ -1,8 +1,7 @@
-// notification-worker: Temporal Go worker hosting the workflows of SPEC §6
-// (BookingSagaWorkflow, ReminderWorkflow, NoShowFollowupWorkflow,
-// TenantOnboardingWorkflow) plus the Go activities that reach
-// booking/payments/identity via Dapr service invocation and send
-// notifications via the Dapr smtp/twilio output bindings.
+// notification-worker: Temporal worker + Dapr subscribers + outbound
+// notifiers (SPEC §6). Boots the worker on task queue `opendesk-main`,
+// registers the saga/reminder/no-show/onboarding workflows and activities,
+// and subscribes to booking events for signal fan-out.
 package main
 
 import (
@@ -25,7 +24,6 @@ import (
 	"github.com/opendesk/notification-worker/internal/httpapi"
 	"github.com/opendesk/notification-worker/internal/notifyoutbox"
 	"github.com/opendesk/notification-worker/internal/pacer"
-	"github.com/opendesk/notification-worker/internal/packs"
 	"github.com/opendesk/notification-worker/internal/provider"
 	"github.com/opendesk/notification-worker/internal/signals"
 	"github.com/opendesk/notification-worker/internal/store"
@@ -54,99 +52,42 @@ func run() error {
 
 	cfg := config.Load()
 
+	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
+
 	tc, err := client.Dial(client.Options{
 		HostPort:  cfg.TemporalHostPort,
 		Namespace: cfg.TemporalNamespace,
 		Logger:    &temporalZapAdapter{log: logger},
 	})
 	if err != nil {
-		return fmt.Errorf("dial temporal: %w", err)
+		return fmt.Errorf("temporal dial: %w", err)
 	}
 	defer tc.Close()
 
-	// Industry workflow packs (SPEC-CRM §C): loaded + validated at boot.
-	registry, err := packs.Load(cfg.IndustriesDir)
-	if err != nil {
-		return fmt.Errorf("load industry packs: %w", err)
-	}
-	logger.Info("industry packs loaded",
-		zap.String("dir", cfg.IndustriesDir), zap.Strings("packs", registry.IDs()))
-
-	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
-	acts := activities.New(daprClient, cfg.BookingAppID, cfg.PaymentsAppID, cfg.IdentityAppID,
-		cfg.SMTPBinding, cfg.TwilioBinding, cfg.SMTPFrom, cfg.TwilioFrom, cfg.OpenSearchURL,
-		activities.IndustryDeps{
-			Packs:          registry,
-			KnowledgeAppID: cfg.KnowledgeAppID,
-			CRMSyncAppID:   cfg.CRMSyncAppID,
-			PubSubName:     cfg.PubSubName,
-			CRMEventsTopic: cfg.CRMEventsTopic,
-		}, logger)
-	// Messaging channel routing (Nigeria channel): per-tenant provider
-	// selection for the sms/email channels — see
-	// docs/integrations/messaging-channels.md.
-	channelRouter, err := activities.NewChannelRouter(cfg.MessagingChannels, cfg.TenantChannelMap)
-	if err != nil {
-		return fmt.Errorf("messaging channel routing: %w", err)
-	}
-	acts.Channels = channelRouter
-	logger.Info("messaging channel routing configured",
-		zap.String("email_provider", channelRouter.Provider("email", "")),
-		zap.String("sms_provider", channelRouter.Provider("sms", "")))
-	// User-facing base URL for waitlist claim links (SPEC-W3 §3).
-	acts.PublicBaseURL = cfg.PublicBaseURL
-	// Outbound CPS pacer + sender rotation (VOICE-SCALING §4 telephony):
-	// paces every workflow-driven outbound send via NotifyPaced.
-	acts.Pacer = pacer.New(pacer.Config{
-		CPS:         cfg.OutboundCPS,
-		Burst:       cfg.OutboundBurst,
-		Backend:     cfg.PacerBackend,
-		RedisAddr:   cfg.RedisAddr,
-		FromNumbers: cfg.OutboundFromNumbers,
-	}, logger)
-	logger.Info("outbound pacer configured",
-		zap.Float64("cps", cfg.OutboundCPS), zap.Int("burst", cfg.OutboundBurst),
-		zap.String("backend", cfg.PacerBackend), zap.Int("from_numbers", len(cfg.OutboundFromNumbers)))
-	// GDPR export/erase configuration (SPEC-W3 §2 innovation 13).
-	acts.Gdpr = activities.GdprDeps{
-		ConversationAppID: cfg.ConversationAppID,
-		PubSubName:        cfg.PubSubName,
-		PrivacyTopic:      cfg.PrivacyEventsTopic,
-		S3Endpoint:        cfg.S3Endpoint,
-		S3Region:          cfg.S3Region,
-		S3AccessKey:       cfg.S3AccessKey,
-		S3SecretKey:       cfg.S3SecretKey,
-		S3ExportsBucket:   cfg.S3ExportsBucket,
-	}
+	acts := activities.New(activities.Deps{
+		Dapr:           daprClient,
+		Log:            logger,
+		SearchAliasURL: cfg.OpenSearchURL,
+	})
 
 	w := worker.New(tc, cfg.TemporalTaskQueue, worker.Options{})
 
-	// Workflows (SPEC §6)
+	// Workflows (SPEC §6 + SPEC-CRM §C2 industry packs).
 	w.RegisterWorkflowWithOptions(workflows.BookingSagaWorkflow, workflow.RegisterOptions{Name: "BookingSagaWorkflow"})
 	w.RegisterWorkflowWithOptions(workflows.ReminderWorkflow, workflow.RegisterOptions{Name: "ReminderWorkflow"})
 	w.RegisterWorkflowWithOptions(workflows.NoShowFollowupWorkflow, workflow.RegisterOptions{Name: "NoShowFollowupWorkflow"})
 	w.RegisterWorkflowWithOptions(workflows.TenantOnboardingWorkflow, workflow.RegisterOptions{Name: "TenantOnboardingWorkflow"})
-	// SPEC-W3 §3 innovation 7: waitlist backfill on BookingCancelled.
-	w.RegisterWorkflowWithOptions(workflows.WaitlistBackfillWorkflow, workflow.RegisterOptions{Name: "WaitlistBackfillWorkflow"})
-	// SPEC-W19 integrator (additive): fire-and-forget paced sends from the
-	// notifications outbox (notifyoutbox consumer starts one per PacedSend
-	// command — e.g. field-service dispatch push).
-	w.RegisterWorkflowWithOptions(workflows.PacedSendWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypePacedSend})
-	// SPEC-W32 WS-B: civic case SLA timers + citizen status notifications
-	// (the civicoutbox consumer starts/signals these from
-	// opendesk.civic.events.v1).
-	w.RegisterWorkflowWithOptions(workflows.CivicSLAWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypeCivicSLA})
-	w.RegisterWorkflowWithOptions(workflows.CivicStatusNotifyWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypeCivicStatusNotify})
-	// SPEC-W3 §3 innovation 12: digital-twin 24h cleanup.
-	w.RegisterWorkflowWithOptions(workflows.TwinCleanupWorkflow, workflow.RegisterOptions{Name: "TwinCleanupWorkflow"})
-
-	// Industry pack workflows (SPEC-CRM §C2)
-	w.RegisterWorkflowWithOptions(workflows.ClinicIntakeWorkflow, workflow.RegisterOptions{Name: "ClinicIntakeWorkflow"})
 	w.RegisterWorkflowWithOptions(workflows.SalonDepositWorkflow, workflow.RegisterOptions{Name: "SalonDepositWorkflow"})
+	w.RegisterWorkflowWithOptions(workflows.ClinicIntakeWorkflow, workflow.RegisterOptions{Name: "ClinicIntakeWorkflow"})
 	w.RegisterWorkflowWithOptions(workflows.ConsultancyFollowupWorkflow, workflow.RegisterOptions{Name: "ConsultancyFollowupWorkflow"})
 	w.RegisterWorkflowWithOptions(workflows.SupportEscalationWorkflow, workflow.RegisterOptions{Name: "SupportEscalationWorkflow"})
+	w.RegisterWorkflowWithOptions(workflows.WebhookDeliveryWorkflow, workflow.RegisterOptions{Name: "WebhookDeliveryWorkflow"})
+	w.RegisterWorkflowWithOptions(workflows.PacedSendWorkflow, workflow.RegisterOptions{Name: "PacedSendWorkflow"})
+	w.RegisterWorkflowWithOptions(workflows.CivicSLAWorkflow, workflow.RegisterOptions{Name: "CivicSLAWorkflow"})
+	w.RegisterWorkflowWithOptions(workflows.CivicStatusWorkflow, workflow.RegisterOptions{Name: "CivicStatusWorkflow"})
+	w.RegisterWorkflowWithOptions(workflows.AudienceCampaignWorkflow, workflow.RegisterOptions{Name: "AudienceCampaignWorkflow"})
 
-	// Activities
+	// Activities.
 	w.RegisterActivityWithOptions(acts.ReserveSlot, activity.RegisterOptions{Name: workflows.ActivityReserveSlot})
 	w.RegisterActivityWithOptions(acts.HoldDeposit, activity.RegisterOptions{Name: workflows.ActivityHoldDeposit})
 	w.RegisterActivityWithOptions(acts.ConfirmBooking, activity.RegisterOptions{Name: workflows.ActivityConfirmBooking})
@@ -155,41 +96,15 @@ func run() error {
 	w.RegisterActivityWithOptions(acts.ReleaseSlot, activity.RegisterOptions{Name: workflows.ActivityReleaseSlot})
 	w.RegisterActivityWithOptions(acts.VoidHold, activity.RegisterOptions{Name: workflows.ActivityVoidHold})
 	w.RegisterActivityWithOptions(acts.GetBookingStatus, activity.RegisterOptions{Name: workflows.ActivityGetBookingStatus})
+	w.RegisterActivityWithOptions(acts.EmitOpsAlert, activity.RegisterOptions{Name: workflows.ActivityEmitOpsAlert})
 	w.RegisterActivityWithOptions(acts.MarkNoShow, activity.RegisterOptions{Name: workflows.ActivityMarkNoShow})
 	w.RegisterActivityWithOptions(acts.SendNoShowFollowup, activity.RegisterOptions{Name: workflows.ActivitySendNoShowFollow})
 	w.RegisterActivityWithOptions(acts.EnsureKeycloakGroup, activity.RegisterOptions{Name: workflows.ActivityEnsureKeycloakGroup})
 	w.RegisterActivityWithOptions(acts.EnsurePermifyTenant, activity.RegisterOptions{Name: workflows.ActivityEnsurePermifyTenant})
 	w.RegisterActivityWithOptions(acts.SeedTenantData, activity.RegisterOptions{Name: workflows.ActivitySeedTenantData})
 	w.RegisterActivityWithOptions(acts.EnsureSearchAlias, activity.RegisterOptions{Name: workflows.ActivityEnsureSearchAlias})
-	// Waitlist backfill activities (SPEC-W3 §3 innovation 7)
-	w.RegisterActivityWithOptions(acts.ListWaitlistEntries, activity.RegisterOptions{Name: workflows.ActivityListWaitlistEntries})
-	w.RegisterActivityWithOptions(acts.SendWaitlistClaimNotification, activity.RegisterOptions{Name: workflows.ActivitySendWaitlistClaimNote})
-	// Outbound pacing wrapper: all workflow sends go through it (VOICE-SCALING §4).
 	w.RegisterActivityWithOptions(acts.NotifyPaced, activity.RegisterOptions{Name: workflows.ActivityNotifyPaced})
-	// SPEC-W8 A2: geo-targeted campaign sends (scheduled by booking-service's
-	// GeoCampaignWorkflow via NotifyPaced kind geo_campaign).
-	w.RegisterActivityWithOptions(acts.SendGeoCampaignMessage, activity.RegisterOptions{Name: workflows.ActivitySendGeoCampaignMessage})
-	// SPEC-W11 Part B §5: incident outreach sends (scheduled by
-	// booking-service's IncidentAlertWorkflow via NotifyPaced kind
-	// incident_alert with priority — the pacer fast-lane).
-	w.RegisterActivityWithOptions(acts.SendIncidentAlert, activity.RegisterOptions{Name: workflows.ActivitySendIncidentAlert})
-	// SPEC-W16 §1: push notification fan-out (kinds push_notification /
-	// push_marketing via NotifyPaced, or scheduled directly).
-	w.RegisterActivityWithOptions(acts.SendPushNotification, activity.RegisterOptions{Name: workflows.ActivitySendPushNotification})
-	// SPEC-W32 WS-B: citizen status updates (via NotifyPaced kind
-	// civic_status) + SLA-breach reporting (booking-service internal
-	// callback + escalation event).
-	w.RegisterActivityWithOptions(acts.SendCivicStatusUpdate, activity.RegisterOptions{Name: workflows.ActivitySendCivicStatusUpdate})
-	w.RegisterActivityWithOptions(acts.ReportCivicSLABreach, activity.RegisterOptions{Name: workflows.ActivityReportCivicSLABreach})
-	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
-	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
-
-	// Outbound webhook delivery (Wave 5 #10)
-	w.RegisterWorkflowWithOptions(workflows.WebhookDeliveryWorkflow, workflow.RegisterOptions{Name: "WebhookDeliveryWorkflow"})
-	w.RegisterActivityWithOptions(acts.DeliverWebhookHTTP, activity.RegisterOptions{Name: workflows.ActivityDeliverWebhookHTTP})
-	w.RegisterActivityWithOptions(acts.UpdateWebhookDelivery, activity.RegisterOptions{Name: workflows.ActivityUpdateWebhookDelivery})
-
-	// Industry pack activities (SPEC-CRM §C2)
+	w.RegisterActivityWithOptions(acts.DeliverWebhook, activity.RegisterOptions{Name: workflows.ActivityDeliverWebhook})
 	w.RegisterActivityWithOptions(acts.ApplyIndustryPack, activity.RegisterOptions{Name: workflows.ActivityApplyIndustryPack})
 	w.RegisterActivityWithOptions(acts.VerifyDepositHold, activity.RegisterOptions{Name: workflows.ActivityVerifyDepositHold})
 	w.RegisterActivityWithOptions(acts.SendDepositReminder, activity.RegisterOptions{Name: workflows.ActivitySendDepositReminder})
@@ -231,6 +146,18 @@ func run() error {
 			acts.Civic.Escalations = activities.NewKafkaTrajectoryProducer(brokers)
 		} else {
 			logger.Warn("CIVIC_ESCALATION_TOPIC set but no Kafka brokers; civic escalation emission disabled")
+		}
+	}
+
+	// SPEC-W34 GF16: ops alert producer for saga compensation exhaustion
+	// (orphaned deposit holds). Same posture as civic escalations:
+	// OPS_ALERTS_TOPIC="off" or no brokers → CRITICAL-log-only.
+	acts.Ops = activities.OpsAlertDeps{Topic: civicoutbox.TopicEnabled(cfg.OpsAlertsTopic)}
+	if acts.Ops.Topic != "" {
+		if brokers := strings.Split(cfg.KafkaBrokers, ","); len(brokers) > 0 && brokers[0] != "" {
+			acts.Ops.Producer = activities.NewKafkaTrajectoryProducer(brokers)
+		} else {
+			logger.Warn("OPS_ALERTS_TOPIC set but no Kafka brokers; ops alerts degrade to CRITICAL-log-only")
 		}
 	}
 
