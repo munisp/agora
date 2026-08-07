@@ -31,13 +31,40 @@ re-runs of the same snapshot_date):
   * {TRAINING_BASE_PATH}/gnn_export/{snapshot_date}/nodes/ and .../edges/
   * {TRAINING_BASE_PATH}/{family}/{snapshot_date}/manifest.json per family
 
-manifest.json (schema_version training-manifest-v1): family, snapshot_date,
+manifest.json (dual schema, SPEC-W34 GF2): family, snapshot_date,
 created_at, seed (env TRAINING_SEED, default 42 — recorded per I3 even
 though this job itself is deterministic and does no sampling), source table
 paths, row counts, and reference distribution stats per numeric feature
 {count, mean, std, min, max} — the W33-C drift monitor (PSI/KS) compares
 incoming feature distributions against these. std is the SAMPLE stddev
 (Spark stddev, ddof=1); NULL when fewer than 2 non-null values.
+
+Every manifest ALSO carries the drift contract that
+services/model-registry/model_registry/drift.py consumes verbatim
+(schema opendesk/training-manifest/v1, kept alongside the legacy
+schema_version key for backcompat):
+
+  * schema: "opendesk/training-manifest/v1"
+  * features: {<name>: {histogram: {edges, counts}}} — fixed-bin
+    histograms (HISTOGRAM_BINS equal-width bins over observed min/max,
+    degenerate single-value ranges expanded to [v-0.5, v+0.5]) computed
+    from the actual snapshot feature columns, binned with EXACTLY the
+    drift.py histogram_counts semantics (bisect_right, edge-clamped).
+  * score_baseline: intentionally EMPTY histogram + note — snapshots carry
+    training labels, not serving scores, so no honest score baseline exists
+    at snapshot time (the drift sweep's score leg uses the trailing 7-day
+    serving baseline, see drift.py).
+  * manifest_hash: "sha256:<hex>" over the canonical JSON (sorted keys,
+    compact separators) minus the hash field itself.
+
+REGISTRY SYNC (SPEC-W34 GF2): the drift sweep reads
+$DRIFT_MANIFEST_DIR/<registry-family>.json where registry families are
+fraud-ml / credit-ml / graphsage — NOT the snapshot family names. The
+--registry-sync DIR mode (standalone, Spark-free, local/file:// paths;
+--sync-only skips the snapshot job) copies each snapshot manifest through
+FAMILY_REGISTRY_MAPPING into DIR. During a Spark run, setting
+REGISTRY_SYNC_DIR additionally writes the registry manifests next to the
+snapshot run (works on s3a:// too, via the Hadoop FS writer).
 
 PII discipline (I6/GA4): person identifiers are hashed at the graph-service
 export endpoint (W28 sha256(salt|tenant|id)); this job never sees raw PII
@@ -56,6 +83,9 @@ Run (packages are injected by the job; no --packages needed):
     /opt/spark-jobs/training_snapshot.py
 """
 
+import argparse
+import bisect
+import hashlib
 import json
 import os
 from datetime import date, datetime, timezone
@@ -79,6 +109,24 @@ LABELS_PATH = os.getenv("TRAINING_LABELS_PATH", "s3://lake/extracts/labels/")
 
 FAMILIES = ("fraud_features", "credit_features", "gnn_export")
 MANIFEST_SCHEMA_VERSION = "training-manifest-v1"
+
+# Drift contract (SPEC-W34 GF2): the schema identifier drift.py's
+# DirectoryManifestProvider expects at top level.
+REGISTRY_MANIFEST_SCHEMA = "opendesk/training-manifest/v1"
+
+# Snapshot family -> model-registry family. The drift sweep enumerates
+# REGISTRY families (fraud-ml/credit-ml/graphsage) and looks up
+# $DRIFT_MANIFEST_DIR/<registry-family>.json; this mapping is the single
+# explicit translation point between the two vocabularies.
+FAMILY_REGISTRY_MAPPING = {
+    "fraud_features": "fraud-ml",
+    "credit_features": "credit-ml",
+    "gnn_export": "graphsage",
+}
+
+# Fixed-bin histogram width for the drift reference distributions. 10 bins
+# matches the drift.py score-leg convention (edges = 11 points over range).
+HISTOGRAM_BINS = 10
 
 # I3 honest-metrics note stamped into every manifest: Slice A validation is
 # synthetic-only (W33-A1 labeled synthetic generator); no platform ground
@@ -158,6 +206,93 @@ def compute_feature_stats(rows, numeric_fields) -> dict:
         if s is not None:
             stats[field] = s
     return stats
+
+
+def _numeric_values(values) -> list[float]:
+    """Non-null, non-bool values as floats (same filter as numeric_stats)."""
+    return [float(v) for v in values if v is not None and not isinstance(v, bool)]
+
+
+def histogram_edges(lo: float, hi: float, bins: int = HISTOGRAM_BINS) -> list[float]:
+    """N+1 ascending equal-width bin edges over [lo, hi]. A degenerate
+    (single-value) range is expanded to [v-0.5, v+0.5] so edges strictly
+    ascend and the drift.py binning never divides by a zero width."""
+    lo, hi = float(lo), float(hi)
+    if hi <= lo:
+        lo, hi = lo - 0.5, hi + 0.5
+    return [lo + (hi - lo) * i / bins for i in range(bins + 1)]
+
+
+def histogram_counts_on_edges(samples, edges) -> list[int]:
+    """Bin ``samples`` on ``edges`` — IDENTICAL semantics to
+    model_registry/drift.py histogram_counts (bisect_right; values below
+    edges[0] fall in the first bin, above edges[-1] in the last). Kept as a
+    local copy so this module stays dependency-free (I5)."""
+    counts = [0] * (len(edges) - 1)
+    for v in samples:
+        i = bisect.bisect_right(edges, v) - 1
+        i = min(max(i, 0), len(counts) - 1)
+        counts[i] += 1
+    return counts
+
+
+def feature_histogram(values, bins: int = HISTOGRAM_BINS) -> dict | None:
+    """{edges: [e0..eN], counts: [c0..cN-1]} for one numeric feature over
+    the snapshot data, or None when there are no non-null values. Edges are
+    HISTOGRAM_BINS equal-width bins over the observed min/max (degenerate
+    range expanded, see histogram_edges), so the drift sweep can bin
+    serving values on the same edges."""
+    nums = _numeric_values(values)
+    if not nums:
+        return None
+    edges = histogram_edges(min(nums), max(nums), bins)
+    return {"edges": edges, "counts": histogram_counts_on_edges(nums, edges)}
+
+
+def compute_feature_histograms(rows, numeric_fields, bins: int = HISTOGRAM_BINS) -> dict:
+    """{feature: {histogram: {edges, counts}}} over the requested numeric
+    fields; features with no non-null values are omitted (mirrors
+    compute_feature_stats)."""
+    out = {}
+    for field in numeric_fields:
+        h = feature_histogram([row.get(field) for row in rows], bins)
+        if h is not None:
+            out[field] = {"histogram": h}
+    return out
+
+
+def empty_score_baseline() -> dict:
+    """Documented-empty score baseline: snapshots carry training LABELS,
+    not serving SCORES, so no honest score histogram exists at snapshot
+    time. drift.py's score leg compares serving windows against the
+    trailing 7-day serving baseline, not against this field."""
+    return {
+        "histogram": {"edges": [], "counts": []},
+        "note": (
+            "No model scores exist at snapshot time (snapshots carry "
+            "training labels, not serving scores); the drift sweep's score "
+            "leg uses the trailing 7-day serving baseline "
+            "(model_registry/drift.py). Intentionally empty."
+        ),
+    }
+
+
+def manifest_hash(manifest: dict) -> str:
+    """"sha256:<hex>" over the canonical JSON (sorted keys, compact
+    separators) of the manifest MINUS the manifest_hash field itself —
+    the format the opendesk/training-manifest/v1 schema documents in
+    drift.py. drift.py currently RECORDS the hash (provenance, I2) and does
+    not verify it at load time; verify_manifest_hash is provided for
+    consumers/tests that want the integrity check."""
+    body = {k: v for k, v in manifest.items() if k != "manifest_hash"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_manifest_hash(manifest: dict) -> bool:
+    """Recompute and compare the manifest_hash (see manifest_hash)."""
+    declared = manifest.get("manifest_hash")
+    return isinstance(declared, str) and declared == manifest_hash(manifest)
 
 
 def _require(row, *keys) -> bool:
@@ -296,14 +431,23 @@ def build_manifest(
     feature_stats,
     seed=SEED,
     created_at=None,
+    feature_histograms=None,
+    score_baseline=None,
 ) -> dict:
-    """manifest.json builder (schema training-manifest-v1). created_at is
-    injected so tests can pin it; defaults to now (UTC). Keys are sorted on
-    serialization for byte-stable diffs."""
+    """manifest.json builder (dual schema, SPEC-W34 GF2): the legacy
+    training-manifest-v1 keys (schema_version, feature_stats, ...) are kept
+    for backcompat AND the drift contract consumed by
+    model_registry/drift.py is emitted alongside:
+    schema="opendesk/training-manifest/v1", features.<name>.histogram,
+    score_baseline (empty/documented by default — snapshots have labels,
+    not scores), and manifest_hash (sha256 over the canonical JSON minus
+    the hash field). created_at is injected so tests can pin it; defaults
+    to now (UTC). Keys are sorted on serialization for byte-stable diffs."""
     if family not in FAMILIES:
         raise ValueError(f"unknown training family {family!r}")
     date.fromisoformat(str(snapshot_date))  # contract: YYYY-MM-DD
-    return {
+    manifest = {
+        # --- legacy keys (training-manifest-v1), unchanged consumers
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "family": family,
         "snapshot_date": str(snapshot_date),
@@ -314,7 +458,85 @@ def build_manifest(
         "row_counts": dict(row_counts),
         "feature_stats": dict(feature_stats),
         "notes": PROVENANCE_NOTE,
+        # --- drift contract (opendesk/training-manifest/v1, drift.py)
+        "schema": REGISTRY_MANIFEST_SCHEMA,
+        "features": dict(feature_histograms or {}),
+        "score_baseline": score_baseline
+        if score_baseline is not None else empty_score_baseline(),
     }
+    manifest["manifest_hash"] = manifest_hash(manifest)
+    return manifest
+
+
+def registry_manifest(manifest: dict) -> dict:
+    """Snapshot manifest -> registry manifest: same content, family name
+    translated via FAMILY_REGISTRY_MAPPING (drift.py looks up
+    <registry-family>.json), manifest_hash recomputed over the translated
+    body so the integrity hash stays honest."""
+    family = manifest.get("family")
+    if family not in FAMILY_REGISTRY_MAPPING:
+        raise ValueError(f"no registry-family mapping for {family!r}")
+    out = dict(manifest)
+    out["family"] = FAMILY_REGISTRY_MAPPING[family]
+    out.pop("manifest_hash", None)
+    out["manifest_hash"] = manifest_hash(out)
+    return out
+
+
+def _local_path(path: str) -> str:
+    """Plain local path (file:// URIs unwrapped). s3:// etc. are rejected —
+    the Spark run syncs object-store manifests via REGISTRY_SYNC_DIR."""
+    if path.startswith("file://"):
+        return path[len("file://"):]
+    if "://" in path:
+        raise ValueError(
+            f"--registry-sync reads local/file:// snapshot manifests only; "
+            f"got {path!r} (on object stores set REGISTRY_SYNC_DIR during "
+            f"the Spark run instead)"
+        )
+    return path
+
+
+def sync_registry_manifests(
+    registry_dir,
+    base_path=BASE_PATH,
+    snapshot_date=SNAPSHOT_DATE,
+    families=FAMILIES,
+) -> dict:
+    """Copy {base_path}/{family}/{snapshot_date}/manifest.json for each
+    family to {registry_dir}/{registry-family}.json through
+    FAMILY_REGISTRY_MAPPING — the files drift.py's
+    DirectoryManifestProvider loads from $DRIFT_MANIFEST_DIR.
+
+    Spark-free, local/file:// paths only. Missing family manifests are
+    skipped with a warning (graceful-degradation pattern: a family that
+    never landed must not block the others). Returns
+    {snapshot_family: written_path}."""
+    registry_dir = _local_path(registry_dir)
+    base_path = _local_path(base_path.rstrip("/"))
+    os.makedirs(registry_dir, exist_ok=True)
+    written = {}
+    for family in families:
+        registry_family = FAMILY_REGISTRY_MAPPING.get(family)
+        if registry_family is None:
+            print(f"[training-snapshot] WARNING: no registry mapping for "
+                  f"{family!r}; skipped")
+            continue
+        src = os.path.join(base_path, family, str(snapshot_date), "manifest.json")
+        try:
+            with open(src, "r", encoding="utf-8") as fh:
+                snapshot_manifest = json.load(fh)
+        except FileNotFoundError:
+            print(f"[training-snapshot] WARNING: no manifest at {src}; "
+                  f"skipped (family not snapshotted?)")
+            continue
+        reg = registry_manifest(snapshot_manifest)
+        dst = os.path.join(registry_dir, f"{registry_family}.json")
+        with open(dst, "w", encoding="utf-8") as fh:
+            fh.write(manifest_json(reg))
+        written[family] = dst
+        print(f"[training-snapshot] synced {src} -> {dst}")
+    return written
 
 
 def manifest_json(manifest: dict) -> str:
@@ -563,6 +785,42 @@ def spark_feature_stats(df, numeric_fields) -> dict:
     return stats
 
 
+def spark_feature_histograms(df, numeric_fields, bins: int = HISTOGRAM_BINS) -> dict:
+    """{feature: {histogram: {edges, counts}}} over numeric columns;
+    mirrors compute_feature_histograms. Two deterministic passes: min/max
+    for the edges (same histogram_edges helper as the pure path), then one
+    bucketed-count pass with EXACTLY the drift.py binning semantics
+    (bin 0 = (-inf, e1), interior bins [e_i, e_{i+1}), last bin
+    [e_{N-1}, +inf); NULLs never count). Empty features are omitted."""
+    stats = spark_feature_stats(df, numeric_fields)
+    edges_by_field = {
+        field: histogram_edges(s["min"], s["max"], bins)
+        for field, s in stats.items()
+    }
+    aggs = []
+    for field, edges in edges_by_field.items():
+        col = F.col(field)
+        for i in range(len(edges) - 1):
+            if i == 0:
+                cond = col < F.lit(edges[1])
+            elif i == len(edges) - 2:
+                cond = col >= F.lit(edges[-2])
+            else:
+                cond = (col >= F.lit(edges[i])) & (col < F.lit(edges[i + 1]))
+            aggs.append(
+                F.sum(F.when(cond, 1).otherwise(0)).alias(f"{field}__bin{i}")
+            )
+    if not aggs:
+        return {}
+    row = df.agg(*aggs).collect()[0].asDict()
+    out = {}
+    for field, edges in edges_by_field.items():
+        counts = [int(row.get(f"{field}__bin{i}") or 0)
+                  for i in range(len(edges) - 1)]
+        out[field] = {"histogram": {"edges": edges, "counts": counts}}
+    return out
+
+
 def write_parquet(df, path) -> None:
     """Parquet dataset partitioned by tenant_id, overwrite for idempotent
     re-runs of the same snapshot_date."""
@@ -638,8 +896,22 @@ def _family_path(family: str, snapshot_date: str, sub: str = "") -> str:
     return f"{base}{sub}" if sub else base
 
 
-def main() -> None:
+def main(registry_sync_dir: str | None = None) -> None:
+    registry_sync_dir = registry_sync_dir or os.getenv("REGISTRY_SYNC_DIR")
     spark = build_spark()
+
+    def emit(family, snapshot_manifest):
+        """Write the snapshot manifest and, when a registry sync dir is
+        configured, the translated $DIR/<registry-family>.json (drift.py
+        contract) next to it via the Hadoop FS writer (s3a/local alike)."""
+        write_manifest_file(
+            spark, f"{_family_path(family, SNAPSHOT_DATE)}manifest.json",
+            snapshot_manifest)
+        if registry_sync_dir:
+            dst = f"{registry_sync_dir.rstrip('/')}/{FAMILY_REGISTRY_MAPPING[family]}.json"
+            write_manifest_file(spark, dst, registry_manifest(snapshot_manifest))
+            print(f"[training-snapshot] synced registry manifest {dst}")
+
     try:
         nodes = read_table_or_empty(spark, NODES_TABLE, NODE_SOURCE_SCHEMA, "node features")
         edges = read_table_or_empty(spark, EDGES_TABLE, EDGE_SOURCE_SCHEMA, "edge features")
@@ -660,8 +932,10 @@ def main() -> None:
             [nodes_src, labels_src],
             {"rows": fraud.count()},
             spark_feature_stats(fraud, PERSON_NUMERIC_FEATURES),
+            feature_histograms=spark_feature_histograms(
+                fraud, PERSON_NUMERIC_FEATURES),
         )
-        write_manifest_file(spark, f"{fraud_path}manifest.json", fraud_manifest)
+        emit("fraud_features", fraud_manifest)
         print(f"[training-snapshot] wrote {fraud_manifest['row_counts']['rows']} "
               f"rows to {fraud_path}")
 
@@ -674,8 +948,10 @@ def main() -> None:
             [nodes_src, cac_src],
             {"rows": credit.count()},
             spark_feature_stats(credit, CREDIT_NUMERIC_FEATURES),
+            feature_histograms=spark_feature_histograms(
+                credit, CREDIT_NUMERIC_FEATURES),
         )
-        write_manifest_file(spark, f"{credit_path}manifest.json", credit_manifest)
+        emit("credit_features", credit_manifest)
         print(f"[training-snapshot] wrote {credit_manifest['row_counts']['rows']} "
               f"rows to {credit_path}")
 
@@ -693,18 +969,63 @@ def main() -> None:
             {f"edges.{k}": v
              for k, v in spark_feature_stats(gnn_e, EDGE_NUMERIC_FEATURES).items()}
         )
+        gnn_histograms = {
+            f"nodes.{k}": v
+            for k, v in spark_feature_histograms(
+                gnn_n, PERSON_NUMERIC_FEATURES).items()
+        }
+        gnn_histograms.update(
+            {f"edges.{k}": v
+             for k, v in spark_feature_histograms(
+                 gnn_e, EDGE_NUMERIC_FEATURES).items()}
+        )
         gnn_manifest = build_manifest(
             "gnn_export", SNAPSHOT_DATE,
             [nodes_src, edges_src],
             {"nodes": gnn_n.count(), "edges": gnn_e.count()},
             gnn_stats,
+            feature_histograms=gnn_histograms,
         )
-        write_manifest_file(spark, f"{gnn_path}manifest.json", gnn_manifest)
+        emit("gnn_export", gnn_manifest)
         print(f"[training-snapshot] wrote nodes={gnn_manifest['row_counts']['nodes']} "
               f"edges={gnn_manifest['row_counts']['edges']} to {gnn_path}")
     finally:
         spark.stop()
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Lakehouse -> versioned training snapshots + drift "
+                    "reference manifests (SPEC-W33 A2, SPEC-W34 GF2).")
+    parser.add_argument(
+        "--registry-sync", metavar="DIR",
+        default=os.getenv("REGISTRY_SYNC_DIR"),
+        help="write drift-contract registry manifests DIR/<registry-family>"
+             ".json (fraud-ml/credit-ml/graphsage) from the snapshot "
+             "manifests; with --sync-only this is all that runs")
+    parser.add_argument(
+        "--sync-only", action="store_true",
+        help="skip the Spark snapshot job; only sync registry manifests "
+             "from EXISTING snapshot manifests (Spark-free, local/file:// "
+             "paths only)")
+    parser.add_argument(
+        "--snapshot-base", default=BASE_PATH,
+        help="base path of the snapshot tree for --sync-only "
+             "(default: TRAINING_BASE_PATH or s3://lake/training/)")
+    parser.add_argument(
+        "--snapshot-date", default=SNAPSHOT_DATE,
+        help="snapshot date dir for --sync-only "
+             "(default: TRAINING_SNAPSHOT_DATE or today)")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    main()
+    args = _parse_args()
+    if args.sync_only:
+        if not args.registry_sync:
+            raise SystemExit("--sync-only requires --registry-sync DIR")
+        sync_registry_manifests(
+            args.registry_sync, base_path=args.snapshot_base,
+            snapshot_date=args.snapshot_date)
+    else:
+        main(registry_sync_dir=args.registry_sync)
