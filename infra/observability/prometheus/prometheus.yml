@@ -10,6 +10,14 @@ global:
   external_labels:
     stack: opendesk
 
+# GF13 (SPEC-W34): alert rules live in rules.yml (mounted alongside this file;
+# see infra/docker-compose.observability.yml). There is NO Alertmanager by
+# design: the platform's alert transport is the Kafka topic `ops.alerts`
+# (services publish structured alerts there directly). These rules surface in
+# Prometheus / Grafana's alert view as the signal layer.
+rule_files:
+  - rules.yml
+
 scrape_configs:
   - job_name: prometheus
     static_configs:
@@ -46,6 +54,15 @@ scrape_configs:
   - job_name: crm-sync
     static_configs:
       - targets: ["crm-sync:7010"]
+
+  # ---- model-registry (GF13/SPEC-W34) ----
+  # Profile-gated compose service (`--profile model-registry`, port 7019,
+  # infra/docker-compose.core.yml): the target is simply DOWN when the
+  # profile is disabled — expected in the base stack. Emits
+  # opendesk_model_drift_psi (see rules.yml ModelDriftPSIHigh).
+  - job_name: model-registry
+    static_configs:
+      - targets: ["model-registry:7019"]
 
   # ---- APISIX gateway (prometheus plugin, see header note) ----
   - job_name: apisix

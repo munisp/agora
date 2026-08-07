@@ -10,6 +10,9 @@ namespace: opendesk
 
 resources:
   - namespace.yaml
+  # GF12 (SPEC-W34): dev-only DB credentials + zero-trust network baseline.
+  - secret.yaml
+  - networkpolicy.yaml
   - identity-deployment.yaml
   - booking-deployment.yaml
   - notification-deployment.yaml

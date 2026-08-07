@@ -3,7 +3,9 @@
 # network and project name come from there. Everything joins the same
 # network and scrapes/consumes over service DNS names.
 #
-#   prometheus  :9090  — scrapes all 10 app services' /metrics + APISIX
+#   prometheus  :9090  — scrapes the app services' /metrics + APISIX +
+#                        model-registry (profile-gated); alert rules in
+#                        observability/prometheus/rules.yml (GF13)
 #   grafana     :3002  — provisioned datasources (prometheus + loki) + dashboards
 #   otel-collector :4318 (OTLP/HTTP) — receives traces (APISIX opentelemetry
 #                        plugin points here) and re-exports logging+prometheus
@@ -35,6 +37,8 @@ services:
       - "9090:9090"
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # GF13 (SPEC-W34): alert rules referenced by `rule_files:` in prometheus.yml.
+      - ./observability/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
       - prometheus-data:/prometheus
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]

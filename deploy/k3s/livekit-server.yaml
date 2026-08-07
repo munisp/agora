@@ -111,16 +111,47 @@ spec:
         livekit: "true"
       # Host networking: RTP/UDP bypasses CNI NAT — lower latency, no
       # conntrack pressure, and the UDP port range maps 1:1 to the node.
+      #
+      # ⚠ ZERO-TRUST EXCEPTION (GF12/SPEC-W34): hostNetwork: true is a
+      # deliberate, SFU-required deviation from the cluster's zero-trust
+      # baseline. An SFU must bind the node's UDP media range directly;
+      # CNI/NAT on the media path breaks latency and the 1:1 hostPort mapping.
+      # Consequences accepted here: (1) NetworkPolicies below do NOT apply to
+      # this pod's traffic (host-net pods bypass pod-network policy in most
+      # CNIs) — node firewall / security-group rules MUST restrict UDP
+      # 50000-50100 + 7881/7882 instead; (2) the pod shares the node network
+      # namespace, so it can reach node-local services — the container-level
+      # securityContext (non-root, read-only rootfs, drop ALL caps) below is
+      # the compensating control. Do NOT copy this pattern to other workloads.
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       # 5-hour drain: in-flight rooms are allowed to finish before SIGKILL.
       # The article's core media-plane lesson — a voice call is a long-lived
       # session, not a request; killing the pod kills calls.
       terminationGracePeriodSeconds: 18000
+      # GF12 zero-trust baseline. LiveKit runs fine as non-root: it binds only
+      # ports > 1024 (7880/7881/7882, 6789, 50000+). Exception note: if TURN
+      # TLS termination or netlink-level socket tuning is ever enabled, this
+      # may need a documented capability exception (NET_BIND_SERVICE /
+      # NET_ADMIN) — keep it commented here until proven required.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: livekit
           image: livekit/livekit-server:v1.7.2
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
           args:
             - --config
             - /etc/livekit/livekit.yaml
@@ -159,6 +190,8 @@ spec:
             - name: config
               mountPath: /etc/livekit
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
           # SFU is CPU/bandwidth-bound (not RAM): give it dedicated cores on
           # the media nodes; memory stays modest.
           resources:
@@ -174,6 +207,17 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          # GF12 (SPEC-W34): liveness on the signalling port. Careful: a
+          # liveness restart of a live SFU drops calls — failureThreshold is
+          # deliberately generous; real rollouts use the 5h drain above.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
           lifecycle:
             # On termination LiveKit stops accepting new rooms and lets
             # existing ones drain within the 5h grace window.
@@ -184,6 +228,8 @@ spec:
         - name: config
           configMap:
             name: livekit-config
+        - name: tmp
+          emptyDir: {}
 ---
 # Signalling service: targets whichever node-pod the mesh assigns; with
 # hostNetwork the pod IP is the node IP, so a simple headless Service gives

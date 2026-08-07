@@ -50,10 +50,28 @@ spec:
         workload: voice-worker
       # 15-minute drain so in-flight calls complete on scale-down/rollout.
       terminationGracePeriodSeconds: 900
+      # GF12 (SPEC-W34) zero-trust baseline (see booking-deployment.yaml).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: voice-worker
           image: opendesk/voice-agent-runtime:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           command:
             - python
             - -m
@@ -113,9 +131,35 @@ spec:
             limits:
               cpu: "4"
               memory: 8Gi
-          # No HTTP readiness probe: the worker CLI serves no /healthz.
-          # Liveness is the LiveKit worker websocket; the HPA reads CPU via
-          # metrics-server. (Add an exec probe on the process if needed.)
+          # GF12 probes (SPEC-W34): the worker CLI serves no HTTP /healthz
+          # (verified: app/livekit_worker.py starts no HTTP server; /healthz
+          # lives in app/control_plane.py, the separate `voice` service), so
+          # these are exec probes asserting the worker process is pid 1 and
+          # its asyncio loop is scheduled. Liveness == LiveKit worker
+          # websocket; a dead-locked process fails the /proc check on restart.
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; d=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'livekit_worker' in d else 1)"
+            initialDelaySeconds: 30   # model preload (whisper) before first job
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; d=open('/proc/1/cmdline','rb').read(); sys.exit(0 if b'livekit_worker' in d else 1)"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 # Headless Service so Prometheus can discover worker /metrics endpoints
 # (voice_* series; per docs/VOICE-SCALING.md §3 instrumentation).

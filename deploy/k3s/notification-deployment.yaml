@@ -18,10 +18,29 @@ spec:
       labels:
         app: notification
     spec:
+      # GF12 (SPEC-W34) zero-trust baseline: non-root, read-only root fs,
+      # no privilege escalation, all capabilities dropped (see booking).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: notification
           image: opendesk-notification:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           ports:
             - containerPort: 7003
           env:
@@ -58,6 +77,9 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

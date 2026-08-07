@@ -1,0 +1,72 @@
+# GF13 (SPEC-W34): recording/alerting rules for the OpenDesk compose stack.
+#
+# ALERT TRANSPORT: there is deliberately NO Alertmanager in this stack. The
+# platform's alert transport is the Kafka topic `ops.alerts` — services
+# (model-registry drift sweeps, payments DLQ, notification compensation
+# exhaustion, ...) publish structured alert events there directly. These
+# Prometheus rules are the complementary SIGNAL layer: they fire in the
+# Prometheus /alerts API and are scraped/displayed by Grafana's built-in
+# Prometheus alert view. Bridging them to `ops.alerts` (e.g. via a small
+# webhook consumer) is intentionally out of scope for W34.
+groups:
+  - name: opendesk-availability
+    rules:
+      - alert: OpenDeskServiceDown
+        # Any configured app/gateway job stops answering scrapes.
+        expr: up{job!~"prometheus|otel-collector"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "OpenDesk target down: {{ $labels.job }} ({{ $labels.instance }})"
+          description: "Prometheus has failed to scrape job={{ $labels.job }} instance={{ $labels.instance }} for >2m."
+
+  - name: opendesk-analytics-pipeline
+    rules:
+      - alert: AnalyticsConsumerLagHigh
+        # analytics_consumer_lag{topic,partition} — emitted by
+        # services/analytics-pipeline (analytics_pipeline/metrics.py).
+        expr: max by (topic) (analytics_consumer_lag) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Analytics consumer lag high on {{ $labels.topic }}"
+          description: "max consumer lag {{ $value }} messages for >10m; Iceberg bronze tables are falling behind."
+
+      - alert: AnalyticsFlushErrorRateHigh
+        # analytics_flushes_total{table,outcome=ok|error}.
+        expr: |
+          sum(rate(analytics_flushes_total{outcome="error"}[5m]))
+            /
+          sum(rate(analytics_flushes_total[5m]))
+            > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Analytics flush error rate above 5%"
+          description: ">5% of Iceberg micro-batch flushes are failing for >15m; check the sink logs (opensearch/minio reachable, schema drift)."
+
+  - name: opendesk-model-registry
+    rules:
+      - alert: ModelDriftPSIHigh
+        # opendesk_model_drift_psi{family,tenant} — emitted by
+        # services/model-registry (model_registry/main.py); threshold mirrors
+        # DRIFT_PSI_THRESHOLD (default 0.25) in the compose service env.
+        # The registry also publishes this alert to Kafka ops.alerts; this
+        # rule is the Prometheus-side mirror for the Grafana alert view.
+        # NOTE: the model-registry scrape job is profile-gated
+        # (--profile model-registry); this rule simply never fires when the
+        # profile is off (no series).
+        expr: opendesk_model_drift_psi > 0.25
+        for: 30m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Model drift PSI high: {{ $labels.family }} / {{ $labels.tenant }}"
+          description: "PSI {{ $value }} > 0.25 sustained for 30m; review the drift report and consider retraining/pinning."
