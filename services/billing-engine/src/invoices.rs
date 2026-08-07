@@ -5,7 +5,7 @@
 //! so multiplication is exact (no float rounding anywhere).
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -85,7 +85,12 @@ pub fn rate_line(
 }
 
 // ---------------------------------------------------------------------------
-// Persistence
+// Persistence (SPEC-W34 GF6)
+//
+// Every function takes an open transaction whose `app.tenant_id` GUC has
+// already been set transaction-locally by the caller (see tenant.rs) — the
+// 0002 RLS policies are fail-closed without it. Multi-statement operations
+// (generate, transitions) now also run atomically inside that transaction.
 // ---------------------------------------------------------------------------
 
 struct RateCardRow {
@@ -98,7 +103,7 @@ struct RateCardRow {
 /// Aggregate a tenant's usage for the period, rate it against the tenant's
 /// rate cards, and create (or replace a draft) invoice.
 pub async fn generate_invoice(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     period: &str,
 ) -> Result<Invoice, BillingError> {
@@ -110,7 +115,7 @@ pub async fn generate_invoice(
     )
     .bind(tenant_id)
     .bind(period)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
     let existing_id: Option<Uuid> = match &existing {
         Some(row) => {
@@ -137,7 +142,7 @@ pub async fn generate_invoice(
     .bind(tenant_id)
     .bind(start)
     .bind(end)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await?;
 
     let card_rows = sqlx::query(
@@ -145,7 +150,7 @@ pub async fn generate_invoice(
          FROM rate_cards WHERE tenant_id = $1 ORDER BY metric",
     )
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await?;
     let cards: Vec<RateCardRow> = card_rows
         .iter()
@@ -192,7 +197,7 @@ pub async fn generate_invoice(
             .bind(subtotal)
             .bind(&currency)
             .bind(id)
-            .execute(pool)
+            .execute(&mut **tx)
             .await?;
             id
         }
@@ -206,33 +211,36 @@ pub async fn generate_invoice(
             .bind(subtotal)
             .bind(&currency)
             .bind(&line_items_json)
-            .fetch_one(pool)
+            .fetch_one(&mut **tx)
             .await?
             .try_get("id")?
         }
     };
 
-    get_invoice(pool, id)
+    get_invoice(tx, id)
         .await?
         .ok_or_else(|| BillingError::NotFound(id.to_string()))
 }
 
 /// Load one invoice by id.
-pub async fn get_invoice(pool: &PgPool, id: Uuid) -> Result<Option<Invoice>, BillingError> {
+pub async fn get_invoice(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<Option<Invoice>, BillingError> {
     let row = sqlx::query(
         "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
                 payment_ref, created_at, issued_at, paid_at \
          FROM invoices WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
     row.map(|r| invoice_from_row(&r)).transpose()
 }
 
 /// List invoices, optionally filtered by status, always tenant-scoped.
 pub async fn list_invoices(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     status: Option<InvoiceStatus>,
 ) -> Result<Vec<Invoice>, BillingError> {
@@ -246,7 +254,7 @@ pub async fn list_invoices(
             )
             .bind(tenant_id)
             .bind(st.as_str())
-            .fetch_all(pool)
+            .fetch_all(&mut **tx)
             .await?
         }
         None => {
@@ -257,7 +265,7 @@ pub async fn list_invoices(
                  ORDER BY created_at DESC",
             )
             .bind(tenant_id)
-            .fetch_all(pool)
+            .fetch_all(&mut **tx)
             .await?
         }
     };
@@ -292,11 +300,11 @@ fn invoice_from_row(row: &sqlx::postgres::PgRow) -> Result<Invoice, BillingError
 /// unknown. The `expected_from` guard in SQL makes concurrent transitions
 /// safe: exactly one caller wins.
 pub async fn transition_invoice(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
     to: InvoiceStatus,
 ) -> Result<InvoiceStatus, BillingError> {
-    let current = match get_invoice(pool, id).await? {
+    let current = match get_invoice(tx, id).await? {
         Some(inv) => inv.status,
         None => return Err(BillingError::NotFound(id.to_string())),
     };
@@ -318,12 +326,12 @@ pub async fn transition_invoice(
         .bind(to.as_str())
         .bind(id)
         .bind(current.as_str())
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     if res.rows_affected() == 0 {
         // Lost a race with a concurrent transition; re-read to report the
         // state we actually saw.
-        let seen = get_invoice(pool, id)
+        let seen = get_invoice(tx, id)
             .await?
             .map(|inv| inv.status.as_str().to_string())
             .unwrap_or_else(|| "missing".to_string());
@@ -340,13 +348,13 @@ pub async fn transition_invoice(
 /// Ok(Some(prev)) when this call performed the transition, Ok(None) when the
 /// invoice was already paid.
 pub async fn mark_paid_idempotent(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
 ) -> Result<Option<InvoiceStatus>, BillingError> {
-    match get_invoice(pool, id).await? {
+    match get_invoice(tx, id).await? {
         None => Err(BillingError::NotFound(id.to_string())),
         Some(inv) if inv.status == InvoiceStatus::Paid => Ok(None),
-        Some(inv) => transition_invoice(pool, id, InvoiceStatus::Paid)
+        Some(inv) => transition_invoice(tx, id, InvoiceStatus::Paid)
             .await
             .map(|prev| {
                 debug_assert_eq!(prev, inv.status);
@@ -357,14 +365,14 @@ pub async fn mark_paid_idempotent(
 
 /// Store the payment reference (Paystack reference or static payload ref).
 pub async fn set_payment_ref(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
     payment_ref: &str,
 ) -> Result<(), BillingError> {
     let res = sqlx::query("UPDATE invoices SET payment_ref = $1 WHERE id = $2 AND status <> 'void'")
         .bind(payment_ref)
         .bind(id)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     if res.rows_affected() == 0 {
         return Err(BillingError::NotFound(id.to_string()));
@@ -374,14 +382,17 @@ pub async fn set_payment_ref(
 
 /// Dunning sweep (B3): issued invoices whose issued_at is older than
 /// `due_days` become past_due. Returns the number transitioned.
-pub async fn mark_overdue(pool: &PgPool, due_days: i64) -> Result<u64, BillingError> {
+pub async fn mark_overdue(
+    tx: &mut Transaction<'_, Postgres>,
+    due_days: i64,
+) -> Result<u64, BillingError> {
     let res = sqlx::query(
         "UPDATE invoices SET status = 'past_due' \
          WHERE status = 'issued' AND issued_at IS NOT NULL \
            AND issued_at < now() - ($1 || ' days')::interval",
     )
     .bind(due_days.to_string())
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(res.rows_affected())
 }

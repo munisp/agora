@@ -19,9 +19,12 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use sqlx::{Postgres, Transaction};
+
 use crate::invoices::{self, BillingError};
 use crate::models::{Invoice, InvoiceStatus, RateCard};
 use crate::payments_qr;
+use crate::tenant;
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -86,16 +89,23 @@ impl From<sqlx::Error> for ApiError {
 
 /// `X-Tenant-ID` must be present and equal the route's tenant.
 fn require_tenant(headers: &HeaderMap, tenant_id: Uuid) -> Result<(), ApiError> {
-    let hdr = headers
-        .get("x-tenant-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::forbidden("missing X-Tenant-ID header"))?;
-    let parsed = Uuid::parse_str(hdr.trim())
-        .map_err(|_| ApiError::forbidden("malformed X-Tenant-ID header"))?;
+    let parsed = tenant_from_header(headers)?;
     if parsed != tenant_id {
         return Err(ApiError::forbidden("X-Tenant-ID does not match tenant"));
     }
     Ok(())
+}
+
+/// Parse the request's tenant context (`X-Tenant-ID`, gateway-validated; the
+/// gateway strips client-spoofed copies since W34 GF4). This tenant is what
+/// the RLS GUC is set to for the request's transactions (GF6).
+fn tenant_from_header(headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    let hdr = headers
+        .get("x-tenant-id")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::forbidden("missing X-Tenant-ID header"))?;
+    Uuid::parse_str(hdr.trim())
+        .map_err(|_| ApiError::forbidden("malformed X-Tenant-ID header"))
 }
 
 /// `x-user-roles` (gateway-injected, comma/space separated realm roles) must
@@ -120,17 +130,25 @@ fn require_owner_or_admin(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
-/// Load an invoice and enforce tenant match in one step.
-async fn load_scoped_invoice(
+/// Begin a tenant-scoped transaction (GF6: `app.tenant_id` GUC from the
+/// gateway-validated header) and load the invoice inside it. Under RLS a
+/// cross-tenant id is simply invisible (404); when RLS is bypassed (dev
+/// superuser pool) the explicit tenant check below still forbids it (403) —
+/// the header check is kept as a second layer, not the only one.
+async fn begin_scoped_invoice_tx(
     st: &AppState,
     headers: &HeaderMap,
     id: Uuid,
-) -> Result<Invoice, ApiError> {
-    let inv = invoices::get_invoice(&st.pool, id)
+) -> Result<(Transaction<'static, Postgres>, Invoice), ApiError> {
+    let tenant_id = tenant_from_header(headers)?;
+    let mut tx = tenant::begin_tenant_tx(&st.pool, tenant_id).await?;
+    let inv = invoices::get_invoice(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("invoice not found: {id}")))?;
-    require_tenant(headers, inv.tenant_id)?;
-    Ok(inv)
+    if inv.tenant_id != tenant_id {
+        return Err(ApiError::forbidden("X-Tenant-ID does not match tenant"));
+    }
+    Ok((tx, inv))
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +232,7 @@ async fn upsert_rate_card(
             "unit_price_cents and included_quota must be >= 0",
         ));
     }
+    let mut tx = tenant::begin_tenant_tx(&st.pool, tenant_id).await?;
     sqlx::query(
         "INSERT INTO rate_cards (tenant_id, metric, unit_price_cents, included_quota, currency) \
          VALUES ($1, $2, $3, $4, $5) \
@@ -227,8 +246,9 @@ async fn upsert_rate_card(
     .bind(body.unit_price_cents)
     .bind(body.included_quota)
     .bind(body.currency.trim().to_ascii_uppercase())
-    .execute(&st.pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Json(RateCard {
         tenant_id,
         metric: body.metric.trim().to_string(),
@@ -248,7 +268,9 @@ async fn generate_invoice(
 ) -> Result<(StatusCode, Json<Invoice>), ApiError> {
     require_tenant(&headers, body.tenant_id)?;
     require_owner_or_admin(&headers)?;
-    let inv = invoices::generate_invoice(&st.pool, body.tenant_id, &body.period).await?;
+    let mut tx = tenant::begin_tenant_tx(&st.pool, body.tenant_id).await?;
+    let inv = invoices::generate_invoice(&mut tx, body.tenant_id, &body.period).await?;
+    tx.commit().await?;
     Ok((StatusCode::CREATED, Json(inv)))
 }
 
@@ -265,7 +287,9 @@ async fn list_invoices(
         ),
         None => None,
     };
-    let inv = invoices::list_invoices(&st.pool, params.tenant_id, status).await?;
+    let mut tx = tenant::begin_tenant_tx(&st.pool, params.tenant_id).await?;
+    let inv = invoices::list_invoices(&mut tx, params.tenant_id, status).await?;
+    tx.commit().await?;
     Ok(Json(inv))
 }
 
@@ -274,7 +298,8 @@ async fn get_invoice(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Invoice>, ApiError> {
-    let inv = load_scoped_invoice(&st, &headers, id).await?;
+    let (tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    tx.commit().await?;
     Ok(Json(inv))
 }
 
@@ -283,10 +308,16 @@ async fn issue_invoice(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Invoice>, ApiError> {
-    let inv = load_scoped_invoice(&st, &headers, id).await?;
-    invoices::transition_invoice(&st.pool, id, InvoiceStatus::Issued).await?;
+    let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    invoices::transition_invoice(&mut tx, id, InvoiceStatus::Issued).await?;
+    let updated = invoices::get_invoice(&mut tx, id)
+        .await?
+        .ok_or_else(|| ApiError::internal("invoice vanished after issue"))?;
+    tx.commit().await?;
     // Ledger: invoice issued -> DR AR-control / CR revenue (code 200).
-    // Zero-amount invoices skip the posting (the ledger rejects 0).
+    // Zero-amount invoices skip the posting (the ledger rejects 0). Posted
+    // after the DB commit, exactly like before GF6 (failures are warn-level,
+    // not rolled back).
     if inv.subtotal_cents > 0 {
         if let Err(e) = st
             .ledger
@@ -296,9 +327,6 @@ async fn issue_invoice(
             tracing::warn!(error = %e, invoice_id = %id, "ledger issued posting failed");
         }
     }
-    let updated = invoices::get_invoice(&st.pool, id)
-        .await?
-        .ok_or_else(|| ApiError::internal("invoice vanished after issue"))?;
     Ok(Json(updated))
 }
 
@@ -307,12 +335,13 @@ async fn void_invoice(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Invoice>, ApiError> {
-    let inv = load_scoped_invoice(&st, &headers, id).await?;
+    let (mut tx, _inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
     require_owner_or_admin(&headers)?;
-    invoices::transition_invoice(&st.pool, id, InvoiceStatus::Void).await?;
-    let updated = invoices::get_invoice(&st.pool, id)
+    invoices::transition_invoice(&mut tx, id, InvoiceStatus::Void).await?;
+    let updated = invoices::get_invoice(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::internal("invoice vanished after void"))?;
+    tx.commit().await?;
     Ok(Json(updated))
 }
 
@@ -325,7 +354,8 @@ async fn payment_link(
     headers: HeaderMap,
     body: Option<Json<PaymentLinkBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let inv = load_scoped_invoice(&st, &headers, id).await?;
+    let (tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    tx.commit().await?; // don't hold a pooled connection across the Paystack HTTP call
     if !matches!(inv.status, InvoiceStatus::Issued | InvoiceStatus::PastDue) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -363,7 +393,9 @@ async fn payment_link(
                 payments_qr::paystack_initialize(&st.http, secret, &req)
                     .await
                     .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
-            invoices::set_payment_ref(&st.pool, id, &authorization_url).await?;
+            let mut tx = tenant::begin_tenant_tx(&st.pool, inv.tenant_id).await?;
+            invoices::set_payment_ref(&mut tx, id, &authorization_url).await?;
+            tx.commit().await?;
             Ok(Json(serde_json::json!({
                 "invoice_id": reference,
                 "mode": "paystack",
@@ -379,7 +411,9 @@ async fn payment_link(
                 &inv.currency,
                 &reference,
             );
-            invoices::set_payment_ref(&st.pool, id, &payload).await?;
+            let mut tx = tenant::begin_tenant_tx(&st.pool, inv.tenant_id).await?;
+            invoices::set_payment_ref(&mut tx, id, &payload).await?;
+            tx.commit().await?;
             Ok(Json(serde_json::json!({
                 "invoice_id": reference,
                 "mode": "static",
@@ -395,7 +429,8 @@ async fn invoice_qr(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let inv = load_scoped_invoice(&st, &headers, id).await?;
+    let (tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    tx.commit().await?;
     let payment_ref = inv.payment_ref.clone().ok_or_else(|| {
         ApiError::new(
             StatusCode::NOT_FOUND,
@@ -458,12 +493,36 @@ async fn paystack_webhook(
     };
 
     // Idempotent paid transition: already-paid is a 200 replay (B3).
-    match invoices::mark_paid_idempotent(&st.pool, invoice_id).await {
-        Ok(None) => Ok(Json(serde_json::json!({ "status": "already_paid" }))),
+    // GF6: the webhook has no tenant header — it authenticates via the
+    // Paystack HMAC signature instead. The invoice lookup therefore runs on
+    // the internal pool (role-gated cross-tenant access); once the row is
+    // found, `app.tenant_id` is pinned to the invoice's own tenant for the
+    // transition, so the write path stays tenant-scoped even here.
+    let mut tx = tenant::begin_internal_tx(&st.internal_pool).await?;
+    let looked_up = match invoices::get_invoice(&mut tx, invoice_id).await {
+        Ok(inv) => inv,
+        Err(e) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError::from(BillingError::from(e)));
+        }
+    };
+    let Some(inv) = looked_up else {
+        let _ = tx.rollback().await;
+        // Reference shaped like our invoices but unknown; ack.
+        tracing::warn!(invoice_id = %invoice_id, "paystack webhook: invoice not found");
+        return Ok(Json(serde_json::json!({ "status": "ignored" })));
+    };
+    tenant::set_tenant_guc(&mut tx, inv.tenant_id).await?;
+    match invoices::mark_paid_idempotent(&mut tx, invoice_id).await {
+        Ok(None) => {
+            tx.commit().await?;
+            Ok(Json(serde_json::json!({ "status": "already_paid" })))
+        }
         Ok(Some(_prev)) => {
-            let inv = invoices::get_invoice(&st.pool, invoice_id)
+            let inv = invoices::get_invoice(&mut tx, invoice_id)
                 .await?
                 .ok_or_else(|| ApiError::internal("invoice vanished after payment"))?;
+            tx.commit().await?;
             // Ledger: invoice paid -> DR payments-clearing / CR AR (code 202).
             if inv.subtotal_cents > 0 {
                 if let Err(e) = st
@@ -491,11 +550,16 @@ async fn paystack_webhook(
             .await;
             Ok(Json(serde_json::json!({ "status": "paid" })))
         }
+        // NotFound cannot occur here (the row was just loaded above), but
+        // keep the ack-on-missing contract for defense in depth.
         Err(BillingError::NotFound(_)) => {
-            // Reference shaped like our invoices but unknown; ack.
+            let _ = tx.rollback().await;
             tracing::warn!(invoice_id = %invoice_id, "paystack webhook: invoice not found");
             Ok(Json(serde_json::json!({ "status": "ignored" })))
         }
-        Err(e) => Err(ApiError::from(e)),
+        Err(e) => {
+            let _ = tx.rollback().await;
+            Err(ApiError::from(e))
+        }
     }
 }
