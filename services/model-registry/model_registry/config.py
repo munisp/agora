@@ -14,6 +14,12 @@ class Settings:
         "postgresql://app_model_registry_login:app_model_registry_dev_password"
         "@localhost:5432/platform"
     )
+    # SPEC-W34 GF1: DSN for internal batch jobs, connecting as
+    # `app_model_registry_batch` (member of the RLS-internal role group).
+    # Production compose ALWAYS sets MODEL_REGISTRY_INTERNAL_DSN; None means
+    # the store falls back to the primary DSN (unit-test path, logged as a
+    # warning — cross-tenant batch reads then see no rows under RLS).
+    pg_internal_dsn: str | None = None
     kafka_enabled: bool = True
     kafka_bootstrap_servers: str = "kafka:9092"
     alerts_topic: str = "ops.alerts"
@@ -43,6 +49,7 @@ def load_settings() -> Settings:
     return Settings(
         port=int(os.getenv("PORT", "7019")),
         pg_dsn=os.getenv("MODEL_REGISTRY_PG_DSN", Settings.pg_dsn),
+        pg_internal_dsn=os.getenv("MODEL_REGISTRY_INTERNAL_DSN") or None,
         kafka_enabled=_bool("KAFKA_ENABLED", True),
         kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
         alerts_topic=os.getenv("ALERTS_TOPIC", "ops.alerts"),

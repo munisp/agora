@@ -16,9 +16,15 @@
 -- The service sets `app.tenant_id` via set_config(..., true) inside every
 -- transaction (single write path, I4). ONE deliberate extension: the service's
 -- internal batch jobs (drift sweep, nightly trainer) must enumerate rows across
--- tenants, so a second GUC `app.registry_internal = 'on'` grants read access for
--- those jobs only. HTTP request paths never set it; when neither GUC is set the
--- policy is fail-closed (no rows visible).
+-- tenants. SPEC-W34 GF1: that used to be a second GUC
+-- `app.registry_internal = 'on'`, but ANY session as the login role could set
+-- it (set_config needs no privilege) and read/UPDATE/DELETE all tenants.
+-- Internal access is now gated on ROLE MEMBERSHIP instead:
+--   pg_has_role(current_user, 'app_model_registry_internal', 'USAGE')
+-- — a property of the connected role that no GUC can forge. Internal jobs
+-- connect as `app_model_registry_batch` (MODEL_REGISTRY_INTERNAL_DSN); HTTP
+-- request paths keep using `app_model_registry_login`, which is NOT a member,
+-- so the policy is fail-closed for them when `app.tenant_id` is unset.
 
 -- ---------------------------------------------------------------------------
 -- Roles (cluster-wide; same NOLOGIN group + LOGIN member pattern as 05)
@@ -30,6 +36,16 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_model_registry_login') THEN
         CREATE ROLE app_model_registry_login LOGIN PASSWORD 'app_model_registry_dev_password' IN ROLE app_model_registry;
+    END IF;
+    -- SPEC-W34 GF1: cross-tenant internal access group. NOLOGIN — privilege is
+    -- only ever reached through membership, never by connecting directly.
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_model_registry_internal') THEN
+        CREATE ROLE app_model_registry_internal NOLOGIN NOINHERIT;
+    END IF;
+    -- Batch/internal LOGIN role (drift sweep, nightly trainer). DEV PASSWORD,
+    -- dev-compose only — rotate via secrets in production (docs/runbooks/secrets.md).
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_model_registry_batch') THEN
+        CREATE ROLE app_model_registry_batch LOGIN PASSWORD 'app_model_registry_batch_dev_password' IN ROLE app_model_registry_internal;
     END IF;
 END
 $$;
@@ -167,41 +183,41 @@ ALTER TABLE model_version ENABLE ROW LEVEL SECURITY;
 ALTER TABLE model_version FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON model_version
     USING (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on')
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on');
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE experiments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE experiments FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON experiments
     USING (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on')
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on');
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE experiment_outcomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE experiment_outcomes FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON experiment_outcomes
     USING (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on')
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on');
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE feature_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feature_observations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON feature_observations
     USING (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on')
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on');
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE score_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE score_observations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON score_observations
     USING (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on')
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
-           OR current_setting('app.registry_internal', true) = 'on');
+           OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 -- ---------------------------------------------------------------------------
 -- Grants to the service role (05-app-roles.sql pattern)
@@ -210,6 +226,12 @@ GRANT CONNECT ON DATABASE platform TO app_model_registry;
 GRANT USAGE ON SCHEMA public TO app_model_registry;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_model_registry;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_model_registry;
+-- SPEC-W34 GF1: the internal group needs the same table reach — the RLS
+-- policies gate on membership, but membership alone grants no privileges.
+GRANT CONNECT ON DATABASE platform TO app_model_registry_internal;
+GRANT USAGE ON SCHEMA public TO app_model_registry_internal;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_model_registry_internal;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_model_registry_internal;
 -- Default privileges reference the bootstrap superuser `opendesk`, which
 -- exists in the docker Postgres image but NOT in the embedded test Postgres
 -- (pgserver, bootstrap user `postgres`) — hence the existence guard so this
@@ -221,6 +243,10 @@ BEGIN
                 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_model_registry';
         EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public '
                 'GRANT USAGE, SELECT ON SEQUENCES TO app_model_registry';
+        EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_model_registry_internal';
+        EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_model_registry_internal';
     END IF;
 END
 $$;

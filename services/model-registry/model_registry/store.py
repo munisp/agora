@@ -7,9 +7,13 @@ set_config(..., is_local=true)) explicit and matches the slim-image deps.
 
 RLS discipline: every transaction that touches tenant tables sets
 `app.tenant_id` transaction-locally. Cross-tenant enumeration exists ONLY for
-the internal batch jobs (drift sweep / nightly trainer) and uses
-`app.registry_internal='on'` — HTTP request handlers never pass internal=True.
-With neither GUC set the RLS policies are fail-closed (no rows visible).
+the internal batch jobs (drift sweep / nightly trainer); SPEC-W34 GF1 moved
+that gate off the forgeable `app.registry_internal` GUC onto ROLE MEMBERSHIP:
+internal transactions connect as `app_model_registry_batch`
+(`MODEL_REGISTRY_INTERNAL_DSN`) and the RLS policies check
+`pg_has_role(current_user, 'app_model_registry_internal')`. HTTP request
+handlers never pass internal=True and the plain login role is not a member,
+so with no tenant GUC set the policies are fail-closed (no rows visible).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator
+from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
@@ -44,22 +49,31 @@ def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class RegistryStore:
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, internal_dsn: str | None = None) -> None:
         self.dsn = dsn
+        # SPEC-W34 GF1: internal (cross-tenant) transactions MUST connect as
+        # the batch role. Production compose always sets
+        # MODEL_REGISTRY_INTERNAL_DSN; the fallback to the primary DSN exists
+        # ONLY for unit tests without a second role — it cannot see across
+        # tenants (the login role is not in app_model_registry_internal).
+        self.internal_dsn = internal_dsn
+        if internal_dsn is None:
+            log.warning(
+                "MODEL_REGISTRY_INTERNAL_DSN unset: internal transactions fall "
+                "back to the primary DSN (unit-test path only; cross-tenant "
+                "batch reads will return no rows under RLS)")
 
     @contextmanager
-    def _tx(self, tenant_id: str | None = None, *,
+    def _tx(self, tenant_id: str | UUID | None = None, *,
             internal: bool = False) -> Iterator[Any]:
-        conn = psycopg.connect(self.dsn, row_factory=dict_row)
+        dsn = self.internal_dsn if (internal and self.internal_dsn) else self.dsn
+        conn = psycopg.connect(dsn, row_factory=dict_row)
         try:
             with conn.transaction():
                 if tenant_id is not None:
                     conn.execute(
                         "SELECT set_config('app.tenant_id', %s, true)",
                         (str(tenant_id),))
-                if internal:
-                    conn.execute(
-                        "SELECT set_config('app.registry_internal', 'on', true)")
                 yield conn
         finally:
             conn.close()
@@ -87,7 +101,7 @@ class RegistryStore:
         return [r["name"] for r in rows]
 
     # ------------------------------------------------------------ model version
-    def register_version(self, *, family: str, tenant_id: str,
+    def register_version(self, *, family: str, tenant_id: str | UUID,
                          artifact_uri: str, metrics: dict | None = None,
                          seed: int | None = None, dataset_hash: str | None = None,
                          git_sha: str | None = None,
@@ -116,14 +130,14 @@ class RegistryStore:
             ).fetchone()
             return _row_to_dict(row)
 
-    def get_production(self, family: str, tenant_id: str) -> dict[str, Any] | None:
+    def get_production(self, family: str, tenant_id: str | UUID) -> dict[str, Any] | None:
         with self._tx(tenant_id) as conn:
             row = conn.execute(
                 "SELECT * FROM model_version WHERE family = %s AND tenant_id = %s"
                 " AND stage = 'production'", (family, tenant_id)).fetchone()
             return _row_to_dict(row) if row else None
 
-    def get_version(self, family: str, tenant_id: str,
+    def get_version(self, family: str, tenant_id: str | UUID,
                     version: int) -> dict[str, Any] | None:
         with self._tx(tenant_id) as conn:
             row = conn.execute(
@@ -131,7 +145,7 @@ class RegistryStore:
                 " AND version = %s", (family, tenant_id, version)).fetchone()
             return _row_to_dict(row) if row else None
 
-    def list_versions(self, family: str, tenant_id: str) -> list[dict[str, Any]]:
+    def list_versions(self, family: str, tenant_id: str | UUID) -> list[dict[str, Any]]:
         with self._tx(tenant_id) as conn:
             rows = conn.execute(
                 "SELECT * FROM model_version WHERE family = %s AND tenant_id = %s"
@@ -146,7 +160,7 @@ class RegistryStore:
                 " ORDER BY family, tenant_id").fetchall()
             return [_row_to_dict(r) for r in rows]
 
-    def promote(self, family: str, tenant_id: str,
+    def promote(self, family: str, tenant_id: str | UUID,
                 version: int) -> dict[str, Any]:
         """staging → production, atomically archiving the current production
         in ONE transaction. The partial unique index guarantees
@@ -172,7 +186,7 @@ class RegistryStore:
             raise Conflict(
                 f"concurrent promote for {family}/{tenant_id}: {exc}") from exc
 
-    def rollback(self, family: str, tenant_id: str) -> dict[str, Any]:
+    def rollback(self, family: str, tenant_id: str | UUID) -> dict[str, Any]:
         """Re-promote the most recent ARCHIVED version (created_at desc,
         version desc), archiving the current production in one transaction."""
         try:
@@ -199,7 +213,7 @@ class RegistryStore:
                 f"concurrent rollback for {family}/{tenant_id}: {exc}") from exc
 
     # ------------------------------------------------------------------ A/B
-    def create_experiment(self, *, family: str, tenant_id: str,
+    def create_experiment(self, *, family: str, tenant_id: str | UUID,
                           champion_version: int, challenger_version: int,
                           pct: int, starts_at: datetime | None = None,
                           ends_at: datetime | None = None) -> dict[str, Any]:
@@ -214,7 +228,7 @@ class RegistryStore:
                  starts_at, ends_at)).fetchone()
             return _row_to_dict(row)
 
-    def get_experiment(self, experiment_id: str) -> dict[str, Any] | None:
+    def get_experiment(self, experiment_id: str | UUID) -> dict[str, Any] | None:
         """Internal read (experiment id is the lookup key; tenant resolved
         from the row for subsequent scoped reads)."""
         with self._tx(internal=True) as conn:
@@ -223,7 +237,7 @@ class RegistryStore:
                 (experiment_id,)).fetchone()
             return _row_to_dict(row) if row else None
 
-    def get_active_experiment(self, family: str, tenant_id: str,
+    def get_active_experiment(self, family: str, tenant_id: str | UUID,
                               now: datetime) -> dict[str, Any] | None:
         with self._tx(tenant_id) as conn:
             row = conn.execute(
@@ -234,8 +248,8 @@ class RegistryStore:
                 (family, tenant_id, now, now)).fetchone()
             return _row_to_dict(row) if row else None
 
-    def stop_experiment(self, experiment_id: str,
-                        tenant_id: str) -> dict[str, Any]:
+    def stop_experiment(self, experiment_id: str | UUID,
+                        tenant_id: str | UUID) -> dict[str, Any]:
         with self._tx(tenant_id) as conn:
             row = conn.execute(
                 "UPDATE experiments SET status = 'stopped' WHERE id = %s"
@@ -244,7 +258,7 @@ class RegistryStore:
                 raise NotFound(f"experiment {experiment_id} not found")
             return _row_to_dict(row)
 
-    def record_outcome(self, *, experiment_id: str, tenant_id: str,
+    def record_outcome(self, *, experiment_id: str | UUID, tenant_id: str | UUID,
                        person_id: str, assigned_arm: str,
                        predicted_label: int, predicted_score: float,
                        true_label: int | None = None) -> dict[str, Any]:
@@ -258,8 +272,8 @@ class RegistryStore:
                  predicted_label, predicted_score, true_label)).fetchone()
             return _row_to_dict(row)
 
-    def experiment_report(self, experiment_id: str,
-                          tenant_id: str) -> list[dict[str, Any]]:
+    def experiment_report(self, experiment_id: str | UUID,
+                          tenant_id: str | UUID) -> list[dict[str, Any]]:
         """Per-arm precision/recall/Brier over LABELED outcomes (pure SQL)."""
         rows_sql = """
             SELECT assigned_arm,
@@ -295,7 +309,7 @@ class RegistryStore:
         return report
 
     # -------------------------------------------------- drift observation sinks
-    def record_scores(self, *, family: str, tenant_id: str,
+    def record_scores(self, *, family: str, tenant_id: str | UUID,
                       scores: list[float],
                       observed_at: datetime | None = None) -> int:
         with self._tx(tenant_id) as conn:
@@ -306,7 +320,7 @@ class RegistryStore:
                     (family, tenant_id, float(s), observed_at))
             return len(scores)
 
-    def record_features(self, *, family: str, tenant_id: str,
+    def record_features(self, *, family: str, tenant_id: str | UUID,
                         features: dict[str, list[float]],
                         observed_at: datetime | None = None) -> int:
         n = 0
@@ -321,7 +335,7 @@ class RegistryStore:
                     n += 1
         return n
 
-    def score_window(self, family: str, tenant_id: str,
+    def score_window(self, family: str, tenant_id: str | UUID,
                      start: datetime, end: datetime) -> list[float]:
         with self._tx(tenant_id) as conn:
             rows = conn.execute(
@@ -331,7 +345,7 @@ class RegistryStore:
                 (family, tenant_id, start, end)).fetchall()
         return [float(r["score"]) for r in rows]
 
-    def feature_window(self, family: str, tenant_id: str,
+    def feature_window(self, family: str, tenant_id: str | UUID,
                        start: datetime, end: datetime) -> dict[str, list[float]]:
         with self._tx(tenant_id) as conn:
             rows = conn.execute(
