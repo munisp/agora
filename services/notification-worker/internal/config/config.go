@@ -1,5 +1,5 @@
 // Package config loads notification-worker configuration from environment
-// variables (envconfig style, no external dependency).
+// variables (envconfig style, no external dependency — identity-service pattern).
 package config
 
 import (
@@ -11,43 +11,42 @@ import (
 
 // Config holds all runtime configuration for notification-worker.
 type Config struct {
-	Port              int    // HTTP listen port for /healthz + /dev endpoints (7003)
-	TemporalHostPort  string // temporal:7233
-	TemporalNamespace string // opendesk
-	TemporalTaskQueue string // opendesk-main
-	DaprHost          string // daprd-notification
-	DaprHTTPPort      int    // 3500
-	BookingAppID      string // Dapr app-id of booking-service
-	PaymentsAppID     string // Dapr app-id of payments-service
-	IdentityAppID     string // Dapr app-id of identity-service
-	KnowledgeAppID    string // Dapr app-id of knowledge-service (pack knowledge seed)
-	CRMSyncAppID      string // Dapr app-id of crm-sync-service (CRM task helper)
-	PubSubName        string // Dapr pubsub component for CRM events
-	CRMEventsTopic    string // topic for escalation priority flags
-	IndustriesDir     string // mounted industry packs dir (INDUSTRIES_DIR, default /industries)
-	SMTPBinding       string // Dapr output binding for email (bindings-smtp)
-	TwilioBinding     string // Dapr output binding for SMS (bindings-twilio)
-	// Messaging channel routing (docs/integrations/messaging-channels.md).
-	MessagingChannels  string // MESSAGING_CHANNELS: "email:smtp,sms:twilio"
-	TenantChannelMap   string // TENANT_CHANNEL_MAP: per-tenant provider JSON
-	SMTPFrom           string // sender address
-	TwilioFrom         string // sender phone number
-	OpenSearchURL      string // used by the tenant onboarding search-alias activity
-	PublicBaseURL      string // user-facing base URL for waitlist claim links (PUBLIC_BASE_URL)
-	KafkaBrokers       string // comma-separated broker list for the booking-events signal bridge
-	BookingEventsTopic string // topic consumed by the signal bridge
-	SignalGroup        string // consumer group of the signal bridge
-	// Outbound webhook platform (Wave 5 #10) + notifications outbox (#7)
-	DatabaseURL              string // notifications DB DSN (empty = webhook platform disabled)
-	ConversationEventsTopic  string // opendesk.conversation.events (webhook dispatcher source)
-	WebhookGroup             string // consumer group of the webhook dispatcher
-	NotificationsOutboxTopic string // opendesk.notifications.outbox (SendPortalCode etc.)
-	NotificationsOutboxGroup string // consumer group of the outbox consumer
-	// SPEC-W32 WS-B: civic case events (CIVIC_EVENTS_TOPIC; unset →
-	// opendesk.civic.events.v1, "off" disables the consumer entirely).
-	CivicEventsTopic       string // opendesk.civic.events.v1
-	CivicEventsGroup       string // consumer group of the civic consumer
-	CivicEscalationTopic   string // SLA-breach escalation events (default = civic events topic)
+	Port               int           // HTTP listen port (health + Dapr pubsub callback, default 7003)
+	TemporalHostPort   string        // TEMPORAL_HOST_PORT (default temporal:7233)
+	TemporalNamespace  string        // TEMPORAL_NAMESPACE (default opendesk)
+	TemporalTaskQueue  string        // TEMPORAL_TASK_QUEUE (default opendesk-main)
+	DaprHost           string        // daprd host (default daprd-notification)
+	DaprHTTPPort       int           // daprd HTTP port (default 3500)
+	BookingAppID       string        // Dapr app-id of booking-service (booking)
+	PaymentsAppID      string        // Dapr app-id of payments-service (payments)
+	IdentityAppID      string        // Dapr app-id of identity-service (identity)
+	KnowledgeAppID     string        // Dapr app-id of knowledge-service (knowledge)
+	CRMSyncAppID       string        // Dapr app-id of crm-sync-service (crm-sync)
+	PubSubName         string        // Dapr pubsub component (pubsub-kafka)
+	CRMEventsTopic     string        // opendesk.crm.events
+	IndustriesDir      string        // INDUSTRIES_DIR: industry pack YAML dir (/industries)
+	SMTPBinding        string        // Dapr smtp output binding name (bindings-smtp)
+	TwilioBinding      string        // Dapr twilio output binding name (bindings-twilio)
+	MessagingChannels  string        // MESSAGING_CHANNELS: default channel map, e.g. email:smtp,sms:twilio
+	TenantChannelMap   string        // TENANT_CHANNEL_MAP: per-tenant overrides JSON
+	SMTPFrom           string        // SMTP_FROM: envelope sender
+	TwilioFrom         string        // TWILIO_FROM: sender msisdn
+	OpenSearchURL      string        // OPENSEARCH_URL: tenant alias management
+	PublicBaseURL      string        // PUBLIC_BASE_URL: base for public links (booking pages)
+	KafkaBrokers       string        // KAFKA_BROKERS: signal/outbox consumers
+	BookingEventsTopic string        // opendesk.booking.events (booking lifecycle signals)
+	SignalGroup        string        // SIGNAL_GROUP: consumer group for booking events
+	DatabaseURL        string        // DATABASE_URL: outbox/webhook subscriptions store
+	ConversationEventsTopic  string // opendesk.conversation.events (SPEC-W6 Part B)
+	WebhookGroup             string // WEBHOOK_GROUP: consumer group for webhook dispatcher
+	NotificationsOutboxTopic string // opendesk.notifications.outbox (SPEC-W6 Part C)
+	NotificationsOutboxGroup string // NOTIFICATIONS_OUTBOX_GROUP
+	CivicEventsTopic         string // opendesk.civic.events.v1 (SPEC-W32 WS-B)
+	CivicEventsGroup         string // CIVIC_EVENTS_GROUP: consumer group for civic events
+	CivicEscalationTopic     string // CIVIC_ESCALATION_TOPIC: SLA-breach escalation sink
+	// SPEC-W34 GF16: ops alerts topic for saga compensation exhaustion
+	// (com.opendesk.ops.SagaCompensationExhausted — see activities/ops_alerts.go).
+	OpsAlertsTopic         string
 	CivicStatusChannel     string // citizen status notification channel (sms)
 	WebhookSigningRequired bool   // require a signing secret on subscription create
 	// GDPR (SPEC-W3 §2 innovation 13)
@@ -117,6 +116,7 @@ func Load() Config {
 		CivicEventsTopic:         envStr("CIVIC_EVENTS_TOPIC", "opendesk.civic.events.v1"),
 		CivicEventsGroup:         envStr("CIVIC_EVENTS_GROUP", "notification-civic"),
 		CivicEscalationTopic:     envStr("CIVIC_ESCALATION_TOPIC", "opendesk.civic.events.v1"),
+		OpsAlertsTopic:           envStr("OPS_ALERTS_TOPIC", "opendesk.ops.alerts"),
 		CivicStatusChannel:       envStr("CIVIC_STATUS_CHANNEL", "sms"),
 		WebhookSigningRequired:   envStr("WEBHOOK_SIGNING_REQUIRED", "false") == "true",
 		ConversationAppID:        envStr("CONVERSATION_APP_ID", "conversation"),
