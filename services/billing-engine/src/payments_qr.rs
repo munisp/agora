@@ -384,12 +384,15 @@ mod tests {
             "NGN",
             "9b0b0d52-1c8b-4d3f-9e2a-6f6a2b7c1d20",
         );
+        // NOTE: the space in the merchant name "OPENDESK DEMO" is a legitimate
+        // payload byte (tag 59, length 13) — Rust's `\`-continuation already
+        // strips the source line breaks/indentation, so no `.replace(' ',"")`
+        // here (that used to nuke the merchant-name space and fail the test).
         assert_eq!(
             p,
             "00020101020226350008OPENDESK0119OPENDESK/0123456789520400005303566540\
              71250.005802NG5913OPENDESK DEMO624005369b0b0d52-1c8b-4d3f-9e2a-6f6a\
              2b7c1d2063046EBD"
-                .replace(' ', "")
         );
         // Payload must end with its own CRC16.
         let (body, crc) = p.split_at(p.len() - 4);

@@ -6,6 +6,14 @@ pub struct Config {
     pub port: u16,
     /// Postgres DSN for the `billing` database (per-service role supported).
     pub database_url: String,
+    /// Optional DSN for cross-tenant internal jobs (dunning sweep, Paystack
+    /// webhook invoice lookup) — SPEC-W34 GF6. Point this at the
+    /// `app_billing_internal_login` role (see migrations/0002_rls.sql) in any
+    /// deployment where DATABASE_URL uses the least-privilege `app_billing`
+    /// role; when unset, internal jobs share the main pool (fine for the dev
+    /// default, where DATABASE_URL is the bootstrap superuser which bypasses
+    /// RLS anyway).
+    pub internal_database_url: Option<String>,
     pub kafka_brokers: String,
     pub kafka_group_id: String,
     /// Source topic for CloudEvents usage records (B1).
@@ -54,6 +62,9 @@ impl Config {
                 "DATABASE_URL",
                 "postgres://opendesk:opendesk@postgres:5432/billing",
             ),
+            internal_database_url: std::env::var("INTERNAL_DATABASE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             kafka_brokers: env_or("KAFKA_BROKERS", "kafka:9092"),
             kafka_group_id: env_or("KAFKA_GROUP_ID", "billing-engine"),
             usage_events_topic: env_or("USAGE_EVENTS_TOPIC", "opendesk.usage.events"),

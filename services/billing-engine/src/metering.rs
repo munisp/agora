@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::{RawCloudEvent, UsageRecordData};
+use crate::tenant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageOutcome {
@@ -38,15 +39,25 @@ async fn record_usage_data(
     event_id: &str,
     data: &UsageRecordData,
 ) -> Result<UsageOutcome, String> {
+    // GF6: claim + insert run in ONE transaction with the RLS tenant GUC set
+    // from the event payload (0002 policies are fail-closed without it). This
+    // also makes the event-id claim atomic with the usage row: a crash
+    // mid-write now rolls the claim back instead of stranding it.
+    let mut tx = tenant::begin_tenant_tx(pool, data.tenant_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Claim the event id first; a concurrent/duplicate delivery loses the race.
     let claimed = sqlx::query(
         "INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT (event_id) DO NOTHING",
     )
     .bind(event_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
     if claimed.rows_affected() == 0 {
+        // Rolling back releases the transaction without touching anything.
+        let _ = tx.rollback().await;
         return Ok(UsageOutcome::Duplicate);
     }
 
@@ -65,9 +76,10 @@ async fn record_usage_data(
     .bind(data.ts)
     .bind(&meta)
     .bind(event_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(UsageOutcome::Recorded)
 }
 

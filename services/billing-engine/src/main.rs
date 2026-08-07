@@ -14,6 +14,7 @@ mod metering;
 mod models;
 mod payments_qr;
 mod routes;
+mod tenant;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +34,11 @@ use crate::ledger::{BillingLedger, SimLedgerClient};
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    /// Pool for cross-tenant internal jobs (dunning sweep, Paystack webhook
+    /// invoice lookup) — SPEC-W34 GF6. Built from INTERNAL_DATABASE_URL (role
+    /// `app_billing_internal_login`); falls back to the main pool when unset
+    /// (dev default: bootstrap superuser, which bypasses RLS anyway).
+    pub internal_pool: PgPool,
     pub ledger: Arc<dyn BillingLedger>,
     /// rdkafka producer for opendesk.billing.events (None when Kafka is
     /// unavailable at boot; event publication degrades to logged + counted).
@@ -88,13 +94,13 @@ impl AppState {
     }
 }
 
-async fn connect_pool(cfg: &config::Config) -> Result<PgPool, Box<dyn std::error::Error>> {
+async fn connect_pool(database_url: &str) -> Result<PgPool, Box<dyn std::error::Error>> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         match PgPoolOptions::new()
             .max_connections(10)
-            .connect(&cfg.database_url)
+            .connect(database_url)
             .await
         {
             Ok(pool) => return Ok(pool),
@@ -124,13 +130,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting billing-engine"
     );
 
-    let pool = connect_pool(&cfg).await?;
+    let pool = connect_pool(&cfg.database_url).await?;
     // Idempotent schema bootstrap (same pattern as notification-worker; the
     // `billing` database itself is created by infra/postgres init scripts).
     sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
         .execute(&pool)
         .await?;
-    info!("billing schema applied");
+    // SPEC-W34 GF6: ENABLE+FORCE RLS on all billing tables. Applied by the
+    // same bootstrap connection (must own the tables — dev default uses the
+    // bootstrap superuser). Fail-closed: if RLS cannot be applied the service
+    // refuses to start rather than serving cross-tenant data.
+    sqlx::raw_sql(include_str!("../migrations/0002_rls.sql"))
+        .execute(&pool)
+        .await?;
+    info!("billing schema applied (incl. 0002 RLS)");
+
+    let internal_pool = match &cfg.internal_database_url {
+        Some(dsn) => {
+            info!("internal jobs pool: INTERNAL_DATABASE_URL configured");
+            connect_pool(dsn).await?
+        }
+        None => {
+            warn!(
+                "INTERNAL_DATABASE_URL unset; internal jobs (dunning, webhook lookup) \
+                 share the main pool — only safe while DATABASE_URL bypasses RLS \
+                 (dev superuser default)"
+            );
+            pool.clone()
+        }
+    };
 
     let producer: Option<FutureProducer> = match rdkafka::config::ClientConfig::new()
         .set("bootstrap.servers", &cfg.kafka_brokers)
@@ -146,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = AppState {
         pool,
+        internal_pool,
         ledger: Arc::new(SimLedgerClient::new()),
         producer,
         http: reqwest::Client::new(),

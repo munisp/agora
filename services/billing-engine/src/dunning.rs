@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::invoices;
+use crate::tenant;
 use crate::AppState;
 
 pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
@@ -27,10 +28,23 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
                 break;
             }
             _ = ticker.tick() => {
-                match invoices::mark_overdue(&state.pool, due_days).await {
-                    Ok(0) => {}
-                    Ok(n) => info!(marked = n, "dunning: invoices marked past_due"),
-                    Err(e) => error!(error = %e, "dunning sweep failed"),
+                // GF6: the sweep is cross-tenant, so it runs on the internal
+                // pool (role app_billing_internal_login; policy access via
+                // role membership, not a spoofable GUC).
+                match tenant::begin_internal_tx(&state.internal_pool).await {
+                    Ok(mut tx) => {
+                        match invoices::mark_overdue(&mut tx, due_days).await {
+                            Ok(n) => {
+                                if let Err(e) = tx.commit().await {
+                                    error!(error = %e, "dunning sweep commit failed");
+                                } else if n > 0 {
+                                    info!(marked = n, "dunning: invoices marked past_due");
+                                }
+                            }
+                            Err(e) => error!(error = %e, "dunning sweep failed"),
+                        }
+                    }
+                    Err(e) => error!(error = %e, "dunning sweep: begin transaction failed"),
                 }
             }
         }
