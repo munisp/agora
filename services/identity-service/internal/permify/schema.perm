@@ -1,0 +1,57 @@
+// schema.perm — EMBEDDED COPY for identity-service (SPEC-W34 GF15).
+// Canonical source: infra/permify/schema.perm — internal/permify/permify_test.go
+// asserts this file stays identical to the canonical schema (header excluded).
+// schema.perm — OpenDesk ReBAC model (SPEC §8), Permify DSL v1.
+// booking-service calls Permify gRPC Check before mutations with
+// subject = user:{JWT sub}, resource = organization:{tenant_id}.
+
+entity user {}
+
+entity organization {
+
+    relation owner  @user
+    relation admin  @user
+    relation member @user
+    relation viewer @user
+    relation analyst @user
+    relation billing @user
+
+    // Catalog (offerings/team/availability) management.
+    permission manage_catalog  = owner or admin
+    // Booking mutations (book/reschedule/cancel).
+    permission manage_bookings = owner or admin or member
+    // Dashboard read access.
+    permission view_dashboard  = owner or admin or member or viewer
+    // Public booking site /p/{siteSlug} publishing.
+    permission publish_site    = owner or admin
+    // KPI/analytics dashboards (Wave 7): read-only, no mutations.
+    permission view_analytics  = owner or admin or analyst
+    // Invoices, rate cards, payment links (Wave 7 billing-engine).
+    permission view_billing    = owner or billing
+    permission manage_billing  = owner or billing
+}
+
+entity offering {
+
+    // Parent organization (tenant).
+    relation org @organization
+
+    permission edit = org.manage_catalog
+    permission view = org.view_dashboard
+}
+
+entity booking {
+
+    relation org @organization
+
+    permission manage = org.manage_bookings
+    permission view   = org.view_dashboard
+}
+
+entity site {
+
+    relation org @organization
+
+    permission publish = org.publish_site
+    permission view    = org.view_dashboard
+}

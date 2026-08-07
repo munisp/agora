@@ -322,7 +322,22 @@ class DetectionRunner:
                     out.append(finding)
                     continue
                 events, degree = activity.get(finding.person_id, ([], 0))
-                result = scorer.score_events(events, degree)
+                try:
+                    result = scorer.score_events(events, degree)
+                except Exception as exc:  # noqa: BLE001 - SPEC-W34 GF9
+                    # Non-finite / failed ML score for ONE person must not
+                    # suppress the upgrade path for the others: this finding
+                    # falls back to the pure rule verdict (I1), the rest of
+                    # the batch still scores.
+                    log.warning(
+                        "ml scoring failed for %s/%s: %s (rule fallback)",
+                        tenant_id, finding.person_id, exc,
+                    )
+                    report.errors.append(
+                        f"{tenant_id}/ml_blend: {type(exc).__name__}: {exc}"
+                    )
+                    out.append(finding)
+                    continue
                 evidence = dict(finding.evidence)
                 evidence["ml_blend"] = scorer.blend_reason(result)
                 evidence["ml_score"] = round(result.score, 6)

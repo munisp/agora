@@ -5,6 +5,7 @@ package permify
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,16 @@ import (
 	"strings"
 	"time"
 )
+
+// Schema is the OpenDesk ReBAC model (SPEC §8), embedded from schema.perm
+// in this package — a copy of the canonical infra/permify/schema.perm
+// (permify_test.go asserts the two stay identical). SPEC-W34 GF15: every
+// per-tenant Permify tenant must have this schema written to it —
+// booking-service permission checks against /v1/tenants/{id}/permissions/
+// check fail-closed (502) on schema-less tenants.
+//
+//go:embed schema.perm
+var Schema string
 
 // Authorizer abstracts permission checks so handlers are testable and the
 // Permify backend can be swapped.
@@ -84,14 +95,31 @@ func (c *HTTPClient) WriteRelationship(ctx context.Context, tenantID, entity, re
 	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/relationships/write", body, nil)
 }
 
-// CreateTenant provisions a Permify tenant for relationship isolation.
+// CreateTenant provisions a Permify tenant for relationship isolation and
+// writes the OpenDesk ReBAC schema to it (SPEC-W34 GF15 — a tenant without
+// the schema fail-closes every booking-service permission check with 502).
+// Fail-closed: a schema write error is returned to the caller.
 func (c *HTTPClient) CreateTenant(ctx context.Context, tenantID, name string) error {
 	body := map[string]any{"id": tenantID, "name": name}
 	err := c.post(ctx, "/v1/tenants/create", body, nil)
-	if err != nil && strings.Contains(err.Error(), "status 409") {
-		return nil // already exists — idempotent
+	if err != nil && !strings.Contains(err.Error(), "status 409") {
+		return err
 	}
-	return err
+	// 409 = already exists — idempotent. The schema is (re)written on every
+	// call so tenants provisioned before GF15 self-heal on the next
+	// ensure-permify / onboarding call (schemas/write versions are additive).
+	if err := c.WriteSchema(ctx, tenantID); err != nil {
+		return fmt.Errorf("write schema for tenant %s: %w", tenantID, err)
+	}
+	return nil
+}
+
+// WriteSchema posts the embedded ReBAC schema to
+// POST /v1/tenants/{t}/schemas/write (same base-path convention as Check
+// and WriteRelationship; payload shape matches infra/permify/load-schema.sh).
+func (c *HTTPClient) WriteSchema(ctx context.Context, tenantID string) error {
+	body := map[string]any{"schema": Schema}
+	return c.post(ctx, "/v1/tenants/"+tenantID+"/schemas/write", body, nil)
 }
 
 func (c *HTTPClient) post(ctx context.Context, path string, body, out any) error {
