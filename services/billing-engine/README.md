@@ -45,7 +45,8 @@ Keycloak realm role `owner` or `admin` (403 otherwise).
 | Var | Default | Notes |
 | --- | --- | --- |
 | `PORT` | `7012` | listen port |
-| `DATABASE_URL` | `postgres://opendesk:opendesk@postgres:5432/billing` | per-service role supported (`BILLING_PG_USER/PASS` in compose) |
+| `DATABASE_URL` | `postgres://opendesk:opendesk@postgres:5432/billing` | per-service role supported (`BILLING_PG_USER/PASS` in compose). GF6 (SPEC-W34): `migrations/0002_rls.sql` enables FORCE RLS on all billing tables; the service sets `app.tenant_id` transaction-locally per request/tenant (`src/tenant.rs`), and the policies are fail-closed without it |
+| `INTERNAL_DATABASE_URL` | unset | GF6: DSN for cross-tenant internal jobs (dunning sweep, Paystack webhook lookup) — point at the `app_billing_internal_login` role when `DATABASE_URL` uses least-privilege `app_billing_login`; unset = share the main pool (fine for the dev superuser default, which bypasses RLS) |
 | `KAFKA_BROKERS` | `kafka:9092` | |
 | `KAFKA_GROUP_ID` | `billing-engine` | usage consumer group |
 | `USAGE_EVENTS_TOPIC` | `opendesk.usage.events` | B1 source |
