@@ -24,9 +24,11 @@ const (
 // ID types accepted by POST /v1/kyc/resolve.
 var validIDTypes = map[string]bool{"bvn": true, "nin": true}
 
-// Resolver resolves one BVN/NIN against an identity provider. MockResolver
-// is the default (KYC_MOCK=1); LiveResolver is the ASSUMPTION-shaped live
-// client behind KYC_PROVIDER_URL (no live keys in this wave — docs/kyc.md).
+// Resolver resolves one BVN/NIN against an identity provider. The live
+// provider is the default (SPEC-W34 GF8 — KYC_MOCK defaults off);
+// MockResolver is explicit dev opt-in (KYC_MOCK=1); LiveResolver is the
+// ASSUMPTION-shaped live client behind KYC_PROVIDER_URL (no live keys in
+// this wave — docs/kyc.md).
 type Resolver interface {
 	Resolve(ctx context.Context, idType, idValue string) (string, error)
 }

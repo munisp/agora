@@ -9,6 +9,14 @@ callers pass rows whose identifiers are already W28-style hashes (I6).
 ``FEATURE_SCHEMA = "fv1"`` is stamped in every meta.json and every ML-scored
 output; any change to dim count/order/meaning requires a schema bump.
 
+SPEC-W34 GF9 (clamp-to-safe, documented): hostile non-finite inputs
+(NaN/±inf amounts, coordinates, epochs, referral degrees) never propagate
+into the vector. Each poisoned contribution is clamped to the safe default
+0.0 (amount absent / point skipped / degree 0) and a final per-dim
+``math.isfinite`` sweep guarantees fv1 is always finite — so a poisoned
+stream cannot turn the ML score into NaN and silently suppress the
+``score >= threshold`` severity-upgrade path (NaN comparisons are False).
+
 Frozen dim order (index: name — meaning):
 
  0  ev_1h_max         max events in any rolling 60-min window
@@ -101,7 +109,15 @@ def _parse_ts(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=UTC)
+        # SPEC-W34 GF9: non-finite / out-of-range epochs are hostile input —
+        # drop the timestamp instead of crashing (OverflowError) or
+        # propagating NaN/Inf into the vector.
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
     s = str(value).strip()
     if not s:
         return None
@@ -170,6 +186,12 @@ def build_feature_vector(
             amt_f = float(amt) if amt is not None else 0.0
         except (TypeError, ValueError):
             amt_f = 0.0
+        if not math.isfinite(amt_f):
+            # SPEC-W34 GF9 clamp-to-safe: a non-finite amount (inf/-inf/NaN)
+            # is poisoned input; the documented safe default treats the
+            # event's amount as absent (0.0) so it cannot turn amt_* dims
+            # into inf/NaN and silently suppress the ML path downstream.
+            amt_f = 0.0
         if amt_f > 0.0:
             amounts.append(amt_f)
             amount_channels.append(etype)
@@ -182,7 +204,11 @@ def build_feature_vector(
         lat, lon = ev.get("lat"), ev.get("lon")
         if lat is not None and lon is not None and dt is not None:
             try:
-                geo.append((dt.timestamp(), float(lat), float(lon)))
+                lat_f, lon_f = float(lat), float(lon)
+                # SPEC-W34 GF9: non-finite coordinates are poisoned input —
+                # skip the geo point so haversine never sees NaN/Inf.
+                if math.isfinite(lat_f) and math.isfinite(lon_f):
+                    geo.append((dt.timestamp(), lat_f, lon_f))
             except (TypeError, ValueError):
                 pass
         ref = ev.get("reference_id")
@@ -239,7 +265,12 @@ def build_feature_vector(
 
     # Entity footprint proxy for device-count (dim 12) + referral degree (13).
     device_count = math.log1p(len(entities))
-    referral_log = math.log1p(max(0, int(referral_degree)))
+    try:
+        referral_n = max(0, int(referral_degree))
+    except (TypeError, ValueError, OverflowError):
+        # SPEC-W34 GF9: poisoned degree (NaN/inf/None-ish) -> safe default 0.
+        referral_n = 0
+    referral_log = math.log1p(referral_n)
 
     # Structuring + cancellation rates (dims 14-15).
     structuring_rate = (
@@ -269,4 +300,8 @@ def build_feature_vector(
         cancel_rate,
     ]
     assert len(fv) == FEATURE_DIM, f"fv1 must be {FEATURE_DIM} dims, got {len(fv)}"
-    return fv
+    # SPEC-W34 GF9 final clamp (belt-and-braces): fv1 NEVER emits a
+    # non-finite dim. Any residual NaN/Inf from hostile input becomes the
+    # documented safe default 0.0 so ``score_vector`` always sees finite
+    # features and a poisoned stream cannot silently suppress the ML path.
+    return [x if math.isfinite(x) else 0.0 for x in fv]

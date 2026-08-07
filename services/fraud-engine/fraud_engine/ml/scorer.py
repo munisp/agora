@@ -30,6 +30,7 @@ provenance honesty); otherwise it stays the dir-derived
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -68,6 +69,23 @@ def _minmax_norm(value: float, lo: float, hi: float) -> float:
     if hi <= lo:
         return 0.0
     return max(0.0, min(1.0, (value - lo) / (hi - lo)))
+
+
+class MLUnavailableError(RuntimeError):
+    """SPEC-W34 GF9: the ML blend produced a non-finite score (NaN/Inf) and
+    is therefore treated as ML-unavailable — the caller falls back to the
+    pure rule path (I1) and NaN is NEVER emitted downstream. A NaN score
+    would otherwise make every ``score >= threshold`` comparison False and
+    silently suppress the severity-upgrade path (evasion)."""
+
+
+def _finite_or_zero(value: Any) -> float:
+    """Coerce one feature dim to a finite float; poisoned dims -> 0.0."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) else 0.0
 
 
 class LearnedScorer:
@@ -180,13 +198,33 @@ class LearnedScorer:
 
     # -- scoring -----------------------------------------------------------
     def score_vector(self, fv: Iterable[float]) -> ScoreResult:
-        """Blend one fv1 vector. CPU, single sample, torch.no_grad."""
-        x = torch.tensor([list(fv)], dtype=torch.float32, device="cpu")
+        """Blend one fv1 vector. CPU, single sample, torch.no_grad.
+
+        SPEC-W34 GF9: input dims are sanitized (non-finite -> 0.0) and the
+        blended score is guarded with ``math.isfinite`` — a non-finite
+        result raises :class:`MLUnavailableError` so the caller degrades to
+        the pure rule path (I1) instead of comparing against NaN (every NaN
+        comparison is False, which would silently suppress the
+        severity-upgrade path) or emitting NaN downstream.
+        """
+        x = torch.tensor(
+            [[_finite_or_zero(v) for v in fv]], dtype=torch.float32, device="cpu"
+        )
         with torch.no_grad():
             ae_err = float(self._ae.reconstruction_error(x).detach().cpu()[0])
             clf_prob = float(self._clf.probability(x).detach().cpu()[0])
         ae_norm = _minmax_norm(ae_err, self._err_min, self._err_max)
         score = 0.5 * ae_norm + 0.5 * clf_prob
+        if not (
+            math.isfinite(score)
+            and math.isfinite(ae_norm)
+            and math.isfinite(clf_prob)
+        ):
+            raise MLUnavailableError(
+                "non-finite ML score "
+                f"(score={score!r} ae_norm={ae_norm!r} clf_prob={clf_prob!r}) "
+                "— treating ML as unavailable (rule fallback, I1)"
+            )
         return ScoreResult(
             score=score,
             ae_norm=ae_norm,
