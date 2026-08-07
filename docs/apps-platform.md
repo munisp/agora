@@ -239,12 +239,13 @@ B=http://localhost:9080/api/identity   # APISIX; via the Next BFF use http://loc
    # time with PATCH {"status":"enabled"}
    ```
 
-6. **Entitlement check** (service-to-service only — call identity directly,
-   not through the tenant-facing gateway):
+6. **Entitlement check** (service-to-service only — the `/internal/*`
+   endpoints are not gateway-routed, and service ports are not host-published
+   since W34 GF4, so probe inside the compose network):
 
    ```bash
-   curl -s -H 'X-Tenant-Slug: acme' \   # or X-Tenant-ID: <uuid>
-     'http://localhost:7001/internal/entitlements/check?app_id=helpdesk' | jq .
+   docker compose exec apisix curl -s -H 'X-Tenant-Slug: acme' \   # or X-Tenant-ID: <uuid>
+     'http://identity:7001/internal/entitlements/check?app_id=helpdesk' | jq .
    # { "app_id": "helpdesk", "allowed": false, "reason": "disabled" }
    ```
 

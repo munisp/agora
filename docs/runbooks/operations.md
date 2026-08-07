@@ -129,10 +129,10 @@ Routine checks:
 
 ```bash
 # Which impl is live:
-curl -sf http://localhost:7004/healthz | jq .ledger_impl
+docker compose exec apisix curl -sf http://payments:7004/healthz | jq .ledger_impl  # service ports not host-published (W34 GF4)
 
 # Tenant positions (posted vs pending, per account):
-curl -sf http://localhost:7004/v1/accounts/acme/balance | jq .
+docker compose exec apisix curl -sf -H 'X-Tenant-Slug: acme' http://payments:7004/v1/accounts/acme/balance | jq .
 
 # Deposits still held (should match bookings in status confirmed/pending
 # with a deposit): compare accounts[*].pending_net against
