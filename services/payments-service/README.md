@@ -21,11 +21,13 @@ Amounts are minor units (cents). All transfers are idempotent by transfer id.
 | 103 | no-show fee | like capture, charges `amount_cents` of the hold, releases remainder |
 | 104 | payout | `tenant:{id}:revenue → platform:payouts` (Mojaloop rail) |
 
-`LEDGER_IMPL=sim` (default) uses the in-memory double-entry ledger
+`LEDGER_IMPL=sim` selects the in-memory double-entry ledger
 (`src/ledger/sim.rs`) with TigerBeetle semantics (pending/posted/voided,
 idempotent ids, `debits_must_not_exceed_credits` on liability accounts).
 `LEDGER_IMPL=tigerbeetle` requires building with `--features tb-live`
-(see `src/ledger/tigerbeetle.rs`; ADR-0007).
+(see `src/ledger/tigerbeetle.rs`; ADR-0007). SPEC-W34 GF11: `LEDGER_IMPL`
+is **mandatory** — the service refuses to start when it is unset/unknown
+(no silent sim fallback in a money path).
 
 ## REST API
 
@@ -69,13 +71,14 @@ committed rail transfer is logged CRITICAL for operator reconciliation.
 |---|---|---|
 | `PORT` | `7004` | HTTP listen port |
 | `RUST_LOG` | `info` | tracing filter (JSON logs) |
-| `LEDGER_IMPL` | `sim` | `sim` \| `tigerbeetle` (latter needs `--features tb-live`) |
+| `LEDGER_IMPL` | — (required; GF11) | `sim` \| `tigerbeetle` (latter needs `--features tb-live`); startup fails when unset |
 | `TB_ADDRESSES` | `tigerbeetle:3000` | TigerBeetle replica addresses |
 | `TB_CLUSTER_ID` | `0` | TigerBeetle cluster id (SPEC §9: cluster 0) |
 | `PLATFORM_FEE_BPS` | `250` | platform fee in basis points on capture/no-show |
 | `KAFKA_BROKERS` | `kafka:9092` | Kafka bootstrap servers |
 | `KAFKA_GROUP_ID` | `payments-service` | consumer group |
 | `PAYMENTS_COMMANDS_TOPIC` | `opendesk.payments.commands` | commands topic |
+| `DLQ_TOPIC` | `opendesk.dlq` | dead-letter topic for failed commands (GF11; offset commits only after the DLQ copy is durable) |
 | `KAFKA_CONSUMER_ENABLED` | `true` | start the commands consumer |
 | `DAPR_HOST` | `daprd-payments` | Dapr sidecar host (SPEC §3) |
 | `DAPR_HTTP_PORT` | `3500` | Dapr sidecar HTTP port |

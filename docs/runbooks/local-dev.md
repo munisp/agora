@@ -37,27 +37,32 @@ make down       # stop;  make clean = stop + DELETE volumes (fresh state)
 
 | UI | URL | Notes |
 |---|---|---|
-| Tenant dashboard | http://localhost:3001/app/acme | Keycloak login `admin` / `admin123` |
-| Public booking page | http://localhost:3001/p/acme or http://localhost:9080/p/acme | via web or via APISIX |
+| Tenant dashboard | http://localhost:9080/app/acme | Keycloak login — create a dev realm user first (§3; the seeded `admin`/`admin123` was removed in W34 GF5) |
+| Public booking page | http://localhost:9080/p/acme | via APISIX catch-all → web upstream (web :3001 is no longer host-published, W34 GF4) |
 | APISIX gateway (proxy) | http://localhost:9080 | all `/api/*`, `/ws/*`, `/voice/*` traffic |
-| APISIX admin | http://localhost:9180 | |
-| Keycloak | http://localhost:8080 | admin console `admin` / `admin` (realm `master`); app realm is `opendesk` |
+| APISIX admin | http://127.0.0.1:9180 | loopback-only bind since W34 GF4 |
+| Keycloak | http://localhost:8080 | admin console `admin` / `$KC_BOOTSTRAP_ADMIN_PASSWORD` (must be exported before `make up` — no default since W34 GF5); app realm is `opendesk` |
 | Temporal UI | http://localhost:8233 | namespace `opendesk` |
 | OpenSearch Dashboards | http://localhost:5601 | |
 | MinIO console | http://localhost:9001 | |
 | Spark master UI | http://localhost:8081 | |
 | Trino | `make trino` | CLI: `iceberg.gold` |
 
-Service health endpoints (direct): `:7001` identity, `:7002` booking,
-`:7003` notification, `:7004` payments, `:7005` edge, `:7006` voice,
-`:7007` conversation, `:7008` knowledge, `:7009` analytics — all `GET /healthz`.
+Service health endpoints: the per-service ports (`:7001` identity … `:7009`
+analytics) are **no longer host-published** (W34 GF4). Probe them inside the
+compose network instead, e.g.
+`docker compose exec apisix curl -sf http://identity:7001/healthz` —
+all services answer `GET /healthz`.
 
 ## 3. Getting a Keycloak token for protected `/api/*` calls
 
 Realm: `opendesk`. Token endpoint:
 `http://localhost:8080/realms/opendesk/protocol/openid-connect/token`.
-Demo user `admin` / `admin123` (member of group `/tenants/acme`, realm role
-`owner`; tokens carry the `tenant_slugs` claim via the group mapper).
+No realm user ships out of the box — W34 GF5 removed the seeded
+`admin`/`admin123`. Create a dev user per `infra/keycloak/README.md`
+(kcadm `create users` + `set-password` + `add-roles --rolename owner`, then
+add to group `/tenants/acme` in the admin console so tokens carry the
+`tenant_slugs` claim). The examples below assume user `dev-admin`.
 
 **Option A — password grant (dev convenience).** The `admin-web` client is a
 public PKCE client with Direct Access Grants **disabled** by default. In dev,
@@ -69,27 +74,30 @@ Then:
 TOKEN=$(curl -sf -X POST \
   http://localhost:8080/realms/opendesk/protocol/openid-connect/token \
   -d grant_type=password -d client_id=admin-web \
-  -d username=admin -d password=admin123 | jq -r .access_token)
+  -d username=dev-admin -d password='<dev-only-password>' | jq -r .access_token)
 
 curl -sf http://localhost:9080/api/bookings/v1/bookings \
   -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Slug: acme" | jq .
 ```
 
-**Option B — client credentials (works out of the box)** for
-service-to-service style calls, using the confidential `service-accounts`
-client (secret from `infra/keycloak/realm-opendesk.json`):
+**Option B — client credentials** for service-to-service style calls, using
+the confidential `service-accounts` client. The shipped realm carries the
+`CHANGE_ME_DEV_ONLY` placeholder, **not** a working secret — set a real one
+first (kcadm flow in `infra/keycloak/README.md`) and export it via
+`KEYCLOAK_ADMIN_CLIENT_SECRET` in `.env`:
 
 ```bash
 TOKEN=$(curl -sf -X POST \
   http://localhost:8080/realms/opendesk/protocol/openid-connect/token \
   -d grant_type=client_credentials -d client_id=service-accounts \
-  -d client_secret=opendesk-service-secret | jq -r .access_token)
+  -d client_secret="$KEYCLOAK_ADMIN_CLIENT_SECRET" | jq -r .access_token)
 ```
 
-Note: booking-service runs with `AUTHZ_DISABLED=true` in dev (root compose),
-so direct calls to `localhost:7002` only need `X-Tenant-Slug: acme` — no
-token. The token path is only required when going through the gateway's
-`openid-connect` / `jwt-auth` plugins.
+Note: service ports are not host-published (W34 GF4), so all local traffic
+goes through the gateway's `openid-connect` / `jwt-auth` plugins with a
+token. The old dev bypass (`AUTHZ_DISABLED=true` + direct `:7002` calls) was
+removed in W34 (GF4/GF12) — the gateway also strips client-supplied
+`x-user-*` / `x-tenant-*` headers before proxying.
 
 ## 4. Voice profile
 
@@ -118,8 +126,8 @@ but expects an external OpenAI-compatible LLM endpoint.
 | `permify-schema-loader` / `kafka-topics` / `fluvio-topics` show `Exited` | They are one-shot init jobs — **normal** | `docker compose logs kafka-topics` should list all SPEC §4 topics |
 | `temporal` crash loop | `temporal` DB missing or postgres not ready | Same fix as keycloak; check `docker compose logs temporal` |
 | Services 500 on publish/subscribe | Wrong Dapr pubsub **name**: the Kafka pubsub component is named `pubsub-kafka` — if you see publish failures, verify the component name is `pubsub-kafka` | Check the service's `DAPR_PUBSUB` env in root compose matches `infra/dapr/components/pubsub.kafka.yaml` metadata.name (`pubsub-kafka`) |
-| 401 from booking writes via direct port | `AUTHZ_DISABLED` not set and no JWT `sub` | Dev default sets `AUTHZ_DISABLED=true` in root compose; otherwise pass a token or `X-User-Id` |
-| `invalid_client` on token request | Wrong client secret for `service-accounts`, or password grant against `admin-web` without enabling Direct Access Grants | Secret is `opendesk-service-secret` (realm import); see §3 |
+| 401 from booking writes via the gateway | Missing/expired bearer token, or client-supplied `x-user-*` headers (stripped at the gateway since W34 GF4) | Get a token per §3 and call `http://localhost:9080/api/bookings/...`; never inject identity headers client-side |
+| `invalid_client` on token request | Wrong client secret for `service-accounts`, or password grant against `admin-web` without enabling Direct Access Grants | Secret comes from `.env` `KEYCLOAK_ADMIN_CLIENT_SECRET` and must match the realm (shipped value is the `CHANGE_ME_DEV_ONLY` placeholder — set a real one per `infra/keycloak/README.md`); see §3 |
 | Voice agent replies time out | Ollama model still downloading (`ollama-init` one-shot) | `docker compose logs -f ollama-init`; wait for `llama3.1:8b` pull; Piper voice download likewise on first start |
 | `mojaloop` unhealthy on `make ps` | Simulator first-boot slowness; healthcheck retries cover it | Usually recovers; `docker compose logs mojaloop` |
 | `make config` fails | YAML edit broke a compose fragment | Run `docker compose config` (no `-q`) for the exact error; all fragments are plain YAML |

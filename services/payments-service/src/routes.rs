@@ -169,6 +169,9 @@ async fn healthz(State(st): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "service": "payments-service",
         "ledger_impl": st.config.ledger_impl,
+        "commands_dead_lettered": st
+            .commands_dead_lettered
+            .load(std::sync::atomic::Ordering::Relaxed),
     }))
 }
 
