@@ -278,6 +278,37 @@ upstreams:
 global_rules:
   - id: 1
     plugins:
+      # GF4 (SPEC-W34, T1-P2): strip client-supplied internal identity/tenant
+      # headers BEFORE any route plugin/proxying runs. Backends (billing-engine
+      # `x-user-roles`, booking/identity `X-User-Id`/`X-User-Email`, graph /
+      # credit-bureau `X-Tenant-Id`, booking tenant middleware `X-Tenant-Slug`,
+      # ...) trust these headers on the assumption that the gateway injects
+      # them — the gateway never did, so any caller could self-assign roles /
+      # tenants. The rewrite phase runs before proxying; services behind the
+      # gateway must derive identity from the validated JWT claims instead.
+      # Public/webhook routes do not trust these headers, so stripping them
+      # there is harmless. Enumerated from `grep -ri "x-user-\|x-tenant-" services/`.
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            local spoofed = {
+              "x-user-id",
+              "x-user-roles",
+              "x-user-email",
+              "x-user-name",
+              "x-tenant",
+              "x-tenant-id",
+              "x-tenant-slug",
+              -- rate-limit example key (api-plan-tier-example, currently
+              -- disabled); strip so a client can never pick its own bucket.
+              "x-tenant-plan",
+            }
+            return function()
+              for _, h in ipairs(spoofed) do
+                ngx.req.clear_header(h)
+              end
+            end
       prometheus:
         prefer_name: true
       opentelemetry:
@@ -318,7 +349,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -414,7 +447,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -449,7 +484,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -488,7 +525,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -523,7 +562,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -558,7 +599,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -595,7 +638,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -634,7 +679,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -702,7 +749,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -804,7 +853,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -844,7 +895,9 @@ routes:
         redis_database: 0
         redis_timeout: 1000
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
@@ -987,7 +1040,9 @@ routes:
           # Dev-only fixed session secret (32+ chars); rotate via secret store in prod.
           secret: opendesk-dev-session-secret-0123456789abcdef
       cors:
-        allow_origins: "*"
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
         expose_headers: "*"
