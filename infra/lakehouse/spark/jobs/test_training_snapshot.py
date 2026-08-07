@@ -15,12 +15,23 @@ import json
 import os
 import py_compile
 import sys
+import tempfile
 import unittest
 
 JOBS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, JOBS_DIR)
 
 import training_snapshot as ts  # noqa: E402
+
+# The REAL drift manifest consumer (SPEC-W34 GF2 roundtrip proof):
+# services/model-registry/model_registry/drift.py — pure stdlib, imports
+# cleanly on driver-less CI boxes.
+MODEL_REGISTRY_DIR = os.path.abspath(
+    os.path.join(JOBS_DIR, "..", "..", "..", "..",
+                 "services", "model-registry", "model_registry"))
+sys.path.insert(0, MODEL_REGISTRY_DIR)
+
+import drift  # noqa: E402  model_registry/drift.py
 
 
 def node_row(person="p1", tenant="t1", label="Person", **overrides):
@@ -70,6 +81,10 @@ class TestPyCompile(unittest.TestCase):
             "numeric_stats", "compute_feature_stats", "fraud_feature_rows",
             "credit_feature_rows", "gnn_node_rows", "gnn_edge_rows",
             "build_manifest", "manifest_json",
+            "feature_histogram", "compute_feature_histograms",
+            "histogram_edges", "histogram_counts_on_edges",
+            "empty_score_baseline", "manifest_hash", "verify_manifest_hash",
+            "registry_manifest", "sync_registry_manifests",
         ):
             self.assertTrue(callable(getattr(ts, fn)), fn)
 
@@ -192,6 +207,57 @@ class TestGnnRows(unittest.TestCase):
         self.assertEqual(rows[0]["dst_id"], "p2")
 
 
+class TestHistograms(unittest.TestCase):
+    """Drift-contract histograms (SPEC-W34 GF2): fixed-bin, deterministic,
+    binned with exactly the drift.py histogram_counts semantics."""
+
+    def test_edges_and_counts_cover_all_samples(self):
+        values = [float(i) for i in range(100)]
+        h = ts.feature_histogram(values)
+        edges, counts = h["edges"], h["counts"]
+        self.assertEqual(len(edges), ts.HISTOGRAM_BINS + 1)
+        self.assertEqual(len(counts), ts.HISTOGRAM_BINS)
+        self.assertEqual(sum(counts), 100)
+        self.assertEqual(edges[0], 0.0)
+        self.assertEqual(edges[-1], 99.0)
+        self.assertTrue(all(b > a for a, b in zip(edges, edges[1:])))
+        # uniform 0..99 over 10 equal-width bins -> 10 per bin
+        self.assertEqual(counts, [10] * 10)
+
+    def test_binning_matches_drift_semantics(self):
+        # boundary values land exactly where drift.py's histogram_counts
+        # (bisect_right, edge-clamped) puts them
+        edges = [0.0, 1.0, 2.0]
+        self.assertEqual(ts.histogram_counts_on_edges([0.5, 1.0, 5.0], edges),
+                         [1, 2])  # 1.0 -> upper bin; 5.0 clamps to last
+
+    def test_degenerate_single_value_range(self):
+        h = ts.feature_histogram([7, 7, 7])
+        edges, counts = h["edges"], h["counts"]
+        self.assertTrue(all(b > a for a, b in zip(edges, edges[1:])))
+        self.assertAlmostEqual(edges[0], 6.5)
+        self.assertAlmostEqual(edges[-1], 7.5)
+        self.assertEqual(sum(counts), 3)
+        # all values land in ONE central bin (7.0 is an exact edge midpoint)
+        self.assertEqual(max(counts), 3)
+
+    def test_none_bool_skipped_and_empty_omitted(self):
+        self.assertIsNone(ts.feature_histogram([None, True]))
+        hists = ts.compute_feature_histograms(
+            [{"a": 1, "b": None}, {"a": 3, "b": None}], ("a", "b"))
+        self.assertIn("a", hists)
+        self.assertNotIn("b", hists)
+        self.assertEqual(
+            sorted(hists["a"].keys()), ["histogram"])
+
+    def test_deterministic(self):
+        rows = [node_row(f"p{i}", ltv_cents=1000 * i) for i in range(50)]
+        h1 = ts.compute_feature_histograms(rows, ts.PERSON_NUMERIC_FEATURES)
+        h2 = ts.compute_feature_histograms(rows, ts.PERSON_NUMERIC_FEATURES)
+        self.assertEqual(json.dumps(h1, sort_keys=True),
+                         json.dumps(h2, sort_keys=True))
+
+
 class TestManifest(unittest.TestCase):
     def test_schema_validation(self):
         stats = ts.compute_feature_stats([node_row()], ts.PERSON_NUMERIC_FEATURES)
@@ -213,6 +279,48 @@ class TestManifest(unittest.TestCase):
             )
         # reference stats required by the W33-C drift PSI monitor are present
         self.assertIn("ltv_cents", m["feature_stats"])
+
+    def test_drift_contract_fields(self):
+        """SPEC-W34 GF2: every manifest ALSO carries the exact contract
+        drift.py's DirectoryManifestProvider/DriftJob consume."""
+        rows = [node_row(f"p{i}", ltv_cents=1000 * (i + 1)) for i in range(30)]
+        stats = ts.compute_feature_stats(rows, ts.PERSON_NUMERIC_FEATURES)
+        hists = ts.compute_feature_histograms(rows, ts.PERSON_NUMERIC_FEATURES)
+        m = ts.build_manifest(
+            "fraud_features", "2026-08-06",
+            [{"kind": "table", "path": "iceberg.gold.graph_node_features"}],
+            {"rows": 30}, stats, seed="42",
+            created_at="2026-08-06T00:00:00+00:00", feature_histograms=hists,
+        )
+        self.assertEqual(m["schema"], "opendesk/training-manifest/v1")
+        # features.<name>.histogram.{edges,counts} — the drift PSI input
+        self.assertEqual(sorted(m["features"]), sorted(hists.keys()))
+        for name, entry in m["features"].items():
+            hist = entry["histogram"]
+            self.assertEqual(len(hist["edges"]), ts.HISTOGRAM_BINS + 1, name)
+            self.assertEqual(len(hist["counts"]), ts.HISTOGRAM_BINS, name)
+            self.assertEqual(sum(hist["counts"]), 30, name)
+            self.assertTrue(
+                all(b > a for a, b in zip(hist["edges"], hist["edges"][1:])),
+                name)
+        # score baseline is the documented-empty variant (labels, not scores)
+        self.assertEqual(m["score_baseline"]["histogram"],
+                         {"edges": [], "counts": []})
+        self.assertIn("snapshot", m["score_baseline"]["note"])
+        # manifest_hash: sha256:<hex>, verifies over the hash-less body
+        self.assertRegex(m["manifest_hash"], r"^sha256:[0-9a-f]{64}$")
+        self.assertTrue(ts.verify_manifest_hash(m))
+        tampered = dict(m)
+        tampered["row_counts"] = {"rows": 31}
+        self.assertFalse(ts.verify_manifest_hash(tampered))
+
+    def test_legacy_and_drift_histograms_agree_on_range(self):
+        rows = [node_row(f"p{i}", ltv_cents=100 * i) for i in range(20)]
+        stats = ts.compute_feature_stats(rows, ts.PERSON_NUMERIC_FEATURES)
+        hists = ts.compute_feature_histograms(rows, ts.PERSON_NUMERIC_FEATURES)
+        edges = hists["ltv_cents"]["histogram"]["edges"]
+        self.assertEqual(edges[0], stats["ltv_cents"]["min"])
+        self.assertEqual(edges[-1], stats["ltv_cents"]["max"])
 
     def test_all_families_accepted(self):
         for family in ts.FAMILIES:
@@ -241,6 +349,131 @@ class TestManifest(unittest.TestCase):
         self.assertEqual(text, ts.manifest_json(m2))  # byte-stable
         parsed = json.loads(text)
         self.assertEqual(parsed["schema_version"], "training-manifest-v1")
+
+
+class TestRegistrySync(unittest.TestCase):
+    """SPEC-W34 GF2: snapshot manifests -> $DRIFT_MANIFEST_DIR registry
+    manifests via the explicit family mapping, loaded through the REAL
+    drift.py DirectoryManifestProvider."""
+
+    def _write_snapshot_tree(self, base, snapshot_date="2026-08-06"):
+        """Small synthetic snapshot: one family dir + manifest.json per
+        family, built through the pure reference implementations."""
+        manifests = {}
+        builders = {
+            "fraud_features": (
+                ts.fraud_feature_rows(
+                    [node_row(f"p{i}", ltv_cents=1000 * (i + 1))
+                     for i in range(30)]),
+                ts.PERSON_NUMERIC_FEATURES,
+            ),
+            "credit_features": (
+                ts.credit_feature_rows(
+                    [node_row(f"p{i}", ltv_cents=2000 * (i + 1))
+                     for i in range(30)]),
+                ts.CREDIT_NUMERIC_FEATURES,
+            ),
+            "gnn_export": (
+                ts.gnn_node_rows([node_row(f"p{i}") for i in range(30)]),
+                ts.PERSON_NUMERIC_FEATURES,
+            ),
+        }
+        for family, (rows, numeric_fields) in builders.items():
+            m = ts.build_manifest(
+                family, snapshot_date,
+                [{"kind": "table", "path": "synthetic"}],
+                {"rows": len(rows)},
+                ts.compute_feature_stats(rows, numeric_fields),
+                seed="42", created_at="2026-08-06T00:00:00+00:00",
+                feature_histograms=ts.compute_feature_histograms(
+                    rows, numeric_fields),
+            )
+            d = os.path.join(base, family, snapshot_date)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "manifest.json"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(ts.manifest_json(m))
+            manifests[family] = m
+        return manifests
+
+    def test_mapping_constant(self):
+        self.assertEqual(
+            ts.FAMILY_REGISTRY_MAPPING,
+            {"fraud_features": "fraud-ml",
+             "credit_features": "credit-ml",
+             "gnn_export": "graphsage"},
+        )
+
+    def test_sync_then_load_through_real_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "training")
+            registry_dir = os.path.join(tmp, "drift_manifests")
+            snapshot_manifests = self._write_snapshot_tree(base)
+
+            written = ts.sync_registry_manifests(
+                registry_dir, base_path=base, snapshot_date="2026-08-06")
+            self.assertEqual(sorted(written), sorted(ts.FAMILIES))
+
+            provider = drift.DirectoryManifestProvider(registry_dir)
+            for snap_family, reg_family in ts.FAMILY_REGISTRY_MAPPING.items():
+                path = os.path.join(registry_dir, f"{reg_family}.json")
+                self.assertTrue(os.path.isfile(path), path)
+                m = provider.get(reg_family)
+                self.assertIsNotNone(m, reg_family)
+                # registry family name, drift contract schema
+                self.assertEqual(m["family"], reg_family)
+                self.assertEqual(m["schema"],
+                                 "opendesk/training-manifest/v1")
+                # histograms survived the round trip byte-intact
+                src = snapshot_manifests[snap_family]
+                self.assertEqual(m["features"], src["features"])
+                for name, entry in m["features"].items():
+                    hist = entry["histogram"]
+                    self.assertEqual(len(hist["edges"]),
+                                     ts.HISTOGRAM_BINS + 1, name)
+                    self.assertEqual(len(hist["counts"]),
+                                     ts.HISTOGRAM_BINS, name)
+                    self.assertGreater(sum(hist["counts"]), 0, name)
+                # score baseline + integrity hash (recomputed over the
+                # translated body) intact
+                self.assertEqual(m["score_baseline"]["histogram"],
+                                 {"edges": [], "counts": []})
+                self.assertTrue(ts.verify_manifest_hash(m), reg_family)
+                # the histograms are directly usable by drift.py's PSI path:
+                # re-binning the reference counts' own edges is a no-op PSI
+                ltv = m["features"].get("ltv_cents")
+                if ltv is not None:
+                    hist = ltv["histogram"]
+                    same = drift.psi(hist["counts"], hist["counts"])
+                    self.assertAlmostEqual(same, 0.0)
+            # unknown family -> honest None (I1)
+            self.assertIsNone(provider.get("no-such-family"))
+
+    def test_sync_skips_missing_family_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "training")
+            registry_dir = os.path.join(tmp, "drift_manifests")
+            manifests = self._write_snapshot_tree(base)
+            os.remove(os.path.join(base, "gnn_export", "2026-08-06",
+                                   "manifest.json"))
+            written = ts.sync_registry_manifests(
+                registry_dir, base_path=base, snapshot_date="2026-08-06")
+            self.assertEqual(sorted(written),
+                             ["credit_features", "fraud_features"])
+            provider = drift.DirectoryManifestProvider(registry_dir)
+            self.assertIsNotNone(provider.get("fraud-ml"))
+            self.assertIsNone(provider.get("graphsage"))
+            self.assertTrue(manifests)  # tree was built
+
+    def test_registry_manifest_rejects_unmapped_family(self):
+        with self.assertRaises(ValueError):
+            ts.registry_manifest({"family": "nope"})
+
+    def test_sync_rejects_non_local_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                ts.sync_registry_manifests(
+                    tmp, base_path="s3://lake/training/")
 
 
 if __name__ == "__main__":
