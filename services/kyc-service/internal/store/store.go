@@ -97,7 +97,27 @@ BEGIN
             USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
     END IF;
 END
-$$;`
+$$;
+-- SPEC-W34 GF7: kyc_audit is an append-only forensic trail. Defense in
+-- depth: (1) REVOKE UPDATE/DELETE from PUBLIC and the application role
+-- (the service only ever INSERTs, so nothing legitimate loses rights);
+-- (2) a BEFORE UPDATE OR DELETE trigger that raises — this also binds the
+-- table owner / superuser paths that REVOKE cannot touch.
+REVOKE UPDATE, DELETE ON kyc_audit FROM PUBLIC;
+DO $$
+BEGIN
+    EXECUTE format('REVOKE UPDATE, DELETE ON kyc_audit FROM %I', current_user);
+END
+$$;
+CREATE OR REPLACE FUNCTION kyc_audit_append_only() RETURNS trigger AS $fn$
+BEGIN
+    RAISE EXCEPTION 'kyc_audit is append-only: % is forbidden (SPEC-W34 GF7)', TG_OP;
+END;
+$fn$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS kyc_audit_append_only ON kyc_audit;
+CREATE TRIGGER kyc_audit_append_only
+    BEFORE UPDATE OR DELETE ON kyc_audit
+    FOR EACH ROW EXECUTE FUNCTION kyc_audit_append_only();`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure kyc_audit table: %w", err)
 	}

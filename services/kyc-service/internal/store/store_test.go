@@ -92,3 +92,64 @@ func TestStoreRLSPolicyPresent(t *testing.T) {
 		t.Errorf("tenant_isolation policy missing: %v", err)
 	}
 }
+
+// SPEC-W34 GF7: kyc_audit is an append-only forensic trail — UPDATE and
+// DELETE must both fail (BEFORE trigger raises), INSERT must still work.
+func TestAuditAppendOnly(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	a := Audit{
+		TenantID:     uuid.New(),
+		Actor:        "kyc-service-test",
+		SubjectPhone: "+2348012345678",
+		IDType:       "nin",
+		IDValueHash:  strings.Repeat("cd", 32),
+		Status:       "verified",
+		Reference:    "kyc_" + uuid.NewString(),
+	}
+	if err := st.InsertAudit(ctx, &a); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	// UPDATE must fail (even as the owner/superuser — the trigger binds
+	// every role, including ones REVOKE cannot touch).
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE kyc_audit SET status = 'mismatch' WHERE audit_id = $1`, a.AuditID); err == nil {
+		t.Errorf("UPDATE on kyc_audit must fail (append-only)")
+	} else if !strings.Contains(err.Error(), "append-only") {
+		t.Errorf("UPDATE error should cite append-only rule, got: %v", err)
+	}
+
+	// DELETE must fail.
+	if _, err := st.pool.Exec(ctx,
+		`DELETE FROM kyc_audit WHERE audit_id = $1`, a.AuditID); err == nil {
+		t.Errorf("DELETE on kyc_audit must fail (append-only)")
+	} else if !strings.Contains(err.Error(), "append-only") {
+		t.Errorf("DELETE error should cite append-only rule, got: %v", err)
+	}
+
+	// Row untouched.
+	var status string
+	if err := st.pool.QueryRow(ctx,
+		`SELECT status FROM kyc_audit WHERE audit_id = $1`, a.AuditID).Scan(&status); err != nil {
+		t.Fatalf("select after blocked mutations: %v", err)
+	}
+	if status != "verified" {
+		t.Errorf("row mutated despite append-only rule: status=%q", status)
+	}
+
+	// INSERT still works — the service's only write path.
+	b := a
+	b.AuditID = uuid.Nil
+	b.Reference = "kyc_" + uuid.NewString()
+	if err := st.InsertAudit(ctx, &b); err != nil {
+		t.Errorf("INSERT must still work on append-only kyc_audit: %v", err)
+	}
+
+	// Trigger + revokes present.
+	var triggerName string
+	if err := st.pool.QueryRow(ctx,
+		`SELECT tgname FROM pg_trigger WHERE tgname = 'kyc_audit_append_only'`).Scan(&triggerName); err != nil {
+		t.Errorf("kyc_audit_append_only trigger missing: %v", err)
+	}
+}

@@ -50,8 +50,9 @@ func run() error {
 
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
 
-	// Resolver: deterministic mock by default (KYC_MOCK=1); the live provider
-	// requires KYC_PROVIDER_URL (ASSUMPTION-shaped client — docs/kyc.md).
+	// Resolver: live provider by default (SPEC-W34 GF8 — KYC_MOCK defaults
+	// off); the deterministic mock is explicit opt-in for dev only and is
+	// flagged loudly at startup because it auto-verifies fabricated IDs.
 	var resolver httpapi.Resolver = httpapi.MockResolver{}
 	if !cfg.Mock {
 		if cfg.ProviderURL == "" {
@@ -60,7 +61,8 @@ func run() error {
 		resolver = httpapi.NewLiveResolver(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ResolveTimeout)
 		logger.Info("live KYC provider configured", zap.String("base", cfg.ProviderURL))
 	} else {
-		logger.Info("KYC_MOCK=1: deterministic mock resolver active")
+		logger.Error("CRITICAL: MOCK KYC — NOT FOR PRODUCTION: KYC_MOCK=1 auto-verifies ANY all-digits BVN/NIN (len>=10) without a real provider; set KYC_MOCK=0 with KYC_PROVIDER_URL for production",
+			zap.String("kyc_mock", "1"))
 	}
 
 	deps := httpapi.Deps{

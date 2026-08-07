@@ -9,7 +9,7 @@ from typing import Annotated, Any
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
-from . import events, incidents, intel, models, ussd
+from . import events, incidents, intel, models, redact, ussd
 from .db import NotFoundError
 
 router = APIRouter()
@@ -203,15 +203,21 @@ async def _persist_turn(
         st.log.error("transcript sink publish failed", error=str(exc),
                      conversation_id=str(conversation_id))
 
-    # 2) CloudEvent to Kafka via Dapr pubsub `pubsub-kafka` (always, SPEC §4)
+    # 2) CloudEvent to Kafka via Dapr pubsub `pubsub-kafka` (always, SPEC §4).
+    #    SPEC-W34 GF3: this path bypasses the Fluvio pii-redact smartmodule,
+    #    so redact phone/email PII here BEFORE publishing — the event lands
+    #    directly in Iceberg bronze.transcripts. The conversation DB keeps
+    #    the original text; only the published event is redacted.
+    redacted_text = redact.redact_text(turn.text)
     event = events.conversation_turn_event(
         conversation_id=conversation_id,
         tenant_id=tenant_id,
         site_slug=site_slug,
         role=turn.role,
-        text=turn.text,
+        text=redacted_text,
         ts=turn.ts,
         audio_url=audio_url,
+        redacted=True,
     )
     try:
         await st.dapr.publish_event(st.cfg.transcripts_topic, event)
