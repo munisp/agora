@@ -14,7 +14,13 @@ Invariants the whole stack obeys (SPEC-W33 §0):
   datasets shipped/derived in-repo with recorded seeds. Synthetic-only validation
   is stated as synthetic.
 - **I4 tenant isolation** — registry stages are per (model_family, tenant);
-  Postgres FORCE RLS (`app.tenant_id`) on the control plane.
+  Postgres FORCE RLS (`app.tenant_id`) on the control plane. Internal batch
+  access (drift sweep, nightly trainer) is role-based, not GUC-based
+  (SPEC-W34 GF1): the NOLOGIN role `app_model_registry_internal` gates
+  cross-tenant rows via `pg_has_role(current_user,
+  'app_model_registry_internal')`, and only the batch login
+  `app_model_registry_batch` (member of that role) holds it; the
+  `app.registry_internal` GUC mechanism is removed.
 - **I5 CPU-first** — everything trains and infers on CPU; torch/Ray are optional
   overlays, never in base images.
 - **I6 PII discipline** — training exports carry W28 salted-SHA-256 hashed
@@ -213,6 +219,21 @@ Consumers pick the flip up on their next `LearnedScorer.load` (registry-first,
   (b) PSI + population KS of serving score distributions vs the trailing 7-day
   baseline. Needs ≥ 10 samples (`min_samples`) else that family is skipped
   honestly (skip reasons logged).
+- Reference-manifest sync (SPEC-W34 GF2): every snapshot `manifest.json`
+  carries the drift contract alongside the legacy keys — `schema:
+  "opendesk/training-manifest/v1"`, `features.<name>.histogram.{edges,counts}`
+  (10 equal-width bins over observed min/max, degenerate ranges expanded),
+  a documented-empty `score_baseline` (snapshots hold labels, not scores;
+  the score leg uses the serving 7-day baseline), and a `manifest_hash`
+  (sha256 over the canonical JSON minus the hash). Because the registry
+  families (`fraud-ml`/`credit-ml`/`graphsage`) differ from the snapshot
+  families (`fraud_features`/`credit_features`/`gnn_export`), a sync step
+  writes `$DRIFT_MANIFEST_DIR/<registry-family>.json` through the explicit
+  `FAMILY_REGISTRY_MAPPING` in `training_snapshot.py`: run
+  `python training_snapshot.py --registry-sync $DRIFT_MANIFEST_DIR --sync-only
+  [--snapshot-base PATH] [--snapshot-date DATE]` (Spark-free, local/file://
+  snapshot trees), or set `REGISTRY_SYNC_DIR` during the Spark run to emit
+  the registry manifests next to the snapshot (s3a included).
 - Threshold: PSI > `DRIFT_PSI_THRESHOLD` (default 0.25). Bands: <0.1 stable,
   0.1–0.25 moderate, >0.25 alert.
 - Where it lands: alert payload `{"type":"model_drift", family, tenant_id,

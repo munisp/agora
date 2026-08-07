@@ -39,14 +39,20 @@ def conversation_turn_event(
     text: str,
     ts: datetime,
     audio_url: str | None = None,
+    redacted: bool = False,
 ) -> dict[str, Any]:
-    """ConversationTurn event for opendesk.conversation.transcripts (SPEC §4)."""
+    """ConversationTurn event for opendesk.conversation.transcripts (SPEC §4).
+
+    ``redacted`` marks that ``text`` has already been PII-redacted
+    (SPEC-W34 GF3) so downstream consumers know not to expect raw PII.
+    """
     data: dict[str, Any] = {
         "conversationId": str(conversation_id),
         "tenantId": str(tenant_id),
         "role": role,
         "text": text,
         "ts": ts.isoformat(),
+        "redacted": redacted,
     }
     if audio_url:
         data["audioUrl"] = audio_url
