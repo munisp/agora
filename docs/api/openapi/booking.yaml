@@ -35,7 +35,7 @@ info:
 
 servers:
   - url: http://localhost:7002
-    description: direct service (dev)
+    description: service-internal (not host-published since W34 GF4; reachable only inside the compose network)
   - url: http://localhost:9080/api/bookings
     description: via APISIX gateway
 
