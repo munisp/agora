@@ -51,6 +51,17 @@ func (in SagaInput) IndustryOrDefault() string {
 	return in.Industry
 }
 
+// OpsAlertInput is the input of the EmitOpsAlert activity (SPEC-W34 GF16):
+// fired when a saga compensation exhausts its retries — e.g. a VoidHold
+// failure leaves an orphaned deposit hold that only manual ops can clear.
+type OpsAlertInput struct {
+	BookingID  string `json:"booking_id"`
+	TenantID   string `json:"tenant_id"`
+	TenantSlug string `json:"tenant_slug"`
+	Activity   string `json:"activity"` // compensation activity that exhausted retries
+	Error      string `json:"error"`    // final retry error text
+}
+
 // ReminderInput starts a ReminderWorkflow.
 type ReminderInput struct {
 	BookingID    string    `json:"booking_id"`

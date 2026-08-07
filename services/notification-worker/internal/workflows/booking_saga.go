@@ -18,6 +18,9 @@ const (
 	ActivityReleaseSlot      = "ReleaseSlot"
 	ActivityVoidHold         = "VoidHold"
 	ActivityGetBookingStatus = "GetBookingStatus"
+	// SPEC-W34 GF16: CRITICAL ops alert when a saga compensation exhausts
+	// its retries (e.g. orphaned deposit hold — holds have no TB timeout).
+	ActivityEmitOpsAlert = "EmitOpsAlert"
 	ActivityMarkNoShow       = "MarkNoShow"
 	ActivitySendNoShowFollow = "SendNoShowFollowup"
 
@@ -103,17 +106,46 @@ func BookingSagaWorkflow(ctx workflow.Context, in SagaInput) error {
 		fn   func(ctx workflow.Context) error
 	}
 	var compensations []compensation
-	compensate := func() {
+	// compensate runs the registered compensations in reverse order and
+	// returns the number that permanently failed (retries exhausted).
+	compensate := func() (failed int) {
 		// disconnected context: compensations must run even on cancellation
 		dctx, _ := workflow.NewDisconnectedContext(ctx)
 		for i := len(compensations) - 1; i >= 0; i-- {
 			c := compensations[i]
 			state = "compensating:" + c.name
 			if err := c.fn(dctx); err != nil {
-				logger.Error("compensation failed", "activity", c.name, "error", err)
+				failed++
+				// SPEC-W34 GF16: a compensation that exhausts its retries
+				// (e.g. VoidHold) leaves an orphaned deposit hold — holds
+				// have no TB timeout. CRITICAL structured log + ops alert;
+				// the saga must NOT report "compensated".
+				logger.Error("CRITICAL: saga compensation exhausted retries — manual ops intervention required",
+					"activity", c.name, "booking_id", in.BookingID,
+					"tenant_id", in.TenantID, "error", err.Error())
+				alertErr := workflow.ExecuteActivity(dctx, ActivityEmitOpsAlert, OpsAlertInput{
+					BookingID:  in.BookingID,
+					TenantID:   in.TenantID,
+					TenantSlug: in.TenantSlug,
+					Activity:   c.name,
+					Error:      err.Error(),
+				}).Get(dctx, nil)
+				if alertErr != nil {
+					logger.Error("CRITICAL: ops alert emission failed after compensation exhaustion",
+						"activity", c.name, "booking_id", in.BookingID, "error", alertErr.Error())
+				}
 			}
 		}
-		state = "compensated"
+		if failed > 0 {
+			// Distinct queryable state so ops can find sagas with orphaned
+			// resources (SPEC-W34 GF16) — never "compensated" when a
+			// compensation actually failed. Callers must not overwrite this
+			// with a generic "failed:<step>" state.
+			state = "compensation_failed"
+		} else {
+			state = "compensated"
+		}
+		return failed
 	}
 
 	// Step 1: ReserveSlot
@@ -136,8 +168,9 @@ func BookingSagaWorkflow(ctx workflow.Context, in SagaInput) error {
 		state = "holding-deposit"
 		err := workflow.ExecuteActivity(ctx, ActivityHoldDeposit, in).Get(ctx, &holdID)
 		if err != nil {
-			compensate()
-			state = "failed:hold-deposit"
+			if compensate() == 0 {
+				state = "failed:hold-deposit"
+			}
 			return temporal.NewApplicationError("HoldDeposit failed", "SagaStepFailed", err)
 		}
 		compensations = append(compensations, compensation{ActivityVoidHold, func(c workflow.Context) error {
@@ -152,8 +185,9 @@ func BookingSagaWorkflow(ctx workflow.Context, in SagaInput) error {
 	// Step 3: ConfirmBooking
 	state = "confirming-booking"
 	if err := workflow.ExecuteActivity(ctx, ActivityConfirmBooking, in).Get(ctx, nil); err != nil {
-		compensate()
-		state = "failed:confirm-booking"
+		if compensate() == 0 {
+			state = "failed:confirm-booking"
+		}
 		return temporal.NewApplicationError("ConfirmBooking failed", "SagaStepFailed", err)
 	}
 	if cancelled {

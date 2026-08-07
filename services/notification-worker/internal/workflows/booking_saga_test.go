@@ -28,6 +28,8 @@ func registerSagaStubs(env *testsuite.TestWorkflowEnvironment) {
 		activity.RegisterOptions{Name: ActivityReleaseSlot})
 	env.RegisterActivityWithOptions(func(ctx context.Context, in SagaInput, holdID string) error { return nil },
 		activity.RegisterOptions{Name: ActivityVoidHold})
+	env.RegisterActivityWithOptions(func(ctx context.Context, in OpsAlertInput) error { return nil },
+		activity.RegisterOptions{Name: ActivityEmitOpsAlert})
 	env.RegisterWorkflowWithOptions(func(ctx workflow.Context, in ReminderInput) error { return nil },
 		workflow.RegisterOptions{Name: "ReminderWorkflow"})
 	env.RegisterWorkflowWithOptions(func(ctx workflow.Context, in NoShowInput) error { return nil },
@@ -136,4 +138,79 @@ func TestBookingSagaWorkflow_ReserveSlotFailureNoCompensation(t *testing.T) {
 	require.Equal(t, []string{"reserve"}, order,
 		"nothing to compensate when the first step fails")
 	env.AssertExpectations(t)
+}
+
+// SPEC-W34 GF16: a compensation that exhausts its retries (VoidHold always
+// erroring = permanent failure) must (a) fire the CRITICAL ops alert
+// activity and (b) leave the saga in the distinct queryable state
+// "compensation_failed" — never "compensated" (orphaned deposit holds have
+// no timeout; ops must be able to find these sagas).
+func TestBookingSagaWorkflow_CompensationExhaustionAlerts(t *testing.T) {
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestWorkflowEnvironment()
+	env.RegisterWorkflow(BookingSagaWorkflow)
+	registerSagaStubs(env)
+
+	env.OnActivity(ActivityReserveSlot, mock.Anything, mock.Anything).Return(nil).Once()
+	env.OnActivity(ActivityHoldDeposit, mock.Anything, mock.Anything).Return("hold-1", nil).Once()
+	env.OnActivity(ActivityConfirmBooking, mock.Anything, mock.Anything).
+		Return(errors.New("booking service exploded"))
+	// Permanent compensation failure: every attempt errors.
+	env.OnActivity(ActivityVoidHold, mock.Anything, mock.Anything, mock.Anything).
+		Return(errors.New("payments-service permanently unreachable"))
+	env.OnActivity(ActivityReleaseSlot, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+
+	var alerts []OpsAlertInput
+	env.OnActivity(ActivityEmitOpsAlert, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { alerts = append(alerts, args.Get(1).(OpsAlertInput)) }).
+		Return(nil).Once()
+
+	env.ExecuteWorkflow(BookingSagaWorkflow, sagaTestInput())
+	require.True(t, env.IsWorkflowCompleted())
+	require.Error(t, env.GetWorkflowError())
+
+	// (a) the CRITICAL ops alert fired with the exhausted compensation.
+	require.Len(t, alerts, 1, "compensation exhaustion must emit exactly one ops alert")
+	require.Equal(t, ActivityVoidHold, alerts[0].Activity)
+	require.Equal(t, "b-1", alerts[0].BookingID)
+	require.Equal(t, "t-1", alerts[0].TenantID)
+	require.Contains(t, alerts[0].Error, "payments-service permanently unreachable")
+
+	// (b) the saga state is the distinct "compensation_failed", queryable by ops.
+	var state string
+	val, err := env.QueryWorkflow(QueryState)
+	require.NoError(t, err)
+	require.NoError(t, val.Get(&state))
+	require.Equal(t, "compensation_failed", state,
+		"a failed compensation must NOT report compensated (orphaned deposit hold)")
+	env.AssertExpectations(t)
+}
+
+// GF16 complement: when compensations SUCCEED the final state is the
+// pre-existing "failed:<step>" semantics (NOT "compensation_failed") and
+// no ops alert fires.
+func TestBookingSagaWorkflow_SuccessfulCompensationNoAlert(t *testing.T) {
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestWorkflowEnvironment()
+	env.RegisterWorkflow(BookingSagaWorkflow)
+	registerSagaStubs(env)
+
+	env.OnActivity(ActivityReserveSlot, mock.Anything, mock.Anything).Return(nil).Once()
+	env.OnActivity(ActivityHoldDeposit, mock.Anything, mock.Anything).Return("hold-1", nil).Once()
+	env.OnActivity(ActivityConfirmBooking, mock.Anything, mock.Anything).
+		Return(errors.New("booking service exploded"))
+	env.OnActivity(ActivityVoidHold, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+	env.OnActivity(ActivityReleaseSlot, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+
+	env.ExecuteWorkflow(BookingSagaWorkflow, sagaTestInput())
+	require.True(t, env.IsWorkflowCompleted())
+	require.Error(t, env.GetWorkflowError())
+
+	var state string
+	val, err := env.QueryWorkflow(QueryState)
+	require.NoError(t, err)
+	require.NoError(t, val.Get(&state))
+	require.Equal(t, "failed:confirm-booking", state,
+		"clean compensation keeps the pre-existing failed:<step> state semantics")
+	env.AssertExpectations(t) // no ActivityEmitOpsAlert expectation → none fired
 }
