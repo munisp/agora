@@ -118,6 +118,7 @@ a gate/operator can invoke it manually without waiting for cron.
 | --- | --- | --- |
 | `PORT` | `7019` | HTTP port |
 | `MODEL_REGISTRY_PG_DSN` | `postgresql://app_model_registry_login:app_model_registry_dev_password@localhost:5432/platform` | psycopg v3 sync DSN |
+| `MODEL_REGISTRY_INTERNAL_DSN` | _(unset)_ | psycopg v3 DSN as `app_model_registry_batch` for internal cross-tenant batch jobs (GF1). Production compose always sets it; unset = unit-test fallback to the primary DSN (logged warning; cross-tenant reads then see no rows) |
 | `KAFKA_ENABLED` | `true` | False → log-only alerts |
 | `KAFKA_BOOTSTRAP_SERVERS` | `kafka:9092` | Kafka bootstrap |
 | `ALERTS_TOPIC` | `ops.alerts` | Alert topic (drift + training gate) |
@@ -151,8 +152,18 @@ atomic-promote transaction and RLS GUC scoping explicit.
   metrics itself except the A/B report, which is labeled-outcomes-only.
 * **Tenant isolation**: FORCE RLS on all tenant tables; a single write path
   (`model_registry.store.RegistryStore`) sets `app.tenant_id` per
-  transaction. Cross-tenant reads exist only for internal batch jobs via
-  `app.registry_internal='on'`; HTTP handlers never use it.
+  transaction. Cross-tenant access exists only for internal batch jobs and is
+  gated on ROLE MEMBERSHIP (SPEC-W34 GF1): internal transactions connect via
+  `MODEL_REGISTRY_INTERNAL_DSN` as `app_model_registry_batch`, and the RLS
+  policies check `pg_has_role(current_user, 'app_model_registry_internal')`.
+  The pre-GF1 `app.registry_internal` GUC was removable by any session
+  (`set_config` needs no privilege) and is gone from the policies — setting
+  it now does nothing (proven by `tests/test_guc_bypass.py`). HTTP handlers
+  never use internal transactions.
+* **Input hardening (SPEC-W34 GF10)**: tenant/experiment ids are UUID-typed,
+  `version` is bounded to int4, `predicted_score` rejects NaN/Inf, and
+  `artifact_uri` is capped at 2048 chars — bad client input is a 422, never
+  a 500 (see `tests/test_input_hardening.py`).
 
 ## Development
 
