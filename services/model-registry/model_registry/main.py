@@ -8,12 +8,16 @@ started in lifespan, jobs wrapped so they never crash the scheduler — I1).
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from uuid import UUID
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Gauge, generate_latest
 from pydantic import BaseModel, Field
@@ -29,56 +33,63 @@ log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------- models
+# SPEC-W34 GF10 input hardening: tenant/experiment ids are UUIDs, version is
+# int4-bounded, predicted_score rejects NaN/Inf, artifact_uri is length-capped
+# — every prior 500-on-client-input case now fails validation with 422.
+INT4_MAX = 2**31 - 1
+ARTIFACT_URI_MAX = 2048
+
+
 class RegisterRequest(BaseModel):
     family: str
-    tenant_id: str
-    artifact_uri: str
+    tenant_id: UUID
+    artifact_uri: str = Field(min_length=1, max_length=ARTIFACT_URI_MAX)
     metrics: dict[str, Any] = Field(default_factory=dict)
     seed: int | None = None
     dataset_hash: str | None = None
     git_sha: str | None = None
-    version: int | None = None
+    version: int | None = Field(default=None, ge=1, le=INT4_MAX)
 
 
 class PromoteRequest(BaseModel):
     family: str
-    tenant_id: str
-    version: int
+    tenant_id: UUID
+    version: int = Field(ge=1, le=INT4_MAX)
 
 
 class RollbackRequest(BaseModel):
     family: str
-    tenant_id: str
+    tenant_id: UUID
 
 
 class ExperimentRequest(BaseModel):
     family: str
-    tenant_id: str
-    champion_version: int
-    challenger_version: int
+    tenant_id: UUID
+    champion_version: int = Field(ge=1, le=INT4_MAX)
+    challenger_version: int = Field(ge=1, le=INT4_MAX)
     pct: int = Field(ge=0, le=100)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
 
 
 class OutcomeRequest(BaseModel):
-    tenant_id: str
+    tenant_id: UUID
     person_id: str
     assigned_arm: str = Field(pattern="^(champion|challenger)$")
     predicted_label: int = Field(ge=0, le=1)
-    predicted_score: float = Field(ge=0.0, le=1.0)
+    predicted_score: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     true_label: int | None = Field(default=None, ge=0, le=1)
 
 
 class ScoresRequest(BaseModel):
     family: str
-    tenant_id: str
+    tenant_id: UUID
     scores: list[float]
 
 
 class FeaturesRequest(BaseModel):
     family: str
-    tenant_id: str
+    tenant_id: UUID
     features: dict[str, list[float]]
 
 
@@ -107,7 +118,8 @@ def create_app(
     enable_scheduler: bool = True,
 ) -> FastAPI:
     settings = settings or load_settings()
-    store = store or RegistryStore(settings.pg_dsn)
+    store = store or RegistryStore(settings.pg_dsn,
+                                   internal_dsn=settings.pg_internal_dsn)
     publisher = publisher or build_publisher(
         kafka_enabled=settings.kafka_enabled,
         bootstrap_servers=settings.kafka_bootstrap_servers)
@@ -174,6 +186,25 @@ def create_app(
                   version="0.1.0", lifespan=lifespan)
 
     # ------------------------------------------------------------ errors (honest)
+    @app.exception_handler(RequestValidationError)
+    async def _rv(_: Request, exc: RequestValidationError):
+        """422 with leak-free detail. GF10: pydantic allow_inf_nan=False errors
+        embed the offending NaN/Inf as the `input` value, and Starlette's
+        JSONResponse (allow_nan=False) would crash serializing it — turning a
+        clean 422 into a 500. Non-finite floats are rendered as their repr."""
+        def _clean(value: Any) -> Any:
+            if isinstance(value, float) and not math.isfinite(value):
+                return repr(value)
+            if isinstance(value, dict):
+                return {k: _clean(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_clean(v) for v in value]
+            return value
+
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(_clean(exc.errors()))})
+
     @app.exception_handler(NotFound)
     async def _nf(_: Request, exc: NotFound):
         return JSONResponse(status_code=404, content={"detail": str(exc)})
@@ -212,14 +243,14 @@ def create_app(
         return state.store.rollback(req.family, req.tenant_id)
 
     @app.get("/v1/registry/{family}/{tenant_id}/production")
-    def production(family: str, tenant_id: str):
+    def production(family: str, tenant_id: UUID):
         row = state.store.get_production(family, tenant_id)
         if row is None:
             raise NotFound(f"no production version for {family}/{tenant_id}")
         return row
 
     @app.get("/v1/registry/{family}/{tenant_id}/versions")
-    def versions(family: str, tenant_id: str):
+    def versions(family: str, tenant_id: UUID):
         return {"family": family, "tenant_id": tenant_id,
                 "versions": state.store.list_versions(family, tenant_id)}
 
@@ -233,7 +264,7 @@ def create_app(
             starts_at=req.starts_at, ends_at=req.ends_at)
 
     @app.get("/v1/registry/experiments/assignment")
-    def assignment(family: str = Query(...), tenant_id: str = Query(...),
+    def assignment(family: str = Query(...), tenant_id: UUID = Query(...),
                    person_id: str = Query(...)):
         """Per-request assignment for scoring services. FAIL-CLOSED to
         champion on missing experiment or any error."""
@@ -257,7 +288,7 @@ def create_app(
 
     @app.post("/v1/registry/experiments/{experiment_id}/outcomes",
               status_code=201)
-    def record_outcome(experiment_id: str, req: OutcomeRequest):
+    def record_outcome(experiment_id: UUID, req: OutcomeRequest):
         return state.store.record_outcome(
             experiment_id=experiment_id, tenant_id=req.tenant_id,
             person_id=req.person_id, assigned_arm=req.assigned_arm,
@@ -265,7 +296,7 @@ def create_app(
             predicted_score=req.predicted_score, true_label=req.true_label)
 
     @app.get("/v1/registry/experiments/{experiment_id}/report")
-    def experiment_report(experiment_id: str):
+    def experiment_report(experiment_id: UUID):
         """Champion vs challenger precision/recall/Brier over labeled
         outcomes. 404 when the experiment does not exist (honest empty)."""
         experiment = state.store.get_experiment(experiment_id)

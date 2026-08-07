@@ -1,4 +1,4 @@
-"""Test fixtures: REAL embedded Postgres 16 (pgserver), migration applied
+r"""Test fixtures: REAL embedded Postgres 16 (pgserver), migration applied
 VERBATIM via psql stdin (handles \c + DO blocks exactly like the postgres
 docker-entrypoint-initdb.d path), RLS exercised with the real app role.
 """
@@ -23,6 +23,7 @@ from model_registry.store import RegistryStore  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MIGRATION = REPO_ROOT / "infra/postgres/init-scripts/30-model-registry.sql"
 APP_ROLE = "app_model_registry_login"
+BATCH_ROLE = "app_model_registry_batch"
 
 TENANT_A = str(uuid.uuid4())
 TENANT_B = str(uuid.uuid4())
@@ -31,7 +32,7 @@ TENANT_B = str(uuid.uuid4())
 @pytest.fixture(scope="session")
 def pg(tmp_path_factory):
     server = pgserver.get_server(str(tmp_path_factory.mktemp("pgdata")))
-    sql = "\set ON_ERROR_STOP on\n" + MIGRATION.read_text()
+    sql = "\\set ON_ERROR_STOP on\n" + MIGRATION.read_text()
     server.psql(sql)  # raises CalledProcessError on any migration error
     yield server
     server.cleanup()
@@ -50,6 +51,15 @@ def app_dsn(pg, super_dsn) -> str:
     return psycopg.conninfo.make_conninfo(**info)
 
 
+@pytest.fixture(scope="session")
+def internal_dsn(pg, super_dsn) -> str:
+    """DSN as the internal batch role (member of app_model_registry_internal),
+    like the production MODEL_REGISTRY_INTERNAL_DSN."""
+    info = psycopg.conninfo.conninfo_to_dict(super_dsn)
+    info["user"] = BATCH_ROLE
+    return psycopg.conninfo.make_conninfo(**info)
+
+
 @pytest.fixture(autouse=True)
 def clean_tables(pg, super_dsn):
     with psycopg.connect(super_dsn, autocommit=True) as conn:
@@ -60,14 +70,16 @@ def clean_tables(pg, super_dsn):
 
 
 @pytest.fixture()
-def store(app_dsn) -> RegistryStore:
-    """Store connected as the app role — exercises the RLS GUC write path."""
-    return RegistryStore(app_dsn)
+def store(app_dsn, internal_dsn) -> RegistryStore:
+    """Store wired like production: app role for tenant paths, batch role for
+    internal cross-tenant transactions (SPEC-W34 GF1)."""
+    return RegistryStore(app_dsn, internal_dsn=internal_dsn)
 
 
 @pytest.fixture()
-def settings(app_dsn) -> Settings:
-    return Settings(pg_dsn=app_dsn, kafka_enabled=False,
+def settings(app_dsn, internal_dsn) -> Settings:
+    return Settings(pg_dsn=app_dsn, pg_internal_dsn=internal_dsn,
+                    kafka_enabled=False,
                     drift_manifest_dir=str(Path(__file__).parent / "fixtures"))
 
 
