@@ -1,89 +1,36 @@
 {
   "uid": "opendesk-temporal-saga",
-  "title": "OpenDesk — Temporal / Saga",
-  "description": "Booking saga and worker health. Panels that reference `opendesk_saga_*` metrics populate once the Go services ship their /metrics endpoints (Wave 3-4 work); crm-sync and analytics panels are live today.",
-  "tags": ["opendesk", "temporal", "saga"],
+  "title": "OpenDesk \u2014 Temporal / Saga",
+  "description": "Booking saga / Temporal worker visibility. GF13 (SPEC-W34): the opendesk_saga_* panels were removed \u2014 no service ever emitted those metrics.",
+  "tags": [
+    "opendesk",
+    "temporal",
+    "saga"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
-  "time": {"from": "now-6h", "to": "now"},
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "refresh": "30s",
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "Saga execution latency (p50/p95/p99)",
-      "description": "BookingSagaWorkflow end-to-end duration histogram (opendesk_saga_duration_seconds, emitted by notification-worker once its /metrics endpoint lands).",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.50, sum(rate(opendesk_saga_duration_seconds_bucket[5m])) by (le, workflow))", "legendFormat": "p50 {{workflow}}"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum(rate(opendesk_saga_duration_seconds_bucket[5m])) by (le, workflow))", "legendFormat": "p95 {{workflow}}"},
-        {"refId": "C", "expr": "histogram_quantile(0.99, sum(rate(opendesk_saga_duration_seconds_bucket[5m])) by (le, workflow))", "legendFormat": "p99 {{workflow}}"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
-    },
-    {
-      "id": 2,
-      "type": "timeseries",
-      "title": "Saga outcomes (completed / compensated / failed)",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [
-        {"refId": "A", "expr": "sum by (outcome) (rate(opendesk_saga_total[5m]))", "legendFormat": "{{outcome}}"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
-    },
-    {
-      "id": 3,
-      "type": "timeseries",
-      "title": "Activity latency by step (ReserveSlot / HoldDeposit / ConfirmBooking / SendConfirmation)",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(opendesk_saga_activity_duration_seconds_bucket[5m])) by (le, activity))", "legendFormat": "{{activity}}"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "Booking events consumed (analytics sink, per topic)",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [
-        {"refId": "A", "expr": "sum by (topic) (rate(analytics_messages_consumed_total[5m]))", "legendFormat": "{{topic}}"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "CRM sync: events processed vs DLQ'd",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [
-        {"refId": "A", "expr": "sum by (name) (rate(crm_sync_counter{name=~\"events_processed.*|dlq.*|events_failed.*\"}[5m]))", "legendFormat": "{{name}}"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "CRM sync: Twenty API call latency (p95)",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
-      "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(crm_sync_twenty_call_duration_seconds_bucket[5m])) by (le, path_class))", "legendFormat": "{{path_class}}"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      "type": "text",
+      "title": "Saga metrics are planned, not yet emitted",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "## No saga metrics exist yet (honest placeholder \u2014 GF13 / SPEC-W34)\n\nThis dashboard previously showed six panels; **five referenced `opendesk_saga_*`\nmetrics that nothing in this repository has ever emitted** (verified by grep\nacross `services/`): booking-service and notification-worker (Go) currently\nexpose **no Prometheus `/metrics` endpoint at all** \u2014 only `/healthz`.\n\nThe panels were removed rather than left dead.\n\n**Planned instrumentation** (when the Go services land Prometheus exporters):\n\n- `opendesk_saga_duration_seconds` (histogram, by workflow)\n- `opendesk_saga_total` (counter, by outcome: completed/compensated/failed)\n- `opendesk_saga_activity_duration_seconds` (histogram, by activity step)\n\n**Until then, saga-adjacent live signals live elsewhere:**\n\n- *Platform overview* dashboard: analytics consumer lag, flush error rate\n- CRM sync health: `crm_sync_counter`, `crm_sync_twenty_call_duration_seconds`\n  (re-add panels here once this dashboard has real saga panels to sit beside)\n- Temporal itself: scrape the Temporal server's own metrics endpoint when the\n  compose Temporal service grows a prometheus listen config.\n"
+      }
     }
   ]
 }

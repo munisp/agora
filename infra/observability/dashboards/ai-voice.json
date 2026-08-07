@@ -1,88 +1,270 @@
 {
   "uid": "opendesk-ai-voice",
-  "title": "OpenDesk — AI & Voice",
+  "title": "OpenDesk \u2014 AI & Voice",
   "description": "Voice agent and LLM observability. LLM/turn panels reference the `voice_*` metric family emitted by voice-agent-runtime (lands with its /metrics endpoint in Wave 3-4); gateway voice-route traffic and voice logs are live today.",
-  "tags": ["opendesk", "voice", "llm"],
+  "tags": [
+    "opendesk",
+    "voice",
+    "llm"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
-  "time": {"from": "now-6h", "to": "now"},
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
   "refresh": "30s",
   "panels": [
     {
       "id": 1,
       "type": "timeseries",
-      "title": "LLM call latency (p50/p95) by model",
-      "description": "voice_llm_call_duration_seconds histogram, labelled by model (qwen3:8b default / MiniMax-M2 alt).",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "title": "LLM completion latency (p50/p95)",
+      "description": "GF13 (SPEC-W34): repointed to the metric voice-agent-runtime actually emits (voice_llm_latency_seconds, app/metrics.py). The histogram carries no model label, so per-model splitting was dropped.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.50, sum(rate(voice_llm_call_duration_seconds_bucket[5m])) by (le, model))", "legendFormat": "p50 {{model}}"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum(rate(voice_llm_call_duration_seconds_bucket[5m])) by (le, model))", "legendFormat": "p95 {{model}}"}
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum(rate(voice_llm_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_llm_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "id": 2,
       "type": "timeseries",
-      "title": "LLM calls / errors per minute",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "title": "LLM completions/min & TTS provider failures",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
       "targets": [
-        {"refId": "A", "expr": "sum by (model) (rate(voice_llm_calls_total[1m])) * 60", "legendFormat": "calls {{model}}"},
-        {"refId": "B", "expr": "sum(rate(voice_llm_errors_total[1m])) * 60", "legendFormat": "errors"}
+        {
+          "refId": "A",
+          "expr": "sum(rate(voice_llm_latency_seconds_count[1m])) * 60",
+          "legendFormat": "llm completions/min"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (provider) (rate(tts_provider_failures_total[5m])) * 60",
+          "legendFormat": "tts failures {{provider}}/min"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "opm"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "GF13: voice_llm_calls_total / voice_llm_errors_total were never emitted. Calls/min derive from the latency histogram count; failure signal uses the real tts_provider_failures_total (provider fallback chain)."
     },
     {
       "id": 3,
       "type": "timeseries",
-      "title": "Chat turns & tool calls",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "title": "Active sessions & tool calls",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
       "targets": [
-        {"refId": "A", "expr": "sum(rate(voice_chat_turns_total[5m]))", "legendFormat": "turns"},
-        {"refId": "B", "expr": "sum by (tool) (rate(voice_tool_calls_total[5m]))", "legendFormat": "tool {{tool}}"}
+        {
+          "refId": "A",
+          "expr": "sum(voice_active_sessions)",
+          "legendFormat": "active sessions"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (tool) (rate(voice_tool_calls_total[5m]))",
+          "legendFormat": "tool {{tool}}"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "GF13: voice_chat_turns_total was never emitted; replaced with the real voice_active_sessions gauge. Tool calls unchanged (voice_tool_calls_total is emitted)."
     },
     {
       "id": 4,
       "type": "timeseries",
       "title": "STT / TTS latency (p95)",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
       "targets": [
-        {"refId": "A", "expr": "histogram_quantile(0.95, sum(rate(voice_stt_duration_seconds_bucket[5m])) by (le))", "legendFormat": "stt p95"},
-        {"refId": "B", "expr": "histogram_quantile(0.95, sum(rate(voice_tts_duration_seconds_bucket[5m])) by (le))", "legendFormat": "tts p95"}
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_stt_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "stt p95"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_tts_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "tts p95"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "GF13: repointed from the never-emitted voice_stt/tts_duration_seconds to the real voice_stt_latency_seconds / voice_tts_latency_seconds histograms (app/metrics.py)."
     },
     {
       "id": 5,
       "type": "timeseries",
       "title": "Voice route traffic via gateway (/voice/*)",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
-      "datasource": {"type": "prometheus", "uid": "Prometheus"},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
       "targets": [
-        {"refId": "A", "expr": "sum by (route) (rate(apisix_http_status{route=~\".*voice.*\"}[5m]))", "legendFormat": "{{route}}"}
+        {
+          "refId": "A",
+          "expr": "sum by (route) (rate(apisix_http_status{route=~\".*voice.*\"}[5m]))",
+          "legendFormat": "{{route}}"
+        }
       ],
-      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}}
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     },
     {
       "id": 6,
       "type": "logs",
       "title": "Voice runtime logs (Loki)",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
-      "datasource": {"type": "loki", "uid": "Loki"},
-      "targets": [{"refId": "A", "expr": "{container=~\"voice|voice-worker|piper|ollama\"}"}],
-      "options": {"showTime": true, "showLabels": false, "wrapLogMessage": false, "prettifyLogMessage": false, "enableLogDetails": true, "dedupStrategy": "none", "sortOrder": "Descending"}
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{container=~\"voice|voice-worker|piper|ollama\"}"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "wrapLogMessage": false,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      }
     }
   ]
 }
