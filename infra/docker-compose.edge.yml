@@ -37,7 +37,11 @@ services:
     - ./apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
     ports:
     - 9080:9080/tcp
-    - 9180:9180/tcp
+    # GF4 (SPEC-W34): admin API no longer exposed on all interfaces - bound to
+    # loopback only (keys are committed dev values; standalone mode is
+    # file-driven so the admin API is read-only diagnostics). Uncomment-free
+    # alternative: delete this line entirely in any shared environment.
+    - 127.0.0.1:9180:9180/tcp
     networks:
     - opendesk
     depends_on:
@@ -89,7 +93,11 @@ services:
     - ./apisix/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
     ports:
     - 9080:9080/tcp
-    - 9180:9180/tcp
+    # GF4 (SPEC-W34): admin API no longer exposed on all interfaces - bound to
+    # loopback only (keys are committed dev values; standalone mode is
+    # file-driven so the admin API is read-only diagnostics). Uncomment-free
+    # alternative: delete this line entirely in any shared environment.
+    - 127.0.0.1:9180:9180/tcp
     networks:
     - opendesk
     depends_on:

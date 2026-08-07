@@ -1,0 +1,158 @@
+# GF12 (SPEC-W34): zero-trust network baseline for the opendesk namespace.
+#
+# Model: default-deny ingress AND egress for every pod, then explicit allows:
+#   1. DNS egress to kube-dns (nothing resolves without it).
+#   2. Pod-to-pod traffic inside the namespace (booking -> identity, workers
+#      -> livekit-server headless service, ...).
+#   3. Ingress from the cluster ingress/gateway path (k3s traefik lives in
+#      kube-system; if you run ingress-nginx or a dedicated gateway namespace,
+#      adjust the namespaceSelector) and from a monitoring namespace for
+#      Prometheus scrapes.
+#   4. Egress to the platform data services. The edge MVP runs its data plane
+#      (postgres/kafka/temporal/redis/permify/keycloak) outside these
+#      manifests (compose or a central cluster), so this allow is port-based
+#      to cluster-internal ranges; tighten to exact CIDRs/hostnames in prod.
+#   5. MirrorMaker2 egress to the CENTRAL Kafka (off-cluster). Restrict the
+#      `to` block to the central cluster's CIDRs once allocated.
+#
+# Exception: livekit-server runs hostNetwork (see the prominent comment in
+# livekit-server.yaml) — pod NetworkPolicies do not govern host-net traffic on
+# most CNIs; enforce the UDP media range at the node firewall instead.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: opendesk
+  labels:
+    app.kubernetes.io/part-of: opendesk
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: opendesk
+  labels:
+    app.kubernetes.io/part-of: opendesk
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: opendesk
+  labels:
+    app.kubernetes.io/part-of: opendesk
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gateway-and-monitoring-ingress
+  namespace: opendesk
+  labels:
+    app.kubernetes.io/part-of: opendesk
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    # k3s ships traefik in kube-system; swap/extend this selector for
+    # ingress-nginx (ingress-nginx ns) or a dedicated gateway namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    # Prometheus scrapes (metrics ports: app /metrics, livekit :6789,
+    # voice-worker :8080) from the monitoring stack, if deployed cluster-side.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 6789
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 7001
+        - protocol: TCP
+          port: 7002
+        - protocol: TCP
+          port: 7003
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-data-services-egress
+  namespace: opendesk
+  labels:
+    app.kubernetes.io/part-of: opendesk
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # Data plane reached by ClusterIP/DNS or off-cluster endpoints:
+    # postgres 5432, kafka 9092, temporal 7233, redis 6379, permify 3476,
+    # keycloak 8080, plus 443/80 for managed endpoints. Tighten `to` to the
+    # actual service CIDRs (or drop it for in-cluster services, where the
+    # port list alone is still a meaningful constraint) in production.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+        - ipBlock:
+            cidr: 172.16.0.0/12
+        - ipBlock:
+            cidr: 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 7233
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 3476
+        - protocol: TCP
+          port: 8080
+    # MirrorMaker2 -> central OpenDesk Kafka (off-cluster; see
+    # mirror-maker2.yaml). Replace 0.0.0.0/0 with the central CIDR when known.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 443

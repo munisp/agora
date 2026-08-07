@@ -18,21 +18,49 @@ spec:
       labels:
         app: booking
     spec:
+      # GF12 (SPEC-W34) zero-trust baseline: non-root, read-only root fs,
+      # no privilege escalation, all capabilities dropped. Writable scratch
+      # space comes from the emptyDir /tmp mount below.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: booking
           image: opendesk-booking:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           ports:
             - containerPort: 7002
           env:
             - name: PORT
               value: "7002"
+            # GF12: DSNs carry the DB password - sourced from the dev-only
+            # Secret (secret.yaml), no longer plaintext in the Deployment.
             - name: PG_DSN
-              value: postgres://opendesk:opendesk@postgres:5432
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: pg-dsn
             - name: PG_DATABASE
               value: booking
             - name: DATABASE_URL
-              value: postgres://opendesk:opendesk@postgres:5432/booking
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: booking-database-url
             # pgxpool MaxConns — size for PEAK concurrent calls, not average
             # (voice turns fan out into availability lookups). Formula and
             # per-service defaults: docs/runbooks/capacity-planning.md §DB.
@@ -50,10 +78,9 @@ spec:
               value: opendesk-main
             - name: PERMIFY_HTTP
               value: http://permify:3476
-            # Dev parity: booking runs with AUTHZ_DISABLED=true in dev; on the
-            # appliance keep it disabled behind the local gateway only.
-            - name: AUTHZ_DISABLED
-              value: "true"
+            # GF12: AUTHZ_DISABLED removed (was "true" here, disabling Permify
+            # checks cluster-wide). The service default is "false"
+            # (internal/config/config.go) - authorization stays enforced.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -73,6 +100,9 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

@@ -7,19 +7,37 @@
   "duplicateEmailsAllowed": false,
   "resetPasswordAllowed": true,
   "editUsernameAllowed": false,
-  "bruteForceProtected": false,
-  "sslRequired": "none",
+  "bruteForceProtected": true,
+  "sslRequired": "external",
   "accessTokenLifespan": 300,
   "ssoSessionIdleTimeout": 1800,
   "ssoSessionMaxLifespan": 36000,
   "roles": {
     "realm": [
-      { "name": "owner", "description": "Tenant owner — full control including billing and deletion" },
-      { "name": "admin", "description": "Tenant admin — manage catalog, bookings, site" },
-      { "name": "staff", "description": "Tenant staff — manage bookings" },
-      { "name": "viewer", "description": "Read-only dashboard access" },
-      { "name": "analyst", "description": "KPI/analytics dashboards, no mutations" },
-      { "name": "billing", "description": "invoices, rate cards, payment links" }
+      {
+        "name": "owner",
+        "description": "Tenant owner \u2014 full control including billing and deletion"
+      },
+      {
+        "name": "admin",
+        "description": "Tenant admin \u2014 manage catalog, bookings, site"
+      },
+      {
+        "name": "staff",
+        "description": "Tenant staff \u2014 manage bookings"
+      },
+      {
+        "name": "viewer",
+        "description": "Read-only dashboard access"
+      },
+      {
+        "name": "analyst",
+        "description": "KPI/analytics dashboards, no mutations"
+      },
+      {
+        "name": "billing",
+        "description": "invoices, rate cards, payment links"
+      }
     ]
   },
   "groups": [
@@ -31,7 +49,9 @@
           "name": "acme",
           "path": "/tenants/acme",
           "attributes": {
-            "tenant_slug": ["acme"]
+            "tenant_slug": [
+              "acme"
+            ]
           },
           "realmRoles": [],
           "subGroups": []
@@ -84,10 +104,10 @@
     {
       "clientId": "service-accounts",
       "name": "OpenDesk Service Accounts",
-      "description": "Confidential client for service-to-service (client credentials)",
+      "description": "Confidential client for service-to-service (client credentials). GF5 (SPEC-W34): the committed secret is a placeholder - set a real one at import time (see infra/keycloak/README.md).",
       "enabled": true,
       "publicClient": false,
-      "secret": "opendesk-service-secret",
+      "secret": "CHANGE_ME_DEV_ONLY",
       "standardFlowEnabled": false,
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
@@ -112,23 +132,6 @@
       ]
     }
   ],
-  "users": [
-    {
-      "username": "admin",
-      "email": "admin@opendesk.local",
-      "enabled": true,
-      "emailVerified": true,
-      "firstName": "Demo",
-      "lastName": "Admin",
-      "credentials": [
-        {
-          "type": "password",
-          "value": "admin123",
-          "temporary": false
-        }
-      ],
-      "realmRoles": ["owner"],
-      "groups": ["/tenants/acme"]
-    }
-  ]
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0
 }

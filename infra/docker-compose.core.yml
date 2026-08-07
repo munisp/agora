@@ -189,7 +189,8 @@ services:
         condition: service_healthy
     environment:
       TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_CORS_ORIGINS: http://localhost:3001
+      # GF4: admin-web is served via the gateway now (3001 unpublished).
+      TEMPORAL_CORS_ORIGINS: http://localhost:9080
     ports:
       - "8233:8080"
     healthcheck:
@@ -288,7 +289,8 @@ services:
       KC_DB_USERNAME: opendesk
       KC_DB_PASSWORD: opendesk
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # GF5 (SPEC-W34): no committed default - compose refuses to start without it.
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?set KC_BOOTSTRAP_ADMIN_PASSWORD (see infra/keycloak/README.md)}
       KC_HEALTH_ENABLED: "true"
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
@@ -348,10 +350,16 @@ services:
       TRAIN_ENABLED: ${MODEL_REGISTRY_TRAIN_ENABLED:-false}
       TRAIN_CRON_HOUR: ${TRAIN_CRON_HOUR:-2}
       GIT_SHA: ${GIT_SHA:-unknown}
-    ports:
-      # 7016 graph-ml, 7017 fraud-engine, 7018 graph-ml-gpu host are taken;
-      # 7019 is the lowest free.
-      - "7019:7019"   # dev/e2e reachability; not routed through APISIX
+      # GF1 wiring (SPEC-W34): internal/batch role DSN used by store.py for
+      # internal transactions (RLS policies gate on the app_model_registry_internal
+      # role, not the GUC). Dev-only password - override in real environments.
+      MODEL_REGISTRY_INTERNAL_DSN: postgres://app_model_registry_batch:app_model_registry_batch_dev_password@postgres:5432/platform
+    # GF4 (SPEC-W34): 7019 is no longer host-published (it bypassed any gateway
+    # control). Reach it in-network as model-registry:7019 (profile-gated
+    # service) or `docker compose exec` for debugging; live e2e suites that
+    # assumed localhost:7019 are deferred per SPEC-W34.
+    # 7016 graph-ml, 7017 fraud-engine, 7018 graph-ml-gpu host are taken;
+    # 7019 is the lowest free if a temporary publish is ever needed.
     volumes:
       - model-registry-manifests:/data/manifests
     depends_on:
