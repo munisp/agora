@@ -24,6 +24,7 @@ import {
   MapPin,
   Target,
   AudioLines,
+  Bot,
   Settings,
   Filter,
   Shield,
@@ -31,6 +32,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
+  canViewAgents,
   canViewAnalytics,
   canViewBilling,
   canViewGeoCampaigns,
@@ -56,6 +58,8 @@ const items: NavItem[] = [
   { segment: "availability", label: "Availability", icon: Clock },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
   { segment: "voice-agent", label: "Voice Agent", icon: Mic },
+  // SPEC-W38: self-serve agents registry (wizard + capture records).
+  { segment: "agents", label: "Agents", icon: Bot },
   { segment: "public-site", label: "Public Site", icon: Globe },
   { segment: "billing", label: "Billing", icon: CreditCard },
   { segment: "analytics", label: "Analytics", icon: BarChart3 },
@@ -141,6 +145,10 @@ export function OrgNav({
     // the same rule server-side.
     if ("segment" in item && item.segment === "voices")
       return canViewVoices(roles);
+    // SPEC-W38: agents registry is operational — owner/admin/staff, same
+    // gate as voices; the pages enforce it server-side too.
+    if ("segment" in item && item.segment === "agents")
+      return canViewAgents(roles);
     return true;
   });
 

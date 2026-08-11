@@ -90,3 +90,13 @@ export function canEnrollVoices(
 ): boolean {
   return hasAnyRole(roles, VOICES_ENROLL_ROLES);
 }
+
+/** Agents registry (SPEC-W38) — operational staff can manage agents. */
+export const AGENTS_ROLES: readonly RealmRole[] = ["owner", "admin", "staff"];
+
+/** owner/admin/staff — viewers, analysts and billing never see the agents section. */
+export function canViewAgents(
+  roles: readonly string[] | undefined | null,
+): boolean {
+  return hasAnyRole(roles, AGENTS_ROLES);
+}
