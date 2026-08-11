@@ -15,6 +15,7 @@ Series:
 - voice_tool_calls_total      (counter, labels tool,result)
 - voice_active_sessions       (gauge)
 - voice_emergency_sessions_total (counter) — SPEC-W11 Part C emergency lane
+- voice_agent_resolution_total (counter, label source) — SPEC-W38 F1 registry
 """
 
 from __future__ import annotations
@@ -186,6 +187,14 @@ class Registry:
             "Voice sessions flagged as emergencies (warm-handoff triggered).",
             (),
         )
+        # SPEC-W38 F1: dialed-number -> agent/tenant resolution outcomes;
+        # label source = registry|env_map|default (agents registry first,
+        # legacy TENANT_PHONE_MAP / SIP_DEFAULT_SITE fallback).
+        self.agent_resolution = Counter(
+            "voice_agent_resolution_total",
+            "Dialed-number resolution outcomes by source.",
+            ("source",),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -198,6 +207,7 @@ class Registry:
             self.tool_calls,
             self.active_sessions,
             self.emergency_sessions,
+            self.agent_resolution,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -236,6 +246,11 @@ def tts_provider_failure(provider: str) -> None:
 def emergency_session() -> None:
     """SPEC-W11 Part C: one voice session flagged as an emergency."""
     _registry.emergency_sessions.inc()
+
+
+def agent_resolution(source: str) -> None:
+    """SPEC-W38 F1: one dialed-number resolution (registry|env_map|default)."""
+    _registry.agent_resolution.inc(source=source)
 
 
 # ---------------------------------------------------------------------------

@@ -149,8 +149,11 @@ class InboundCallContext:
     site_slug: str  # tenant/site slug the receptionist session binds to
     caller_phone: str = ""  # normalized caller ID (may be "" when anonymous)
     dialed_number: str = ""
-    tenant_source: str = ""  # map|room|default — for logs/metrics
+    tenant_source: str = ""  # registry|map|default — for logs/metrics
     attributes: dict[str, str] = field(default_factory=dict)
+    # SPEC-W38 F1: agent record when the dialed number resolved via the
+    # agents registry (app/agents_registry.py); None on the legacy paths.
+    agent_record: Any = None
 
 
 def extract_call_info(
@@ -193,6 +196,59 @@ def resolve_tenant(
     raise SipTenantResolutionError(
         f"no tenant mapped for dialed number {number or '<unknown>'}"
     )
+
+
+async def resolve_agent_for_dialed(
+    settings: Any,
+    dialed_number: str,
+    registry: Any = None,
+) -> tuple[str, str, Any]:
+    """SPEC-W38 F1: dialed number -> (tenant slug, source, agent record).
+
+    Resolution order:
+    1. agents registry (conversation-service, app/agents_registry.py) —
+       fail-open: 404/network/timeout yield None and we fall through;
+    2. legacy TENANT_PHONE_MAP;
+    3. SIP_DEFAULT_SITE.
+
+    Returns (site_slug, source, AgentRecord | None) where source is
+    ``registry|map|default``; the agent record is None on the legacy paths.
+    Raises SipTenantResolutionError exactly like resolve_tenant when nothing
+    resolves. ``registry`` is injectable for tests; when omitted the shared
+    client is built from settings (None when AGENTS_REGISTRY_URL is empty).
+    """
+    from . import agents_registry, metrics
+
+    number = normalize_phone(dialed_number)
+    client = registry
+    if client is None:
+        client = agents_registry.get_registry_client(settings)
+    if number and client is not None:
+        record = await client.resolve_agent_by_phone(number)
+        if record is not None:
+            metrics.agent_resolution("registry")
+            slug = record.tenant_slug
+            if not slug:
+                # The registry resolved the agent but did not carry a tenant
+                # slug; reuse the legacy map/default purely for the slug so
+                # the session can still bootstrap a TenantContext.
+                slug, _ = resolve_tenant(
+                    number,
+                    getattr(settings, "tenant_phone_map", None) or {},
+                    getattr(settings, "sip_default_site", "") or "",
+                )
+            log.info(
+                "dialed number resolved via agents registry",
+                dialed=number,
+                agent_id=record.id,
+                tenant=slug,
+            )
+            return slug, "registry", record
+    phone_map = getattr(settings, "tenant_phone_map", None) or {}
+    default_site = getattr(settings, "sip_default_site", "") or ""
+    slug, source = resolve_tenant(number, phone_map, default_site)
+    metrics.agent_resolution("env_map" if source == "map" else "default")
+    return slug, source, None
 
 
 def attach_caller_id(session: SessionState, caller_phone: str) -> bool:
@@ -244,6 +300,49 @@ def bootstrap_inbound_call(
         dialed=ctx.dialed_number or "<unknown>",
         tenant=site_slug,
         tenant_source=source,
+        caller=ctx.caller_phone or "<anonymous>",
+    )
+    return ctx
+
+
+async def bootstrap_inbound_call_async(
+    settings: Any,
+    room_name: str,
+    participants: Iterable[Any] = (),
+    session: SessionState | None = None,
+    registry: Any = None,
+) -> InboundCallContext:
+    """SPEC-W38 F1 variant of bootstrap_inbound_call: registry-first tenant
+    resolution via resolve_agent_for_dialed (agents registry, fail-open to
+    the legacy TENANT_PHONE_MAP/SIP_DEFAULT_SITE path). The resolved agent
+    record (when any) rides on ``ctx.agent_record`` for the worker to merge
+    its definition; caller-ID handling is unchanged."""
+    caller, dialed, attrs = extract_call_info(room_name, participants)
+    site_slug, source, record = await resolve_agent_for_dialed(
+        settings, dialed, registry=registry
+    )
+    ctx = InboundCallContext(
+        site_slug=site_slug,
+        caller_phone=caller,
+        dialed_number=dialed,
+        tenant_source=source,
+        attributes=attrs,
+        agent_record=record,
+    )
+    if session is not None:
+        attached = attach_caller_id(session, ctx.caller_phone)
+        log.info(
+            "sip caller id attached",
+            confirmed=attached,
+            caller=ctx.caller_phone or "<anonymous>",
+        )
+    log.info(
+        "sip inbound call bootstrapped",
+        room=room_name,
+        dialed=ctx.dialed_number or "<unknown>",
+        tenant=site_slug,
+        tenant_source=source,
+        agent_id=getattr(record, "id", "") or "",
         caller=ctx.caller_phone or "<anonymous>",
     )
     return ctx
