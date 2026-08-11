@@ -81,6 +81,32 @@ AI_DISCLOSURE_LINE = "You're speaking with an automated assistant."
 RECORDING_NOTICE_LINE = "This call may be recorded for quality and safety."
 
 
+def truncate_knowledge_snippets(
+    snippets: list[str], budget_tokens: int | None
+) -> list[str]:
+    """SPEC-W38 F2 ``context_budget_tokens``: truncate knowledge snippets to
+    fit the token budget (approx 4 chars/token). Snippets are kept whole in
+    order until the budget would overflow; the snippet that crosses the
+    budget is hard-truncated and nothing after it is included. A None or
+    non-positive budget leaves the snippets untouched."""
+    if not budget_tokens or budget_tokens <= 0:
+        return list(snippets)
+    max_chars = budget_tokens * 4
+    out: list[str] = []
+    used = 0
+    for snippet in snippets:
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        text = str(snippet)
+        if len(text) > remaining:
+            out.append(text[:remaining])
+            break
+        out.append(text)
+        used += len(text)
+    return out
+
+
 def build_greeting(ctx: TenantContext) -> str:
     """Session-opening greeting, with the SPEC-W11 Part C §5 disclosure.
 
@@ -138,9 +164,18 @@ def build_system_prompt(
         if ctx.terminology
         else "(default terminology)"
     )
+    # SPEC-W38 F2: the agent definition (agents registry) bounds the
+    # knowledge block via context_budget_tokens (~4 chars/token); absent a
+    # definition the snippet list is used as-is.
+    definition = getattr(ctx, "agent_definition", None)
+    snippets = ctx.knowledge_snippets
+    if definition is not None:
+        snippets = truncate_knowledge_snippets(
+            snippets, definition.context_budget_tokens
+        )
     knowledge = (
-        "\n".join(f"- {s}" for s in ctx.knowledge_snippets)
-        if ctx.knowledge_snippets
+        "\n".join(f"- {s}" for s in snippets)
+        if snippets
         else "- (no extra knowledge available)"
     )
     if active_agent is not None:
@@ -162,8 +197,21 @@ def build_system_prompt(
     )
     # SPEC-CRM §C4: append the industry pack persona when the tenant's pack
     # provides one (guarded — absent for tenants without a resolved pack).
+    # SPEC-W38 F2: merge_definition replaces ctx.agent_persona with the
+    # agent definition's persona when set (definition wins over pack).
     if ctx.agent_persona:
-        prompt += f"\nINDUSTRY PERSONA (follow this guidance on tone, policies and domain knowledge)\n{ctx.agent_persona}\n"
+        header = (
+            "AGENT PERSONA"
+            if definition is not None and definition.persona.strip()
+            else "INDUSTRY PERSONA"
+        )
+        prompt += (
+            f"\n{header} (follow this guidance on tone, policies and domain knowledge)"
+            f"\n{ctx.agent_persona}\n"
+        )
+    # SPEC-W38 F2: definition.instructions is its own system-prompt block.
+    if definition is not None and definition.instructions.strip():
+        prompt += f"\nAGENT INSTRUCTIONS\n{definition.instructions.strip()}\n"
     # Wave 5 #3: per-turn locale instruction when the caller speaks a
     # non-default language (whisper detection -> MultilangState).
     if language:

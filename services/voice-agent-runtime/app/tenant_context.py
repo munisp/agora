@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .agent_definition import AgentDefinition
 from .config import Settings
 from .dapr_client import DaprClient, DaprError
 from .logging import get_logger
@@ -49,6 +50,10 @@ class TenantContext:
     offerings: list[dict[str, Any]] = field(default_factory=list)
     team_members: list[dict[str, Any]] = field(default_factory=list)
     knowledge_snippets: list[str] = field(default_factory=list)
+    # SPEC-W38 F2: declarative agent definition from the agents registry
+    # (app/agent_definition.py), merged over the pack/env context by
+    # merge_definition after bootstrap. None = legacy pack/env behaviour.
+    agent_definition: AgentDefinition | None = None
 
     def offering_summary(self) -> str:
         parts = []

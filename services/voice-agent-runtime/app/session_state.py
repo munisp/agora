@@ -51,6 +51,11 @@ class SessionState:
     # Omnichannel inbound (SPEC-W6 Part A): the channel the current message
     # arrived on ("web" | "whatsapp" | "telegram"). Metadata only.
     channel: str = "web"
+    # SPEC-W38 F1/F3: id of the agents-registry record resolved during SIP
+    # inbound bootstrap (resolve_agent_for_dialed). Carried on the session
+    # so the SessionEnded lifecycle event can emit it as `agentId`; None for
+    # web sessions and legacy TENANT_PHONE_MAP calls.
+    resolved_agent_id: str | None = None
     created_at: float = field(default_factory=time.time)
     touched_at: float = field(default_factory=time.time)
 

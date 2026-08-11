@@ -20,6 +20,7 @@ def session_lifecycle_data(
     channel: str,
     site_slug: str,
     quality: dict[str, Any] | None = None,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Data payload for SessionStarted/SessionEnded events.
 
@@ -27,12 +28,20 @@ def session_lifecycle_data(
     only when the session produced data — the key stays absent otherwise so
     downstream consumers (crm-sync-service) can tell "no signals" apart from
     "zero values".
+
+    `agent_id` is the registry-resolved agent id (SPEC-W38 F1). When present
+    it is emitted as camelCase ``agentId`` — the conversation-service
+    capture consumer's primary key (it also accepts ``agent_id``); absent
+    otherwise so unresolved (legacy TENANT_PHONE_MAP / web) calls keep the
+    pre-W38 shape.
     """
     data: dict[str, Any] = {
         "conversationId": conversation_id,
         "channel": channel,
         "siteSlug": site_slug,
     }
+    if agent_id:
+        data["agentId"] = agent_id
     if quality:
         data["quality"] = quality
     return data
