@@ -47,6 +47,7 @@ from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
+from .agent_definition import merge_definition
 from .multilang import MultilangState, normalize_language, resolve_tts_voice
 from .pipeline.stt import FasterWhisperSTT
 from .pipeline.tts import TTSInterface
@@ -513,6 +514,7 @@ async def _publish_lifecycle(
     conversation_id: str,
     *,
     quality: dict[str, Any] | None = None,
+    agent_id: str | None = None,
 ) -> None:
     event = new_cloudevent(
         type_=type_,
@@ -523,6 +525,7 @@ async def _publish_lifecycle(
             channel="voice",
             site_slug=ctx.site_slug,
             quality=quality,
+            agent_id=agent_id,
         ),
     )
     await dapr.publish_best_effort(
@@ -548,7 +551,19 @@ async def build_voice_agent(
     the prompt is rendered, so the receptionist skips the read-back step.
     """
     ctx = await fetch_tenant_context(dapr, settings, site_slug)
+    # SPEC-W38 F1/F2: when the SIP bootstrap resolved an agent record via
+    # the agents registry, merge its declarative definition over the
+    # pack/env context BEFORE the prompt is built and the tool layer is
+    # assembled (merge order: env < pack < definition).
+    agent_record = getattr(sip_call, "agent_record", None) if sip_call is not None else None
+    if agent_record is not None and agent_record.definition is not None:
+        merge_definition(ctx, agent_record.definition)
     session = SessionState(conversation_id=conversation_id, site_slug=site_slug)
+    # SPEC-W38 F3: retain the registry-resolved agent id on the session so
+    # the SessionEnded lifecycle event can carry it as `agentId` for the
+    # conversation-service capture consumer.
+    if agent_record is not None:
+        session.resolved_agent_id = (getattr(agent_record, "id", "") or "").strip() or None
     caller_phone = ""
     if sip_call is not None:
         sip.attach_caller_id(session, sip_call.caller_phone)
@@ -593,6 +608,17 @@ async def build_voice_agent(
         )
 
     tts_impl.voice = _voice_spec(ml_state.active_language)
+    # SPEC-W38 F2: definition.voice overrides the session's default voice
+    # (per-turn language switching still applies on top). Only piper /
+    # provider-less voices are applied here — other providers go through the
+    # chain's own voice maps.
+    definition = getattr(ctx, "agent_definition", None)
+    if (
+        definition is not None
+        and definition.voice.voice_id
+        and definition.voice.provider in ("", "piper")
+    ):
+        tts_impl.voice = definition.voice.voice_id
 
     def _on_language(detected: str) -> None:
         switched = ml_state.observe(detected)
@@ -670,7 +696,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     participants = list(getattr(ctx.room, "remote_participants", {}).values())
     if sip.is_sip_room(room_name) or any(sip.is_sip_participant(p) for p in participants):
         try:
-            sip_call = sip.bootstrap_inbound_call(settings, room_name, participants)
+            # SPEC-W38 F1: registry-first dialed-number resolution (agents
+            # registry), fail-open to the legacy TENANT_PHONE_MAP path.
+            sip_call = await sip.bootstrap_inbound_call_async(
+                settings, room_name, participants
+            )
         except sip.SipTenantResolutionError as exc:
             log.error("sip tenant resolution failed", room=room_name, error=str(exc))
             await dapr.aclose()
@@ -744,6 +774,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 "com.opendesk.conversation.SessionEnded",
                 conversation_id,
                 quality=quality,
+                agent_id=session.resolved_agent_id,
             )
         )
 
