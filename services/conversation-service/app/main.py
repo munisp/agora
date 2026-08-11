@@ -18,6 +18,9 @@ from fastapi.responses import JSONResponse
 from .config import Config, load
 from .dapr_client import DaprClient
 from .db import Database
+from .agent_db import AgentStore
+from .agent_routes import router as agent_router
+from .capture import CaptureExtractor
 from .indexer import TranscriptIndexer
 from .logging import get_logger, setup
 from .privacy import PrivacyEraseConsumer
@@ -25,6 +28,7 @@ from .quality import CallQualityEnricher
 from .retention import RetentionSweeper
 from .routes import router
 from .sinks import KafkaSink, TranscriptSink, build_sink
+from .tenants import TenantResolver
 
 
 @dataclass
@@ -37,6 +41,7 @@ class State:
     quality_sink: TranscriptSink
     indexer: TranscriptIndexer | None
     quality_enricher: CallQualityEnricher | None
+    capture_extractor: CaptureExtractor | None
     privacy: PrivacyEraseConsumer | None
     retention: RetentionSweeper | None
     log: object
@@ -75,7 +80,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.error("ussd bootstrap failed; ussd conversations will fail",
                   error=str(exc))
 
+    # SPEC-W38 F1/F3: agents registry + capture tables (init script
+    # 07-agents-capture-schema.sql is authoritative on fresh installs; the
+    # idempotent ensure covers already-initialized databases).
+    agent_store = AgentStore(db)
+    try:
+        await agent_store.ensure_agent_tables()
+    except Exception as exc:
+        log.error("agents/capture table bootstrap failed; /v1/agents will fail",
+                  error=str(exc))
+
     dapr = DaprClient(cfg.dapr_host, cfg.dapr_http_port, cfg.dapr_pubsub_name)
+
+    # Tenant slug -> UUID resolution for ?tenant=<slug> (admin-web passes the
+    # org slug). identity-service via Dapr invoke, TTL-cached; every success
+    # is written through to the tenant_slugs projection so /v1/agents/resolve
+    # can answer tenant_id -> slug for the voice runtime.
+    tenant_resolver = TenantResolver(
+        dapr,
+        cfg.identity_app_id,
+        cfg.tenant_cache_ttl_seconds,
+        remember=agent_store.remember_tenant_slug,
+    )
 
     sink = build_sink(cfg)
     try:
@@ -117,6 +143,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         quality_enricher = CallQualityEnricher(cfg, db, quality_sink)
         quality_enricher.start()
 
+    # SPEC-W38 F3: post-call capture extraction (LLM, degrade = skip).
+    # Publishes CaptureExtracted via the Dapr pubsub path (like transcripts)
+    # so daprd owns broker delivery to opendesk.conversation.captures.
+    capture_extractor: CaptureExtractor | None = None
+    if cfg.capture_enabled:
+        capture_extractor = CaptureExtractor(cfg, db, agent_store, dapr)
+        capture_extractor.start()
+
     privacy: PrivacyEraseConsumer | None = None
     if cfg.privacy_enabled:
         try:
@@ -136,13 +170,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.cfg = cfg
     app.state.db = db
+    app.state.agent_store = agent_store
     app.state.dapr = dapr
+    app.state.tenant_resolver = tenant_resolver
     app.state.sink = sink
     app.state.intel_sink = intel_sink
     app.state.quality_sink = quality_sink
     app.state.log = log
     log.info("conversation-service started", port=cfg.port, sink=cfg.transcript_sink,
              intel_llm=cfg.intel_llm, quality_enrich=cfg.quality_enrich_enabled,
+             capture=cfg.capture_enabled,
              retention_days=cfg.retention_days if cfg.retention_enabled else None)
 
     try:
@@ -154,6 +191,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if quality_enricher is not None:
             with contextlib.suppress(Exception):
                 await quality_enricher.stop()
+        if capture_extractor is not None:
+            with contextlib.suppress(Exception):
+                await capture_extractor.stop()
         if privacy is not None:
             with contextlib.suppress(Exception):
                 await privacy.stop()
@@ -182,6 +222,7 @@ class _NullSink:
 
 app = FastAPI(title="OpenDesk conversation-service", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
+app.include_router(agent_router)
 
 
 @app.get("/healthz")
