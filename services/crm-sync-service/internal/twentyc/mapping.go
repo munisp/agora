@@ -175,6 +175,30 @@ func CallSummaryNote(q events.CallQuality) string {
 	return CallSummaryNoteTitle + " — " + strings.Join(parts, ", ")
 }
 
+// CaptureNoteTitle is the Note title for post-call captured fields
+// (SPEC-W38 F3: CaptureExtracted events on opendesk.conversation.captures).
+const CaptureNoteTitle = "📋 AI captured fields"
+
+// CaptureNote renders the markdown-ish Note body for a CaptureExtracted
+// payload, e.g.:
+//
+//	📋 AI captured fields — caller_name: Ada, day: Friday, party_size: 4
+//
+// Keys are sorted for a deterministic body; the capture schema's declared
+// keys are what the LLM extraction kept, so every value renders with %v.
+func CaptureNote(d events.CaptureExtractedData) string {
+	keys := make([]string, 0, len(d.Data))
+	for k := range d.Data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s: %v", k, d.Data[k]))
+	}
+	return CaptureNoteTitle + " — " + strings.Join(parts, ", ")
+}
+
 func yesNo(b bool) string {
 	if b {
 		return "yes"
