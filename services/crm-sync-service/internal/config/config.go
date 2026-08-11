@@ -26,6 +26,8 @@ type Config struct {
 	BookingTopic        string // opendesk.booking.events
 	ConversationTopic   string // opendesk.conversation.events
 	QualityTopic        string // opendesk.conversation.quality (CallQualityEnriched, Wave 5 #2)
+	CapturesTopic       string // opendesk.conversation.captures (CaptureExtracted, SPEC-W38 F3)
+	CaptureGroup        string // crm-sync-capture (own group for the captures topic)
 	CRMEventsTopic      string // opendesk.crm.events (reverse webhook intake)
 	PrivacyTopic        string // opendesk.privacy.events (GDPR erase tombstones)
 	ConsumerGroup       string // crm-sync
@@ -54,6 +56,8 @@ func Load() (Config, error) {
 		BookingTopic:        envStr("BOOKING_EVENTS_TOPIC", "opendesk.booking.events"),
 		ConversationTopic:   envStr("CONVERSATION_EVENTS_TOPIC", "opendesk.conversation.events"),
 		QualityTopic:        envStr("QUALITY_EVENTS_TOPIC", "opendesk.conversation.quality"),
+		CapturesTopic:       envStr("CAPTURES_TOPIC", "opendesk.conversation.captures"),
+		CaptureGroup:        envStr("CAPTURE_CONSUMER_GROUP", "crm-sync-capture"),
 		CRMEventsTopic:      envStr("CRM_EVENTS_TOPIC", "opendesk.crm.events"),
 		PrivacyTopic:        envStr("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
 		ConsumerGroup:       envStr("CONSUMER_GROUP", "crm-sync"),

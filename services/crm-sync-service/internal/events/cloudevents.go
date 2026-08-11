@@ -39,6 +39,10 @@ const (
 	// (app/quality.py, Wave 5 #2) on opendesk.conversation.quality — the
 	// SessionEnded quality payload plus avg per-turn sentiment.
 	TypeCallQualityEnriched = "com.opendesk.conversation.CallQualityEnriched"
+	// TypeCaptureExtracted is published by conversation-service
+	// (app/capture.py, SPEC-W38 F3) on opendesk.conversation.captures —
+	// post-call LLM-extracted fields against an agent's capture schema.
+	TypeCaptureExtracted = "com.opendesk.conversation.CaptureExtracted"
 )
 
 // TenantProvisionedData mirrors identity-service createTenant's payload:
@@ -103,6 +107,19 @@ type CallQualityEnrichedData struct {
 	Quality           *CallQuality `json:"quality"`
 	AvgSentiment      *float64     `json:"avg_sentiment"`
 	TurnSentimentCount int         `json:"turn_sentiment_count"`
+}
+
+// CaptureExtractedData mirrors conversation-service app/capture.py
+// build_capture_event payloads on opendesk.conversation.captures
+// (SPEC-W38 F3): {record_id, tenant_id, agent_id, conversation_id,
+// schema_id, data}. data holds the LLM-extracted capture-schema fields.
+type CaptureExtractedData struct {
+	RecordID       string         `json:"record_id"`
+	TenantID       string         `json:"tenant_id"`
+	AgentID        string         `json:"agent_id"`
+	ConversationID string         `json:"conversation_id"`
+	SchemaID       string         `json:"schema_id"`
+	Data           map[string]any `json:"data"`
 }
 
 // CallQuality mirrors SessionMetrics.quality_payload (app/metrics.py).
