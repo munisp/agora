@@ -27,6 +27,12 @@ class Config:
     dapr_pubsub_name: str = "pubsub-kafka"
     transcripts_topic: str = "opendesk.conversation.transcripts"
 
+    # Tenant slug -> UUID resolution (admin-web passes ?tenant=<slug>):
+    # identity-service via Dapr service invocation, TTL-cached like
+    # booking-service / analytics-pipeline.
+    identity_app_id: str = "identity"
+    tenant_cache_ttl_seconds: float = 300.0
+
     # Raw transcript sink (SPEC §5). "kafka" (aiokafka fallback) or "fluvio".
     transcript_sink: str = "kafka"
     fluvio_topic: str = "opendesk.transcripts-raw"
@@ -49,6 +55,16 @@ class Config:
     conversation_events_topic: str = "opendesk.conversation.events"
     quality_topic: str = "opendesk.conversation.quality"
     sentiment_group: str = "conversation-sentiment"
+
+    # Capture primitive (SPEC-W38 F3): consume SessionEnded in a dedicated
+    # group, run one LLM extraction pass per ACTIVE capture schema, insert
+    # capture_records, publish CaptureExtracted to CAPTURE_TOPIC via Dapr
+    # pubsub (same path as transcripts). LLM failures degrade to "skip, no
+    # record" — never a crash. Defaults follow INTEL_LLM (no LLM, no
+    # capture); CAPTURE_ENABLED overrides explicitly.
+    capture_enabled: bool = False
+    capture_topic: str = "opendesk.conversation.captures"
+    capture_group: str = "conversation-capture"
 
     # GDPR privacy events consumer (SPEC-W3 §2, innovation 13).
     privacy_enabled: bool = True
@@ -111,6 +127,8 @@ def load() -> Config:
         dapr_host=_env("DAPR_HOST", "daprd-conversation"),
         dapr_http_port=int(_env("DAPR_HTTP_PORT", "3500")),
         dapr_pubsub_name=_env("DAPR_PUBSUB_NAME", "pubsub-kafka"),
+        identity_app_id=_env("IDENTITY_APP_ID", "identity"),
+        tenant_cache_ttl_seconds=float(_env("TENANT_CACHE_TTL_SECONDS", "300")),
         transcripts_topic=_env("TRANSCRIPTS_TOPIC", "opendesk.conversation.transcripts"),
         transcript_sink=_env("TRANSCRIPT_SINK", "kafka").lower(),
         fluvio_topic=_env("FLUVIO_TOPIC", "opendesk.transcripts-raw"),
@@ -133,6 +151,14 @@ def load() -> Config:
         ),
         quality_topic=_env("QUALITY_EVENTS_TOPIC", "opendesk.conversation.quality"),
         sentiment_group=_env("QUALITY_ENRICH_GROUP", "conversation-sentiment"),
+        # Capture (SPEC-W38 F3): default follows INTEL_LLM — extraction needs
+        # the LLM, so capture is on exactly when the intel LLM is on, unless
+        # CAPTURE_ENABLED says otherwise.
+        capture_enabled=_env(
+            "CAPTURE_ENABLED", _env("INTEL_LLM", "off")
+        ).lower() in ("1", "on", "true", "yes"),
+        capture_topic=_env("CAPTURE_TOPIC", "opendesk.conversation.captures"),
+        capture_group=_env("CAPTURE_GROUP", "conversation-capture"),
         privacy_enabled=_env("PRIVACY_ENABLED", "true").lower() == "true",
         privacy_topic=_env("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
         privacy_group=_env("PRIVACY_EVENTS_GROUP", "conversation-service-privacy"),

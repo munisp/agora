@@ -61,3 +61,91 @@ class ConversationWithTurns(Conversation):
 
 class TurnCreated(BaseModel):
     turn: Turn
+
+# ---------------------------------------------------------------------------
+# SPEC-W38 F1/F3: agents registry + capture primitive
+# ---------------------------------------------------------------------------
+
+# E.164 (ITU-T): "+" followed by 2-15 digits, first non-zero.
+E164 = r"^\+[1-9]\d{1,14}$"
+
+AgentStatus = Literal["active", "disabled"]
+
+
+class AgentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    slug: str | None = Field(default=None, min_length=1, max_length=128)
+    purpose: str | None = None
+    phone_number: str | None = Field(default=None, pattern=E164)
+    definition: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentUpdate(BaseModel):
+    """PATCH: only explicitly-provided fields change (model_fields_set)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    slug: str | None = Field(default=None, min_length=1, max_length=128)
+    purpose: str | None = None
+    phone_number: str | None = Field(default=None, pattern=E164)
+    status: AgentStatus | None = None
+    definition: dict[str, Any] | None = None
+
+
+class Agent(BaseModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    name: str
+    slug: str
+    purpose: str | None = None
+    phone_number: str | None = None
+    status: str
+    definition: dict[str, Any] = Field(default_factory=dict)
+    # Only populated by /v1/agents/resolve (LEFT JOIN tenant_slugs): the
+    # voice runtime needs the tenant SLUG to bootstrap TenantContext.
+    tenant_slug: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AgentResolved(BaseModel):
+    """GET /v1/agents/resolve response (INTERNAL, voice runtime)."""
+
+    agent: Agent
+    definition: dict[str, Any] = Field(default_factory=dict)
+
+
+class CaptureSchemaCreate(BaseModel):
+    agent_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=200)
+    schema: dict[str, Any] = Field(default_factory=lambda: {"fields": []})
+    active: bool = True
+
+
+class CaptureSchemaUpdate(BaseModel):
+    """PATCH: only explicitly-provided fields change (model_fields_set)."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    schema: dict[str, Any] | None = None
+    active: bool | None = None
+
+
+class CaptureSchema(BaseModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    name: str
+    schema: dict[str, Any]
+    active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class CaptureRecord(BaseModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    capture_schema_id: uuid.UUID
+    agent_id: uuid.UUID
+    conversation_id: uuid.UUID
+    data: dict[str, Any]
+    extraction_confidence: float | None = None
+    created_at: datetime

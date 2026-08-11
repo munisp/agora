@@ -184,6 +184,133 @@ class TestBootstrap:
 
 
 # --------------------------------------------------------------------------
+# SPEC-W38 F1: agents-registry-first resolution, fail-open to the legacy map
+# --------------------------------------------------------------------------
+class _FakeRegistry:
+    """Scriptable stand-in for AgentsRegistryClient."""
+
+    def __init__(self, record=None):
+        self.record = record
+        self.calls: list[str] = []
+
+    async def resolve_agent_by_phone(self, phone: str):
+        self.calls.append(phone)
+        return self.record
+
+
+def _record(tenant_slug="acme"):
+    from app.agents_registry import AgentRecord
+
+    return AgentRecord(
+        id="agent-1",
+        tenant_id="t-uuid",
+        tenant_slug=tenant_slug,
+        name="Front Desk",
+        phone_number="+15551234567",
+        status="active",
+    )
+
+
+class TestRegistryResolution:
+    async def test_registry_hit_wins_over_env_map(self):
+        settings = _settings(phone_map={"+15551234567": "legacy-tenant"})
+        registry = _FakeRegistry(_record())
+        slug, source, record = await sip.resolve_agent_for_dialed(
+            settings, "+1 555-123-4567", registry=registry
+        )
+        assert (slug, source) == ("acme", "registry")
+        assert record is not None and record.id == "agent-1"
+        assert registry.calls == ["+15551234567"]
+
+    async def test_registry_miss_falls_back_to_env_map(self):
+        settings = _settings(phone_map={"+15551234567": "acme"})
+        registry = _FakeRegistry(None)  # 404 / network / timeout all land here
+        slug, source, record = await sip.resolve_agent_for_dialed(
+            settings, "+15551234567", registry=registry
+        )
+        assert (slug, source) == ("acme", "map")
+        assert record is None
+        assert registry.calls == ["+15551234567"]
+
+    async def test_registry_miss_falls_back_to_default_site(self):
+        settings = _settings(default_site="front-desk")
+        slug, source, record = await sip.resolve_agent_for_dialed(
+            settings, "+49999000", registry=_FakeRegistry(None)
+        )
+        assert (slug, source) == ("front-desk", "default")
+        assert record is None
+
+    async def test_no_registry_uses_legacy_path(self):
+        settings = _settings(phone_map={"+15551234567": "acme"})
+        slug, source, record = await sip.resolve_agent_for_dialed(
+            settings, "+15551234567", registry=None
+        )
+        assert (slug, source) == ("acme", "map")
+        assert record is None
+
+    async def test_registry_hit_without_slug_falls_back_for_slug(self):
+        """Registry resolved the agent but carried no tenant slug: the legacy
+        map/default still provides the slug, the record still rides along."""
+        settings = _settings(phone_map={"+15551234567": "acme"})
+        registry = _FakeRegistry(_record(tenant_slug=""))
+        slug, source, record = await sip.resolve_agent_for_dialed(
+            settings, "+15551234567", registry=registry
+        )
+        assert (slug, source) == ("acme", "registry")
+        assert record is not None
+
+    async def test_unmapped_everywhere_still_raises(self):
+        settings = _settings()
+        with pytest.raises(sip.SipTenantResolutionError):
+            await sip.resolve_agent_for_dialed(
+                settings, "+49999000", registry=_FakeRegistry(None)
+            )
+
+    async def test_bootstrap_async_attaches_record_and_caller(self):
+        settings = _settings()
+        registry = _FakeRegistry(_record())
+        p = SimpleNamespace(
+            kind=None,
+            identity="sip_+15552223333_x",
+            attributes={"sip.trunkPhoneNumber": "+15551234567"},
+        )
+        session = SessionState(conversation_id="c1", site_slug="")
+        ctx = await sip.bootstrap_inbound_call_async(
+            settings, "call-+15551234567", [p], session, registry=registry
+        )
+        assert ctx.site_slug == "acme"
+        assert ctx.tenant_source == "registry"
+        assert ctx.agent_record is not None
+        assert ctx.agent_record.id == "agent-1"
+        assert session.confirmed_phone == "+15552223333"
+
+    async def test_bootstrap_async_legacy_fallback_unchanged(self):
+        settings = _settings(phone_map={"+15551234567": "acme"})
+        ctx = await sip.bootstrap_inbound_call_async(
+            settings, "call-+15551234567", [], registry=_FakeRegistry(None)
+        )
+        assert ctx.site_slug == "acme"
+        assert ctx.tenant_source == "map"
+        assert ctx.agent_record is None
+
+    async def test_resolution_metric_recorded(self):
+        from app import metrics
+
+        registry = metrics.reset_registry()
+        settings = _settings(phone_map={"+15551234567": "acme"})
+        await sip.resolve_agent_for_dialed(
+            settings, "+15551234567", registry=_FakeRegistry(_record())
+        )
+        await sip.resolve_agent_for_dialed(
+            settings, "+15551234567", registry=_FakeRegistry(None)
+        )
+        rendered = registry.render()
+        assert 'voice_agent_resolution_total{source="registry"} 1' in rendered
+        assert 'voice_agent_resolution_total{source="env_map"} 1' in rendered
+        metrics.reset_registry()
+
+
+# --------------------------------------------------------------------------
 # Deploy YAML schemas (safe_load)
 # --------------------------------------------------------------------------
 class TestDeployYaml:
