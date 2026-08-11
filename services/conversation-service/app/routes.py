@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 
 from . import events, incidents, intel, models, redact, ussd
 from .db import NotFoundError
+from .tenants import TenantNotFoundError, TenantResolutionError
 
 router = APIRouter()
 
@@ -24,18 +25,44 @@ def _tenant_header(x_tenant_id: Annotated[str | None, Header()] = None) -> uuid.
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid X-Tenant-ID header") from None
 
 
-def _require_tenant(
-    tenant: uuid.UUID | None = Query(default=None),
+async def _require_tenant(
+    request: Request,
+    tenant: Annotated[str | None, Query()] = None,
     header_tenant: uuid.UUID | None = Depends(_tenant_header),
 ) -> uuid.UUID:
-    """Tenant scope comes from ?tenant= or X-Tenant-ID (required by RLS)."""
-    t = tenant or header_tenant
-    if t is None:
+    """Tenant scope comes from ?tenant= or X-Tenant-ID (required by RLS).
+
+    ?tenant= accepts a UUID (back-compat) OR a tenant slug (admin-web passes
+    the org slug, e.g. ?tenant=acme): non-UUID values are resolved through
+    identity-service via the app-state TenantResolver (Dapr invoke, same
+    mechanism as booking-service / analytics-pipeline)."""
+    if tenant is not None:
+        try:
+            return uuid.UUID(tenant)
+        except ValueError:
+            pass
+        resolver = getattr(request.app.state, "tenant_resolver", None)
+        if resolver is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "tenant slug resolution unavailable",
+            )
+        try:
+            info = await resolver.by_slug(tenant)
+        except TenantNotFoundError:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, f"tenant {tenant!r} not found"
+            ) from None
+        except TenantResolutionError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
+        return uuid.UUID(info.id)
+    if header_tenant is None:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "tenant scope required: ?tenant=<uuid> query param or X-Tenant-ID header",
+            "tenant scope required: ?tenant=<uuid-or-slug> query param or "
+            "X-Tenant-ID header",
         )
-    return t
+    return header_tenant
 
 
 def _state(request: Request) -> Any:

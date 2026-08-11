@@ -89,6 +89,9 @@ func run() error {
 			// Wave 5 #2: sentiment-enriched call-quality events (preferred
 			// call-summary note path; plain SessionEnded stays as fallback).
 			consumer.New(cfg.KafkaBrokers, cfg.QualityTopic, cfg.ConsumerGroup, cfg.DLQTopic, syncer.HandleQuality, reg, logger),
+			// SPEC-W38 F3: post-call captured fields -> Twenty note (own
+			// group `crm-sync-capture`; dedupe via sync_map capture_note).
+			consumer.New(cfg.KafkaBrokers, cfg.CapturesTopic, cfg.CaptureGroup, cfg.DLQTopic, syncer.HandleCapture, reg, logger),
 			// GDPR erase tombstones (SPEC-W3 §2): deletes the Twenty person.
 			consumer.New(cfg.KafkaBrokers, cfg.PrivacyTopic, cfg.ConsumerGroup, cfg.DLQTopic, syncer.HandlePrivacy, reg, logger),
 			// Reverse direction: Twenty webhook events -> OpenDesk.
