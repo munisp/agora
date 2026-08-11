@@ -364,6 +364,10 @@ services:
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
       # Voiceprints are biometric data — NDPA profile keeps them off.
       VOICEPRINTS: ${VOICEPRINTS:-off}
+      # SPEC-W38 F1: agents registry lookup (dialed number -> agent);
+      # TENANT_PHONE_MAP remains the fallback when the registry misses.
+      AGENTS_REGISTRY_URL: ${AGENTS_REGISTRY_URL:-http://conversation:7007}
+      AGENTS_CACHE_TTL_S: ${AGENTS_CACHE_TTL_S:-30}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -418,6 +422,9 @@ services:
       RETENTION_ENABLED: ${RETENTION_ENABLED:-true}
       RETENTION_DAYS: ${RETENTION_DAYS:-365}
       INTEL_LLM: ${INTEL_LLM:-off}
+      # SPEC-W38 F3: capture primitive topic (consumer group
+      # conversation-capture; CAPTURE_ENABLED defaults to INTEL_LLM).
+      CAPTURE_TOPIC: ${CAPTURE_TOPIC:-opendesk.conversation.captures}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -591,6 +598,10 @@ services:
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
       KAFKA_BROKERS: kafka:9092
       AGENT_BACKEND: ${AGENT_BACKEND:-livekit}
+      # SPEC-W38 F1: agents registry lookup (dialed number -> agent);
+      # TENANT_PHONE_MAP remains the fallback when the registry misses.
+      AGENTS_REGISTRY_URL: ${AGENTS_REGISTRY_URL:-http://conversation:7007}
+      AGENTS_CACHE_TTL_S: ${AGENTS_CACHE_TTL_S:-30}
     depends_on:
     - livekit
     - voice
@@ -618,6 +629,8 @@ services:
       IDENTITY_EVENTS_TOPIC: opendesk.identity.events
       BOOKING_EVENTS_TOPIC: opendesk.booking.events
       CONVERSATION_EVENTS_TOPIC: opendesk.conversation.events
+      # SPEC-W38 F3: captured-fields notes (group crm-sync-capture).
+      CAPTURES_TOPIC: opendesk.conversation.captures
       CONSUMER_GROUP: crm-sync
       DLQ_TOPIC: opendesk.dlq
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
