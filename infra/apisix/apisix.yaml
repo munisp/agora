@@ -608,6 +608,100 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- SPEC-W38 F1/F3: agents registry + capture primitive ----
+  # Same jwt + rewrite + limit-count pattern as api-conversations, but the
+  # rewrite targets the /v1/... paths explicitly (/api/agents -> /v1/agents,
+  # /api/capture-* -> /v1/capture-*).
+  - id: api-agents
+    uris:
+      - /api/agents/*
+      - /api/agents
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    upstream_id: conversation
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/agents/?(.*)"
+          - "/v1/agents/$1"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      limit-count:
+        count: 600
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  # /v1/agents/resolve is INTERNAL (SPEC-W38 §2): the voice runtime calls
+  # conversation:7007 directly; it must NOT be reachable through the
+  # gateway. APISIX radix-tree matching prefers this exact URI over the
+  # /api/agents/* wildcard above, so the dialed-number lookup stays
+  # network-internal.
+  - id: api-agents-resolve-internal
+    uri: /api/agents/resolve
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    plugins:
+      fault-injection:
+        abort:
+          http_status: 404
+          body: "not found"
+
+  - id: api-capture
+    uris:
+      - /api/capture-schemas/*
+      - /api/capture-schemas
+      - /api/capture-records/*
+      - /api/capture-records
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    upstream_id: conversation
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/(capture-.*)"
+          - "/v1/$1"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      limit-count:
+        count: 600
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
   # Outbound webhook platform (Wave 5 #10): notification-worker REST
   # (/v1/webhooks) behind the standard jwt + rewrite pattern.
   - id: api-notifications
