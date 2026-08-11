@@ -134,6 +134,14 @@ class Settings:
     tenant_phone_map: dict = field(default_factory=dict)
     sip_default_site: str = ""
 
+    # Agents registry (SPEC-W38 F1, app/agents_registry.py): dialed-number ->
+    # agent resolution via conversation-service (internal, no APISIX). The
+    # static TENANT_PHONE_MAP above remains the fallback when the registry
+    # misses or is unreachable (fail-open). Empty URL disables the registry
+    # path; AGENTS_CACHE_TTL_S bounds the in-process resolve cache.
+    agents_registry_url: str = "http://conversation:7007"
+    agents_cache_ttl_s: int = 30
+
     # Multilingual receptionist (Wave 5 #3, app/multilang.py): language ->
     # piper voice map (PIPER_VOICE_MAP JSON). Languages without an entry fall
     # back to `piper_voice`.
@@ -238,6 +246,8 @@ def load_settings() -> Settings:
         voiceprint_threshold=float(os.environ.get("VOICEPRINT_THRESHOLD", "0.75")),
         tenant_phone_map=parse_tenant_phone_map(_env("TENANT_PHONE_MAP", "")),
         sip_default_site=_env("SIP_DEFAULT_SITE", ""),
+        agents_registry_url=_env("AGENTS_REGISTRY_URL", "http://conversation:7007"),
+        agents_cache_ttl_s=_env_int("AGENTS_CACHE_TTL_S", 30),
         piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
         tts_provider_chain=_env("TTS_PROVIDER_CHAIN", "piper"),
         tts_voice_map=parse_tts_voice_map(_env("TTS_VOICE_MAP", "")),

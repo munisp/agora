@@ -94,6 +94,8 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `VOICEPRINT_THRESHOLD` | `0.75` | cosine-similarity verify threshold |
 | `TENANT_PHONE_MAP` | `{}` | SIP inbound (Wave 5 #1): JSON `{"+1555…":"tenant-slug"}` dialed-number→tenant map (dev-mode; production = `phone_numbers` table, see docs/telephony.md) |
 | `SIP_DEFAULT_SITE` | _(unset)_ | fallback site slug for unmapped dialed numbers (empty = reject) |
+| `AGENTS_REGISTRY_URL` | `http://conversation:7007` | SPEC-W38: conversation-service agents registry base URL (internal); empty disables registry resolution |
+| `AGENTS_CACHE_TTL_S` | `30` | SPEC-W38: in-process cache TTL for agent resolve/get lookups (hits and misses) |
 | `PIPER_VOICE_MAP` | `{}` | multilingual (Wave 5 #3): JSON `{"es":"es_ES-sharvard-medium"}` language→piper voice; unmapped languages fall back to `PIPER_VOICE` |
 | `EVAL_PERSONA_OVERRIDE` | `false` | A/B eval (Wave 5 #8): allow `persona_override` on POST /voice/chat — eval only, prompt-injection surface otherwise |
 | `HF_HOME` | `/models` (image) | whisper model cache dir |
@@ -256,6 +258,38 @@ table), and attaches the carrier-asserted caller ID as the session's
 confirmed phone — the two-step read-back confirmation is bypassed for SIP
 calls only (policy documented in `app/sip.py`). Provisioning:
 `deploy/livekit-sip/setup.sh` + docs/telephony.md.
+
+## Agents registry & agent definitions (SPEC-W38)
+
+Voice agents are first-class tenant-scoped entities owned by
+conversation-service (agent-as-product). On an inbound SIP call the dialed
+number is resolved **registry-first**:
+
+1. `app/agents_registry.py` calls
+   `GET {AGENTS_REGISTRY_URL}/v1/agents/resolve?phone=<E.164>` (internal,
+   not exposed via APISIX; 2s timeout) and caches hits **and** misses for
+   `AGENTS_CACHE_TTL_S` (default 30s). Any 404/network/timeout/malformed
+   payload **fails open** to step 2 — dev mode keeps working when the
+   registry is down.
+2. Legacy `TENANT_PHONE_MAP` → `SIP_DEFAULT_SITE` (unchanged).
+
+Resolution outcomes are counted as
+`voice_agent_resolution_total{source=registry|env_map|default}`.
+
+A resolved agent carries a declarative **definition** JSONB
+(`app/agent_definition.py`, all keys optional):
+`persona`, `voice{provider,voice_id,language}`, `instructions`,
+`context_budget_tokens`, `tool_allowlist`, `knowledge_packs`,
+`ops_rules{max_call_seconds,escalation_phone}`. The worker merges it over
+the bootstrapped tenant context (merge order: **env defaults < industry
+pack < agent definition**) before the prompt is built:
+
+- `persona` replaces the pack `agentPersona` in the system prompt;
+- `instructions` is appended as its own `AGENT INSTRUCTIONS` block;
+- `context_budget_tokens` truncates knowledge snippets (~4 chars/token);
+- `tool_allowlist` (non-empty) filters `ToolLayer.schemas()` and blocks
+  dispatch of non-allowlisted tools;
+- `voice.voice_id` (piper) overrides the session's default TTS voice.
 
 ## Multilingual receptionist (Wave 5 #3)
 
