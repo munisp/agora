@@ -589,3 +589,80 @@ export interface TenantApp extends PlatformApp {
   provisioned_by?: string | null;
   updated_at?: string | null;
 }
+
+/* ------------------------------------------------------------------ */
+/* SPEC-W38 — agents registry & capture primitive (conversation-service) */
+/* ------------------------------------------------------------------ */
+
+/** Declarative agent definition (agents.definition JSONB, SPEC-W38 F2). */
+export interface AgentVoice {
+  provider: string;
+  voice_id: string;
+  language: string;
+}
+
+export interface AgentOpsRules {
+  max_call_seconds?: number;
+  escalation_phone?: string;
+}
+
+export interface AgentDefinition {
+  persona?: string;
+  voice?: AgentVoice;
+  instructions?: string;
+  context_budget_tokens?: number;
+  tool_allowlist?: string[];
+  knowledge_packs?: string[];
+  ops_rules?: AgentOpsRules;
+}
+
+export type AgentStatus = "active" | "disabled";
+
+/** Agent row (GET/POST /v1/agents via APISIX /api/agents, SPEC-W38 F1). */
+export interface Agent {
+  id: string;
+  tenant_id: string;
+  name: string;
+  slug: string;
+  purpose: string;
+  phone_number: string | null;
+  status: AgentStatus;
+  definition: AgentDefinition;
+  created_at: string;
+  updated_at: string;
+}
+
+export type CaptureFieldType = "string" | "number" | "boolean" | "enum";
+
+/** One field of a capture schema (SPEC-W38 F3). */
+export interface CaptureField {
+  key: string;
+  type: CaptureFieldType;
+  label: string;
+  required: boolean;
+  /** allowed values — only meaningful when type === "enum" */
+  options?: string[];
+}
+
+export interface CaptureSchema {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  name: string;
+  schema: { fields: CaptureField[] };
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Extracted post-call capture record (GET /v1/capture-records). */
+export interface CaptureRecord {
+  id: string;
+  tenant_id: string;
+  capture_schema_id: string;
+  agent_id: string;
+  conversation_id: string;
+  data: Record<string, unknown>;
+  extraction_confidence: number | null;
+  created_at: string;
+}
