@@ -214,3 +214,73 @@ def test_session_ended_cloudevent_carries_quality():
     assert event["type"] == "com.opendesk.conversation.SessionEnded"
     assert set(event["data"]["quality"]) == QUALITY_KEYS
     assert event["data"]["quality"]["confirmed_phone"] == "+1555000111"
+def test_session_lifecycle_data_includes_agent_id_only_when_resolved():
+    # SPEC-W38 F3/G3: registry-resolved calls emit camelCase `agentId`
+    # (the conversation-service capture consumer's primary key); unresolved
+    # (web / legacy TENANT_PHONE_MAP) calls keep the pre-W38 shape.
+    base = session_lifecycle_data(
+        conversation_id="c1", channel="voice", site_slug="acme"
+    )
+    assert "agentId" not in base
+
+    resolved = session_lifecycle_data(
+        conversation_id="c1", channel="voice", site_slug="acme", agent_id="agent-42"
+    )
+    assert resolved["agentId"] == "agent-42"
+    # Falsy agent ids ("" / None) behave like an unresolved call.
+    falsy = session_lifecycle_data(
+        conversation_id="c1", channel="voice", site_slug="acme", agent_id=""
+    )
+    assert "agentId" not in falsy
+
+
+def test_session_ended_cloudevent_carries_resolved_agent_id():
+    quality = {"duration_s": 12.0, "turn_count": 3}
+    event = new_cloudevent(
+        type_="com.opendesk.conversation.SessionEnded",
+        subject="acme",
+        tenant_uuid="tenant-uuid",
+        data=session_lifecycle_data(
+            conversation_id="conv-1",
+            channel="voice",
+            site_slug="acme",
+            quality=quality,
+            agent_id="agent-42",
+        ),
+    )
+    assert event["type"] == "com.opendesk.conversation.SessionEnded"
+    assert event["data"]["agentId"] == "agent-42"
+    assert event["data"]["quality"] == quality
+
+
+def test_session_state_retains_resolved_agent_id_for_lifecycle():
+    # Mirrors app/livekit_worker.build_voice_agent: the SIP bootstrap's
+    # agent_record.id rides on SessionState until _publish_lifecycle emits
+    # SessionEnded with it.
+    from app.session_state import SessionState
+
+    session = SessionState(conversation_id="conv-1", site_slug="acme")
+    assert session.resolved_agent_id is None
+
+    class _Record:  # stand-in for app/agents_registry.AgentRecord
+        id = "agent-42"
+
+    record = _Record()
+    session.resolved_agent_id = (getattr(record, "id", "") or "").strip() or None
+    data = session_lifecycle_data(
+        conversation_id=session.conversation_id,
+        channel="voice",
+        site_slug=session.site_slug,
+        agent_id=session.resolved_agent_id,
+    )
+    assert data["agentId"] == "agent-42"
+
+    # No record resolved -> SessionEnded emits no agentId key.
+    unresolved = SessionState(conversation_id="conv-2", site_slug="acme")
+    data = session_lifecycle_data(
+        conversation_id=unresolved.conversation_id,
+        channel="voice",
+        site_slug=unresolved.site_slug,
+        agent_id=unresolved.resolved_agent_id,
+    )
+    assert "agentId" not in data
