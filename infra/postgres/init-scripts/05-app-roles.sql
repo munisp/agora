@@ -137,3 +137,32 @@ ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_kyc;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_kyc;
+
+-- ---------------------------------------------------------------------------
+-- Wave 38 (SPEC-W38 F1/F3): agents registry + capture tables
+-- ---------------------------------------------------------------------------
+-- Explicit grants on the three W38 tables (created by
+-- 07-agents-capture-schema.sql). NOTE: on a FRESH init this script (05) runs
+-- BEFORE 07, so the table-existence guards below no-op here and the guarded
+-- GRANTs at the bottom of 07 itself apply. This block covers deployments
+-- where the tables already exist when 05 is (re-)run — same privilege set
+-- as the conversation section above. ALTER DEFAULT PRIVILEGES above already
+-- covers future tables; the explicit grants keep the intent readable.
+-- ---------------------------------------------------------------------------
+\c conversation
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_conversation') THEN
+        IF to_regclass('public.agents') IS NOT NULL THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agents TO app_conversation';
+        END IF;
+        IF to_regclass('public.capture_schemas') IS NOT NULL THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.capture_schemas TO app_conversation';
+        END IF;
+        IF to_regclass('public.capture_records') IS NOT NULL THEN
+            EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.capture_records TO app_conversation';
+        END IF;
+    END IF;
+END
+$$;
