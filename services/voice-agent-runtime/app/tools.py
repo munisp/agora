@@ -297,9 +297,25 @@ class ToolLayer:
         """Validated UI actions queued by tools during this turn (SPEC-W9 B)."""
         return self._ui_actions
 
+    def _tool_allowlist(self) -> set[str]:
+        """SPEC-W38 F2 ``tool_allowlist`` from the agent definition merged
+        onto the tenant context (app/agent_definition.py). Empty/absent =
+        all tools allowed (legacy behaviour)."""
+        definition = getattr(self._ctx, "agent_definition", None)
+        if definition is None:
+            return set()
+        return {str(n) for n in (definition.tool_allowlist or [])}
+
     def schemas(self) -> list[dict[str, Any]]:
-        """Built-in tool schemas plus any pack plugin tool schemas."""
-        return TOOL_SCHEMAS + [t.schema() for t in self._plugin_tools.values()]
+        """Built-in tool schemas plus any pack plugin tool schemas.
+
+        SPEC-W38 F2: a non-empty definition tool_allowlist filters the
+        merged list to the named tools only."""
+        merged = TOOL_SCHEMAS + [t.schema() for t in self._plugin_tools.values()]
+        allowlist = self._tool_allowlist()
+        if not allowlist:
+            return merged
+        return [s for s in merged if s["function"]["name"] in allowlist]
 
     # ------------------------------------------------------------------ util
     async def _emit_tool_event(self, tool: str, status: str, detail: dict[str, Any]) -> None:
@@ -760,6 +776,17 @@ class ToolLayer:
     # ----------------------------------------------------------- dispatching
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Dispatch a tool call by name (chat path / ElevenLabs webhook)."""
+        # SPEC-W38 F2: a non-empty definition tool_allowlist also BLOCKS
+        # dispatch of non-allowlisted tools (defense in depth — the model
+        # never saw the schema, but a leaked/retried call must not run).
+        allowlist = self._tool_allowlist()
+        if allowlist and name not in allowlist:
+            log.info("tool blocked by agent definition allowlist", tool=name)
+            await self._emit_tool_event(name, "blocked", {})
+            return {
+                "status": "error",
+                "message": f"tool {name!r} is not enabled for this agent",
+            }
         handler = {
             "get_business_info": lambda: self.get_business_info(),
             "get_availability": lambda: self.get_availability(
