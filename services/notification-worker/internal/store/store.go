@@ -5,8 +5,18 @@
 //
 // The tables live in the `notifications` database (00-create-dbs.sql) and
 // are bootstrapped idempotently here so upgrades need no manual migration.
-// Tenant isolation is application-level (every query filters tenant_id);
-// unlike the booking DB there are no FORCE RLS policies on this database.
+//
+// Tenant isolation (SQL-003): every table carries ENABLE + FORCE ROW LEVEL
+// SECURITY with a tenant_isolation policy keyed on the app.tenant_id GUC
+// (identity-service consent/apps store idiom). Tenant-scoped webhook
+// queries run inside withTenant (`SET LOCAL app.tenant_id`) so isolation is
+// enforced at the database layer even if a future caller forgets the WHERE
+// clause. The policies deliberately treat an UNSET app.tenant_id as
+// "no database-level scoping" (the pre-existing application-level
+// filtering posture): several paths legitimately run without a single
+// tenant context (UpdateDelivery by delivery id, the slug-keyed DND
+// lookups, the global NCC 2442 import). Once a session sets app.tenant_id,
+// cross-tenant rows are invisible and cross-tenant writes are rejected.
 package store
 
 import (
@@ -95,11 +105,60 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub ON webhook_deliveries (sub_id, created_at DESC);`
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub ON webhook_deliveries (sub_id, created_at DESC);
+ALTER TABLE webhook_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_subscriptions FORCE ROW LEVEL SECURITY;
+ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_deliveries FORCE ROW LEVEL SECURITY;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies
+                   WHERE schemaname = current_schema()
+                     AND tablename = 'webhook_subscriptions'
+                     AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON webhook_subscriptions
+            USING (CASE
+                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
+                ELSE tenant_id = current_setting('app.tenant_id', true)::uuid
+            END);
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_policies
+                   WHERE schemaname = current_schema()
+                     AND tablename = 'webhook_deliveries'
+                     AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON webhook_deliveries
+            USING (CASE
+                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
+                ELSE tenant_id = current_setting('app.tenant_id', true)::uuid
+            END);
+    END IF;
+END
+$$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure webhook tables: %w", err)
 	}
 	return nil
+}
+
+// withTenant runs fn inside a transaction with `SET LOCAL app.tenant_id`
+// applied (set_config(..., true): parameter binding keeps this
+// injection-safe), so the tenant_isolation RLS policies scope every
+// statement of fn to the given tenant (identity-service consent store
+// idiom). tenantID is a string because civic_notifications.tenant_id is
+// TEXT; the UUID-keyed tables receive tenantID.String().
+func (s *Store) withTenant(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -134,33 +193,43 @@ func (s *Store) CreateSubscription(ctx context.Context, sub *WebhookSubscription
 	sub.Active = true
 	const q = `INSERT INTO webhook_subscriptions (id, tenant_id, tenant_slug, url, secret, events, active)
 	           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING created_at`
-	return s.pool.QueryRow(ctx, q, sub.ID, sub.TenantID, sub.TenantSlug, sub.URL, sub.Secret, sub.Events, sub.Active).
-		Scan(&sub.CreatedAt)
+	return s.withTenant(ctx, sub.TenantID.String(), func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, q, sub.ID, sub.TenantID, sub.TenantSlug, sub.URL, sub.Secret, sub.Events, sub.Active).
+			Scan(&sub.CreatedAt)
+	})
 }
 
 // ListSubscriptions returns a tenant's subscriptions, newest first.
 func (s *Store) ListSubscriptions(ctx context.Context, tenantID uuid.UUID) ([]WebhookSubscription, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+subCols+` FROM webhook_subscriptions WHERE tenant_id=$1 ORDER BY created_at DESC`, tenantID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []WebhookSubscription
-	for rows.Next() {
-		sub, err := scanSub(rows)
+	err := s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT `+subCols+` FROM webhook_subscriptions WHERE tenant_id=$1 ORDER BY created_at DESC`, tenantID)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, sub)
-	}
-	return out, rows.Err()
+		defer rows.Close()
+		for rows.Next() {
+			sub, err := scanSub(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, sub)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // GetSubscription fetches one subscription scoped to a tenant.
 func (s *Store) GetSubscription(ctx context.Context, tenantID, id uuid.UUID) (WebhookSubscription, error) {
-	sub, err := scanSub(s.pool.QueryRow(ctx,
-		`SELECT `+subCols+` FROM webhook_subscriptions WHERE tenant_id=$1 AND id=$2`, tenantID, id))
+	var sub WebhookSubscription
+	err := s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		var err error
+		sub, err = scanSub(tx.QueryRow(ctx,
+			`SELECT `+subCols+` FROM webhook_subscriptions WHERE tenant_id=$1 AND id=$2`, tenantID, id))
+		return err
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return sub, ErrNotFound
 	}
@@ -169,36 +238,41 @@ func (s *Store) GetSubscription(ctx context.Context, tenantID, id uuid.UUID) (We
 
 // DeleteSubscription removes a subscription (deliveries cascade).
 func (s *Store) DeleteSubscription(ctx context.Context, tenantID, id uuid.UUID) error {
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM webhook_subscriptions WHERE tenant_id=$1 AND id=$2`, tenantID, id)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM webhook_subscriptions WHERE tenant_id=$1 AND id=$2`, tenantID, id)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // ActiveSubscriptions returns all active subscriptions of a tenant; event
 // matching happens in Go (webhooks.EventMatches) to keep wildcard rules in
 // one tested place.
 func (s *Store) ActiveSubscriptions(ctx context.Context, tenantID uuid.UUID) ([]WebhookSubscription, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+subCols+` FROM webhook_subscriptions WHERE tenant_id=$1 AND active ORDER BY created_at`, tenantID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []WebhookSubscription
-	for rows.Next() {
-		sub, err := scanSub(rows)
+	err := s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT `+subCols+` FROM webhook_subscriptions WHERE tenant_id=$1 AND active ORDER BY created_at`, tenantID)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, sub)
-	}
-	return out, rows.Err()
+		defer rows.Close()
+		for rows.Next() {
+			sub, err := scanSub(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, sub)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // ---------------------------------------------------------------------------
@@ -237,8 +311,10 @@ func (s *Store) CreateDelivery(ctx context.Context, d *WebhookDelivery) error {
 	d.Status = StatusPending
 	const q = `INSERT INTO webhook_deliveries (id, sub_id, tenant_id, event_id, event_type, status)
 	           VALUES ($1,$2,$3,$4,$5,'pending') RETURNING created_at, updated_at`
-	return s.pool.QueryRow(ctx, q, d.ID, d.SubID, d.TenantID, d.EventID, d.EventType).
-		Scan(&d.CreatedAt, &d.UpdatedAt)
+	return s.withTenant(ctx, d.TenantID.String(), func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, q, d.ID, d.SubID, d.TenantID, d.EventID, d.EventType).
+			Scan(&d.CreatedAt, &d.UpdatedAt)
+	})
 }
 
 // ListDeliveries returns a subscription's deliveries (tenant-scoped),
@@ -247,27 +323,33 @@ func (s *Store) ListDeliveries(ctx context.Context, tenantID, subID uuid.UUID, l
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT `+deliveryCols+` FROM webhook_deliveries
-		 WHERE tenant_id=$1 AND sub_id=$2 ORDER BY created_at DESC LIMIT $3`, tenantID, subID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	var out []WebhookDelivery
-	for rows.Next() {
-		d, err := scanDelivery(rows)
+	err := s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT `+deliveryCols+` FROM webhook_deliveries
+			 WHERE tenant_id=$1 AND sub_id=$2 ORDER BY created_at DESC LIMIT $3`, tenantID, subID, limit)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
+		defer rows.Close()
+		for rows.Next() {
+			d, err := scanDelivery(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // UpdateDelivery records the outcome of one delivery attempt (called by the
 // UpdateWebhookDelivery activity after every attempt: retrying → schedules
-// the next timer, delivered/dlq are terminal).
+// the next timer, delivered/dlq are terminal). It is keyed by delivery id
+// only (the workflow carries no tenant id), so it runs without a tenant
+// context — the tenant_isolation policy's unset-context clause keeps the
+// application-level posture for this path (see package header).
 func (s *Store) UpdateDelivery(ctx context.Context, id uuid.UUID, status string, attempts int, statusCode *int, nextRetryAt *time.Time) error {
 	tag, err := s.pool.Exec(ctx,
 		`UPDATE webhook_deliveries
