@@ -1,7 +1,8 @@
 package provider
 
-// Meta (Facebook/Instagram) provider (SPEC-W21 Agent B). Mock is the
-// zero-config default (META_MOCK / SOCIAL_MOCK, see the package doc). The
+// Meta (Facebook/Instagram) provider (SPEC-W21 Agent B). The mock is an
+// explicit dev opt-in (META_MOCK / SOCIAL_MOCK, default OFF — see the
+// package doc). The
 // real-API path is an HONEST STUB: the Meta Marketing API / Graph API
 // wiring (app review, pages tokens, and — for political ads — the
 // separate Meta political-ads authorization, an EXTERNAL multi-week
@@ -17,6 +18,10 @@ type Meta struct {
 
 // Name implements Publisher.
 func (p *Meta) Name() string { return "meta" }
+
+// IsMock reports the mock posture (metering must not count simulated
+// publishes as real usage — W39 SIM-006).
+func (p *Meta) IsMock() bool { return p.mock }
 
 func (p *Meta) mockRef() *mockPublisher {
 	if p.m.name == "" {

@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sqlx::{PgPool, Row};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -159,6 +160,17 @@ fn account_id(name: &str) -> u128 {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()).as_u128()
 }
 
+/// Account code inferred from the account name (SPEC-W7 B2 naming).
+fn code_for_account(name: &str) -> u16 {
+    if name.ends_with(":ar") {
+        ACCOUNT_CODE_AR_CONTROL
+    } else if name.ends_with(":revenue") {
+        ACCOUNT_CODE_REVENUE
+    } else {
+        ACCOUNT_CODE_CLEARING
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SimLedgerClient: in-memory double-entry default (ADR-0007 fallback).
 // ---------------------------------------------------------------------------
@@ -224,21 +236,12 @@ impl BillingLedger for SimLedgerClient {
             ));
         }
 
-        let code_for = |name: &str| -> u16 {
-            if name.ends_with(":ar") {
-                ACCOUNT_CODE_AR_CONTROL
-            } else if name.ends_with(":revenue") {
-                ACCOUNT_CODE_REVENUE
-            } else {
-                ACCOUNT_CODE_CLEARING
-            }
-        };
         for name in [debit, credit] {
             st.accounts.entry(name.to_string()).or_insert_with(|| Account {
                 id: account_id(name),
                 name: name.to_string(),
                 ledger: self.ledger_id,
-                code: code_for(name),
+                code: code_for_account(name),
                 debits_posted: 0,
                 credits_posted: 0,
             });
@@ -280,6 +283,180 @@ impl BillingLedger for SimLedgerClient {
             })
             .collect();
         accounts.sort_by(|a, b| a.account.cmp(&b.account));
+        Ok(TenantBalance {
+            tenant_id: tenant_id.to_string(),
+            accounts,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PgLedgerClient: durable Postgres-backed implementation (SIM-029 default).
+// ---------------------------------------------------------------------------
+
+/// Postgres-backed receivables ledger (SIM-029). Selected by default via
+/// BILLING_LEDGER_IMPL=postgres; the same double-entry posting rules and
+/// idempotency-by-transfer-id semantics as the sim, but durable across
+/// restarts. Posting runs in one transaction: replay check, account
+/// upserts, balance updates, and the transfer insert commit atomically.
+pub struct PgLedgerClient {
+    pool: PgPool,
+    ledger_id: u32,
+}
+
+fn pg_err(context: &str, e: sqlx::Error) -> LedgerError {
+    LedgerError::Backend(format!("{context}: {e}"))
+}
+
+impl PgLedgerClient {
+    /// Fail-closed construction: verifies the ledger tables exist (migration
+    /// 0003) so a mis-provisioned database fails the boot loudly instead of
+    /// failing the first posting.
+    pub async fn new(pool: PgPool) -> Result<Self, LedgerError> {
+        sqlx::query("SELECT id FROM ledger_transfers WHERE false")
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| pg_err("ledger tables unavailable (migration 0003 applied?)", e))?;
+        Ok(Self {
+            pool,
+            ledger_id: LEDGER_ID,
+        })
+    }
+}
+
+#[async_trait]
+impl BillingLedger for PgLedgerClient {
+    async fn post(
+        &self,
+        transfer_id: Uuid,
+        debit: &str,
+        credit: &str,
+        amount: u64,
+        code: u16,
+    ) -> Result<Transfer, LedgerError> {
+        if amount == 0 {
+            return Err(LedgerError::InvalidAmount);
+        }
+        let amt = i64::try_from(amount).map_err(|_| LedgerError::InvalidAmount)?;
+        let mut tx = self.pool.begin().await.map_err(|e| pg_err("begin", e))?;
+
+        // Idempotent replay: same id + same parameters returns the recorded
+        // transfer; same id + different parameters is a conflict.
+        let existing = sqlx::query(
+            "SELECT debit_account, credit_account, amount, code, created_at \
+             FROM ledger_transfers WHERE id = $1",
+        )
+        .bind(transfer_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| pg_err("replay check", e))?;
+        if let Some(row) = existing {
+            let ex_debit: String = row.try_get("debit_account").map_err(|e| pg_err("decode", e))?;
+            let ex_credit: String = row.try_get("credit_account").map_err(|e| pg_err("decode", e))?;
+            let ex_amount: i64 = row.try_get("amount").map_err(|e| pg_err("decode", e))?;
+            let ex_code: i32 = row.try_get("code").map_err(|e| pg_err("decode", e))?;
+            let ex_created: DateTime<Utc> =
+                row.try_get("created_at").map_err(|e| pg_err("decode", e))?;
+            let same = ex_debit == debit
+                && ex_credit == credit
+                && ex_amount == amt
+                && ex_code == i32::from(code);
+            tx.commit().await.map_err(|e| pg_err("commit", e))?;
+            if same {
+                return Ok(Transfer {
+                    id: transfer_id.as_u128(),
+                    debit_account: ex_debit,
+                    credit_account: ex_credit,
+                    amount,
+                    ledger: self.ledger_id,
+                    code,
+                    created_at: ex_created,
+                });
+            }
+            return Err(LedgerError::ExistsWithDifferentParameters(
+                transfer_id.to_string(),
+            ));
+        }
+
+        for name in [debit, credit] {
+            sqlx::query(
+                "INSERT INTO ledger_accounts (name, id, ledger, code) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(format!("{:032x}", account_id(name)))
+            .bind(self.ledger_id as i32)
+            .bind(i32::from(code_for_account(name)))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| pg_err("ensure account", e))?;
+        }
+        sqlx::query("UPDATE ledger_accounts SET debits_posted = debits_posted + $2 WHERE name = $1")
+            .bind(debit)
+            .bind(amt)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| pg_err("debit update", e))?;
+        sqlx::query("UPDATE ledger_accounts SET credits_posted = credits_posted + $2 WHERE name = $1")
+            .bind(credit)
+            .bind(amt)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| pg_err("credit update", e))?;
+
+        let created_at = Utc::now();
+        sqlx::query(
+            "INSERT INTO ledger_transfers \
+             (id, debit_account, credit_account, amount, ledger, code, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(transfer_id)
+        .bind(debit)
+        .bind(credit)
+        .bind(amt)
+        .bind(self.ledger_id as i32)
+        .bind(i32::from(code))
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pg_err("insert transfer", e))?;
+
+        tx.commit().await.map_err(|e| pg_err("commit", e))?;
+        Ok(Transfer {
+            id: transfer_id.as_u128(),
+            debit_account: debit.to_string(),
+            credit_account: credit.to_string(),
+            amount,
+            ledger: self.ledger_id,
+            code,
+            created_at,
+        })
+    }
+
+    async fn balance(&self, tenant_id: &str) -> Result<TenantBalance, LedgerError> {
+        // Tenant ids are UUIDs in billing, so the prefix contains no LIKE
+        // metacharacters.
+        let rows = sqlx::query(
+            "SELECT name, debits_posted, credits_posted FROM ledger_accounts \
+             WHERE name LIKE $1 ORDER BY name",
+        )
+        .bind(format!("tenant:{tenant_id}:%"))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| pg_err("balance", e))?;
+        let accounts = rows
+            .iter()
+            .map(|r| -> Result<AccountBalance, LedgerError> {
+                let debits: i64 = r.try_get("debits_posted").map_err(|e| pg_err("decode", e))?;
+                let credits: i64 = r.try_get("credits_posted").map_err(|e| pg_err("decode", e))?;
+                Ok(AccountBalance {
+                    account: r.try_get("name").map_err(|e| pg_err("decode", e))?,
+                    debits_posted: debits as u64,
+                    credits_posted: credits as u64,
+                    posted_net: credits as i128 - debits as i128,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(TenantBalance {
             tenant_id: tenant_id.to_string(),
             accounts,

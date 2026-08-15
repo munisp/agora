@@ -126,6 +126,9 @@ struct RawCloudEvent {
     id: String,
     #[serde(rename = "type")]
     type_: String,
+    /// CloudEvents tenant extension; carried for log correlation but the
+    /// command payload's `tenant_id` is authoritative for ledger ops.
+    #[allow(dead_code)]
     #[serde(default)]
     tenantid: Option<String>,
     #[serde(default)]
@@ -135,6 +138,9 @@ struct RawCloudEvent {
 #[derive(Debug, Deserialize)]
 struct ChargeDepositCmd {
     tenant_id: String,
+    /// Part of the command contract (carried for downstream events);
+    /// the ledger path keys off tenant_id + amount only.
+    #[allow(dead_code)]
     booking_id: Option<String>,
     amount_cents: u64,
 }
@@ -430,6 +436,7 @@ mod tests {
             dapr_pubsub: "pubsub".to_string(),
             events_topic: "opendesk.payments.events".to_string(),
             mojaloop_endpoint: "http://127.0.0.1:1".to_string(),
+            mojaloop_allow_sim: false,
             platform_fee_bps: 0,
         };
         AppState {
