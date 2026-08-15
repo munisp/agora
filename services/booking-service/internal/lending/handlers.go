@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -79,6 +80,32 @@ type Deps struct {
 	// fallback, then the body-supplied decided_by). Mirrors
 	// workforce.Deps.UserFromContext.
 	UserFromContext func(ctx context.Context) string
+	// RealRailConfigured reports that the LIVE disbursement rail is wired
+	// (LENDING_TB_BRIDGE_URL set → the payments-service TigerBeetle
+	// bridge). When false, Disburse is only allowed under the explicit
+	// ALLOW_MOCK_RAILS=1 dev opt-in; otherwise it fails closed (503, no
+	// state mutation, no events — W39 SIM-001).
+	RealRailConfigured bool
+}
+
+// EnvAllowMockRails (ALLOW_MOCK_RAILS) opts into the SIMULATED
+// money-movement rails (lending MockRail, and the other services' mock
+// rails by the same convention). Default OFF (fail closed): simulated
+// rails never move real money, so without the opt-in or a real rail the
+// operation must error explicitly instead of pretending to disburse
+// (W39 mock-posture contract, precedent: kyc-service KYC_MOCK).
+const EnvAllowMockRails = "ALLOW_MOCK_RAILS"
+
+// MockRailsAllowed reports whether the simulated rails are explicitly
+// opted in via ALLOW_MOCK_RAILS (truthy: 1/true/yes/on). Unset or any
+// other value → false.
+func MockRailsAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvAllowMockRails))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // Handlers serves the lending endpoints. Constructed by RegisterRoutes;
@@ -93,6 +120,10 @@ type Handlers struct {
 	// UserFromContext extracts the caller subject (JWT sub) for
 	// decided_by; may be nil (see Deps).
 	UserFromContext func(ctx context.Context) string
+	// RealRailConfigured reports the live disbursement rail is wired (see
+	// Deps.RealRailConfigured). Default false → Disburse fails closed
+	// unless ALLOW_MOCK_RAILS=1 opts into the simulation.
+	RealRailConfigured bool
 }
 
 func (h *Handlers) log() *zap.Logger {
@@ -122,13 +153,14 @@ func TenantFromContext(ctx context.Context) bookingops.TenantInfo {
 // comment for the integrator's recommended authZ shape).
 func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler) {
 	h := &Handlers{
-		Store:           d.Store,
-		Log:             d.Logger,
-		EventsTopic:     d.EventsTopic,
-		UsageTopic:      d.UsageTopic,
-		KYCURL:          d.KYCURL,
-		KYCHTTP:         d.KYCHTTP,
-		UserFromContext: d.UserFromContext,
+		Store:              d.Store,
+		Log:                d.Logger,
+		EventsTopic:        d.EventsTopic,
+		UsageTopic:         d.UsageTopic,
+		KYCURL:             d.KYCURL,
+		KYCHTTP:            d.KYCHTTP,
+		UserFromContext:    d.UserFromContext,
+		RealRailConfigured: d.RealRailConfigured,
 	}
 	r.Route("/v1/lending", func(r chi.Router) {
 		r.Use(tenantMiddleware(d.Resolver, d.Logger))
@@ -629,6 +661,14 @@ func (h *Handlers) checkKYC(r *http.Request, tenant bookingops.TenantInfo, req p
 // the application status guard: a replay returns 200 with the existing
 // loan account and {replayed: true} (no events, no metering, no intent —
 // money movement is never re-intended).
+//
+// RAIL POSTURE (W39 SIM-001): disbursement marks the loan disbursed in
+// the lending ledger BEFORE the rail consumer moves the money, so the
+// endpoint refuses (503, explicit error — NO state mutation, NO
+// LoanDisbursed/Intent event, NO metering) unless a real rail is wired
+// (RealRailConfigured ⇐ LENDING_TB_BRIDGE_URL) or the simulated rail is
+// explicitly opted into for dev (ALLOW_MOCK_RAILS=1). A silent simulated
+// "disbursement" is never acceptable in the default posture.
 func (h *Handlers) Disburse(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := h.tenantOr400(w, r)
 	if !ok {
@@ -637,6 +677,11 @@ func (h *Handlers) Disburse(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid application id")
+		return
+	}
+	if !h.RealRailConfigured && !MockRailsAllowed() {
+		writeError(w, http.StatusServiceUnavailable,
+			"lending disbursement rail not configured: set LENDING_TB_BRIDGE_URL for the live TigerBeetle bridge, or ALLOW_MOCK_RAILS=1 to opt into the dev simulation")
 		return
 	}
 	res, err := h.Store.Disburse(r.Context(), tenant.ID, id, time.Now().UTC())
