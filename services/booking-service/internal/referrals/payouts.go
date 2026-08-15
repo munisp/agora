@@ -90,7 +90,8 @@ type TransferStatusResult struct {
 }
 
 // PayoutProvider abstracts the cash-out rail so the workflows stay
-// mockable (contract §4/§5: PAYOUT_MOCK=1 default).
+// mockable (contract §4/§5; the mock is an explicit PAYOUT_MOCK=1 dev
+// opt-in since W39 — default fail-closed).
 type PayoutProvider interface {
 	Name() string // paystack | flutterwave | mock
 	Transfer(ctx context.Context, in TransferRequest) (TransferResult, error)
@@ -239,13 +240,14 @@ func truncate(s string, n int) string {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic mock provider (PAYOUT_MOCK=1 default)
+// Deterministic mock provider (PAYOUT_MOCK=1 dev opt-in; default OFF)
 // ---------------------------------------------------------------------------
 
-// MockProvider is the DEFAULT provider (PAYOUT_MOCK=1): deterministic, no
-// network. Transfer succeeds with provider_ref = the deterministic
-// PayoutReference; TransferStatus reports "success" for any reference it
-// issued. Test hooks (documented, still deterministic):
+// MockProvider is the DEV-ONLY simulated provider (PAYOUT_MOCK=1 opt-in
+// since W39 — previously the silent default): deterministic, no network,
+// NO money movement. Transfer succeeds with provider_ref = the
+// deterministic PayoutReference; TransferStatus reports "success" for any
+// reference it issued. Test hooks (documented, still deterministic):
 //   - beneficiary "mock-fail"          → Transfer errors (declined)
 //   - beneficiary "mock-pending"       → Transfer status "pending"
 //   - status lookup of an unknown ref  → "failed" (never issued ⇒ mismatch)
@@ -279,7 +281,10 @@ func (MockProvider) TransferStatus(_ context.Context, providerRef string) (Trans
 // ---------------------------------------------------------------------------
 
 const (
-	// EnvPayoutMock gates the mock: default "1" (contract §4/§B: mock default).
+	// EnvPayoutMock gates the mock: DEFAULT OFF since W39 (SIM-002) —
+	// truthy (1/true/yes/on) explicitly opts into the deterministic
+	// MockProvider for dev; otherwise a real rail must be configured or
+	// ProviderFromEnv fails closed.
 	EnvPayoutMock = "PAYOUT_MOCK"
 	// EnvPayoutProvider selects the real rail: paystack (default) | flutterwave.
 	EnvPayoutProvider = "PAYOUT_PROVIDER"
@@ -294,25 +299,51 @@ const (
 	EnvPayoutMinNGN = "PAYOUT_MIN_NGN"
 )
 
+// ErrPayoutProviderNotConfigured is the explicit fail-closed error when
+// the mock is not opted into (PAYOUT_MOCK off) and no real rail is
+// configured (neither PAYOUT_PROVIDER_BASE_URL nor
+// PAYOUT_PROVIDER_SECRET set). No payout may ever be marked sent without
+// a real rail (W39 SIM-002).
+var ErrPayoutProviderNotConfigured = errors.New("payout provider not configured: set PAYOUT_PROVIDER_BASE_URL/PAYOUT_PROVIDER_SECRET for the live rail, or PAYOUT_MOCK=1 to opt into the dev simulation")
+
+// payoutMockAllowed reports whether the deterministic mock provider is
+// explicitly opted in (PAYOUT_MOCK truthy). Default OFF (fail closed).
+func payoutMockAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvPayoutMock))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // ProviderFromEnv builds the PayoutProvider from the environment.
-// PAYOUT_MOCK unset or "1" → deterministic MockProvider (default).
-// Otherwise PAYOUT_PROVIDER (default paystack) selects the real client.
+// PAYOUT_MOCK truthy → deterministic MockProvider (dev opt-in).
+// Otherwise PAYOUT_PROVIDER (default paystack) selects the real client —
+// but only when a real rail is actually configured
+// (PAYOUT_PROVIDER_BASE_URL or PAYOUT_PROVIDER_SECRET); with neither, it
+// returns ErrPayoutProviderNotConfigured so the caller can fail closed
+// instead of silently simulating payouts.
 // Flutterwave is contract-listed but not yet implemented — it falls back to
 // the Paystack-shape client (same assumed envelope) and is flagged in logs
 // by the caller via Name().
-func ProviderFromEnv() PayoutProvider {
-	if v := os.Getenv(EnvPayoutMock); v == "" || v == "1" || strings.EqualFold(v, "true") {
-		return MockProvider{}
+func ProviderFromEnv() (PayoutProvider, error) {
+	if payoutMockAllowed() {
+		return MockProvider{}, nil
+	}
+	baseURL, secret := os.Getenv(EnvPayoutProviderBaseURL), os.Getenv(EnvPayoutProviderSecret)
+	if strings.TrimSpace(baseURL) == "" && strings.TrimSpace(secret) == "" {
+		return nil, ErrPayoutProviderNotConfigured
 	}
 	switch strings.ToLower(os.Getenv(EnvPayoutProvider)) {
 	case ProviderFlutterwave:
 		// Contract §4 lists flutterwave; its transfer shape is not specified
 		// in this wave — reuse the Paystack-shape client against the
 		// flutterwave base URL (flagged ASSUMPTION, single-file change).
-		c := NewPaystackClient(os.Getenv(EnvPayoutProviderBaseURL), os.Getenv(EnvPayoutProviderSecret))
-		return &flutterwaveShim{PaystackClient: c}
+		c := NewPaystackClient(baseURL, secret)
+		return &flutterwaveShim{PaystackClient: c}, nil
 	default:
-		return NewPaystackClient(os.Getenv(EnvPayoutProviderBaseURL), os.Getenv(EnvPayoutProviderSecret))
+		return NewPaystackClient(baseURL, secret), nil
 	}
 }
 
