@@ -98,7 +98,8 @@ impl FlutterwaveAdapter {
     /// Build from environment (SPEC-W12 §8 naming).
     pub fn from_env() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // RS-006: shared client with 5s connect / 30s overall timeouts.
+            http: crate::http_client(),
             base_url: std::env::var("FLUTTERWAVE_BASE_URL")
                 .unwrap_or_else(|_| "https://api.flutterwave.com/v3".to_string()),
             secret_key: std::env::var("FLUTTERWAVE_SECRET_KEY").unwrap_or_default(),
@@ -170,6 +171,9 @@ pub struct FwCustomer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FwMeta {
     pub tenant_id: String,
+    /// Round-trips to Flutterwave and back for reconciliation; the webhook
+    /// path currently only needs `tenant_id`.
+    #[allow(dead_code)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub booking_id: Option<String>,
 }
@@ -568,5 +572,161 @@ mod tests {
         assert_eq!(id.to_string(), "9b0b0d52-1c8b-4d3f-9e2a-6f6a2b7c1d20");
         assert_eq!(data["meta"]["tenant_id"], "t1");
         assert_eq!(data["amount"].as_f64().unwrap(), 1250.0);
+    }
+
+    // ------------------------------------------------------------------
+    // SIM-004 handler-level regression tests: the webhook must fail closed
+    // (401, no state change) on a missing/invalid verif-hash, 503 when no
+    // hash is configured at all, and replays must not double-capture.
+    // ------------------------------------------------------------------
+
+    use crate::config::Config;
+    use crate::consumer::UnavailableDlqSink;
+    use crate::dapr::DaprOutbox;
+    use crate::ledger::sim::SimLedgerClient;
+    use crate::mojaloop::MojaloopAdapter;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    fn test_state(secret_hash: Option<&str>) -> AppState {
+        let cfg = Config {
+            port: 0,
+            ledger_impl: "sim".to_string(),
+            tb_addresses: String::new(),
+            tb_cluster_id: 0,
+            kafka_brokers: String::new(),
+            kafka_group_id: "test".to_string(),
+            kafka_commands_topic: "opendesk.payments.commands".to_string(),
+            kafka_consumer_enabled: false,
+            dlq_topic: "opendesk.dlq".to_string(),
+            dapr_host: "127.0.0.1".to_string(),
+            dapr_http_port: 1, // unreachable; outbox is best-effort
+            dapr_pubsub: "pubsub".to_string(),
+            events_topic: "opendesk.payments.events".to_string(),
+            mojaloop_endpoint: "http://127.0.0.1:1".to_string(),
+            mojaloop_allow_sim: false,
+            platform_fee_bps: 0,
+        };
+        AppState {
+            ledger: Arc::new(SimLedgerClient::new(0)),
+            outbox: DaprOutbox::new(
+                "http://127.0.0.1:1".to_string(),
+                "pubsub".to_string(),
+                "opendesk.payments.events".to_string(),
+            ),
+            mojaloop: MojaloopAdapter::new("http://127.0.0.1:1".to_string()),
+            flutterwave: FlutterwaveAdapter {
+                http: crate::http_client(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                secret_key: "sk_test".to_string(),
+                secret_hash: secret_hash.map(|s| s.to_string()),
+                redirect_url: None,
+            },
+            config: Arc::new(cfg),
+            dlq: Arc::new(UnavailableDlqSink),
+            events_published: Arc::new(AtomicU64::new(0)),
+            events_failed: Arc::new(AtomicU64::new(0)),
+            commands_dead_lettered: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn webhook_body(hold_id: Uuid) -> axum::body::Bytes {
+        serde_json::to_vec(&serde_json::json!({
+            "event": "charge.completed",
+            "data": {
+                "id": 123,
+                "status": "successful",
+                "tx_ref": make_tx_ref(hold_id),
+                "amount": 12.00,
+                "currency": "NGN",
+                "meta": {"tenant_id": "t-1"}
+            }
+        }))
+        .unwrap()
+        .into()
+    }
+
+    async fn seed_hold(st: &AppState, hold_id: Uuid, amount_cents: u64) {
+        st.ledger
+            .hold_deposit("t-1", hold_id, amount_cents)
+            .await
+            .expect("seed hold");
+    }
+
+    #[tokio::test]
+    async fn webhook_missing_verif_hash_is_401_and_no_state_change() {
+        let st = test_state(Some("s3cret"));
+        let hold_id = Uuid::new_v4();
+        seed_hold(&st, hold_id, 1_200).await;
+        let resp = webhook(
+            State(st.clone()),
+            HeaderMap::new(),
+            webhook_body(hold_id),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Hold must still be pending (no capture applied).
+        let bal = st.ledger.balance("t-1").await.unwrap();
+        let revenue = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0);
+        assert_eq!(revenue, 0, "no capture may be applied without a valid signature");
+    }
+
+    #[tokio::test]
+    async fn webhook_invalid_verif_hash_is_401_and_no_state_change() {
+        let st = test_state(Some("s3cret"));
+        let hold_id = Uuid::new_v4();
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "wrong-hash".parse().unwrap());
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bal = st.ledger.balance("t-1").await.unwrap();
+        let revenue = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0);
+        assert_eq!(revenue, 0, "invalid signature must not move money");
+    }
+
+    #[tokio::test]
+    async fn webhook_without_configured_hash_is_503_fail_closed() {
+        let st = test_state(None);
+        let hold_id = Uuid::new_v4();
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "anything".parse().unwrap());
+        let resp = webhook(State(st), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn webhook_valid_hash_captures_once_and_replay_is_idempotent() {
+        let st = test_state(Some("s3cret"));
+        let hold_id = Uuid::new_v4();
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+
+        let resp = webhook(State(st.clone()), headers.clone(), webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Exact duplicate delivery: must not double-capture.
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bal = st.ledger.balance("t-1").await.unwrap();
+        let revenue = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0);
+        assert_eq!(revenue, 1_200, "duplicate webhook must not double-apply");
     }
 }

@@ -78,9 +78,19 @@ metadata:
     app: livekit
 type: Opaque
 stringData:
-  # Replace for any non-dev environment (and rotate per docs/runbooks/secrets.md).
-  LIVEKIT_API_KEY: devkey
-  LIVEKIT_API_SECRET: secret
+  # ========================================================================
+  # W39 SIM-024 — NO DEFAULTS SHIPPED. The values below are placeholders;
+  # applying this manifest AS-IS is INVALID and will break media auth.
+  # Generate a real keypair and rotate it per docs/runbooks/secrets.md
+  # BEFORE `kubectl apply`, e.g. inject via SOPS/ExternalSecrets or:
+  #   kubectl -n opendesk create secret generic livekit-keys \
+  #     --from-literal=LIVEKIT_API_KEY=<generated> \
+  #     --from-literal=LIVEKIT_API_SECRET=<generated>
+  # Every LiveKit client (voice-agent-runtime, avatar-renderer, SIP bridge)
+  # must be handed the SAME pair.
+  # ========================================================================
+  LIVEKIT_API_KEY: REPLACE_ME_LIVEKIT_API_KEY
+  LIVEKIT_API_SECRET: REPLACE_ME_LIVEKIT_API_SECRET
 ---
 apiVersion: apps/v1
 kind: DaemonSet
