@@ -303,6 +303,10 @@ global_rules:
               -- rate-limit example key (api-plan-tier-example, currently
               -- disabled); strip so a client can never pick its own bucket.
               "x-tenant-plan",
+              -- W39 billing internal auth: x-internal-token is INJECTED by the
+              -- gateway on billing routes only (see api-billing). A client
+              -- must never supply its own — strip it everywhere first.
+              "x-internal-token",
             }
             return function()
               for _, h in ipairs(spoofed) do
@@ -497,6 +501,17 @@ routes:
   # same jwt (openid-connect bearer_only) + rewrite + limit-count pattern as
   # api-payments. Role enforcement (owner/admin for generate/void) happens in
   # the service via the x-user-roles header; tenant scoping via X-Tenant-ID.
+  #
+  # W39 internal-auth contract: every request to billing must carry
+  # x-internal-token matching the billing-engine BILLING_INTERNAL_TOKEN env.
+  # The global serverless-pre-function above STRIPS any client-supplied
+  # x-internal-token; this route then INJECTS the configured value via
+  # proxy-rewrite headers.set, so the token billing sees always comes from
+  # the gateway. DEV-ONLY STATIC VALUE below — mirrors the jwt-auth consumer
+  # secret convention in this file (gateway static secrets are not
+  # env-driven in dev; see .env.example "Gateway static secrets"). It MUST
+  # match BILLING_INTERNAL_TOKEN in docker-compose.yml / .env and be rotated
+  # for any non-local deployment (docs/runbooks/secrets.md).
   - id: api-billing
     uris:
       - /api/billing/*
@@ -508,6 +523,10 @@ routes:
         regex_uri:
           - "^/api/billing/?(.*)"
           - "/$1"
+        headers:
+          set:
+            # DEV ONLY static gateway secret — see block comment above.
+            x-internal-token: opendesk-dev-billing-internal-token-change-in-prod
       openid-connect:
         discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
         bearer_only: true
@@ -655,7 +674,12 @@ routes:
   # /api/agents/* wildcard above, so the dialed-number lookup stays
   # network-internal.
   - id: api-agents-resolve-internal
-    uri: /api/agents/resolve
+    # uris list covers the trailing-slash variant too (W39 INFRA-002):
+    # /api/agents/resolve/ must NOT fall through to the /api/agents/*
+    # wildcard OIDC route above.
+    uris:
+      - /api/agents/resolve
+      - /api/agents/resolve/
     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     plugins:
       fault-injection:
@@ -900,6 +924,51 @@ routes:
     methods: [POST, OPTIONS]
     upstream_id: billing
     plugins:
+      limit-count:
+        count: 600
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  # ---- Flutterwave webhook (SPEC-W12 §6): /api/webhooks/flutterwave -> payments ----
+  # W39 INFRA-001: payments-service exposes POST /webhooks/flutterwave but the
+  # gateway previously had NO route for it, so capture webhooks never fired.
+  # PUBLIC by design (Flutterwave cannot present Keycloak tokens) — same
+  # posture as webhooks-paystack / webhooks-messaging: NO openid-connect here.
+  # Provider-native auth instead: SIGNATURE VERIFICATION HAPPENS IN
+  # PAYMENTS-SERVICE — it constant-time-compares the `verif-hash` header
+  # against FLUTTERWAVE_SECRET_HASH (401 on mismatch). The gateway preserves
+  # the raw body and all headers (no body transformer, no header mutation on
+  # this route) so the signature check sees exactly what Flutterwave sent.
+  # proxy-rewrite maps the public /api/webhooks/flutterwave prefix onto the
+  # service-native /webhooks/flutterwave path (unlike webhooks-paystack, which
+  # the upstream serves natively at the same path). Exact-URI route (+ explicit
+  # trailing-slash variant) so radix-tree matching prefers it over any
+  # wildcard. The handler always answers fast (Flutterwave retry-storms on
+  # non-200), so limit-count stays generous.
+  - id: webhooks-flutterwave
+    uris:
+      - /api/webhooks/flutterwave
+      - /api/webhooks/flutterwave/
+    methods: [POST, OPTIONS]
+    upstream_id: payments
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/webhooks/flutterwave/?$"
+          - "/webhooks/flutterwave"
       limit-count:
         count: 600
         time_window: 60
