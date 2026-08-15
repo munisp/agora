@@ -16,12 +16,12 @@ package socialpub
 //	GET    /v1/social/posts                    list (status/account_id filters)
 //	POST   /v1/social/posts                    create draft|queued
 //	GET    /v1/social/posts/{id}               one post
-//	POST   /v1/social/posts/{id}/publish       provider publish (mock default; gates account status)
+//	POST   /v1/social/posts/{id}/publish       provider publish (mock is opt-in; gates account status)
 //	GET    /v1/social/ads                      list (status/account_id filters)
 //	POST   /v1/social/ads                      create draft (budget/age gates at input)
 //	PATCH  /v1/social/ads/{id}                 edit (draft|review|rejected) / status machine
 //	POST   /v1/social/ads/{id}/launch          provider launch (political + account gates)
-//	GET    /v1/social/ads/{id}/stats           provider stats (mock default)
+//	GET    /v1/social/ads/{id}/stats           provider stats (mock is opt-in)
 
 import (
 	"context"
@@ -62,8 +62,10 @@ type Deps struct {
 	// opendesk.usage.events). Empty disables social_ad_launched metering.
 	UsageTopic string
 	// Publishers maps provider id (meta|tiktok|x) → Publisher. When nil or
-	// missing an entry, the package lazily installs the deterministic mock
-	// for that provider (the zero-config default — SOCIAL_MOCK posture).
+	// missing an entry, the package lazily resolves the provider from the
+	// environment (SOCIAL_MOCK / <PROVIDER>_MOCK): the deterministic mock
+	// ONLY under an explicit truthy opt-in, otherwise the honest real-API
+	// stub that fails closed with "not configured" (W39 SIM-005).
 	Publishers map[string]provider.Publisher
 }
 
@@ -119,14 +121,16 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 	})
 }
 
-// publisher resolves the Publisher for a provider id, lazily installing
-// the deterministic mock when the integrator wired none (zero-config
-// default).
+// publisher resolves the Publisher for a provider id, lazily resolving
+// the env posture when the integrator wired none (W39 SIM-005): the
+// deterministic mock ONLY under an explicit SOCIAL_MOCK/<PROVIDER>_MOCK
+// truthy opt-in; otherwise the honest real-API stub, which fails closed
+// with "not configured" on every call.
 func (h *Handlers) publisher(providerID string) (provider.Publisher, bool) {
 	if p, ok := h.publishers[providerID]; ok {
 		return p, true
 	}
-	p, ok := provider.New(providerID, true) // mock default (SOCIAL_MOCK posture)
+	p, ok := provider.New(providerID, provider.MockEnabledFromEnv(providerID))
 	if !ok {
 		return nil, false
 	}
@@ -511,7 +515,7 @@ func (h *Handlers) GetPost(w http.ResponseWriter, r *http.Request) {
 }
 
 // PublishPost (POST /v1/social/posts/{id}/publish) — synchronous publish
-// through the provider seam (mock default). Gates: the account must be
+// through the provider seam (mock only when opted in). Gates: the account must be
 // connected (expired|revoked → 409). Success stamps provider_post_id +
 // published_at and emits com.opendesk.social.PostPublished; provider
 // failure lands the post in failed with the error recorded (502 to the
@@ -781,7 +785,7 @@ func (h *Handlers) PatchAd(w http.ResponseWriter, r *http.Request) {
 //  2. account must be connected (expired|revoked → 409);
 //  3. political=true requires account.political_ads_authorized AND a
 //     non-empty effective disclaimer (else 422);
-//  4. provider launch (mock default): rejection → status rejected +
+//  4. provider launch (mock only when opted in): rejection → status rejected +
 //     AdRejected event; success → status review + provider_ad_id +
 //     AdLaunched event + social_ad_launched metering.
 func (h *Handlers) LaunchAd(w http.ResponseWriter, r *http.Request) {
@@ -855,12 +859,16 @@ func (h *Handlers) LaunchAd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.emit(ctx, a.ID, EventTypeAdLaunched, tenant.Slug, tenant.ID.String(), adLaunchedData(a, account.Provider))
-	h.meterLaunched(ctx, a, account.Provider, tenant.Slug)
+	// W39 SIM-006: simulated (mock) launches are NOT billable usage —
+	// metering counts only launches through a real provider rail.
+	if !provider.IsMock(pub) {
+		h.meterLaunched(ctx, a, account.Provider, tenant.Slug)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ad": a, "rejected": false})
 }
 
 // AdStats (GET /v1/social/ads/{id}/stats) — provider stats for a launched
-// ad (mock default: deterministic plausible numbers keyed on the provider
+// ad (with the mock opted in: deterministic plausible numbers keyed on the provider
 // ad id). 409 when the ad has never reached a provider (no provider_ad_id).
 func (h *Handlers) AdStats(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := h.tenant(w, r)
@@ -900,7 +908,7 @@ func (h *Handlers) AdStats(w http.ResponseWriter, r *http.Request) {
 		"ad_id":          a.ID.String(),
 		"provider_ad_id": *a.ProviderAdID,
 		"provider":       account.Provider,
-		"mock":           true, // honest disclosure while the mock is the default
+		"mock":           provider.IsMock(pub), // honest disclosure of the rail posture
 		"stats":          stats,
 	})
 }

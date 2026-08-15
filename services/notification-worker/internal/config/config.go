@@ -45,9 +45,9 @@ type Config struct {
 	NotificationsOutboxGroup string // consumer group of the outbox consumer
 	// SPEC-W32 WS-B: civic case events (CIVIC_EVENTS_TOPIC; unset →
 	// opendesk.civic.events.v1, "off" disables the consumer entirely).
-	CivicEventsTopic       string // opendesk.civic.events.v1
-	CivicEventsGroup       string // consumer group of the civic consumer
-	CivicEscalationTopic   string // SLA-breach escalation events (default = civic events topic)
+	CivicEventsTopic     string // opendesk.civic.events.v1
+	CivicEventsGroup     string // consumer group of the civic consumer
+	CivicEscalationTopic string // SLA-breach escalation events (default = civic events topic)
 	// SPEC-W34 GF16: ops alerts (saga compensation exhaustion). Default
 	// opendesk.ops.alerts; "off" disables emission (CRITICAL log remains).
 	OpsAlertsTopic         string
@@ -72,7 +72,7 @@ type Config struct {
 	QuietHoursDefault   string // QUIET_HOURS_DEFAULT: "HH:MM-HH:MM" ("20:00-08:00")
 	QuietHoursOverrides string // QUIET_HOURS_OVERRIDES: per-channel JSON {"sms":"21:00-07:00"}
 	// SPEC-W16 §1: push notification providers.
-	FCMMock            bool   // FCM_MOCK: deterministic mock, no network (true)
+	FCMMock            bool   // FCM_MOCK: deterministic mock, no network (default FALSE — SIM-010: explicit opt-in, KYC_MOCK idiom)
 	FCMServerKey       string // FCM_SERVER_KEY: legacy FCM API key (deprecated upstream)
 	FCMCredentialsJSON string // FCM_CREDENTIALS_JSON: service-account JSON (HTTP v1)
 	FCMProjectID       string // FCM_PROJECT_ID: GCP project (creds project_id wins)
@@ -138,9 +138,11 @@ func Load() Config {
 		DNDEnforcement:           envStr("DND_ENFORCEMENT", "true") == "true",
 		QuietHoursDefault:        envStr("QUIET_HOURS_DEFAULT", "20:00-08:00"),
 		QuietHoursOverrides:      os.Getenv("QUIET_HOURS_OVERRIDES"),
-		// Push providers (SPEC-W16 §1): FCM_MOCK unset or "1" → mock
-		// (mirrors the KYC_MOCK / PAYOUT_MOCK env idiom).
-		FCMMock:            envStr("FCM_MOCK", "1") != "0",
+		// Push providers (SPEC-W16 §1): FCM_MOCK defaults OFF (SIM-010) —
+		// the deterministic mock is an explicit dev/test opt-in (KYC_MOCK /
+		// PAYOUT_MOCK env idiom). With the mock off and no FCM credentials
+		// configured, sends fail closed with an explicit error (provider/fcm.go).
+		FCMMock:            envBool("FCM_MOCK", false),
 		FCMServerKey:       os.Getenv("FCM_SERVER_KEY"),
 		FCMCredentialsJSON: os.Getenv("FCM_CREDENTIALS_JSON"),
 		FCMProjectID:       os.Getenv("FCM_PROJECT_ID"),
@@ -156,6 +158,17 @@ func Load() Config {
 func envStr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+// envBool mirrors the kyc-service KYC_MOCK idiom (strconv.ParseBool: "1",
+// "true", … opt in; anything else falls back to the default).
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
 	}
 	return def
 }

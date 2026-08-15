@@ -1,0 +1,6 @@
+# Fluvio smartmodules reference host-provided imports (e.g. `copy_records`)
+# that are intentionally undefined at link time and resolved by the Fluvio
+# SPU wasm runtime. Modern rust-lld defaults to --no-undefined for cdylib
+# wasm outputs, so allow undefined symbols for this target.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-args=--allow-undefined"]
