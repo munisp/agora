@@ -474,7 +474,6 @@ export function VoicesClient({
                 {previewing ? "Synthesizing…" : "Preview"}
               </Button>
               {audioUrl ? (
-                // eslint-disable-next-line jsx-a11y/media-has-caption -- synthesized speech preview has no captions
                 <audio controls src={audioUrl} className="h-9 min-w-0 flex-1" />
               ) : null}
             </div>

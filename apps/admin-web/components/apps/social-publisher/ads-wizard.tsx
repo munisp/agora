@@ -37,7 +37,6 @@ import {
   AD_STATUS_META,
   effectiveDisclaimer,
   formatKobo,
-  formatTs,
   launchGateBlocker,
   type SocialAccount,
   type SocialAd,

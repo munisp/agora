@@ -32,3 +32,8 @@ scopes:
   - edge
   - voice
   - crm-sync
+  # W39 INFRA-003: kyc publishes opendesk.kyc.resolved.v1 via this component
+  # (Dapr app-id `kyc`) and billing publishes com.opendesk.billing.* — both
+  # were missing and got silent 403s on publish.
+  - kyc
+  - billing
