@@ -13,7 +13,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Mock provider (deterministic, PAYOUT_MOCK=1 default)
+// Mock provider (deterministic; PAYOUT_MOCK=1 dev opt-in since W39)
 // ---------------------------------------------------------------------------
 
 func TestMockProviderDeterministic(t *testing.T) {
@@ -161,16 +161,58 @@ func TestPaystackClientStatusFalseEnvelope(t *testing.T) {
 // Env selection (contract §7)
 // ---------------------------------------------------------------------------
 
-func TestProviderFromEnvDefaultsToMock(t *testing.T) {
+// W39 SIM-002: the mock is an explicit opt-in (PAYOUT_MOCK truthy);
+// the default posture fails closed when no real rail is configured.
+func TestProviderFromEnvFailsClosedByDefault(t *testing.T) {
+	// Default (unset) posture: no mock opt-in + no real rail → error.
 	t.Setenv(EnvPayoutMock, "")
-	require.Equal(t, ProviderMock, ProviderFromEnv().Name(), "unset PAYOUT_MOCK ⇒ mock default")
+	t.Setenv(EnvPayoutProviderBaseURL, "")
+	t.Setenv(EnvPayoutProviderSecret, "")
+	p, err := ProviderFromEnv()
+	require.ErrorIs(t, err, ErrPayoutProviderNotConfigured, "unset PAYOUT_MOCK + no real rail ⇒ fail closed")
+	require.Nil(t, p)
+
+	// Explicitly off, still no real rail → error.
+	t.Setenv(EnvPayoutMock, "0")
+	_, err = ProviderFromEnv()
+	require.ErrorIs(t, err, ErrPayoutProviderNotConfigured)
+}
+
+func TestProviderFromEnvMockOptIn(t *testing.T) {
 	t.Setenv(EnvPayoutMock, "1")
-	require.Equal(t, ProviderMock, ProviderFromEnv().Name())
+	t.Setenv(EnvPayoutProviderBaseURL, "")
+	t.Setenv(EnvPayoutProviderSecret, "")
+	p, err := ProviderFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, ProviderMock, p.Name())
+
+	t.Setenv(EnvPayoutMock, "true")
+	p, err = ProviderFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, ProviderMock, p.Name())
+}
+
+func TestProviderFromEnvRealRail(t *testing.T) {
 	t.Setenv(EnvPayoutMock, "0")
 	t.Setenv(EnvPayoutProvider, "")
-	require.Equal(t, ProviderPaystack, ProviderFromEnv().Name(), "mock off + no provider ⇒ paystack")
+	t.Setenv(EnvPayoutProviderSecret, "")
+	t.Setenv(EnvPayoutProviderBaseURL, "http://daprd:3500/v1.0/invoke/payments/method")
+	p, err := ProviderFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, ProviderPaystack, p.Name(), "mock off + base URL ⇒ paystack real rail")
+
+	// A secret alone (live Paystack API default base URL) also counts as
+	// a configured real rail.
+	t.Setenv(EnvPayoutProviderBaseURL, "")
+	t.Setenv(EnvPayoutProviderSecret, "sk_test_123")
+	p, err = ProviderFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, ProviderPaystack, p.Name())
+
 	t.Setenv(EnvPayoutProvider, "flutterwave")
-	require.Equal(t, ProviderFlutterwave, ProviderFromEnv().Name())
+	p, err = ProviderFromEnv()
+	require.NoError(t, err)
+	require.Equal(t, ProviderFlutterwave, p.Name())
 }
 
 func TestMinPayoutFromEnv(t *testing.T) {

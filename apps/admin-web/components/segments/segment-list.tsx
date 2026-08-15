@@ -35,7 +35,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input, Label, Select, Textarea } from "@/components/ui/input";
+import { Label, Select, Textarea } from "@/components/ui/input";
 import {
   Table,
   TableBody,

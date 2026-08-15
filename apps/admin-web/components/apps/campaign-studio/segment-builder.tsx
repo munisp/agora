@@ -58,7 +58,6 @@ export function SegmentBuilder({
 }) {
   const { toast } = useToast();
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
-  const selected = segments.find((s) => s.id === selectedId) ?? null;
 
   const [name, setName] = React.useState("");
   const [rows, setRows] = React.useState<FilterRow[]>(rowsFromDefinition(null));

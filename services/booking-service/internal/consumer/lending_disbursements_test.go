@@ -175,13 +175,63 @@ func TestTransferIDFallsBackToEventID(t *testing.T) {
 	require.Equal(t, DisbursementTransferID(env.ID), rail.ids[0])
 }
 
-// Mock posture is the default when TB is unconfigured; LENDING_TB_BRIDGE_URL
-// selects the live HTTP bridge (payments ledger sim/mock convention).
+// W39 SIM-001 posture: TB unconfigured + no mock opt-in → FAIL CLOSED
+// (ErrRailNotConfigured); ALLOW_MOCK_RAILS=1 opts into the mock (dev
+// only); LENDING_TB_BRIDGE_URL always selects the live HTTP bridge.
 func TestRailFromEnvPosture(t *testing.T) {
 	t.Setenv(EnvLendingTBBridgeURL, "")
-	require.Equal(t, "mock", RailFromEnv(zap.NewNop()).Name())
+	t.Setenv("ALLOW_MOCK_RAILS", "")
+	_, err := RailFromEnv(zap.NewNop())
+	require.ErrorIs(t, err, ErrRailNotConfigured, "default posture must fail closed")
+
+	t.Setenv("ALLOW_MOCK_RAILS", "1")
+	rail, err := RailFromEnv(zap.NewNop())
+	require.NoError(t, err)
+	require.Equal(t, "mock", rail.Name(), "explicit opt-in selects the mock rail")
+
 	t.Setenv(EnvLendingTBBridgeURL, "http://daprd:3500/v1.0/invoke/payments/method")
-	require.Equal(t, "http", RailFromEnv(zap.NewNop()).Name())
+	rail, err = RailFromEnv(zap.NewNop())
+	require.NoError(t, err)
+	require.Equal(t, "http", rail.Name())
+
+	// The live bridge wins even when the mock opt-in is also set (a real
+	// rail configured is never downgraded to a simulation).
+	t.Setenv("ALLOW_MOCK_RAILS", "1")
+	rail, err = RailFromEnv(zap.NewNop())
+	require.NoError(t, err)
+	require.Equal(t, "http", rail.Name())
+}
+
+// W39 SIM-001 regression: with NO rail wired (nil rail — the default
+// posture when the mock is not opted into and no bridge URL is set) the
+// consumer fails closed: process returns the explicit
+// ErrRailNotConfigured, records nothing, and claims no success.
+func TestFailClosedRailNeverSimulates(t *testing.T) {
+	c := NewLendingDisbursements([]string{"localhost:9092"}, "topic", "group", "dlq", nil, zap.NewNop())
+	require.Equal(t, "unconfigured", c.rail.Name(), "nil rail must select the fail-closed posture")
+	defer func() { _ = c.Close() }()
+
+	msg := kafka.Message{Value: marshalIntent(t, uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), 250_000)}
+	err := c.process(context.Background(), msg)
+	require.ErrorIs(t, err, ErrRailNotConfigured)
+}
+
+// W39 SIM-001 regression (mock opt-in posture): with ALLOW_MOCK_RAILS=1
+// the mock rail acknowledges deterministically and dedupes redeliveries —
+// dev-only simulation behavior preserved.
+func TestMockRailOptInSimulates(t *testing.T) {
+	t.Setenv("ALLOW_MOCK_RAILS", "1")
+	t.Setenv(EnvLendingTBBridgeURL, "")
+	rail, err := RailFromEnv(zap.NewNop())
+	require.NoError(t, err)
+	mock, ok := rail.(*MockRail)
+	require.True(t, ok, "opt-in must select the MockRail")
+
+	c := newTestConsumer(rail)
+	payload := marshalIntent(t, uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString(), 5000)
+	require.NoError(t, c.process(context.Background(), kafka.Message{Value: payload}))
+	require.NoError(t, c.process(context.Background(), kafka.Message{Value: payload})) // redelivery
+	require.Len(t, mock.Transfers(), 1, "mock rail dedupes on the deterministic transfer ID")
 }
 
 // HTTPRail posts the transfer with the idempotency-key header.

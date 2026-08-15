@@ -1,7 +1,7 @@
 package provider
 
-// TikTok provider (SPEC-W21 Agent B). Mock is the zero-config default
-// (TIKTOK_MOCK / SOCIAL_MOCK, see the package doc). The real-API path is
+// TikTok provider (SPEC-W21 Agent B). The mock is an explicit dev opt-in
+// (TIKTOK_MOCK / SOCIAL_MOCK, default OFF — see the package doc). The real-API path is
 // an HONEST STUB: TikTok Marketing API wiring (app approval, advertiser
 // access tokens) is a documented follow-up in
 // docs/apps/social-publisher.md.
@@ -16,6 +16,10 @@ type TikTok struct {
 
 // Name implements Publisher.
 func (p *TikTok) Name() string { return "tiktok" }
+
+// IsMock reports the mock posture (metering must not count simulated
+// publishes as real usage — W39 SIM-006).
+func (p *TikTok) IsMock() bool { return p.mock }
 
 func (p *TikTok) mockRef() *mockPublisher {
 	if p.m.name == "" {
