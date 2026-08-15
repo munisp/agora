@@ -343,8 +343,8 @@ export function AgentDetailClient({
             <TableBody>
               {records.length === 0 ? (
                 <TableEmpty colSpan={columns.length + 2}>
-                  No capture records yet — they appear after the agent's next
-                  completed call.
+                  No capture records yet — they appear after the agent&apos;s
+                  next completed call.
                 </TableEmpty>
               ) : (
                 records.map((record) => (

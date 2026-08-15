@@ -1,17 +1,23 @@
 //! REST API (SPEC-W7 B2/B3): rate cards, invoicing, payment links/QR, and the
 //! public Paystack webhook.
 //!
-//! Auth contract (B2): every /v1/* route requires the `X-Tenant-ID` header to
-//! match the target tenant (service-to-service via APISIX). Mutating
-//! generate/void additionally require the gateway-injected `x-user-roles`
-//! header to contain the Keycloak realm role `owner` or `admin` (403
-//! otherwise). `/webhooks/paystack` is exempt: it authenticates via the
-//! Paystack HMAC signature instead.
+//! Auth contract (B2 + RS-002): every route except /healthz and
+//! /webhooks/paystack first requires the `x-internal-token` header to match
+//! BILLING_INTERNAL_TOKEN (boot fails closed when the env is unset). APISIX
+//! strips any client-supplied copy and injects the real one; without it even
+//! a well-formed X-Tenant-ID is rejected (401), so the tenant/role headers
+//! below can never be spoofed from the docker network. On top of that every
+//! /v1/* route requires the `X-Tenant-ID` header to match the target tenant
+//! (service-to-service via APISIX). Mutating generate/void additionally
+//! require the gateway-injected `x-user-roles` header to contain the Keycloak
+//! realm role `owner` or `admin` (403 otherwise). `/webhooks/paystack` is
+//! exempt from both: it authenticates via the Paystack HMAC signature instead.
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -23,6 +29,7 @@ use sqlx::{Postgres, Transaction};
 
 use crate::invoices::{self, BillingError};
 use crate::models::{Invoice, InvoiceStatus, RateCard};
+use crate::outbox;
 use crate::payments_qr;
 use crate::tenant;
 use crate::AppState;
@@ -187,11 +194,53 @@ pub struct PaymentLinkBody {
 }
 
 // ---------------------------------------------------------------------------
+// Internal-token middleware (RS-002)
+// ---------------------------------------------------------------------------
+
+/// Paths exempt from the internal-token check: liveness probes (the
+/// orchestrator does not hold the token) and the Paystack webhook, which is a
+/// PUBLIC ingress authenticated by the HMAC signature inside its handler
+/// (Paystack cannot know our internal token).
+fn is_token_exempt(path: &str) -> bool {
+    path == "/healthz" || path == "/metrics" || path == "/webhooks/paystack"
+}
+
+/// Pure token check (unit-tested): constant-time compare, empty/missing
+/// presented token never matches.
+fn internal_token_matches(expected: &str, headers: &HeaderMap) -> bool {
+    let presented = headers
+        .get("x-internal-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    !presented.is_empty()
+        && payments_qr::constant_time_eq(expected.trim().as_bytes(), presented.trim().as_bytes())
+}
+
+async fn require_internal_token(
+    State(st): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_token_exempt(req.uri().path()) {
+        return next.run(req).await;
+    }
+    if !internal_token_matches(&st.config.internal_token, req.headers()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing or invalid x-internal-token" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/v1/rate-cards/{tenant_id}", put(upsert_rate_card))
         .route("/v1/invoices", get(list_invoices))
         .route("/v1/invoices/generate", post(generate_invoice))
@@ -201,6 +250,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/invoices/{id}/payment-link", post(payment_link))
         .route("/v1/invoices/{id}/qr", get(invoice_qr))
         .route("/webhooks/paystack", post(paystack_webhook))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_internal_token,
+        ))
         .with_state(state)
 }
 
@@ -209,9 +262,32 @@ async fn healthz(State(st): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "service": "billing-engine",
         "payment_mode": st.config.payment_mode(),
+        "ledger_impl": st.config.billing_ledger_impl,
         "events_published": st.events_published.load(std::sync::atomic::Ordering::Relaxed),
         "events_failed": st.events_failed.load(std::sync::atomic::Ordering::Relaxed),
     }))
+}
+
+/// Prometheus text exposition (RS-001): the outbox failure counter is the
+/// alerting hook for "InvoicePaid could not reach Kafka" (the event itself
+/// stays durable in billing_outbox).
+async fn metrics(State(st): State<AppState>) -> Response {
+    use std::sync::atomic::Ordering;
+    let body = format!(
+        "# HELP billing_events_published_total Billing events published to Kafka by the outbox relay.\n\
+         # TYPE billing_events_published_total counter\n\
+         billing_events_published_total {}\n\
+         # HELP billing_events_failed_total Billing event publish failures (retried from the durable outbox).\n\
+         # TYPE billing_events_failed_total counter\n\
+         billing_events_failed_total {}\n",
+        st.events_published.load(Ordering::Relaxed),
+        st.events_failed.load(Ordering::Relaxed),
+    );
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -503,7 +579,7 @@ async fn paystack_webhook(
         Ok(inv) => inv,
         Err(e) => {
             let _ = tx.rollback().await;
-            return Err(ApiError::from(BillingError::from(e)));
+            return Err(ApiError::from(e));
         }
     };
     let Some(inv) = looked_up else {
@@ -522,19 +598,15 @@ async fn paystack_webhook(
             let inv = invoices::get_invoice(&mut tx, invoice_id)
                 .await?
                 .ok_or_else(|| ApiError::internal("invoice vanished after payment"))?;
-            tx.commit().await?;
-            // Ledger: invoice paid -> DR payments-clearing / CR AR (code 202).
-            if inv.subtotal_cents > 0 {
-                if let Err(e) = st
-                    .ledger
-                    .invoice_paid(&inv.tenant_id.to_string(), invoice_id, inv.subtotal_cents as u64)
-                    .await
-                {
-                    tracing::warn!(error = %e, invoice_id = %invoice_id, "ledger paid posting failed");
-                }
-            }
-            st.publish_event(
-                "InvoicePaid",
+            // RS-001: the InvoicePaid CloudEvent is written to the durable
+            // outbox INSIDE the same transaction as the paid transition, so
+            // the event can never be silently lost (topic unprovisioned,
+            // broker down, ...). The relay republishes with backoff until
+            // Kafka accepts it; the paid commit is never rolled back by a
+            // publication failure.
+            let event = crate::models::CloudEvent::new(
+                "billing-engine",
+                "com.opendesk.billing.InvoicePaid",
                 &invoice_id.to_string(),
                 &inv.tenant_id.to_string(),
                 serde_json::json!({
@@ -546,8 +618,29 @@ async fn paystack_webhook(
                     "paymentRef": inv.payment_ref,
                     "paystackReference": reference,
                 }),
+            );
+            let payload = serde_json::to_value(&event)
+                .map_err(|e| ApiError::internal(format!("invoice paid event serialize: {e}")))?;
+            outbox::enqueue(
+                &mut tx,
+                &st.config.billing_events_topic,
+                &inv.tenant_id.to_string(),
+                &payload,
             )
-            .await;
+            .await?;
+            tx.commit().await?;
+            // Ledger: invoice paid -> DR payments-clearing / CR AR (code 202).
+            if inv.subtotal_cents > 0 {
+                if let Err(e) = st
+                    .ledger
+                    .invoice_paid(&inv.tenant_id.to_string(), invoice_id, inv.subtotal_cents as u64)
+                    .await
+                {
+                    tracing::error!(error = %e, invoice_id = %invoice_id, "ledger paid posting failed");
+                }
+            }
+            // Flush immediately (the poll tick is the backstop).
+            st.outbox_notify.notify_one();
             Ok(Json(serde_json::json!({ "status": "paid" })))
         }
         // NotFound cannot occur here (the row was just loaded above), but
@@ -560,6 +653,53 @@ async fn paystack_webhook(
         Err(e) => {
             let _ = tx.rollback().await;
             Err(ApiError::from(e))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: RS-002 internal-token gate (pure logic; DB-backed handler tests are
+// covered by the pgserver-backed gate probes, no embedded Postgres here).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(token: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(t) = token {
+            h.insert("x-internal-token", t.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn internal_token_gate_fail_closed() {
+        // Missing header, empty value, and wrong value never match.
+        assert!(!internal_token_matches("tok-123", &headers_with(None)));
+        assert!(!internal_token_matches("tok-123", &headers_with(Some(""))));
+        assert!(!internal_token_matches("tok-123", &headers_with(Some("tok-124"))));
+        // Prefix/suffix tricks do not pass the constant-time compare.
+        assert!(!internal_token_matches("tok-123", &headers_with(Some("tok-1234"))));
+        assert!(!internal_token_matches("tok-123", &headers_with(Some("tok-12"))));
+        // Exact match passes (surrounding whitespace tolerated).
+        assert!(internal_token_matches("tok-123", &headers_with(Some("tok-123"))));
+        assert!(internal_token_matches("tok-123", &headers_with(Some(" tok-123 "))));
+    }
+
+    #[test]
+    fn token_exemptions_are_exactly_health_metrics_and_paystack_webhook() {
+        assert!(is_token_exempt("/healthz"));
+        assert!(is_token_exempt("/metrics"));
+        assert!(is_token_exempt("/webhooks/paystack"));
+        for p in [
+            "/v1/invoices",
+            "/v1/rate-cards/9b0b0d52-1c8b-4d3f-9e2a-6f6a2b7c1d20",
+            "/webhooks/flutterwave",
+            "/healthz2",
+            "/webhooks/paystack/extra",
+        ] {
+            assert!(!is_token_exempt(p), "{p} must require the internal token");
         }
     }
 }
