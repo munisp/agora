@@ -3,14 +3,18 @@
 //
 // Reliability contract: these handlers ALWAYS answer 200 fast to the
 // provider (Meta/Telegram retry-storm on non-200). The only non-200 answers
-// are 403 for a bad verify token (GET) or a bad shared secret (Telegram
-// POST) — i.e. authentication failures, never internal processing errors.
+// are authentication failures, never internal processing errors: 403 for a
+// bad verify token (GET) or a bad shared secret (Telegram POST), and 401
+// for a missing/invalid WhatsApp X-Hub-Signature-256 (SIM-007/SIM-008).
 // Processing is synchronous but bounded by a 25s context.
 package httpapi
 
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,12 +80,53 @@ type waWebhook struct {
 	} `json:"entry"`
 }
 
+// verifyWhatsAppSignature enforces the Meta WhatsApp webhook signature
+// (SIM-007/SIM-008, fail-closed): X-Hub-Signature-256 must be
+// "sha256=" + hex HMAC-SHA256(WHATSAPP_APP_SECRET, raw body). A missing or
+// invalid signature — or a missing app-secret configuration — rejects the
+// post with 401 and NOTHING is processed. The ONLY bypass is the explicit
+// dev opt-in WHATSAPP_MOCK=1 (Server.WhatsAppMock, default false), which
+// exists so local/dev journeys can post unsigned payloads.
+func (s *Server) verifyWhatsAppSignature(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		s.Log.Warn("whatsapp webhook: unreadable body, dropping", zap.Error(err))
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
+		return nil, false
+	}
+	if s.WhatsAppMock {
+		// Dev/test opt-in (WHATSAPP_MOCK=1): unsigned payloads accepted.
+		return body, true
+	}
+	if s.WhatsAppAppSecret == "" {
+		s.Log.Error("whatsapp webhook: WHATSAPP_APP_SECRET not configured, rejecting (fail-closed)")
+		writeError(w, http.StatusUnauthorized, "webhook signature verification not configured")
+		return nil, false
+	}
+	sig := r.Header.Get("X-Hub-Signature-256")
+	mac := hmac.New(sha256.New, []byte(s.WhatsAppAppSecret))
+	mac.Write(body)
+	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	if sig == "" || !hmac.Equal([]byte(sig), []byte(want)) {
+		s.Log.Warn("whatsapp webhook: missing or invalid X-Hub-Signature-256, rejecting")
+		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
+		return nil, false
+	}
+	return body, true
+}
+
 // handleWhatsAppWebhook ingests inbound WhatsApp messages. Text messages
 // are normalized and bridged; statuses[] delivery receipts and non-text
-// message types are ignored. Always 200 (SPEC-W6 §A1).
+// message types are ignored. Always 200 (SPEC-W6 §A1) except 401 for a
+// missing/invalid X-Hub-Signature-256 (authentication failure — Meta does
+// not retry-storm on those).
 func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
+	body, ok := s.verifyWhatsAppSignature(w, r)
+	if !ok {
+		return
+	}
 	var payload waWebhook
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		// Malformed payload: still 200 — Meta retries non-200 forever and a
 		// poison payload would loop. Log and drop.
 		s.Log.Warn("whatsapp webhook: invalid JSON body, dropping", zap.Error(err))
