@@ -98,6 +98,9 @@ func patchApp(t *testing.T, r http.Handler, id uuid.UUID, body string) *httptest
 // portfolio — plus the outbox emissions (decided/disbursed/intent/repaid +
 // one loan_disbursed usage record).
 func TestLendingLifecycle(t *testing.T) {
+	// W39 SIM-001: disbursement requires a rail — the tests exercise the
+	// simulated-rail posture via the explicit ALLOW_MOCK_RAILS opt-in.
+	t.Setenv(EnvAllowMockRails, "1")
 	r, st, tenant := testRouter(t, &Deps{EventsTopic: "test.lending", UsageTopic: "test.usage"})
 	contact := addContact(t, st, tenant.ID, "Ada")
 	addBooking(t, st, tenant.ID, contact, "completed", mustTime(t))
@@ -538,4 +541,115 @@ func mustTime(t *testing.T) (tm time.Time) {
 		t.Fatal(err)
 	}
 	return tm.Add(-24 * time.Hour)
+}
+
+// W39 SIM-001 regression: with NO rail configured (LENDING_TB_BRIDGE_URL
+// unset, RealRailConfigured false) and NO ALLOW_MOCK_RAILS opt-in,
+// Disburse FAILS CLOSED — 503 with an explicit error, no state mutation
+// (application stays approved, no loan account), no LoanDisbursed /
+// DisbursementIntent events, no metering. Opting into the simulation
+// (ALLOW_MOCK_RAILS=1) or wiring the real rail restores disbursement.
+func TestDisburseFailsClosedWithoutRail(t *testing.T) {
+	t.Setenv(EnvAllowMockRails, "")
+	r, st, tenant := testRouter(t, &Deps{EventsTopic: "test.lending", UsageTopic: "test.usage"})
+	contact := addContact(t, st, tenant.ID, "Bola")
+	addBooking(t, st, tenant.ID, contact, "completed", mustTime(t))
+
+	prod := createProduct(t, r)
+	app := createApplication(t, r, prod.ID, contact, 2000000, "submitted")
+	if rec := patchApp(t, r, app.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
+		t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := patchApp(t, r, app.ID, `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card"}`); rec.Code != http.StatusOK {
+		t.Fatalf("approve = %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Fail closed: no mock opt-in, no real rail.
+	rec := do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fail-closed disburse = %d (%s), want 503", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "rail not configured") {
+		t.Fatalf("error must name the missing rail: %s", rec.Body.String())
+	}
+
+	// No state mutation: no loan account exists for the application.
+	var loans int
+	if err := st.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM loan_accounts WHERE application_id=$1`, app.ID).Scan(&loans); err != nil {
+		t.Fatalf("count loans: %v", err)
+	}
+	if loans != 0 {
+		t.Fatalf("fail-closed disburse must not create a loan account, found %d", loans)
+	}
+	// No disbursed/intent events, no metering (only ApplicationDecided
+	// from the approve step may exist).
+	rows, err := st.pool.Query(context.Background(),
+		`SELECT payload->>'type' FROM outbox`)
+	if err != nil {
+		t.Fatalf("outbox query: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ string
+		if err := rows.Scan(&typ); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if typ == EventTypeLoanDisbursed || typ == EventTypeDisbursementIntent {
+			t.Fatalf("fail-closed disburse emitted %s — no money moved, no event allowed", typ)
+		}
+		if typ == "com.opendesk.usage.UsageRecord" {
+			t.Fatal("fail-closed disburse must not meter loan_disbursed")
+		}
+	}
+
+	// Dev opt-in restores the simulated disbursement.
+	t.Setenv(EnvAllowMockRails, "1")
+	rec = do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disburse with mock opt-in = %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// W39 SIM-001 regression: a configured REAL rail (RealRailConfigured,
+// wired by main.go from LENDING_TB_BRIDGE_URL) disburses without the
+// mock opt-in.
+func TestDisburseAllowedWithRealRail(t *testing.T) {
+	t.Setenv(EnvAllowMockRails, "")
+	r, st, tenant := testRouter(t, &Deps{
+		EventsTopic: "test.lending", UsageTopic: "test.usage",
+		RealRailConfigured: true,
+	})
+	contact := addContact(t, st, tenant.ID, "Chidi")
+	addBooking(t, st, tenant.ID, contact, "completed", mustTime(t))
+
+	prod := createProduct(t, r)
+	app := createApplication(t, r, prod.ID, contact, 2000000, "submitted")
+	if rec := patchApp(t, r, app.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
+		t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := patchApp(t, r, app.ID, `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card"}`); rec.Code != http.StatusOK {
+		t.Fatalf("approve = %d (%s)", rec.Code, rec.Body.String())
+	}
+	rec := do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("disburse with real rail = %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMockRailsAllowed(t *testing.T) {
+	t.Setenv(EnvAllowMockRails, "")
+	if MockRailsAllowed() {
+		t.Fatal("unset ALLOW_MOCK_RAILS must be OFF (fail closed)")
+	}
+	t.Setenv(EnvAllowMockRails, "0")
+	if MockRailsAllowed() {
+		t.Fatal("ALLOW_MOCK_RAILS=0 must be OFF")
+	}
+	for _, v := range []string{"1", "true", "TRUE", "yes", "on"} {
+		t.Setenv(EnvAllowMockRails, v)
+		if !MockRailsAllowed() {
+			t.Fatalf("ALLOW_MOCK_RAILS=%q must be ON", v)
+		}
+	}
 }

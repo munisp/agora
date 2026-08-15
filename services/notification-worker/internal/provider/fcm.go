@@ -4,15 +4,19 @@ package provider
 //
 // Configuration (env, wired by cmd/worker via internal/config):
 //
-//	FCM_MOCK             default "1": deterministic mock, no network (below)
+//	FCM_MOCK             default OFF (SIM-010, KYC_MOCK idiom): explicit
+//	                     dev/test opt-in ("1"/"true") for the deterministic
+//	                     no-network mock (below). NEVER enable in production.
 //	FCM_SERVER_KEY       legacy FCM server key → legacy HTTP API
 //	FCM_CREDENTIALS_JSON service-account JSON → FCM HTTP v1 + OAuth2
 //	FCM_PROJECT_ID       GCP project id (HTTP v1 path; the service-account
 //	                     project_id wins when both are set)
 //	FCM_BASE_URL         default https://fcm.googleapis.com (tests/override)
 //
-// Auth selection when FCM_MOCK=0: FCM_CREDENTIALS_JSON takes precedence
-// (HTTP v1); FCM_SERVER_KEY alone selects the legacy API.
+// Auth selection with the mock off: FCM_CREDENTIALS_JSON takes precedence
+// (HTTP v1); FCM_SERVER_KEY alone selects the legacy API. With the mock off
+// and NEITHER credential set, SendPush fails closed with an explicit error
+// — a push is never silently simulated.
 //
 // ASSUMPTION: the legacy FCM HTTP API (POST /fcm/send, Authorization:
 // key=...) was deprecated by Google with shutdown announced for 2024; it is
@@ -62,7 +66,7 @@ const fcmScope = "https://www.googleapis.com/auth/firebase.messaging"
 
 // FCMConfig carries the FCM_* environment configuration (see file header).
 type FCMConfig struct {
-	Mock            bool   // FCM_MOCK (default true): deterministic, no network
+	Mock            bool   // FCM_MOCK (default false, SIM-010): deterministic, no network — explicit dev/test opt-in
 	ServerKey       string // FCM_SERVER_KEY (legacy API)
 	CredentialsJSON string // FCM_CREDENTIALS_JSON (service account, HTTP v1)
 	ProjectID       string // FCM_PROJECT_ID (HTTP v1; creds project_id wins)
@@ -112,8 +116,8 @@ func NewFCM(cfg FCMConfig, log *zap.Logger) (*FCM, error) {
 // Name implements PushProvider.
 func (f *FCM) Name() string { return "fcm" }
 
-// Configured implements PushProvider. Mock mode counts as configured: it
-// needs no credentials (this is the default developer experience).
+// Configured implements PushProvider. Mock mode (explicit FCM_MOCK=1
+// opt-in) counts as configured: it needs no credentials.
 func (f *FCM) Configured() bool {
 	if f.Mock {
 		return true
@@ -143,7 +147,7 @@ func (f *FCM) SendPush(ctx context.Context, msg PushMessage) (int, []byte, error
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic mock (FCM_MOCK=1 default)
+// Deterministic mock (FCM_MOCK=1 explicit opt-in; default OFF, SIM-010)
 // ---------------------------------------------------------------------------
 
 // sendMock mirrors the deterministic mock idiom of booking-service's payout
@@ -252,10 +256,10 @@ func Unregistered(status int, body []byte) bool {
 // serviceAccount is the subset of the Google service-account JSON key file
 // the provider needs (FCM_CREDENTIALS_JSON).
 type serviceAccount struct {
-	ProjectID  string `json:"project_id"`
+	ProjectID   string `json:"project_id"`
 	ClientEmail string `json:"client_email"`
-	PrivateKey string `json:"private_key"` // PEM PKCS#8
-	TokenURI   string `json:"token_uri"`   // default https://oauth2.googleapis.com/token
+	PrivateKey  string `json:"private_key"` // PEM PKCS#8
+	TokenURI    string `json:"token_uri"`   // default https://oauth2.googleapis.com/token
 
 	key *rsa.PrivateKey
 }
