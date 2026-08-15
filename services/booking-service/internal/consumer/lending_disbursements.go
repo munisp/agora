@@ -9,14 +9,16 @@
 // segmentio/kafka-go like the command/privacy consumers; poison messages
 // dead-letter to opendesk.dlq.
 //
-// Rail posture (mirrors the payments ledger + the W14 payout provider):
-// there is no Go TigerBeetle client in this repo — payments-service owns
-// the TB ledger (Rust, LEDGER_IMPL=sim default = in-memory mock posture).
-// This consumer follows the same convention: LENDING_TB_BRIDGE_URL empty →
-// deterministic MockRail (no money movement, TB unconfigured); set it to
-// the payments-service Dapr invoke gateway (the deployment convention
-// documented for PAYOUT_PROVIDER_BASE_URL in internal/referrals/payouts.go)
-// to post real transfers.
+// Rail posture (W39 mock-posture contract): there is no Go TigerBeetle
+// client in this repo — payments-service owns the TB ledger. This
+// consumer fails closed by default: LENDING_TB_BRIDGE_URL selects the
+// live HTTP bridge (the payments-service Dapr invoke gateway — the
+// deployment convention documented for PAYOUT_PROVIDER_BASE_URL in
+// internal/referrals/payouts.go); the deterministic MockRail (no money
+// movement) is only available under the explicit ALLOW_MOCK_RAILS=1 dev
+// opt-in; with neither configured, RailFromEnv returns
+// ErrRailNotConfigured and intents dead-letter instead of being silently
+// simulated.
 //
 // Exactly-once under redelivery: the transfer ID is derived
 // deterministically from the intent's ref_id (the rail-side idempotency
@@ -51,11 +53,19 @@ import (
 // LENDING_DISBURSEMENTS_GROUP is unset (main.go wiring).
 const DefaultLendingDisbursementsGroup = "booking-lending-disbursements"
 
-// EnvLendingTBBridgeURL selects the live rail: empty → MockRail (TB
-// unconfigured, the payments ledger's mock/sim default posture); non-empty
-// → HTTPRail posting {base}/transfers (point it at the payments-service
-// Dapr invoke gateway, e.g. http://daprd-booking:3500/v1.0/invoke/payments/method).
+// EnvLendingTBBridgeURL selects the live rail: non-empty → HTTPRail
+// posting {base}/transfers (point it at the payments-service Dapr invoke
+// gateway, e.g. http://daprd-booking:3500/v1.0/invoke/payments/method).
+// Empty → the MockRail is only available under the explicit
+// ALLOW_MOCK_RAILS=1 dev opt-in (lending.MockRailsAllowed); otherwise
+// RailFromEnv fails closed with ErrRailNotConfigured (W39 SIM-001).
 const EnvLendingTBBridgeURL = "LENDING_TB_BRIDGE_URL"
+
+// ErrRailNotConfigured is the explicit fail-closed error when neither the
+// live rail (LENDING_TB_BRIDGE_URL) nor the mock opt-in
+// (ALLOW_MOCK_RAILS=1) is configured. A disbursement intent must NEVER be
+// silently simulated in the default posture.
+var ErrRailNotConfigured = errors.New("lending disbursement rail not configured: set LENDING_TB_BRIDGE_URL for the live TigerBeetle bridge, or ALLOW_MOCK_RAILS=1 to opt into the dev simulation")
 
 // disbursementIntentData mirrors the data payload of
 // lending.MarshalDisbursementIntent (duplicated per service-boundary
@@ -114,11 +124,12 @@ func DisbursementTransferID(anchor string) string {
 }
 
 // ---------------------------------------------------------------------------
-// MockRail — the default (LENDING_TB_BRIDGE_URL unset): deterministic, no
-// network, no money movement. Mirrors the payments ledger's sim default
-// and referrals.MockProvider: the intent is logged and acknowledged so
-// lending is never blocked while TB is unconfigured. In-process dedupe on
-// the transfer ID gives exactly-once under redelivery; cross-process
+// MockRail — DEV-ONLY simulation (ALLOW_MOCK_RAILS=1 opt-in since W39;
+// previously the silent default): deterministic, no network, no money
+// movement. The intent is logged and acknowledged so lending is not
+// blocked while TB is unconfigured — but ONLY when the operator
+// explicitly opted into the simulation. In-process dedupe on the
+// transfer ID gives exactly-once under redelivery; cross-process
 // exactly-once is the live rail's job (TB transfer IDs are idempotent).
 // ---------------------------------------------------------------------------
 
@@ -214,14 +225,31 @@ func (r *HTTPRail) CreateTransfer(ctx context.Context, in RailTransfer) (string,
 	return in.TransferID, nil
 }
 
+// failClosedRail is the defensive rail when none was wired: every
+// transfer fails explicitly with ErrRailNotConfigured — never a silent
+// simulation, never a success claim.
+type failClosedRail struct{}
+
+// Name implements DisbursementRail.
+func (failClosedRail) Name() string { return "unconfigured" }
+
+// CreateTransfer implements DisbursementRail (fail-closed).
+func (failClosedRail) CreateTransfer(context.Context, RailTransfer) (string, error) {
+	return "", ErrRailNotConfigured
+}
+
 // RailFromEnv builds the DisbursementRail from the environment:
-// LENDING_TB_BRIDGE_URL empty → MockRail (default; TB unconfigured),
-// non-empty → HTTPRail.
-func RailFromEnv(log *zap.Logger) DisbursementRail {
+// LENDING_TB_BRIDGE_URL non-empty → HTTPRail (live); else
+// ALLOW_MOCK_RAILS=1 → MockRail (dev simulation); else FAIL CLOSED with
+// ErrRailNotConfigured (W39 SIM-001 — the mock posture is opt-in only).
+func RailFromEnv(log *zap.Logger) (DisbursementRail, error) {
 	if base := os.Getenv(EnvLendingTBBridgeURL); base != "" {
-		return NewHTTPRail(base)
+		return NewHTTPRail(base), nil
 	}
-	return NewMockRail(log)
+	if lending.MockRailsAllowed() {
+		return NewMockRail(log), nil
+	}
+	return nil, ErrRailNotConfigured
 }
 
 // ---------------------------------------------------------------------------
@@ -238,10 +266,12 @@ type LendingDisbursementsConsumer struct {
 }
 
 // NewLendingDisbursements builds the lending disbursement-intent consumer.
-// A nil rail selects the mock posture (defensive; wiring uses RailFromEnv).
+// A nil rail selects the FAIL-CLOSED posture (defensive: every intent
+// errors with ErrRailNotConfigured and dead-letters; wiring uses
+// RailFromEnv).
 func NewLendingDisbursements(brokers []string, topic, group, dlqTopic string, rail DisbursementRail, log *zap.Logger) *LendingDisbursementsConsumer {
 	if rail == nil {
-		rail = NewMockRail(log)
+		rail = failClosedRail{}
 	}
 	return &LendingDisbursementsConsumer{
 		reader: kafka.NewReader(kafka.ReaderConfig{

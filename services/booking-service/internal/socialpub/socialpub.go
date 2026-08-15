@@ -15,7 +15,7 @@
 //	    media_url, disclaimer_text}. Creative bodies NEVER appear in
 //	    CloudEvent payloads (privacy contract §Shared contracts).
 //	social_posts     — draft|queued|publishing|published|failed; publish
-//	    goes through the provider seam (mock default).
+//	    goes through the provider seam (mock only when opted in).
 //	social_ads       — draft|review|active|paused|rejected; budget_kobo
 //	    int64 (total) + daily_budget_kobo int64, targeting jsonb
 //	    {lgas, age_min, age_max, interests}, political flag, disclaimer.
@@ -29,15 +29,19 @@
 //   - targeting.age_min ≤ age_max, both within 18..100 (400).
 //
 // Provider seam: internal/socialpub/provider — interface Publisher
-// {PublishPost, LaunchAd, AdStats} with per-provider mocks as the
-// zero-config default (SOCIAL_MOCK=1 master switch, or per-provider
-// META_MOCK/TIKTOK_MOCK/X_MOCK — see the provider package doc), returning
-// deterministic sandbox ids (mock-post-*/mock-ad-*) and plausible stats.
-// Real API wiring is an honest stub posture (same as W16 APNs): the
-// credential-follow-up runbook lives in docs/apps/social-publisher.md.
+// {PublishPost, LaunchAd, AdStats}. W39 SIM-005: the per-provider
+// deterministic mocks are an explicit DEV OPT-IN (SOCIAL_MOCK=1 master
+// switch, or per-provider META_MOCK/TIKTOK_MOCK/X_MOCK — all default OFF;
+// see the provider package doc), returning deterministic sandbox ids
+// (mock-post-*/mock-ad-*) and plausible stats. Without the opt-in the
+// real-API seam is an honest stub posture (same as W16 APNs) that fails
+// closed with "not configured": the credential-follow-up runbook lives in
+// docs/apps/social-publisher.md.
 //
-// Metering: one social_ad_launched usage record per successful launch
-// (opendesk.usage.events; the shared W19/W20 metering idiom). Events:
+// Metering: one social_ad_launched usage record per successful launch on
+// a REAL provider rail (opendesk.usage.events; the shared W19/W20
+// metering idiom) — simulated/mock launches are NOT metered as real
+// usage (W39 SIM-006). Events:
 // topic opendesk.social.events.v1 — com.opendesk.social.PostPublished /
 // AdLaunched / AdRejected; payloads carry ids + metadata, NEVER the
 // creative body.
@@ -56,11 +60,12 @@
 //	USAGE_EVENTS_TOPIC  — shared usage-metering topic
 //	    (default opendesk.usage.events; empty disables social_ad_launched
 //	    metering)
-//	SOCIAL_MOCK         — master provider mock switch (default "1";
-//	    SOCIAL_MOCK=0 lets per-provider switches decide)
+//	SOCIAL_MOCK         — master provider mock switch (default "0";
+//	    truthy opts into the dev simulation)
 //	META_MOCK / TIKTOK_MOCK / X_MOCK — per-provider mock switches
-//	    (each default "1"; "0" selects the honest real-API stub which
-//	    answers "not configured" until credentials land — follow-up)
+//	    (each default "0"; truthy opts that provider into the mock,
+//	    otherwise the honest real-API stub answers "not configured"
+//	    until credentials land — follow-up)
 //	DATABASE_URL        — DialStore fallback pool (same idiom as W16 devices)
 //
 // Permissions (integrator wires; recommended shape composed from httpapi's
