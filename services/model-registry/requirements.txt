@@ -12,3 +12,5 @@ prometheus-client==0.21.1
 # tests
 httpx==0.27.2
 pytest==8.3.4
+# Embedded Postgres 16 for the RLS/migration test harness (tests/conftest.py).
+pgserver==0.1.4

@@ -73,8 +73,16 @@ class AgentStore:
         """Idempotent bootstrap for existing deployments (the init script
         07-agents-capture-schema.sql is authoritative on fresh installs;
         this mirrors the ensure_intel_columns pattern so upgrades to an
-        already-initialized database get the tables too). RLS policies and
-        grants stay with the init script. Safe on every startup."""
+        already-initialized database get the tables too).
+
+        SQL-001: the bootstrap ALSO ensures FORCE ROW LEVEL SECURITY +
+        tenant_isolation policies + app_conversation GRANTs (verbatim from
+        07-agents-capture-schema.sql) — previously a database bootstrapped
+        ONLY by this method had the tables without any RLS, so the
+        app.tenant_id GUC was set but never enforced. Policies/grants are
+        guarded by pg_policies/pg_roles existence checks; tenant_slugs is
+        deliberately NOT RLS-scoped (resolve runs cross-tenant by design).
+        Safe on every startup."""
         ddl = [
             """
             CREATE TABLE IF NOT EXISTS agents (
@@ -151,6 +159,78 @@ class AgentStore:
                 slug       TEXT NOT NULL UNIQUE,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
+            """,
+            # -------- Row Level Security (SQL-001; verbatim policy shape from
+            # infra/postgres/init-scripts/07-agents-capture-schema.sql) ------
+            # tenant_slugs stays policy-free: /v1/agents/resolve is
+            # cross-tenant by design (see the comment above its CREATE).
+            """
+            ALTER TABLE agents ENABLE ROW LEVEL SECURITY
+            """,
+            """
+            ALTER TABLE agents FORCE ROW LEVEL SECURITY
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT FROM pg_policies
+                               WHERE schemaname = 'public' AND tablename = 'agents'
+                                 AND policyname = 'tenant_isolation') THEN
+                    CREATE POLICY tenant_isolation ON agents
+                        USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+                END IF;
+            END
+            $$
+            """,
+            """
+            ALTER TABLE capture_schemas ENABLE ROW LEVEL SECURITY
+            """,
+            """
+            ALTER TABLE capture_schemas FORCE ROW LEVEL SECURITY
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT FROM pg_policies
+                               WHERE schemaname = 'public' AND tablename = 'capture_schemas'
+                                 AND policyname = 'tenant_isolation') THEN
+                    CREATE POLICY tenant_isolation ON capture_schemas
+                        USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+                END IF;
+            END
+            $$
+            """,
+            """
+            ALTER TABLE capture_records ENABLE ROW LEVEL SECURITY
+            """,
+            """
+            ALTER TABLE capture_records FORCE ROW LEVEL SECURITY
+            """,
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT FROM pg_policies
+                               WHERE schemaname = 'public' AND tablename = 'capture_records'
+                                 AND policyname = 'tenant_isolation') THEN
+                    CREATE POLICY tenant_isolation ON capture_records
+                        USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+                END IF;
+            END
+            $$
+            """,
+            # Grants to the conversation service role (created by
+            # 05-app-roles.sql on fresh installs). Guarded so the bootstrap
+            # also works when the role is absent (e.g. embedded test Postgres).
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_conversation') THEN
+                    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agents TO app_conversation';
+                    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.capture_schemas TO app_conversation';
+                    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.capture_records TO app_conversation';
+                END IF;
+            END
+            $$
             """,
         ]
         async with self._db._pool_acquire() as conn:

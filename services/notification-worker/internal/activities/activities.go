@@ -63,7 +63,7 @@ type Activities struct {
 	Push PushDeps
 	// WhatsApp holds the WhatsApp campaign provider (SPEC-W21 Agent A);
 	// set by main after New. A nil Provider falls back to the env-derived
-	// provider at send time (WHATSAPP_MOCK=1 default — see
+	// provider at send time (WHATSAPP_MOCK default OFF, SIM-011 — see
 	// activities/whatsapp.go).
 	WhatsApp WhatsAppDeps
 	// Channels resolves the messaging provider per channel + tenant
@@ -77,8 +77,8 @@ type Activities struct {
 	// Ops holds the SPEC-W34 GF16 ops-alert dependencies (saga compensation
 	// exhaustion alerts); set by main after New. Zero value degrades to
 	// CRITICAL-log-only alerting.
-	Ops  OpsAlertDeps
-	Log  *zap.Logger
+	Ops OpsAlertDeps
+	Log *zap.Logger
 
 	hc *http.Client
 }
