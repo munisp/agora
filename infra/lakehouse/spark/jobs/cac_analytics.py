@@ -351,7 +351,7 @@ def read_funnel_events(spark) -> "DataFrame":
     """
     try:
         df = spark.table(EVENTS_TABLE)
-    except Exception as exc:  # bronze sink for cac.events not landed yet — TODO producer
+    except Exception as exc:  # bronze.cac_events producer LANDED (SPEC-W33 §2 A2 analytics-pipeline sink); table may simply not exist yet on a fresh lakehouse
         print(f"[cac] WARNING: funnel events table unreadable at "
               f"{EVENTS_TABLE} ({exc.__class__.__name__}); using empty input")
         return spark.createDataFrame([], EVENTS_SCHEMA)
