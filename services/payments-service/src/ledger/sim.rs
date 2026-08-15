@@ -194,6 +194,9 @@ impl SimLedgerClient {
         self.state.lock().await.clone()
     }
 
+    /// Transfer constructor; the nine fields mirror the TigerBeetle transfer
+    /// record 1:1, so a params struct would only obscure the mapping.
+    #[allow(clippy::too_many_arguments)]
     fn new_transfer(
         &self,
         id: Uuid,

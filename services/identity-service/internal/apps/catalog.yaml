@@ -79,7 +79,9 @@ apps:
     description: Consent-gated BVN/NIN identity resolution and compliance audit trail for regulated onboarding.
     category: Compliance
     icon: "\U0001FAAA"
-    nav_route: /apps/kyc-compliance
+    # TS-004: dead nav_route (/apps/kyc-compliance) removed — no such page
+    # exists under apps/admin-web/app; the app is managed from the /apps
+    # grid until its dedicated portal section lands (see backend_note).
     required_perms: [manage_bookings]
     default_plan_tier: standard
     backend_note: services/kyc-service (:7013) shipped in W12; dedicated portal section lands W19 — until then managed from the apps grid (docs/kyc.md).
@@ -101,7 +103,9 @@ apps:
     description: Incident data packets, signed dispatch endpoints, IoT webhook ingest and the voice emergency lane.
     category: Operations
     icon: "\U0001F6A8"
-    nav_route: /apps/incidents
+    # TS-004: dead nav_route (/apps/incidents) removed — no such page exists
+    # under apps/admin-web/app; managed from the /apps grid until the portal
+    # section lands (see backend_note).
     required_perms: [manage_bookings]
     default_plan_tier: pro
     backend_note: services/booking-service/internal/httpapi/incidents.go + IoT ingest (W11, docs/incidents.md); portal section lands W19.
