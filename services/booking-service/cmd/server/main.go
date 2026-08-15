@@ -180,34 +180,44 @@ func run() error {
 		// COMMISSIONS_ENABLED != true or the dial failed).
 		// Ledger: Agent A's Postgres impl (reconciled after A landed).
 		if payoutStore != nil {
-			provider := referrals.ProviderFromEnv()
-			payoutActs := &referrals.PayoutActivities{
-				Store:      payoutStore,
-				Ledger:     referrals.NewPostgresLedger(st), // Agent A's Postgres Ledger (SPEC-W14 reconciled)
-				Provider:   provider,
-				MinKobo:    referrals.MinPayoutFromEnv(),
-				UsageTopic: cfg.UsageEventsTopic,
-				Logger:     logger,
-			}
-			reconActs := &referrals.ReconActivities{
-				Store:              payoutStore,
-				Provider:           provider,
-				UsageTopic:         cfg.UsageEventsTopic,
-				NotificationsTopic: cfg.NotificationsTopic,
-				Logger:             logger,
-			}
-			w.RegisterWorkflowWithOptions(referrals.CommissionPayoutWorkflow, workflow.RegisterOptions{Name: referrals.WorkflowTypePayout})
-			w.RegisterWorkflowWithOptions(referrals.CommissionReconWorkflow, workflow.RegisterOptions{Name: referrals.WorkflowTypeRecon})
-			w.RegisterActivityWithOptions(payoutActs.ExecuteTransfer, activity.RegisterOptions{Name: referrals.ActivityPayoutTransfer})
-			w.RegisterActivityWithOptions(payoutActs.FinalizePaid, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkPaid})
-			w.RegisterActivityWithOptions(payoutActs.MarkFailed, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkFailed})
-			w.RegisterActivityWithOptions(reconActs.FetchCandidates, activity.RegisterOptions{Name: referrals.ActivityReconFetch})
-			w.RegisterActivityWithOptions(reconActs.CheckTransfer, activity.RegisterOptions{Name: referrals.ActivityReconCheck})
-			if err := tc.EnsureCommissionReconSchedule(ctx, os.Getenv("RECON_CRON")); err != nil {
-				logger.Error("commission recon schedule bootstrap failed", zap.Error(err))
+			// W39 SIM-002: the payout provider fails closed — PAYOUT_MOCK
+			// defaults OFF; without a real rail (PAYOUT_PROVIDER_BASE_URL /
+			// PAYOUT_PROVIDER_SECRET) the payout + recon workflows are NOT
+			// registered (no payout may be marked sent without a real
+			// rail) instead of silently simulating money movement.
+			provider, providerErr := referrals.ProviderFromEnv()
+			if providerErr != nil {
+				logger.Error("payout provider not configured; commission payout + recon workflows disabled (set PAYOUT_PROVIDER_BASE_URL/PAYOUT_PROVIDER_SECRET, or PAYOUT_MOCK=1 for the dev simulation)",
+					zap.Error(providerErr))
 			} else {
-				logger.Info("commission recon schedule ensured",
-					zap.String("schedule_id", referrals.ReconScheduleID), zap.String("provider", provider.Name()))
+				payoutActs := &referrals.PayoutActivities{
+					Store:      payoutStore,
+					Ledger:     referrals.NewPostgresLedger(st), // Agent A's Postgres Ledger (SPEC-W14 reconciled)
+					Provider:   provider,
+					MinKobo:    referrals.MinPayoutFromEnv(),
+					UsageTopic: cfg.UsageEventsTopic,
+					Logger:     logger,
+				}
+				reconActs := &referrals.ReconActivities{
+					Store:              payoutStore,
+					Provider:           provider,
+					UsageTopic:         cfg.UsageEventsTopic,
+					NotificationsTopic: cfg.NotificationsTopic,
+					Logger:             logger,
+				}
+				w.RegisterWorkflowWithOptions(referrals.CommissionPayoutWorkflow, workflow.RegisterOptions{Name: referrals.WorkflowTypePayout})
+				w.RegisterWorkflowWithOptions(referrals.CommissionReconWorkflow, workflow.RegisterOptions{Name: referrals.WorkflowTypeRecon})
+				w.RegisterActivityWithOptions(payoutActs.ExecuteTransfer, activity.RegisterOptions{Name: referrals.ActivityPayoutTransfer})
+				w.RegisterActivityWithOptions(payoutActs.FinalizePaid, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkPaid})
+				w.RegisterActivityWithOptions(payoutActs.MarkFailed, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkFailed})
+				w.RegisterActivityWithOptions(reconActs.FetchCandidates, activity.RegisterOptions{Name: referrals.ActivityReconFetch})
+				w.RegisterActivityWithOptions(reconActs.CheckTransfer, activity.RegisterOptions{Name: referrals.ActivityReconCheck})
+				if err := tc.EnsureCommissionReconSchedule(ctx, os.Getenv("RECON_CRON")); err != nil {
+					logger.Error("commission recon schedule bootstrap failed", zap.Error(err))
+				} else {
+					logger.Info("commission recon schedule ensured",
+						zap.String("schedule_id", referrals.ReconScheduleID), zap.String("provider", provider.Name()))
+				}
 			}
 		}
 		// SPEC-W14 Agent B — END
@@ -420,6 +430,10 @@ func run() error {
 			EventsTopic: cfg.LendingEventsTopic,
 			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W20 Agent C: metering rides USAGE_EVENTS_TOPIC
 			KYCURL:      cfg.LendingKYCURL,    // empty = override-only approval mode (documented in docs/apps/lending.md)
+			// W39 SIM-001: the live rail is "configured" only when the TB
+			// bridge URL is set; otherwise Disburse fails closed unless
+			// ALLOW_MOCK_RAILS=1 opts into the simulation.
+			RealRailConfigured: os.Getenv(consumer.EnvLendingTBBridgeURL) != "",
 		}
 	}
 	var workforceDeps *workforce.Deps
@@ -526,29 +540,36 @@ func run() error {
 
 		// SPEC-W24 Agent B (WS-B2) — BEGIN (additive): lending
 		// DisbursementIntent → TigerBeetle rail consumer (group
-		// booking-lending-disbursements) on LENDING_EVENTS_TOPIC. The rail
-		// follows the payments ledger's mock posture: LENDING_TB_BRIDGE_URL
-		// empty → deterministic mock (no money movement); set it to the
-		// payments-service Dapr invoke gateway for live TB transfers.
-		// Exactly-once under redelivery via the deterministic transfer ID
-		// (anchor: intent ref_id = application id). Skipped when lending
-		// events are disabled (empty topic).
+		// booking-lending-disbursements) on LENDING_EVENTS_TOPIC. Rail
+		// posture (W39 SIM-001, fail closed): LENDING_TB_BRIDGE_URL selects
+		// the live payments-service bridge; ALLOW_MOCK_RAILS=1 opts into
+		// the deterministic mock (no money movement, dev only); with
+		// neither configured the consumer is NOT started (intents stay
+		// unconsumed for the operator to wire the rail — never silently
+		// simulated). Exactly-once under redelivery via the deterministic
+		// transfer ID (anchor: intent ref_id = application id). Skipped
+		// when lending events are disabled (empty topic).
 		if cfg.LendingEventsTopic != "" {
 			lendingGroup := os.Getenv("LENDING_DISBURSEMENTS_GROUP")
 			if lendingGroup == "" {
 				lendingGroup = consumer.DefaultLendingDisbursementsGroup
 			}
-			lendingRail := consumer.RailFromEnv(logger)
-			lendingConsumer := consumer.NewLendingDisbursements(cfg.KafkaBrokers, cfg.LendingEventsTopic, lendingGroup, cfg.DLQTopic, lendingRail, logger)
-			go func() {
-				if err := lendingConsumer.Run(ctx); err != nil && ctx.Err() == nil {
-					logger.Error("lending disbursement consumer exited", zap.Error(err))
-				}
-			}()
-			defer lendingConsumer.Close() //nolint:errcheck
-			logger.Info("lending disbursement consumer started",
-				zap.String("topic", cfg.LendingEventsTopic), zap.String("group", lendingGroup),
-				zap.String("rail", lendingRail.Name()))
+			lendingRail, railErr := consumer.RailFromEnv(logger)
+			if railErr != nil {
+				logger.Error("lending disbursement rail not configured; consumer NOT started (fail closed)",
+					zap.Error(railErr), zap.String("topic", cfg.LendingEventsTopic))
+			} else {
+				lendingConsumer := consumer.NewLendingDisbursements(cfg.KafkaBrokers, cfg.LendingEventsTopic, lendingGroup, cfg.DLQTopic, lendingRail, logger)
+				go func() {
+					if err := lendingConsumer.Run(ctx); err != nil && ctx.Err() == nil {
+						logger.Error("lending disbursement consumer exited", zap.Error(err))
+					}
+				}()
+				defer lendingConsumer.Close() //nolint:errcheck
+				logger.Info("lending disbursement consumer started",
+					zap.String("topic", cfg.LendingEventsTopic), zap.String("group", lendingGroup),
+					zap.String("rail", lendingRail.Name()))
+			}
 		}
 		// SPEC-W24 Agent B (WS-B2) — END
 	}

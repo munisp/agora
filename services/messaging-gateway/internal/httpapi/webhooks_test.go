@@ -2,6 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -42,17 +45,29 @@ func (f *fakeBridge) captured() []bridgeCall {
 	return out
 }
 
+// waTestAppSecret is the WHATSAPP_APP_SECRET the test servers run with; the
+// WhatsApp POST tests sign their payloads with it (SIM-007/SIM-008).
+const waTestAppSecret = "test-app-secret"
+
 func newWebhookServer(fb Bridger) *Server {
 	return &Server{
 		WhatsApp:              &provider.WhatsApp{},
 		Telegram:              &provider.Telegram{},
 		Bridge:                fb,
 		WhatsAppVerifyToken:   "verify-me",
+		WhatsAppAppSecret:     waTestAppSecret,
 		TelegramBotUsername:   "opendesk_bot",
 		TelegramWebhookSecret: "s3cret",
 		Metrics:               metrics.New(),
 		Log:                   zap.NewNop(),
 	}
+}
+
+// waSignedHeaders computes the Meta X-Hub-Signature-256 header for a body.
+func waSignedHeaders(secret, body string) map[string]string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(body))
+	return map[string]string{"X-Hub-Signature-256": "sha256=" + hex.EncodeToString(mac.Sum(nil))}
 }
 
 func do(t *testing.T, h http.Handler, method, target, body string, hdrs map[string]string) *httptest.ResponseRecorder {
@@ -115,7 +130,7 @@ const waTextPayload = `{
 func TestWhatsAppTextIngestion(t *testing.T) {
 	fb := &fakeBridge{}
 	s := newWebhookServer(fb)
-	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", waTextPayload, nil)
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", waTextPayload, waSignedHeaders(waTestAppSecret, waTextPayload))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
@@ -145,7 +160,7 @@ func TestWhatsAppStatusesIgnored(t *testing.T) {
 		"metadata":{"phone_number_id":"10987654321"},
 		"statuses":[{"id":"wamid.HBgLM","status":"delivered","timestamp":"1733000001"}]
 	}}]}]}`
-	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", payload, nil)
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", payload, waSignedHeaders(waTestAppSecret, payload))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
@@ -161,12 +176,67 @@ func TestWhatsAppNonTextIgnored(t *testing.T) {
 		"metadata":{"phone_number_id":"10987654321"},
 		"messages":[{"from":"2348012345678","id":"wamid.Img","timestamp":"1733000000","type":"image","image":{"id":"img1"}}]
 	}}]}]}`
-	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", payload, nil)
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", payload, waSignedHeaders(waTestAppSecret, payload))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 	if n := len(fb.captured()); n != 0 {
 		t.Fatalf("non-text messages must not reach the bridge, got %d calls", n)
+	}
+}
+
+// --- WhatsApp signature enforcement (SIM-007/SIM-008, fail-closed) ---
+
+// A missing or invalid X-Hub-Signature-256 must be rejected with 401 and
+// NOTHING reaches the bridge.
+func TestWhatsAppSignatureMissingOrInvalidRejected(t *testing.T) {
+	fb := &fakeBridge{}
+	s := newWebhookServer(fb)
+	for _, hdrs := range []map[string]string{
+		nil, // missing header
+		{"X-Hub-Signature-256": "sha256=deadbeef"},          // wrong HMAC
+		{"X-Hub-Signature-256": "deadbeef"},                 // missing sha256= prefix
+		waSignedHeaders("wrong-secret", waTextPayload),      // wrong secret
+		waSignedHeaders(waTestAppSecret, waTextPayload+" "), // signed a different body
+	} {
+		rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", waTextPayload, hdrs)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("headers %v: expected 401, got %d (%s)", hdrs, rec.Code, rec.Body.String())
+		}
+	}
+	if n := len(fb.captured()); n != 0 {
+		t.Fatalf("rejected posts must not reach the bridge, got %d calls", n)
+	}
+}
+
+// Fail-closed at the config layer too: with no WHATSAPP_APP_SECRET and no
+// mock opt-in, even a well-formed post is 401.
+func TestWhatsAppSignatureFailClosedWithoutAppSecret(t *testing.T) {
+	fb := &fakeBridge{}
+	s := newWebhookServer(fb)
+	s.WhatsAppAppSecret = ""
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", waTextPayload,
+		waSignedHeaders(waTestAppSecret, waTextPayload))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if n := len(fb.captured()); n != 0 {
+		t.Fatalf("unconfigured signature verification must not process, got %d calls", n)
+	}
+}
+
+// The unsigned bypass exists ONLY behind the explicit WHATSAPP_MOCK=1
+// dev/test opt-in (Server.WhatsAppMock).
+func TestWhatsAppSignatureMockBypassOptIn(t *testing.T) {
+	fb := &fakeBridge{}
+	s := newWebhookServer(fb)
+	s.WhatsAppMock = true
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", waTextPayload, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("WHATSAPP_MOCK=1 must accept unsigned posts, got %d", rec.Code)
+	}
+	if n := len(fb.captured()); n != 1 {
+		t.Fatalf("mock bypass must still process the payload, got %d calls", n)
 	}
 }
 
