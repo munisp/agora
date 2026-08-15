@@ -30,7 +30,7 @@ func newTestFCM(t *testing.T, cfg FCMConfig) *FCM {
 }
 
 // ---------------------------------------------------------------------------
-// FCM_MOCK=1 default: deterministic, no network
+// FCM_MOCK=1 opt-in (default OFF, SIM-010): deterministic, no network
 // ---------------------------------------------------------------------------
 
 func TestFCMMockDefaultDeterministic(t *testing.T) {
@@ -87,15 +87,15 @@ func TestFCMUnconfiguredLive(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type capturedRequest struct {
-	path   string
-	auth   string
-	body   []byte
+	path string
+	auth string
+	body []byte
 }
 
 // fakeFCMServer records requests and serves scripted status codes per call.
 type fakeFCMServer struct {
-	srv *httptest.Server
-	mu  sync.Mutex
+	srv  *httptest.Server
+	mu   sync.Mutex
 	reqs []capturedRequest
 	// statuses are served in order; the last one repeats.
 	statuses []int
@@ -187,7 +187,7 @@ func testServiceAccountJSON(t *testing.T, tokenURI string) string {
 	require.NoError(t, err)
 	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 	sa := map[string]string{
-		"project_id":  "proj-1",
+		"project_id":   "proj-1",
 		"client_email": "fcm@proj-1.iam.gserviceaccount.com",
 		"private_key":  pemKey,
 		"token_uri":    tokenURI,
