@@ -40,13 +40,31 @@ function cfg() {
 }
 function saveCfg(c) { lsSet(LS.cfg, JSON.stringify(c)); syncMeta(); }
 
+/* Token storage posture (TS-003, mission-critical assurance): bearer and
+ * refresh tokens live ONLY in this in-memory variable, mirrored into
+ * sessionStorage so a page reload within the same tab session stays signed
+ * in. They are NEVER written to localStorage or IndexedDB — both survive
+ * logout and device loss/theft on shared field devices. Closing the tab
+ * ends the session; logout clears everything immediately. IndexedDB keeps
+ * only non-secret app data (the offline outbox and the slug/cfg/mode
+ * context mirror below). */
+var memTokens = null;
 function tokens() {
-  try { return JSON.parse(lsGet(LS.tokens) || "null"); } catch (e) { return null; }
+  if (memTokens) return memTokens;
+  try { memTokens = JSON.parse(sessionStorage.getItem(LS.tokens) || "null"); } catch (e) { memTokens = null; }
+  return memTokens;
 }
 function saveTokens(t) {
-  if (t) lsSet(LS.tokens, JSON.stringify(t)); else lsDel(LS.tokens);
+  memTokens = t || null;
+  try {
+    if (t) sessionStorage.setItem(LS.tokens, JSON.stringify(t)); else sessionStorage.removeItem(LS.tokens);
+  } catch (e) {}
   syncMeta();
 }
+/* One-time migration scrub: purge any token copy persisted by pre-TS-003
+ * builds in localStorage (and the IDB meta mirror is overwritten without
+ * tokens by syncMeta() on boot). */
+lsDel(LS.tokens);
 function mode() { return lsGet(LS.mode); }
 function setMode(m) { if (m) lsSet(LS.mode, m); else lsDel(LS.mode); renderMode(); }
 
@@ -99,12 +117,16 @@ function outboxDel(id) {
   });
 }
 
-/* Mirror auth/config into IDB so the service worker can flush during a
- * Background Sync event when no page is open. */
+/* Mirror NON-SECRET context (tenant slug, endpoints config, mode) into IDB
+ * so the service worker knows the outbox target. Tokens are deliberately
+ * NOT mirrored (TS-003 posture above): the SW cannot attach Authorization
+ * on its own, so on a Background Sync event it asks an open page to run
+ * the authenticated flush; with no page open the outbox stays queued
+ * (durable, non-secret) until the next page load flushes it. */
 function syncMeta() {
   openDb().then(function (db) {
     return tx(db, "meta", "readwrite", function (s) {
-      s.put({ k: "ctx", slug: lsGet(LS.slug), cfg: cfg(), tokens: tokens(), mode: mode() });
+      s.put({ k: "ctx", slug: lsGet(LS.slug), cfg: cfg(), mode: mode() });
     });
   }).catch(function () {});
 }
@@ -445,11 +467,15 @@ function boot() {
     navigator.serviceWorker.register("sw.js").catch(function () {});
     navigator.serviceWorker.addEventListener("message", function (ev) {
       if (ev.data === "flushed") renderOutbox();
+      // Background Sync fired: the SW holds no tokens (TS-003), so the
+      // authenticated flush runs here in the page session.
+      if (ev.data === "flush") flush();
     });
   }
 
   handleCallback().then(function () {
     if (mode() === "live" && !tokens()) setMode("demo");
+    syncMeta(); // rewrites the IDB ctx mirror token-free (TS-003 scrub)
     render();
     flush();
   });

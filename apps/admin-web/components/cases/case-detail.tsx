@@ -353,7 +353,7 @@ export function CaseDetail({
                     className="font-mono text-xs underline underline-offset-2"
                     href={`https://www.openstreetmap.org/?mlat=${c.lat}&mlon=${c.lon}#map=16/${c.lat}/${c.lon}`}
                     target="_blank"
-                    rel="noreferrer"
+                    rel="noreferrer noopener"
                   >
                     {c.lat.toFixed(5)}, {c.lon.toFixed(5)}
                   </a>
@@ -390,7 +390,7 @@ export function CaseDetail({
                   className="text-xs underline underline-offset-2"
                   href={c.photo_url}
                   target="_blank"
-                  rel="noreferrer"
+                  rel="noreferrer noopener"
                 >
                   View attachment
                 </a>
