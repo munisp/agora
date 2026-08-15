@@ -290,11 +290,17 @@ func run() error {
 		zap.String("quiet_hours_default", quietHours.DefaultWindow),
 		zap.Int("quiet_hours_overrides", len(quietOverrides)))
 
-	// SPEC-W16 §1: push notification providers. FCM_MOCK=1 (default) is a
-	// deterministic no-network mock; FCM_CREDENTIALS_JSON selects HTTP v1,
-	// FCM_SERVER_KEY the legacy API. APNs is a documented STUB (interface +
-	// config only): iOS tokens surface honest "not implemented" per-token
-	// failures until the provider/apns.go TODO lands.
+	// SPEC-W16 §1: push notification providers. FCM_MOCK defaults OFF
+	// (SIM-010, KYC_MOCK idiom): FCM_CREDENTIALS_JSON selects HTTP v1,
+	// FCM_SERVER_KEY the legacy API, and with neither configured sends fail
+	// closed with an explicit error — nothing is silently simulated. The
+	// deterministic no-network mock is an explicit dev/test opt-in
+	// (FCM_MOCK=1). APNs is a documented STUB (interface + config only):
+	// iOS tokens surface honest "not implemented" per-token failures until
+	// the provider/apns.go TODO lands.
+	if cfg.FCMMock {
+		logger.Error("CRITICAL: MOCK FCM — NOT FOR PRODUCTION: FCM_MOCK=1 simulates push sends without a real provider; unset it and configure FCM_CREDENTIALS_JSON or FCM_SERVER_KEY for production")
+	}
 	fcm, err := provider.NewFCM(provider.FCMConfig{
 		Mock:            cfg.FCMMock,
 		ServerKey:       cfg.FCMServerKey,
@@ -326,6 +332,12 @@ func run() error {
 	audienceIntake := activities.NewAudienceIntake(daprClient, cfg.BookingAppID, tc, cfg.TemporalTaskQueue, strings.Split(cfg.KafkaBrokers, ","), logger)
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.Port),
+		// GO-001: bound header/body reads (Slowloris) — ReadHeaderTimeout
+		// mirrors the messaging-gateway (5s) / kyc-service (10s) precedent;
+		// IdleTimeout reaps idle keep-alive connections.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 		Handler: httpapi.NewRouter(&httpapi.Server{
 			Temporal:  tc,
 			TaskQueue: cfg.TemporalTaskQueue,

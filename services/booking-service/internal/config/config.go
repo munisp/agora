@@ -104,13 +104,14 @@ type Config struct {
 	// Social Publisher app (SPEC-W21 Agent B; integrator-wired). Metering
 	// (social_ad_launched) rides UsageEventsTopic — same posture as
 	// lending. The mock switches are strings (not bools) so the provider
-	// package's MockEnabled can apply its "both falsy → real stub" rule;
-	// every provider defaults to the deterministic mock (no network).
+	// package's MockEnabled can apply its "explicit truthy → mock" rule;
+	// W39 SIM-005: every mock switch defaults OFF (fail closed — the
+	// honest real-API stub), the deterministic mock is a dev opt-in.
 	SocialEventsTopic string // SOCIAL_EVENTS_TOPIC (default opendesk.social.events.v1; empty disables events)
-	SocialMock        string // SOCIAL_MOCK (default "1" — master provider mock switch)
-	MetaMock          string // META_MOCK (default "1")
-	TikTokMock        string // TIKTOK_MOCK (default "1")
-	XMock             string // X_MOCK (default "1")
+	SocialMock        string // SOCIAL_MOCK (default "0" — master provider mock switch, opt-in)
+	MetaMock          string // META_MOCK (default "0")
+	TikTokMock        string // TIKTOK_MOCK (default "0")
+	XMock             string // X_MOCK (default "0")
 }
 
 // Load reads configuration from the environment.
@@ -195,15 +196,16 @@ func Load() (Config, error) {
 		LendingEventsTopic:        envStr("LENDING_EVENTS_TOPIC", "opendesk.lending.events.v1"),
 		LendingKYCURL:             os.Getenv("LENDING_KYC_URL"),
 		WorkforceEventsTopic:      envStr("WORKFORCE_EVENTS_TOPIC", "opendesk.workforce.events.v1"),
-		// SPEC-W21 integrator (additive): social-publisher — functional
-		// with zero config; the events default matches the package doc
-		// contract (empty disables emission) and every provider defaults
-		// to the deterministic mock (both switches truthy).
+		// SPEC-W21 integrator (additive): social-publisher — the events
+		// default matches the package doc contract (empty disables
+		// emission). W39 SIM-005: every provider mock switch defaults OFF
+		// (fail closed — the honest real-API stub answers "not
+		// configured"); the deterministic mock is an explicit dev opt-in.
 		SocialEventsTopic: envStr("SOCIAL_EVENTS_TOPIC", "opendesk.social.events.v1"),
-		SocialMock:        envStr("SOCIAL_MOCK", "1"),
-		MetaMock:          envStr("META_MOCK", "1"),
-		TikTokMock:        envStr("TIKTOK_MOCK", "1"),
-		XMock:             envStr("X_MOCK", "1"),
+		SocialMock:        envStr("SOCIAL_MOCK", "0"),
+		MetaMock:          envStr("META_MOCK", "0"),
+		TikTokMock:        envStr("TIKTOK_MOCK", "0"),
+		XMock:             envStr("X_MOCK", "0"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
