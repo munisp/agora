@@ -11,17 +11,19 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/bookingops"
+	"github.com/opendesk/booking-service/internal/socialpub/provider"
 )
 
 // Handler tests boot the same embedded-Postgres harness as the store tests
 // and exercise the real HTTP request/response cycle through RegisterRoutes
 // (the anti-collision contract entry point) with a test tenant accessor —
 // httpapi wiring itself is the integrator's gate. Providers are the
-// package-default deterministic mocks (Deps.Publishers nil — the
-// zero-config SOCIAL_MOCK posture).
+// deterministic mocks via the explicit SOCIAL_MOCK=1 opt-in (W39 SIM-005:
+// the mock is no longer the silent default, so tests opt in explicitly).
 
 func testRouter(t *testing.T, tenant bookingops.TenantInfo) (http.Handler, *Store) {
 	t.Helper()
+	t.Setenv("SOCIAL_MOCK", "1") // explicit mock opt-in (dev/test posture)
 	st := newTestStore(t)
 	r := chi.NewRouter()
 	RegisterRoutes(r, &Deps{
@@ -264,7 +266,8 @@ func TestLaunchGates(t *testing.T) {
 	}
 
 	// 3) authorized + creative disclaimer → 200, status review, mock-ad-*
-	// provider id, AdLaunched event + social_ad_launched metering.
+	// provider id, AdLaunched event. W39 SIM-006: a MOCK launch is NOT
+	// metered as real usage (no social_ad_launched usage row).
 	ad3 := createAdAPI(t, r, auth.ID, crDisc.ID, "GOTV 3", true, "")
 	rec = do(t, r, http.MethodPost, "/v1/social/ads/"+ad3.ID.String()+"/launch", "")
 	if rec.Code != http.StatusOK {
@@ -281,13 +284,13 @@ func TestLaunchGates(t *testing.T) {
 	if len(types) != 1 || types[0] != EventTypeAdLaunched {
 		t.Fatalf("events = %v, want [AdLaunched]", types)
 	}
-	var metric string
+	var usageRows int
 	if err := st.pool.QueryRow(context.Background(),
-		`SELECT payload->'data'->>'metric' FROM outbox WHERE topic='opendesk.usage.events'`).Scan(&metric); err != nil {
-		t.Fatalf("usage metering row missing: %v", err)
+		`SELECT count(*) FROM outbox WHERE topic='opendesk.usage.events'`).Scan(&usageRows); err != nil {
+		t.Fatalf("count usage rows: %v", err)
 	}
-	if metric != UsageMetricAdLaunched {
-		t.Fatalf("usage metric = %s, want %s", metric, UsageMetricAdLaunched)
+	if usageRows != 0 {
+		t.Fatalf("mock launch must NOT be metered as real usage, found %d rows", usageRows)
 	}
 
 	// 4) launch on an EXPIRED account → 409.
@@ -482,5 +485,113 @@ func TestTenantContextRequired(t *testing.T) {
 	rec := do(t, r, http.MethodGet, "/v1/social/accounts", "")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("no tenant = %d, want 400", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W39 SIM-005 / SIM-006 regressions
+// ---------------------------------------------------------------------------
+
+// fakeRealPublisher is a NON-mock Publisher test double (a "real rail"
+// that succeeds): metering must count its launches as real usage.
+type fakeRealPublisher struct{}
+
+func (fakeRealPublisher) Name() string { return "meta" }
+func (fakeRealPublisher) PublishPost(_ context.Context, _ provider.PostRequest) (string, error) {
+	return "real-post-1", nil
+}
+func (fakeRealPublisher) LaunchAd(_ context.Context, _ provider.AdRequest) (string, bool, string, error) {
+	return "real-ad-1", false, "", nil
+}
+func (fakeRealPublisher) AdStats(_ context.Context, _ string) (provider.Stats, error) {
+	return provider.Stats{Impressions: 1}, nil
+}
+
+// W39 SIM-005: with NO mock opt-in (SOCIAL_MOCK off) and no wired
+// publisher, publish fails closed — 502 "not configured", the post is NOT
+// marked published, and NO PostPublished event is emitted.
+func TestPublishFailsClosedWithoutMockOptIn(t *testing.T) {
+	t.Setenv("SOCIAL_MOCK", "")
+	t.Setenv("META_MOCK", "")
+	tenant := bookingops.TenantInfo{ID: uuid.New(), Slug: "acme"}
+	st := newTestStore(t)
+	r := chi.NewRouter()
+	RegisterRoutes(r, &Deps{
+		Store: st,
+		TenantFromContext: func(ctx context.Context) (bookingops.TenantInfo, bool) {
+			return tenant, true
+		},
+		EventsTopic: "opendesk.social.events.v1",
+		UsageTopic:  "opendesk.usage.events",
+	})
+
+	acct := createAccountAPI(t, r, ProviderMeta, false)
+	cr := createCreativeAPI(t, r, "")
+	rec := do(t, r, http.MethodPost, "/v1/social/posts",
+		`{"account_id":"`+acct.ID.String()+`","creative_id":"`+cr.ID.String()+`"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create post = %d (%s)", rec.Code, rec.Body.String())
+	}
+	post := decodeEnv[struct {
+		Post Post `json:"post"`
+	}](t, rec).Post
+
+	rec = do(t, r, http.MethodPost, "/v1/social/posts/"+post.ID.String()+"/publish", "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("fail-closed publish = %d (%s), want 502", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "not configured") {
+		t.Fatalf("error must name the missing configuration: %s", rec.Body.String())
+	}
+
+	// No fake success: the post is not published, no event emitted.
+	rec = do(t, r, http.MethodGet, "/v1/social/posts/"+post.ID.String(), "")
+	got := decodeEnv[struct {
+		Post Post `json:"post"`
+	}](t, rec).Post
+	if got.Status == PostPublished || got.ProviderPostID != nil {
+		t.Fatalf("post must not be marked published on the fail-closed rail: %+v", got)
+	}
+	if types := outboxTypes(t, st, "opendesk.social.events.v1"); len(types) != 0 {
+		t.Fatalf("no events may be emitted on the fail-closed rail, got %v", types)
+	}
+}
+
+// W39 SIM-006: a launch through a REAL (non-mock) provider rail IS
+// metered exactly once as social_ad_launched.
+func TestLaunchMetersRealProviderRail(t *testing.T) {
+	tenant := bookingops.TenantInfo{ID: uuid.New(), Slug: "acme"}
+	st := newTestStore(t)
+	r := chi.NewRouter()
+	RegisterRoutes(r, &Deps{
+		Store: st,
+		TenantFromContext: func(ctx context.Context) (bookingops.TenantInfo, bool) {
+			return tenant, true
+		},
+		EventsTopic: "opendesk.social.events.v1",
+		UsageTopic:  "opendesk.usage.events",
+		Publishers:  map[string]provider.Publisher{"meta": fakeRealPublisher{}},
+	})
+
+	acct := createAccountAPI(t, r, ProviderMeta, false)
+	cr := createCreativeAPI(t, r, "")
+	ad := createAdAPI(t, r, acct.ID, cr.ID, "Awareness", false, "")
+	rec := do(t, r, http.MethodPost, "/v1/social/ads/"+ad.ID.String()+"/launch", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("real-rail launch = %d (%s)", rec.Code, rec.Body.String())
+	}
+	launched := decodeEnv[struct {
+		Ad Ad `json:"ad"`
+	}](t, rec).Ad
+	if launched.ProviderAdID == nil || *launched.ProviderAdID != "real-ad-1" {
+		t.Fatalf("real-rail provider ad id mismatch: %+v", launched)
+	}
+	var metric string
+	if err := st.pool.QueryRow(context.Background(),
+		`SELECT payload->'data'->>'metric' FROM outbox WHERE topic='opendesk.usage.events'`).Scan(&metric); err != nil {
+		t.Fatalf("usage metering row missing for a real-rail launch: %v", err)
+	}
+	if metric != UsageMetricAdLaunched {
+		t.Fatalf("usage metric = %s, want %s", metric, UsageMetricAdLaunched)
 	}
 }

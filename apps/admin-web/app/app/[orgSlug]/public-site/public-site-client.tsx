@@ -139,7 +139,7 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
         description="Your customer-facing booking page, chat widget and voice button."
         actions={
           site?.published ? (
-            <Link href={`/p/${form.site_slug}`} target="_blank">
+            <Link href={`/p/${form.site_slug}`} target="_blank" rel="noreferrer noopener">
               <Button variant="outline" size="sm">
                 <ExternalLink className="h-3.5 w-3.5" /> Open /p/{form.site_slug}
               </Button>
