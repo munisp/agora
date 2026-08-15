@@ -162,7 +162,7 @@ export function OrgNav({
               key={item.label}
               href={item.external}
               target="_blank"
-              rel="noreferrer"
+              rel="noreferrer noopener"
               className={linkClass(false)}
             >
               <Icon className="h-4 w-4 shrink-0" />

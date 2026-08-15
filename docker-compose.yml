@@ -127,6 +127,13 @@ services:
       GEOCODE_ENABLED: ${GEOCODE_ENABLED:-false}
       GEOCODE_BASE_URL: ${GEOCODE_BASE_URL:-https://nominatim.openstreetmap.org}
       GEO_CAMPAIGN_BATCH: ${GEO_CAMPAIGN_BATCH:-50}
+      # W39 mock-rail contract — the dev stack has no payout-provider
+      # credentials, no live TigerBeetle bridge for lending, and no social
+      # API credentials, so these are opted in EXPLICITLY here. Code defaults
+      # are ALL OFF (fail-closed); production must leave them unset/0.
+      ALLOW_MOCK_RAILS: ${ALLOW_MOCK_RAILS:-1}  # DEV ONLY — mock rail (lending disbursement intents)
+      PAYOUT_MOCK: ${PAYOUT_MOCK:-1}            # DEV ONLY — mock rail (referral/commission payouts)
+      SOCIAL_MOCK: ${SOCIAL_MOCK:-1}            # DEV ONLY — mock rail (social-publisher providers)
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -194,6 +201,11 @@ services:
       DND_ENFORCEMENT: ${DND_ENFORCEMENT:-true}
       QUIET_HOURS_DEFAULT: ${QUIET_HOURS_DEFAULT:-20:00-08:00}
       QUIET_HOURS_OVERRIDES: ${QUIET_HOURS_OVERRIDES:-}
+      # W39 mock-rail contract — dev has no FCM credentials and no Meta
+      # WhatsApp app secret, so the mocks are opted in EXPLICITLY here. Code
+      # defaults are OFF (fail-closed); production must leave unset/0.
+      FCM_MOCK: ${FCM_MOCK:-1}            # DEV ONLY — mock rail (push sends logged, no network)
+      WHATSAPP_MOCK: ${WHATSAPP_MOCK:-1}  # DEV ONLY — mock rail (WhatsApp sends simulated)
     volumes:
     - ./industries:/industries:ro
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
@@ -250,6 +262,11 @@ services:
       # BOOKING_URL empty = forward via Dapr invoke app-id booking.
       INCIDENT_WEBHOOK_SECRETS: ${INCIDENT_WEBHOOK_SECRETS:-}
       BOOKING_URL: ${BOOKING_URL:-}
+      # W39 mock-rail contract — dev has no Meta app secret, so unsigned
+      # inbound WhatsApp posts are opted in EXPLICITLY here (messaging-gateway
+      # logs CRITICAL at startup). Code default OFF (fail-closed, unsigned =
+      # 403); production must leave unset/0 and set WHATSAPP_APP_SECRET.
+      WHATSAPP_MOCK: ${WHATSAPP_MOCK:-1}  # DEV ONLY — mock rail (unsigned WhatsApp webhook intake)
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -284,9 +301,21 @@ services:
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
       PORT: '7004'
+      # DEV ONLY — mock rail: in-memory sim ledger (ADR-0007) so the dev
+      # stack boots without a TigerBeetle client; prod sets LEDGER_IMPL=tigerbeetle
+      # explicitly. Sim postings move NO real money.
       LEDGER_IMPL: ${LEDGER_IMPL:-sim}
-      TIGERBEETLE_ADDR: tigerbeetle:3000
+      # W39 RS-007 env-name fix: payments-service reads TB_ADDRESSES
+      # (src/config.rs, default tigerbeetle:3000) — the previous
+      # TIGERBEETLE_ADDR key here was DEAD (never read by any code path).
+      TB_ADDRESSES: ${TB_ADDRESSES:-tigerbeetle:3000}
       MOJALOOP_ENDPOINT: http://mojaloop:8444
+      # DEV ONLY — mock rail: MOJALOOP_ENDPOINT above points at the
+      # mojaloop/simulator container (infra/docker-compose.core.yml), so the
+      # dev stack EXPLICITLY opts into the simulated Mojaloop rail. Prod MUST
+      # unset this (code default OFF; fail-closed) and use a real FSPIOP
+      # endpoint.
+      MOJALOOP_ALLOW_SIM: ${MOJALOOP_ALLOW_SIM:-1}
       # SPEC-W12 §6/§8: Flutterwave mirror of the Paystack path.
       FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
       FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:-}
@@ -324,6 +353,10 @@ services:
       PORT: '7005'
       FLUVIO_ADDR: fluvio:9003
       KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/opendesk/protocol/openid-connect/certs
+      # W39 contract: GATEWAY_EDGE_ALLOW_SIM (Fluvio stub) is deliberately NOT
+      # set — dev runs the real fluvio service (depends_on below). Opt in only
+      # for fluvio-less environments by exporting GATEWAY_EDGE_ALLOW_SIM=true
+      # explicitly (code default OFF; the service never silently simulates).
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -356,6 +389,9 @@ services:
       PORT: '7006'
       AGENT_BACKEND: ${AGENT_BACKEND:-livekit}
       LIVEKIT_URL: ws://livekit:7880
+      # DEV ONLY defaults: `devkey`/`secret` are the well-known credentials of
+      # the `livekit --dev` server below. Override for any real deployment
+      # (docs/runbooks/secrets.md).
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434/v1}
@@ -674,10 +710,30 @@ services:
       PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
       PAYSTACK_DEFAULT_EMAIL: ${PAYSTACK_DEFAULT_EMAIL:-billing@opendesk.local}
       PAYSTACK_CALLBACK_URL: ${PAYSTACK_CALLBACK_URL:-http://localhost:9080/billing/callback}
+      # DEV ONLY stand-ins (W39 SIM-030): the code no longer has hardcoded
+      # static-mode merchant coordinates — these dev values are what keeps
+      # the static EMV QR fallback usable in dev. Prod MUST set the real
+      # merchant account/name via .env / the secrets store; shipping these
+      # would silently misdirect payments.
       BILLING_STATIC_ACCOUNT: ${BILLING_STATIC_ACCOUNT:-OPENDESK/0123456789}
       BILLING_MERCHANT_NAME: ${BILLING_MERCHANT_NAME:-OPENDESK DEMO}
       DUNNING_INTERVAL_S: ${DUNNING_INTERVAL_S:-3600}
       INVOICE_DUE_DAYS: ${INVOICE_DUE_DAYS:-14}
+      # W39 RS-007: billing ledger implementation. billing-engine accepts ONLY
+      # `postgres` (default; DATABASE_URL + migrations 0001-0004 above) or
+      # `sim` — any other value aborts boot (src/config.rs SIM-029). The REAL
+      # impl is the default here on purpose; `sim` must NEVER be selected
+      # silently — opt in only for isolated dev/tests via BILLING_LEDGER_IMPL=sim.
+      BILLING_LEDGER_IMPL: ${BILLING_LEDGER_IMPL:-postgres}
+      # W39 RS-007 internal-auth contract: billing rejects any request whose
+      # x-internal-token header does not match this value. APISIX strips
+      # client-supplied x-internal-token globally and injects this same value
+      # on /api/billing/* (see infra/apisix/apisix.yaml, api-billing route) —
+      # keep the two in sync.
+      # DEV ONLY default below (repo convention: compose boots without .env);
+      # prod MUST set BILLING_INTERNAL_TOKEN via the secrets store
+      # (docs/runbooks/secrets.md).
+      BILLING_INTERNAL_TOKEN: ${BILLING_INTERNAL_TOKEN:-opendesk-dev-billing-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -687,8 +743,8 @@ services:
     depends_on:
     - postgres
     - kafka
-  # SPEC-W12 §5: KYC verification service (BVN/NIN, consent-gated, mock by
-  # default). Dapr app-id kyc; publishes opendesk.kyc.resolved.v1.
+  # SPEC-W12 §5: KYC verification service (BVN/NIN, consent-gated). Dapr
+  # app-id kyc; publishes opendesk.kyc.resolved.v1.
   kyc:
     build: ./services/kyc-service
     env_file:
@@ -703,7 +759,7 @@ services:
       PORT: '7013'
       PG_DATABASE: kyc
       DATABASE_URL: postgres://opendesk:opendesk@postgres:5432/kyc
-      KYC_MOCK: ${KYC_MOCK:-0}  # W34 GF8: safe default off; explicit KYC_MOCK=1 opts into mock (CRITICAL startup log)
+      KYC_MOCK: ${KYC_MOCK:-0}  # W34 GF8: safe default off; DEV ONLY — mock resolver via explicit KYC_MOCK=1 (CRITICAL startup log)
       # Consent gate: identity GET /internal/consents/check (Dapr app-id
       # identity); empty = Dapr invoke via the sidecar.
       IDENTITY_URL: ${IDENTITY_URL:-}
