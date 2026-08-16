@@ -20,7 +20,13 @@ dependencies = [
 
 [project.optional-dependencies]
 fluvio = ["fluvio==0.16.1"]
-dev = ["pytest==8.3.4", "pytest-asyncio==0.24.0", "ruff==0.8.4"]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "ruff==0.8.4",
+    # Embedded Postgres 16 for the RLS regression tests (tests/test_agent_rls.py).
+    "pgserver==0.1.4",
+]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

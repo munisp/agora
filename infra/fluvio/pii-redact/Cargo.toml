@@ -9,7 +9,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # fluvio-smartmodule is the current name of the former `smartmodule-sdk` crate.
-fluvio-smartmodule = { version = "0.6", features = ["derive"] }
+# NOTE (RS-004): version 0.6.0 has NO `derive` feature (that feature only
+# existed in 0.1.0); in >= 0.3 the `#[smartmodule]` macro comes from the
+# non-optional `fluvio-smartmodule-derive` dependency and is re-exported by
+# default. Pin the version and use default features.
+fluvio-smartmodule = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
