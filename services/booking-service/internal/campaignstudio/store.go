@@ -84,7 +84,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'studio_segments' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON studio_segments
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -108,7 +108,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'studio_journeys' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON studio_journeys
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -132,7 +132,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'studio_enrollments' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON studio_enrollments
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -153,7 +153,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'studio_step_events' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON studio_step_events
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
