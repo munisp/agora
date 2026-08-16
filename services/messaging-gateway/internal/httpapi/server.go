@@ -22,10 +22,17 @@ type Server struct {
 	Telegram *provider.Telegram
 
 	// Omnichannel inbound (SPEC-W6 Part A).
-	Bridge                Bridger // nil: inbound disabled, webhooks drop + 200
-	WhatsAppVerifyToken   string  // WHATSAPP_VERIFY_TOKEN (Meta GET handshake)
-	TelegramBotUsername   string  // TELEGRAM_BOT_USERNAME (site-map route key)
-	TelegramWebhookSecret string  // TELEGRAM_WEBHOOK_SECRET (optional shared secret)
+	Bridge              Bridger // nil: inbound disabled, webhooks drop + 200
+	WhatsAppVerifyToken string  // WHATSAPP_VERIFY_TOKEN (Meta GET handshake)
+	// WhatsAppAppSecret (WHATSAPP_APP_SECRET) authenticates inbound WhatsApp
+	// posts via X-Hub-Signature-256 HMAC (SIM-007/SIM-008, fail-closed: an
+	// empty secret rejects every post with 401). WhatsAppMock
+	// (WHATSAPP_MOCK, default false) is the explicit dev/test opt-in that
+	// accepts unsigned posts.
+	WhatsAppAppSecret     string
+	WhatsAppMock          bool
+	TelegramBotUsername   string // TELEGRAM_BOT_USERNAME (site-map route key)
+	TelegramWebhookSecret string // TELEGRAM_WEBHOOK_SECRET (optional shared secret)
 
 	// IoT incident ingest (SPEC-W11 Part B §6).
 	IncidentSecrets map[string]string // INCIDENT_WEBHOOK_SECRETS parsed (tenant slug|id → secret)
@@ -68,8 +75,10 @@ func (s *Server) Router() http.Handler {
 	})
 
 	// Omnichannel inbound webhooks (SPEC-W6 Part A). Public by design —
-	// authentication is the Meta verify token / Telegram shared secret, and
-	// handlers always answer 200 fast (providers retry-storm on non-200).
+	// authentication is the Meta verify token (GET) / X-Hub-Signature-256
+	// HMAC (WhatsApp POST, SIM-007/SIM-008) / Telegram shared secret, and
+	// handlers answer 200 fast for everything except authentication
+	// failures (providers retry-storm on non-200).
 	r.Route("/webhooks", func(r chi.Router) {
 		r.Get("/whatsapp", s.handleWhatsAppVerify)
 		r.Post("/whatsapp", s.handleWhatsAppWebhook)

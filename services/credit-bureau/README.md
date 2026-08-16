@@ -44,7 +44,7 @@ P(default-in-12m)), blended `0.6*ml + 0.4*rule`, clamped to [300,900].
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `PORT` / `HOST` | `7017` / `0.0.0.0` | HTTP bind |
+| `PORT` / `HOST` | `7022` / `0.0.0.0` | HTTP bind |
 | `CREDIT_ML_REGISTRY_DIR` | empty (ML OFF) | registry root; resolution `{dir}/{tenant}/credit-ml-v{N}` then `{dir}/global/…` |
 | `JWT_PUBLIC_KEY` / `JWT_ALGORITHM` | empty / `HS256` | workforce auth seam |
 

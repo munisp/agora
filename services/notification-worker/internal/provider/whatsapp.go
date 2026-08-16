@@ -7,8 +7,10 @@ package provider
 // falls back to it when no provider is wired, so the zero-config default
 // works WITHOUT main/config edits):
 //
-//	WHATSAPP_MOCK                 default "1": deterministic mock, no
-//	                              network (FCM_MOCK posture, SPEC-W16)
+//	WHATSAPP_MOCK                 default OFF (SIM-011, KYC_MOCK idiom):
+//	                              explicit dev/test opt-in ("1"/"true"/"on")
+//	                              for the deterministic no-network mock.
+//	                              NEVER enable in production.
 //	WHATSAPP_CLOUD_API_TOKEN      Meta system-user access token
 //	WHATSAPP_PHONE_NUMBER_ID      sender phone number id (not the number)
 //	WHATSAPP_BUSINESS_ACCOUNT_ID  WhatsApp Business Account id (optional;
@@ -22,8 +24,10 @@ package provider
 // template (name + language) is APPROVED in the WhatsApp Business Manager
 // and the sender number's quality rating allows business-initiated traffic
 // (new numbers ramp through Meta's messaging limits). Both are Meta-side
-// processes outside this repo; WHATSAPP_MOCK=1 exists so journeys are
-// testable before they complete.
+// processes outside this repo; the WHATSAPP_MOCK=1 opt-in exists so dev/test
+// journeys are exercisable before they complete. With the mock off and no
+// Cloud API credentials configured, sends fail closed with an explicit
+// error — a WhatsApp send is never silently simulated.
 //
 // The shared Client machinery (retry/timeout/logging) is identical to the
 // FCM provider's.
@@ -51,7 +55,7 @@ const MaxWhatsAppTemplateParams = 10
 // WhatsAppConfig carries the WHATSAPP_* environment configuration (see
 // file header).
 type WhatsAppConfig struct {
-	Mock              bool   // WHATSAPP_MOCK (default true): deterministic, no network
+	Mock              bool   // WHATSAPP_MOCK (default false, SIM-011): deterministic, no network — explicit dev/test opt-in
 	Token             string // WHATSAPP_CLOUD_API_TOKEN
 	PhoneNumberID     string // WHATSAPP_PHONE_NUMBER_ID
 	BusinessAccountID string // WHATSAPP_BUSINESS_ACCOUNT_ID (optional; reporting only)
@@ -86,14 +90,15 @@ func NewWhatsApp(cfg WhatsAppConfig, log *zap.Logger) *WhatsApp {
 }
 
 // NewWhatsAppFromEnv builds the provider from the WHATSAPP_* environment
-// (file header). WHATSAPP_MOCK defaults to "1" — the zero-config posture is
-// the deterministic mock, exactly like FCM_MOCK (SPEC-W16); an explicit
-// "0"/"false" opts into the live Cloud API (credentials required).
+// (file header). WHATSAPP_MOCK defaults OFF (SIM-011, KYC_MOCK idiom) — the
+// zero-config posture is the LIVE Cloud API (credentials required; sends
+// fail closed with an explicit error when they are absent); only an
+// explicit truthy value opts into the deterministic mock.
 func NewWhatsAppFromEnv(log *zap.Logger) *WhatsApp {
-	mock := true
+	mock := false
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("WHATSAPP_MOCK"))) {
-	case "0", "false", "no", "off":
-		mock = false
+	case "1", "true", "yes", "on":
+		mock = true
 	}
 	return NewWhatsApp(WhatsAppConfig{
 		Mock:              mock,
@@ -145,7 +150,7 @@ func (w *WhatsApp) SendTemplate(ctx context.Context, msg WhatsAppTemplateMessage
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic mock (WHATSAPP_MOCK=1 default)
+// Deterministic mock (WHATSAPP_MOCK=1 explicit opt-in; default OFF, SIM-011)
 // ---------------------------------------------------------------------------
 
 // sendMock mirrors the FCM mock idiom: no network, deterministic results,

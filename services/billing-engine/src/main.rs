@@ -12,86 +12,58 @@ mod invoices;
 mod ledger;
 mod metering;
 mod models;
+mod outbox;
 mod payments_qr;
 mod routes;
 mod tenant;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use serde::Serialize;
+use rdkafka::producer::FutureProducer;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::ledger::{BillingLedger, SimLedgerClient};
+use crate::ledger::BillingLedger;
+
+/// Shared outbound HTTP client construction (RS-006): explicit timeouts —
+/// 5s connect, 30s overall — so a hung rail cannot park a request forever.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("reqwest client with static timeout configuration must build")
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     /// Pool for cross-tenant internal jobs (dunning sweep, Paystack webhook
-    /// invoice lookup) — SPEC-W34 GF6. Built from INTERNAL_DATABASE_URL (role
-    /// `app_billing_internal_login`); falls back to the main pool when unset
-    /// (dev default: bootstrap superuser, which bypasses RLS anyway).
+    /// invoice lookup, outbox relay) — SPEC-W34 GF6. Built from
+    /// INTERNAL_DATABASE_URL (role `app_billing_internal_login`); falls back
+    /// to the main pool when unset (dev default: bootstrap superuser, which
+    /// bypasses RLS anyway).
     pub internal_pool: PgPool,
     pub ledger: Arc<dyn BillingLedger>,
-    /// rdkafka producer for opendesk.billing.events (None when Kafka is
-    /// unavailable at boot; event publication degrades to logged + counted).
+    /// rdkafka producer for the outbox relay (None when Kafka is unavailable
+    /// at boot; events stay durable in billing_outbox until a restart with a
+    /// working broker — RS-001: they are never silently dropped).
     pub producer: Option<FutureProducer>,
     pub http: reqwest::Client,
     pub config: Arc<config::Config>,
+    /// Signalled after a transaction commits with a fresh outbox row so the
+    /// relay flushes immediately instead of waiting for the poll tick.
+    pub outbox_notify: Arc<tokio::sync::Notify>,
+    /// billing_events_published_total (Prometheus text exposition: /metrics).
     pub events_published: Arc<AtomicU64>,
+    /// billing_events_failed_total.
     pub events_failed: Arc<AtomicU64>,
-}
-
-impl AppState {
-    /// Best-effort event publication (same contract as payments-service):
-    /// state changes commit first; publication failures are logged + counted.
-    pub async fn publish_event<T: Serialize>(
-        &self,
-        type_name: &str,
-        subject: &str,
-        tenant_id: &str,
-        data: T,
-    ) {
-        let event = models::CloudEvent::new(
-            "billing-engine",
-            &format!("com.opendesk.billing.{type_name}"),
-            subject,
-            tenant_id,
-            data,
-        );
-        let payload = match serde_json::to_vec(&event) {
-            Ok(p) => p,
-            Err(e) => {
-                self.events_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, "billing event serialize failed");
-                return;
-            }
-        };
-        let Some(producer) = &self.producer else {
-            self.events_failed.fetch_add(1, Ordering::Relaxed);
-            warn!(type_ = %event.type_, "no kafka producer; billing event dropped");
-            return;
-        };
-        let record = FutureRecord::to(self.config.billing_events_topic.as_str())
-            .key(tenant_id)
-            .payload(payload.as_slice());
-        match producer.send(record, Duration::from_secs(5)).await {
-            Ok(_) => {
-                self.events_published.fetch_add(1, Ordering::Relaxed);
-            }
-            Err((e, _msg)) => {
-                self.events_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, type_ = %event.type_, "billing event publish failed");
-            }
-        }
-    }
 }
 
 async fn connect_pool(database_url: &str) -> Result<PgPool, Box<dyn std::error::Error>> {
@@ -113,6 +85,31 @@ async fn connect_pool(database_url: &str) -> Result<PgPool, Box<dyn std::error::
     }
 }
 
+/// SIM-029: ledger selection. `postgres` (default) constructs the durable
+/// PgLedgerClient and FAILS THE BOOT when it cannot be built (missing
+/// tables/config/DB) — there is no silent fallback to the sim. `sim` is a
+/// dev/CI opt-in only.
+async fn build_ledger(
+    cfg: &config::Config,
+    pool: &PgPool,
+) -> Result<Arc<dyn BillingLedger>, Box<dyn std::error::Error>> {
+    match cfg.billing_ledger_impl.as_str() {
+        "postgres" => {
+            info!("billing ledger: postgres-backed (durable, default)");
+            Ok(Arc::new(ledger::PgLedgerClient::new(pool.clone()).await?))
+        }
+        "sim" => {
+            warn!("BILLING_LEDGER_IMPL=sim: in-memory ledger (dev/CI only; NON-DURABLE)");
+            Ok(Arc::new(ledger::SimLedgerClient::new()))
+        }
+        // Unreachable (config::from_env validates), but fail closed anyway.
+        other => Err(format!(
+            "unknown BILLING_LEDGER_IMPL '{other}' (expected postgres|sim)"
+        )
+        .into()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -122,10 +119,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .json()
         .init();
 
-    let cfg = config::Config::from_env();
+    let cfg = match config::Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            // Fail-closed startup (RS-002/SIM-029/SIM-030): no silent defaults
+            // on auth tokens, ledger selection, or merchant coordinates.
+            error!(error = %e, "invalid configuration; refusing to start");
+            return Err(e.into());
+        }
+    };
     info!(
         port = cfg.port,
         payment_mode = cfg.payment_mode(),
+        ledger_impl = %cfg.billing_ledger_impl,
         usage_topic = %cfg.usage_events_topic,
         "starting billing-engine"
     );
@@ -143,7 +149,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(include_str!("../migrations/0002_rls.sql"))
         .execute(&pool)
         .await?;
-    info!("billing schema applied (incl. 0002 RLS)");
+    // SIM-029: durable ledger tables (PgLedgerClient storage).
+    sqlx::raw_sql(include_str!("../migrations/0003_ledger.sql"))
+        .execute(&pool)
+        .await?;
+    // RS-001: durable event outbox (InvoicePaid can never be silently lost).
+    sqlx::raw_sql(include_str!("../migrations/0004_outbox.sql"))
+        .execute(&pool)
+        .await?;
+    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox)");
 
     let internal_pool = match &cfg.internal_database_url {
         Some(dsn) => {
@@ -160,6 +174,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // SIM-029: build the ledger AFTER the schema bootstrap so the postgres
+    // implementation's table probe can only fail on real mis-provisioning.
+    let ledger = build_ledger(&cfg, &pool).await?;
+
     let producer: Option<FutureProducer> = match rdkafka::config::ClientConfig::new()
         .set("bootstrap.servers", &cfg.kafka_brokers)
         .set("message.timeout.ms", "10000")
@@ -167,7 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(p) => Some(p),
         Err(e) => {
-            error!(error = %e, "failed to create kafka producer; events will be dropped");
+            // Not fatal: outbox rows stay durable (RS-001) and the relay
+            // drains them on the next boot with a working broker.
+            error!(error = %e, "failed to create kafka producer; billing events accumulate in the outbox");
             None
         }
     };
@@ -175,10 +195,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         pool,
         internal_pool,
-        ledger: Arc::new(SimLedgerClient::new()),
+        ledger,
         producer,
-        http: reqwest::Client::new(),
+        http: http_client(),
         config: Arc::new(cfg.clone()),
+        outbox_notify: Arc::new(tokio::sync::Notify::new()),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
     };
@@ -189,7 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let dunning_handle = tokio::spawn(dunning::run(state.clone(), shutdown_rx));
+    let dunning_handle = tokio::spawn(dunning::run(state.clone(), shutdown_rx.clone()));
+    let outbox_handle = tokio::spawn(outbox::run(state.clone(), shutdown_rx));
 
     let app = routes::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -203,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = handle.await;
     }
     let _ = dunning_handle.await;
+    let _ = outbox_handle.await;
     info!("billing-engine stopped");
     Ok(())
 }

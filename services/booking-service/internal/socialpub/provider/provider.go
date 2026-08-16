@@ -1,23 +1,23 @@
 // Package provider implements the social-publisher provider seam
 // (SPEC-W21 Agent B): one Publisher interface, three providers
-// (meta/tiktok/x), each with a DETERMINISTIC MOCK as the zero-config
-// default (mirroring the W16 FCM_MOCK posture — no network, documented
-// test hooks) and an HONEST real-API stub that refuses with "not
-// configured" until credentials are wired (same posture as the W16 APNs
-// stub — no fake implementation claims; the credential runbook lives in
-// docs/apps/social-publisher.md).
+// (meta/tiktok/x), each with a DETERMINISTIC MOCK available ONLY as an
+// explicit dev opt-in (W39 SIM-005 — previously the silent zero-config
+// default; no network, documented test hooks) and an HONEST real-API stub
+// that refuses with "not configured" until credentials are wired (same
+// posture as the W16 APNs stub — no fake implementation claims; the
+// credential runbook lives in docs/apps/social-publisher.md).
 //
 // Mock switches (documented for the integrator; resolved by
 // MockEnabled):
 //
-//	SOCIAL_MOCK                         master switch (default "1")
-//	META_MOCK / TIKTOK_MOCK / X_MOCK    per-provider (each default "1")
+//	SOCIAL_MOCK                         master switch (default OFF)
+//	META_MOCK / TIKTOK_MOCK / X_MOCK    per-provider (each default OFF)
 //
-// A provider is in mock mode when the master switch is unset/truthy OR
-// its per-provider switch is unset/truthy — with all four unset every
-// provider is a mock and the app works with zero config. Setting
-// SOCIAL_MOCK=0 AND META_MOCK=0 selects the real Meta stub (not yet
-// credential-wired: every call answers "not configured").
+// A provider is in mock mode only when the master switch OR its
+// per-provider switch is EXPLICITLY truthy (1/true/yes/on). With all
+// four unset every provider is the honest real-API stub and every
+// publish/launch/stats call fails closed with "not configured" — the
+// mock is never engaged silently (W39 mock-posture contract).
 //
 // Mock determinism:
 //   - PublishPost → "mock-post-<provider>-<sha256[:16]>" of the stable
@@ -35,6 +35,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -110,19 +111,43 @@ const MockSentinelFailAccount = "mock-fail"
 // mock LaunchAd reject on policy grounds (documented test hook).
 const MockSentinelRejectName = "mock-reject"
 
-// MockEnabled resolves the mock switch for one provider: truthy/unset
-// master (SOCIAL_MOCK) or truthy/unset per-provider switch → mock. Only
-// BOTH explicitly falsy selects the real-API stub.
+// EnvSocialMock is the master mock switch (SOCIAL_MOCK). Per-provider
+// switches are strings.ToUpper(providerID)+"_MOCK" (META_MOCK, …).
+// All default OFF since W39 (SIM-005) — mocks are opt-in only.
+const EnvSocialMock = "SOCIAL_MOCK"
+
+// MockEnabled resolves the mock switch for one provider: an EXPLICITLY
+// truthy master (SOCIAL_MOCK) or per-provider switch → mock. Unset or any
+// other spelling → OFF: the real-API stub (which fails closed with "not
+// configured" until credentials are wired). W39 SIM-005: the mock
+// posture is opt-in only.
 func MockEnabled(master, perProvider string) bool {
-	return truthyDefault(master) || truthyDefault(perProvider)
+	return truthy(master) || truthy(perProvider)
 }
 
-func truthyDefault(v string) bool {
+// MockEnabledFromEnv resolves the mock switch for a provider id from the
+// process environment (SOCIAL_MOCK master + <PROVIDER>_MOCK).
+func MockEnabledFromEnv(providerID string) bool {
+	return MockEnabled(os.Getenv(EnvSocialMock), os.Getenv(strings.ToUpper(providerID)+"_MOCK"))
+}
+
+// IsMock reports whether p is a simulated provider. The concrete
+// providers report their posture; foreign Publisher implementations are
+// assumed real (metering counts them — W39 SIM-006).
+func IsMock(p Publisher) bool {
+	type mockReporter interface{ IsMock() bool }
+	if m, ok := p.(mockReporter); ok {
+		return m.IsMock()
+	}
+	return false
+}
+
+func truthy(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "no", "off":
-		return false
-	default: // unset or any truthy spelling → mock (zero-config default)
+	case "1", "true", "yes", "on":
 		return true
+	default: // unset or any other spelling → mock OFF (fail closed)
+		return false
 	}
 }
 
