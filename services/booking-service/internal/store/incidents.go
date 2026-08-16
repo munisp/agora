@@ -83,7 +83,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'incidents' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON incidents
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -107,7 +107,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'incident_deliveries' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON incident_deliveries
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -125,7 +125,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'incident_dispatch_endpoints' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON incident_dispatch_endpoints
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
