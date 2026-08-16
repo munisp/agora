@@ -22,10 +22,18 @@ services:
     restart: unless-stopped
     environment:
       LIVEKIT_URL: ${LIVEKIT_URL:-ws://livekit:7880}
+      # DEV ONLY defaults: `devkey`/`secret` are the well-known credentials of
+      # the root-compose `livekit --dev` server. They are INVALID against any
+      # real deployment — set LIVEKIT_API_KEY/LIVEKIT_API_SECRET to the
+      # environment's livekit-keys pair (docs/runbooks/secrets.md).
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
-      # mock = warm test pattern (no GPU, default). musetalk = real lip-sync
-      # inference — requires the Dockerfile MuseTalk enablement block + GPU.
+      # mock = warm test pattern (no GPU). musetalk = real lip-sync
+      # inference — requires the Dockerfile MuseTalk enablement block + GPU,
+      # and is currently a DOCUMENTED STUB in services/avatar-renderer
+      # (app/main.py), so `mock` stays the deliberate DEV ONLY default here.
+      # W39 SIM-014: this is an explicit opt-in override stack (profile
+      # `voice`); set AVATAR_RENDERER_MODE=musetalk only with a real backend.
       AVATAR_RENDERER_MODE: ${AVATAR_RENDERER_MODE:-mock}
       AVATAR_ROOM_PREFIX: ${AVATAR_ROOM_PREFIX:-site-}
       AVATAR_DISCOVERY_INTERVAL_S: ${AVATAR_DISCOVERY_INTERVAL_S:-5}

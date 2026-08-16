@@ -68,6 +68,12 @@ TOPICS=(
   # SPEC-W33 (additive): ML platform ops alerts (model-registry emits drift
   # sweep PSI breaches + nightly training-gate failures; SPEC-W33 §4 C2/C5).
   ops.alerts                       # model_drift / training_gate_failed / training_tick_error alerts
+  # W39 INFRA-004 (additive): previously unprovisioned topics — broker
+  # auto-create is OFF, so producers/consumers of these failed silently.
+  opendesk.billing.events          # billing-engine BILLING_EVENTS_TOPIC default: com.opendesk.billing.* CloudEvents (InvoicePaid etc.)
+  opendesk.cac.events              # prefixed CAC stream (fraud-engine FRAUD_KAFKA_TOPICS default consumes it; producers migrate from cac.events)
+  opendesk.conversation.captures   # conversation-service CAPTURE_TOPIC default (CaptureExtracted, SPEC-W38 F3); crm-sync CAPTURES_TOPIC consumes
+  opendesk.ops.alerts              # notification-worker OPS_ALERTS_TOPIC default (prefixed ops alerts stream)
 )
 
 echo "[kafka-topics] waiting for broker at ${BOOTSTRAP}..."

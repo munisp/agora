@@ -96,7 +96,7 @@ export default function MarketingPage() {
             <a
               href="https://github.com/opendesk/opendesk"
               target="_blank"
-              rel="noreferrer"
+              rel="noreferrer noopener"
             >
               <Button size="lg" variant="outline">
                 View source

@@ -29,6 +29,8 @@ type Config struct {
 
 	// Omnichannel inbound (SPEC-W6 Part A)
 	WhatsAppVerifyToken   string // WHATSAPP_VERIFY_TOKEN (Meta webhook GET handshake)
+	WhatsAppAppSecret     string // WHATSAPP_APP_SECRET (Meta app secret → X-Hub-Signature-256 HMAC, SIM-007/SIM-008)
+	WhatsAppMock          bool   // WHATSAPP_MOCK (default false): dev/test opt-in accepting UNSIGNED inbound WhatsApp posts — never enable in production
 	TelegramBotToken      string // TELEGRAM_BOT_TOKEN (BotFather)
 	TelegramBotUsername   string // TELEGRAM_BOT_USERNAME (CHANNEL_SITE_MAP route key)
 	TelegramWebhookSecret string // TELEGRAM_WEBHOOK_SECRET (optional setWebhook secret_token)
@@ -65,18 +67,22 @@ type Config struct {
 // Load reads configuration from the environment.
 func Load() Config {
 	return Config{
-		Port:                   envInt("PORT", 7011),
-		TermiiAPIKey:           os.Getenv("TERMII_API_KEY"),
-		TermiiSenderID:         envStr("TERMII_SENDER_ID", "OpenDesk"),
-		TermiiBaseURL:          envStr("TERMII_BASE_URL", "https://v2.api.termii.com"),
-		ATAPIKey:               os.Getenv("AT_API_KEY"),
-		ATUsername:             os.Getenv("AT_USERNAME"),
-		ATBaseURL:              envStr("AT_BASE_URL", "https://api.africastalking.com"),
-		ATFrom:                 os.Getenv("AT_FROM"),
-		WhatsAppToken:          os.Getenv("WHATSAPP_TOKEN"),
-		WhatsAppPhoneNumberID:  os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
-		WhatsAppBaseURL:        envStr("WHATSAPP_BASE_URL", "https://graph.facebook.com/v21.0"),
-		WhatsAppVerifyToken:    os.Getenv("WHATSAPP_VERIFY_TOKEN"),
+		Port:                  envInt("PORT", 7011),
+		TermiiAPIKey:          os.Getenv("TERMII_API_KEY"),
+		TermiiSenderID:        envStr("TERMII_SENDER_ID", "OpenDesk"),
+		TermiiBaseURL:         envStr("TERMII_BASE_URL", "https://v2.api.termii.com"),
+		ATAPIKey:              os.Getenv("AT_API_KEY"),
+		ATUsername:            os.Getenv("AT_USERNAME"),
+		ATBaseURL:             envStr("AT_BASE_URL", "https://api.africastalking.com"),
+		ATFrom:                os.Getenv("AT_FROM"),
+		WhatsAppToken:         os.Getenv("WHATSAPP_TOKEN"),
+		WhatsAppPhoneNumberID: os.Getenv("WHATSAPP_PHONE_NUMBER_ID"),
+		WhatsAppBaseURL:       envStr("WHATSAPP_BASE_URL", "https://graph.facebook.com/v21.0"),
+		WhatsAppVerifyToken:   os.Getenv("WHATSAPP_VERIFY_TOKEN"),
+		WhatsAppAppSecret:     os.Getenv("WHATSAPP_APP_SECRET"),
+		// WHATSAPP_MOCK defaults OFF (SIM-007/SIM-008 fail-closed posture,
+		// KYC_MOCK idiom): only an explicit truthy value opts in.
+		WhatsAppMock:           envBool("WHATSAPP_MOCK", false),
 		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramBotUsername:    os.Getenv("TELEGRAM_BOT_USERNAME"),
 		TelegramWebhookSecret:  os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
@@ -110,6 +116,17 @@ func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// envBool mirrors the kyc-service KYC_MOCK idiom (strconv.ParseBool: "1",
+// "true", … opt in; anything else falls back to the default).
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

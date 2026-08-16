@@ -8,9 +8,10 @@ package activities
 // codes TO the contract: response is a JSON array of
 // {tenant_id, contact_id, token, platform, app}) or to an explicit token
 // list in the payload. Fan-out goes through the internal/provider
-// implementations (fcm live or FCM_MOCK=1 deterministic mock; apns stub —
-// iOS tokens surface honest "not implemented" failures until the
-// documented TODO lands).
+// implementations (fcm live, or the FCM_MOCK=1 deterministic mock when
+// explicitly opted in — default OFF, SIM-010; apns stub — iOS tokens
+// surface honest "not implemented" failures until the documented TODO
+// lands).
 //
 // Per-token failures are RESULTS, not activity errors: a Temporal retry of
 // the activity must not re-deliver to tokens that already succeeded. The

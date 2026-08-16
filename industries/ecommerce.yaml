@@ -117,17 +117,11 @@ agents:
 # from tool-call arguments (and the session context vars site_slug,
 # tenant_slug, tenant_id).
 #
-# NOTE: the plugin hosts below (plugin-shopify, plugin-woo) are internal
-# sidecars and must be added to the voice runtime's PLUGIN_ALLOWED_HOSTS SSRF
-# allowlist before these tools can execute (default allowlist is
-# booking,knowledge,identity). GET carries no body, so bodyTemplate is
-# intentionally omitted (the pack validator requires a string when present).
-customTools:
-- name: shopify_order_lookup
-  description: Look up a Shopify order by order id to verify status, fulfillment and tracking before answering the customer.
-  method: GET
-  url: http://plugin-shopify:7020/v1/orders/{{order_id}}
-- name: woocommerce_order_lookup
-  description: Look up a WooCommerce order by order id to verify status, fulfillment and tracking before answering the customer.
-  method: GET
-  url: http://plugin-woo:7021/v1/orders/{{order_id}}
+# W39 SIM-016/017: the `shopify_order_lookup` / `woocommerce_order_lookup`
+# customTools were REMOVED — the plugin-shopify / plugin-woo sidecars they
+# targeted do not exist anywhere in this repo (no image, no service, no
+# code), so the tools could never execute. A listed-but-unimplemented tool
+# is a runtime lie; re-add only when those plugin sidecars land (and are
+# added to the runtime's PLUGIN_ALLOWED_HOSTS SSRF allowlist — default
+# booking,knowledge,identity).
+
