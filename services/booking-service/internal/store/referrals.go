@@ -137,7 +137,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'referrals' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON referrals
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -164,7 +164,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'commission_rules' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON commission_rules
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 `
@@ -195,7 +195,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'commission_ledger' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON commission_ledger
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -226,7 +226,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'commission_payouts' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON commission_payouts
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 `
