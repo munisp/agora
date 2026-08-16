@@ -36,9 +36,9 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON tenants
-    USING (id = current_setting('app.tenant_id', true)::uuid);
+    USING (id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON memberships
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);

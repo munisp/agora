@@ -38,7 +38,7 @@ ALTER TABLE turns ADD COLUMN IF NOT EXISTS entities JSONB;
 ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON conversations
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- turns carries no tenant_id per SPEC §7; isolate through the parent row.
 ALTER TABLE turns ENABLE ROW LEVEL SECURITY;
@@ -47,5 +47,5 @@ CREATE POLICY tenant_isolation ON turns
     USING (EXISTS (
         SELECT 1 FROM conversations c
         WHERE c.id = turns.conversation_id
-          AND c.tenant_id = current_setting('app.tenant_id', true)::uuid
+          AND c.tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
     ));

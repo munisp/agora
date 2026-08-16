@@ -63,8 +63,8 @@ BEGIN
         -- policy compares the GUC without the ::uuid cast.
         CREATE POLICY tenant_isolation ON civic_notifications
             USING (CASE
-                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
-                ELSE tenant_id = current_setting('app.tenant_id', true)
+                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
+                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
             END);
     END IF;
 END

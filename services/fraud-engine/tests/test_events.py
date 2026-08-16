@@ -61,6 +61,9 @@ def test_inmemory_publisher_records_topic_key_event():
 
 def test_kafka_trigger_routing():
     # D3 on capture/lead events; D5 on consent/messaging events (SPEC §3)
+    # REAL produced type on cac.events: booking-service leads.go EventTypeFunnel.
+    assert detectors_for_event("com.opendesk.cac.FunnelEvent") == ["d3_capture_velocity"]
+    # Legacy/fictional type kept as compatibility coverage.
     assert detectors_for_event("com.opendesk.cac.LeadCaptured") == ["d3_capture_velocity"]
     assert detectors_for_event("com.opendesk.identity.ConsentGranted") == ["d5_consent_backdating"]
     assert detectors_for_event("com.opendesk.conversation.MessageSent") == ["d5_consent_backdating"]

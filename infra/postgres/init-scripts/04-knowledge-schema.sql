@@ -27,7 +27,7 @@ CREATE TABLE chunks (
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON documents
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 -- chunks carries no tenant_id per SPEC §7; isolate through the parent row.
 ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
@@ -36,5 +36,5 @@ CREATE POLICY tenant_isolation ON chunks
     USING (EXISTS (
         SELECT 1 FROM documents d
         WHERE d.id = chunks.document_id
-          AND d.tenant_id = current_setting('app.tenant_id', true)::uuid
+          AND d.tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
     ));
