@@ -1,7 +1,8 @@
 """asyncpg persistence for the conversation DB (SPEC §7).
 
 RLS note: init script 03-conversation-schema.sql enables FORCE ROW LEVEL
-SECURITY with policy tenant_id = current_setting('app.tenant_id')::uuid, so
+SECURITY with policy tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+(NULLIF so a recycled '' GUC fails closed instead of raising), so
 every transaction sets app.tenant_id via set_config(..., true) (LOCAL).
 """
 
