@@ -6,7 +6,7 @@ import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Label, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
 import { cn, minutesToTime, timeToMinutes, WEEKDAYS } from "@/lib/utils";

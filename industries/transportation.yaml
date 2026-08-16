@@ -156,11 +156,9 @@ agents:
     terminal is 30 minutes before departure and boarding closes 10 minutes
     before. You never invent departure times or fares.
   intents: [bus, buses, coach, "bus seat", "bus ticket", "motor park", "bus charter", "luxury bus", terminal, seat]
-# Demo custom tool (SPEC-W3 §5): stand-in URL for the schedules adapter
-# until the real schedules API plugin lands — replace with the live
-# timetables endpoint before production use.
-customTools:
-- name: check_schedule
-  description: Check scheduled departures and live status (demo adapter) for a route, mode and date before quoting times to a passenger.
-  method: GET
-  url: http://gateway-edge:7005/healthz
+# W39 SIM-016/017: the `check_schedule` customTool was REMOVED — it pointed at
+# the gateway-edge /healthz demo adapter (always-on stand-in), i.e. a tool the
+# voice runtime would register but that could never return real schedules. A
+# listed-but-unimplemented tool is a runtime lie; re-add only with the live
+# timetables/schedules plugin endpoint (and PLUGIN_ALLOWED_HOSTS entry).
+

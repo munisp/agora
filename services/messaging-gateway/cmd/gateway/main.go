@@ -66,10 +66,23 @@ func run() error {
 			Token:   cfg.TelegramBotToken,
 		},
 		WhatsAppVerifyToken:   cfg.WhatsAppVerifyToken,
+		WhatsAppAppSecret:     cfg.WhatsAppAppSecret,
+		WhatsAppMock:          cfg.WhatsAppMock,
 		TelegramBotUsername:   cfg.TelegramBotUsername,
 		TelegramWebhookSecret: cfg.TelegramWebhookSecret,
 		Metrics:               reg,
 		Log:                   logger,
+	}
+
+	// SIM-007/SIM-008 posture: the inbound WhatsApp webhook verifies
+	// X-Hub-Signature-256 against WHATSAPP_APP_SECRET, fail-closed. The
+	// unsigned bypass exists ONLY via the explicit WHATSAPP_MOCK=1 dev
+	// opt-in — surface both misconfigurations loudly at boot.
+	switch {
+	case cfg.WhatsAppMock:
+		logger.Error("CRITICAL: MOCK WHATSAPP WEBHOOK — NOT FOR PRODUCTION: WHATSAPP_MOCK=1 accepts UNSIGNED inbound WhatsApp posts; unset it and configure WHATSAPP_APP_SECRET for production")
+	case cfg.WhatsAppAppSecret == "":
+		logger.Warn("WHATSAPP_APP_SECRET unset: inbound WhatsApp webhook rejects every post (401, fail-closed) until configured")
 	}
 
 	// Omnichannel inbound bridge (SPEC-W6 Part A): wired whenever

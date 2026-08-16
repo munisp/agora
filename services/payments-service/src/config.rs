@@ -22,7 +22,13 @@ pub struct Config {
     pub dapr_http_port: u16,
     pub dapr_pubsub: String,
     pub events_topic: String,
+    /// Mojaloop payout rail endpoint (SIM-003: no silent simulator default).
+    /// The real rail is configured via MOJALOOP_ENDPOINT; the
+    /// mojaloop-simulator URL is only ever used when MOJALOOP_ALLOW_SIM=true
+    /// (dev/CI opt-in) — otherwise `from_env` fails closed.
     pub mojaloop_endpoint: String,
+    /// True only when MOJALOOP_ALLOW_SIM opted in to the simulator rail.
+    pub mojaloop_allow_sim: bool,
     /// Platform fee in basis points applied on captures/no-show fees.
     pub platform_fee_bps: u64,
 }
@@ -58,6 +64,30 @@ impl Config {
                 "unknown LEDGER_IMPL '{ledger_impl}' (expected sim|tigerbeetle)"
             ));
         }
+        // SIM-003 mock-posture contract: the Mojaloop simulator rail is
+        // opt-in. Default posture (MOJALOOP_ALLOW_SIM unset/false) requires an
+        // explicitly configured real endpoint; with neither, fail closed at
+        // boot — never silently aim payouts at the simulator.
+        let mojaloop_allow_sim = env_parse("MOJALOOP_ALLOW_SIM", false);
+        let mojaloop_endpoint = match std::env::var("MOJALOOP_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(ep) => ep,
+            None if mojaloop_allow_sim => {
+                // Dev/CI only: the mojaloop-simulator container.
+                "http://mojaloop:8444".to_string()
+            }
+            None => {
+                return Err(
+                    "MOJALOOP_ENDPOINT is not set and MOJALOOP_ALLOW_SIM is not true; \
+                     refusing to start: the payout rail would have no real Mojaloop \
+                     endpoint (set MOJALOOP_ENDPOINT for the real rail, or opt in to \
+                     the mojaloop-simulator for dev/CI with MOJALOOP_ALLOW_SIM=true)"
+                        .to_string(),
+                )
+            }
+        };
         Ok(Self {
             port: env_parse("PORT", 7004),
             ledger_impl,
@@ -72,7 +102,8 @@ impl Config {
             dapr_http_port: env_parse("DAPR_HTTP_PORT", 3500),
             dapr_pubsub: env_or("DAPR_PUBSUB_NAME", "pubsub-kafka"),
             events_topic: env_or("PAYMENTS_EVENTS_TOPIC", "opendesk.payments.events"),
-            mojaloop_endpoint: env_or("MOJALOOP_ENDPOINT", "http://mojaloop:8444"),
+            mojaloop_endpoint,
+            mojaloop_allow_sim,
             platform_fee_bps: env_parse("PLATFORM_FEE_BPS", 250),
         })
     }
@@ -93,10 +124,18 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    /// Deterministic env for each test: clear every variable `from_env`
+    /// treats as posture-sensitive.
+    fn clear_posture_env() {
+        std::env::remove_var("LEDGER_IMPL");
+        std::env::remove_var("MOJALOOP_ENDPOINT");
+        std::env::remove_var("MOJALOOP_ALLOW_SIM");
+    }
+
     #[test]
     fn ledger_impl_must_be_explicit() {
         let _g = env_lock();
-        std::env::remove_var("LEDGER_IMPL");
+        clear_posture_env();
         let err = Config::from_env().unwrap_err();
         assert!(
             err.contains("LEDGER_IMPL"),
@@ -107,19 +146,68 @@ mod tests {
     #[test]
     fn ledger_impl_rejects_unknown_value() {
         let _g = env_lock();
+        clear_posture_env();
         std::env::set_var("LEDGER_IMPL", "sqlite");
         let err = Config::from_env().unwrap_err();
         assert!(err.contains("sqlite"), "error should echo the value: {err}");
-        std::env::remove_var("LEDGER_IMPL");
+        clear_posture_env();
     }
 
     #[test]
     fn ledger_impl_explicit_sim_loads() {
         let _g = env_lock();
+        clear_posture_env();
         std::env::set_var("LEDGER_IMPL", "sim");
+        std::env::set_var("MOJALOOP_ALLOW_SIM", "true");
         let cfg = Config::from_env().expect("explicit sim must load");
         assert_eq!(cfg.ledger_impl, "sim");
         assert_eq!(cfg.dlq_topic, "opendesk.dlq");
-        std::env::remove_var("LEDGER_IMPL");
+        clear_posture_env();
+    }
+
+    // ------------------------------------------------------------------
+    // SIM-003: Mojaloop simulator rail is opt-in, never the silent default.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mojaloop_fails_closed_when_endpoint_missing_and_sim_not_allowed() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("LEDGER_IMPL", "sim");
+        // Default posture: no endpoint, no opt-in -> explicit boot error.
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.contains("MOJALOOP_ENDPOINT") && err.contains("MOJALOOP_ALLOW_SIM"),
+            "error should name both variables: {err}"
+        );
+        // Explicit false must behave identically to unset.
+        std::env::set_var("MOJALOOP_ALLOW_SIM", "false");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.contains("MOJALOOP_ENDPOINT"), "false must not opt in: {err}");
+        clear_posture_env();
+    }
+
+    #[test]
+    fn mojaloop_sim_rail_requires_explicit_opt_in() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("LEDGER_IMPL", "sim");
+        std::env::set_var("MOJALOOP_ALLOW_SIM", "true");
+        let cfg = Config::from_env().expect("sim opt-in must load");
+        assert!(cfg.mojaloop_allow_sim);
+        assert_eq!(cfg.mojaloop_endpoint, "http://mojaloop:8444");
+        clear_posture_env();
+    }
+
+    #[test]
+    fn mojaloop_real_endpoint_loads_without_sim_opt_in() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("LEDGER_IMPL", "sim");
+        std::env::set_var("MOJALOOP_ENDPOINT", "https://mojaloop.example.com");
+        let cfg = Config::from_env().expect("explicit endpoint must load");
+        assert!(!cfg.mojaloop_allow_sim);
+        assert_eq!(cfg.mojaloop_endpoint, "https://mojaloop.example.com");
+        clear_posture_env();
     }
 }

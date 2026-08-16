@@ -23,6 +23,17 @@ use tracing_subscriber::EnvFilter;
 
 use crate::ledger::{LedgerClient, sim::SimLedgerClient};
 
+/// Shared outbound HTTP client construction (RS-006): every reqwest client in
+/// this service gets explicit timeouts — 5s connect, 30s overall — so a hung
+/// rail/sidecar cannot park a money-path request forever.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("reqwest client with static timeout configuration must build")
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub ledger: Arc<dyn LedgerClient>,
@@ -130,8 +141,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port = cfg.port,
         ledger_impl = %cfg.ledger_impl,
         mojaloop = %cfg.mojaloop_endpoint,
+        mojaloop_allow_sim = cfg.mojaloop_allow_sim,
         "starting payments-service"
     );
+    if cfg.mojaloop_allow_sim && cfg.mojaloop_endpoint == "http://mojaloop:8444" {
+        warn!("MOJALOOP_ALLOW_SIM=true: payout rail targets the mojaloop-simulator (dev/CI only)");
+    }
 
     let ledger = build_ledger(&cfg).await?;
     let outbox = dapr::DaprOutbox::new(
