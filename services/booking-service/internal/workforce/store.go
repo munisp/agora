@@ -95,7 +95,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'shifts' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON shifts
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 CREATE TABLE IF NOT EXISTS time_entries (
@@ -119,7 +119,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'time_entries' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON time_entries
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 CREATE TABLE IF NOT EXISTS leave_requests (
@@ -147,7 +147,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'leave_requests' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON leave_requests
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
@@ -735,12 +735,12 @@ func (s *Store) Coverage(ctx context.Context, tenantID uuid.UUID, from, to time.
 		// labelling pins to UTC explicitly so the session timezone of the
 		// server can never shift a day boundary.
 		q := `SELECT to_char(d AT TIME ZONE 'UTC', 'YYYY-MM-DD'),
-		       (SELECT COUNT(DISTINCT s.agent_id) FROM shifts s
-		         WHERE s.tenant_id=$1 AND s.status != 'cancelled'
-		           AND s.starts_at < d + interval '1 day' AND s.ends_at > d),
-		       ` + bookingsExpr + `
-		FROM generate_series($2::timestamptz, $3::timestamptz, interval '1 day') AS d
-		ORDER BY d`
+	       (SELECT COUNT(DISTINCT s.agent_id) FROM shifts s
+	         WHERE s.tenant_id=$1 AND s.status != 'cancelled'
+	           AND s.starts_at < d + interval '1 day' AND s.ends_at > d),
+	       ` + bookingsExpr + `
+	FROM generate_series($2::timestamptz, $3::timestamptz, interval '1 day') AS d
+	ORDER BY d`
 		rows, err := tx.Query(ctx, q, tenantID, from, to)
 		if err != nil {
 			return err
