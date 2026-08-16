@@ -118,8 +118,8 @@ BEGIN
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON webhook_subscriptions
             USING (CASE
-                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
-                ELSE tenant_id = current_setting('app.tenant_id', true)::uuid
+                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
+                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
             END);
     END IF;
     IF NOT EXISTS (SELECT FROM pg_policies
@@ -128,8 +128,8 @@ BEGIN
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON webhook_deliveries
             USING (CASE
-                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
-                ELSE tenant_id = current_setting('app.tenant_id', true)::uuid
+                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
+                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
             END);
     END IF;
 END

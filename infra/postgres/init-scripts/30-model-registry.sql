@@ -12,7 +12,7 @@
 -- and the schema with FORCE ROW LEVEL SECURITY exactly like 03/04.
 --
 -- RLS convention (matches 01/03/04): tenant rows are visible/writable only when
---   tenant_id = current_setting('app.tenant_id', true)::uuid
+--   tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
 -- The service sets `app.tenant_id` via set_config(..., true) inside every
 -- transaction (single write path, I4). ONE deliberate extension: the service's
 -- internal batch jobs (drift sweep, nightly trainer) must enumerate rows across
@@ -182,41 +182,41 @@ CREATE INDEX idx_score_observations_window
 ALTER TABLE model_version ENABLE ROW LEVEL SECURITY;
 ALTER TABLE model_version FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON model_version
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE experiments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE experiments FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON experiments
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE experiment_outcomes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE experiment_outcomes FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON experiment_outcomes
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE feature_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feature_observations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON feature_observations
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 ALTER TABLE score_observations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE score_observations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON score_observations
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_model_registry_internal', 'USAGE'));
 
 -- ---------------------------------------------------------------------------
