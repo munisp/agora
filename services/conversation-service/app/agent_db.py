@@ -177,7 +177,7 @@ class AgentStore:
                                WHERE schemaname = 'public' AND tablename = 'agents'
                                  AND policyname = 'tenant_isolation') THEN
                     CREATE POLICY tenant_isolation ON agents
-                        USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+                        USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
                 END IF;
             END
             $$
@@ -195,7 +195,7 @@ class AgentStore:
                                WHERE schemaname = 'public' AND tablename = 'capture_schemas'
                                  AND policyname = 'tenant_isolation') THEN
                     CREATE POLICY tenant_isolation ON capture_schemas
-                        USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+                        USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
                 END IF;
             END
             $$
@@ -213,7 +213,7 @@ class AgentStore:
                                WHERE schemaname = 'public' AND tablename = 'capture_records'
                                  AND policyname = 'tenant_isolation') THEN
                     CREATE POLICY tenant_isolation ON capture_records
-                        USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+                        USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
                 END IF;
             END
             $$
