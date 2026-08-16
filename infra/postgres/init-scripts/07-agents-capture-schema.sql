@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_tenant_status ON agents (tenant_id, status
 
 -- Declarative post-call extraction schema per agent (SPEC-W38 F3).
 -- schema shape: {"fields":[{"key","type":"string|number|boolean|enum",
--- "label","required","options"?}]}
+-- "label","required","options"}?]}
 CREATE TABLE IF NOT EXISTS capture_schemas (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id  UUID NOT NULL,
@@ -75,7 +75,7 @@ BEGIN
                    WHERE schemaname = 'public' AND tablename = 'agents'
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON agents
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END
 $$;
@@ -88,7 +88,7 @@ BEGIN
                    WHERE schemaname = 'public' AND tablename = 'capture_schemas'
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON capture_schemas
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END
 $$;
@@ -101,7 +101,7 @@ BEGIN
                    WHERE schemaname = 'public' AND tablename = 'capture_records'
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON capture_records
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END
 $$;

@@ -95,24 +95,24 @@ CREATE INDEX idx_outbox_unsent ON outbox (id) WHERE sent_at IS NULL;
 ALTER TABLE offerings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE offerings FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON offerings
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 ALTER TABLE team_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE team_members FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON team_members
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 ALTER TABLE availability_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE availability_rules FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON availability_rules
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 ALTER TABLE contacts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE contacts FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON contacts
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 
 ALTER TABLE bookings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE bookings FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON bookings
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);

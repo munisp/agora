@@ -8,7 +8,11 @@
 #   (cd industries && sha256sum *.yaml > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
 # (prepend this header afterwards — it is stripped by sha256sum -c).
 # Verify: (cd industries && sha256sum -c SHA256SUMS)
-# Loader-side enforcement is a code change owned elsewhere (see HANDOFF).
+# Loader-side enforcement LANDED in W40-5: identity-service
+# internal/packs.Load verifies every pack against this manifest
+# before registering it (fail-closed on mismatch/unlisted/missing).
+# W40-1 regeneration: transportation.yaml re-hashed after its stale
+# header-comment fix (all other entries re-verified unchanged).
 ab229564d289dd9eebfc3f075815f86efe467c91e2294c01ed4e196f9c63766f  agri-input.yaml
 a67fba8f40ebb55462f111b6ba8c19caedc4e2081787e4f3843054db93359d92  agriculture.yaml
 048a86ea552fd5c1bdbb9ba55ad6bf3c881766dd237eb3bac8fc9a5abc00ad69  agritech.yaml
@@ -43,7 +47,7 @@ c24910519e249e6a92271951c197139f66d4a627c57c3af042944dd40a9aab78  recruitment.ya
 4e2e92f5be1bc624ce7d260b8d279976fa5c96cc3d8974ceb0d01126db604fbd  salon.yaml
 f52d35f82a8c6ade0716586180df9ecf5970c206330856f231ded87951c32126  stock-brokerage.yaml
 e9b170331d46631c0c9fc4afe73c407a9b7a945af77feffb0443847dc678ba1a  support-desk.yaml
-c30df6a42381969493d51d0395440a4a144ff1b41c41adc12e92f5e9bd00ca3d  transportation.yaml
+18428bad7e5f00c86e0aa2186e84b90bd82192544ecb27603f4856490fed1810  transportation.yaml
 5602718f53b5800094d53d2e27d148823562ab064d45403a5cf129a567c0fa83  travel.yaml
 09101a5b040cc3f2db44e8da8e8adb0f4a066a020f069c7cc63c97ae55779977  utilities-payg.yaml
 6bd5591812043c1f8583dd5dc62a6c2670d0ec066d4dbd0f0df93b9a90e983e2  vocational.yaml

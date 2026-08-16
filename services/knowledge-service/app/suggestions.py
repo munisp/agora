@@ -38,7 +38,7 @@ BEGIN
         WHERE tablename = 'kb_suggestions' AND policyname = 'tenant_isolation'
     ) THEN
         CREATE POLICY tenant_isolation ON kb_suggestions
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 """
