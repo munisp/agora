@@ -85,7 +85,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'loyalty_programs' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON loyalty_programs
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -107,7 +107,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'loyalty_wallets' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON loyalty_wallets
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -137,7 +137,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'loyalty_ledger' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON loyalty_ledger
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
