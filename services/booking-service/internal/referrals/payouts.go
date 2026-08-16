@@ -229,7 +229,7 @@ func (c *PaystackClient) TransferStatus(ctx context.Context, providerRef string)
 	if ref == "" {
 		ref = env.Data.Reference
 	}
-	return TransferResult{ProviderRef: ref, Status: env.Data.Status, AmountNGN: env.Data.Amount}, nil
+	return TransferStatusResult{ProviderRef: ref, Status: env.Data.Status, AmountNGN: env.Data.Amount}, nil
 }
 
 func truncate(s string, n int) string {
