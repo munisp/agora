@@ -34,7 +34,7 @@ CREATE INDEX IF NOT EXISTS idx_agents_tenant_status ON agents (tenant_id, status
 
 -- Declarative post-call extraction schema per agent (SPEC-W38 F3).
 -- schema shape: {"fields":[{"key","type":"string|number|boolean|enum",
--- "label","required","options"}?]}
+-- "label","required","options"?}]}
 CREATE TABLE IF NOT EXISTS capture_schemas (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id  UUID NOT NULL,
