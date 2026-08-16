@@ -19,6 +19,10 @@ x-twenty-env: &twenty-env
   REDIS_URL: redis://twenty-redis:6379
   SERVER_URL: ${TWENTY_SERVER_URL:-http://localhost:3100}
   FRONT_BASE_URL: ${TWENTY_FRONT_BASE_URL:-http://localhost:3100}
+  # DEV ONLY token/app secrets (W39 SIM-025/026/045): these defaults match
+  # .env.example verbatim so the dev stack boots without a .env. They are
+  # PUBLIC knowledge — production MUST override every one via the secrets
+  # store (docs/runbooks/secrets.md).
   ACCESS_TOKEN_SECRET: ${TWENTY_ACCESS_TOKEN_SECRET:-opendesk-twenty-access-token-dev}
   LOGIN_TOKEN_SECRET: ${TWENTY_LOGIN_TOKEN_SECRET:-opendesk-twenty-login-token-dev}
   REFRESH_TOKEN_SECRET: ${TWENTY_REFRESH_TOKEN_SECRET:-opendesk-twenty-refresh-token-dev}

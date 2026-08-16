@@ -6,11 +6,13 @@
 #
 #   docker compose -f docker-compose.yml -f infra/compose/voices.compose.yml up -d
 #
-# Both services default to MOCK mode (deterministic sine wav, no model
-# downloads, no GPU) so the voice pipeline is e2e-testable. Real inference:
-#   MMS_MOCK=0  (CPU is fine; checkpoints ~100-250MB/lang cached in mms-models)
-#   XTTS_MOCK=0 (GPU REQUIRED, >=6GB VRAM — build the CUDA variant per
-#                services/xtts-tts/Dockerfile and uncomment the deploy block)
+# Both services run REAL inference unless the mock is EXPLICITLY opted into
+# (W39 SIM-013 — mocks default OFF):
+#   MMS_MOCK=1  deterministic sine wav, no model downloads (e2e only)
+#   XTTS_MOCK=1 same posture (e2e only; real XTTS needs a GPU, >=6GB VRAM —
+#                build the CUDA variant per services/xtts-tts/Dockerfile and
+#                uncomment the deploy block below)
+# Real mode: MMS CPU is fine; checkpoints ~100-250MB/lang cached in mms-models.
 # Point the runtime at these services via MMS_TTS_URL / XTTS_TTS_URL
 # (defaults http://mms-tts:5800 / http://xtts-tts:5810).
 
@@ -24,7 +26,10 @@ services:
     ports:
       - "5800:5800"
     environment:
-      MMS_MOCK: ${MMS_MOCK:-1}
+      # W39 SIM-013: safe default OFF. DEV ONLY — mock TTS: set MMS_MOCK=1
+      # explicitly in the environment for e2e (deterministic sine wav, no
+      # model downloads). NEVER set in production.
+      MMS_MOCK: ${MMS_MOCK:-0}
       # Real-mode per-language allow-list (facebook/mms-tts-{lang}).
       # All five: eng,pcm,yor,ibo,hau
       MMS_LANGS: ${MMS_LANGS:-eng,pcm}
@@ -51,7 +56,9 @@ services:
     ports:
       - "5810:5810"
     environment:
-      XTTS_MOCK: ${XTTS_MOCK:-1}
+      # W39 SIM-013: safe default OFF. DEV ONLY — mock TTS: set XTTS_MOCK=1
+      # explicitly for e2e (no GPU needed). NEVER set in production.
+      XTTS_MOCK: ${XTTS_MOCK:-0}
       VOICES_DIR: /data
       # Real mode: persist the ~1.8GB XTTS-v2 checkpoint on the volume too.
       # TTS_HOME: /data/models

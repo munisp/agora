@@ -17,7 +17,8 @@ pub struct DaprOutbox {
 impl DaprOutbox {
     pub fn new(base_url: String, pubsub: String, topic: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // RS-006: shared client with 5s connect / 30s overall timeouts.
+            http: crate::http_client(),
             base_url,
             pubsub,
             topic,

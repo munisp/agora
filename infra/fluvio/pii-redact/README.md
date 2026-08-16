@@ -72,7 +72,13 @@ transforms:
 ## Notes
 
 - Crate: `fluvio-smartmodule` (the renamed successor of `smartmodule-sdk`),
-  built to `wasm32-unknown-unknown` as a `cdylib`.
+  built to `wasm32-unknown-unknown` as a `cdylib`. Note: 0.6.x has no
+  `derive` feature — the `#[smartmodule]` macro is re-exported from the
+  bundled `fluvio-smartmodule-derive` dependency by default.
+- The wasm link intentionally leaves host imports (`copy_records`, …)
+  undefined; `.cargo/config.toml` passes `--allow-undefined` to rust-lld
+  for the `wasm32-unknown-unknown` target so `cargo build` / `smdk build`
+  work out of the box (the imports are resolved by the Fluvio SPU runtime).
 - The raw topic intentionally keeps unredacted records inside the platform
   trust boundary; redaction is enforced at consumption/sink time. gateway-edge
   live-tails the raw topic for `/ws/transcripts`; external sinks must apply

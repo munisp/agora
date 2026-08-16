@@ -9,7 +9,9 @@ description = "OpenDesk Kafka -> Iceberg bronze sink with health/metrics sidecar
 requires-python = ">=3.12"
 dependencies = [
     "pyiceberg[pyarrow,sql-sqlite]==0.7.1",
-    "pyarrow==18.1.0",
+    # pyiceberg 0.7.1 requires pyarrow<18.0.0,>=9.0.0 — 17.0.0 is the newest
+    # compatible release (18.x made the package uninstallable: PY-002).
+    "pyarrow==17.0.0",
     "aiokafka==0.10.0",
     "fastapi==0.115.6",
     "uvicorn[standard]==0.32.1",

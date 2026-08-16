@@ -11,6 +11,7 @@ RUN apt-get update \
 
 # Dependency caching layer.
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release \
     && rm -rf src

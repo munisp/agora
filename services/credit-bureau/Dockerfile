@@ -17,12 +17,12 @@ COPY credit_bureau ./credit_bureau
 RUN useradd --create-home --uid 10002 creditbureau && mkdir -p /app/models && chown -R creditbureau /app
 USER creditbureau
 
-ENV PORT=7017 \
+ENV PORT=7022 \
     CREDIT_ML_REGISTRY_DIR=
 
-EXPOSE 7017
+EXPOSE 7022
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request,os;urllib.request.urlopen(f\"http://127.0.0.1:{os.getenv('PORT','7017')}/healthz\",timeout=4)"
+  CMD python -c "import urllib.request,os;urllib.request.urlopen(f\"http://127.0.0.1:{os.getenv('PORT','7022')}/healthz\",timeout=4)"
 
-CMD ["python", "-m", "uvicorn", "credit_bureau.main:app", "--host", "0.0.0.0", "--port", "7017"]
+CMD ["python", "-m", "uvicorn", "credit_bureau.main:app", "--host", "0.0.0.0", "--port", "7022"]

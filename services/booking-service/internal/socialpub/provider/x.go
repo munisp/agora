@@ -1,7 +1,7 @@
 package provider
 
-// X (Twitter) provider (SPEC-W21 Agent B). Mock is the zero-config
-// default (X_MOCK / SOCIAL_MOCK, see the package doc). The real-API path
+// X (Twitter) provider (SPEC-W21 Agent B). The mock is an explicit dev opt-in
+// (X_MOCK / SOCIAL_MOCK, default OFF — see the package doc). The real-API path
 // is an HONEST STUB: X Ads API wiring (developer account, OAuth tokens)
 // is a documented follow-up in docs/apps/social-publisher.md.
 
@@ -15,6 +15,10 @@ type X struct {
 
 // Name implements Publisher.
 func (p *X) Name() string { return "x" }
+
+// IsMock reports the mock posture (metering must not count simulated
+// publishes as real usage — W39 SIM-006).
+func (p *X) IsMock() bool { return p.mock }
 
 func (p *X) mockRef() *mockPublisher {
 	if p.m.name == "" {

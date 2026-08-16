@@ -3,14 +3,15 @@
  * - App shell (index, app.js, manifest, icons): cache-first.
  * - API calls (/v1/*, token endpoints): network only — writes are queued in
  *   IndexedDB by the page, never replayed from cache.
- * - Background Sync ("od-field-flush"): flushes the IndexedDB outbox itself
- *   when no page is open, then notifies open clients to re-render.
+ * - Background Sync ("od-field-flush"): asks any open page to flush the
+ *   IndexedDB outbox. Tokens are session-only and never reach this worker
+ *   (TS-003), so the authenticated flush always runs in a page context.
  *
  * Bump OPENDESK_SW_V on every change (cache busting).
  */
 "use strict";
 
-var OPENDESK_SW_V = "field-pwa-v2";
+var OPENDESK_SW_V = "field-pwa-v3";
 var SHELL = "opendesk-field-" + OPENDESK_SW_V;
 
 var PRECACHE = [
@@ -67,65 +68,18 @@ self.addEventListener("fetch", function (event) {
   );
 });
 
-/* ---- Background Sync flush (SPEC-W16 §4) ---- */
-
-function openDb() {
-  return new Promise(function (resolve, reject) {
-    var req = indexedDB.open("opendesk-field", 1);
-    req.onsuccess = function () { resolve(req.result); };
-    req.onerror = function () { reject(req.error); };
-  });
-}
-
-function idbGetAll(db, store) {
-  return new Promise(function (resolve, reject) {
-    var req = db.transaction(store).objectStore(store).getAll();
-    req.onsuccess = function () { resolve(req.result || []); };
-    req.onerror = function () { reject(req.error); };
-  });
-}
-
-function idbDel(db, store, key) {
-  return new Promise(function (resolve, reject) {
-    var t = db.transaction(store, "readwrite");
-    t.objectStore(store).delete(key);
-    t.oncomplete = resolve;
-    t.onerror = function () { reject(t.error); };
-  });
-}
-
+/* ---- Background Sync flush (SPEC-W16 §4, TS-003 posture) ----
+ *
+ * Bearer/refresh tokens are session-only (in-memory + sessionStorage in the
+ * page) and are NEVER persisted to IndexedDB or visible to this worker, so
+ * the SW cannot attach Authorization when no page is open. On a sync event
+ * we delegate: any open client is told to run the authenticated flush
+ * itself (it holds the session tokens); if no page is open the outbox
+ * stays queued — durable and non-secret — until the next page load, whose
+ * boot path flushes it. */
 function flushOutbox() {
-  return openDb().then(function (db) {
-    return Promise.all([idbGetAll(db, "outbox"), idbGetAll(db, "meta")]).then(function (r) {
-      var items = r[0];
-      var meta = null;
-      r[1].forEach(function (m) { if (m.k === "ctx") meta = m; });
-      if (!items.length || !meta || meta.mode !== "live" || !meta.tokens || !meta.slug) return;
-      if (meta.tokens.expires_at && meta.tokens.expires_at - 30000 < Date.now()) return; // page must refresh
-      var batchId = crypto.randomUUID();
-      return fetch(meta.cfg.apiBase.replace(/\/+$/, "") + "/v1/field/capture", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: "Bearer " + meta.tokens.access_token,
-          "x-tenant-slug": meta.slug,
-          "idempotency-key": "field_capture:" + batchId,
-        },
-        body: JSON.stringify({
-          batch_id: batchId,
-          items: items.map(function (i) {
-            return { client_id: i.id, kind: i.kind, payload: i.payload, captured_at: i.captured_at, gps: i.gps };
-          }),
-        }),
-      }).then(function (res) {
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        return Promise.all(items.map(function (i) { return idbDel(db, "outbox", i.id); }));
-      }).then(function () {
-        return self.clients.matchAll().then(function (cs) {
-          cs.forEach(function (c) { c.postMessage("flushed"); });
-        });
-      });
-    });
+  return self.clients.matchAll().then(function (cs) {
+    cs.forEach(function (c) { c.postMessage("flush"); });
   });
 }
 
