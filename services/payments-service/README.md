@@ -84,7 +84,8 @@ committed rail transfer is logged CRITICAL for operator reconciliation.
 | `DAPR_HTTP_PORT` | `3500` | Dapr sidecar HTTP port |
 | `DAPR_PUBSUB_NAME` | `pubsub-kafka` | Dapr pubsub component |
 | `PAYMENTS_EVENTS_TOPIC` | `opendesk.payments.events` | events topic |
-| `MOJALOOP_ENDPOINT` | `http://mojaloop:8444` | mojaloop-simulator base URL |
+| `MOJALOOP_ENDPOINT` | — (required unless sim opted in; SIM-003) | real Mojaloop rail base URL; startup fails closed when unset and `MOJALOOP_ALLOW_SIM` is not `true` |
+| `MOJALOOP_ALLOW_SIM` | `false` | dev/CI opt-in: allow the payout rail to target the mojaloop-simulator (`http://mojaloop:8444` default) |
 
 ## Run
 

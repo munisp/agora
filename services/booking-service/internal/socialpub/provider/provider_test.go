@@ -92,12 +92,14 @@ func TestMockEnabled(t *testing.T) {
 		master, per string
 		want        bool
 	}{
-		{"", "", true},    // zero-config default
-		{"1", "1", true},  // explicit mocks
-		{"0", "1", true},  // per-provider wins
-		{"1", "0", true},  // master wins
-		{"0", "0", false}, // BOTH falsy → real stub
+		{"", "", false}, // W39 SIM-005: unset ⇒ mock OFF (fail closed)
+		{"0", "0", false},
 		{"false", "no", false},
+		{"1", "1", true}, // explicit mocks
+		{"0", "1", true}, // per-provider opt-in wins
+		{"1", "0", true}, // master opt-in wins
+		{"true", "", true},
+		{"", "yes", true},
 	}
 	for _, tc := range cases {
 		if got := MockEnabled(tc.master, tc.per); got != tc.want {
@@ -130,5 +132,44 @@ func TestRealStubsNotConfigured(t *testing.T) {
 	}
 	if _, ok := New("myspace", true); ok {
 		t.Fatalf("unknown provider should return ok=false")
+	}
+}
+
+// W39 SIM-005 regression: env-driven mock resolution defaults OFF (fail
+// closed) and only an explicit truthy switch opts a provider into the
+// mock.
+func TestMockEnabledFromEnvPosture(t *testing.T) {
+	t.Setenv(EnvSocialMock, "")
+	t.Setenv("META_MOCK", "")
+	if MockEnabledFromEnv("meta") {
+		t.Fatal("unset switches must NOT enable the mock (fail closed)")
+	}
+	// The lazily-resolved provider is then the honest stub.
+	p, ok := New("meta", MockEnabledFromEnv("meta"))
+	if !ok {
+		t.Fatal("New(meta) missing")
+	}
+	if IsMock(p) {
+		t.Fatal("default posture must not be mock")
+	}
+	if _, err := p.PublishPost(context.Background(), PostRequest{Body: "hi"}); err == nil ||
+		!strings.Contains(err.Error(), "not configured") {
+		t.Fatalf("default posture must fail closed, got %v", err)
+	}
+
+	// Master opt-in.
+	t.Setenv(EnvSocialMock, "1")
+	if !MockEnabledFromEnv("meta") {
+		t.Fatal("SOCIAL_MOCK=1 must enable the mock")
+	}
+	// Per-provider opt-in with master off.
+	t.Setenv(EnvSocialMock, "0")
+	t.Setenv("META_MOCK", "1")
+	if !MockEnabledFromEnv("meta") {
+		t.Fatal("META_MOCK=1 must enable the mock")
+	}
+	pm, _ := New("meta", MockEnabledFromEnv("meta"))
+	if !IsMock(pm) {
+		t.Fatal("opted-in provider must report IsMock")
 	}
 }

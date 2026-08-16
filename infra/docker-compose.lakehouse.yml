@@ -70,10 +70,13 @@ services:
     - /bin/sh
     - -c
     command:
-    - "until pg_isready -h postgres -p 5432 -U \"$${POSTGRES_USER}\"; do sleep 2; done\npsql \"postgresql://$${POSTGRES_USER}:$${POSTGRES_PASSWORD}@postgres:5432/postgres\"\
+    - "until pg_isready -h postgres -p 5432 -U \"$${POSTGRES_USER}\"; do sleep 2; done\npsql \"postgresql://$${POSTGRES_USER}:$${POSTGRES_PASSWORD}@postgres:5432/postgres\"
       \ \\\n  -c \"CREATE DATABASE iceberg\" || echo \"database iceberg already exists\"
 "
     environment:
+      # DEV ONLY: matches the root-compose Postgres bootstrap credentials
+      # (.env.example POSTGRES_USER/POSTGRES_PASSWORD). Not a secret boundary
+      # in dev; prod uses per-service roles + the secrets store.
       POSTGRES_USER: ${POSTGRES_USER:-opendesk}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-opendesk}
     networks:
@@ -95,6 +98,7 @@ services:
       CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
       CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg
       CATALOG_JDBC_USER: ${POSTGRES_USER:-opendesk}
+      # DEV ONLY default — same dev bootstrap credential as above.
       CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD:-opendesk}
       CATALOG_JDBC_STRICT__MODE: 'true'
       REST_PORT: '8181'

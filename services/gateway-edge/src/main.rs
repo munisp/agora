@@ -87,7 +87,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_rx.clone(),
     ));
 
-    // Fluvio live-tail (transcripts). Stub unless built with `fluvio-live`.
+    // Fluvio live-tail (transcripts). Real consumer only when built with
+    // `fluvio-live`; otherwise FAIL CLOSED (no silent simulation) unless the
+    // operator explicitly opts into the no-op stub via GATEWAY_EDGE_ALLOW_SIM.
+    #[cfg(not(feature = "fluvio-live"))]
+    if !cfg.fluvio_stub_allowed {
+        tracing::error!(
+            topic = %cfg.fluvio_transcripts_topic,
+            endpoint = %cfg.fluvio_endpoint,
+            "fluvio live-tail is not compiled into this build; refusing to \
+             silently simulate transcript consumption. Rebuild with \
+             `--features fluvio-live`, or set GATEWAY_EDGE_ALLOW_SIM=true to \
+             explicitly opt into running without the transcript source"
+        );
+        return Err(
+            "fluvio consumer unavailable: build with --features fluvio-live \
+             or set GATEWAY_EDGE_ALLOW_SIM=true (opt-in stub)"
+                .into(),
+        );
+    }
     let fluvio_handle = tokio::spawn(fluvio_consumer::run(
         bus.clone(),
         cfg.fluvio_endpoint.clone(),

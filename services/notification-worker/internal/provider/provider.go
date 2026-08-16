@@ -1,7 +1,8 @@
 // Package provider implements the outbound push-notification provider
-// clients (SPEC-W16 Agent A): FCM (HTTP v1 / legacy server key, FCM_MOCK=1
-// deterministic mock default) and APNs (stub only — interface + config +
-// documented TODO, no fake implementation claims).
+// clients (SPEC-W16 Agent A): FCM (HTTP v1 / legacy server key; FCM_MOCK=1
+// deterministic mock as an explicit opt-in — default OFF, SIM-010) and APNs
+// (stub only — interface + config + documented TODO, no fake implementation
+// claims).
 //
 // The shared HTTP machinery mirrors messaging-gateway/internal/provider:
 // 10s client timeout, up to 2 retries on 5xx/429/transport errors, no retry
