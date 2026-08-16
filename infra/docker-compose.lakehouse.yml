@@ -71,8 +71,7 @@ services:
     - -c
     command:
     - "until pg_isready -h postgres -p 5432 -U \"$${POSTGRES_USER}\"; do sleep 2; done\npsql \"postgresql://$${POSTGRES_USER}:$${POSTGRES_PASSWORD}@postgres:5432/postgres\"\
-      \ \\
-  -c \"CREATE DATABASE iceberg\" || echo \"database iceberg already exists\"
+      \ \\\n  -c \"CREATE DATABASE iceberg\" || echo \"database iceberg already exists\"
 "
     environment:
       # DEV ONLY: matches the root-compose Postgres bootstrap credentials
