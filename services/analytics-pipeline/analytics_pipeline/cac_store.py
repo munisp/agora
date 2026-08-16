@@ -4,7 +4,7 @@ Tables live in the ``analytics_meta`` database (one DB per service, SPEC §7)
 and every table is tenant-RLS'd with the OpenDesk idiom:
 
     ENABLE + FORCE ROW LEVEL SECURITY
-    POLICY tenant_isolation USING (tenant_id = current_setting('app.tenant_id', true)::uuid)
+    POLICY tenant_isolation USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
 
 Every tenant-scoped statement runs inside a transaction that first does
 ``SELECT set_config('app.tenant_id', $1, true)`` (SET LOCAL) — same pattern
@@ -53,7 +53,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'cac_rollup_channel' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON cac_rollup_channel
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -73,7 +73,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'cac_rollup_lga' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON cac_rollup_lga
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -93,7 +93,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'cac_campaign_channel' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON cac_campaign_channel
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -112,7 +112,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'cac_processed_events' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON cac_processed_events
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 """
