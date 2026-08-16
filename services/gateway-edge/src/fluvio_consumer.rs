@@ -2,9 +2,11 @@
 //! fanning records out to `transcripts:{slug}` channels (`/ws/transcripts`).
 //!
 //! The real consumer is compiled with `--features fluvio-live` (dependency
-//! `fluvio`). The default build ships a stub so the service builds green; the
-//! Kafka consumer (`opendesk.booking.events`) remains the primary source
-//! (SPEC §5: "Fluvio mirror + Kafka fallback").
+//! `fluvio`). The default build ships a stub that is FAIL-CLOSED: `main`
+//! refuses to start unless the operator explicitly opts in with
+//! `GATEWAY_EDGE_ALLOW_SIM=true` — the service never silently simulates
+//! transcript consumption. The Kafka consumer (`opendesk.booking.events`)
+//! remains the primary source (SPEC §5: "Fluvio mirror + Kafka fallback").
 
 use std::sync::Arc;
 
@@ -140,10 +142,14 @@ pub async fn run(
     _partitions: i32,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    tracing::info!(
+    // Reachable only when the operator explicitly opted into the no-op stub
+    // (GATEWAY_EDGE_ALLOW_SIM=true); main refuses to start otherwise, so this
+    // path never silently simulates consumption.
+    tracing::warn!(
         topic = %topic,
-        "fluvio live-tail disabled in this build (rebuild with --features fluvio-live); \
-         kafka booking events remain the primary source"
+        "GATEWAY_EDGE_ALLOW_SIM=true: running WITHOUT the fluvio transcript tail \
+         (explicit opt-in no-op stub; rebuild with --features fluvio-live for \
+         the real consumer). Kafka booking events remain the primary source"
     );
     // Stay alive (so supervision restarts don't flap) until shutdown.
     let _ = shutdown.changed().await;

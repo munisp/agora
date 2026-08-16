@@ -6,8 +6,10 @@ description = "OpenDesk edge gateway: per-tenant WebSocket fan-out over Kafka/Fl
 
 [features]
 # Default build: Kafka primary consumer only; the Fluvio live-tail is a
-# compiled-in stub. Build with `--features fluvio-live` to enable the real
-# Fluvio consumer for `opendesk.transcripts-raw` (see src/fluvio_consumer.rs).
+# compiled-in stub that is FAIL-CLOSED (the service refuses to start unless
+# GATEWAY_EDGE_ALLOW_SIM=true is set — never silently simulates). Build with
+# `--features fluvio-live` to enable the real Fluvio consumer for
+# `opendesk.transcripts-raw` (see src/fluvio_consumer.rs).
 default = []
 fluvio-live = ["dep:fluvio"]
 

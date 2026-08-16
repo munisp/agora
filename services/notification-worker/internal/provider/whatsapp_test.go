@@ -11,18 +11,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// SPEC-W21 Agent A: WhatsApp Cloud API provider — WHATSAPP_MOCK=1
-// deterministic mock default (FCM_MOCK posture) + honest live posture.
+// SPEC-W21 Agent A: WhatsApp Cloud API provider — WHATSAPP_MOCK opt-in
+// (default OFF, SIM-011) + fail-closed live posture.
 
-func TestWhatsAppMockDefaultFromEnv(t *testing.T) {
-	// No WHATSAPP_* env set: the zero-config posture is the mock.
+// SIM-011: with no WHATSAPP_* env set the zero-config posture is the LIVE
+// provider, NOT the mock — and with no credentials it fails closed.
+func TestWhatsAppMockDefaultsOffFromEnv(t *testing.T) {
 	for _, k := range []string{"WHATSAPP_MOCK", "WHATSAPP_CLOUD_API_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_BUSINESS_ACCOUNT_ID", "WHATSAPP_CLOUD_API_BASE_URL"} {
 		t.Setenv(k, "")
 	}
 	w := NewWhatsAppFromEnv(nil)
-	require.True(t, w.Mock, "WHATSAPP_MOCK must default to the mock posture")
-	require.True(t, w.Configured(), "mock mode counts as configured")
+	require.False(t, w.Mock, "WHATSAPP_MOCK must default OFF (SIM-011)")
+	require.False(t, w.Configured(), "no credentials + no mock = not configured")
 	require.Equal(t, DefaultWhatsAppBaseURL, w.BaseURL)
+
+	// Fail closed: the send errors explicitly, never a simulated success.
+	_, _, err := w.SendTemplate(context.Background(), WhatsAppTemplateMessage{To: "+234", Template: "t"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "WHATSAPP_CLOUD_API_TOKEN")
+}
+
+// The mock remains available as an explicit dev/test opt-in.
+func TestWhatsAppMockOptInFromEnv(t *testing.T) {
+	for _, k := range []string{"WHATSAPP_CLOUD_API_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_BUSINESS_ACCOUNT_ID", "WHATSAPP_CLOUD_API_BASE_URL"} {
+		t.Setenv(k, "")
+	}
+	for _, v := range []string{"1", "true", "on"} {
+		t.Setenv("WHATSAPP_MOCK", v)
+		w := NewWhatsAppFromEnv(nil)
+		require.True(t, w.Mock, "WHATSAPP_MOCK=%q must opt into the mock", v)
+		require.True(t, w.Configured(), "mock mode counts as configured")
+	}
+	for _, v := range []string{"0", "false", "off", "garbage"} {
+		t.Setenv("WHATSAPP_MOCK", v)
+		require.False(t, NewWhatsAppFromEnv(nil).Mock, "WHATSAPP_MOCK=%q must keep the mock off", v)
+	}
 }
 
 func TestWhatsAppMockSendsDeterministicWamid(t *testing.T) {

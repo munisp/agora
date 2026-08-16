@@ -8,9 +8,11 @@ package store
 // The dnd_numbers table lives in the `notifications` database alongside the
 // webhook tables and is bootstrapped idempotently like them. Tenant
 // isolation is application-level (every tenant-scoped query filters
-// tenant_id/tenant_slug), matching the rest of this database — RLS is
-// OPTIONAL here (SPEC-W12: "RLS-optional global list + per-tenant
-// opt-outs"); the global rows carry tenant_id NULL.
+// tenant_id/tenant_slug) PLUS defense-in-depth RLS (SQL-003): the
+// tenant_isolation policy keeps the global NCC 2442 rows (tenant_id NULL)
+// visible to every tenant context while scoping per-tenant opt-out rows to
+// the session's app.tenant_id (unset GUC = legacy application-level
+// posture, see the package header).
 
 import (
 	"context"
@@ -62,7 +64,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_dnd_global_phone
 CREATE UNIQUE INDEX IF NOT EXISTS idx_dnd_tenant_phone
     ON dnd_numbers (tenant_id, phone_e164) WHERE tenant_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_dnd_tenant_slug_phone
-    ON dnd_numbers (tenant_slug, phone_e164) WHERE tenant_id IS NOT NULL;`
+    ON dnd_numbers (tenant_slug, phone_e164) WHERE tenant_id IS NOT NULL;
+ALTER TABLE dnd_numbers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dnd_numbers FORCE ROW LEVEL SECURITY;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies
+                   WHERE schemaname = current_schema()
+                     AND tablename = 'dnd_numbers'
+                     AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON dnd_numbers
+            USING (tenant_id IS NULL OR CASE
+                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
+                ELSE tenant_id = current_setting('app.tenant_id', true)::uuid
+            END);
+    END IF;
+END
+$$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure dnd_numbers table: %w", err)
 	}
@@ -119,16 +137,20 @@ func (s *Store) ImportGlobalDND(ctx context.Context, phones []string, source str
 }
 
 // AddTenantOptOut records a per-tenant marketing opt-out. Idempotent on
-// (tenant_id, phone_e164).
+// (tenant_id, phone_e164). Runs inside withTenant so the RLS policy
+// hard-enforces the tenant scope of the write.
 func (s *Store) AddTenantOptOut(ctx context.Context, tenantID uuid.UUID, tenantSlug, phone string) error {
 	phone = NormalizePhone(phone)
 	if phone == "" {
 		return fmt.Errorf("tenant opt-out: phone is required")
 	}
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO dnd_numbers (tenant_id, tenant_slug, phone_e164, source)
-		 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-		tenantID, tenantSlug, phone, DNDSourceTenantOptOut)
+	err := s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO dnd_numbers (tenant_id, tenant_slug, phone_e164, source)
+			 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+			tenantID, tenantSlug, phone, DNDSourceTenantOptOut)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("add tenant opt-out: %w", err)
 	}

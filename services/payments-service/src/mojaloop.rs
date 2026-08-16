@@ -90,6 +90,9 @@ struct TransferRequest {
 struct TransferResponse {
     transfer_state: Option<String>,
     completed_timestamp: Option<String>,
+    /// FSPIOP fulfilment (ILP); decoded for forward compatibility with real
+    /// switch responses, not yet used in the payout decision.
+    #[allow(dead_code)]
     fulfilment: Option<String>,
 }
 
@@ -122,7 +125,8 @@ fn minor_to_decimal(amount_cents: u64) -> String {
 impl MojaloopAdapter {
     pub fn new(endpoint: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // RS-006: shared client with 5s connect / 30s overall timeouts.
+            http: crate::http_client(),
             endpoint,
             source_fsp: "opendesk".to_string(),
         }
