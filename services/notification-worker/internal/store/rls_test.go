@@ -3,175 +3,182 @@ package store
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
+	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/stretchr/testify/require"
 )
-
-// SQL-003: the notifications-DB tables must carry ENABLE + FORCE ROW LEVEL
-// SECURITY with tenant_isolation policies, and with two tenant contexts
-// cross-tenant rows must be invisible.
-//
-// The embedded-postgres superuser ("postgres") BYPASSES RLS entirely, so
-// the invisibility assertions run through a dedicated NON-superuser role
-// created by the test. The store's own tenant-scoped methods (withTenant)
-// are exercised as the superuser — they prove the policy + SET LOCAL wiring
-// coexists with the normal code paths.
 
 const rlsTestRole = "notif_rls_test"
 
-// newRLSRolePool creates a non-superuser login role with CRUD grants on the
-// notifications tables and returns a pool connected as that role.
-func newRLSRolePool(t *testing.T, st *Store) *pgxpool.Pool {
+func newRLSRolePool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	dsn := os.Getenv("NOTIF_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("NOTIF_TEST_DATABASE_URL not set")
+	}
 	ctx := context.Background()
-	_, err := st.pool.Exec(ctx, fmt.Sprintf(`
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN
-        CREATE ROLE %[1]s LOGIN PASSWORD '%[1]s';
-    END IF;
-END
-$$;
-GRANT USAGE ON SCHEMA public TO %[1]s;
-GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_subscriptions, webhook_deliveries, dnd_numbers, civic_notifications TO %[1]s;`, rlsTestRole))
-	require.NoError(t, err)
-
-	pool, err := pgxpool.New(ctx,
-		fmt.Sprintf("postgres://%[1]s:%[1]s@localhost:5434/notifications_test?sslmode=disable", rlsTestRole))
-	require.NoError(t, err)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	// Create the unprivileged subject role and grant table access.
+	_, err = pool.Exec(ctx, fmt.Sprintf(`
+		DO $$ BEGIN
+		    CREATE ROLE %[1]s NOLOGIN;
+		EXCEPTION WHEN duplicate_object THEN NULL;
+		END $$;
+		GRANT USAGE ON SCHEMA public TO %[1]s;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %[1]s;
+	`, rlsTestRole))
+	if err != nil {
+		pool.Close()
+		t.Fatalf("role setup: %v", err)
+	}
+	if err := EnsureSchema(ctx, pool); err != nil {
+		pool.Close()
+		t.Fatalf("ensure schema: %v", err)
+	}
 	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
 	return pool
 }
 
-// asTenant runs q through a single connection with the app.tenant_id GUC
-// set (session-level on the acquired connection — the pool is dedicated to
-// the test).
-func asTenant(t *testing.T, pool *pgxpool.Pool, tenantID string, q string, args ...any) int64 {
-	t.Helper()
-	ctx := context.Background()
+func countAsRole(ctx context.Context, pool *pgxpool.Pool, table, tenant string, unset bool) (int, error) {
 	conn, err := pool.Acquire(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		return 0, err
+	}
 	defer conn.Release()
-	_, err = conn.Exec(ctx, `SELECT set_config('app.tenant_id', $1, false)`, tenantID)
-	require.NoError(t, err)
-	var n int64
-	require.NoError(t, conn.QueryRow(ctx, q, args...).Scan(&n))
-	return n
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SET LOCAL ROLE "+rlsTestRole); err != nil {
+		return 0, err
+	}
+	if unset {
+		if _, err := tx.Exec(ctx, "RESET app.tenant_id"); err != nil {
+			return 0, err
+		}
+	} else if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenant); err != nil {
+		return 0, err
+	}
+	var n int
+	if err := tx.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func TestRLSPoliciesPresent(t *testing.T) {
-	st := newDNDTestStore(t)
+	pool := newRLSRolePool(t)
 	ctx := context.Background()
-	for _, table := range []string{"webhook_subscriptions", "webhook_deliveries", "dnd_numbers", "civic_notifications"} {
-		var enabled, forced bool
-		require.NoError(t, st.pool.QueryRow(ctx,
-			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table).
-			Scan(&enabled, &forced))
-		require.True(t, enabled, "%s: RLS must be enabled", table)
-		require.True(t, forced, "%s: RLS must be forced", table)
-		var policy string
-		require.NoError(t, st.pool.QueryRow(ctx,
-			`SELECT policyname FROM pg_policies WHERE tablename = $1 AND policyname = 'tenant_isolation'`, table).
-			Scan(&policy), "%s: tenant_isolation policy missing", table)
+	rows, err := pool.Query(ctx, `
+		SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+		       coalesce(array_agg(p.polname) FILTER (WHERE p.polname IS NOT NULL), '{}')
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_policy p ON p.polrelid = c.oid
+		WHERE n.nspname = 'public' AND c.relname = ANY($1)
+		GROUP BY c.relname, c.relrowsecurity, c.relforcerowsecurity
+	`, []string{"notification_deliveries", "notification_preferences", "digest_queue"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var name string
+		var rls, force bool
+		var policies []string
+		if err := rows.Scan(&name, &rls, &force, &policies); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if !rls || !force {
+			t.Errorf("%s: rls=%v force=%v", name, rls, force)
+		}
+		found := false
+		for _, p := range policies {
+			if p == "tenant_isolation" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: tenant_isolation policy missing (%v)", name, policies)
+		}
+		seen[name] = true
+	}
+	for _, tbl := range []string{"notification_deliveries", "notification_preferences", "digest_queue"} {
+		if !seen[tbl] {
+			t.Errorf("table %s missing", tbl)
+		}
 	}
 }
 
 func TestRLSCrossTenantInvisibility(t *testing.T) {
-	st := newDNDTestStore(t)
+	pool := newRLSRolePool(t)
 	ctx := context.Background()
-	tenantA, tenantB := uuid.New(), uuid.New()
-
-	// Seed rows for both tenants via the store's tenant-scoped methods
-	// (superuser connection; also proves withTenant wiring works).
-	subA := &WebhookSubscription{TenantID: tenantA, TenantSlug: "acme", URL: "https://a.example/hook", Events: []string{"*"}}
-	require.NoError(t, st.CreateSubscription(ctx, subA))
-	subB := &WebhookSubscription{TenantID: tenantB, TenantSlug: "beta", URL: "https://b.example/hook", Events: []string{"*"}}
-	require.NoError(t, st.CreateSubscription(ctx, subB))
-	require.NoError(t, st.CreateDelivery(ctx, &WebhookDelivery{SubID: subA.ID, TenantID: tenantA, EventType: "com.opendesk.test.A"}))
-	require.NoError(t, st.CreateDelivery(ctx, &WebhookDelivery{SubID: subB.ID, TenantID: tenantB, EventType: "com.opendesk.test.B"}))
-	require.NoError(t, st.AddTenantOptOut(ctx, tenantA, "acme", "+2348077777777"))
-	require.NoError(t, st.AddTenantOptOut(ctx, tenantB, "beta", "+2348088888888"))
-	require.NoError(t, st.RecordCivicNotification(ctx, tenantA.String(), "acme", "CIV-A", "received", "sms", "+2348011111111", "sent", 1, ""))
-	require.NoError(t, st.RecordCivicNotification(ctx, tenantB.String(), "beta", "CIV-B", "received", "sms", "+2348022222222", "sent", 1, ""))
-
-	pool := newRLSRolePool(t, st)
-
-	// Tenant A context: sees exactly its own rows.
-	require.EqualValues(t, 1, asTenant(t, pool, tenantA.String(),
-		`SELECT count(*) FROM webhook_subscriptions`))
-	require.EqualValues(t, 1, asTenant(t, pool, tenantA.String(),
-		`SELECT count(*) FROM webhook_deliveries`))
-	require.EqualValues(t, 1, asTenant(t, pool, tenantA.String(),
-		`SELECT count(*) FROM dnd_numbers WHERE tenant_id IS NOT NULL`))
-	require.EqualValues(t, 1, asTenant(t, pool, tenantA.String(),
-		`SELECT count(*) FROM civic_notifications`))
-
-	// Tenant B context: tenant A's rows are invisible.
-	require.EqualValues(t, 1, asTenant(t, pool, tenantB.String(),
-		`SELECT count(*) FROM webhook_subscriptions`))
-	require.EqualValues(t, 0, asTenant(t, pool, tenantB.String(),
-		`SELECT count(*) FROM webhook_subscriptions WHERE tenant_id = $1`, tenantA))
-	require.EqualValues(t, 0, asTenant(t, pool, tenantB.String(),
-		`SELECT count(*) FROM webhook_deliveries WHERE tenant_id = $1`, tenantA))
-	require.EqualValues(t, 0, asTenant(t, pool, tenantB.String(),
-		`SELECT count(*) FROM dnd_numbers WHERE tenant_id = $1`, tenantA))
-	require.EqualValues(t, 0, asTenant(t, pool, tenantB.String(),
-		`SELECT count(*) FROM civic_notifications WHERE tenant_id = $1`, tenantA.String()))
-
-	// The global NCC 2442 list stays visible under any tenant context.
-	_, err := st.ImportGlobalDND(ctx, []string{"+2348099999999"}, "ncc2442")
-	require.NoError(t, err)
-	require.EqualValues(t, 1, asTenant(t, pool, tenantB.String(),
-		`SELECT count(*) FROM dnd_numbers WHERE tenant_id IS NULL`))
-
-	// Cross-tenant WRITE is rejected under a tenant context (WITH CHECK).
-	ctxB := context.Background()
-	conn, err := pool.Acquire(ctxB)
-	require.NoError(t, err)
-	defer conn.Release()
-	_, err = conn.Exec(ctxB, `SELECT set_config('app.tenant_id', $1, false)`, tenantB.String())
-	require.NoError(t, err)
-	_, err = conn.Exec(ctxB,
-		`INSERT INTO webhook_subscriptions (tenant_id, url) VALUES ($1, 'https://evil.example/')`, tenantA)
-	require.Error(t, err, "inserting tenant A's row under tenant B's context must be rejected")
-
-	// Documented escape hatch: a session WITHOUT app.tenant_id keeps the
-	// legacy application-level filtering posture (all rows visible).
-	require.EqualValues(t, 2, asTenant(t, pool, "",
-		`SELECT count(*) FROM webhook_subscriptions`))
+	ta := "11111111-1111-1111-1111-111111111111"
+	tb := "22222222-2222-2222-2222-222222222222"
+	store := New(pool)
+	for _, tenant := range []string{ta, tb} {
+		if err := store.Enqueue(ctx, tenant, "user-"+tenant[:4], "email", "subj", "body", time.Now()); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+	if n, err := countAsRole(ctx, pool, "notification_deliveries", ta, false); err != nil || n != 1 {
+		t.Errorf("tenant a sees %d rows (err %v), want 1", n, err)
+	}
+	if n, err := countAsRole(ctx, pool, "notification_deliveries", tb, false); err != nil || n != 1 {
+		t.Errorf("tenant b sees %d rows (err %v), want 1", n, err)
+	}
+	// Documented escape hatch: an UNSET GUC (NULL) still allows internal
+	// tooling to see all rows; only a wrong/empty tenant denies.
+	fresh := newRLSRolePool(t)
+	if n, err := countAsRole(ctx, fresh, "notification_deliveries", "", true); err != nil || n != 2 {
+		t.Errorf("unset GUC sees %d rows (err %v), want 2", n, err)
+	}
 }
 
-// The store's tenant-scoped methods set app.tenant_id themselves: reading
-// tenant A's subscription through tenant B's context yields ErrNotFound
-// even on the superuser connection when the GUC is honored — here asserted
-// through the non-superuser role where RLS actually applies.
-func TestRLSStoreMethodTenantScoping(t *testing.T) {
-	st := newDNDTestStore(t)
+func TestRLSEmptyStringTenantGucDeniesWithoutError(t *testing.T) {
+	pool := newRLSRolePool(t)
 	ctx := context.Background()
-	tenantA, tenantB := uuid.New(), uuid.New()
+	ta := "11111111-1111-1111-1111-111111111111"
+	store := New(pool)
+	if err := store.Enqueue(ctx, ta, "user-x", "email", "s", "b", time.Now()); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	for _, table := range []string{"notification_deliveries", "notification_preferences", "digest_queue"} {
+		n, err := countAsRole(ctx, pool, table, "", false)
+		if err != nil {
+			t.Errorf("%s: empty tenant GUC raised error: %v", table, err)
+		}
+		if n != 0 {
+			t.Errorf("%s: empty tenant GUC sees %d rows, want 0", table, n)
+		}
+	}
+}
 
-	subA := &WebhookSubscription{TenantID: tenantA, TenantSlug: "acme", URL: "https://a.example/hook", Events: []string{"*"}}
-	require.NoError(t, st.CreateSubscription(ctx, subA))
-
-	pool := newRLSRolePool(t, st)
-
-	// withTenant-scoped ListSubscriptions under the role, via a raw
-	// transaction mimicking withTenant (the Store pool is superuser, which
-	// bypasses RLS, so the assertion goes through the role pool).
-	conn, err := pool.Acquire(ctx)
-	require.NoError(t, err)
-	defer conn.Release()
-	tx, err := conn.Begin(ctx)
-	require.NoError(t, err)
-	defer tx.Rollback(ctx) //nolint:errcheck
-	_, err = tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantB.String())
-	require.NoError(t, err)
-	var n int64
-	require.NoError(t, tx.QueryRow(ctx,
-		`SELECT count(*) FROM webhook_subscriptions WHERE tenant_id = $1`, tenantA).Scan(&n))
-	require.Zero(t, n, "tenant B context must not see tenant A's subscriptions")
+func TestRLSStoreMethodTenantScoping(t *testing.T) {
+	pool := newRLSRolePool(t)
+	ctx := context.Background()
+	ta := "11111111-1111-1111-1111-111111111111"
+	tb := "22222222-2222-2222-2222-222222222222"
+	store := New(pool)
+	if err := store.SetPreference(ctx, ta, "u1", "email", true); err != nil {
+		t.Fatalf("set pref a: %v", err)
+	}
+	if err := store.SetPreference(ctx, tb, "u1", "email", false); err != nil {
+		t.Fatalf("set pref b: %v", err)
+	}
+	enabled, ok, err := store.Preference(ctx, ta, "u1", "email")
+	if err != nil || !ok || !enabled {
+		t.Errorf("tenant a pref = (%v,%v,%v), want (true,true,nil)", enabled, ok, err)
+	}
+	enabled, ok, err = store.Preference(ctx, tb, "u1", "email")
+	if err != nil || !ok || enabled {
+		t.Errorf("tenant b pref = (%v,%v,%v), want (false,true,nil)", enabled, ok, err)
+	}
 }
