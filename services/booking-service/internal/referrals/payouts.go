@@ -229,7 +229,7 @@ func (c *PaystackClient) TransferStatus(ctx context.Context, providerRef string)
 	if ref == "" {
 		ref = env.Data.Reference
 	}
-	return TransferStatusResult{ProviderRef: ref, Status: env.Data.Status, AmountNGN: env.Data.Amount}, nil
+	return TransferResult{ProviderRef: ref, Status: env.Data.Status, AmountNGN: env.Data.Amount}, nil
 }
 
 func truncate(s string, n int) string {
@@ -466,7 +466,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'commission_payouts' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON commission_payouts
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
