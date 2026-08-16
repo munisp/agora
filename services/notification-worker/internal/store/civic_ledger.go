@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // CivicNotification mirrors one civic_notifications ledger row.
@@ -49,7 +50,25 @@ CREATE TABLE IF NOT EXISTS civic_notifications (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_civic_notifications_ref
-    ON civic_notifications (tenant_slug, ref, created_at DESC);`
+    ON civic_notifications (tenant_slug, ref, created_at DESC);
+ALTER TABLE civic_notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE civic_notifications FORCE ROW LEVEL SECURITY;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_policies
+                   WHERE schemaname = current_schema()
+                     AND tablename = 'civic_notifications'
+                     AND policyname = 'tenant_isolation') THEN
+        -- tenant_id is TEXT here (civic refs are not UUID-keyed), so the
+        -- policy compares the GUC without the ::uuid cast.
+        CREATE POLICY tenant_isolation ON civic_notifications
+            USING (CASE
+                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
+                ELSE tenant_id = current_setting('app.tenant_id', true)
+            END);
+    END IF;
+END
+$$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure civic_notifications table: %w", err)
 	}
@@ -57,12 +76,16 @@ CREATE INDEX IF NOT EXISTS idx_civic_notifications_ref
 }
 
 // RecordCivicNotification appends one ledger row (id generated). Outcome
-// must be sent|failed|escalated (CHECK constraint).
+// must be sent|failed|escalated (CHECK constraint). Runs inside withTenant
+// so the RLS policy hard-enforces the tenant scope of the write.
 func (s *Store) RecordCivicNotification(ctx context.Context, tenantID, tenantSlug, ref, status, channel, phone, outcome string, attempt int, errText string) error {
 	const q = `INSERT INTO civic_notifications
 	    (tenant_id, tenant_slug, ref, status, channel, phone_e164, outcome, attempt, error)
 	    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`
-	_, err := s.pool.Exec(ctx, q, tenantID, tenantSlug, ref, status, channel, NormalizePhone(phone), outcome, attempt, errText)
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, q, tenantID, tenantSlug, ref, status, channel, NormalizePhone(phone), outcome, attempt, errText)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("record civic notification: %w", err)
 	}

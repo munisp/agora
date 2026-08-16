@@ -1,0 +1,49 @@
+# industries/SHA256SUMS — W39 SIM-027 pack integrity manifest.
+#
+# Verification contract: a loader (voice-agent-runtime pack registry or CI)
+# MUST recompute `sha256sum <file>` for every industries/*.yaml and compare
+# against this manifest BEFORE registering pack tools/personas; any mismatch
+# or missing entry = tampered/unsigned pack = refuse to load (fail closed).
+# Regenerate after ANY industries/*.yaml edit:
+#   (cd industries && sha256sum *.yaml > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
+# (prepend this header afterwards — it is stripped by sha256sum -c).
+# Verify: (cd industries && sha256sum -c SHA256SUMS)
+# Loader-side enforcement is a code change owned elsewhere (see HANDOFF).
+ab229564d289dd9eebfc3f075815f86efe467c91e2294c01ed4e196f9c63766f  agri-input.yaml
+a67fba8f40ebb55462f111b6ba8c19caedc4e2081787e4f3843054db93359d92  agriculture.yaml
+048a86ea552fd5c1bdbb9ba55ad6bf3c881766dd237eb3bac8fc9a5abc00ad69  agritech.yaml
+f61525270e1b2427d8311f40cd3db39f1975265b3cf75fe6d8154e2d785e4b25  b2b-saas.yaml
+81b147842f2919144170a9c7738288d30390a5b3553beb8a3f69e67a811691de  banking.yaml
+09f1ac581ffe729e88b490a2f83b78cfb3eccf05153c5e47e2694de30e3dde66  civic-services.yaml
+6a4e80db039853f85553730b46409752659797bb65ed29a94e1a49125d47d0d0  clinic.yaml
+72692e34693524d3474f058d769722111ef290f276caf56b15e069e95815e3bb  consultancy.yaml
+f1f23cc536d2cadc2453c9aad11d224c3180dd9af36f24a7bb6871656bef59af  ecommerce-d2c.yaml
+4196e5f66c0caf9afcddc6fe8064890e9c116b8569f2ba150f052d2179e4fa7b  ecommerce.yaml
+748e854362f8f60587550a7b377cf4c46bc2c984f88ea36dade14041728bfbc8  edtech.yaml
+f77e480b41bd0214736a6f98c4fe0d791ac709ba032af2512f8e6f4fdb99d622  education.yaml
+26e8e6ffef8f2d68bae6b8cd79c66a090db7eb8df8c97e4fd2022782df150941  entertainment.yaml
+005f4871a26a7201fed607d90a764eaf2410d93c4f9b526e48f5a84e9d50ec38  fashion.yaml
+4b13e429967e0d500078de571d0754ff6a152b5b9b49c9f0268ec041b7d756bb  fintech-agent-banking.yaml
+4b3e7b232d77fe957e005dcbe47167d93acf9c55562aa95fca40a7bbddcc4b87  fmcg-retail.yaml
+34bbf1444fd6f0ed0ffadc5ed1fac8cc568da468fa5f83ec1447d9b55ded7b81  government.yaml
+ebb6b95e3c3fe6e7aa161d77293dc698905cfa271d3fe7fcda958058def9fb5d  healthcare.yaml
+e8442646bb73845e9505566f553918f92dd47d71961c66e76c8d93356311c9e7  healthtech.yaml
+ed125efaa03e5d9335ed4d3397e2faebe834e64239287fed142793f7be36721d  hospitality.yaml
+a1a5aff9c0972c3863638ce7003ba15ae1f8b2661d8beb54b28f3a63cabb615a  insurance.yaml
+3cc90039a3b22b4494af9bc782f66db68b87e509b697b818f34e9877cb1f3d01  isp-installer.yaml
+6374958e073e2f0696ce2cf78e4c4d03f507ab8a0a480b01e20631d621a7b260  law-enforcement.yaml
+57c13d3563fc9fef5f13bd7fc4590e10da1525e89c734a0f40f261ff59dc1d12  legal-aid.yaml
+3c18a26449375954e0190b25be3f51f305d8d76252170acdb017b33edf268508  logistics.yaml
+0ef068b910b3d6ac6cd667b0a13d7c2dddca424472e9132188c0a0397d09e520  microfinance.yaml
+f041cdcb299814ce0cde680179cdc2a0e3273a53e4ced5a1e564c30942c89c30  neighborhood-watch.yaml
+963f7b2a08286a5984eb6d26b71a2ddffbb6c37628885e97ae51bc857a2188e3  nigeria-sme.yaml
+5fd18bfc665d8c9b25152e688d97230968700e6ab96df81291331033709d2009  pharmacy.yaml
+c24910519e249e6a92271951c197139f66d4a627c57c3af042944dd40a9aab78  recruitment.yaml
+5f01855448db02587cbb9df8ff6d2ea28f03c29751b360a0af5772bb8f880c37  religious.yaml
+4e2e92f5be1bc624ce7d260b8d279976fa5c96cc3d8974ceb0d01126db604fbd  salon.yaml
+f52d35f82a8c6ade0716586180df9ecf5970c206330856f231ded87951c32126  stock-brokerage.yaml
+e9b170331d46631c0c9fc4afe73c407a9b7a945af77feffb0443847dc678ba1a  support-desk.yaml
+c30df6a42381969493d51d0395440a4a144ff1b41c41adc12e92f5e9bd00ca3d  transportation.yaml
+5602718f53b5800094d53d2e27d148823562ab064d45403a5cf129a567c0fa83  travel.yaml
+09101a5b040cc3f2db44e8da8e8adb0f4a066a020f069c7cc63c97ae55779977  utilities-payg.yaml
+6bd5591812043c1f8583dd5dc62a6c2670d0ec066d4dbd0f0df93b9a90e983e2  vocational.yaml

@@ -23,6 +23,10 @@ pub struct Config {
     pub fluvio_endpoint: String,
     pub fluvio_transcripts_topic: String,
     pub fluvio_partitions: i32,
+    /// Explicit opt-in to run the no-op Fluvio stub (builds without the
+    /// `fluvio-live` feature). Default OFF: the service refuses to start
+    /// rather than silently simulate transcript consumption.
+    pub fluvio_stub_allowed: bool,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -43,6 +47,7 @@ impl Config {
             kafka_brokers: env_or("KAFKA_BROKERS", "kafka:9092"),
             kafka_group_id: env_or("KAFKA_GROUP_ID", "gateway-edge"),
             booking_events_topic: env_or("BOOKING_EVENTS_TOPIC", "opendesk.booking.events"),
+            enriched_topic: env_or("ENRICHED_TOPIC", "opendesk.conversation.enriched"),
             jwks_url: env_or(
                 "KEYCLOAK_JWKS_URL",
                 "http://keycloak:8080/realms/opendesk/protocol/openid-connect/certs",
@@ -58,6 +63,36 @@ impl Config {
                 "opendesk.transcripts-raw",
             ),
             fluvio_partitions: env_parse("FLUVIO_PARTITIONS", 6),
+            fluvio_stub_allowed: env_parse("GATEWAY_EDGE_ALLOW_SIM", false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for RS-003: `enriched_topic` must be a real, parsed field
+    /// of `Config` (the default build previously failed with E0063: missing
+    /// field in initializer) and the Fluvio stub must default to fail-closed.
+    #[test]
+    fn from_env_parses_enriched_topic_and_stub_opt_in() {
+        std::env::remove_var("ENRICHED_TOPIC");
+        std::env::remove_var("GATEWAY_EDGE_ALLOW_SIM");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.enriched_topic, "opendesk.conversation.enriched");
+        assert!(
+            !cfg.fluvio_stub_allowed,
+            "fluvio stub must be opt-in, default OFF"
+        );
+
+        std::env::set_var("ENRICHED_TOPIC", "custom.enriched");
+        std::env::set_var("GATEWAY_EDGE_ALLOW_SIM", "true");
+        let cfg = Config::from_env();
+        assert_eq!(cfg.enriched_topic, "custom.enriched");
+        assert!(cfg.fluvio_stub_allowed);
+
+        std::env::remove_var("ENRICHED_TOPIC");
+        std::env::remove_var("GATEWAY_EDGE_ALLOW_SIM");
     }
 }

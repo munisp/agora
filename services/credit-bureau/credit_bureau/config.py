@@ -27,8 +27,11 @@ def _str(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    # HTTP server.
-    port: int = field(default_factory=lambda: _int("PORT", 7017))
+    # HTTP server. Default 7022: 7017 collides with fraud-engine (PY-004);
+    # 7016-7019 are taken (graph-ml, fraud-engine, graph-ml-gpu host publish,
+    # model-registry) and 7020/7021 appear in industries/ecommerce.yaml
+    # plugin URLs, so 7022 is the lowest verified-free port.
+    port: int = field(default_factory=lambda: _int("PORT", 7022))
     host: str = field(default_factory=lambda: _str("HOST", "0.0.0.0"))
 
     # Learned-scorer registry root (invariant I4: resolution is

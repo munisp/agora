@@ -77,6 +77,7 @@ func WebhookDeliveryWorkflow(ctx workflow.Context, in WebhookDeliveryInput) erro
 		RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 1},
 	})
 	maxAttempts := len(WebhookBackoff) + 1
+	log := workflow.GetLogger(ctx)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		var statusCode int
 		err := workflow.ExecuteActivity(ao, ActivityDeliverWebhookHTTP, in).Get(ctx, &statusCode)
@@ -88,11 +89,16 @@ func WebhookDeliveryWorkflow(ctx workflow.Context, in WebhookDeliveryInput) erro
 		case err == nil && statusCode >= 200 && statusCode < 300:
 			upd.Status = "delivered"
 			// A bookkeeping failure must not redeliver — swallow with a log.
-			_ = workflow.ExecuteActivity(ao, ActivityUpdateWebhookDelivery, upd).Get(ctx, nil)
+			if uerr := workflow.ExecuteActivity(ao, ActivityUpdateWebhookDelivery, upd).Get(ctx, nil); uerr != nil {
+				log.Warn("webhook delivery bookkeeping failed (terminal delivered)", "delivery_id", in.DeliveryID, "error", uerr)
+			}
 			return nil
 		case attempt == maxAttempts:
 			upd.Status = "dlq"
-			_ = workflow.ExecuteActivity(ao, ActivityUpdateWebhookDelivery, upd).Get(ctx, nil)
+			// A bookkeeping failure must not redeliver — swallow with a log.
+			if uerr := workflow.ExecuteActivity(ao, ActivityUpdateWebhookDelivery, upd).Get(ctx, nil); uerr != nil {
+				log.Warn("webhook delivery bookkeeping failed (terminal dlq)", "delivery_id", in.DeliveryID, "error", uerr)
+			}
 			return nil
 		default:
 			upd.Status = "retrying"

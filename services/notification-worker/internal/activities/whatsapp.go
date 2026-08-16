@@ -7,14 +7,15 @@ package activities
 // quiet-hours deferred workflow-side) exactly like the sms marketing kinds.
 //
 // Transport idiom: DIRECT Meta Cloud API call from the worker via
-// internal/provider.WhatsApp — the FCM_MOCK posture from SPEC-W16
-// (WHATSAPP_MOCK=1 zero-config default: the mock logs the send and returns
-// a deterministic fake wamid, no network). The messaging-gateway is NOT
-// involved: its /v1/whatsapp/send endpoint predates this contract and
-// carries neither the template language nor positional params, and the
-// established worker-side provider seam (internal/provider, FCM) is the
-// documented pattern for credential-bearing outbound sends with a mock
-// default.
+// internal/provider.WhatsApp. Mock posture (SIM-011): WHATSAPP_MOCK
+// defaults OFF — the deterministic mock (no network, fake wamid) is an
+// explicit dev/test opt-in; with the mock off and no Cloud API credentials
+// configured, sends fail closed with an explicit error. The
+// messaging-gateway is NOT involved: its /v1/whatsapp/send endpoint
+// predates this contract and carries neither the template language nor
+// positional params, and the established worker-side provider seam
+// (internal/provider, FCM) is the documented pattern for
+// credential-bearing outbound sends.
 
 import (
 	"context"
@@ -33,15 +34,15 @@ type WhatsAppSender interface {
 
 // WhatsAppDeps bundles the WhatsApp campaign dependencies; set by main
 // after New. A nil Provider falls back to provider.NewWhatsAppFromEnv at
-// send time, so the WHATSAPP_MOCK=1 zero-config default works WITHOUT
-// main/config edits (integrator may wire an explicit provider later,
-// mirroring PushDeps).
+// send time (WHATSAPP_MOCK defaults OFF — SIM-011), so the seam works
+// WITHOUT main/config edits (integrator may wire an explicit provider
+// later, mirroring PushDeps).
 type WhatsAppDeps struct {
 	Provider WhatsAppSender
 }
 
 // whatsappSender resolves the send provider: the wired dependency first,
-// else the env-derived provider (WHATSAPP_MOCK default "1").
+// else the env-derived provider (WHATSAPP_MOCK default OFF, SIM-011).
 func (a *Activities) whatsappSender() WhatsAppSender {
 	if a.WhatsApp.Provider != nil {
 		return a.WhatsApp.Provider

@@ -85,6 +85,7 @@ async fn record_usage_data(
 
 /// Exposed for tests and potential admin tooling: the tenant a usage event
 /// belongs to (used for structured logging).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn event_tenant(event: &RawCloudEvent) -> Option<Uuid> {
     serde_json::from_value::<UsageRecordData>(event.data.clone())
         .ok()

@@ -76,6 +76,7 @@ export default async function OrgLayout({
           <Link
             href={`/p/${orgSlug}`}
             target="_blank"
+            rel="noreferrer noopener"
             className="flex items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground"
           >
             <ExternalLink className="h-4 w-4" />

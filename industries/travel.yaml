@@ -100,14 +100,10 @@ dashboardLabels:
 # tenant_slug, tenant_id); the host must pass the runtime's
 # PLUGIN_ALLOWED_HOSTS SSRF allowlist (default booking,knowledge,identity).
 #
-# DEMO ADAPTER: check_flight_status currently points at the gateway-edge
-# health endpoint as a stand-in that always answers. Replace the url with the
-# Amadeus flight-status plugin endpoint (plugin-amadeus, allowlisted via
-# PLUGIN_ALLOWED_HOSTS) when that plugin lands. GET carries no body, so
-# bodyTemplate is intentionally omitted (the pack validator requires it to be
-# a string when present).
-customTools:
-- name: check_flight_status
-  description: Check flight status (demo adapter) for a flight number and date before confirming airport pickup timing.
-  method: GET
-  url: http://gateway-edge:7005/healthz
+# W39 SIM-016/017: the `check_flight_status` customTool was REMOVED — it
+# pointed at the gateway-edge /healthz demo adapter (always-on stand-in), not
+# a real flight-status backend (the plugin-amadeus sidecar does not exist in
+# this repo). A listed-but-unimplemented tool is a runtime lie; re-add only
+# when the Amadeus plugin endpoint lands (allowlisted via
+# PLUGIN_ALLOWED_HOSTS). GET carries no body, so bodyTemplate is omitted.
+

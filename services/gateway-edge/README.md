@@ -44,10 +44,11 @@ Transcript records route on `tenantId`.
   `gateway-edge`, offset reset `latest`.
 - **Fluvio (live tail)**: `opendesk.transcripts-raw`, one partition consumer
   per partition, streaming from `Offset::end()`. Compiled with
-  `--features fluvio-live`; the default build ships a stub that logs and
-  idles (SPEC §5: Fluvio mirror + Kafka fallback). The integration surface is
-  isolated in `src/fluvio_consumer.rs` in case the pinned `fluvio` crate
-  version drifts.
+  `--features fluvio-live`; the default build ships a stub that is
+  **fail-closed** — the service refuses to start unless the operator
+  explicitly opts in with `GATEWAY_EDGE_ALLOW_SIM=true` (SPEC §5: Fluvio mirror
+  + Kafka fallback). The integration surface is isolated in
+  `src/fluvio_consumer.rs` in case the pinned `fluvio` crate version drifts.
 
 ## Env vars
 
@@ -58,6 +59,7 @@ Transcript records route on `tenantId`.
 | `KAFKA_BROKERS` | `kafka:9092` | Kafka bootstrap servers |
 | `KAFKA_GROUP_ID` | `gateway-edge` | consumer group |
 | `BOOKING_EVENTS_TOPIC` | `opendesk.booking.events` | booking events topic |
+| `ENRICHED_TOPIC` | `opendesk.conversation.enriched` | enriched turns topic (→ `/ws/intel`) |
 | `KEYCLOAK_JWKS_URL` | `http://keycloak:8080/realms/opendesk/protocol/openid-connect/certs` | JWKS endpoint |
 | `KEYCLOAK_ISSUER` | `http://keycloak:8080/realms/opendesk` | expected `iss` |
 | `KEYCLOAK_AUDIENCE` | _(unset)_ | expected `aud` (validated when set) |
@@ -67,6 +69,7 @@ Transcript records route on `tenantId`.
 | `FLUVIO_ENDPOINT` | `fluvio:9003` | Fluvio SC endpoint |
 | `FLUVIO_TRANSCRIPTS_TOPIC` | `opendesk.transcripts-raw` | transcripts topic |
 | `FLUVIO_PARTITIONS` | `6` | partitions to tail (SPEC §4: 6 partitions) |
+| `GATEWAY_EDGE_ALLOW_SIM` | `false` | explicit opt-in to run without the Fluvio transcript tail in builds lacking `--features fluvio-live`; when unset/false the service **refuses to start** rather than silently simulate consumption |
 
 ## Run
 
