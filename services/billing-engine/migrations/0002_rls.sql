@@ -11,7 +11,7 @@
 --     is why services must connect with the per-service roles from
 --     05-app-roles.sql in any security-sensitive deployment);
 --   * a PUBLIC `tenant_isolation` policy keyed on the request-scoped GUC
---       tenant_id = current_setting('app.tenant_id', true)::uuid
+--       tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
 --     The GUC is set TRANSACTION-LOCALLY (`SELECT set_config(..., true)`) by
 --     billing-engine at the start of every transaction that touches tenant
 --     tables (see src/tenant.rs). With the GUC unset, current_setting returns
@@ -106,27 +106,27 @@ ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_records FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON usage_records;
 CREATE POLICY tenant_isolation ON usage_records
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_billing_internal', 'member'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_billing_internal', 'member'));
 
 ALTER TABLE rate_cards ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rate_cards FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON rate_cards;
 CREATE POLICY tenant_isolation ON rate_cards
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_billing_internal', 'member'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_billing_internal', 'member'));
 
 ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
 ALTER TABLE invoices FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON invoices;
 CREATE POLICY tenant_isolation ON invoices
-    USING (tenant_id = current_setting('app.tenant_id', true)::uuid
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_billing_internal', 'member'))
-    WITH CHECK (tenant_id = current_setting('app.tenant_id', true)::uuid
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_billing_internal', 'member'));
 
 -- ---------------------------------------------------------------------------
@@ -137,16 +137,16 @@ ALTER TABLE processed_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE processed_events FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_context_required ON processed_events;
 CREATE POLICY tenant_context_required ON processed_events
-    USING (current_setting('app.tenant_id', true) IS NOT NULL
+    USING (NULLIF(current_setting('app.tenant_id', true), '') IS NOT NULL
            OR pg_has_role(current_user, 'app_billing_internal', 'member'))
-    WITH CHECK (current_setting('app.tenant_id', true) IS NOT NULL
+    WITH CHECK (NULLIF(current_setting('app.tenant_id', true), '') IS NOT NULL
            OR pg_has_role(current_user, 'app_billing_internal', 'member'));
 
 ALTER TABLE plan_presets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE plan_presets FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_context_required ON plan_presets;
 CREATE POLICY tenant_context_required ON plan_presets
-    USING (current_setting('app.tenant_id', true) IS NOT NULL
+    USING (NULLIF(current_setting('app.tenant_id', true), '') IS NOT NULL
            OR pg_has_role(current_user, 'app_billing_internal', 'member'))
-    WITH CHECK (current_setting('app.tenant_id', true) IS NOT NULL
+    WITH CHECK (NULLIF(current_setting('app.tenant_id', true), '') IS NOT NULL
            OR pg_has_role(current_user, 'app_billing_internal', 'member'));

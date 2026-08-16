@@ -3,6 +3,10 @@
 These tests run ONLY against a live docker host with the full OpenDesk
 compose stack (see README.md). Everything below is real: no mocks, no fakes.
 Set E2E_COMPOSE_UP=1 to have the fixture bring the stack up itself.
+
+The stack fixture exports AUTHZ_DISABLED=true and E2E_FIXTURES=1 (in the
+environment of the `docker compose` processes it spawns) for the stack it
+manages — an e2e-only posture; neither is a code default.
 """
 from __future__ import annotations
 
@@ -44,10 +48,16 @@ COMPOSE_DOWN = os.environ.get("E2E_COMPOSE_DOWN") == "1"
 HEALTH_TIMEOUT_S = int(os.environ.get("E2E_HEALTH_TIMEOUT", "600"))
 
 
-def run(cmd: list[str], timeout: int = 60, check: bool = True, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run(
+    cmd: list[str],
+    timeout: int = 60,
+    check: bool = True,
+    cwd: Path | None = None,
+    env: dict | None = None,
+) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd, capture_output=True, text=True, timeout=timeout, check=check,
-        cwd=cwd or REPO_ROOT,
+        cwd=cwd or REPO_ROOT, env=env,
     )
 
 
@@ -86,12 +96,20 @@ def stack():
     if not docker_available():
         pytest.skip("no docker host available (e2e requires docker + compose)")
 
+    # E2E-only posture: the stack this fixture manages gets an EXPLICIT
+    # opt-in to the dev auth seam (X-Tenant-Slug / X-Tenant-Id pass-through)
+    # and the graph internal-fixtures seed route. Post-W39 SIM-028,
+    # infra/docker-compose.graph.yml (lines ~211-237) defaults these
+    # fail-closed (${AUTHZ_DISABLED:-false} / ${E2E_FIXTURES:-0}), so an
+    # unset env no longer silently disables authz or enables fixtures —
+    # e2e must opt in explicitly here. NEVER mirrored into production env.
+    e2e_stack_env = {**os.environ, "AUTHZ_DISABLED": "true", "E2E_FIXTURES": "1"}
     if COMPOSE_UP:
-        run(["docker", "compose", "up", "-d", "--build"], timeout=3600)
+        run(["docker", "compose", "up", "-d", "--build"], timeout=3600, env=e2e_stack_env)
     if COMPOSE_DOWN:
         # Schedule teardown regardless of test outcome.
         def _down():
-            run(["docker", "compose", "down"], timeout=600, check=False)
+            run(["docker", "compose", "down"], timeout=600, check=False, env=e2e_stack_env)
         import atexit
         atexit.register(_down)
 

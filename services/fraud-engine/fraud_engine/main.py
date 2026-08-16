@@ -35,9 +35,11 @@ log = logging.getLogger("fraud_engine")
 
 # Event-type substring -> detectors to trigger (SPEC-W30 §3: D3 on capture
 # events, D5 on consent/messaging events; SPEC-W32 §3 WS-D: D8 on civic
-# case events).
+# case events). "funnel" covers com.opendesk.cac.FunnelEvent, the REAL type
+# produced on cac.events by booking-service leads.go (EventTypeFunnel);
+# "capture"/"lead" are kept for legacy-type compatibility.
 EVENT_TRIGGERS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("capture", "lead"), ("d3_capture_velocity",)),
+    (("capture", "lead", "funnel"), ("d3_capture_velocity",)),
     (("consent", "messag"), ("d5_consent_backdating",)),
     (("civic",), ("d8_report_spam",)),
 )
