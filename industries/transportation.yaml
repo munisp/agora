@@ -1,7 +1,7 @@
 # Transportation industry pack (SPEC-CRM §C) — airline, train and bus
 # operators under one travel-operations desk. Full prepayment at ticketing;
 # SupportEscalationWorkflow handles disruption (delays, cancellations,
-# missed connections). Includes a check_schedule demo custom tool.
+# missed connections).
 id: transportation
 displayName: Transportation (Airline · Train · Bus)
 terminology:

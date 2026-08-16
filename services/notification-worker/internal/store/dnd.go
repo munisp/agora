@@ -75,8 +75,8 @@ BEGIN
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON dnd_numbers
             USING (tenant_id IS NULL OR CASE
-                WHEN coalesce(current_setting('app.tenant_id', true), '') = '' THEN true
-                ELSE tenant_id = current_setting('app.tenant_id', true)::uuid
+                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
+                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
             END);
     END IF;
 END

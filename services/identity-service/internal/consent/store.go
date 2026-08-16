@@ -91,7 +91,7 @@ BEGIN
                      AND tablename = 'consents'
                      AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON consents
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END
 $$;`

@@ -51,6 +51,30 @@ def test_app_role_cannot_cross_tenants(app_dsn, super_dsn):
     assert _read_as(super_dsn, None) == 0
 
 
+def test_empty_string_tenant_guc_denies_without_error(app_dsn, super_dsn):
+    """W40-6: a recycled pool connection may carry app.tenant_id='' (EMPTY
+    string, not NULL). A bare current_setting('app.tenant_id', true) uuid-cast qual
+    RAISES `invalid input syntax for type uuid: ""` on '' instead of failing
+    closed; the NULLIF-wrapped qual must make '' evaluate NULL → deny-by-default:
+    every tenant table returns 0 rows WITHOUT raising (the internal-role
+    escape via pg_has_role stays available to batch role only)."""
+    store = RegistryStore(app_dsn)
+    store.register_version(family="fraud-clf", tenant_id=TENANT_A,
+                           artifact_uri="s3://x/v1", version=1)
+    store.register_version(family="fraud-clf", tenant_id=TENANT_B,
+                           artifact_uri="s3://x/v1", version=1)
+    with psycopg.connect(_dsn_as(super_dsn, APP_ROLE)) as conn:
+        # Session-level empty string — the recycled-connection state.
+        conn.execute("SELECT set_config('app.tenant_id', '', false)")
+        guc = conn.execute(
+            "SELECT current_setting('app.tenant_id', true)").fetchone()[0]
+        assert guc == ""
+        for tbl in ("model_version", "experiments", "experiment_outcomes",
+                    "feature_observations", "score_observations"):
+            n = conn.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
+            assert n == 0, f"{tbl} visible under empty-string tenant GUC"
+
+
 def test_batch_role_sees_across_tenants(app_dsn, super_dsn):
     # internal batch jobs (drift sweep / nightly trainer) connect as the batch
     # role and enumerate all tenants WITHOUT any tenant GUC (GF1 mechanism).
