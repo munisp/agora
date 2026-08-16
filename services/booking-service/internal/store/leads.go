@@ -134,7 +134,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'leads' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON leads
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -154,7 +154,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'promo_codes' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON promo_codes
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -172,7 +172,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'promo_redemptions' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON promo_redemptions
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -192,7 +192,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'campaigns' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON campaigns
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
 
@@ -213,7 +213,7 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'campaign_spend' AND policyname = 'tenant_isolation') THEN
         CREATE POLICY tenant_isolation ON campaign_spend
-            USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
