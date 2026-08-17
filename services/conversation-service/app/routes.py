@@ -32,10 +32,17 @@ async def _require_tenant(
 ) -> uuid.UUID:
     """Tenant scope comes from ?tenant= or X-Tenant-ID (required by RLS).
 
+    J-14 fail-closed rule (SPEC-W42): a request whose tenant context cannot
+    be resolved NEVER reaches a tenant-scoped query with app.tenant_id
+    unset — missing scope is rejected 401 here (no app-level fallback
+    filtering on RLS tables), an unknown slug is 404, and an
+    identity-service outage with no cache is 502.
+
     ?tenant= accepts a UUID (back-compat) OR a tenant slug (admin-web passes
     the org slug, e.g. ?tenant=acme): non-UUID values are resolved through
     identity-service via the app-state TenantResolver (Dapr invoke, same
-    mechanism as booking-service / analytics-pipeline)."""
+    mechanism as booking-service / analytics-pipeline). The X-Tenant-ID UUID
+    fast path is unchanged: a valid header UUID is used as-is."""
     if tenant is not None:
         try:
             return uuid.UUID(tenant)
@@ -57,8 +64,10 @@ async def _require_tenant(
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
         return uuid.UUID(info.id)
     if header_tenant is None:
+        # J-14: fail closed — no tenant scope means NO tenant-scoped query
+        # runs (401, not an app-level filtered read with the GUC unset).
         raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
+            status.HTTP_401_UNAUTHORIZED,
             "tenant scope required: ?tenant=<uuid-or-slug> query param or "
             "X-Tenant-ID header",
         )

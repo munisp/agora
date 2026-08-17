@@ -102,9 +102,10 @@ app.include_router(router)
 
 def main():
     with TestClient(app) as c:
-        # 400 without tenant scope
+        # 401 without tenant scope (J-14: fail closed, never query with the
+        # tenant GUC unset)
         r = c.get("/v1/conversations")
-        assert r.status_code == 400, r.text
+        assert r.status_code == 401, r.text
 
         r = c.post("/v1/conversations", json={
             "tenant_id": str(TENANT), "site_slug": "acme", "channel": "voice"})
@@ -112,9 +113,9 @@ def main():
         conv = r.json()
         cid = conv["id"]
 
-        # turns: 400 without tenant, 201 with
+        # turns: 401 without tenant, 201 with
         r = c.post(f"/v1/conversations/{cid}/turns", json={"role": "user", "text": "hi"})
-        assert r.status_code == 400, r.text
+        assert r.status_code == 401, r.text
         r = c.post(f"/v1/conversations/{cid}/turns?tenant={TENANT}",
                    json={"role": "user", "text": "hi", "tool_calls": [{"name": "get_business_info"}]})
         assert r.status_code == 201, r.text
