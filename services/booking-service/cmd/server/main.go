@@ -110,7 +110,16 @@ func run() error {
 	// stores are dialed next to the W16 stores below)
 
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
-	resolver := bookingops.NewTenantResolver(daprClient, cfg.IdentityAppID, cfg.IdentityCacheTTL, logger)
+	// SPEC-W42 Coder G: IDENTITY_BASE_URL (default empty) switches tenant
+	// resolution to a direct HTTP GET, removing the hard daprd dependency
+	// from the booking write path (used by tests and no-Dapr dev). Empty =
+	// unchanged Dapr behavior.
+	resolver := bookingops.NewTenantResolver(daprClient, cfg.IdentityAppID, cfg.IdentityCacheTTL, logger,
+		bookingops.WithIdentityBaseURL(cfg.IdentityBaseURL))
+	if cfg.IdentityBaseURL != "" {
+		logger.Info("IDENTITY_BASE_URL set: tenant resolution uses direct HTTP (no Dapr sidecar required)",
+			zap.String("identity_base_url", cfg.IdentityBaseURL))
+	}
 
 	// SPEC-W18 Agent D — BEGIN (additive): app entitlement gate (contract
 	// §4). APP_GATE_ENABLED=false is the DEFAULT and keeps the gate a pure
