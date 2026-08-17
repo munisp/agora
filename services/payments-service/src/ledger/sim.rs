@@ -11,6 +11,14 @@
 //!   error (`ExistsWithDifferentParameters`);
 //! - liability accounts (`*:deposits`, `*:revenue`) enforce
 //!   `debits_posted <= credits_posted`.
+//!
+//! NOTE (SPEC-W42): the sim deliberately does NOT enforce TigerBeetle's
+//! code-matching rule (a POST/VOID_PENDING_TRANSFER leg must carry the
+//! pending hold's own code — real TB rejects a mismatch with
+//! `pending_transfer_has_different_code`). The sim records the operation
+//! code (101/102/103) on post/void legs for observability; its externally
+//! visible behavior is unchanged. The live client (`tigerbeetle.rs`) carries
+//! `CODE_DEPOSIT_HOLD` on those legs, and its structure tests pin the rule.
 
 use std::collections::HashMap;
 
