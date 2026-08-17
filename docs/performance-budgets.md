@@ -2,8 +2,8 @@
 
 Latency and throughput budgets for the revenue-critical HTTP paths. Budgets
 are **normative gates**, not measurements: the measured baseline lives in
-`tests/perf/RESULTS.md` (filled by the W41 perf aggregation run — see
-§Methodology). SLO alignment: the customer-API budgets below are the
+`tests/perf/RESULTS.md` (W41 baseline; re-measured per wave by the
+`tests/perf/aggregate.py` run — see §Methodology). SLO alignment: the customer-API budgets below are the
 per-route decomposition of `docs/slo-dashboards.md` SLO 1
 (p50 ≤ 300 ms, p99 ≤ 1.5 s).
 
@@ -40,9 +40,17 @@ Rationale for the tighter tiers:
    replay calls. Run it with `python tests/funds-e2e/harness.py --workdir
    <dir>` (the harness's only flag; CI passes a per-runner workdir).
 2. **Aggregation — `tests/perf/aggregate.py`.** Repeats the hot calls
-   (N ≥ 50 iterations each), computes p50/p99 and sustained throughput, and
-   writes the comparison-against-budget table to `tests/perf/RESULTS.md`.
-   A run **fails** if any measured p99 exceeds its budget above.
+   (N ≥ 50 iterations each), computes p50 **and** p99 **and** sustained
+   throughput (rps = N / wall-clock seconds) per timed call, and compares
+   all three against the B1–B7 budgets above — emitting **PASS/FAIL per
+   budget** (p50, p99, and rps each checked against its column) in the
+   comparison table it writes to `tests/perf/RESULTS.md`. A run **fails**
+   if any measured p99 exceeds its budget or any measured sustained rps
+   falls below its throughput budget. As of W42, booking create (B1/B2)
+   is **measured at HTTP** by the funds-e2e harness (both the
+   authenticated and public endpoints, via the booking-service
+   `IDENTITY_BASE_URL` tenant-resolution fallback) — it is no longer a
+   store-bench-only NOT-MEASURED line.
 3. **Store-level micro-benchmarks — Go `testing.B`.**
    `services/booking-service/internal/store/bench_test.go`
    (`BenchmarkCreateBookingTx`, `BenchmarkListBookings`) runs against
