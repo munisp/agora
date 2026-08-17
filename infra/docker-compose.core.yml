@@ -202,7 +202,13 @@ services:
 
   # ---------------- TigerBeetle (SPEC §9, cluster 0, replica 3000) ----------------
   tigerbeetle:
-    image: ghcr.io/tigerbeetledb/tigerbeetle:0.16.4
+    # SPEC-W42 R1: the pinned Rust client (tigerbeetle-unofficial
+    # 0.8.0+0.16.28, see services/payments-service/Cargo.toml) speaks the
+    # TigerBeetle 0.16.28 wire protocol, and the server enforces client/server
+    # release parity: a 0.16.4 server evicts this client with
+    # `client_release_too_high`. Keep this image tag in lockstep with the
+    # client pin.
+    image: ghcr.io/tigerbeetledb/tigerbeetle:0.16.28
     container_name: tigerbeetle
     restart: unless-stopped
     # Official two-command pattern: format the data file once, then start.
