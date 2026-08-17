@@ -1,0 +1,4 @@
+go test fuzz v1
+string("s3cret")
+[]byte("{\"event\":\"person.created\",\"id\":\"1\"}")
+string("")
