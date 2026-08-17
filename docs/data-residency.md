@@ -57,9 +57,11 @@ copies live, and the concrete artifact to change.
 - **Holds:** all service DBs — `identity` (incl. `identity.consents`, the
   NDPA consent registry, RLS-isolated per `tenant_isolation` policy),
   `booking`, `conversation`, `knowledge`, `crm_sync`, `twenty`,
-  `analytics_meta`, `temporal`, `keycloak`, `permify`, `iceberg`, `opendesk`
-  (see `PG_DBS` in `infra/backups/backup.sh`). Contains PII and payment
-  metadata → **residency-restricted (Nigeria)**.
+  `analytics_meta`, `notifications`, `billing`, `kyc`, `platform`,
+  `temporal`, `keycloak`, `permify`, `iceberg`, `opendesk`
+  (see `PG_DBS` in `infra/backups/backup.sh` — W41-fixed default now
+  includes `notifications`/`billing`/`kyc`/`platform`). Contains PII and
+  payment metadata → **residency-restricted (Nigeria)**.
 - **Primary:** Lagos, Patroni 3-node per ADR-0008 (`synchronous_mode:
   quorum` for the `booking` and ledger-adjacent metadata DBs). Dev single
   node: `infra/docker-compose.core.yml` service `postgres`
@@ -80,7 +82,12 @@ copies live, and the concrete artifact to change.
 - **RPO/RTO:** RPO ≈ replication lag (alert on
   `pg_stat_replication` replay lag; target <5 min) + WAL-G archive cadence;
   RTO = promote replica or `backup-fetch` into a fresh Patroni cluster
-  (target ≤4h, drill quarterly).
+  (target ≤4h, drill quarterly). The quarterly drill is executable:
+  `tests/restore-drill/drill.py` performs a real dump → fresh-cluster
+  `pg_restore` → assertion pass (row counts, RLS policies,
+  `relforcerowsecurity`, tenant-deny) — see `tests/restore-drill/README.md`;
+  executed runs are filed as `tests/restore-drill/RESULTS.md` (runbook:
+  `docs/runbooks/operations.md` §6/§8).
 
 ### 2.2 Kafka (opendesk.* event backbone)
 
