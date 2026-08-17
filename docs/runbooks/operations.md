@@ -125,6 +125,17 @@ implementations selected by `LEDGER_IMPL` (ADR-0007):
   (`/data/0_0.tigerbeetle`, cluster 0 replica 0 on :3000) and survives
   restarts.
 
+Version and wire-protocol rules for the `tigerbeetle` impl:
+
+* The server is pinned to **0.16.28** and client/server releases **must
+  match** — a 0.16.4 server evicts the 0.16.28 client at handshake
+  (`client_release_too_high`). Bump them together or not at all.
+* Every pending-transfer **post/void leg must carry the hold's own
+  transfer code** (deposit hold = code 100). Real TigerBeetle enforces
+  this (`pending_transfer_has_different_code`, result 30) and rolls back
+  the whole linked batch on mismatch; the sim ledger never enforced it,
+  so a sim-green flow can still fail against the real server.
+
 Routine checks:
 
 ```bash
