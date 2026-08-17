@@ -35,11 +35,11 @@ BACKUP_KEEP=14 ./infra/backups/backup.sh /var/backups/opendesk
   edit the label to change the schedule, `no-overlap` is on).
 
 In sidecar mode the docker socket is the host's, so the MinIO mirror step
-mounts the **`opendesk_backups` named volume** (`BACKUP_DOCKER_VOLUME`)
+mounts the **`agora_backups` named volume** (`BACKUP_DOCKER_VOLUME`)
 instead of a host path. Inspect snapshots with:
 
 ```bash
-docker run --rm -v opendesk_backups:/b alpine ls -1 /b
+docker run --rm -v agora_backups:/b alpine ls -1 /b
 ```
 
 ## Restore (DESTRUCTIVE)

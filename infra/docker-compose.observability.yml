@@ -144,7 +144,7 @@ services:
       ofelia.enabled: "true"
       # Daily at 03:17 container-local time; override by editing here.
       ofelia.job-exec.backup.schedule: "17 3 * * *"
-      ofelia.job-exec.backup.command: "env BACKUP_DOCKER_VOLUME=opendesk_backups sh /repo/infra/backups/backup.sh /backups"
+      ofelia.job-exec.backup.command: "env BACKUP_DOCKER_VOLUME=agora_backups sh /repo/infra/backups/backup.sh /backups"
       ofelia.job-exec.backup.no-overlap: "true"
     networks: [opendesk]
 

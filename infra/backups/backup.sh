@@ -16,7 +16,7 @@
 # Sidecar mode (ofelia in docker-compose.observability.yml): when the
 # script runs inside the backup container, the docker socket belongs to the
 # HOST, so `docker run -v` needs a host-visible source. Set
-# BACKUP_DOCKER_VOLUME=<named-volume> (e.g. opendesk_backups) and the MinIO
+# BACKUP_DOCKER_VOLUME=<named-volume> (e.g. agora_backups) and the MinIO
 # mirror step mounts that volume instead of a host path.
 set -eu
 
@@ -28,13 +28,20 @@ DEST="$BACKUP_ROOT/$TS"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-postgres}"
 TB_CONTAINER="${TB_CONTAINER:-tigerbeetle}"
 PG_USER="${PG_USER:-opendesk}"
-PG_DBS="${PG_DBS:-identity booking conversation knowledge analytics_meta temporal keycloak permify iceberg twenty crm_sync opendesk}"
+# W41 fix: the default list previously omitted notifications, billing and kyc
+# (created by infra/postgres/init-scripts/00-create-dbs.sql) plus platform
+# (created by infra/postgres/init-scripts/30-model-registry.sql).
+PG_DBS="${PG_DBS:-identity booking conversation knowledge analytics_meta notifications billing kyc platform temporal keycloak permify iceberg twenty crm_sync opendesk}"
 MINIO_ALIAS_URL="${MINIO_ALIAS_URL:-http://minio:9000}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
 MINIO_BUCKETS="${MINIO_BUCKETS:-lake exports}"
 MC_IMAGE="${MC_IMAGE:-minio/mc:RELEASE.2024-07-11T18-01-46Z}"
-COMPOSE_NETWORK="${COMPOSE_NETWORK:-opendesk}"
+# W41 fix: the compose project is `agora` (root docker-compose.yml line 1), so
+# the `opendesk` bridge network is created as `agora_opendesk` — the previous
+# default `opendesk` matched no real network and the mc mirror step always
+# failed. Override via COMPOSE_NETWORK for non-default project names.
+COMPOSE_NETWORK="${COMPOSE_NETWORK:-agora_opendesk}"
 TB_DATA_FILE="${TB_DATA_FILE:-/data/0_0.tigerbeetle}"
 TB_PAUSE="${TB_PAUSE:-1}"
 

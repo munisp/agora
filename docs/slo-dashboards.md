@@ -37,7 +37,13 @@ nothing emits.
    counter in notification-worker (`internal/pacer/guards.go`) but is **not
    yet exposed over HTTP** — the code comment says "a metrics endpoint can
    scrape them later".
-3. Some existing dashboard JSON references metrics **no service emits**
+3. W41 addition: the funds/booking hot paths now have an **offline measured
+   baseline** (`tests/perf/RESULTS.md`, produced by `tests/funds-e2e` +
+   `tests/perf/aggregate.py` + Go store benchmarks) with explicit budgets in
+   `docs/performance-budgets.md`. That is a point-in-time release gate — it
+   does NOT replace the per-service Prometheus histograms below, which remain
+   needed for continuous production monitoring.
+4. Some existing dashboard JSON references metrics **no service emits**
    (`voice_chat_turns_total`, `voice_llm_calls_total`,
    `voice_llm_errors_total`, `voice_llm_call_duration_seconds`,
    `voice_stt_duration_seconds`, `voice_tts_duration_seconds` in
@@ -54,7 +60,7 @@ nothing emits.
 | --- | --- | --- | --- |
 | 1.1 | Gateway-side p50/p99 per route | `histogram_quantile(0.50, sum by (le, route) (rate(apisix_http_latency{type="request"}[5m])))` and `0.99` — from the APISIX prometheus plugin (`prefer_name: true` gives route names) | **real** (`apisix_http_latency`, plugin-provided via `infra/apisix/apisix.yaml`) |
 | 1.2 | Upstream latency split | `histogram_quantile(0.99, sum by (le, service) (rate(apisix_http_latency{type="upstream"}[5m])))` — gateway↔service share of 1.1 | **real** (same plugin metric, `type` label) |
-| 1.3 | Per-service server latency (identity `/v1/tenants`, booking `/v1/bookings`, conversation, knowledge) | needs instrumentation: `http_server_request_duration_seconds{service,route,status}` histogram in each Go service (chi middleware next to `middleware.RequestID` in `internal/httpapi/server.go`) | **needs instrumentation** |
+| 1.3 | Per-service server latency (identity `/v1/tenants`, booking `/v1/bookings`, conversation, knowledge) | needs instrumentation: `http_server_request_duration_seconds{service,route,status}` histogram in each Go service (chi middleware next to `middleware.RequestID` in `internal/httpapi/server.go`). W41: booking create / public booking / tenant provisioning latency is now measured offline per release — `tests/perf/RESULTS.md` vs budgets B1/B2 (`docs/performance-budgets.md`) | **needs instrumentation** (offline baseline exists via `tests/perf`; continuous histogram still pending) |
 | 1.4 | Error budget companion: 5xx ratio | `sum(rate(apisix_http_status{status=~"5.."}[5m])) / sum(rate(apisix_http_status[5m]))` | **real** (`apisix_http_status`, plugin-provided) |
 
 ## SLO 2 — Kafka publish latency: p95 ≤ 50 ms
@@ -85,7 +91,7 @@ WS/Kafka/Fluvio ingest path.
 | # | Panel | Metric / PromQL sketch | Status |
 | --- | --- | --- | --- |
 | 4.1 | Ledger write success ratio | needs instrumentation: `payments_ledger_writes_total{op,result}` counter in payments-service (`src/ledger/tigerbeetle.rs` — the Rust service has no metrics module today) | **needs instrumentation** |
-| 4.2 | Ledger write latency p99 | needs instrumentation: `payments_ledger_write_duration_seconds{op}` histogram (same location) | **needs instrumentation** |
+| 4.2 | Ledger write latency p99 | needs instrumentation: `payments_ledger_write_duration_seconds{op}` histogram (same location). W41: deposit hold/capture latency is measured offline per release — `tests/perf/RESULTS.md` vs budgets B6/B7 (`docs/performance-budgets.md`); measured with `LEDGER_IMPL=sim`, so production TigerBeetle latency still requires this histogram | **needs instrumentation** (offline sim-ledger baseline exists via `tests/perf`; production histogram still pending) |
 | 4.3 | Payment event flow proxy | `rate(analytics_messages_consumed_total{topic="opendesk.payments.events"}[5m])` | **real** (analytics sink) |
 | 4.4 | TigerBeetle cluster health | needs instrumentation: TigerBeetle exposes no Prometheus endpoint; probe via the payments-service healthz or a TB stats exporter — proposed `tigerbeetle_replica_status{replica}` | **needs instrumentation** |
 

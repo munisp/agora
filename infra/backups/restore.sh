@@ -32,7 +32,12 @@ MINIO_ALIAS_URL="${MINIO_ALIAS_URL:-http://minio:9000}"
 MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
 MC_IMAGE="${MC_IMAGE:-minio/mc:RELEASE.2024-07-11T18-01-46Z}"
-COMPOSE_NETWORK="${COMPOSE_NETWORK:-opendesk}"
+# W41 fix: same as backup.sh -- the compose project is `agora` (root
+# docker-compose.yml line 1), so the `opendesk` bridge network is
+# created as `agora_opendesk`; the previous default `opendesk`
+# matched no real network. Override via COMPOSE_NETWORK for
+# non-default project names.
+COMPOSE_NETWORK="${COMPOSE_NETWORK:-agora_opendesk}"
 TB_DATA_FILE="${TB_DATA_FILE:-/data/0_0.tigerbeetle}"
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
