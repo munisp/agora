@@ -22,6 +22,7 @@ type Config struct {
 	PubSubName         string        // Dapr pubsub component (pubsub-kafka)
 	BookingEventsTopic string        // opendesk.booking.events
 	IdentityAppID      string        // Dapr app-id of identity-service
+	IdentityBaseURL    string        // IDENTITY_BASE_URL: direct HTTP base for tenant resolution, bypassing Dapr (default empty = Dapr; used by tests and no-Dapr dev)
 	TemporalHostPort   string        // temporal:7233
 	TemporalNamespace  string        // opendesk
 	TemporalTaskQueue  string        // opendesk-main
@@ -128,6 +129,11 @@ func Load() (Config, error) {
 		PubSubName:         envStr("DAPR_PUBSUB_NAME", "pubsub-kafka"),
 		BookingEventsTopic: envStr("BOOKING_EVENTS_TOPIC", "opendesk.booking.events"),
 		IdentityAppID:      envStr("IDENTITY_APP_ID", "identity"),
+		// IDENTITY_BASE_URL (used by tests and no-Dapr dev): when set,
+		// TenantResolver.BySlug issues a direct HTTP GET
+		// {IDENTITY_BASE_URL}/v1/tenants/{slug} instead of Dapr service
+		// invocation. Empty = unchanged Dapr behavior.
+		IdentityBaseURL:    os.Getenv("IDENTITY_BASE_URL"),
 		TemporalHostPort:   envStr("TEMPORAL_HOST_PORT", "temporal:7233"),
 		TemporalNamespace:  envStr("TEMPORAL_NAMESPACE", "opendesk"),
 		TemporalTaskQueue:  envStr("TEMPORAL_TASK_QUEUE", "opendesk-main"),
