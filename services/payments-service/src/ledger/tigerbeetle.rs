@@ -24,10 +24,33 @@
 //!     replay of the same transfer id) — previously any per-item result was
 //!     reported as an error, so at-least-once replays of a committed transfer
 //!     looked like ledger failures and got dead-lettered;
+//!   * SPEC-W42 R2: the idempotent-replay acceptance also covers the LINKED-
+//!     batch replay signature (live-proven against TigerBeetle 0.16.28): a
+//!     verbatim replay of an already-committed linked capture batch returns
+//!     `exists` on leg 0 and `linked_event_failed` on every leg linked after
+//!     it (ANY non-`ok` result breaks the chain). `is_idempotent_replay()`
+//!     accepts exactly an {Exists, LinkedEventFailed} error set anchored by
+//!     at least one Exists; any other error kind still fails (mutation
+//!     safety — see the helper's docs).
 //!   * capture/no-show-fee post + revenue/fee split is ONE linked
 //!     `create_transfers` batch — TigerBeetle applies linked batches
 //!     atomically, so a partial capture (hold posted, split lost) can no
 //!     longer happen.
+//!
+//! SPEC-W42 transfer-code correctness (recon R1, live-proven):
+//!   * TigerBeetle enforces that a `POST_PENDING_TRANSFER` /
+//!     `VOID_PENDING_TRANSFER` leg carries the SAME `code` as the pending
+//!     transfer it resolves; a mismatch is rejected with
+//!     `pending_transfer_has_different_code` (result 30) and the whole
+//!     LINKED batch rolls back. Deposit holds are created with
+//!     `CODE_DEPOSIT_HOLD`, so every post/void leg of a deposit hold carries
+//!     `CODE_DEPOSIT_HOLD` too. Only the auxiliary NON-pending legs linked
+//!     after the post (the revenue / platform-fee split) keep the
+//!     operation's own code (`CODE_CAPTURE` / `CODE_NO_SHOW_FEE`).
+//!   * The transfer batches are built by pure constructors
+//!     (`build_hold_transfer`, `build_void_hold_transfer`,
+//!     `build_capture_batch`) so the exact structure sent on the wire is
+//!     unit-testable without a server (see the `tests` module below).
 
 use async_trait::async_trait;
 use tigerbeetle_unofficial as tb;
@@ -47,6 +70,198 @@ fn map_err<E: std::fmt::Display>(e: E) -> LedgerError {
     LedgerError::Backend(e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Pure transfer constructors (no server needed — unit-tested below)
+// ---------------------------------------------------------------------------
+
+/// Shared transfer constructor.
+fn tb_transfer(
+    ledger_id: u32,
+    id: u128,
+    debit: &str,
+    credit: &str,
+    amount: u64,
+    code: u16,
+) -> tb::Transfer {
+    tb::Transfer::new(id)
+        .with_debit_account_id(account_id(debit))
+        .with_credit_account_id(account_id(credit))
+        .with_amount(amount as u128)
+        .with_ledger(ledger_id)
+        .with_code(code)
+}
+
+/// Two-phase hold leg: pending `platform:clearing -> tenant:{id}:deposits`
+/// with `CODE_DEPOSIT_HOLD` (flag PENDING).
+fn build_hold_transfer(
+    ledger_id: u32,
+    transfer_id: Uuid,
+    tenant_id: &str,
+    amount: u64,
+) -> tb::Transfer {
+    tb_transfer(
+        ledger_id,
+        transfer_id.as_u128(),
+        PLATFORM_CLEARING_ACCOUNT,
+        &deposits_account(tenant_id),
+        amount,
+        CODE_DEPOSIT_HOLD,
+    )
+    .with_flags(TbFlags::PENDING)
+}
+
+/// VOID_PENDING_TRANSFER leg resolving a deposit hold.
+///
+/// TB code-matching rule (SPEC-W42): the void leg MUST carry the hold's own
+/// code (`CODE_DEPOSIT_HOLD`), not `CODE_REFUND` — a real server rejects a
+/// mismatch with `pending_transfer_has_different_code` and the hold is left
+/// unresolved. Amount 0 tells TigerBeetle to void the full pending amount.
+fn build_void_hold_transfer(
+    ledger_id: u32,
+    transfer_id: u128,
+    hold_id: u128,
+    debit: &str,
+    credit: &str,
+) -> tb::Transfer {
+    tb_transfer(ledger_id, transfer_id, debit, credit, 0, CODE_DEPOSIT_HOLD)
+        .with_pending_id(hold_id)
+        .with_flags(TbFlags::VOID_PENDING_TRANSFER)
+}
+
+/// The fully-constructed linked capture/no-show-fee batch plus the amounts
+/// and derived ids needed to wrap the result after submit. Built by a pure
+/// function so the exact wire structure is unit-testable (SPEC-W42).
+#[derive(Debug)]
+struct CaptureBatch {
+    transfers: Vec<tb::Transfer>,
+    posted: u64,
+    net: u64,
+    fee: u64,
+    rev_id: u128,
+    fee_id: u128,
+}
+
+/// GF11: post + revenue split (+ platform fee) as ONE linked
+/// `create_transfers` batch — TigerBeetle applies linked batches atomically
+/// (all-or-nothing), eliminating the previous two-batch window where the
+/// hold was posted but the split was lost.
+///
+/// TB code-matching rule (SPEC-W42): leg 0 (the POST_PENDING_TRANSFER leg)
+/// carries `CODE_DEPOSIT_HOLD` — the hold's own code — while the auxiliary
+/// non-pending split legs carry the operation code (`code`: `CODE_CAPTURE`
+/// or `CODE_NO_SHOW_FEE`).
+fn build_capture_batch(
+    ledger_id: u32,
+    fee_bps: u64,
+    tenant_id: &str,
+    hold_id: Uuid,
+    transfer_id: Uuid,
+    posted: u64,
+    code: u16,
+) -> Result<CaptureBatch, LedgerError> {
+    if posted == 0 {
+        return Err(LedgerError::InvalidAmount);
+    }
+    let deposits = deposits_account(tenant_id);
+    let revenue = revenue_account(tenant_id);
+    let fee = posted * fee_bps / 10_000;
+    let net = posted - fee;
+
+    let rev_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("capture-revenue:{:032x}", transfer_id.as_u128()).as_bytes(),
+    )
+    .as_u128();
+    let fee_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("capture-fee:{:032x}", transfer_id.as_u128()).as_bytes(),
+    )
+    .as_u128();
+
+    let mut transfers = Vec::with_capacity(3);
+    // Leg 0: posting transfer resolving the hold. Carries the hold's code
+    // (CODE_DEPOSIT_HOLD) — NOT the operation code — per the TB rule above.
+    let post = tb_transfer(
+        ledger_id,
+        transfer_id.as_u128(),
+        PLATFORM_CLEARING_ACCOUNT,
+        &deposits,
+        posted,
+        CODE_DEPOSIT_HOLD,
+    )
+    .with_pending_id(hold_id.as_u128())
+    .with_flags(TbFlags::POST_PENDING_TRANSFER | TbFlags::LINKED);
+    transfers.push(post);
+    // Leg 1: deposits -> revenue (net of platform fee). Auxiliary NON-pending
+    // leg: keeps the operation code.
+    let mut rev = tb_transfer(ledger_id, rev_id, &deposits, &revenue, net, code);
+    if fee > 0 {
+        // Not the last event in the chain: keep the link open.
+        rev = rev.with_flags(TbFlags::LINKED);
+    }
+    transfers.push(rev);
+    // Leg 2 (skipped when fee rounds to zero): deposits -> platform:fees.
+    if fee > 0 {
+        transfers.push(tb_transfer(
+            ledger_id,
+            fee_id,
+            &deposits,
+            PLATFORM_FEES_ACCOUNT,
+            fee,
+            code,
+        ));
+    }
+    Ok(CaptureBatch {
+        transfers,
+        posted,
+        net,
+        fee,
+        rev_id,
+        fee_id,
+    })
+}
+
+/// GF11 idempotent-replay acceptance, extended in SPEC-W42 R2 for LINKED
+/// batches (live-proven against TigerBeetle 0.16.28).
+///
+/// TigerBeetle linked-batch replay semantics: when a verbatim replay of an
+/// already-committed LINKED `create_transfers` batch is submitted, the first
+/// leg of the chain reports `exists` and — because ANY non-`ok` result
+/// breaks the link chain — every leg linked after it reports
+/// `linked_event_failed`. The committed batch's fund state is already exactly
+/// what this batch puts there, so this error pattern is an idempotent-replay
+/// SUCCESS, not a ledger failure.
+///
+/// Acceptance rule: EVERY returned error kind must be `Exists` or
+/// `LinkedEventFailed`, AND at least one must be `Exists`. The `Exists`
+/// anchor is mandatory: `linked_event_failed` alone never proves a prior
+/// commit — it also trails genuine first-leg rejections.
+///
+/// Mutation safety: any other error kind in the set fails the check. E.g. a
+/// capture batch whose post leg carries the wrong code is rejected by a real
+/// server as `pending_transfer_has_different_code` + `linked_event_failed`,
+/// which is NOT accepted here, so a mutated batch can never masquerade as an
+/// idempotent replay. (The error-kind enums implement no `PartialEq` —
+/// use `matches!`.)
+fn is_idempotent_replay(kinds: &[CreateTransferErrorKind]) -> bool {
+    if kinds.is_empty() {
+        // Vacuous case: an Api error with no per-item results cannot come
+        // from a real server; preserve the previous all-`Exists` guard's
+        // vacuous truth on an empty slice so the success path is untouched.
+        return true;
+    }
+    let anchored = kinds
+        .iter()
+        .any(|k| matches!(k, CreateTransferErrorKind::Exists));
+    let only_replay_kinds = kinds.iter().all(|k| {
+        matches!(
+            k,
+            CreateTransferErrorKind::Exists | CreateTransferErrorKind::LinkedEventFailed
+        )
+    });
+    anchored && only_replay_kinds
+}
+
 impl TigerBeetleClient {
     pub async fn connect(
         addresses: &str,
@@ -62,34 +277,20 @@ impl TigerBeetleClient {
         })
     }
 
-    fn tb_transfer(
-        &self,
-        id: u128,
-        debit: &str,
-        credit: &str,
-        amount: u64,
-        code: u16,
-    ) -> tb::Transfer {
-        tb::Transfer::new(id)
-            .with_debit_account_id(account_id(debit))
-            .with_credit_account_id(account_id(credit))
-            .with_amount(amount as u128)
-            .with_ledger(self.ledger_id)
-            .with_code(code)
-    }
-
     /// Submit one batch. GF11: TigerBeetle reports idempotent replays of an
     /// already-committed transfer id as per-item `exists` results — those are
-    /// SUCCESS (the money is already where this batch puts it). Only genuine
-    /// rejections (including `exists_with_different_*` conflicts) are errors.
+    /// SUCCESS (the money is already where this batch puts it). SPEC-W42 R2:
+    /// for a LINKED batch the replay surfaces as `exists` on the chain-
+    /// breaking leg plus `linked_event_failed` on every leg linked after it
+    /// (see `is_idempotent_replay`). Only genuine rejections (including
+    /// `exists_with_different_*` conflicts and code mismatches) are errors.
     async fn submit(&self, transfers: Vec<tb::Transfer>) -> Result<(), LedgerError> {
         match self.client.create_transfers(transfers).await {
             Ok(()) => Ok(()),
             Err(CreateTransfersError::Api(api))
-                if api
-                    .as_slice()
-                    .iter()
-                    .all(|e| e.kind() == CreateTransferErrorKind::Exists) =>
+                if is_idempotent_replay(
+                    &api.as_slice().iter().map(|e| e.kind()).collect::<Vec<_>>(),
+                ) =>
             {
                 Ok(())
             }
@@ -153,7 +354,7 @@ impl LedgerClient for TigerBeetleClient {
                 if api
                     .as_slice()
                     .iter()
-                    .all(|e| e.kind() == CreateAccountErrorKind::Exists) => {}
+                    .all(|e| matches!(e.kind(), CreateAccountErrorKind::Exists)) => {}
             Err(e) => {
                 return Err(LedgerError::Backend(format!(
                     "tigerbeetle account creation failed: {e}"
@@ -186,9 +387,7 @@ impl LedgerClient for TigerBeetleClient {
         }
         let debit = PLATFORM_CLEARING_ACCOUNT.to_string();
         let credit = deposits_account(tenant_id);
-        let t = self
-            .tb_transfer(transfer_id.as_u128(), &debit, &credit, amount, CODE_DEPOSIT_HOLD)
-            .with_flags(TbFlags::PENDING);
+        let t = build_hold_transfer(self.ledger_id, transfer_id, tenant_id, amount);
         self.submit(vec![t]).await?;
         Ok(self.wrap(
             transfer_id.as_u128(),
@@ -221,25 +420,34 @@ impl LedgerClient for TigerBeetleClient {
         amount: u64,
     ) -> Result<Transfer, LedgerError> {
         if let Some(h) = hold_id {
-            // Void the pending hold. Amount 0 tells TigerBeetle to void the
-            // full pending amount; TB fails with `pending_transfer_not_pending`
+            // Void the pending hold. TB fails with `pending_transfer_not_pending`
             // if the hold was already resolved (then we fall through to a
             // posted refund). A replayed void reports `exists` and is treated
             // as success by submit() (GF11).
+            //
+            // TB code-matching rule (SPEC-W42): the void leg carries the
+            // hold's own code (CODE_DEPOSIT_HOLD), not CODE_REFUND — a real
+            // server rejects the mismatch with
+            // `pending_transfer_has_different_code`.
             let debit = PLATFORM_CLEARING_ACCOUNT.to_string();
             let credit = deposits_account(tenant_id);
-            let t = self
-                .tb_transfer(transfer_id.as_u128(), &debit, &credit, 0, CODE_REFUND)
-                .with_pending_id(h.as_u128())
-                .with_flags(TbFlags::VOID_PENDING_TRANSFER);
+            let t = build_void_hold_transfer(
+                self.ledger_id,
+                transfer_id.as_u128(),
+                h.as_u128(),
+                &debit,
+                &credit,
+            );
             match self.submit(vec![t]).await {
                 Ok(()) => {
+                    // TigerBeetle records the void leg with the hold's code,
+                    // so the returned snapshot reports CODE_DEPOSIT_HOLD.
                     return Ok(self.wrap(
                         transfer_id.as_u128(),
                         &debit,
                         &credit,
                         0,
-                        CODE_REFUND,
+                        CODE_DEPOSIT_HOLD,
                         TransferState::Posted,
                         TransferFlag::VoidPending,
                         Some(h.as_u128()),
@@ -253,7 +461,14 @@ impl LedgerClient for TigerBeetleClient {
         }
         let debit = revenue_account(tenant_id);
         let credit = PLATFORM_CLEARING_ACCOUNT.to_string();
-        let t = self.tb_transfer(transfer_id.as_u128(), &debit, &credit, amount, CODE_REFUND);
+        let t = tb_transfer(
+            self.ledger_id,
+            transfer_id.as_u128(),
+            &debit,
+            &credit,
+            amount,
+            CODE_REFUND,
+        );
         self.submit(vec![t]).await?;
         Ok(self.wrap(
             transfer_id.as_u128(),
@@ -289,7 +504,14 @@ impl LedgerClient for TigerBeetleClient {
         }
         let debit = revenue_account(tenant_id);
         let credit = PLATFORM_PAYOUTS_ACCOUNT.to_string();
-        let t = self.tb_transfer(transfer_id.as_u128(), &debit, &credit, amount, CODE_PAYOUT);
+        let t = tb_transfer(
+            self.ledger_id,
+            transfer_id.as_u128(),
+            &debit,
+            &credit,
+            amount,
+            CODE_PAYOUT,
+        );
         self.submit(vec![t]).await?;
         Ok(self.wrap(
             transfer_id.as_u128(),
@@ -342,8 +564,6 @@ impl TigerBeetleClient {
         amount: Option<u64>,
         code: u16,
     ) -> Result<CaptureResult, LedgerError> {
-        let deposits = deposits_account(tenant_id);
-        let revenue = revenue_account(tenant_id);
         // The split needs the exact posted amount, so the live client
         // requires explicit amounts from callers (routes always pass one).
         // Amount `0` on a post would tell TigerBeetle to post the full
@@ -354,67 +574,42 @@ impl TigerBeetleClient {
                 "live client requires explicit capture amount for fee split".into(),
             )
         })?;
-        if posted == 0 {
-            return Err(LedgerError::InvalidAmount);
-        }
-        let fee = posted * self.fee_bps / 10_000;
-        let net = posted - fee;
+        let batch = build_capture_batch(
+            self.ledger_id,
+            self.fee_bps,
+            tenant_id,
+            hold_id,
+            transfer_id,
+            posted,
+            code,
+        )?;
+        let CaptureBatch {
+            transfers,
+            posted,
+            net,
+            fee,
+            rev_id,
+            fee_id,
+        } = batch;
+        self.submit(transfers).await?;
 
-        let rev_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("capture-revenue:{:032x}", transfer_id.as_u128()).as_bytes(),
-        );
-        let fee_id = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("capture-fee:{:032x}", transfer_id.as_u128()).as_bytes(),
-        );
-
-        // GF11: post + revenue split (+ platform fee) as ONE linked
-        // create_transfers batch. TigerBeetle applies linked batches
-        // atomically (all-or-nothing), eliminating the previous two-batch
-        // window where the hold was posted but the split was lost.
-        let mut batch = Vec::with_capacity(3);
-        let post = self
-            .tb_transfer(
-                transfer_id.as_u128(),
-                PLATFORM_CLEARING_ACCOUNT,
-                &deposits,
-                posted,
-                code,
-            )
-            .with_pending_id(hold_id.as_u128())
-            .with_flags(TbFlags::POST_PENDING_TRANSFER | TbFlags::LINKED);
-        batch.push(post);
-        let mut rev = self.tb_transfer(rev_id.as_u128(), &deposits, &revenue, net, code);
-        if fee > 0 {
-            // Not the last event in the chain: keep the link open.
-            rev = rev.with_flags(TbFlags::LINKED);
-        }
-        batch.push(rev);
-        if fee > 0 {
-            batch.push(self.tb_transfer(
-                fee_id.as_u128(),
-                &deposits,
-                PLATFORM_FEES_ACCOUNT,
-                fee,
-                code,
-            ));
-        }
-        self.submit(batch).await?;
-
+        let deposits = deposits_account(tenant_id);
+        let revenue = revenue_account(tenant_id);
         Ok(CaptureResult {
+            // The post leg carries the hold's code on the wire (TB code-
+            // matching rule), so the snapshot reports CODE_DEPOSIT_HOLD.
             post: self.wrap(
                 transfer_id.as_u128(),
                 PLATFORM_CLEARING_ACCOUNT,
                 &deposits,
                 posted,
-                code,
+                CODE_DEPOSIT_HOLD,
                 TransferState::Posted,
                 TransferFlag::PostPending,
                 Some(hold_id.as_u128()),
             ),
             revenue: self.wrap(
-                rev_id.as_u128(),
+                rev_id,
                 &deposits,
                 &revenue,
                 net,
@@ -425,7 +620,7 @@ impl TigerBeetleClient {
             ),
             platform_fee: if fee > 0 {
                 Some(self.wrap(
-                    fee_id.as_u128(),
+                    fee_id,
                     &deposits,
                     PLATFORM_FEES_ACCOUNT,
                     fee,
@@ -438,5 +633,255 @@ impl TigerBeetleClient {
                 None
             },
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests: structure assertions on the constructed wire transfers — no
+// TigerBeetle server needed. These pin the SPEC-W42 code-matching rule:
+// every POST_PENDING_TRANSFER / VOID_PENDING_TRANSFER leg of a deposit hold
+// carries CODE_DEPOSIT_HOLD (the hold's code). Mutation check: reverting any
+// post/void leg to CODE_CAPTURE / CODE_REFUND must fail these tests, exactly
+// as a real server rejects the batch with pending_transfer_has_different_code.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TENANT: &str = "t-codes";
+    const FEE_BPS: u64 = 1_000; // 10%
+
+    fn hold_id() -> Uuid {
+        Uuid::from_u128(0x001d)
+    }
+
+    #[test]
+    fn hold_leg_is_pending_with_deposit_hold_code() {
+        let id = Uuid::from_u128(0x1001);
+        let t = build_hold_transfer(LEDGER_ID, id, TENANT, 5_000);
+        assert_eq!(t.id(), id.as_u128());
+        assert_eq!(t.code(), CODE_DEPOSIT_HOLD);
+        assert!(t.flags().contains(TbFlags::PENDING));
+        assert!(!t.flags().contains(TbFlags::POST_PENDING_TRANSFER));
+        assert!(!t.flags().contains(TbFlags::VOID_PENDING_TRANSFER));
+        assert!(!t.flags().contains(TbFlags::LINKED));
+        assert_eq!(t.ledger(), LEDGER_ID);
+        assert_eq!(t.amount(), 5_000);
+        assert_eq!(t.debit_account_id(), account_id(PLATFORM_CLEARING_ACCOUNT));
+        assert_eq!(t.credit_account_id(), account_id(&deposits_account(TENANT)));
+    }
+
+    #[test]
+    fn capture_post_leg_carries_the_holds_code() {
+        let cap_id = Uuid::from_u128(0x2002);
+        let b = build_capture_batch(LEDGER_ID, FEE_BPS, TENANT, hold_id(), cap_id, 10_000, CODE_CAPTURE)
+            .unwrap();
+        let post = &b.transfers[0];
+        // THE SPEC-W42 rule: a POST_PENDING_TRANSFER leg must carry the
+        // pending hold's code, not the operation code.
+        assert_eq!(
+            post.code(),
+            CODE_DEPOSIT_HOLD,
+            "POST_PENDING_TRANSFER leg must carry CODE_DEPOSIT_HOLD (real TB \
+             rejects a mismatch with pending_transfer_has_different_code and \
+             rolls back the linked batch)"
+        );
+        assert!(post.flags().contains(TbFlags::POST_PENDING_TRANSFER));
+        assert!(post.flags().contains(TbFlags::LINKED), "linked to the split legs");
+        assert!(!post.flags().contains(TbFlags::PENDING));
+        assert_eq!(post.pending_id(), hold_id().as_u128());
+        assert_eq!(post.id(), cap_id.as_u128());
+        assert_eq!(post.amount(), 10_000);
+        assert_eq!(post.debit_account_id(), account_id(PLATFORM_CLEARING_ACCOUNT));
+        assert_eq!(post.credit_account_id(), account_id(&deposits_account(TENANT)));
+    }
+
+    #[test]
+    fn capture_split_legs_keep_the_operation_code() {
+        let cap_id = Uuid::from_u128(0x2003);
+        let b = build_capture_batch(LEDGER_ID, FEE_BPS, TENANT, hold_id(), cap_id, 10_000, CODE_CAPTURE)
+            .unwrap();
+        assert_eq!(b.transfers.len(), 3, "post + revenue + platform fee");
+        let rev = &b.transfers[1];
+        let fee = &b.transfers[2];
+        // Auxiliary NON-pending legs keep the operation's own code.
+        assert_eq!(rev.code(), CODE_CAPTURE);
+        assert_eq!(fee.code(), CODE_CAPTURE);
+        for aux in [rev, fee] {
+            assert!(!aux.flags().contains(TbFlags::POST_PENDING_TRANSFER));
+            assert!(!aux.flags().contains(TbFlags::VOID_PENDING_TRANSFER));
+            assert!(!aux.flags().contains(TbFlags::PENDING));
+            assert_eq!(aux.pending_id(), 0, "non-pending legs have no pending_id");
+        }
+        // Link chain: post LINKED, rev LINKED, fee closes the chain.
+        assert!(rev.flags().contains(TbFlags::LINKED));
+        assert!(!fee.flags().contains(TbFlags::LINKED), "last leg closes the chain");
+        // 10% fee split: net 9000 / fee 1000.
+        assert_eq!(rev.amount(), 9_000);
+        assert_eq!(fee.amount(), 1_000);
+        assert_eq!(rev.credit_account_id(), account_id(&revenue_account(TENANT)));
+        assert_eq!(fee.credit_account_id(), account_id(PLATFORM_FEES_ACCOUNT));
+        // Deterministic derived ids (idempotent replay of the split).
+        assert_eq!(rev.id(), b.rev_id);
+        assert_eq!(fee.id(), b.fee_id);
+    }
+
+    #[test]
+    fn no_show_fee_post_leg_carries_the_holds_code() {
+        let fee_id = Uuid::from_u128(0x2004);
+        let b = build_capture_batch(LEDGER_ID, FEE_BPS, TENANT, hold_id(), fee_id, 2_500, CODE_NO_SHOW_FEE)
+            .unwrap();
+        let post = &b.transfers[0];
+        assert_eq!(post.code(), CODE_DEPOSIT_HOLD);
+        assert!(post.flags().contains(TbFlags::POST_PENDING_TRANSFER));
+        assert_eq!(post.pending_id(), hold_id().as_u128());
+        // Split legs keep CODE_NO_SHOW_FEE.
+        assert_eq!(b.transfers[1].code(), CODE_NO_SHOW_FEE);
+        assert_eq!(b.transfers[2].code(), CODE_NO_SHOW_FEE);
+    }
+
+    #[test]
+    fn zero_fee_batch_has_two_legs_and_a_closed_link() {
+        let cap_id = Uuid::from_u128(0x2005);
+        let b = build_capture_batch(LEDGER_ID, 0, TENANT, hold_id(), cap_id, 4_000, CODE_CAPTURE)
+            .unwrap();
+        assert_eq!(b.transfers.len(), 2, "no platform-fee leg when fee rounds to zero");
+        assert_eq!(b.fee, 0);
+        assert_eq!(b.net, 4_000);
+        let rev = &b.transfers[1];
+        assert_eq!(rev.code(), CODE_CAPTURE);
+        assert!(!rev.flags().contains(TbFlags::LINKED), "last leg closes the chain");
+    }
+
+    #[test]
+    fn capture_batch_rejects_zero_amount() {
+        let err = build_capture_batch(LEDGER_ID, 0, TENANT, hold_id(), Uuid::from_u128(0x2006), 0, CODE_CAPTURE)
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::InvalidAmount));
+    }
+
+    #[test]
+    fn void_leg_carries_the_holds_code() {
+        let debit = PLATFORM_CLEARING_ACCOUNT.to_string();
+        let credit = deposits_account(TENANT);
+        let t = build_void_hold_transfer(LEDGER_ID, 0x3003, hold_id().as_u128(), &debit, &credit);
+        // THE SPEC-W42 rule: a VOID_PENDING_TRANSFER leg must carry the
+        // pending hold's code, not CODE_REFUND.
+        assert_eq!(
+            t.code(),
+            CODE_DEPOSIT_HOLD,
+            "VOID_PENDING_TRANSFER leg must carry CODE_DEPOSIT_HOLD (real TB \
+             rejects a mismatch with pending_transfer_has_different_code)"
+        );
+        assert!(t.flags().contains(TbFlags::VOID_PENDING_TRANSFER));
+        assert!(!t.flags().contains(TbFlags::POST_PENDING_TRANSFER));
+        assert!(!t.flags().contains(TbFlags::LINKED));
+        assert_eq!(t.pending_id(), hold_id().as_u128());
+        assert_eq!(t.amount(), 0, "amount 0 voids the full pending hold");
+        assert_eq!(t.ledger(), LEDGER_ID);
+    }
+
+    #[test]
+    fn hold_post_and_void_legs_share_one_code() {
+        // Cross-check the invariant end to end: hold, capture-post and void
+        // legs for the SAME deposit hold all carry CODE_DEPOSIT_HOLD.
+        let hold = build_hold_transfer(LEDGER_ID, Uuid::from_u128(0x4001), TENANT, 7_000);
+        let b = build_capture_batch(
+            LEDGER_ID,
+            FEE_BPS,
+            TENANT,
+            Uuid::from_u128(0x4002),
+            Uuid::from_u128(0x4003),
+            7_000,
+            CODE_CAPTURE,
+        )
+        .unwrap();
+        let void = build_void_hold_transfer(
+            LEDGER_ID,
+            0x4004,
+            0x4002,
+            PLATFORM_CLEARING_ACCOUNT,
+            &deposits_account(TENANT),
+        );
+        assert_eq!(hold.code(), b.transfers[0].code());
+        assert_eq!(hold.code(), void.code());
+        assert_eq!(hold.code(), CODE_DEPOSIT_HOLD);
+    }
+
+    // -----------------------------------------------------------------------
+    // GF11 idempotent-replay acceptance (SPEC-W42 R2): synthetic error-kind
+    // vectors against `is_idempotent_replay` — pure, no server needed.
+    // Mutation check: widening the accepted kind set (e.g. accepting
+    // PendingTransferHasDifferentCode) or dropping the Exists anchor must
+    // fail these tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn replay_all_exists_is_accepted() {
+        // Single-leg replay (hold / void / refund / payout batches).
+        assert!(is_idempotent_replay(&[CreateTransferErrorKind::Exists]));
+    }
+
+    #[test]
+    fn replay_linked_exists_then_linked_event_failed_is_accepted() {
+        use CreateTransferErrorKind as K;
+        // Live-proven replay signature of a committed 3-leg LINKED capture
+        // batch: leg 0 `exists`, legs 1..n `linked_event_failed`.
+        assert!(is_idempotent_replay(&[
+            K::Exists,
+            K::LinkedEventFailed,
+            K::LinkedEventFailed,
+        ]));
+        // Two-leg variant (fee rounds to zero).
+        assert!(is_idempotent_replay(&[K::Exists, K::LinkedEventFailed]));
+    }
+
+    #[test]
+    fn linked_event_failed_without_exists_anchor_is_rejected() {
+        // `linked_event_failed` alone never proves a prior commit — it also
+        // trails genuine first-leg rejections.
+        assert!(!is_idempotent_replay(&[
+            CreateTransferErrorKind::LinkedEventFailed
+        ]));
+        assert!(!is_idempotent_replay(&[
+            CreateTransferErrorKind::LinkedEventFailed,
+            CreateTransferErrorKind::LinkedEventFailed,
+        ]));
+    }
+
+    #[test]
+    fn mutant_different_code_plus_linked_event_failed_is_rejected() {
+        use CreateTransferErrorKind as K;
+        // The W42 mutant (post leg carrying the operation code instead of
+        // CODE_DEPOSIT_HOLD) is rejected by a real server with
+        // `pending_transfer_has_different_code` on leg 0, which breaks the
+        // link chain: this MUST NOT be accepted as an idempotent replay.
+        assert!(!is_idempotent_replay(&[
+            K::PendingTransferHasDifferentCode,
+            K::LinkedEventFailed,
+        ]));
+        // Anchor present elsewhere does not rescue a genuine rejection.
+        assert!(!is_idempotent_replay(&[
+            K::Exists,
+            K::PendingTransferHasDifferentCode,
+        ]));
+    }
+
+    #[test]
+    fn any_genuine_error_kind_defeats_replay_acceptance() {
+        use CreateTransferErrorKind as K;
+        assert!(!is_idempotent_replay(&[K::Exists, K::ExceedsCredits]));
+        assert!(!is_idempotent_replay(&[
+            K::ExceedsCredits,
+            K::LinkedEventFailed,
+        ]));
+    }
+
+    #[test]
+    fn empty_error_set_keeps_prior_vacuous_acceptance() {
+        // Success path unaffected: no per-item errors (the Ok(()) arm handles
+        // real success; this preserves the old all-Exists guard's vacuous
+        // truth on an empty slice).
+        assert!(is_idempotent_replay(&[]));
     }
 }
