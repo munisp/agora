@@ -56,15 +56,15 @@ measurements blocked by a known defect.
 
 | Artifact | What it evidences | Status |
 |---|---|---|
-| `.github/workflows/ci.yml` | Applied by maintainer directive in W41 (parked local-only in W39). Fixes: analytics-pipeline lane installs `-e '.[dev]'`; `workflow_dispatch` trigger added (e2e job was dead code); stale Cargo.lock comment corrected; new blocking `funds-e2e` lane | STATIC (yaml.safe_load_all parses; V-Docs re-lints) |
-| `apps/admin-web/package-lock.json`, `apps/mobile/package-lock.json` | SYNC-OK vs package.json (recon-verified); pushed unchanged | STATIC |
+| `.github/workflows/ci.yml` | Push ATTEMPTED in W41 by maintainer directive and REJECTED — token lacks the `workflows` scope (git-trees API 404 in W39; contents-API PUT 404 in W41), so it remains parked LOCAL-ONLY. Fixes: analytics-pipeline lane installs `-e '.[dev]'`; `workflow_dispatch` trigger added (e2e job was dead code); stale Cargo.lock comment corrected; new blocking `funds-e2e` lane | STATIC (yaml.safe_load_all parses; V-Docs re-lints) |
+| `apps/admin-web/package-lock.json`, `apps/mobile/package-lock.json` | SYNC-OK vs package.json (recon-verified); parked LOCAL-ONLY — 250KB/582KB lockfiles exceed the text-only push budget; audit-allowlisted | STATIC |
 
 ## 6. Docs sweep (W41-7)
 
 | Artifact | What it evidences | Status |
 |---|---|---|
 | `docs/slo-dashboards.md` | 1.3/4.2 rows now cite the W41 offline baseline; remaining "needs instrumentation" lines stay honest | STATIC |
-| `docs/ROADMAP.md` G2/G3 | ci.yml applied + funds-e2e/race/restore/perf evidence locations | STATIC |
+| `docs/ROADMAP.md` G2/G3 | ci.yml push attempted/rejected (remains parked LOCAL-ONLY; token lacks `workflows` scope) + funds-e2e/race/restore/perf evidence locations | STATIC |
 | `docs/industries.md` | customTool claims match pack YAMLs (ecommerce row fixed; travel/transportation already honest; consultancy's live `check_calendar_availability` targets the real booking service) | STATIC |
 
 ## 7. Wave ledger
