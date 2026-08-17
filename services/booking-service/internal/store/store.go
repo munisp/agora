@@ -42,7 +42,7 @@ type Store struct {
 
 // New connects to Postgres, verifies connectivity and ensures the `sites`
 // table exists (see package doc). maxConns sizes the pool; <= 0 keeps the
-// pgx default (min(4, NumCPU)). Size for PEAK concurrent calls, not average:
+// pgx default (max(4, NumCPU)). Size for PEAK concurrent calls, not average:
 // docs/runbooks/capacity-planning.md §DB connection pools
 // (peak_calls × peak turns_per_call); a pool sized for average injects dead
 // air mid-call while every dashboard looks green.
