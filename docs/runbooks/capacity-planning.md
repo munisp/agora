@@ -23,17 +23,23 @@ Fill the **Ceiling now** column from load tests (`tests/load/voice_ramp.py`)
 and the Concurrency Ceilings dashboard. The demand column is per *N
 concurrent calls*.
 
+> **W41 measurement note:** no placeholder cells remain, and none were filled
+> with invented numbers. Voice-layer ceilings are **not yet measured**
+> (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution); the
+> funds/booking API paths now have a measured baseline via the W41 perf
+> harness — see §1a and `tests/perf/RESULTS.md`.
+
 | # | Layer | Agora component | Ceiling unit | Demand per concurrent call | Ceiling now | Lift lever |
 |---|-------|--------------------|--------------|----------------------------|-------------|------------|
-| 1 | Media plane (SFU) | LiveKit DaemonSet (`deploy/k3s/livekit-server.yaml`), 1 pod/node, hostNetwork | concurrent **rooms** per node; node CPU/bandwidth | 1 room + 1–2 participant streams | _fill_ (start: ~50–100 calls/node on 4 dedicated cores, UDP hostPorts 50000-50100) | add `livekit=true` nodes (rooms mesh across nodes); budget old+new capacity during 5h drain rollouts |
-| 2 | Worker plane | `voice-worker` Deployment + HPA (`deploy/k3s/voice-worker*.yaml`) | concurrent **job processes** per pod | 1 job (1 warm subprocess) | _fill_ (start: 10–25 jobs per 4cpu/8Gi pod; HPA 2–20 pods) | raise `maxReplicas` + add compute-optimized nodes (**never burstable t3-class**); `AGENT_IDLE_PROCESSES` prewarming |
-| 3a | Inference — STT | faster-whisper in voice-agent-runtime (`WHISPER_MODEL=base`) | concurrent **streams** per GPU/CPU box | 1 stream while caller speaks (~40% of call) | _fill_ | bigger GPU / smaller model / dedicated STT tier |
-| 3b | Inference — LLM | Ollama `qwen3:8b` (`LLM_BASE_URL`); MiniMax-M2 adapter as API mode | **rate** (RPM/TPM); self-hosted: `OLLAMA_NUM_PARALLEL` slots | ~2–4 completions/turn, ~8–12 turns/call | _fill_ (start: `OLLAMA_NUM_PARALLEL` = GPU VRAM-dependent, 4–8 typical) | raise `OLLAMA_NUM_PARALLEL`, add GPU, or fallback adapter (Ollama→MiniMax on 429/timeout) |
-| 3c | Inference — TTS | Piper sidecar (`PIPER_URL`); ElevenLabs adapter optional | concurrent **synth streams** | 1 stream per agent turn | _fill_ (Piper is light: ~dozens of streams per core) | scale piper replicas; ElevenLabs adapter when enabled (reintroduces API rate cap) |
+| 1 | Media plane (SFU) | LiveKit DaemonSet (`deploy/k3s/livekit-server.yaml`), 1 pod/node, hostNetwork | concurrent **rooms** per node; node CPU/bandwidth | 1 room + 1–2 participant streams | not yet measured (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution) (planning start: ~50–100 calls/node on 4 dedicated cores, UDP hostPorts 50000-50100) | add `livekit=true` nodes (rooms mesh across nodes); budget old+new capacity during 5h drain rollouts |
+| 2 | Worker plane | `voice-worker` Deployment + HPA (`deploy/k3s/voice-worker*.yaml`) | concurrent **job processes** per pod | 1 job (1 warm subprocess) | not yet measured (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution) (planning start: 10–25 jobs per 4cpu/8Gi pod; HPA 2–20 pods) | raise `maxReplicas` + add compute-optimized nodes (**never burstable t3-class**); `AGENT_IDLE_PROCESSES` prewarming |
+| 3a | Inference — STT | faster-whisper in voice-agent-runtime (`WHISPER_MODEL=base`) | concurrent **streams** per GPU/CPU box | 1 stream while caller speaks (~40% of call) | not yet measured (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution) | bigger GPU / smaller model / dedicated STT tier |
+| 3b | Inference — LLM | Ollama `qwen3:8b` (`LLM_BASE_URL`); MiniMax-M2 adapter as API mode | **rate** (RPM/TPM); self-hosted: `OLLAMA_NUM_PARALLEL` slots | ~2–4 completions/turn, ~8–12 turns/call | not yet measured (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution) (planning start: `OLLAMA_NUM_PARALLEL` = GPU VRAM-dependent, 4–8 typical) | raise `OLLAMA_NUM_PARALLEL`, add GPU, or fallback adapter (Ollama→MiniMax on 429/timeout) |
+| 3c | Inference — TTS | Piper sidecar (`PIPER_URL`); ElevenLabs adapter optional | concurrent **synth streams** | 1 stream per agent turn | not yet measured (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution) (planning note: Piper is light — ~dozens of streams per core) | scale piper replicas; ElevenLabs adapter when enabled (reintroduces API rate cap) |
 | 4 | Telephony | LiveKit SIP (roadmap — waitlist backfill outbound) | carrier **channel count** (hard cap) + **CPS** (start rate) | 1 SIP channel per PSTN call | not yet provisioned | procurement: more channels/trunks/numbers, regional origination; pace outbound with `OutboundPacer` (`OUTBOUND_CPS`, default 1/s) — CPS binds campaigns first |
-| 5a | Application — tools | Dapr-invoked booking availability / knowledge RAG / identity context | downstream rps at p99 ≤ turn budget | 2–5 downstream calls per turn | _fill_ | cache (Redis availability cache ✓), async tools + filler audio, hard 4s timeout → spoken fallback |
+| 5a | Application — tools | Dapr-invoked booking availability / knowledge RAG / identity context | downstream rps at p99 ≤ turn budget | 2–5 downstream calls per turn | booking paths: see `tests/perf/RESULTS.md` (W41 measured baseline); knowledge/identity downstreams not yet measured | cache (Redis availability cache ✓), async tools + filler audio, hard 4s timeout → spoken fallback |
 | 5b | Application — DB | Postgres pgx pools per Go service | pool **connections** (see §3) | per-turn queries × N calls | defaults in §3 | size for peak (formula §3), not average |
-| 5c | Application — search | OpenSearch (knowledge RAG) | concurrent queries at p99 latency | 0–2 searches per turn (industry-pack dependent) | _fill_ | replicas/shards; cache embeddings |
+| 5c | Application — search | OpenSearch (knowledge RAG) | concurrent queries at p99 latency | 0–2 searches per turn (industry-pack dependent) | not yet measured (harness: `tests/load/voice_ramp.py`, §5 — no W41 execution) | replicas/shards; cache embeddings |
 | 6 | Gateway | APISIX (`apisix_http_status`, `apisix_bandwidth`) | rps + bandwidth | signalling + webhooks only (RTP bypasses gateway) | rarely binding | scale gateway replicas |
 
 **Rule-of-thumb scaling order** (cheapest/most-likely-first):
@@ -49,6 +55,40 @@ concurrent calls*.
    any outbound campaign.
 6. **Gateway/OpenSearch** — almost never the binding layer; verify before
    spending.
+
+---
+
+## 1a. Funds/booking API baseline + headroom (W41)
+
+The voice worksheet above is unmeasured; the **funds and booking API paths**
+now have a measurement loop (SPEC-W41 W41-5): `tests/funds-e2e/harness.py`
+times every public call against real service binaries + real (embedded)
+Postgres, and `tests/perf/aggregate.py` computes p50/p99 + throughput
+(N ≥ 50 per hot call) into `tests/perf/RESULTS.md`. Budgets are defined in
+`docs/performance-budgets.md`.
+
+| Operation | Budget (p50 / p99 / rps) | Measured baseline |
+|---|---|---|
+| Booking create (`POST /v1/bookings`) | see `docs/performance-budgets.md` B1 | see `tests/perf/RESULTS.md` (W41 measured baseline) |
+| Public booking (`POST /public/sites/{slug}/bookings`) | B2 | see `tests/perf/RESULTS.md` (W41 measured baseline) |
+| Invoice generate / issue | B3 / B4 | see `tests/perf/RESULTS.md` (W41 measured baseline) |
+| Paystack webhook | B5 | see `tests/perf/RESULTS.md` (W41 measured baseline) |
+| Deposit hold / capture | B6 / B7 | see `tests/perf/RESULTS.md` (W41 measured baseline) |
+
+**Headroom formulas** (recompute per release from the fresh baseline):
+
+```
+latency_headroom    = budget_p99 / measured_p99        # >1 = inside budget
+throughput_headroom = measured_rps / peak_expected_rps # >1 = inside budget
+```
+
+Planning rule: when either headroom drops **below 2×** for a path, treat that
+path's layer as the next binding constraint in §1 (usually 5b DB pools —
+formula in §3) and provision before the next demand step. Sandbox numbers are
+indicative only; re-measure on staging per release (environment caveats:
+`docs/performance-budgets.md` §3). Do **not** transcribe baseline numbers
+into this table — `tests/perf/RESULTS.md` is the single source of truth and
+is appended per run.
 
 ---
 
@@ -96,9 +136,9 @@ Postgres `max_connections` with ~20% headroom for migrations/jobs.
 | Service | Env | Default | Rationale |
 |---|---|---|---|
 | booking-service | `PG_MAX_CONNS` | **20** | ✅ implemented (`store.New(ctx, dsn, maxConns)` — pgxpool `ParseConfig`+`NewWithConfig`). Hottest path: availability lookup + booking write per turn. |
-| identity-service | `PG_MAX_CONNS` | 10 (recommended) | ⚠️ pool config **not exposed** — `store.New` calls `pgxpool.New` directly (pgx default `min(4, NumCPU)`). Tenant context is read once per call; default 4 is acceptable at small scale, revisit with the same pattern as booking-service when identity joins the mid-call path. |
+| identity-service | `PG_MAX_CONNS` | 10 (recommended) | ⚠️ pool config **not exposed** — `store.New` calls `pgxpool.New` directly (pgx v5 default `max(4, NumCPU)`). Tenant context is read once per call; default 4 is acceptable at small scale, revisit with the same pattern as booking-service when identity joins the mid-call path. |
 | crm-sync-service | `PG_MAX_CONNS` | 10 (recommended) | ⚠️ not exposed (same `pgxpool.New` pattern). Off-call-path (event sync); pgx default is fine until sync batch sizes grow. |
-| notification-worker | — | n/a | ⚠️ no pgx pool: worker is Temporal-activities only, no direct Postgres access. If a DB activity lands, expose `PG_MAX_CONNS` with the booking-service pattern. |
+| notification-worker | `PG_MAX_CONNS` | 10 (recommended) | ⚠️ pool config **not exposed** — `cmd/worker/main.go` calls `store.New` → `pgxpool.New` directly (pgx v5 default `max(4, NumCPU)`); the civic-ledger/DND activities query Postgres via pgx (`internal/store`). Same pattern as identity-service: expose `PG_MAX_CONNS` with the booking-service pattern. |
 
 Monitoring: Grafana → Concurrency Ceilings → "Postgres connections per
 database" (`pg_stat_activity_count` vs `pg_settings_max_connections`; needs

@@ -190,7 +190,8 @@ there is no other raw copy.
 ## 6. Backups
 
 **Postgres** (all service DBs — identity, booking, conversation, knowledge,
-analytics_meta, temporal, keycloak, permify, iceberg):
+analytics_meta, notifications, billing, kyc, platform, temporal, keycloak,
+permify, iceberg, twenty, crm_sync, opendesk):
 
 ```bash
 # Full cluster dump:
@@ -206,11 +207,20 @@ cleanly because policies reference the GUC, not literal tenant ids. The
 `iceberg` DB is the Iceberg REST catalog — losing it orphans the lake tables
 even if Parquet files survive; back it up **together with** MinIO.
 
+**Executable restore drill (W41):** `tests/restore-drill/drill.py` automates
+this section end-to-end against real Postgres — it dumps each application DB
+with `pg_dump -Fc`, restores into a FRESH cluster with `pg_restore
+--no-owner --no-privileges` (mirroring `infra/backups/restore.sh`), then
+asserts identical row counts, RLS policies present, `relforcerowsecurity`
+set, marker rows readable, and tenant-deny still enforced post-restore. See
+`tests/restore-drill/README.md` for how to run it; executed evidence
+(commands, outputs, timings) lives in `tests/restore-drill/RESULTS.md`.
+
 **MinIO** (bucket `lake` — all Iceberg data files):
 
 ```bash
 # Filesystem-level copy of the volume (dev):
-docker run --rm -v opendesk_minio-data:/data -v $PWD/backups:/backup \
+docker run --rm -v agora_minio-data:/data -v $PWD/backups:/backup \
   alpine tar czf /backup/minio-lake-$(date +%F).tgz -C /data lake
 # Or use `mc mirror` from a client container for object-level replication.
 ```
@@ -331,20 +341,23 @@ they are not recoverable, so rotate during low traffic.
 * Downgrades are not supported by Twenty's migrations; snapshot the `twenty`
   DB before upgrading if rollback matters.
 
-## 7. Backup automation (infra/backups)
+## 8. Backup automation (infra/backups)
 
 `infra/backups/backup.sh` captures a timestamped snapshot of all stateful
 systems and keeps the newest 7 snapshots (restic-style keep-last,
 `BACKUP_KEEP` to change):
 
 * **Postgres** — `pg_dump -Fc` per database (identity, booking, conversation,
-  knowledge, analytics_meta, temporal, keycloak, permify, iceberg, twenty,
-  crm_sync, opendesk) from the `postgres` container. This is the automated
-  form of the §6 per-DB pattern; it replaces ad-hoc `pg_dumpall` for routine
-  snapshots.
+  knowledge, analytics_meta, notifications, billing, kyc, platform, temporal,
+  keycloak, permify, iceberg, twenty, crm_sync, opendesk — the W41-fixed
+  `PG_DBS` default in `backup.sh`; override via the `PG_DBS` env var) from
+  the `postgres` container. This is the automated form of the §6 per-DB
+  pattern; it replaces ad-hoc `pg_dumpall` for routine snapshots.
 * **MinIO** — `mc mirror` of the `lake` and `exports` buckets via an
-  ephemeral `minio/mc` container on the `opendesk` network. The `iceberg`
-  catalog DB is dumped in the same run, keeping the lakehouse consistent.
+  ephemeral `minio/mc` container on the compose network (default
+  `agora_opendesk` — project `agora` × network `opendesk`; override with
+  `COMPOSE_NETWORK`). The `iceberg` catalog DB is dumped in the same run,
+  keeping the lakehouse consistent.
 * **TigerBeetle** — data-file copy (`/data/0_0.tigerbeetle`); the container
   is **paused** during the copy so the snapshot is consistent (`TB_PAUSE=0`
   to skip). Ledger writes stall for the duration of the copy.
@@ -361,7 +374,7 @@ docker logs opendesk-ofelia        # scheduler activity
 docker logs opendesk-backup        # last run output (job-exec logs)
 
 # Verify a snapshot:
-ls -1 backups/                     # or: docker run --rm -v opendesk_backups:/b alpine ls -1 /b
+ls -1 backups/                     # or: docker run --rm -v agora_backups:/b alpine ls -1 /b
 cat backups/<ts>/manifest.txt
 
 # Restore (DESTRUCTIVE — requires RESTORE_CONFIRM=yes):
@@ -375,6 +388,12 @@ swap the data file back. There is **no point-in-time recovery** — you get
 the snapshot as-is. After a Postgres restore of `booking`/`conversation`/
 `knowledge`, re-verify RLS roles (§Agent B runbook) still match if you
 restored with `--no-owner`.
+
+**Quarterly restore drill:** run the executable drill
+(`tests/restore-drill/drill.py`, see §6) each quarter and after any backup
+tooling change; file the run's output as `tests/restore-drill/RESULTS.md`.
+This is the evidence artifact for the quarterly-drill requirement in
+`docs/data-residency.md` §2.1.
 
 Limitations (dev topology): per-DB dumps, not WAL archiving — production HA
 (Patroni, ADR-0008) should use WAL-G/pgBackRest to object storage; on a
