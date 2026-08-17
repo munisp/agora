@@ -4,6 +4,26 @@ RLS note: init script 03-conversation-schema.sql enables FORCE ROW LEVEL
 SECURITY with policy tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
 (NULLIF so a recycled '' GUC fails closed instead of raising), so
 every transaction sets app.tenant_id via set_config(..., true) (LOCAL).
+
+J-14 tenant-GUC closure (SPEC-W42):
+
+- Every tenant-scoped statement runs through ``_tenant_tx``: an explicit
+  transaction with ``set_config('app.tenant_id', ..., true)`` — the
+  parameterizable form of ``SET LOCAL``. The GUC is transaction-scoped and
+  auto-resets at commit/rollback, so a pooled connection can NEVER carry a
+  tenant context into the next checkout, whatever the pool reset behavior.
+  Regression proof: tests/test_tenant_guc_pool.py interleaves tenants on a
+  size-1..2 pool and probes recycled connections.
+- No code path issues a session-level ``SET app.tenant_id``; fail closed is
+  enforced at the HTTP layer (app/routes.py ``_require_tenant`` returns 401
+  when tenant scope is missing) and here (``_tenant_tx`` refuses None).
+- Documented exemptions (not tenant-scoped reads, or cross-tenant by
+  design): ``ping`` (SELECT 1), the ``ensure_*`` idempotent DDL (ALTER/CREATE
+  only, no tenant rows), ``list_tenant_ids`` (retention-sweep enumeration —
+  requires an RLS-bypassing maintenance role; under the least-privilege
+  app role it returns [] i.e. fail-closed), and AgentStore's
+  ``tenant_slugs`` projection / ``resolve_agent_by_phone`` (see
+  app/agent_db.py docstrings).
 """
 
 from __future__ import annotations
@@ -131,7 +151,22 @@ class Database:
 
     @asynccontextmanager
     async def _tenant_tx(self, tenant_id: uuid.UUID) -> AsyncIterator[asyncpg.Connection]:
-        """Acquire a connection inside a transaction with app.tenant_id set."""
+        """Acquire a connection inside an explicit transaction with
+        ``SET LOCAL app.tenant_id`` (J-14 closure).
+
+        ``set_config(..., true)`` is the parameterizable form of
+        ``SET LOCAL``: the GUC is transaction-scoped and auto-resets at
+        commit/rollback, so it never survives pool release. tenant_id=None
+        (an unresolved tenant context) is a programming error and fails
+        loudly here instead of running tenant-scoped queries with the GUC
+        unset — HTTP callers must fail closed BEFORE reaching this point
+        (``_require_tenant`` in app/routes.py returns 401).
+        """
+        if tenant_id is None:
+            raise ValueError(
+                "tenant_id is required: refusing to run tenant-scoped queries "
+                "with app.tenant_id unset"
+            )
         async with self._pool_acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -269,11 +304,13 @@ class Database:
     async def list_tenant_ids(self) -> list[uuid.UUID]:
         """Distinct tenant ids present in the conversations table.
 
-        RLS caveat: this enumeration runs WITHOUT app.tenant_id set, so it
-        only sees rows when the connecting role bypasses RLS (the default
-        opendesk superuser DSN). With an RLS-enforced role
-        (app_conversation_login) it returns an empty list — run the
-        retention sweep with the superuser DSN or a maintenance role.
+        RLS caveat (documented J-14 exemption): this enumeration runs
+        WITHOUT app.tenant_id set, so it only sees rows when the connecting
+        role bypasses RLS (the default opendesk superuser DSN). With an
+        RLS-enforced role (app_conversation_login) it returns an empty list
+        — fail-closed, no app-level fallback filtering. Run the retention
+        sweep with the superuser DSN or a maintenance role. The per-tenant
+        deletes themselves (delete_turns_older_than) are tenant-scoped.
         """
         async with self._pool_acquire() as conn:
             rows = await conn.fetch(
