@@ -29,3 +29,4 @@ tigerbeetle-unofficial = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+proptest = "1"
