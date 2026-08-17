@@ -439,4 +439,3 @@ created_at) result and every ledger balance counter byte-identical.
 Mutant detected at the FIRST capture (502; the 3 api errors = pending_transfer_has_different_code on the
 post leg + linked_event_failed x2 on the linked split legs — exactly the kind vector the R2 unit test
 `mutant_different_code_plus_linked_event_failed_is_rejected` rejects). Mutation check: **PASS** (still fails).
-
