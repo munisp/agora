@@ -10,6 +10,19 @@
 //! - [`sim::SimLedgerClient`] — default; in-memory double-entry ledger for dev/CI.
 //! - `tigerbeetle::TigerBeetleClient` — live client, only compiled with the
 //!   `tb-live` cargo feature.
+//!
+//! ## TigerBeetle code-matching rule (SPEC-W42, recon R1 — live-proven)
+//!
+//! Real TigerBeetle requires every `POST_PENDING_TRANSFER` /
+//! `VOID_PENDING_TRANSFER` leg to carry the SAME `code` as the pending
+//! transfer it resolves; a mismatch is rejected with
+//! `pending_transfer_has_different_code` (result 30) and the whole LINKED
+//! batch rolls back. Deposit holds are [`CODE_DEPOSIT_HOLD`], so every
+//! post/void leg of a deposit hold carries [`CODE_DEPOSIT_HOLD`] too. Only
+//! auxiliary NON-pending legs linked after the post (the revenue /
+//! platform-fee split) keep the operation's own code ([`CODE_CAPTURE`],
+//! [`CODE_NO_SHOW_FEE`]). The sim ledger intentionally does NOT enforce this
+//! rule (see the note in `sim.rs`).
 
 pub mod sim;
 #[cfg(feature = "tb-live")]
@@ -27,10 +40,15 @@ pub const LEDGER_ID: u32 = 1;
 // ---------------------------------------------------------------------------
 // Transfer codes (SPEC §9)
 // ---------------------------------------------------------------------------
-pub const CODE_DEPOSIT_HOLD: u16 = 100; // deposit hold (pending)
-pub const CODE_CAPTURE: u16 = 101; // capture of a held deposit
-pub const CODE_REFUND: u16 = 102; // refund / void of a hold
-pub const CODE_NO_SHOW_FEE: u16 = 103; // no-show fee charged from a hold
+// NOTE (TB code-matching rule, SPEC-W42): a POST_PENDING_TRANSFER or
+// VOID_PENDING_TRANSFER leg must carry the SAME code as the pending hold it
+// resolves, i.e. CODE_DEPOSIT_HOLD for deposit holds — real TigerBeetle
+// rejects a mismatch with `pending_transfer_has_different_code`. Codes
+// 101..=104 below apply to plain (non-pending-resolving) transfers only.
+pub const CODE_DEPOSIT_HOLD: u16 = 100; // deposit hold (pending) AND every post/void leg resolving it
+pub const CODE_CAPTURE: u16 = 101; // auxiliary revenue/fee split legs of a capture (non-pending)
+pub const CODE_REFUND: u16 = 102; // posted refund legs (a hold's VOID leg carries 100 instead)
+pub const CODE_NO_SHOW_FEE: u16 = 103; // auxiliary split legs of a no-show fee (non-pending)
 pub const CODE_PAYOUT: u16 = 104; // payout of tenant earnings (Mojaloop rail)
 
 // ---------------------------------------------------------------------------
@@ -201,10 +219,14 @@ pub trait LedgerClient: Send + Sync {
         amount: u64,
     ) -> Result<Transfer, LedgerError>;
 
-    /// Capture a hold: posts the pending transfer (code 101), releasing any
-    /// remainder, then splits the captured amount from `tenant:{id}:deposits`
-    /// into `tenant:{id}:revenue` (net) and `platform:fees` (fee).
+    /// Capture a hold: posts the pending transfer (releasing any remainder),
+    /// then splits the captured amount from `tenant:{id}:deposits` into
+    /// `tenant:{id}:revenue` (net) and `platform:fees` (fee).
     /// `amount = None` captures the full hold. Idempotent by `hold_id`.
+    ///
+    /// Codes (TB rule): the POST_PENDING_TRANSFER leg carries the hold's own
+    /// code [`CODE_DEPOSIT_HOLD`]; the auxiliary non-pending split legs carry
+    /// [`CODE_CAPTURE`].
     async fn capture(
         &self,
         tenant_id: &str,
@@ -213,9 +235,13 @@ pub trait LedgerClient: Send + Sync {
         amount: Option<u64>,
     ) -> Result<CaptureResult, LedgerError>;
 
-    /// Refund (code 102). If `hold_id` refers to a still-pending hold, the hold
-    /// is voided (flag void_pending, `amount` ignored). Otherwise money is moved
-    /// back: `tenant:{id}:revenue -> platform:clearing`. Idempotent by `transfer_id`.
+    /// Refund. If `hold_id` refers to a still-pending hold, the hold is
+    /// voided (flag void_pending, `amount` ignored); per the TB code-matching
+    /// rule that VOID leg carries the hold's own code [`CODE_DEPOSIT_HOLD`]
+    /// on the wire (the sim records [`CODE_REFUND`] for observability — sim
+    /// does not enforce code matching). Otherwise money is moved back:
+    /// `tenant:{id}:revenue -> platform:clearing` with [`CODE_REFUND`].
+    /// Idempotent by `transfer_id`.
     async fn refund(
         &self,
         tenant_id: &str,
@@ -224,9 +250,13 @@ pub trait LedgerClient: Send + Sync {
         amount: u64,
     ) -> Result<Transfer, LedgerError>;
 
-    /// No-show fee (code 103): posts `amount` of the pending hold (releasing
-    /// the remainder) and splits it into tenant revenue / platform fee.
+    /// No-show fee: posts `amount` of the pending hold (releasing the
+    /// remainder) and splits it into tenant revenue / platform fee.
     /// Idempotent by `hold_id`.
+    ///
+    /// Codes (TB rule): the POST_PENDING_TRANSFER leg carries the hold's own
+    /// code [`CODE_DEPOSIT_HOLD`]; the auxiliary non-pending split legs carry
+    /// [`CODE_NO_SHOW_FEE`].
     async fn no_show_fee(
         &self,
         tenant_id: &str,

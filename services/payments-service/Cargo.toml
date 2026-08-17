@@ -25,6 +25,10 @@ async-trait = "0.1"
 thiserror = "1"
 # Gated behind `tb-live`; the community-published official Rust client for
 # TigerBeetle. Only used when LEDGER_IMPL=tigerbeetle and built with --features tb-live.
+# Pin note (SPEC-W42 R1): 0.8.0+0.16.28 speaks the TigerBeetle 0.16.28 wire
+# protocol and the server enforces client/server release parity — the compose
+# image (infra/docker-compose.core.yml) MUST run the same release (0.16.28);
+# an older server (e.g. 0.16.4) evicts this client with `client_release_too_high`.
 tigerbeetle-unofficial = { version = "0.8", optional = true }
 
 [dev-dependencies]
