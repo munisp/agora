@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """restore-drill — backup/restore + migration drill against REAL Postgres.
 
-Two REAL embedded-Postgres clusters (pgserver == full PostgreSQL binaries,
-no mocks, no sqlite):
+Two REAL Postgres clusters, one dump+restore cycle:
 
   instance A  — init-scripts applied exactly like the docker
                 postgres docker-entrypoint-initdb.d psql path (psql stdin,
-                \\c meta-commands supported by pgserver's server.psql),
+                \\c meta-commands supported),
                 billing migrations 0001..0004 applied, marker rows seeded.
   pg_dump -Fc — one custom-format dump per application database (mirrors
                 infra/backups/backup.sh).
@@ -14,15 +13,42 @@ no mocks, no sqlite):
                 pg_restore --no-owner --no-privileges (mirrors
                 infra/backups/restore.sh exactly).
 
-pgserver adaptations (ALL documented, none weaken the drill):
+Cluster backend (env DRILL_PG):
+  * DRILL_PG=pgserver (DEFAULT) — embedded full PostgreSQL binaries via the
+    pgserver package (real PostgreSQL 16, unix-socket only, no contrib
+    modules). Adaptations listed below.
+  * DRILL_PG=system (SPEC-W42) — locally installed system PostgreSQL
+    (apt `postgresql`; binaries from DRILL_PG_BIN, else
+    /usr/lib/postgresql/<ver>/bin, else PATH). initdb+pg_ctl run a real
+    cluster per instance on a workdir-local unix socket (no TCP). This mode
+    exists so the postgis init script (06-booking-postgis.sql) can be
+    EXECUTED as part of the drill when the postgis packages are installed
+    (apt `postgis` / `postgresql-<ver>-postgis-3`): 06 is applied verbatim
+    on instance A, the extension rides the pg_dump/pg_restore cycle like any
+    schema object, and instance B is asserted to have postgis live on the
+    booking DB. If postgis is NOT available (pg_available_extensions lacks
+    it), the drill prints an explicit `SKIP` line with the precise reason
+    and records a skipped check in drill-summary.json — never a silent
+    pass. If no system PostgreSQL is found at all, the whole system mode is
+    an explicit SKIP with the apt remediation in the message (evidence for
+    EXTERNAL_BLOCKED), exit 0. When running as root, initdb/pg_ctl/postgres
+    are demoted to the `postgres` (else `nobody`) account via setpriv/su
+    (PostgreSQL refuses to run as root); psql/pg_dump/pg_restore run as the
+    invoking user over the unix socket.
+    In system mode the pgcrypto strip is conditional: pgcrypto ships with
+    the postgresql-contrib package, so when it is present the init scripts
+    apply fully verbatim.
+
+pgserver-mode adaptations (ALL documented, none weaken the drill):
   1. `CREATE EXTENSION IF NOT EXISTS pgcrypto;` lines are stripped before
      applying 01/02/03/04/07 — pgserver ships CORE PostgreSQL without contrib
      modules (no pgcrypto/postgis). gen_random_uuid() is core since PG13 and
      is all those schemas use pgcrypto for. 30-model-registry.sql already
      guards its own pgcrypto line and is applied verbatim.
-  2. 06-booking-postgis.sql is SKIPPED: postgis is a contrib extension
-     pgserver cannot provide. The booking store tolerates its absence (geo
-     features are additive; the drill covers schema/RLS fidelity, not geo).
+  2. 06-booking-postgis.sql is SKIPPED with an explicit SKIP line: postgis
+     is a contrib extension pgserver cannot provide. The booking store
+     tolerates its absence (geo features are additive; the drill covers
+     schema/RLS fidelity, not geo). Use DRILL_PG=system for postgis coverage.
   3. 05-app-roles.sql references the docker bootstrap superuser `opendesk`
      in ALTER DEFAULT PRIVILEGES ... FOR ROLE opendesk. pgserver's bootstrap
      superuser is `postgres`, so the drill (a) creates a NOLOGIN `opendesk`
@@ -31,7 +57,8 @@ pgserver adaptations (ALL documented, none weaken the drill):
      0002_rls.sql already uses (FOREACH ['opendesk','postgres']). Without
      (b), pg_restore --no-privileges (tables created by `postgres`) would
      leave app roles with no grants — in production restore.sh restores as
-     `opendesk`, so the FOR ROLE opendesk defaults cover it.
+     `opendesk`, so the FOR ROLE opendesk defaults cover it. (In system mode
+     the bootstrap superuser is likewise `postgres`; identical handling.)
   4. Cluster-global roles are NOT carried by per-database pg_dump (that is
      what pg_dumpall --globals-only would do; production restore.sh likewise
      assumes the target cluster already ran the init scripts). Instance B
@@ -46,12 +73,16 @@ Assertions (exit 1 on any failure):
   * marker rows readable post-restore;
   * RLS still enforced post-restore: app_billing_login with a WRONG
     app.tenant_id sees 0 invoices; with app.tenant_id='' sees 0 (W40-6
-    NULLIF fail-closed posture); with the RIGHT tenant sees exactly 1.
+    NULLIF fail-closed posture); with the RIGHT tenant sees exactly 1;
+  * DRILL_PG=system with postgis available: 06 applied verbatim on A and
+    pg_extension postgis present on booking post-restore on B.
 
 Usage:
   python3 tests/restore-drill/drill.py [--workdir /tmp/restore-drill] [--keep]
-Deps: pip install pgserver==0.1.4 psycopg   (network: pgserver downloads PG
-binaries once into the package dir on first get_server())
+  DRILL_PG=system python3 tests/restore-drill/drill.py   # system PG + postgis
+Deps (pgserver mode): pip install pgserver==0.1.4 psycopg   (network: pgserver
+downloads PG binaries once into the package dir on first get_server())
+Deps (system mode): apt install postgresql postgis (or postgresql-<ver>-postgis-3)
 """
 
 from __future__ import annotations
@@ -59,6 +90,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -80,8 +113,15 @@ REPO_ROOT = Path(os.environ.get("OPENDESK_REPO", Path(__file__).resolve().parent
 INIT = REPO_ROOT / "infra/postgres/init-scripts"
 BILLING_MIGRATIONS = REPO_ROOT / "services/billing-engine/migrations"
 
+# DRILL_PG=pgserver (default, embedded PG binaries) | system (SPEC-W42:
+# locally installed postgresql+postgis, enables the 06-booking-postgis.sql
+# leg of the drill).
+DRILL_PG = os.environ.get("DRILL_PG", "pgserver").strip().lower()
+
 # Init scripts applied to instance A, in docker-entrypoint order. 06 is
-# deliberately absent (postgis unavailable under pgserver — see docstring).
+# absent here: it is inserted (after 05) only when the cluster backend can
+# provide the postgis extension — DRILL_PG=system with the postgis packages
+# installed. In pgserver mode it is SKIPPED with an explicit line.
 INIT_SCRIPTS = [
     "00-create-dbs.sql",
     "01-booking-schema.sql",
@@ -92,6 +132,7 @@ INIT_SCRIPTS = [
     "07-agents-capture-schema.sql",
     "30-model-registry.sql",
 ]
+POSTGIS_SCRIPT = "06-booking-postgis.sql"  # docker order: after 05, before 07
 BILLING_MIGRATION_FILES = ["0001_init.sql", "0002_rls.sql", "0003_ledger.sql", "0004_outbox.sql"]
 
 # Application databases covered by the drill (schema-bearing).
@@ -106,11 +147,19 @@ RLS_ASSERTIONS = [
 ]
 
 RESULTS: list[dict] = []
+SKIPS: list[dict] = []
 
 
 def record(name: str, ok: bool, detail: str = "") -> None:
     RESULTS.append({"check": name, "ok": ok, "detail": detail})
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""), flush=True)
+
+
+def record_skip(name: str, reason: str) -> None:
+    """An explicit, recorded SKIP — evidence for EXTERNAL_BLOCKED, never a
+    silent pass."""
+    SKIPS.append({"check": name, "skipped": True, "reason": reason})
+    print(f"SKIP  {name}  — {reason}", flush=True)
 
 
 def strip_contrib_extensions(sql: str) -> str:
@@ -119,12 +168,14 @@ def strip_contrib_extensions(sql: str) -> str:
     pgserver ships core PostgreSQL WITHOUT contrib modules, so pgcrypto is
     unavailable; every use in these schemas is gen_random_uuid(), which has
     been core since PG13. The line is replaced by a comment so the applied
-    text stays auditable. Nothing else is stripped.
+    text stays auditable. Nothing else is stripped. (In DRILL_PG=system mode
+    this is only used when the system cluster also lacks pgcrypto — the
+    postgresql-contrib package normally provides it.)
     """
     out = []
     for line in sql.splitlines():
         if line.strip().lower().startswith("create extension if not exists pgcrypto"):
-            out.append("-- [restore-drill: stripped — pgserver has no contrib pgcrypto] " + line)
+            out.append("-- [restore-drill: stripped — backend has no contrib pgcrypto] " + line)
         else:
             out.append(line)
     return "\n".join(out)
@@ -135,8 +186,168 @@ def psql(server, sql: str) -> None:
     server.psql("\\set ON_ERROR_STOP on\n" + sql)  # raises CalledProcessError
 
 
+# ---------------------------------------------------------------------------
+# System-PostgreSQL cluster backend (DRILL_PG=system, SPEC-W42)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_BIN: Path | None = None  # resolved lazily by system_pg_bindir()
+
+
+def system_pg_bindir() -> Path | None:
+    """Locate system PostgreSQL binaries: DRILL_PG_BIN, then the highest
+    /usr/lib/postgresql/<ver>/bin, then PATH."""
+    global _SYSTEM_BIN
+    if _SYSTEM_BIN is not None:
+        return _SYSTEM_BIN
+    cands: list[Path] = []
+    env_dir = os.environ.get("DRILL_PG_BIN")
+    if env_dir:
+        cands.append(Path(env_dir))
+    pg_lib = Path("/usr/lib/postgresql")
+    if pg_lib.is_dir():
+        for d in sorted(pg_lib.iterdir(), key=lambda p: p.name, reverse=True):
+            cands.append(d / "bin")
+    which_psql = shutil.which("psql")
+    if which_psql:
+        cands.append(Path(which_psql).resolve().parent)
+    for d in cands:
+        if (d / "initdb").exists() and (d / "psql").exists() and (d / "pg_ctl").exists():
+            _SYSTEM_BIN = d
+            return d
+    return None
+
+
+def _unpriv_account() -> tuple[int, int, str] | None:
+    """(uid, gid, name) for running postgres when we are root: the Debian
+    `postgres` account (created by the apt package) preferred, else nobody.
+    None when not root (no demotion needed) or no account exists."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    for name in ("postgres", "nobody"):
+        try:
+            ent = pwd.getpwnam(name)
+            return ent.pw_uid, ent.pw_gid, name
+        except KeyError:
+            continue
+    return None
+
+
+class SystemPG:
+    """A real system-PostgreSQL cluster on a workdir-local unix socket.
+
+    Same interface the drill uses on a pgserver server object:
+    psql(sql), get_uri(database), socket_dir (attribute), cleanup().
+    """
+
+    def __init__(self, pgdata: Path, label: str):
+        bindir = system_pg_bindir()
+        if bindir is None:
+            raise RuntimeError("no system PostgreSQL binaries found")
+        self.bin = bindir
+        self.pgdata = pgdata
+        self.label = label
+        self.socket_dir = str(pgdata.parent / f"sock-{label}")
+        self.log = str(pgdata.parent / f"postgres-{label}.log")
+        self._acct = _unpriv_account()
+        Path(self.socket_dir).mkdir(parents=True, exist_ok=True)
+        if self._acct:
+            uid, gid, _name = self._acct
+            # postgres refuses to run as root: hand the dirs to the demoted
+            # account and make the workdir chain traversable.
+            for d in (pgdata.parent, Path(self.socket_dir)):
+                os.chown(d, uid, gid)
+                os.chmod(d, 0o777)
+            os.chmod(pgdata.parent.parent, os.stat(pgdata.parent.parent).st_mode | 0o755)
+        self._initdb()
+        self._start()
+
+    def _run_demoted(self, argv: list[str], **kw) -> subprocess.CompletedProcess:
+        if self._acct is None:
+            return subprocess.run(argv, **kw)
+        uid, gid, name = self._acct
+        if shutil.which("setpriv"):
+            return subprocess.run(
+                ["setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups"] + argv, **kw)
+        return subprocess.run(["su", "-s", "/bin/sh", name, "-c", shlex.join(argv)], **kw)
+
+    def _initdb(self) -> None:
+        r = self._run_demoted(
+            [str(self.bin / "initdb"), "-D", str(self.pgdata), "-U", "postgres",
+             "--auth=trust", "-E", "UTF8", "--no-instructions"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"initdb failed for {self.label}: {r.stderr.strip()[:400]}")
+
+    def _start(self) -> None:
+        r = self._run_demoted(
+            [str(self.bin / "pg_ctl"), "-D", str(self.pgdata), "-l", self.log,
+             "-o", f"-k {self.socket_dir}",
+             "-o", "-c listen_addresses=''",  # unix socket only, no TCP ports
+             "-o", "-c unix_socket_permissions=0777",
+             "-w", "-t", "60", "start"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"pg_ctl start failed for {self.label}: {r.stderr.strip()[:300]}; see {self.log}")
+
+    def psql(self, sql: str) -> None:
+        """Drop-in for pgserver's server.psql: real psql over the socket,
+        stdin input (\\c handled natively), CalledProcessError on failure."""
+        r = subprocess.run(
+            [str(self.bin / "psql"), "-X", "-h", self.socket_dir, "-U", "postgres",
+             "-d", "postgres"],
+            input=sql, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise subprocess.CalledProcessError(r.returncode, "psql", output=r.stdout,
+                                                stderr=r.stderr)
+
+    def psql_out(self, sql: str) -> str:
+        """psql -tA returning stdout (probes)."""
+        r = subprocess.run(
+            [str(self.bin / "psql"), "-X", "-tA", "-h", self.socket_dir, "-U", "postgres",
+             "-d", "postgres", "-c", sql],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            raise subprocess.CalledProcessError(r.returncode, "psql", output=r.stdout,
+                                                stderr=r.stderr)
+        return r.stdout.strip()
+
+    def extension_available(self, name: str) -> bool:
+        return self.psql_out(
+            "SELECT 1 FROM pg_available_extensions WHERE name = "
+            + "'" + name.replace("'", "''") + "'") == "1"
+
+    def get_uri(self, database: str = "postgres") -> str:
+        # Keyword-conninfo form (socket dir in host=); psycopg.conninfo
+        # parses it identically to pgserver's URI form.
+        return f"host={self.socket_dir} user=postgres dbname={database}"
+
+    def cleanup(self) -> None:
+        self._run_demoted([str(self.bin / "pg_ctl"), "-D", str(self.pgdata),
+                           "-m", "fast", "-w", "-t", "30", "stop"],
+                          capture_output=True, text=True)
+
+
+def boot_cluster(pgdata: Path, label: str):
+    """Cluster backend per DRILL_PG: pgserver embedded PG (default) or a
+    system PostgreSQL cluster (SPEC-W42)."""
+    if DRILL_PG == "system":
+        return SystemPG(pgdata, label)
+    return pgserver.get_server(str(pgdata))
+
+
 def pg_bin(name: str) -> str:
-    """pgserver bundles the full bin/ dir (pg_dump/pg_restore/psql)."""
+    """pg_dump/pg_restore/psql from the active backend: the system bin dir in
+    DRILL_PG=system mode (client and cluster versions must match), else
+    pgserver's bundled full bin/ dir."""
+    if DRILL_PG == "system":
+        bindir = system_pg_bindir()
+        if bindir is not None and (bindir / name).exists():
+            return str(bindir / name)
+        found = shutil.which(name)
+        if found:
+            return found
+        raise RuntimeError(f"{name} not found (DRILL_PG_BIN /usr/lib/postgresql/*/bin nor PATH)")
     bundled = Path(pgserver.__file__).resolve().parent / "pginstall" / "bin" / name
     if bundled.exists():
         return str(bundled)
@@ -147,7 +358,11 @@ def pg_bin(name: str) -> str:
 
 
 def socket_dir(server) -> str:
-    """Extract the unix-socket dir from pgserver's URI (?host=/path)."""
+    """Socket dir of the active cluster (attribute on SystemPG; ?host= query
+    of pgserver's URI otherwise)."""
+    sd = getattr(server, "socket_dir", None)
+    if isinstance(sd, str):
+        return sd
     q = urllib.parse.parse_qs(urllib.parse.urlparse(server.get_uri()).query)
     return q["host"][0]
 
@@ -181,8 +396,9 @@ def apply_role_layer(server) -> None:
     infra/postgres/init-scripts/30-model-registry.sql respectively (those
     files also carry schema, which here arrives via pg_restore instead).
     """
-    # 05 references FOR ROLE opendesk (docker bootstrap superuser); pgserver's
-    # is `postgres`, so create the name and bridge defaults for BOTH (the
+    # 05 references FOR ROLE opendesk (docker bootstrap superuser); the drill
+    # cluster's is `postgres` (pgserver bootstrap; initdb -U postgres in
+    # system mode), so create the name and bridge defaults for BOTH (the
     # 0002_rls.sql FOREACH idiom).
     psql(server, "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='opendesk')"
                  " THEN CREATE ROLE opendesk NOLOGIN; END IF; END $$;")
@@ -219,7 +435,7 @@ $$;
 """
     )
     # DB-level grants + default privileges FOR ROLE postgres so tables
-    # created by pg_restore (as the pgserver superuser) are reachable by the
+    # created by pg_restore (as the cluster superuser) are reachable by the
     # app roles — exactly what FOR ROLE opendesk defaults do in production.
     db_roles = {
         "booking": ["app_booking"],
@@ -317,18 +533,67 @@ def main() -> int:
 
     print(f"[drill] repo={REPO_ROOT}")
     print(f"[drill] workdir={workdir}")
+    print(f"[drill] DRILL_PG={DRILL_PG}")
+
+    if DRILL_PG not in ("pgserver", "system"):
+        print(f"[drill] ERROR: unknown DRILL_PG={DRILL_PG!r} (expected pgserver|system)")
+        return 2
+    if DRILL_PG == "system" and system_pg_bindir() is None:
+        record_skip(
+            "DRILL_PG=system restore-drill mode",
+            "no system PostgreSQL binaries found (initdb/psql/pg_ctl absent from "
+            "DRILL_PG_BIN, /usr/lib/postgresql/*/bin and PATH) — install with "
+            "`apt install postgresql postgis`; system-PG mode NOT executed. This "
+            "SKIP is the EXTERNAL_BLOCKED evidence trail, not a pass.")
+        finalize(workdir, started, None, None, args.keep)
+        return 0
 
     # ---- instance A: init + migrate + seed -------------------------------
-    print("[drill] booting pgserver instance A ...")
-    srv_a = pgserver.get_server(str(workdir / "pgdata-A"))
+    print(f"[drill] booting {'system PostgreSQL' if DRILL_PG == 'system' else 'pgserver'} instance A ...")
+    srv_a = boot_cluster(workdir / "pgdata-A", "A")
+
+    # pgcrypto: pgserver (core-only binaries) always needs the strip; system
+    # clusters get verbatim scripts when postgresql-contrib provides pgcrypto.
+    strip_crypto = True
+    if DRILL_PG == "system":
+        strip_crypto = not srv_a.extension_available("pgcrypto")
+        print(f"[drill] A: system cluster pgcrypto available={not strip_crypto}"
+              + (" — init scripts applied FULLY VERBATIM" if not strip_crypto
+                 else " — stripping pgcrypto lines (contrib not installed)"))
+
+    # postgis (SPEC-W42): system mode executes 06-booking-postgis.sql as part
+    # of the drill when the extension packages are installed; otherwise an
+    # explicit SKIP with the precise reason.
+    postgis_applied = False
+    scripts = list(INIT_SCRIPTS)
+    if DRILL_PG == "system":
+        if srv_a.extension_available("postgis"):
+            scripts.insert(scripts.index("05-app-roles.sql") + 1, POSTGIS_SCRIPT)
+            postgis_applied = True
+            print("[drill] A: postgis available — 06-booking-postgis.sql joins the drill verbatim")
+        else:
+            record_skip(
+                f"{POSTGIS_SCRIPT} (postgis init script)",
+                "DRILL_PG=system: extension 'postgis' absent from pg_available_extensions "
+                "of the system cluster — the postgis packages are not installed "
+                "(remediation: `apt install postgis` or `apt install "
+                "postgresql-<ver>-postgis-3`, see `apt-cache search postgis`). The rest of "
+                "the drill still runs on the system cluster; geo init-script coverage is "
+                "EXTERNAL_BLOCKED, not silently passed.")
+    else:
+        record_skip(
+            f"{POSTGIS_SCRIPT} (postgis init script)",
+            "pgserver ships core PostgreSQL without contrib modules — postgis cannot "
+            "load. Use DRILL_PG=system on a host with the postgis packages installed "
+            "for 06 coverage. (Unchanged pre-W42 behavior; now an explicit recorded SKIP.)")
+
     psql(srv_a, "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='opendesk')"
                 " THEN CREATE ROLE opendesk NOLOGIN; END IF; END $$;")  # docstring adaptation 3
-    for name in INIT_SCRIPTS:
+    for name in scripts:
         raw = (INIT / name).read_text()
         # 30 guards its own pgcrypto line; stripping is a no-op for it.
-        psql(srv_a, strip_contrib_extensions(raw))
+        psql(srv_a, strip_contrib_extensions(raw) if strip_crypto else raw)
         print(f"[drill] A: applied {name}")
-    print("[drill] A: SKIPPED 06-booking-postgis.sql (pgserver has no postgis contrib)")
     for m in BILLING_MIGRATION_FILES:
         psql(srv_a, "\\c billing\n" + (BILLING_MIGRATIONS / m).read_text())
         print(f"[drill] A: applied billing migration {m}")
@@ -351,8 +616,8 @@ def main() -> int:
         print(f"[drill] dumped {db} -> {out.name} ({out.stat().st_size} bytes)")
 
     # ---- instance B: fresh cluster, roles, pg_restore ---------------------
-    print("[drill] booting FRESH pgserver instance B ...")
-    srv_b = pgserver.get_server(str(workdir / "pgdata-B"))
+    print("[drill] booting FRESH instance B ...")
+    srv_b = boot_cluster(workdir / "pgdata-B", "B")
     # APP_DBS + kyc (05-app-roles.sql \c's into kyc for the kyc-service role).
     for db in sorted(set(APP_DBS) | {"kyc"}):
         psql(srv_b, f"CREATE DATABASE {db};")
@@ -402,6 +667,15 @@ def main() -> int:
         n = c.execute("SELECT count(*) FROM model_family WHERE name=%s", (markers["model_family"],)).fetchone()[0]
     record("marker row readable: platform.model_family", n == 1)
 
+    # postgis rode the dump/restore cycle (system mode, 06 applied on A):
+    # pg_extension on the booking DB of instance B must show it live.
+    if postgis_applied:
+        with psycopg.connect(dsn_for(srv_b, "booking"), autocommit=True) as c:
+            ext = c.execute(
+                "SELECT extversion FROM pg_extension WHERE extname='postgis'").fetchone()
+        record("postgis: extension live on booking DB post-restore (06 rode pg_dump/pg_restore)",
+               ext is not None, f"extversion={ext[0] if ext else None}")
+
     # RLS still enforced post-restore (W40-6 NULLIF posture).
     app = dsn_for(srv_b, "billing", user="app_billing_login", password="app_billing_dev_password")
 
@@ -422,15 +696,18 @@ def main() -> int:
 
     finalize(workdir, started, srv_a, srv_b, args.keep)
     failed = [r for r in RESULTS if not r["ok"]]
-    print(f"[drill] {'OK' if not failed else 'FAILED'}: {len(RESULTS)-len(failed)}/{len(RESULTS)} checks passed")
+    print(f"[drill] {'OK' if not failed else 'FAILED'}: {len(RESULTS)-len(failed)}/{len(RESULTS)} checks passed"
+          + (f"; {len(SKIPS)} explicit SKIP(s)" if SKIPS else ""))
     return 0 if not failed else 1
 
 
 def finalize(workdir: Path, started: float, srv_a, srv_b, keep: bool) -> None:
     summary = {
         "results": RESULTS,
+        "skips": SKIPS,
+        "drill_pg": DRILL_PG,
         "wall_time_s": round(time.time() - started, 2),
-        "pg_bin_dir": str(Path(pg_bin("pg_dump")).parent),
+        "pg_bin_dir": str(Path(pg_bin("pg_dump")).parent) if (DRILL_PG != "system" or system_pg_bindir()) else None,
     }
     out = workdir / "drill-summary.json"
     out.write_text(json.dumps(summary, indent=2))
@@ -441,6 +718,9 @@ def finalize(workdir: Path, started: float, srv_a, srv_b, keep: bool) -> None:
     if not keep:
         shutil.rmtree(workdir / "pgdata-A", ignore_errors=True)
         shutil.rmtree(workdir / "pgdata-B", ignore_errors=True)
+        if DRILL_PG == "system":
+            shutil.rmtree(workdir / "sock-A", ignore_errors=True)
+            shutil.rmtree(workdir / "sock-B", ignore_errors=True)
 
 
 if __name__ == "__main__":
