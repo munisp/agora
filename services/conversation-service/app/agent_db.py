@@ -261,7 +261,11 @@ class AgentStore:
     ) -> None:
         """Write-through tenant_id -> slug projection (called by the
         TenantResolver after every successful identity lookup). Best-effort:
-        callers log and continue on failure."""
+        callers log and continue on failure.
+
+        J-14 exemption: tenant_slugs is deliberately NOT RLS-scoped (the
+        mapping is cross-tenant by design), so this runs outside the tenant
+        tx; it writes ONLY the (tenant_id, slug) pair, never tenant data."""
         async with self._db._pool_acquire() as conn:
             await conn.execute(
                 """
@@ -398,12 +402,18 @@ class AgentStore:
     ) -> dict[str, Any] | None:
         """Dialed-number -> agent lookup for /v1/agents/resolve (INTERNAL,
         voice-runtime only). The whole point of the endpoint is number ->
-        tenant+agent, so it is deliberately NOT tenant-scoped: it runs
-        outside the tenant tx and matches the idx_agents_phone partial
-        index. A shared number across tenants resolves to the oldest
-        active agent (deterministic; logged). The row also carries
-        tenant_slug (LEFT JOIN tenant_slugs) so the voice runtime can
-        bootstrap its TenantContext without a second lookup."""
+        tenant+agent, so it is deliberately NOT tenant-scoped (documented
+        J-14 exemption): it runs outside the tenant tx and matches the
+        idx_agents_phone partial index. A shared number across tenants
+        resolves to the oldest active agent (deterministic; logged). The
+        row also carries tenant_slug (LEFT JOIN tenant_slugs) so the voice
+        runtime can bootstrap its TenantContext without a second lookup.
+
+        NOTE: under the least-privilege app_conversation_login role this
+        query sees ZERO agents rows unless app.tenant_id is set (FORCE RLS
+        on agents) — the endpoint is deployed against the RLS-bypassing
+        bootstrap DSN. That asymmetry is intentional: the general API pool
+        can never enumerate other tenants' agents through this path."""
         async with self._db._pool_acquire() as conn:
             if tenant_id is not None:
                 row = await conn.fetchrow(
