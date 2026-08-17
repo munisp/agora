@@ -300,8 +300,13 @@ def test_bad_phone_rejected(client):
 
 
 def test_tenant_scope_required(client):
+    """J-14 fail-closed: no tenant scope -> 401, and the store is never
+    touched (no query may run with app.tenant_id unset)."""
+    store = client.app.state.agent_store
+    agents_before = dict(store.agents)
     r = client.get("/v1/agents")
-    assert r.status_code == 400
+    assert r.status_code == 401
+    assert store.agents == agents_before
 
 
 # ---------------------------------------------------- ?tenant= uuid OR slug
