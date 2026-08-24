@@ -24,10 +24,13 @@ function StatCard({
   label,
   value,
   icon: Icon,
+  unavailable = false,
 }: {
   label: string;
   value: string | number;
   icon: React.ComponentType<{ className?: string }>;
+  /** W44/F15-11: explicit error state — never render a misleading 0. */
+  unavailable?: boolean;
 }) {
   return (
     <Card>
@@ -36,7 +39,14 @@ function StatCard({
         <Icon className="h-4 w-4 text-muted-foreground" />
       </CardHeader>
       <CardContent>
-        <p className="text-3xl font-bold">{value}</p>
+        {unavailable ? (
+          <>
+            <p className="text-3xl font-bold text-muted-foreground">—</p>
+            <p className="mt-1 text-xs text-destructive">Unavailable</p>
+          </>
+        ) : (
+          <p className="text-3xl font-bold">{value}</p>
+        )}
       </CardContent>
     </Card>
   );
@@ -98,17 +108,25 @@ export default async function OverviewPage({
           label="Bookings today"
           value={todayBookings.length}
           icon={CalendarCheck}
+          unavailable={error !== null}
         />
-        <StatCard label="Awaiting confirmation" value={pending} icon={Hourglass} />
+        <StatCard
+          label="Awaiting confirmation"
+          value={pending}
+          icon={Hourglass}
+          unavailable={error !== null}
+        />
         <StatCard
           label="Next 7 days"
           value={upcoming.length}
           icon={Clock}
+          unavailable={error !== null}
         />
         <StatCard
           label="Active offerings"
           value={offerings.filter((o) => o.bookable).length}
           icon={Store}
+          unavailable={error !== null}
         />
       </div>
 

@@ -70,6 +70,8 @@ interface KpiData {
   callMinutes: number;
   /** average turn sentiment in [-1, 1]; null when nothing was scored */
   avgSentiment: number | null;
+  /** number of conversations the sentiment sample covers (capped, see load) */
+  sentimentSamples: number;
   channelCounts: Record<ChannelBucket, number>;
   /** bookings per day, oldest → newest, aligned with `dayLabels` */
   dailyCounts: number[];
@@ -105,6 +107,9 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
             tenant: orgSlug,
             from: from.toISOString(),
             to: to.toISOString(),
+            // W44/F15-10: booking-service honors an explicit limit up to 500
+            // (default 100 would silently truncate the 90d view).
+            limit: 500,
           },
         ),
         api.get<Offering[] | { items: Offering[] }>(
@@ -151,6 +156,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
       };
       let callMinutes = 0;
       let avgSentiment: number | null = null;
+      let sentimentSamples = 0;
       try {
         const convRes = await api.get<{
           conversations?: Conversation[];
@@ -179,6 +185,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
         // Sentiment: average scored turns across a capped sample of the
         // most recent in-period conversations (detail fetch per conv).
         const sample = inPeriod.slice(0, 8);
+        sentimentSamples = sample.length;
         const scores: number[] = [];
         for (const c of sample) {
           try {
@@ -211,6 +218,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
         currency: tenant.currency ?? "USD",
         callMinutes,
         avgSentiment,
+        sentimentSamples,
         channelCounts,
         dailyCounts,
         dayLabels,
@@ -278,7 +286,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
         />
         <KpiCard
           icon={<Wallet className="h-4 w-4 text-muted-foreground" />}
-          label="Revenue (booked)"
+          label="Booked value (list price)"
           value={
             loading || !data
               ? "—"
@@ -294,7 +302,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
         />
         <KpiCard
           icon={<SmilePlus className="h-4 w-4 text-muted-foreground" />}
-          label="Avg sentiment"
+          label={`Avg sentiment (n=${data?.sentimentSamples ?? 0})`}
           value={
             loading || !data
               ? "—"

@@ -24,13 +24,18 @@ export function StatsTiles({ stats }: { stats: AdStatsResponse }) {
     stats.stats.reach > 0
       ? `${((stats.stats.clicks / stats.stats.reach) * 100).toFixed(1)}%`
       : "—";
+  // W44/F15-16: badge the stats whenever they come from the mock provider —
+  // either via the explicit `mock` disclosure flag or via the deterministic
+  // mock's `mock-*` provider reference (covers backends that omit the flag).
+  const isMock =
+    stats.mock === true || stats.provider_ad_id.startsWith("mock-");
   return (
     <div>
       <div className="mb-2 flex items-center gap-2">
         <p className="text-sm text-muted-foreground">
           Lifetime stats · {stats.provider} · {stats.provider_ad_id}
         </p>
-        {stats.mock ? (
+        {isMock ? (
           <Badge variant="outline" title="Deterministic provider mock — no real network calls">
             mock data
           </Badge>
