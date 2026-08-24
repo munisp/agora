@@ -17,6 +17,14 @@ spec:
     metadata:
       labels:
         app: notification
+      # SPEC-W44 F16-9: NO Dapr sidecar in this base (see README "Dapr gap").
+      # notification-worker code defaults DAPR_HOST=daprd-notification; its
+      # Dapr binding/invoke paths (messaging sends, saga activities) fail
+      # without one. With the Dapr control plane installed, uncomment:
+      # annotations:
+      #   dapr.io/enabled: "true"
+      #   dapr.io/app-id: "notification"
+      #   dapr.io/app-port: "7003"
     spec:
       # GF12 (SPEC-W34) zero-trust baseline: non-root, read-only root fs,
       # no privilege escalation, all capabilities dropped (see booking).
@@ -46,18 +54,48 @@ spec:
           env:
             - name: PORT
               value: "7003"
-            - name: PG_DSN
-              value: postgres://opendesk:opendesk@postgres:5432
+            # SPEC-W44 F16: code reads DATABASE_URL incl. dbname; PG_DSN was
+            # never read. TODO(prod): move to secretKeyRef like the token envs.
+            - name: DATABASE_URL
+              value: postgres://opendesk:opendesk@postgres:5432/notifications
             - name: KAFKA_BROKERS
               value: kafka:9092
             - name: REDIS_ADDR
               value: redis:6379
-            - name: TEMPORAL_ADDRESS
+            # SPEC-W44 F16-3: code reads TEMPORAL_HOST_PORT (notification
+            # config.go); the old TEMPORAL_ADDRESS name was never read.
+            - name: TEMPORAL_HOST_PORT
               value: temporal:7233
             - name: TEMPORAL_NAMESPACE
               value: opendesk
             - name: TEMPORAL_TASK_QUEUE
               value: opendesk-main
+            # SPEC-W44 K2: X-Internal-Token gate on signals + /internal/*
+            # (503 fail-closed when unset). Dev placeholder from secret.yaml.
+            - name: NOTIFICATION_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: notification-internal-token
+            # SPEC-W44 K2 caller side: outbound gated calls (payments
+            # hold-deposit/void, identity tenant delete, booking
+            # activities) send X-Internal-Token with these values; each must
+            # match the target's server-side token (secret.yaml).
+            - name: PAYMENTS_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: payments-internal-token
+            - name: IDENTITY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: identity-internal-token
+            - name: BOOKING_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: booking-internal-token
           readinessProbe:
             httpGet:
               path: /healthz

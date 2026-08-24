@@ -17,6 +17,14 @@ spec:
     metadata:
       labels:
         app: booking
+      # SPEC-W44 F16-9: NO Dapr sidecar in this base (see README "Dapr gap").
+      # booking code defaults DAPR_HOST=daprd-booking; without a sidecar any
+      # Dapr invoke path fails. When the Dapr control plane is installed on
+      # the appliance, uncomment to inject the sidecar:
+      # annotations:
+      #   dapr.io/enabled: "true"
+      #   dapr.io/app-id: "booking"
+      #   dapr.io/app-port: "7002"
     spec:
       # GF12 (SPEC-W34) zero-trust baseline: non-root, read-only root fs,
       # no privilege escalation, all capabilities dropped. Writable scratch
@@ -70,14 +78,32 @@ spec:
               value: kafka:9092
             - name: REDIS_ADDR
               value: redis:6379
-            - name: TEMPORAL_ADDRESS
+            # SPEC-W44 F16-2/F16-3: env names match what the code reads
+            # (booking config.go): TEMPORAL_HOST_PORT and PERMIFY_URL. The
+            # old TEMPORAL_ADDRESS/PERMIFY_HTTP names were never read.
+            - name: TEMPORAL_HOST_PORT
               value: temporal:7233
             - name: TEMPORAL_NAMESPACE
               value: opendesk
             - name: TEMPORAL_TASK_QUEUE
               value: opendesk-main
-            - name: PERMIFY_HTTP
+            - name: PERMIFY_URL
               value: http://permify:3476
+            # SPEC-W44 K2: X-Internal-Token gate on /internal/* + /activities/*
+            # (503 fail-closed when unset). Dev placeholder from secret.yaml.
+            - name: BOOKING_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: booking-internal-token
+            # SPEC-W44 K2 caller side: identity tenant-resolution calls
+            # (appgate/resolver) send X-Internal-Token with this value; must
+            # match identity's IDENTITY_INTERNAL_TOKEN (secret.yaml).
+            - name: IDENTITY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: identity-internal-token
             # GF12: AUTHZ_DISABLED removed (was "true" here, disabling Permify
             # checks cluster-wide). The service default is "false"
             # (internal/config/config.go) - authorization stays enforced.

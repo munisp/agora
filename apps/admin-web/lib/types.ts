@@ -265,6 +265,18 @@ export interface Payout {
   created_at: string;
 }
 
+/**
+ * Registered payout beneficiary (W44/K7 payee registry).
+ * GET /api/payments/v1/beneficiaries → Beneficiary[]; payouts reference the
+ * beneficiary by id — raw per-call payee details are rejected by the service.
+ */
+export interface Beneficiary {
+  id: string;
+  label: string;
+  /** Mojaloop PartyIdInfo ({partyIdType, partyIdentifier}). */
+  party_id_info: Record<string, unknown>;
+}
+
 // ---------- conversation-service ----------
 
 /** Conversation (conversation-service GET /v1/conversations). */

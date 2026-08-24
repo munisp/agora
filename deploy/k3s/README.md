@@ -33,12 +33,35 @@ store-and-forward to the central cluster.
   (b) tunnelled access back to the central cluster's middleware. Option (a)
   with local-path volumes is the intended appliance default; the middleware
   manifests are a follow-up.
-- **No dapr sidecars.** The compose stack injects `daprd` per service; the
-  edge MVP runs services directly (same ports/env). Service invocation that
-  goes through Dapr in compose must point at direct service DNS on the
-  appliance — this is the main functional gap to close before the appliance
-  is real. Stated plainly: **today this base proves the services run on
+- **No dapr sidecars (SPEC-W44 F16-9 — precise gap).** The compose stack
+  injects `daprd` per service; the edge MVP runs services directly (same
+  ports/env). Verified against the code: booking/notification/identity
+  default `DAPR_HOST=daprd-<service>` (e.g. booking-service
+  `internal/config/config.go` → `envStr("DAPR_HOST", "daprd-booking")`), and
+  these manifests deliberately do NOT set `DAPR_HOST`, so any Dapr
+  invoke/binding path (notification messaging bindings, saga deposit
+  activities, consent checks) resolves to a non-existent host and fails.
+  Paths that read a direct `*_URL` env (e.g. messaging-gateway
+  `CONVERSATION_URL`) can be pointed at in-cluster Service DNS instead.
+  **Fix path:** install the Dapr control plane on the appliance and
+  uncomment the `dapr.io/enabled`/`dapr.io/app-id`/`dapr.io/app-port`
+  annotation blocks added (commented) on the booking/notification pod
+  templates this wave; identity's annotation recipe is documented in
+  `identity-deployment.yaml`. Until then the saga/Dapr dataplane still
+  expects the compose middleware, as stated below.
+  Stated plainly: **today this base proves the services run on
   k3s; the full saga/Dapr dataplane still expects the compose middleware.**
+- **gateway-edge is not in this base** (SPEC-W44 F15-01 parity note): when
+  an edge Deployment is added, its image MUST be built with
+  `--build-arg CARGO_FEATURES=fluvio-live` (the root compose now passes this
+  by default; the Dockerfile ARG default flips to `fluvio-live` in the same
+  wave). Without the feature, `main.rs` refuses to boot unless
+  `GATEWAY_EDGE_ALLOW_SIM=true` — a default-built edge image crash-loops.
+- **Internal tokens (SPEC-W44 K2):** `secret.yaml` carries DEV-ONLY
+  placeholders for `identity/booking/notification/payments/billing`
+  internal tokens; the three Deployments consume them via `secretKeyRef`
+  (503 fail-closed when unset). Replace via SOPS/SealedSecrets/ESO for any
+  real deployment, same rule as the DB credentials.
 - MM2 needs the Strimzi operator installed and a real central endpoint
   (see `mirror-maker2.yaml` comments). It has not been run end-to-end.
 

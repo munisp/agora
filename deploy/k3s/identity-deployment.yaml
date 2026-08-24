@@ -60,9 +60,11 @@ spec:
               value: redis:6379
             - name: KEYCLOAK_URL
               value: http://keycloak:8080
-            - name: PERMIFY_HTTP
+            # SPEC-W44 F16-2/F16-3: code reads PERMIFY_URL / TEMPORAL_HOST_PORT
+            # (identity config.go); the old names were never read.
+            - name: PERMIFY_URL
               value: http://permify:3476
-            - name: TEMPORAL_ADDRESS
+            - name: TEMPORAL_HOST_PORT
               value: temporal:7233
             - name: TEMPORAL_NAMESPACE
               value: opendesk
@@ -70,8 +72,28 @@ spec:
               value: opendesk-main
             - name: INDUSTRIES_DIR
               value: /industries
+            # SPEC-W44 K2: X-Internal-Token gate on /internal/* (503
+            # fail-closed when unset). Dev placeholder from secret.yaml.
+            - name: IDENTITY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: identity-internal-token
+            # SPEC-W44 K2 caller side: the dev onboarding/twin-cleanup
+            # triggers invoke notification-worker /dev/* with
+            # X-Internal-Token; must match NOTIFICATION_INTERNAL_TOKEN.
+            - name: NOTIFICATION_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opendesk-db
+                  key: notification-internal-token
             # DAPR_HOST/PORTS are set per-pod when the dapr sidecar is
-            # injected; the edge MVP runs without dapr (see README).
+            # injected; the edge MVP runs without dapr (see README "Dapr gap",
+            # SPEC-W44 F16-9). To enable once the Dapr control plane is
+            # installed, add to the pod template annotations:
+            #   dapr.io/enabled: "true"
+            #   dapr.io/app-id: "identity"
+            #   dapr.io/app-port: "7001"
           readinessProbe:
             httpGet:
               path: /healthz

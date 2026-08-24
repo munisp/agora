@@ -167,8 +167,12 @@ export interface AdStatsResponse {
   ad_id: string;
   provider_ad_id: string;
   provider: string;
-  /** Honest disclosure: true while the deterministic mock is the default. */
-  mock: boolean;
+  /**
+   * Honest disclosure: true while the deterministic mock is the default.
+   * Optional for older backends — the UI also treats `mock-*` provider refs
+   * as mock posture (W44/F15-16).
+   */
+  mock?: boolean;
   stats: {
     impressions: number;
     reach: number;
