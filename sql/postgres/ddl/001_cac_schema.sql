@@ -113,6 +113,25 @@ CREATE TABLE IF NOT EXISTS cac.fx_series (
 );
 CREATE INDEX IF NOT EXISTS idx_fx_series_date ON cac.fx_series (series_date);
 
+-- SPEC-W43 G-06 (DATA#16): the parallel market rate can never be BELOW the
+-- official window rate. NOT VALID so pre-existing rows are not scanned
+-- (no lock-heavy rewrite on populated installs); new writes are enforced.
+-- Idempotent via pg_constraint guard (this DDL file is re-applied by
+-- scripts/seeds/bootstrap.sh step 1 on every seed run).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT FROM pg_constraint
+        WHERE conname = 'fx_series_parallel_gte_official'
+          AND conrelid = 'cac.fx_series'::regclass
+    ) THEN
+        ALTER TABLE cac.fx_series
+            ADD CONSTRAINT fx_series_parallel_gte_official
+            CHECK (usd_ngn_parallel >= usd_ngn_official) NOT VALID;
+    END IF;
+END
+$$;
+
 -- ---------------------------------------------------------------------------
 -- Seed run audit
 -- ---------------------------------------------------------------------------

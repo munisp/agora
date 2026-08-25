@@ -144,9 +144,16 @@ async def fetch_tenant_context(
     _apply_pack(ctx, tenant)
 
     # 2. Canonical tenant record from identity (best-effort enrichment).
+    # SPEC-W44 K2: identity gates tenant-scoped reads for service callers
+    # behind X-Internal-Token; the enrichment stays soft-fail when unset.
     try:
+        headers = (
+            {"X-Internal-Token": settings.identity_internal_token}
+            if settings.identity_internal_token
+            else None
+        )
         identity_tenant = await dapr.invoke_get(
-            settings.identity_app_id, f"v1/tenants/{tenant_slug}"
+            settings.identity_app_id, f"v1/tenants/{tenant_slug}", headers=headers
         )
         if isinstance(identity_tenant, dict):
             ctx.timezone = identity_tenant.get("timezone") or ctx.timezone

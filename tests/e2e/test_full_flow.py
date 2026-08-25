@@ -57,9 +57,21 @@ def test_02_availability_has_slots(tenant, flow):
         timeout=20,
     )
     assert r.status_code == 200, f"availability failed: {r.status_code} {r.text}"
-    slots = r.json()
+    # CORR#12: the availability endpoint returns an OBJECT
+    # {"offering_id", "slots": [{"starts_at", "ends_at"}, ...]}, not a bare
+    # list of slot strings.
+    body = r.json()
+    assert isinstance(body, dict), f"availability must be an object, got {type(body)}"
+    assert body.get("offering_id") == flow["offering_id"], (
+        f"offering_id mismatch: {body.get('offering_id')} != {flow['offering_id']}"
+    )
+    slots = body.get("slots")
     assert isinstance(slots, list) and slots, "no availability slots in the next 7 days"
-    flow["slot_start"] = slots[0]["start"] if isinstance(slots[0], dict) else slots[0]
+    first = slots[0]
+    assert isinstance(first, dict) and first.get("starts_at") and first.get("ends_at"), (
+        f"slot missing starts_at/ends_at: {first}"
+    )
+    flow["slot_start"] = first["starts_at"]
 
 
 def test_03_public_booking_created(tenant, flow):
