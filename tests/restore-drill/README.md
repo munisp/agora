@@ -68,12 +68,18 @@ Instance A (fresh cluster):
 1. applies `infra/postgres/init-scripts/00,01,02,03,04,05,07,30` via real
    `psql` over stdin (`\c` meta-commands handled exactly like the docker
    `docker-entrypoint-initdb.d` psql path) — plus **`06` in system mode
-   when postgis is available** (see above);
+   when postgis is available** (see above), plus **`08-code-bootstrap-parity.sql`
+   (SPEC-W43, CODER-G) inserted after `07` when the file exists** — when it
+   does not, the drill records an explicit SKIP (`record_skip`) and
+   continues; it never crashes on the missing file;
 2. in pgserver mode, strips ONLY the `CREATE EXTENSION IF NOT EXISTS
    pgcrypto;` lines (pgserver lacks contrib pgcrypto; `gen_random_uuid()`
    is core PG13+ and is all those schemas use);
 3. applies billing migrations `0001..0004` to the `billing` DB exactly as
-   billing-engine does at boot (`src/main.rs:142-159`);
+   billing-engine does at boot (`src/main.rs:142-159`), plus
+   **`0005_hardening.sql` (SPEC-W43 B-07, CODER-B) when the file exists** —
+   same conditional-SKIP idiom as the init scripts (explicit recorded SKIP,
+   never a crash, when B's migration has not landed in the mirror yet);
 4. seeds marker rows: `identity.tenants`, `booking.offerings`,
    `conversation.conversations` (+ agents/capture chain), `billing`
    (`processed_events`/`usage_records`/`invoices`), `platform.model_family`;

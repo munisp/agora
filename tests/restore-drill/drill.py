@@ -133,7 +133,15 @@ INIT_SCRIPTS = [
     "30-model-registry.sql",
 ]
 POSTGIS_SCRIPT = "06-booking-postgis.sql"  # docker order: after 05, before 07
+# SPEC-W43 (CODER-G deliverable): code-bootstrap parity script, docker order
+# after 07, before 30. Defensive (H-05): applied only when the file actually
+# exists in infra/postgres/init-scripts; otherwise an explicit recorded SKIP
+# (the drill never crashes on the missing file).
+CODE_BOOTSTRAP_PARITY_SCRIPT = "08-code-bootstrap-parity.sql"
 BILLING_MIGRATION_FILES = ["0001_init.sql", "0002_rls.sql", "0003_ledger.sql", "0004_outbox.sql"]
+# SPEC-W43 B-07 (CODER-B deliverable): hardening migration. Same conditional
+# idiom as the init script: applied when present, explicit SKIP otherwise.
+BILLING_HARDENING_MIGRATION = "0005_hardening.sql"
 
 # Application databases covered by the drill (schema-bearing).
 APP_DBS = ["identity", "booking", "conversation", "knowledge", "billing", "platform"]
@@ -587,6 +595,19 @@ def main() -> int:
             "load. Use DRILL_PG=system on a host with the postgis packages installed "
             "for 06 coverage. (Unchanged pre-W42 behavior; now an explicit recorded SKIP.)")
 
+    # 08-code-bootstrap-parity.sql (W43, after 07 / before 30 in docker
+    # order): include only when CODER-G's file is present.
+    if (INIT / CODE_BOOTSTRAP_PARITY_SCRIPT).exists():
+        scripts.insert(scripts.index("07-agents-capture-schema.sql") + 1,
+                       CODE_BOOTSTRAP_PARITY_SCRIPT)
+        print(f"[drill] A: {CODE_BOOTSTRAP_PARITY_SCRIPT} present — joins the drill")
+    else:
+        record_skip(
+            f"{CODE_BOOTSTRAP_PARITY_SCRIPT} (code-bootstrap parity init script)",
+            "file absent from infra/postgres/init-scripts (CODER-G W43 deliverable "
+            "not landed in this mirror) — skipped defensively so the drill never "
+            "crashes on the missing file; re-run once G lands it.")
+
     psql(srv_a, "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='opendesk')"
                 " THEN CREATE ROLE opendesk NOLOGIN; END IF; END $$;")  # docstring adaptation 3
     for name in scripts:
@@ -594,7 +615,17 @@ def main() -> int:
         # 30 guards its own pgcrypto line; stripping is a no-op for it.
         psql(srv_a, strip_contrib_extensions(raw) if strip_crypto else raw)
         print(f"[drill] A: applied {name}")
-    for m in BILLING_MIGRATION_FILES:
+    migration_files = list(BILLING_MIGRATION_FILES)
+    if (BILLING_MIGRATIONS / BILLING_HARDENING_MIGRATION).exists():
+        migration_files.append(BILLING_HARDENING_MIGRATION)
+        print(f"[drill] A: {BILLING_HARDENING_MIGRATION} present — joins the drill")
+    else:
+        record_skip(
+            f"billing migration {BILLING_HARDENING_MIGRATION}",
+            "file absent from services/billing-engine/migrations (CODER-B B-07 "
+            "deliverable not landed in this mirror) — skipped defensively; "
+            "re-run once B lands it.")
+    for m in migration_files:
         psql(srv_a, "\\c billing\n" + (BILLING_MIGRATIONS / m).read_text())
         print(f"[drill] A: applied billing migration {m}")
     markers = seed_markers(srv_a)

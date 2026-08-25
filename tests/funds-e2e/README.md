@@ -13,7 +13,7 @@ TigerBeetle ledger. **No mocks anywhere; Dapr is never faked.**
 | identity-service (Go) | 17001 | `DATABASE_URL`->pgserver `identity`, `INDUSTRIES_DIR=<repo>/industries` |
 | booking-service (Go) | 17002 | `DATABASE_URL`->pgserver `booking`, `AUTHZ_DISABLED=true`, `CONSUMER_ENABLED=false`, `IDENTITY_BASE_URL=http://127.0.0.1:17001` |
 | billing-engine (Rust) | 17012 | `DATABASE_URL`->pgserver `billing`, `BILLING_INTERNAL_TOKEN=<random hex/run>`, `BILLING_STATIC_ACCOUNT=OPENDESK/0123456789`, `BILLING_MERCHANT_NAME='OPENDESK DEMO'`, `KAFKA_CONSUMER_ENABLED=false` |
-| payments-service (Rust) | 17004 | sim mode: `LEDGER_IMPL=sim`, `MOJALOOP_ALLOW_SIM=true`, `KAFKA_CONSUMER_ENABLED=false` — or TB mode below |
+| payments-service (Rust) | 17004 | sim mode: `LEDGER_IMPL=sim`, `MOJALOOP_ALLOW_SIM=true`, `KAFKA_CONSUMER_ENABLED=false` — or TB mode below. Since W43 also: `PAYMENTS_INTERNAL_TOKEN=<random hex/run>` (P-09; sent as `x-internal-token` on every payments call), `PAYMENTS_DATABASE_URL`->pgserver `payments` (P-01 durable `payout_attempts`), `MOJALOOP_ENDPOINT`->the in-harness sim rail (below) |
 
 Keycloak/Permify/Dapr/Temporal endpoints are pointed at dead loopback ports
 so their best-effort side effects fail fast and are logged — by design they
@@ -136,12 +136,73 @@ mint a payment link offline and accept webhooks. The harness:
 
 ## Payments flow (both ledger modes)
 
-`POST /v1/deposits` (hold, explicit `idempotency_key`) → 201; replay with
-the same key → identical `deposit_id` (no double-hold); `POST
-/v1/deposits/{id}/capture` → 200 (TB mode sends an explicit
-`amount_cents` — the live client's fee split requires it); replay capture →
+`POST /v1/deposits` (hold, explicit `idempotency_key`, NGN — P-13 makes
+payments NGN-only, 400 otherwise) → 201; replay with the same key →
+identical `deposit_id` (no double-hold); `POST
+/v1/deposits/{id}/capture` → 200 (the main flow still sends an explicit
+`amount_cents`; since W43 P-04 the amount-less capture resolves the pending
+amount via lookup — exercised by a dedicated 5c case); replay capture →
 byte-identical result, no double-post (deterministic capture id
 `uuid v5("capture:{hold_id}")`); `GET /v1/accounts/{t}/balance` → 200.
+All calls carry `x-internal-token` (P-09); money endpoints require an
+idempotency key (P-12).
+
+### W43 v3 cases (H-03, harness section 5c)
+
+* `POST /v1/internal/accounts/provision` without token → 401; with the
+  internal token → 200 (P-09/P-10).
+* capture with `amount_cents > hold` → rejected (sim 422; live TB 502 via
+  `exceeds_pending_transfer_amount`), balances byte-identical.
+* void happy path via `POST /activities/void-hold` → 200, deposits
+  `credits_pending` delta == −hold amount, zero posted drift;
+  capture-after-void → rejected (sim 409 `AlreadyResolved`; TB 502
+  `pending_transfer_already_voided`), balances unchanged.
+* cross-tenant capture/void/refund → 403 (`TenantMismatch`, P-06).
+* refund happy path (post-capture full amount) → 201, revenue
+  `debits_posted += amount`; replay with the same key → same refund id,
+  balances byte-identical (no double refund).
+* refund with a wrong (partial) amount against a PENDING hold → 400, zero
+  mutations (P-11: never a silent full void).
+* payout happy path (P-01/C3 ledger-first): 201, response `ledger_transfer`
+  is the `post_pending` leg with `pending_id` set (pending→posted), revenue
+  `debits_posted` delta == amount exactly, the sim rail is hit EXACTLY once
+  (1 quote + 1 transfer), and `payout_attempts` has a `committed` row in
+  the real `payments` DB.
+* payout over-limit: rejected BEFORE the rail — the sim-rail call counter
+  delta is asserted ZERO, balances unchanged, no attempt row.
+* capture WITHOUT `amount_cents` → 200 with `post.amount == hold amount`
+  (C4 lookup path; SKIP-pending-P if the live-TB lookup has not landed).
+* boot probe: `PLATFORM_FEE_BPS=10001` → the service refuses to boot with an
+  explicit error (P-05).
+
+### Sim rail (W43)
+
+The payout rail is an in-process REAL HTTP server (`SimRail`,
+stdlib `http.server`) implementing FSPIOP `POST /quotes` (echoes the
+requested amount/currency so the P-08 echo check passes) and
+`POST /transfers` (explicit `COMMITTED`). It counts calls so the
+over-limit case can prove no rail side effect. The unreachable docker-only
+default `http://mojaloop:8444` is never used; `MOJALOOP_ENDPOINT` points at
+the harness rail explicitly.
+
+### TB fixture flags (W43 P-03 mirror)
+
+The workdir fixture crate now creates the tenant `deposits`/`revenue`
+accounts with `debits_must_not_exceed_credits` — the exact rule the
+service-side helper applies after P-03 (`ledger/mod.rs no_overdraft` +
+`ledger/tigerbeetle.rs create_accounts`). This is what makes the over-limit
+payout reject at hold time on the real ledger.
+
+### B-01 webhook mismatch cases (section 4b)
+
+Two sacrificial invoices (distinct periods): a `charge.success` webhook
+with a WRONG `data.amount`, and one with a WRONG `data.currency`. Expected
+post-B-01: 202, invoice NOT paid, `payment_mismatch` outbox row. Until
+billing ships the verification the harness records an explicit
+**SKIP-pending-B** (the invoice is wrongly marked paid — recorded, never
+silently passed, never a fake failure against unshipped behavior). The
+happy-path webhook body now carries the matching `amount`/`currency`, which
+pre-B-01 handlers ignore and post-B-01 require.
 
 ## RLS adversarial (post-flow)
 
