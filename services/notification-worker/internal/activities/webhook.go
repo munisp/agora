@@ -92,8 +92,9 @@ func (a *Activities) UpdateWebhookDelivery(ctx context.Context, upd workflows.We
 			"attempts":    upd.Attempts,
 			"status_code": upd.StatusCode,
 		}
-		return a.Dapr.InvokeService(ctx, a.Webhooks.BookingAppID,
-			"internal/incidents/deliveries/"+upd.DeliveryID, body, nil)
+		return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.Webhooks.BookingAppID,
+			"internal/incidents/deliveries/"+upd.DeliveryID, body,
+			internalHeaders(a.BookingInternalToken), nil)
 	}
 	if a.Webhooks.Store == nil {
 		return fmt.Errorf("webhook store not configured")

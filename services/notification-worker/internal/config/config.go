@@ -81,6 +81,18 @@ type Config struct {
 	APNSTeamID         string // APNS_TEAM_ID (stub)
 	APNSKeyP8          string // APNS_KEY_P8 (stub)
 	APNSTopic          string // APNS_TOPIC (stub)
+	// SPEC-W44 security wave (K1/K2/K3/K5, N-01..N-09).
+	InternalToken         string   // NOTIFICATION_INTERNAL_TOKEN: X-Internal-Token for /v1/signals (K2)
+	PaymentsInternalToken string   // PAYMENTS_INTERNAL_TOKEN: forwarded on payments /activities/* calls
+	BookingInternalToken  string   // BOOKING_INTERNAL_TOKEN: forwarded on booking /activities/* + civic sla-breach
+	IdentityInternalToken string   // IDENTITY_INTERNAL_TOKEN: forwarded on identity /internal/* calls
+	PaymentsURL           string   // PAYMENTS_URL: direct-HTTP fallback for payments calls (empty = Dapr invoke)
+	InternalDatabaseURL   string   // INTERNAL_DATABASE_URL: app_notifications_internal pool for RLS escape (N-08)
+	DNDAdminRoles         []string // DND_ADMIN_ROLES csv (default "platform-admin")
+	SignalWorkflowPrefixes []string // SIGNAL_WORKFLOW_PREFIXES csv (S1-F7-04 allowlist; "{tenant}" expands)
+	DevEndpoints          bool     // OPENDESK_DEV_ENDPOINTS=1: compile in /dev/* (N-01) + relax webhook URL guard (N-02 dev)
+	TrustDirectTenant     bool     // OPENDESK_TRUST_DIRECT_TENANT=1: gateway-less dev escape for K1 bindings
+	OpsAlertsGroup        string   // OPS_ALERTS_GROUP: consumer group of the ops-alerts consumer
 	ShutdownTimeout    time.Duration
 }
 
@@ -151,6 +163,18 @@ func Load() Config {
 		APNSTeamID:         os.Getenv("APNS_TEAM_ID"),
 		APNSKeyP8:          os.Getenv("APNS_KEY_P8"),
 		APNSTopic:          os.Getenv("APNS_TOPIC"),
+		// SPEC-W44 (K1/K2/K5).
+		InternalToken:          os.Getenv("NOTIFICATION_INTERNAL_TOKEN"),
+		PaymentsInternalToken:  os.Getenv("PAYMENTS_INTERNAL_TOKEN"),
+		BookingInternalToken:   os.Getenv("BOOKING_INTERNAL_TOKEN"),
+		IdentityInternalToken:  os.Getenv("IDENTITY_INTERNAL_TOKEN"),
+		PaymentsURL:            os.Getenv("PAYMENTS_URL"),
+		InternalDatabaseURL:    os.Getenv("INTERNAL_DATABASE_URL"),
+		DNDAdminRoles:          envListDefault("DND_ADMIN_ROLES", "platform-admin"),
+		SignalWorkflowPrefixes: envList("SIGNAL_WORKFLOW_PREFIXES"),
+		DevEndpoints:           envBool("OPENDESK_DEV_ENDPOINTS", false),
+		TrustDirectTenant:      envBool("OPENDESK_TRUST_DIRECT_TENANT", false),
+		OpsAlertsGroup:         envStr("OPS_ALERTS_GROUP", "notification-ops-alerts"),
 		ShutdownTimeout:    time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 	}
 }
@@ -197,6 +221,24 @@ func envList(key string) []string {
 	if v == "" {
 		return nil
 	}
+	out := make([]string, 0, 4)
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// envListDefault is envList with a default csv when the env is unset.
+func envListDefault(key, def string) []string {
+	if v := envList(key); len(v) > 0 {
+		return v
+	}
+	return envListFromString(def)
+}
+
+func envListFromString(v string) []string {
 	out := make([]string, 0, 4)
 	for _, part := range strings.Split(v, ",") {
 		if part = strings.TrimSpace(part); part != "" {
