@@ -107,5 +107,8 @@ class TestPublishedEvent:
         publish_idx = src.index("publish_event(st.cfg.transcripts_topic")
         prefix = src[:publish_idx]
         # redaction happens before the publish call in the same flow
-        assert "redact.redact_text(turn.text)" in prefix
+        # (SPEC-W43 Y-08: inside the outbox payload builder — the stored
+        # conversation_outbox payload IS the redacted event that the inline
+        # publish and the relay both send).
+        assert "redact.redact_text(turn_row[" in prefix
         assert "redacted=True" in prefix

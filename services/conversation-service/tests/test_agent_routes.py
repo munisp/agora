@@ -204,7 +204,9 @@ def _app():
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        app.state.cfg = Config()
+        # SPEC-W43 C1: standalone-dev escape for the direct X-Tenant-ID style
+        # used here; the gateway-bound matrix is tests/test_tenant_binding.py.
+        app.state.cfg = Config(trust_direct_tenant=True)
         app.state.agent_store = FakeAgentStore()
         app.state.tenant_resolver = FakeTenantResolver({TENANT_A_SLUG: TENANT_A})
         app.state.log = get_logger("agent-routes-test")

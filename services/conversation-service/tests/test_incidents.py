@@ -5,6 +5,8 @@
 - build_idp canonical shape vs docs/schemas/incident-data-packet.json
 - reference-number format/increment (fake counter store)
 - emission dedupe per conversation_id+turn_id + CloudEvent contract
+- SPEC-W43 Y-03: durable dedupe via incident_emitted (publish failure leaves
+  an unsent row; IncidentRetryWorker republishes; post-restart dedupe holds)
 - route wiring: emergency user turn -> non-blocking IDP publish
 """
 
@@ -55,10 +57,34 @@ class _FakeConn:
 class _FakeDB:
     def __init__(self):
         self.conn = _FakeConn()
+        # incident_emitted stand-in: (tenant, dedupe_key) -> row
+        self.emitted: dict[tuple[str, str], dict] = {}
 
     @contextlib.asynccontextmanager
     async def _tenant_tx(self, tenant_id):
         yield self.conn
+
+    # --- SPEC-W43 Y-03 durable emission gate (db.incident_emit_record) ---
+    async def incident_emit_record(self, tenant_id, dedupe_key, build):
+        key = (str(tenant_id), dedupe_key)
+        row = self.emitted.get(key)
+        if row is not None:
+            if row["published"]:
+                return None, "duplicate"
+            return row["payload"], "retry"
+        payload = build(f"INC-2026-{len(self.emitted) + 1:06d}")
+        self.emitted[key] = {"payload": payload, "published": False}
+        return payload, "created"
+
+    async def incident_mark_published(self, tenant_id, dedupe_key):
+        self.emitted[(str(tenant_id), dedupe_key)]["published"] = True
+
+    async def incident_unsent(self, limit=100):
+        return [
+            (uuid.UUID(t), k, r["payload"])
+            for (t, k), r in self.emitted.items()
+            if not r["published"]
+        ][:limit]
 
 
 class _FakeDapr:
@@ -338,6 +364,7 @@ def _wiring_app():
             super().__init__()
             self.convs = {}
             self.turns = {}
+            self.outbox = {}
 
         async def create_conversation(self, tenant_id, site_slug, channel, contact_phone=None):
             cid = uuid.uuid4()
@@ -352,14 +379,23 @@ def _wiring_app():
 
         async def add_turn(self, cid, tenant_id, role, text, tool_calls,
                            sentiment=None, intent=None, entities=None,
-                           idempotency_key=None):
+                           idempotency_key=None, outbox=None):
             seq = len(self.turns.get(cid, [])) + 1
             rec = dict(id=uuid.uuid4(), conversation_id=cid, seq=seq, role=role,
                        text=text, tool_calls=tool_calls, sentiment=sentiment,
                        intent=intent, entities=entities,
                        idempotency_key=idempotency_key, ts=datetime.now(UTC))
             self.turns.setdefault(cid, []).append(rec)
-            return rec, True
+            outbox_id = None
+            if outbox is not None:
+                topic, builder = outbox
+                outbox_id = uuid.uuid4()
+                self.outbox[outbox_id] = {"payload": builder(rec), "topic": topic,
+                                          "sent": False}
+            return rec, True, outbox_id
+
+        async def outbox_mark_sent(self, outbox_id, tenant_id):
+            self.outbox[outbox_id]["sent"] = True
 
     class FakeSink:
         async def publish(self, rec):
@@ -367,7 +403,9 @@ def _wiring_app():
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        app.state.cfg = Config()
+        # SPEC-W43 C1: standalone-dev escape for the direct ?tenant= style
+        # used here; the gateway-bound matrix is tests/test_tenant_binding.py.
+        app.state.cfg = Config(trust_direct_tenant=True)
         app.state.db = FakeDB()
         app.state.sink = FakeSink()
         app.state.intel_sink = FakeSink()
@@ -423,3 +461,79 @@ def test_route_wiring_emits_idp_on_emergency_turn():
         time.sleep(0.2)
         assert len([e for t, e in dapr.published
                     if e.get("type") == "com.opendesk.incidents.IDPCreated"]) == 1
+
+
+# ------------------------------------------------------- SPEC-W43 Y-03
+# Durable incident emission: dedupe survives restart, publish failure leaves
+# an unsent row, the retry worker republishes — never silent.
+# ---------------------------------------------------------------------------
+class _BoomDapr:
+    def __init__(self):
+        self.calls = 0
+
+    async def publish_event(self, topic, event):
+        self.calls += 1
+        raise RuntimeError("broker down")
+
+
+async def test_failed_publish_leaves_unsent_row_and_retry_worker_republishes():
+    db = _FakeDB()
+    turn_id = uuid.uuid4()
+    out = await incidents.emit_for_turn(**_emit_kwargs(db, _BoomDapr(), turn_id=turn_id))
+    assert out is None  # never raised to the caller
+    unsent = await db.incident_unsent()
+    assert len(unsent) == 1  # durable state — the incident is NOT lost
+    assert unsent[0][1] == f"{CONV}:{turn_id}"
+
+    # retry worker republishes the STORED payload and marks the row sent
+    dapr2 = _FakeDapr()
+    worker = incidents.IncidentRetryWorker(Config(), db, dapr2)
+    assert await worker.run_once() == 1
+    assert await db.incident_unsent() == []
+    assert len(dapr2.published) == 1
+    topic, event = dapr2.published[0]
+    assert topic == "opendesk.incidents"
+    assert event["type"] == "com.opendesk.incidents.IDPCreated"
+
+    # durable dedupe holds across an in-process cache reset ("restart"):
+    # same turn does NOT re-emit and does NOT burn another reference number
+    incidents._reset_dedupe()
+    again = await incidents.emit_for_turn(**_emit_kwargs(db, dapr2, turn_id=turn_id))
+    assert again is None
+    assert len(dapr2.published) == 1
+
+
+async def test_retry_worker_failure_keeps_row_unsent_and_retries_later():
+    db = _FakeDB()
+    boom = _BoomDapr()
+    turn_id = uuid.uuid4()
+    out = await incidents.emit_for_turn(**_emit_kwargs(db, boom, turn_id=turn_id))
+    assert out is None
+
+    # worker with a still-down broker: nothing published, row stays unsent
+    worker = incidents.IncidentRetryWorker(Config(), db, boom)
+    assert await worker.run_once() == 0
+    assert len(await db.incident_unsent()) == 1
+
+    # broker recovers: the SAME stored event is eventually published
+    dapr_ok = _FakeDapr()
+    worker_ok = incidents.IncidentRetryWorker(Config(), db, dapr_ok)
+    assert await worker_ok.run_once() == 1
+    assert await db.incident_unsent() == []
+
+
+async def test_unsent_row_republished_via_emit_retry_path():
+    """A second emit_for_turn for the same turn while the row is still
+    unsent takes the 'retry' path: republishes the stored event, no new
+    reference number."""
+    db = _FakeDB()
+    turn_id = uuid.uuid4()
+    out = await incidents.emit_for_turn(**_emit_kwargs(db, _BoomDapr(), turn_id=turn_id))
+    assert out is None
+    incidents._reset_dedupe()  # force the durable path (skip the fast cache)
+    dapr2 = _FakeDapr()
+    idp = await incidents.emit_for_turn(**_emit_kwargs(db, dapr2, turn_id=turn_id))
+    assert idp is not None
+    assert idp["reference_number"] == "INC-2026-000001"  # original, not burned
+    assert len(dapr2.published) == 1
+    assert await db.incident_unsent() == []

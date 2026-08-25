@@ -222,7 +222,7 @@ async def _seed(db: Database, tenant_id: uuid.UUID, n: int, tag: str):
     out = []
     for i in range(n):
         conv = await db.create_conversation(tenant_id, "site-x", "voice")
-        turn, created = await db.add_turn(
+        turn, created, _outbox_id = await db.add_turn(
             conv["id"], tenant_id, "user", f"{tag}-{i}", None
         )
         assert created
@@ -284,7 +284,7 @@ async def test_interleaved_tenants_no_cross_reads_pool1(app_db, dsns):
     with pytest.raises(
         (asyncpg.InsufficientPrivilegeError, asyncpg.ForeignKeyViolationError)
     ):
-        await app_db.add_turn(rows_b[0][0], TENANT_A, "user", "x-tenant", None)
+        row, created, _ = await app_db.add_turn(rows_b[0][0], TENANT_A, "user", "x-tenant", None)
 
     # conversation_exists / conversation_meta never leak across tenants.
     assert await app_db.conversation_exists(rows_a[0][0], TENANT_A)
