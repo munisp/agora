@@ -25,6 +25,11 @@ class Settings:
     # Control plane
     port: int = 7006
     log_level: str = "info"
+    # W44/F15-09: the LiveKit worker PROCESS (app/livekit_worker.py) serves
+    # the app/metrics.py registry exposition on its own port so Prometheus
+    # can scrape the per-call voice_* series the dashboards query (the
+    # control-plane /metrics on `port` is a different process). 0 disables.
+    worker_metrics_port: int = 9464
 
     # Dapr sidecar (SPEC §3: companion daprd container, app-id `voice`)
     dapr_host: str = "daprd-voice"
@@ -32,6 +37,10 @@ class Settings:
     dapr_pubsub: str = "pubsub-kafka"
     booking_app_id: str = "booking"
     identity_app_id: str = "identity"
+    # SPEC-W44 K2: X-Internal-Token sent on the identity tenant-context
+    # lookup (IDENTITY_INTERNAL_TOKEN env; empty = header not sent —
+    # identity fails closed on its own side when unset).
+    identity_internal_token: str = ""
     knowledge_app_id: str = "knowledge"
     booking_commands_topic: str = "opendesk.booking.commands"
     conversation_events_topic: str = "opendesk.conversation.events"
@@ -181,11 +190,13 @@ def load_settings() -> Settings:
     return Settings(
         port=_env_int("PORT", 7006),
         log_level=_env("LOG_LEVEL", "info"),
+        worker_metrics_port=_env_int("VOICE_WORKER_METRICS_PORT", 9464),
         dapr_host=_env("DAPR_HOST", "daprd-voice"),
         dapr_http_port=_env_int("DAPR_HTTP_PORT", 3500),
         dapr_pubsub=_env("DAPR_PUBSUB_NAME", "pubsub-kafka"),
         booking_app_id=_env("BOOKING_APP_ID", "booking"),
         identity_app_id=_env("IDENTITY_APP_ID", "identity"),
+        identity_internal_token=_env("IDENTITY_INTERNAL_TOKEN", ""),
         knowledge_app_id=_env("KNOWLEDGE_APP_ID", "knowledge"),
         booking_commands_topic=_env("BOOKING_COMMANDS_TOPIC", "opendesk.booking.commands"),
         conversation_events_topic=_env(
