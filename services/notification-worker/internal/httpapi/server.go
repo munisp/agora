@@ -1,4 +1,5 @@
-// Package httpapi exposes /healthz and small dev endpoints for the worker.
+// Package httpapi exposes /healthz, /metrics and small internal/tenant
+// endpoints for the worker.
 package httpapi
 
 import (
@@ -6,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/opendesk/notification-worker/internal/workflows"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"go.uber.org/zap"
@@ -23,6 +26,28 @@ type Server struct {
 	TaskQueue string
 	Log       *zap.Logger
 
+	// InternalToken is NOTIFICATION_INTERNAL_TOKEN (K2): required on the
+	// machine-only /v1/signals route (constant-time compare; unset fails
+	// closed with 503).
+	InternalToken string
+	// DevEndpoints (OPENDESK_DEV_ENDPOINTS=1) compiles the /dev/* triggers
+	// into the router (N-01); default OFF — the routes answer 404.
+	DevEndpoints bool
+	// TrustDirectTenancy (OPENDESK_TRUST_DIRECT_TENANT=1) is the explicit
+	// gateway-less dev escape for the K1 role/tenant bindings (auth.go);
+	// every use is logged. Never set in deployed environments.
+	TrustDirectTenancy bool
+	// DNDAdminRoles (DND_ADMIN_ROLES csv, default "platform-admin") gates
+	// the DND import / global delete and the ops-alerts read (S1-F7-03, K3).
+	DNDAdminRoles []string
+	// SignalWorkflowPrefixes (SIGNAL_WORKFLOW_PREFIXES csv) is the /v1/signals
+	// workflow-id prefix allowlist (S1-F7-04); "{tenant}" expands to the
+	// bound tenant slug. Empty → defaultSignalPrefixes.
+	SignalWorkflowPrefixes []string
+	// WebhookURLValidator validates outbound webhook subscription URLs
+	// (S1-F6-03/N-02 SSRF guard); nil → strict default (https-only).
+	WebhookURLValidator *URLValidator
+
 	// Outbound webhook platform (Wave 5 #10); nil Webhooks disables the
 	// /v1/webhooks routes (503).
 	Webhooks               WebhookStore
@@ -33,9 +58,20 @@ type Server struct {
 	// disables the /v1/dnd routes (503).
 	DND DNDStore
 
+	// OpsAlerts is the K3 ops-alert store; nil disables GET /v1/ops-alerts
+	// (503).
+	OpsAlerts OpsAlertStore
+
 	// AudienceIntake is the SPEC-W28 graph audience intake; nil degrades
 	// POST /v1/audiences to 503.
 	AudienceIntake AudienceIntaker
+
+	// HealthPostgres pings the notifications DB for /healthz (F15-05/N-07);
+	// nil skips the check (DATABASE_URL unset).
+	HealthPostgres func(ctx context.Context) error
+	// HealthTemporal checks Temporal frontend health for /healthz; nil
+	// skips the check.
+	HealthTemporal func(ctx context.Context) error
 }
 
 // NewRouter builds the chi router.
@@ -44,23 +80,36 @@ func NewRouter(s *Server) http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	r.Get("/healthz", s.healthz)
+	// Prometheus scrape endpoint (F15-02; client_golang promhttp).
+	r.Handle("/metrics", promhttp.Handler())
 
-	// POST /dev/trigger-reminder starts a ReminderWorkflow with overridden
-	// (short) delays for manual testing.
-	r.Post("/dev/trigger-reminder", s.triggerReminder)
-	// POST /dev/trigger-onboarding starts a TenantOnboardingWorkflow.
-	r.Post("/dev/trigger-onboarding", s.triggerOnboarding)
-	// POST /dev/trigger-twin-cleanup starts a TwinCleanupWorkflow (24h →
-	// delete the twin tenant). Invoked by identity-service's twin endpoint
-	// via Dapr service invocation (SPEC-W3 §3 innovation 12).
-	r.Post("/dev/trigger-twin-cleanup", s.triggerTwinCleanup)
+	// /dev/* triggers (manual testing) are compiled OUT unless
+	// OPENDESK_DEV_ENDPOINTS=1 (N-01): without the flag the routes do not
+	// exist and answer 404. APISIX additionally denies /api/notifications/dev/*
+	// (C7). Even when compiled in, the group sits behind the K2
+	// internal-token middleware (V2-D2: identity-service reaches
+	// trigger-twin-cleanup with X-Internal-Token = NOTIFICATION_INTERNAL_TOKEN;
+	// compose defaults the flag OFF, and the token gate is the real control).
+	if s.DevEndpoints {
+		r.Group(func(r chi.Router) {
+			r.Use(s.requireInternalToken)
+			// POST /dev/trigger-reminder starts a ReminderWorkflow with
+			// overridden (short) delays for manual testing.
+			r.Post("/dev/trigger-reminder", s.triggerReminder)
+			// POST /dev/trigger-onboarding starts a TenantOnboardingWorkflow.
+			r.Post("/dev/trigger-onboarding", s.triggerOnboarding)
+			// POST /dev/trigger-twin-cleanup starts a TwinCleanupWorkflow (24h
+			// → delete the twin tenant). Invoked by identity-service's twin
+			// endpoint via Dapr service invocation (SPEC-W3 §3 innovation 12).
+			r.Post("/dev/trigger-twin-cleanup", s.triggerTwinCleanup)
+		})
+	}
 	// POST /v1/signals delivers a signal to a running workflow (staff UI:
 	// IntakeCompleted / Responded on the pack workflows, SPEC-CRM §C2).
-	r.Post("/v1/signals", s.sendSignal)
+	// Machine-only route (S1-F7-04): K2 internal token + required tenant_slug
+	// bound to X-Tenant-Slugs + workflow-id prefix allowlist.
+	r.With(s.requireInternalToken).Post("/v1/signals", s.sendSignal)
 
 	// Outbound webhook platform (Wave 5 #10): tenant-scoped via
 	// X-Tenant-Slug; reached from the UI through APISIX /api/notifications/*.
@@ -72,29 +121,101 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/{id}/deliveries", s.listWebhookDeliveries)
 	})
 
-	// DND registry (SPEC-W12 Agent B): NCC 2442 global import (admin via
-	// APISIX), opt-out honor, suppression check.
+	// DND registry (SPEC-W12 Agent B + S1-F7-03): the NCC 2442 global import
+	// and the global delete are admin-mutation routes gated on
+	// X-User-Roles ∩ DND_ADMIN_ROLES (K1 header contract — APISIX injects the
+	// roles from the verified JWT); the tenant-scoped delete binds its slug
+	// to X-Tenant-Slugs membership. /v1/dnd/check stays an ungated read (the
+	// send-guard lookup path).
 	r.Route("/v1/dnd", func(r chi.Router) {
-		r.Post("/import", s.importDND)
+		r.With(s.requireDNDAdmin).Post("/import", s.importDND)
 		r.Delete("/{phone}", s.deleteDND)
 		r.Get("/check", s.checkDND)
 	})
+
+	// K3: ops-alerts read-back (the opendesk.ops.alerts consumer persists;
+	// this endpoint is DND-admin-role gated, limit ≤ 500).
+	r.With(s.requireDNDAdmin).Get("/v1/ops-alerts", s.listOpsAlerts)
 
 	// SPEC-W28: consent-gated graph audiences → existing pacer path.
 	RegisterAudienceRoutes(r, NewAudienceHandler(s.AudienceIntake, s.Log))
 	return r
 }
 
-// signalRequest is the body of POST /v1/signals. Payload is optional (the
-// IntakeCompleted / Responded / NoShow signals carry no payload); when given
+// healthz is dependency-aware (F15-05/N-07): every configured dependency
+// (Postgres ping, Temporal CheckHealth) is probed with a 2s budget; any
+// failure answers 503 with per-check detail instead of a blind ok.
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	checks := map[string]func(context.Context) error{}
+	if s.HealthPostgres != nil {
+		checks["postgres"] = s.HealthPostgres
+	}
+	if s.HealthTemporal != nil {
+		checks["temporal"] = s.HealthTemporal
+	}
+	type result struct {
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}
+	out := map[string]result{}
+	healthy := true
+	for name, check := range checks {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		err := check(ctx)
+		cancel()
+		if err != nil {
+			healthy = false
+			out[name] = result{Status: "error", Error: err.Error()}
+			s.Log.Warn("healthz dependency check failed", zap.String("check", name), zap.Error(err))
+		} else {
+			out[name] = result{Status: "ok"}
+		}
+	}
+	status := http.StatusOK
+	top := "ok"
+	if !healthy {
+		status = http.StatusServiceUnavailable
+		top = "degraded"
+	}
+	writeJSON(w, status, map[string]any{"status": top, "checks": out})
+}
+
+// defaultSignalPrefixes is the /v1/signals workflow-id prefix allowlist
+// (S1-F7-04): only the staff-facing pack/reminder/noshow workflow families
+// are signalable — never twin-cleanup / onboarding / delivery machinery.
+// "{tenant}" expands to the bound tenant slug for slug-prefixed ids.
+var defaultSignalPrefixes = []string{"reminder-", "noshow-", "pack-", "{tenant}-"}
+
+// signalAllowed reports whether workflowID matches the prefix allowlist.
+func (s *Server) signalAllowed(tenantSlug, workflowID string) bool {
+	prefixes := s.SignalWorkflowPrefixes
+	if len(prefixes) == 0 {
+		prefixes = defaultSignalPrefixes
+	}
+	for _, p := range prefixes {
+		p = strings.ReplaceAll(p, "{tenant}", tenantSlug)
+		if p != "" && strings.HasPrefix(workflowID, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// signalRequest is the body of POST /v1/signals. tenant_slug is required
+// (S1-F7-04) and bound to the X-Tenant-Slugs membership list. Payload is
+// optional (the IntakeCompleted / Responded / NoShow signals carry no
+// payload); when given
 // it must be a JSON value, e.g. {"type":"cancelled"} for "booking-event".
 type signalRequest struct {
 	WorkflowID string          `json:"workflow_id"`
+	TenantSlug string          `json:"tenant_slug"`
 	Signal     string          `json:"signal"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
 }
 
-// sendSignal forwards the signal via the Temporal client. A workflow that is
+// sendSignal forwards the signal via the Temporal client (behind the K2
+// internal-token gate mounted on the route, the required tenant_slug binding
+// and the workflow-id prefix allowlist — S1-F7-04). A workflow that is
 // not running maps to 404; payload-less signals send no argument.
 func (s *Server) sendSignal(w http.ResponseWriter, r *http.Request) {
 	var req signalRequest
@@ -104,6 +225,19 @@ func (s *Server) sendSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.WorkflowID == "" || req.Signal == "" {
 		http.Error(w, `{"error":"workflow_id and signal are required"}`, http.StatusBadRequest)
+		return
+	}
+	req.TenantSlug = strings.TrimSpace(req.TenantSlug)
+	if req.TenantSlug == "" {
+		http.Error(w, `{"error":"tenant_slug is required"}`, http.StatusBadRequest)
+		return
+	}
+	if !s.bindTenantSlug(r, req.TenantSlug) {
+		http.Error(w, `{"error":"tenant_slug is not bound to the caller"}`, http.StatusForbidden)
+		return
+	}
+	if !s.signalAllowed(req.TenantSlug, req.WorkflowID) {
+		http.Error(w, `{"error":"workflow_id is not in the signal allowlist"}`, http.StatusForbidden)
 		return
 	}
 	var payload any

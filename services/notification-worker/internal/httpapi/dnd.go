@@ -5,12 +5,21 @@ package httpapi
 //
 // Routes (registered in server.go):
 //
-//	POST   /v1/dnd/import       bulk-load the global NCC 2442 list (admin;
-//	                            APISIX restricts this route to admin JWTs
-//	                            like the other /api/notifications/* routes)
+//	POST   /v1/dnd/import       bulk-load the global NCC 2442 list. ADMIN
+//	                            MUTATION (S1-F7-03): gated on
+//	                            X-User-Roles ∩ DND_ADMIN_ROLES (default
+//	                            "platform-admin") — the roles come from the
+//	                            gateway-injected header ONLY (K1: APISIX
+//	                            strips caller-sent x-* and re-injects from
+//	                            the verified JWT; fail-closed when absent).
 //	DELETE /v1/dnd/{phone}      opt-out honor: remove a number from the DND
-//	                            registry (global + all tenant lists; with the
-//	                            X-Tenant-Slug header, only that tenant's row)
+//	                            registry. Without a tenant slug this is a
+//	                            global delete (global + all tenant lists) and
+//	                            carries the same admin-role gate as import;
+//	                            with ?tenant= / X-Tenant-Slug only that
+//	                            tenant's row is removed and the slug is BOUND
+//	                            to the X-Tenant-Slugs membership list (C1/K1
+//	                            binding, 403 on mismatch).
 //	GET    /v1/dnd/check?phone= suppression lookup (+ optional tenant= slug)
 //
 // The handlers are thin; all matching/normalization semantics live in
@@ -69,10 +78,12 @@ func (s *Server) importDND(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"received": len(req.Phones), "imported": inserted})
 }
 
-// deleteDND serves DELETE /v1/dnd/{phone} (opt-out honor). Without the
-// X-Tenant-Slug header the number is removed from the global list AND every
-// tenant list (full re-consent); with the header only that tenant's opt-out
-// row is removed.
+// deleteDND serves DELETE /v1/dnd/{phone} (opt-out honor, S1-F7-03). With a
+// tenant slug (X-Tenant-Slug header or ?tenant= query) only that tenant's
+// opt-out row is removed and the slug is bound to X-Tenant-Slugs membership
+// (403 on mismatch). WITHOUT a tenant slug the number is removed from the
+// global list AND every tenant list (full re-consent) — a global mutation
+// gated on X-User-Roles ∩ DND_ADMIN_ROLES (403 otherwise).
 func (s *Server) deleteDND(w http.ResponseWriter, r *http.Request) {
 	if s.DND == nil {
 		http.Error(w, `{"error":"DND registry not configured"}`, http.StatusServiceUnavailable)
@@ -84,6 +95,20 @@ func (s *Server) deleteDND(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenant := strings.TrimSpace(r.Header.Get("X-Tenant-Slug"))
+	if tenant == "" {
+		tenant = strings.TrimSpace(r.URL.Query().Get("tenant"))
+	}
+	if tenant == "" {
+		// Global delete: admin-role gate (same set as /v1/dnd/import).
+		if !s.hasAnyRole(r, s.dndAdminRoles()) {
+			http.Error(w, `{"error":"admin role required for a global DND delete"}`, http.StatusForbidden)
+			return
+		}
+	} else if !s.bindTenantSlug(r, tenant) {
+		s.Log.Warn("dnd tenant binding rejected", zap.String("tenant", tenant))
+		http.Error(w, `{"error":"tenant is not bound to the caller"}`, http.StatusForbidden)
+		return
+	}
 	removed, err := s.DND.RemoveDND(r.Context(), phone, tenant)
 	if err != nil {
 		s.Log.Error("dnd remove", zap.String("phone", phone), zap.Error(err))
