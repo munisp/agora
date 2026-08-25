@@ -30,7 +30,30 @@ pub struct Config {
     /// True only when MOJALOOP_ALLOW_SIM opted in to the simulator rail.
     pub mojaloop_allow_sim: bool,
     /// Platform fee in basis points applied on captures/no-show fees.
+    /// SPEC-W43 P-05: validated 0..=10000 at boot (fail-closed, panic-free).
     pub platform_fee_bps: u64,
+    /// SPEC-W43 P-09 (contract C1): shared secret authenticating internal /
+    /// service-to-service calls (`X-Internal-Token` header, constant-time
+    /// compare). When unset the service fails closed on money routes (503)
+    /// unless the dev escape below is on.
+    pub internal_token: Option<String>,
+    /// C1 dev escape (`OPENDESK_TRUST_DIRECT_TENANT=1`): accept tenant
+    /// context directly from request bodies without the gateway-injected
+    /// `X-Tenant-Slugs` header. OFF by default; never set in compose.
+    pub trust_direct_tenant: bool,
+    /// SPEC-W43 P-01 (contract C3): Postgres DSN for the durable
+    /// `payout_attempts` table (`PAYMENTS_DATABASE_URL`, falling back to
+    /// `DATABASE_URL` then `PG_DSN`). When configured the service bootstraps
+    /// the table at startup and refuses to boot if unreachable (fail-closed).
+    /// When unset an in-memory store is used (dev only — reconciliation
+    /// records are lost on restart; a loud warning is logged).
+    pub database_url: Option<String>,
+    /// Reconciler sweep interval (seconds) for unknown payout rail outcomes.
+    pub payout_reconciler_interval_secs: u64,
+    /// SPEC-W44 K6: roles allowed to perform money mutations
+    /// (`MONEY_ROLES`, comma-separated, default "owner,admin"). Compared
+    /// case-insensitively against the gateway-injected `X-User-Roles`.
+    pub money_roles: Vec<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -42,6 +65,21 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// K6: csv env -> lowercase trimmed role list; empty input falls back to the
+/// safe default so a misconfigured MONEY_ROLES="" never disables the gate.
+fn parse_roles(raw: &str) -> Vec<String> {
+    let roles: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if roles.is_empty() {
+        vec!["owner".to_string(), "admin".to_string()]
+    } else {
+        roles
+    }
 }
 
 impl Config {
@@ -88,6 +126,13 @@ impl Config {
                 )
             }
         };
+        // P-05: fee bounds validated at boot, panic-free (fail closed).
+        let platform_fee_bps: u64 = env_parse("PLATFORM_FEE_BPS", 250);
+        if platform_fee_bps > 10_000 {
+            return Err(format!(
+                "PLATFORM_FEE_BPS={platform_fee_bps} is out of range 0..=10000                  (basis points); refusing to start"
+            ));
+        }
         Ok(Self {
             port: env_parse("PORT", 7004),
             ledger_impl,
@@ -104,7 +149,16 @@ impl Config {
             events_topic: env_or("PAYMENTS_EVENTS_TOPIC", "opendesk.payments.events"),
             mojaloop_endpoint,
             mojaloop_allow_sim,
-            platform_fee_bps: env_parse("PLATFORM_FEE_BPS", 250),
+            platform_fee_bps,
+            internal_token: std::env::var("PAYMENTS_INTERNAL_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            trust_direct_tenant: env_parse("OPENDESK_TRUST_DIRECT_TENANT", false),
+            database_url: ["PAYMENTS_DATABASE_URL", "DATABASE_URL", "PG_DSN"]
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|s| !s.trim().is_empty())),
+            payout_reconciler_interval_secs: env_parse("PAYOUT_RECONCILER_INTERVAL_SECS", 30),
+            money_roles: parse_roles(&env_or("MONEY_ROLES", "owner,admin")),
         })
     }
 
@@ -196,6 +250,42 @@ mod tests {
         let cfg = Config::from_env().expect("sim opt-in must load");
         assert!(cfg.mojaloop_allow_sim);
         assert_eq!(cfg.mojaloop_endpoint, "http://mojaloop:8444");
+        clear_posture_env();
+    }
+
+    // ------------------------------------------------------------------
+    // P-05: PLATFORM_FEE_BPS boot validation (0..=10000, panic-free).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn platform_fee_bps_within_bounds_loads() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("LEDGER_IMPL", "sim");
+        std::env::set_var("MOJALOOP_ALLOW_SIM", "true");
+        std::env::set_var("PLATFORM_FEE_BPS", "10000");
+        let cfg = Config::from_env().expect("10000 bps (100%) must be accepted");
+        assert_eq!(cfg.platform_fee_bps, 10_000);
+        std::env::set_var("PLATFORM_FEE_BPS", "0");
+        let cfg = Config::from_env().expect("0 bps must be accepted");
+        assert_eq!(cfg.platform_fee_bps, 0);
+        std::env::remove_var("PLATFORM_FEE_BPS");
+        clear_posture_env();
+    }
+
+    #[test]
+    fn platform_fee_bps_out_of_bounds_fails_closed() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("LEDGER_IMPL", "sim");
+        std::env::set_var("MOJALOOP_ALLOW_SIM", "true");
+        std::env::set_var("PLATFORM_FEE_BPS", "10001");
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.contains("PLATFORM_FEE_BPS") && err.contains("10001"),
+            "error should name the variable and value: {err}"
+        );
+        std::env::remove_var("PLATFORM_FEE_BPS");
         clear_posture_env();
     }
 
