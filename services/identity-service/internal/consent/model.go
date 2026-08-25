@@ -17,6 +17,17 @@ const (
 	ErasureEventType = "com.opendesk.consent.ErasureRequested"
 	// DefaultErasureTopic is the default Kafka topic for erasure events.
 	DefaultErasureTopic = "opendesk.consent.erasure.v1"
+	// PrivacyEraseEventType / DefaultPrivacyTopic are the K4 erasure
+	// contract (SPEC-W44): every erasure ADDITIONALLY publishes a
+	// PrivacyEraseRequested tombstone to opendesk.privacy.events with the
+	// exact CloudEvent shape the booking consumer
+	// (booking-service/internal/consumer/privacy.go) and the conversation
+	// consumer (conversation-service/app/privacy.py) already expect:
+	// data = {phone, email, tenant_id}. Published by notification-worker's
+	// GdprEraseWorkflow on the same topic; the consent-registry erasure
+	// path was previously invisible to those consumers (F15-06).
+	PrivacyEraseEventType = "PrivacyEraseRequested"
+	DefaultPrivacyTopic   = "opendesk.privacy.events"
 )
 
 // Record mirrors the identity.consents table — the ConsentRecord of
