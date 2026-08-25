@@ -16,6 +16,10 @@ pub struct Config {
     pub audience: Option<String>,
     /// Dev escape hatch: skip JWT validation entirely (never use in prod).
     pub auth_disabled: bool,
+    /// Dev mode (`OPENDESK_DEV=1|true`): relaxes production startup
+    /// invariants (KEYCLOAK_AUDIENCE — SEC#12). OFF by default and never
+    /// set in compose.
+    pub dev_mode: bool,
     pub jwks_cache_ttl_secs: u64,
     /// Per-tenant broadcast channel capacity; slow consumers are dropped
     /// (drop-slow policy) and counted in metrics.
@@ -31,6 +35,14 @@ pub struct Config {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Boolean env flag accepting `1`/`true` (case-insensitive); absent or any
+/// other value is false.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -54,7 +66,8 @@ impl Config {
             ),
             issuer: env_or("KEYCLOAK_ISSUER", "http://keycloak:8080/realms/opendesk"),
             audience: std::env::var("KEYCLOAK_AUDIENCE").ok().filter(|s| !s.is_empty()),
-            auth_disabled: env_parse("EDGE_AUTH_DISABLED", false),
+            auth_disabled: env_flag("EDGE_AUTH_DISABLED"),
+            dev_mode: env_flag("OPENDESK_DEV"),
             jwks_cache_ttl_secs: env_parse("JWKS_CACHE_TTL_SECS", 300),
             ws_channel_capacity: env_parse("WS_CHANNEL_CAPACITY", 256),
             fluvio_endpoint: env_or("FLUVIO_ENDPOINT", "fluvio:9003"),
@@ -63,8 +76,24 @@ impl Config {
                 "opendesk.transcripts-raw",
             ),
             fluvio_partitions: env_parse("FLUVIO_PARTITIONS", 6),
-            fluvio_stub_allowed: env_parse("GATEWAY_EDGE_ALLOW_SIM", false),
+            fluvio_stub_allowed: env_flag("GATEWAY_EDGE_ALLOW_SIM"),
         }
+    }
+
+    /// Startup invariants (fail-closed). SEC#12: KEYCLOAK_AUDIENCE is
+    /// REQUIRED unless this is an explicit dev run (`OPENDESK_DEV=1`) or
+    /// auth is entirely disabled (`EDGE_AUTH_DISABLED=true`, itself a
+    /// dev-only escape): without an audience, ANY RS256 token signed by the
+    /// realm for ANY client would be accepted (aud validation disabled),
+    /// which is never acceptable outside dev.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.audience.is_none() && !self.dev_mode && !self.auth_disabled {
+            return Err(
+                "KEYCLOAK_AUDIENCE is not set: refusing to start without audience                  validation in non-dev mode (set KEYCLOAK_AUDIENCE, or opt into                  dev posture with OPENDESK_DEV=1)"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -94,5 +123,34 @@ mod tests {
 
         std::env::remove_var("ENRICHED_TOPIC");
         std::env::remove_var("GATEWAY_EDGE_ALLOW_SIM");
+    }
+
+    /// SEC#12: audience is mandatory outside explicit dev posture.
+    #[test]
+    fn audience_required_unless_dev() {
+        for k in ["KEYCLOAK_AUDIENCE", "OPENDESK_DEV", "EDGE_AUTH_DISABLED"] {
+            std::env::remove_var(k);
+        }
+        let cfg = Config::from_env();
+        assert!(cfg.audience.is_none() && !cfg.dev_mode && !cfg.auth_disabled);
+        let err = cfg.validate().expect_err("non-dev without audience must fail");
+        assert!(err.contains("KEYCLOAK_AUDIENCE"), "{err}");
+
+        // Audience set -> ok.
+        std::env::set_var("KEYCLOAK_AUDIENCE", "opendesk");
+        assert!(Config::from_env().validate().is_ok());
+        std::env::remove_var("KEYCLOAK_AUDIENCE");
+
+        // OPENDESK_DEV=1 -> ok (explicit dev opt-in; accepts `1` and `true`).
+        std::env::set_var("OPENDESK_DEV", "1");
+        assert!(Config::from_env().validate().is_ok());
+        std::env::set_var("OPENDESK_DEV", "true");
+        assert!(Config::from_env().validate().is_ok());
+        std::env::remove_var("OPENDESK_DEV");
+
+        // EDGE_AUTH_DISABLED=true -> ok (dev-only escape, warns at boot).
+        std::env::set_var("EDGE_AUTH_DISABLED", "true");
+        assert!(Config::from_env().validate().is_ok());
+        std::env::remove_var("EDGE_AUTH_DISABLED");
     }
 }

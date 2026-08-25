@@ -18,6 +18,9 @@ import (
 // adds last_synced_at (reverse-sync echo suppression: when the forward syncer
 // touches a person mapping, inbound webhooks for that person are suppressed
 // for a short window); the index backs the twenty_id reverse lookups.
+// webhook_events_seen (SPEC-W43 K-13): replay dedupe for the Twenty webhook
+// intake — a redelivered event id inside the 24h window is ignored instead
+// of re-emitted.
 const ddl = `CREATE TABLE IF NOT EXISTS sync_map (
 	id SERIAL PRIMARY KEY,
 	kind TEXT NOT NULL,
@@ -28,7 +31,12 @@ const ddl = `CREATE TABLE IF NOT EXISTS sync_map (
 	UNIQUE (kind, opendesk_id, tenant_id)
 );
 ALTER TABLE sync_map ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
-CREATE INDEX IF NOT EXISTS sync_map_twenty_idx ON sync_map (kind, twenty_id)`
+CREATE INDEX IF NOT EXISTS sync_map_twenty_idx ON sync_map (kind, twenty_id);
+CREATE TABLE IF NOT EXISTS webhook_events_seen (
+	event_id TEXT PRIMARY KEY,
+	seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS webhook_events_seen_seen_at_idx ON webhook_events_seen (seen_at)`
 
 // Store wraps the pgx pool.
 type Store struct {
@@ -144,6 +152,42 @@ func (s *Store) DeleteByTwentyID(ctx context.Context, twentyID string) (int64, e
 		return 0, fmt.Errorf("sync_map delete by twenty_id: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// MarkWebhookSeen records a Twenty webhook event id (SPEC-W43 K-13 replay
+// dedupe). It returns true when the id is NEW (first delivery) and false
+// when it was already seen — the caller then answers 200 "ignored" without
+// re-publishing. Rows older than 24h are pruned in the same call (the
+// replay window), so a same-id delivery a day later is processed again.
+func (s *Store) MarkWebhookSeen(ctx context.Context, eventID string) (bool, error) {
+	if eventID == "" {
+		return true, nil // no id to dedupe on — process (fail-open is impossible to dedupe anyway)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("webhook seen tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var inserted bool
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO webhook_events_seen (event_id) VALUES ($1)
+		 ON CONFLICT (event_id) DO NOTHING
+		 RETURNING true`, eventID).Scan(&inserted); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			inserted = false // duplicate
+		} else {
+			return false, fmt.Errorf("webhook seen insert: %w", err)
+		}
+	}
+	// 24h replay-window prune (indexed; webhook volume is low).
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM webhook_events_seen WHERE seen_at < now() - interval '24 hours'`); err != nil {
+		return false, fmt.Errorf("webhook seen prune: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("webhook seen commit: %w", err)
+	}
+	return inserted, nil
 }
 
 // Put inserts or updates (kind, opendesk_id, tenant_id) -> twenty_id. Every

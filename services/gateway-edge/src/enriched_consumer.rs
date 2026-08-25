@@ -15,16 +15,35 @@ use tracing::{debug, error, info, warn};
 
 use crate::bus;
 use crate::bus::EventBus;
+use crate::health;
 use crate::kafka_consumer::{extract_tenant, RawCloudEvent};
 use crate::metrics;
 
+/// Task entry point: runs the consumer and, on ANY return path, records
+/// the exit so `/healthz` goes degraded (F15-07).
 pub async fn run(
+    bus: Arc<EventBus>,
+    brokers: String,
+    group_id: String,
+    topic: String,
+    shutdown: watch::Receiver<bool>,
+) {
+    run_inner(bus, brokers, group_id, topic, shutdown).await;
+    health::KAFKA_ENRICHED.mark_exited();
+}
+
+async fn run_inner(
     bus: Arc<EventBus>,
     brokers: String,
     group_id: String,
     topic: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    health::KAFKA_ENRICHED.beat();
+    let mut beat = tokio::time::interval(std::time::Duration::from_secs(
+        health::BEAT_INTERVAL_SECS,
+    ));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let consumer: StreamConsumer = match rdkafka::config::ClientConfig::new()
         .set("group.id", &group_id)
         .set("bootstrap.servers", &brokers)
@@ -52,6 +71,10 @@ pub async fn run(
                     info!("enriched turns consumer shutting down");
                 }
                 break;
+            }
+            // F15-07: fixed-interval heartbeat independent of message flow.
+            _ = beat.tick() => {
+                health::KAFKA_ENRICHED.beat();
             }
             msg = consumer.recv() => {
                 match msg {

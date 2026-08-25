@@ -11,7 +11,7 @@ booking events and live transcripts.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/healthz` | liveness |
+| GET | `/healthz` | dependency-aware liveness (F15-07): 200 `{"status":"ok"}` only while every consumer task (Kafka booking events, Kafka enriched turns, Fluvio transcript tail) is alive with a heartbeat ≤30s old; otherwise 503 `{"status":"degraded"}` with per-consumer detail |
 | GET | `/metrics` | Prometheus text exposition |
 | GET | `/ws?tenant={slug}&token={jwt}` | live booking events (Kafka `opendesk.booking.events`) |
 | GET | `/ws/transcripts?tenant={slug}&token={jwt}` | live transcript tail (Fluvio `opendesk.transcripts-raw`) |

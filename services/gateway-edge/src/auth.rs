@@ -86,7 +86,15 @@ pub struct JwksValidator {
 impl JwksValidator {
     pub fn new(jwks_url: String, issuer: String, audience: Option<String>, ttl: Duration) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // RS-006 idiom (payments-service): explicit timeouts so a hung
+            // Keycloak can never park token validation forever — 5s connect,
+            // 10s total (tighter than the 30s rail budget: JWKS is tiny and
+            // on the request hot path).
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("reqwest client with static timeout configuration must build"),
             jwks_url,
             issuer,
             audience,
@@ -174,6 +182,19 @@ mod tests {
         };
         assert!(authorize_tenant(&claims, "acme"));
         assert!(!authorize_tenant(&claims, "initech"));
+    }
+
+    /// RS-006: the JWKS validator must construct (timeouts are statically
+    /// configured; a builder failure would panic here).
+    #[test]
+    fn jwks_validator_constructs_with_timeouts() {
+        let v = JwksValidator::new(
+            "http://keycloak:8080/certs".into(),
+            "http://keycloak:8080/realms/opendesk".into(),
+            Some("opendesk".into()),
+            Duration::from_secs(60),
+        );
+        assert_eq!(v.audience.as_deref(), Some("opendesk"));
     }
 
     #[test]
