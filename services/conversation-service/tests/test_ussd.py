@@ -217,6 +217,8 @@ class _FakeDB:
         self.convs = {}
         self.turns = {}
         self.conn = _FakeConn()
+        self.outbox = {}
+        self.emitted = {}
 
     @contextlib.asynccontextmanager
     async def _tenant_tx(self, tenant_id):
@@ -240,19 +242,51 @@ class _FakeDB:
 
     async def add_turn(self, cid, tenant_id, role, text, tool_calls,
                        sentiment=None, intent=None, entities=None,
-                       idempotency_key=None):
+                       idempotency_key=None, outbox=None):
         existing = self.turns.get(cid, [])
         if idempotency_key:
             for t in existing:
                 if t["idempotency_key"] == idempotency_key:
-                    return t, False
+                    return t, False, None
         rec = dict(id=uuid.uuid4(), conversation_id=cid, seq=len(existing) + 1,
                    role=role, text=text, tool_calls=tool_calls,
                    sentiment=sentiment, intent=intent, entities=entities,
                    idempotency_key=idempotency_key, ts=datetime.now(UTC))
         existing.append(rec)
         self.turns[cid] = existing
-        return rec, True
+        outbox_id = None
+        if outbox is not None:
+            topic, builder = outbox
+            outbox_id = uuid.uuid4()
+            self.outbox[outbox_id] = {"payload": builder(rec), "topic": topic,
+                                      "sent": False}
+        return rec, True, outbox_id
+
+    async def outbox_mark_sent(self, outbox_id, tenant_id):
+        self.outbox[outbox_id]["sent"] = True
+
+    # --- SPEC-W43 Y-03 durable incident gate stand-in (same shape as
+    # tests/test_incidents.py _FakeDB) ---
+    async def incident_emit_record(self, tenant_id, dedupe_key, build):
+        key = (str(tenant_id), dedupe_key)
+        row = self.emitted.get(key)
+        if row is not None:
+            if row["published"]:
+                return None, "duplicate"
+            return row["payload"], "retry"
+        payload = build(f"INC-2026-{len(self.emitted) + 1:06d}")
+        self.emitted[key] = {"payload": payload, "published": False}
+        return payload, "created"
+
+    async def incident_mark_published(self, tenant_id, dedupe_key):
+        self.emitted[(str(tenant_id), dedupe_key)]["published"] = True
+
+    async def incident_unsent(self, limit=100):
+        return [
+            (uuid.UUID(t), k, r["payload"])
+            for (t, k), r in self.emitted.items()
+            if not r["published"]
+        ][:limit]
 
 
 class _FakeSink:

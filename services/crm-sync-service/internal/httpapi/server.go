@@ -11,6 +11,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,12 @@ type MapReader interface {
 	Get(ctx context.Context, kind, opendeskID string, tenantID *uuid.UUID) (syncmap.Mapping, error)
 }
 
+// WebhookDedupe records seen webhook event ids (SPEC-W43 K-13); it reports
+// true for a NEW event and false for a replay inside the dedupe window.
+type WebhookDedupe interface {
+	MarkWebhookSeen(ctx context.Context, eventID string) (bool, error)
+}
+
 // Server bundles the HTTP dependencies.
 type Server struct {
 	Twenty         *twentyc.Client
@@ -47,8 +55,11 @@ type Server struct {
 	WebhookSecret  string
 	DB             Pinger
 	Map            MapReader
-	Metrics        *metrics.Registry
-	Log            *zap.Logger
+	// Dedupe is the webhook replay guard (webhook_events_seen, 24h window).
+	// Nil → dedupe disabled (tests / no-DB deployments).
+	Dedupe  WebhookDedupe
+	Metrics *metrics.Registry
+	Log     *zap.Logger
 }
 
 // Router builds the chi router.
@@ -123,6 +134,32 @@ func (s *Server) twentyWebhook(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
+	}
+	// SPEC-W43 K-13: replay freshness — dedupe on the provider event id
+	// (payload "id", falling back to a body digest so unsigned-id payloads
+	// still dedupe exact replays) BEFORE re-emitting. A duplicate is a 200
+	// "ignored" (acknowledged, not retried, not re-published). The dedupe
+	// check runs only after HMAC verification, so an unauthenticated caller
+	// cannot poison the seen-table. A dedupe-store failure fails LOUD (502)
+	// so Twenty retries instead of the event being silently droppable.
+	if s.Dedupe != nil {
+		eventID, _ := payload["id"].(string)
+		if eventID == "" {
+			sum := sha256.Sum256(body)
+			eventID = "sha256:" + hex.EncodeToString(sum[:])
+		}
+		fresh, err := s.Dedupe.MarkWebhookSeen(r.Context(), eventID)
+		if err != nil {
+			s.Log.Error("webhook dedupe store failed", zap.Error(err))
+			writeError(w, http.StatusBadGateway, "webhook dedupe unavailable")
+			return
+		}
+		if !fresh {
+			s.Metrics.Inc("webhook_duplicate")
+			s.Log.Info("duplicate twenty webhook ignored", zap.String("event_id", eventID))
+			writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "duplicate": true})
+			return
+		}
 	}
 	// Twenty webhook payloads carry an "event" field like "person.created";
 	// default to a generic type when absent.

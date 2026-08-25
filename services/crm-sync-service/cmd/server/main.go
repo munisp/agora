@@ -117,6 +117,7 @@ func run() error {
 			WebhookSecret:  cfg.TwentyWebhookSecret,
 			DB:             st,
 			Map:            st,
+			Dedupe:         st, // SPEC-W43 K-13: webhook_events_seen replay guard
 			Metrics:        reg,
 			Log:            logger,
 		}).Router(),
