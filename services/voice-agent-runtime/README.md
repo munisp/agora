@@ -159,6 +159,15 @@ Per-layer concurrency disciplines from `docs/VOICE-SCALING.md`:
   `voice_llm_tokens_total{kind=prompt|completion}`,
   `voice_tts_latency_seconds`, `voice_tool_calls_total{tool,result}`,
   `voice_active_sessions`.
+- **Worker metrics (W44/F15-09)**: the LiveKit worker process
+  (`python -m app.livekit_worker start`) serves the SAME hand-rolled registry
+  on `VOICE_WORKER_METRICS_PORT` (default **9464**, `0` disables) so
+  Prometheus can scrape the per-call series recorded in job processes — the
+  control-plane `/metrics` on 7006 is a different process and never sees
+  them. The worker supervisor and every job process bind the port with
+  `SO_REUSEPORT` where available, so a scrape returns one process' view of
+  the shared registry; add a Prometheus scrape job targeting this port
+  (see infra/prometheus — job `voice-worker`).
 - **LLM fallback chain (P1)**: when `LLM_FALLBACK_BASE_URL` (+
   `LLM_FALLBACK_MODEL`/`LLM_FALLBACK_API_KEY`) is set, a primary failure —
   connection error, 429, 5xx, or a call exceeding `LLM_TIMEOUT=20`s — retries
