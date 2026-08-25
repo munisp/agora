@@ -555,7 +555,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -712,7 +712,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -808,7 +808,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -922,7 +922,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1018,7 +1018,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1114,7 +1114,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1214,7 +1214,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1331,7 +1331,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1429,7 +1429,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1529,7 +1529,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
@@ -1658,7 +1658,7 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
               local rem = #b64 % 4
               if rem == 2 then b64 = b64 .. "=="
               elseif rem == 3 then b64 = b64 .. "="
