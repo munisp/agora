@@ -2,6 +2,7 @@ package consent
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
@@ -136,6 +137,52 @@ func TestStoreCaptureIdempotentAndErase(t *testing.T) {
 	}
 }
 
+// TestStoreEraseWritesOutbox (SPEC-W43 I-04): Erase persists the tombstone
+// AND the durable outbox row in one transaction; the relay-facing
+// fetch/mark lifecycle drains it.
+func TestStoreEraseWritesOutbox(t *testing.T) {
+	st, tenantID := newTestStore(t)
+	ctx := context.Background()
+
+	rec := Record{TenantID: tenantID, DataSubjectID: "+234809990077", Purpose: "kyc"}
+	if err := st.Capture(ctx, &rec); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	n, err := st.Erase(ctx, tenantID, rec.DataSubjectID, "kyc")
+	if err != nil || n != 1 {
+		t.Fatalf("erase: %v, n=%d", err, n)
+	}
+
+	rows, err := st.FetchUnsentOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("fetch unsent: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("unsent rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.TenantID != tenantID || row.DataSubjectID != rec.DataSubjectID ||
+		row.Purpose != "kyc" || row.ErasedRecords != 1 || row.CreatedAt.IsZero() {
+		t.Errorf("outbox row = %+v", row)
+	}
+	if err := st.MarkOutboxSent(ctx, row.ID); err != nil {
+		t.Fatalf("mark sent: %v", err)
+	}
+	rows, err = st.FetchUnsentOutbox(ctx, 10)
+	if err != nil || len(rows) != 0 {
+		t.Errorf("post-mark unsent = %v, %d", err, len(rows))
+	}
+
+	// A no-op erase (already tombstoned) must NOT enqueue another row.
+	if n, _ := st.Erase(ctx, tenantID, rec.DataSubjectID, "kyc"); n != 0 {
+		t.Fatalf("re-erase n=%d, want 0", n)
+	}
+	rows, _ = st.FetchUnsentOutbox(ctx, 10)
+	if len(rows) != 0 {
+		t.Errorf("no-op erase enqueued %d rows, want 0", len(rows))
+	}
+}
+
 func TestStoreRLSPolicyPresent(t *testing.T) {
 	st, _ := newTestStore(t)
 	ctx := context.Background()
@@ -154,5 +201,24 @@ func TestStoreRLSPolicyPresent(t *testing.T) {
 		Scan(&policy)
 	if err != nil {
 		t.Errorf("tenant_isolation policy missing: %v", err)
+	}
+	// SPEC-W43 I-03: fail-closed NULLIF idiom + app_identity_internal escape.
+	var qual string
+	if err := st.pool.QueryRow(ctx,
+		`SELECT pg_get_expr(polqual, polrelid) FROM pg_policy
+		 WHERE polrelid = 'consents'::regclass AND polname = 'tenant_isolation'`).Scan(&qual); err != nil {
+		t.Fatalf("policy expr: %v", err)
+	}
+	if !strings.Contains(qual, "NULLIF") || !strings.Contains(qual, "app_identity_internal") {
+		t.Errorf("policy must be fail-closed with internal escape, got: %s", qual)
+	}
+	// Outbox table carries the same fail-closed + escape policy.
+	if err := st.pool.QueryRow(ctx,
+		`SELECT pg_get_expr(polqual, polrelid) FROM pg_policy
+		 WHERE polrelid = 'consent_events_outbox'::regclass AND polname = 'tenant_isolation'`).Scan(&qual); err != nil {
+		t.Fatalf("outbox policy expr: %v", err)
+	}
+	if !strings.Contains(qual, "NULLIF") || !strings.Contains(qual, "app_identity_internal") {
+		t.Errorf("outbox policy must be fail-closed with internal escape, got: %s", qual)
 	}
 }

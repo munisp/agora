@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -29,23 +31,51 @@ type Repository interface {
 	// Erase tombstones matching records (sets erasure_ts = now(), only where
 	// not already erased). purpose empty erases ALL of the subject's
 	// purposes. Returns the number of records tombstoned by this call.
+	// When n > 0 the call ALSO enqueues one consent_events_outbox row in the
+	// same transaction (SPEC-W43 I-04: the erasure events are durable —
+	// the Relay publishes them).
 	Erase(ctx context.Context, tenantID uuid.UUID, subject, purpose string) (int, error)
+	// FetchUnsentOutbox returns unpublished outbox rows (oldest first).
+	FetchUnsentOutbox(ctx context.Context, limit int) ([]OutboxEvent, error)
+	// MarkOutboxSent marks an outbox row published.
+	MarkOutboxSent(ctx context.Context, id int64) error
 	// Ping checks database liveness.
 	Ping(ctx context.Context) error
+}
+
+// OutboxEvent is one consent_events_outbox row — everything the Relay needs
+// to rebuild both erasure CloudEvents (K4: ErasureRequested on the consent
+// topic + PrivacyEraseRequested on opendesk.privacy.events).
+type OutboxEvent struct {
+	ID            int64
+	TenantID      uuid.UUID
+	DataSubjectID string
+	Purpose       string
+	ErasedRecords int
+	Synthetic     bool
+	CreatedAt     time.Time
 }
 
 // Store is the Postgres-backed Repository. RLS: every query runs inside a
 // transaction with `SET LOCAL app.tenant_id` (booking-service withTenant
 // idiom) so the FORCE ROW LEVEL SECURITY policy on consents enforces tenant
 // isolation at the database layer.
+//
+// Outbox (SPEC-W43 I-04 / SPEC-W44 W-I): Erase writes a consent_events_outbox
+// row in the SAME transaction as the tombstone; the Relay publishes from it.
+// The relay sweeps across tenants, so outbox fetch/mark run on the internal
+// pool (INTERNAL_DATABASE_URL — app_identity_internal escape role, billing
+// 0002 idiom; aliases the main pool when unset).
 type Store struct {
-	pool *pgxpool.Pool
+	pool     *pgxpool.Pool
+	internal *pgxpool.Pool
 }
 
 // New connects to Postgres, verifies connectivity and bootstraps the
 // consents table + RLS policy (idempotent; covers fresh and existing
-// installs, same role as the identity store's bootstrap ALTERs).
-func New(ctx context.Context, databaseURL string) (*Store, error) {
+// installs, same role as the identity store's bootstrap ALTERs). internalURL
+// is optional (see Store docs).
+func New(ctx context.Context, databaseURL string, internalURL ...string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -54,22 +84,38 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	s := &Store{pool: pool}
+	s := &Store{pool: pool, internal: pool}
+	if len(internalURL) > 0 && internalURL[0] != "" && internalURL[0] != databaseURL {
+		ipool, err := pgxpool.New(ctx, internalURL[0])
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("connect internal postgres: %w", err)
+		}
+		if err := ipool.Ping(ctx); err != nil {
+			ipool.Close()
+			pool.Close()
+			return nil, fmt.Errorf("ping internal postgres: %w", err)
+		}
+		s.internal = ipool
+	}
 	if err := s.bootstrap(ctx); err != nil {
-		pool.Close()
+		s.Close()
 		return nil, fmt.Errorf("bootstrap consents schema: %w", err)
 	}
 	return s, nil
 }
 
-// bootstrap creates the consents table with the tenant_isolation RLS policy
-// of 02-identity-schema.sql.
+// bootstrap creates the consents table + consent_events_outbox with the
+// tenant_isolation RLS policy of 02-identity-schema.sql.
 //
 // NOTE (RLS): bootstrap DDL is a superuser migration path, not a tenant
 // query — it intentionally runs outside withTenant (booking-service
-// ensureSitesTable idiom).
+// ensureSitesTable idiom). SPEC-W43 I-03: statements tolerate
+// insufficient_privilege (42501) with a WARN so the least-privilege
+// app_identity role boots once the infra layer owns the DDL.
 func (s *Store) bootstrap(ctx context.Context) error {
-	const ddl = `
+	stmts := []struct{ name, sql string }{
+		{"ensure consents table", `
 CREATE TABLE IF NOT EXISTS consents (
     consent_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id        UUID NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
@@ -84,25 +130,56 @@ CREATE TABLE IF NOT EXISTS consents (
 CREATE INDEX IF NOT EXISTS idx_consents_subject ON consents (tenant_id, data_subject_id);
 ALTER TABLE consents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE consents FORCE ROW LEVEL SECURITY;
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_policies
-                   WHERE schemaname = current_schema()
-                     AND tablename = 'consents'
-                     AND policyname = 'tenant_isolation') THEN
-        CREATE POLICY tenant_isolation ON consents
-            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
-    END IF;
-END
-$$;`
-	if _, err := s.pool.Exec(ctx, ddl); err != nil {
-		return fmt.Errorf("ensure consents table: %w", err)
+DROP POLICY IF EXISTS tenant_isolation ON consents;
+CREATE POLICY tenant_isolation ON consents
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR pg_has_role(current_user, 'app_identity_internal', 'member'))`},
+		// SPEC-W43 I-04 / SPEC-W44 W-I-1+K4: durable erasure outbox. One row
+		// per erasure call; the Relay publishes ErasureRequested (consent
+		// topic) + PrivacyEraseRequested (opendesk.privacy.events) from it
+		// and marks sent_at. Relay reads are cross-tenant => internal-role
+		// escape in the policy.
+		{"ensure consent_events_outbox", `
+CREATE TABLE IF NOT EXISTS consent_events_outbox (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       UUID NOT NULL,
+    data_subject_id TEXT NOT NULL,
+    purpose         TEXT NOT NULL DEFAULT '',
+    erased_records  INT NOT NULL DEFAULT 0,
+    synthetic       BOOLEAN NOT NULL DEFAULT false,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at         TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_consent_outbox_unsent
+    ON consent_events_outbox (id) WHERE sent_at IS NULL;
+ALTER TABLE consent_events_outbox ENABLE ROW LEVEL SECURITY;
+ALTER TABLE consent_events_outbox FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON consent_events_outbox;
+CREATE POLICY tenant_isolation ON consent_events_outbox
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR pg_has_role(current_user, 'app_identity_internal', 'member'))`},
+	}
+	for _, st := range stmts {
+		if _, err := s.pool.Exec(ctx, st.sql); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "42501" {
+				slog.Warn("consent bootstrap skipped (insufficient privilege — infra-owned DDL assumed)",
+					"stmt", st.name)
+				continue
+			}
+			return fmt.Errorf("%s: %w", st.name, err)
+		}
 	}
 	return nil
 }
 
-// Close releases the pool.
-func (s *Store) Close() { s.pool.Close() }
+// Close releases the pool(s).
+func (s *Store) Close() {
+	s.pool.Close()
+	if s.internal != s.pool {
+		s.internal.Close()
+	}
+}
 
 // Ping checks database liveness.
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
@@ -202,7 +279,9 @@ func (s *Store) Active(ctx context.Context, tenantID uuid.UUID, subject, purpose
 	return r, err
 }
 
-// Erase implements Repository.
+// Erase implements Repository: tombstone + outbox row in ONE transaction
+// (SPEC-W43 I-04 — a crash between tombstone and publish can no longer lose
+// the erasure events; the Relay republishes until MarkOutboxSent).
 func (s *Store) Erase(ctx context.Context, tenantID uuid.UUID, subject, purpose string) (int, error) {
 	var n int
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
@@ -223,7 +302,53 @@ func (s *Store) Erase(ctx context.Context, tenantID uuid.UUID, subject, purpose 
 			return err
 		}
 		n = int(tag.RowsAffected())
+		if n == 0 {
+			return nil
+		}
+		// Durable outbox row (same tx). Synthetic is recomputed
+		// deterministically from the subject (EvaluateErasureEligibility).
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO consent_events_outbox (tenant_id, data_subject_id, purpose, erased_records, synthetic)
+			 VALUES ($1,$2,$3,$4,$5)`,
+			tenantID, subject, purpose, n, EvaluateErasureEligibility(subject).Synthetic); err != nil {
+			return fmt.Errorf("enqueue erasure outbox: %w", err)
+		}
 		return nil
 	})
 	return n, err
+}
+
+// FetchUnsentOutbox implements Repository. Cross-tenant by design (the relay
+// is a platform job): runs on the internal pool, which in least-privilege
+// deploys connects as an app_identity_internal member allowed by the policy
+// escape.
+func (s *Store) FetchUnsentOutbox(ctx context.Context, limit int) ([]OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	const q = `SELECT id, tenant_id, data_subject_id, purpose, erased_records, synthetic, created_at
+	           FROM consent_events_outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1`
+	rows, err := s.internal.Query(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("fetch unsent outbox: %w", err)
+	}
+	defer rows.Close()
+	var out []OutboxEvent
+	for rows.Next() {
+		var e OutboxEvent
+		if err := rows.Scan(&e.ID, &e.TenantID, &e.DataSubjectID, &e.Purpose, &e.ErasedRecords, &e.Synthetic, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// MarkOutboxSent implements Repository.
+func (s *Store) MarkOutboxSent(ctx context.Context, id int64) error {
+	if _, err := s.internal.Exec(ctx,
+		`UPDATE consent_events_outbox SET sent_at = now() WHERE id = $1 AND sent_at IS NULL`, id); err != nil {
+		return fmt.Errorf("mark outbox sent: %w", err)
+	}
+	return nil
 }
