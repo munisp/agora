@@ -115,7 +115,7 @@ def run_nightly_tick(store, trainers: Mapping[str, FamilyTrainer],
                      alerter=None, git_sha: str | None = None,
                      brier_max: float = BRIER_MAX,
                      aucpr_tolerance: float = AUCPR_TOLERANCE,
-                     alerts_topic: str = "ops.alerts") -> list[TickResult]:
+                     alerts_topic: str = "opendesk.ops.alerts") -> list[TickResult]:
     """One nightly pass over all families. NEVER raises (I1): per-family
     errors are caught and reported as decision='error'.
     """

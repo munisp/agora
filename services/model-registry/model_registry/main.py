@@ -26,7 +26,7 @@ from . import ab
 from .alerts import AlertPublisher, build_publisher
 from .config import Settings, load_settings
 from .drift import DirectoryManifestProvider, DriftJob, ManifestProvider
-from .store import Conflict, NotFound, RegistryStore
+from .store import Conflict, NotFound, RegistryStore, TenantMismatch
 from .trainer import FamilyTrainer, run_nightly_tick
 
 log = logging.getLogger(__name__)
@@ -73,7 +73,10 @@ class ExperimentRequest(BaseModel):
 
 
 class OutcomeRequest(BaseModel):
-    tenant_id: UUID
+    # SPEC-W43 Y-04: the tenant is derived server-side from the experiment
+    # row. A supplied tenant_id that disagrees is rejected 403; omitting it
+    # is fine (the experiment's tenant is used).
+    tenant_id: UUID | None = None
     person_id: str
     assigned_arm: str = Field(pattern="^(champion|challenger)$")
     predicted_label: int = Field(ge=0, le=1)
@@ -212,6 +215,10 @@ def create_app(
     @app.exception_handler(Conflict)
     async def _cf(_: Request, exc: Conflict):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(TenantMismatch)
+    async def _tm(_: Request, exc: TenantMismatch):
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
 
     # ------------------------------------------------------------------ health
     @app.get("/healthz")

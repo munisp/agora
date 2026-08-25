@@ -40,6 +40,11 @@ class Conflict(Exception):
     """State conflict, e.g. single-production race (partial unique index)."""
 
 
+class TenantMismatch(Exception):
+    """SPEC-W43 Y-04: caller-supplied tenant_id disagrees with the
+    server-side tenant derived from the referenced row (HTTP 403)."""
+
+
 def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     for k in ("id", "tenant_id", "experiment_id"):
@@ -217,8 +222,29 @@ class RegistryStore:
                           champion_version: int, challenger_version: int,
                           pct: int, starts_at: datetime | None = None,
                           ends_at: datetime | None = None) -> dict[str, Any]:
+        """SPEC-W43 Y-05: champion != challenger and BOTH versions must exist
+        for the family+tenant — otherwise Conflict (409). A champion ==
+        challenger experiment is a degenerate A/B that would silently
+        poison the report arms."""
+        if champion_version == challenger_version:
+            raise Conflict(
+                f"champion_version == challenger_version ({champion_version})"
+                f" for {family}/{tenant_id}: an experiment needs two distinct"
+                " versions")
         with self._tx(tenant_id) as conn:
             self.ensure_family(conn, family)
+            rows = conn.execute(
+                "SELECT version FROM model_version"
+                " WHERE family = %s AND tenant_id = %s AND version = ANY(%s)",
+                (family, tenant_id,
+                 [champion_version, challenger_version])).fetchall()
+            existing = {int(r["version"]) for r in rows}
+            missing = [v for v in (champion_version, challenger_version)
+                       if v not in existing]
+            if missing:
+                raise Conflict(
+                    f"model version(s) {missing} do not exist for"
+                    f" {family}/{tenant_id}")
             row = conn.execute(
                 "INSERT INTO experiments "
                 "(family, tenant_id, champion_version, challenger_version, pct,"
@@ -258,17 +284,36 @@ class RegistryStore:
                 raise NotFound(f"experiment {experiment_id} not found")
             return _row_to_dict(row)
 
-    def record_outcome(self, *, experiment_id: str | UUID, tenant_id: str | UUID,
+    def record_outcome(self, *, experiment_id: str | UUID,
+                       tenant_id: str | UUID | None = None,
                        person_id: str, assigned_arm: str,
                        predicted_label: int, predicted_score: float,
                        true_label: int | None = None) -> dict[str, Any]:
-        with self._tx(tenant_id) as conn:
+        """SPEC-W43 Y-04 (DATA#4b): the outcome tenant is derived
+        SERVER-SIDE from the experiment row — never trusted from the
+        caller. The FK from experiment_outcomes to experiments bypasses
+        RLS (constraint checks run as the table owner), so a client-chosen
+        tenant_id could poison another tenant's experiment metrics; that
+        is now impossible: an unknown/invisible experiment id is 404 and a
+        caller tenant_id that disagrees with the experiment's tenant is
+        TenantMismatch (403). tenant_id=None simply takes the experiment's
+        tenant.
+        """
+        experiment = self.get_experiment(experiment_id)
+        if experiment is None:
+            raise NotFound(f"experiment {experiment_id} not found")
+        exp_tenant = experiment["tenant_id"]
+        if tenant_id is not None and str(tenant_id) != str(exp_tenant):
+            raise TenantMismatch(
+                f"tenant_id {tenant_id} does not match experiment"
+                f" {experiment_id} tenant")
+        with self._tx(exp_tenant) as conn:
             row = conn.execute(
                 "INSERT INTO experiment_outcomes "
                 "(experiment_id, tenant_id, person_id, assigned_arm,"
                 " predicted_label, predicted_score, true_label) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
-                (experiment_id, tenant_id, person_id, assigned_arm,
+                (experiment_id, exp_tenant, person_id, assigned_arm,
                  predicted_label, predicted_score, true_label)).fetchone()
             return _row_to_dict(row)
 

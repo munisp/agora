@@ -22,7 +22,10 @@ class Settings:
     pg_internal_dsn: str | None = None
     kafka_enabled: bool = True
     kafka_bootstrap_servers: str = "kafka:9092"
-    alerts_topic: str = "ops.alerts"
+    # SPEC-W44 K3: canonical ops-alert topic is opendesk.ops.alerts (unified
+    # with notification-worker OPS_ALERTS_TOPIC; the legacy unprefixed
+    # `ops.alerts` topic is retired — infra/kafka/create-topics.sh).
+    alerts_topic: str = "opendesk.ops.alerts"
     drift_interval_minutes: int = 15
     drift_psi_threshold: float = 0.25
     # Directory of training-snapshot reference manifests (C2); one JSON file
@@ -52,7 +55,9 @@ def load_settings() -> Settings:
         pg_internal_dsn=os.getenv("MODEL_REGISTRY_INTERNAL_DSN") or None,
         kafka_enabled=_bool("KAFKA_ENABLED", True),
         kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
-        alerts_topic=os.getenv("ALERTS_TOPIC", "ops.alerts"),
+        # Default references the class field (SPEC-W44 K3, single source) —
+        # same pattern as pg_dsn above.
+        alerts_topic=os.getenv("ALERTS_TOPIC", Settings.alerts_topic),
         drift_interval_minutes=int(os.getenv("DRIFT_INTERVAL_MINUTES", "15")),
         drift_psi_threshold=float(os.getenv("DRIFT_PSI_THRESHOLD", "0.25")),
         drift_manifest_dir=os.getenv("DRIFT_MANIFEST_DIR", "/data/manifests"),

@@ -88,8 +88,12 @@ def test_assignment_matches_hash(client, store):
 def test_stopped_experiment_fails_closed(client, store):
     store.register_version(family="fraud-clf", tenant_id=TENANT_A,
                            artifact_uri="s3://x/v1", version=1)
+    # SPEC-W43 Y-05: champion != challenger — v2 is registered so the
+    # experiment is valid; pct=100 keeps everyone on the challenger arm.
+    store.register_version(family="fraud-clf", tenant_id=TENANT_A,
+                           artifact_uri="s3://x/v2", version=2)
     exp = store.create_experiment(family="fraud-clf", tenant_id=TENANT_A,
-                                  champion_version=1, challenger_version=1,
+                                  champion_version=1, challenger_version=2,
                                   pct=100)
     store.stop_experiment(exp["id"], TENANT_A)
     r = client.get("/v1/registry/experiments/assignment", params={

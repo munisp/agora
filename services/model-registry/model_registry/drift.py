@@ -16,7 +16,7 @@ The scheduled sweep (``DriftJob``), every ``DRIFT_INTERVAL_MINUTES`` (default
       7-day baseline.
 
 PSI > ``DRIFT_PSI_THRESHOLD`` (default 0.25) → alert on Kafka topic
-``ops.alerts`` + Prometheus gauge ``opendesk_model_drift_psi{family,tenant}``.
+``opendesk.ops.alerts`` + Prometheus gauge ``opendesk_model_drift_psi{family,tenant}``.
 
 Reference manifest schema (``opendesk/training-manifest/v1``) — written by the
 lakehouse ``training_snapshot.py`` job (Slice A, sibling owner); this service
@@ -179,7 +179,7 @@ class DriftJob:
         window_minutes: int = 15,
         baseline_days: int = 7,
         min_samples: int = 10,
-        alerts_topic: str = "ops.alerts",
+        alerts_topic: str = "opendesk.ops.alerts",
     ) -> None:
         self.store = store
         self.manifests = manifests
