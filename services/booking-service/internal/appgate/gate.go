@@ -96,6 +96,11 @@ type Options struct {
 	HTTPClient *http.Client
 	// Logger (default: no-op).
 	Logger *zap.Logger
+	// InternalToken (SPEC-W44 W-B, K2) is forwarded as X-Internal-Token on
+	// the GET /internal/entitlements/check service call — identity gates its
+	// internal endpoints on it (CODER-I2). IDENTITY_INTERNAL_TOKEN; empty =
+	// no header (identity then answers 503/401 → the gate fails closed).
+	InternalToken string
 }
 
 // Gate is a concurrency-safe entitlement gate. Construct once at boot with
@@ -108,6 +113,9 @@ type Gate struct {
 	retryAfter int
 	log        *zap.Logger
 	hc         *http.Client
+	// internalToken rides as X-Internal-Token on the identity service call
+	// (SPEC-W44 W-B, K2; see Options.InternalToken).
+	internalToken string
 
 	mu     sync.RWMutex // guards slugOf and cache
 	slugOf func(*http.Request) string
@@ -149,6 +157,7 @@ func New(opts Options) *Gate {
 		slugOf:     opts.TenantSlug,
 		cache:      map[string]cacheEntry{},
 	}
+	g.internalToken = opts.InternalToken
 	if g.slugOf == nil {
 		g.slugOf = func(r *http.Request) string { return r.Header.Get("X-Tenant-Slug") }
 	}
@@ -267,6 +276,11 @@ func (g *Gate) fetch(ctx context.Context, slug, appID string) (Entitlement, erro
 		return Entitlement{}, err
 	}
 	req.Header.Set("X-Tenant-Slug", slug)
+	// SPEC-W44 W-B (K2): identity's /internal/* endpoints are token-gated —
+	// service callers must carry X-Internal-Token (IDENTITY_INTERNAL_TOKEN).
+	if g.internalToken != "" {
+		req.Header.Set("X-Internal-Token", g.internalToken)
+	}
 	resp, err := g.hc.Do(req)
 	if err != nil {
 		return Entitlement{}, fmt.Errorf("entitlement check %s: %w", appID, err)

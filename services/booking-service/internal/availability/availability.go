@@ -91,8 +91,7 @@ func Slots(p Params) []Slot {
 			if !effectiveOn(rule, d) {
 				continue
 			}
-			winStart := d.Add(time.Duration(rule.StartMin) * time.Minute)
-			winEnd := d.Add(time.Duration(rule.EndMin) * time.Minute)
+			winStart, winEnd := ruleWindow(d, rule.StartMin, rule.EndMin)
 			for s := winStart; !s.Add(p.Duration).After(winEnd); s = s.Add(p.Step) {
 				e := s.Add(p.Duration)
 				if s.Before(p.From) || e.After(p.To) {
@@ -146,13 +145,26 @@ func Covers(rules []Rule, loc *time.Location, s, e time.Time) bool {
 		if !effectiveOn(r, day) {
 			continue
 		}
-		winStart := day.Add(time.Duration(r.StartMin) * time.Minute)
-		winEnd := day.Add(time.Duration(r.EndMin) * time.Minute)
+		winStart, winEnd := ruleWindow(day, r.StartMin, r.EndMin)
 		if !s.Before(winStart) && !e.After(winEnd) {
 			return true
 		}
 	}
 	return false
+}
+
+// ruleWindow builds the [start,end) wall-clock window of a rule on the
+// given calendar day (SPEC-W43 K-04). time.Date arithmetic — NOT
+// midnight.Add(duration) — so a DST transition inside the day keeps
+// "09:00" at 09:00 local wall-clock time (midnight.Add(9h) would land at
+// 10:00 on a spring-forward day). EndMin=1440 (midnight end-of-day) spills
+// to 00:00 of the next day, which time.Date normalizes correctly.
+func ruleWindow(day time.Time, startMin, endMin int) (time.Time, time.Time) {
+	loc := day.Location()
+	y, m, d := day.Date()
+	winStart := time.Date(y, m, d, startMin/60, startMin%60, 0, 0, loc)
+	winEnd := time.Date(y, m, d, endMin/60, endMin%60, 0, 0, loc)
+	return winStart, winEnd
 }
 
 // Fits reports whether candidate [s,e) can be booked given existing bookings,
