@@ -7,29 +7,64 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/opendesk/identity-service/internal/apps"
 	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
 	"github.com/opendesk/identity-service/internal/events"
 	"github.com/opendesk/identity-service/internal/keycloak"
 	"github.com/opendesk/identity-service/internal/packs"
-	"github.com/opendesk/identity-service/internal/permify"
 	"github.com/opendesk/identity-service/internal/store"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
+// TenantStore is the persistence contract the handlers depend on
+// (*store.Store satisfies it; tests substitute a fake).
+type TenantStore interface {
+	Ping(ctx context.Context) error
+	GetTenantBySlug(ctx context.Context, slug string) (store.Tenant, error)
+	CreateTenant(ctx context.Context, t *store.Tenant) error
+	DeleteTenant(ctx context.Context, slug string) error
+	MergeTerminology(ctx context.Context, slug string, patch json.RawMessage) (json.RawMessage, error)
+	ListMembers(ctx context.Context, tenantID uuid.UUID) ([]store.Membership, error)
+	AddMember(ctx context.Context, m store.Membership) error
+}
+
+// PermifyClient is the authorization/relationship contract
+// (*permify.HTTPClient satisfies it; tests substitute a fake).
+type PermifyClient interface {
+	Check(ctx context.Context, tenantID, subject, permission, resource string) (bool, error)
+	CreateTenant(ctx context.Context, tenantID, name string) error
+	WriteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error
+}
+
+// KeycloakClient is the identity-provider contract (*keycloak.Client
+// satisfies it; tests substitute a fake).
+type KeycloakClient interface {
+	CreateTenantGroup(ctx context.Context, slug string) (string, error)
+	CreateUser(ctx context.Context, slug string, in keycloak.CreateUserInput) (string, error)
+}
+
 // Deps bundles server dependencies.
 type Deps struct {
-	Store             *store.Store
-	Keycloak          *keycloak.Client
-	Permify           *permify.HTTPClient
-	Dapr              *daprc.Client
+	Store    TenantStore
+	Keycloak KeycloakClient
+	Permify  PermifyClient
+	Dapr     *daprc.Client
+	// InternalToken gates every /internal/* surface (K2): compared
+	// constant-time against X-Internal-Token; empty = fail-closed 503.
+	InternalToken string
+	// PlatformAdmins is the OPENDESK_PLATFORM_ADMINS subject allowlist
+	// (SPEC-W43 I-01): these subs may set non-free plans on createTenant.
+	PlatformAdmins    []string
 	PubSub            string
 	Topic             string // identity events topic
 	NotificationAppID string // Dapr app-id of notification-worker
@@ -53,7 +88,15 @@ func NewRouter(d Deps) http.Handler {
 
 	s := &server{d: d}
 
+	// K2: every /internal/* surface requires X-Internal-Token ==
+	// IDENTITY_INTERNAL_TOKEN (constant-time; unset env => 503 fail-closed).
+	// Path-scoped so additively-registered consent/apps internal routes are
+	// covered too.
+	r.Use(s.internauth)
+
 	r.Get("/healthz", s.healthz)
+	// SPEC-W44 W-I-5: Prometheus scrape endpoint on the service port.
+	r.Method(http.MethodGet, "/metrics", promhttp.Handler())
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/tenants", s.createTenant)
 		r.Get("/tenants/{slug}", s.getTenant)
@@ -69,8 +112,13 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/ensure-group", s.ensureGroup)
 		r.Post("/ensure-permify", s.ensurePermify)
 		r.Post("/terminology", s.mergeTerminology)
-		// SPEC-W3 §3 innovation 12: digital-twin provisioning.
+		// SPEC-W3 §3 innovation 12: digital-twin provisioning (internauth-gated
+		// via the /internal prefix, SPEC-W44 W-I-3 / S1-F7-06).
 		r.Post("/twin", s.createTwin)
+		// SPEC-W44 W-I-2: internal tenant deletion for the
+		// TwinCleanupWorkflow (internauth-gated; NO Permify check — the
+		// cleanup workflow is a platform actor).
+		r.Delete("/", s.deleteTenantInternal)
 	})
 	// SPEC-W12 §4: NDPA consent registry (/v1/consents*, /internal/consents/check).
 	if d.Consents != nil {
@@ -100,6 +148,13 @@ func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
 
 // getTenant returns the public tenant context used by the agent session
 // injection path: name, timezone, currency, locale, terminology, plan.
+//
+// SPEC-W44 W-I-1 (S1-F7-09): no longer realm-wide open. Callers are either
+// (a) service-to-service, authenticated with the internal token (K2 — the
+// Dapr/direct callers: booking resolver, conversation/analytics session
+// injection), or (b) an end-user subject scoped to the requested tenant:
+// slug present in the caller's tenant_slugs (K1 binding) or a Permify
+// view_dashboard grant on the organization.
 func (s *server) getTenant(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	t, err := s.d.Store.GetTenantBySlug(r.Context(), slug)
@@ -110,6 +165,30 @@ func (s *server) getTenant(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.internal(w, err)
 		return
+	}
+	if !s.validInternalToken(r) {
+		c, err := resolveCaller(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "malformed bearer token")
+			return
+		}
+		if c.Subject == "" {
+			writeError(w, http.StatusUnauthorized, "authenticated subject or internal token required")
+			return
+		}
+		if !c.HasSlug(slug) {
+			allowed, err := s.d.Permify.Check(r.Context(), t.ID.String(),
+				"user:"+c.Subject, "view_dashboard", "organization:"+t.ID.String())
+			if err != nil {
+				s.d.Logger.Error("permify check failed", zap.Error(err))
+				writeError(w, http.StatusBadGateway, "authorization service error")
+				return
+			}
+			if !allowed {
+				writeError(w, http.StatusForbidden, "not a member of this tenant")
+				return
+			}
+		}
 	}
 	resp := map[string]any{
 		"id":          t.ID,
@@ -162,7 +241,23 @@ type createTenantRequest struct {
 
 // createTenant provisions a tenant: DB row, Keycloak group /tenants/{slug},
 // Permify tenant + owner relationship, and publishes TenantProvisioned.
+//
+// SPEC-W44 W-I-1 (S1-F7-02, KC-1): the endpoint now requires an
+// authenticated subject. The plan is forced to "free" unless the caller is a
+// platform admin (platform-admin realm role or OPENDESK_PLATFORM_ADMINS
+// allowlist), and the owner relationship defaults to the caller — a tenant
+// creator can no longer self-assign a paid plan or an arbitrary owner.
 func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
+	c, err := resolveCaller(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "malformed bearer token")
+		return
+	}
+	if c.Subject == "" {
+		writeError(w, http.StatusUnauthorized, "authenticated subject required (JWT sub or X-User-Id)")
+		return
+	}
+	platformAdmin := s.isPlatformAdmin(c)
 	var req createTenantRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -185,8 +280,24 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 	if req.Locale == "" {
 		req.Locale = "en-US"
 	}
+	if !platformAdmin {
+		if req.Plan != "" && req.Plan != "free" {
+			s.d.Logger.Warn("non-admin plan override ignored — forcing plan=free",
+				zap.String("subject", c.Subject), zap.String("requested_plan", req.Plan))
+		}
+		req.Plan = "free"
+	}
 	if req.Plan == "" {
 		req.Plan = "free"
+	}
+	if !validPlans[req.Plan] {
+		writeError(w, http.StatusBadRequest, "plan must be free|pro|enterprise")
+		return
+	}
+	if !platformAdmin || req.OwnerUserID == "" {
+		// Non-admins own what they create; admins may provision for someone
+		// else via owner_user_id.
+		req.OwnerUserID = c.Subject
 	}
 	if len(req.Terminology) == 0 {
 		req.Terminology = json.RawMessage(`{}`)
@@ -265,14 +376,16 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 func (s *server) triggerOnboarding(t store.Tenant) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := s.d.Dapr.InvokeService(ctx, s.d.NotificationAppID, "dev/trigger-onboarding", map[string]any{
+	// SPEC-W44 K2: notification-worker gates its /dev/* triggers behind
+	// X-Internal-Token == NOTIFICATION_INTERNAL_TOKEN (401/503 fail-closed).
+	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "dev/trigger-onboarding", map[string]any{
 		"tenant_id":   t.ID.String(),
 		"tenant_slug": t.Slug,
 		"slug":        t.Slug,
 		"name":        t.Name,
 		"plan":        t.Plan,
 		"industry":    t.Industry,
-	}, nil)
+	}, notificationInternalHeaders(), nil)
 	if err != nil {
 		s.d.Logger.Error("failed to trigger TenantOnboardingWorkflow",
 			zap.String("slug", t.Slug), zap.Error(err))
@@ -281,9 +394,27 @@ func (s *server) triggerOnboarding(t store.Tenant) {
 	s.d.Logger.Info("TenantOnboardingWorkflow triggered", zap.String("slug", t.Slug))
 }
 
+// notificationInternalHeaders builds the X-Internal-Token header set for
+// outbound calls to notification-worker's token-gated /dev/* + /internal/*
+// surfaces (SPEC-W44 K2). Empty when NOTIFICATION_INTERNAL_TOKEN is unset —
+// the target then fails closed (503), surfaced via the invoke error log.
+func notificationInternalHeaders() map[string]string {
+	if tok := os.Getenv("NOTIFICATION_INTERNAL_TOKEN"); tok != "" {
+		return map[string]string{"X-Internal-Token": tok}
+	}
+	return nil
+}
+
+// listMembers (GET /v1/tenants/{slug}/members) — tenant-scoped to caller
+// membership (SPEC-W44 W-I-1, S1-F7-09): the caller must be an authenticated
+// subject whose tenant_slugs include the slug (K1 binding) or who holds
+// view_dashboard on the organization (owner|admin|member|viewer).
 func (s *server) listMembers(w http.ResponseWriter, r *http.Request) {
 	t, err := s.tenant(w, r)
 	if err != nil {
+		return
+	}
+	if _, ok := s.requireOrgAccess(w, r, t, "view_dashboard"); !ok {
 		return
 	}
 	members, err := s.d.Store.ListMembers(r.Context(), t.ID)
@@ -293,6 +424,44 @@ func (s *server) listMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": members})
 }
+
+// requireOrgAccess resolves the caller and authorizes them against the
+// organization. The K1 tenant_slugs binding is a MEMBERSHIP proof only, so
+// it satisfies read-level access (view_dashboard) directly; mutations
+// (manage_catalog and up) always require the Permify permission check.
+// Writes the error response and returns ok=false on failure.
+func (s *server) requireOrgAccess(w http.ResponseWriter, r *http.Request, t store.Tenant, permission string) (caller, bool) {
+	c, err := resolveCaller(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "malformed bearer token")
+		return c, false
+	}
+	if c.Subject == "" {
+		writeError(w, http.StatusUnauthorized, "authenticated subject required (JWT sub or X-User-Id)")
+		return c, false
+	}
+	if permission == "view_dashboard" && c.HasSlug(t.Slug) {
+		return c, true
+	}
+	allowed, err := s.d.Permify.Check(r.Context(), t.ID.String(),
+		"user:"+c.Subject, permission, "organization:"+t.ID.String())
+	if err != nil {
+		s.d.Logger.Error("permify check failed", zap.Error(err))
+		writeError(w, http.StatusBadGateway, "authorization service error")
+		return c, false
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "missing permission "+permission+" on this tenant")
+		return c, false
+	}
+	return c, true
+}
+
+// validPlans is the PUBLIC plan set accepted by POST /v1/tenants. The DB
+// CHECK (02-identity-schema.sql) additionally accepts 'twin', the internal
+// digital-twin plan set only by createTwin (SPEC-W44 F4 / V2-D1): callers
+// must not be able to self-assign it, so it stays out of this map.
+var validPlans = map[string]bool{"free": true, "pro": true, "enterprise": true}
 
 type inviteMemberRequest struct {
 	Email     string `json:"email"`
@@ -305,9 +474,18 @@ var memberRoles = map[string]bool{"owner": true, "admin": true, "staff": true, "
 
 // inviteMember creates the Keycloak user, a membership row and the Permify
 // relationship, then publishes MemberInvited.
+//
+// SPEC-W44 W-I-1 (S1-F7-02, KC-1): the caller must be authenticated and hold
+// manage_catalog (owner|admin) on the target organization; inviting with
+// role=owner additionally requires the caller to hold the owner relation
+// itself (Permify relation check — an admin cannot mint new owners).
 func (s *server) inviteMember(w http.ResponseWriter, r *http.Request) {
 	t, err := s.tenant(w, r)
 	if err != nil {
+		return
+	}
+	c, ok := s.requireOrgAccess(w, r, t, "manage_catalog")
+	if !ok {
 		return
 	}
 	var req inviteMemberRequest
@@ -325,6 +503,22 @@ func (s *server) inviteMember(w http.ResponseWriter, r *http.Request) {
 	if !memberRoles[req.Role] {
 		writeError(w, http.StatusBadRequest, "role must be owner|admin|staff|viewer")
 		return
+	}
+	if req.Role == "owner" {
+		// Owner-role invites require an owner caller (Permify relation check;
+		// the organization schema has no owner-only permission, and the
+		// embedded schema copy must stay identical to infra/permify).
+		owner, err := s.d.Permify.Check(r.Context(), t.ID.String(),
+			"user:"+c.Subject, "owner", "organization:"+t.ID.String())
+		if err != nil {
+			s.d.Logger.Error("permify owner check failed", zap.Error(err))
+			writeError(w, http.StatusBadGateway, "authorization service error")
+			return
+		}
+		if !owner {
+			writeError(w, http.StatusForbidden, "only an owner can invite another owner")
+			return
+		}
 	}
 
 	userID, err := s.d.Keycloak.CreateUser(r.Context(), t.Slug, keycloak.CreateUserInput{
