@@ -33,9 +33,9 @@ use std::collections::HashMap;
 
 use ledger::sim::SimLedgerClient;
 use ledger::{
-    deposits_account, no_overdraft, revenue_account, transfer_id_from_key, LedgerClient,
-    TenantBalance, Transfer, CODE_CAPTURE, CODE_DEPOSIT_HOLD, CODE_NO_SHOW_FEE, CODE_REFUND,
-    PLATFORM_CLEARING_ACCOUNT, PLATFORM_FEES_ACCOUNT,
+    deposits_account, fee_split, no_overdraft, revenue_account, transfer_id_from_key,
+    LedgerClient, TenantBalance, Transfer, CODE_CAPTURE, CODE_DEPOSIT_HOLD, CODE_NO_SHOW_FEE,
+    CODE_REFUND, PLATFORM_CLEARING_ACCOUNT, PLATFORM_FEES_ACCOUNT,
 };
 use proptest::prelude::*;
 use uuid::Uuid;
@@ -213,7 +213,9 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 }
 
 fn seq_strategy() -> impl Strategy<Value = (u64, Vec<Op>)> {
-    (0u64..=2_000u64, prop::collection::vec(op_strategy(), 1..40))
+    // P-05: exercise the full boot-validated fee range 0..=10_000 (0%..=100%)
+    // so fee-bound violations (fee > post) would surface here.
+    (0u64..=10_000u64, prop::collection::vec(op_strategy(), 1..40))
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +341,10 @@ async fn run_op(
                                 assert_eq!(res.post.amount, res.revenue.amount, "{}", ctx());
                             }
                             let post = amount.unwrap_or(h.amount);
-                            let fee = post * fee_bps / 10_000;
+                            // P-05: checked fee math; the fee may never
+                            // exceed the posted amount.
+                            let (_, fee) = fee_split(post, fee_bps).expect("fee split");
+                            assert!(fee <= post, "{}: fee {fee} > post {post}", ctx());
                             assert_eq!(res.post.code, CODE_CAPTURE, "{}", ctx());
                             assert_eq!(res.post.id, tid.as_u128(), "{}", ctx());
                             assert_eq!(res.post.amount, post, "{}", ctx());
@@ -379,11 +384,17 @@ async fn run_op(
                 }
                 Err(e) => {
                     // Legal failures: zero/over-hold amount on a pending hold,
-                    // already-voided hold, or a code mismatch when replaying a
-                    // hold resolved by a different code.
+                    // a 100% fee split (fee == post) that would leave a
+                    // zero-amount revenue leg, an already-voided hold, or a
+                    // code mismatch when replaying a hold resolved by a
+                    // different code.
                     let post = amount.unwrap_or(h.amount);
                     let legal = match h.state {
-                        HoldState::Pending => post == 0 || post > h.amount,
+                        HoldState::Pending => {
+                            post == 0
+                                || post > h.amount
+                                || fee_split(post, fee_bps).expect("fee split").0 == 0
+                        }
                         HoldState::Voided => true,
                         HoldState::Posted(code) => code != CODE_CAPTURE,
                     };
@@ -404,8 +415,14 @@ async fn run_op(
                     assert_eq!(t.code, CODE_REFUND, "{}", ctx());
                     match h.as_ref().map(|(_, x)| x.state) {
                         Some(HoldState::Pending) => {
-                            // Void of a pending hold; `amount` ignored.
+                            // Void of a pending hold (P-11: only amount 0 or
+                            // exactly the hold amount may void).
                             let (idx, hh) = h.clone().expect("pending hold is Some");
+                            assert!(
+                                amount == 0 || amount == hh.amount,
+                                "{}: void accepted with partial amount {amount}",
+                                ctx()
+                            );
                             assert_eq!(t.amount, hh.amount, "{}", ctx());
                             apply_void_model(model, tname, hh.amount);
                             model.holds.get_mut(&tenant).unwrap()[idx].state = HoldState::Voided;
@@ -427,6 +444,13 @@ async fn run_op(
                     // path, or refund exceeding earned revenue (no overdraft).
                     let legal = match h.as_ref().map(|(_, x)| x.state) {
                         Some(HoldState::Voided) => true,
+                        Some(HoldState::Pending) => {
+                            // P-11: refund(amount != 0 && amount != hold)
+                            // against a pending hold is rejected (400), not a
+                            // silent full void.
+                            let (_, hh) = h.clone().expect("pending hold is Some");
+                            amount != 0 && amount != hh.amount
+                        }
                         _ => {
                             amount == 0 || {
                                 let rev = model.get(&revenue_account(tname));
@@ -447,7 +471,8 @@ async fn run_op(
                     assert_transfer_shape(&res.post);
                     match h.state {
                         HoldState::Pending => {
-                            let fee = amount * fee_bps / 10_000;
+                            let (_, fee) = fee_split(amount, fee_bps).expect("fee split");
+                            assert!(fee <= amount, "{}: fee {fee} > amount {amount}", ctx());
                             assert_eq!(res.post.code, CODE_NO_SHOW_FEE, "{}", ctx());
                             assert_eq!(res.post.id, tid.as_u128(), "{}", ctx());
                             assert_eq!(res.post.amount, amount, "{}", ctx());
@@ -468,8 +493,15 @@ async fn run_op(
                     Some(OpRecord { primary_id: res.post.id, hold_id: Some(h.id) })
                 }
                 Err(e) => {
+                    // Legal failures mirror capture: zero/over-hold amount,
+                    // a 100% fee split leaving a zero-amount revenue leg,
+                    // voided hold, or a replay code mismatch.
                     let legal = match h.state {
-                        HoldState::Pending => amount == 0 || amount > h.amount,
+                        HoldState::Pending => {
+                            amount == 0
+                                || amount > h.amount
+                                || fee_split(amount, fee_bps).expect("fee split").0 == 0
+                        }
                         HoldState::Voided => true,
                         HoldState::Posted(code) => code != CODE_NO_SHOW_FEE,
                     };
@@ -666,5 +698,41 @@ proptest! {
         prop_assert_ne!(a, b);
         prop_assert_eq!(a.get_version(), Some(uuid::Version::Random));
         prop_assert_eq!(b.get_version(), Some(uuid::Version::Random));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P-05: fee_split property tests — checked arithmetic over the full input
+// space (any amount, full boot-validated bps range, out-of-range rejection).
+// ---------------------------------------------------------------------------
+proptest! {
+    #[test]
+    fn fee_split_never_overflows_and_bounds_fee(amount in any::<u64>(), bps in 0u64..=10_000u64) {
+        // Overflow-free inputs MUST succeed; overflowing products must be a
+        // clean InvalidAmount, never a wrap/panic.
+        let product_fits = (amount as u128) * (bps as u128) <= u64::MAX as u128;
+        match fee_split(amount, bps) {
+            Ok((net, fee)) => {
+                prop_assert!(fee <= amount, "fee {fee} exceeds amount {amount}");
+                prop_assert_eq!(net + fee, amount, "net + fee must equal amount");
+                // Integer-division floor: fee <= amount * bps / 10_000 (u128 check).
+                prop_assert!((fee as u128) <= (amount as u128) * (bps as u128) / 10_000u128);
+            }
+            Err(e) => prop_assert!(!product_fits, "overflow-free input must succeed: {e}"),
+        }
+    }
+
+    #[test]
+    fn fee_split_rejects_out_of_range_bps(bps in 10_001u64..=u64::MAX) {
+        prop_assert!(fee_split(1_000, bps).is_err());
+    }
+
+    #[test]
+    fn fee_split_huge_amounts_do_not_panic(amount in any::<u64>(), bps in any::<u64>()) {
+        // Must never panic/wrap: either Ok with bounds or InvalidAmount.
+        if let Ok((net, fee)) = fee_split(amount, bps) {
+            prop_assert!(fee <= amount);
+            prop_assert_eq!(net + fee, amount);
+        }
     }
 }
