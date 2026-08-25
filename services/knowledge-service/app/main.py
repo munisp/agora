@@ -18,13 +18,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from . import analytics
 from .chunking import chunk_text
 from .config import settings
 from .dapr_client import DaprClient
-from .db import Database, resolve_tenant_id
+from .db import Database, bind_tenant_value, parse_tenant_slugs, resolve_tenant_id
 from .embeddings import Embedder
 from .logging import configure_logging, get_logger
 from .rrf import reciprocal_rank_fusion
@@ -50,6 +52,24 @@ class AppState:
 
 def get_state(request: Request) -> AppState:
     return request.app.state.deps
+
+
+async def _bound_tenant_id(request: Request, explicit: str, deps: AppState) -> str:
+    """SPEC-W43 C1: bind the caller's tenant selector (query param or body
+    field) to the gateway-injected X-Tenant-Slugs header (exact match, else
+    403; no header + no dev escape -> 401), THEN resolve slug -> UUID via
+    identity-service as before."""
+    value = bind_tenant_value(
+        parse_tenant_slugs(request.headers.get("x-tenant-slugs")),
+        explicit,
+        trust_direct=settings.trust_direct_tenant,
+    )
+    try:
+        return await resolve_tenant_id(
+            deps.dapr, settings.identity_app_id, value, settings.identity_internal_token
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @asynccontextmanager
@@ -98,6 +118,15 @@ async def healthz(deps: AppState = Depends(get_state)):
 
     return JSONResponse(
         {"status": status, "postgres": db_ok, "opensearch": os_ok}, status_code=code
+    )
+
+
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """W44: Prometheus scrape endpoint (default registry: process + platform
+    collectors) on the existing app port — closes the F15-02 scrape gap."""
+    return PlainTextResponse(
+        generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST
     )
 
 
@@ -154,24 +183,21 @@ async def _ingest_document(
 
 
 @app.post("/v1/documents", status_code=201)
-async def ingest_document(req: IngestRequest, deps: AppState = Depends(get_state)):
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, req.tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+async def ingest_document(
+    req: IngestRequest, request: Request, deps: AppState = Depends(get_state)
+):
+    tenant_id = await _bound_tenant_id(request, req.tenant, deps)
     return await _ingest_document(deps, tenant_id, req.title, req.body, req.source_url)
 
 
 @app.delete("/v1/documents/{document_id}", status_code=204)
 async def delete_document(
     document_id: str,
+    request: Request,
     tenant: str = Query(..., description="tenant slug or UUID"),
     deps: AppState = Depends(get_state),
 ):
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
     try:
         doc_uuid = uuid.UUID(document_id)
     except ValueError:
@@ -204,12 +230,10 @@ async def search(
     q: str = Query(..., min_length=1),
     tenant: str = Query(..., description="tenant slug or UUID"),
     k: int = Query(settings.default_k, ge=1, le=settings.max_k),
+    request: Request = None,
     deps: AppState = Depends(get_state),
 ):
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
     hits = await _hybrid(deps, tenant_id, q, k)
 
     # Self-improving KB (SPEC-W3 §4, innovation 4): weak answer to a
@@ -248,13 +272,11 @@ async def context(
     q: str = Query(..., min_length=1),
     tenant: str = Query(..., description="tenant slug or UUID"),
     k: int = Query(settings.default_k, ge=1, le=20),
+    request: Request = None,
     deps: AppState = Depends(get_state),
 ):
     """Top snippets formatted for injection into an agent system prompt."""
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
     hits = await _hybrid(deps, tenant_id, q, k)
     snippets = [h["_source"]["content"] for h in hits]
     prompt_block = "\n".join(f"- {s}" for s in snippets)
@@ -276,14 +298,12 @@ class ApproveRequest(BaseModel):
 
 @app.get("/v1/suggestions")
 async def list_kb_suggestions(
+    request: Request,
     tenant: str = Query(..., description="tenant slug or UUID"),
     status: str | None = Query(default=None, description="pending|approved|rejected"),
     deps: AppState = Depends(get_state),
 ):
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
     if status is not None and status not in ("pending", "approved", "rejected"):
         raise HTTPException(status_code=400, detail="invalid status filter")
     async with deps.db.tenant_conn(tenant_id) as conn:
@@ -302,14 +322,12 @@ async def list_kb_suggestions(
 async def approve_kb_suggestion(
     suggestion_id: str,
     req: ApproveRequest,
+    request: Request,
     tenant: str = Query(..., description="tenant slug or UUID"),
     deps: AppState = Depends(get_state),
 ):
     """Approve: ingest the answer as a real document, then mark approved."""
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
     try:
         sid = uuid.UUID(suggestion_id)
     except ValueError:
@@ -341,14 +359,12 @@ async def approve_kb_suggestion(
 @app.delete("/v1/suggestions/{suggestion_id}")
 async def reject_kb_suggestion(
     suggestion_id: str,
+    request: Request,
     tenant: str = Query(..., description="tenant slug or UUID"),
     deps: AppState = Depends(get_state),
 ):
     """Reject: mark the suggestion rejected (kept for audit)."""
-    try:
-        tenant_id = await resolve_tenant_id(deps.dapr, settings.identity_app_id, tenant)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
     try:
         sid = uuid.UUID(suggestion_id)
     except ValueError:

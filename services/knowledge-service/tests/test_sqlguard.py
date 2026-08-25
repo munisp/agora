@@ -96,14 +96,47 @@ def test_keywords_inside_strings_are_allowed():
     assert "'US;D -- drop'" in out
 
 
-def test_subquery_where_does_not_confuse_injection():
+def test_subquery_without_tenant_predicate_rejected():
+    """SPEC-W43 Y-02: the platform predicate is injected at the TOP level
+    only, so a subselect lacking its own tenant_id predicate would read
+    across tenants — rejected outright."""
     sql = (
         "SELECT day FROM gold.daily_bookings_per_tenant "
         "WHERE bookings_created > (SELECT avg(bookings_created) FROM gold.daily_bookings_per_tenant)"
     )
+    with pytest.raises(SqlGuardError, match="subquery must filter tenant_id"):
+        validate_and_bind(sql, TENANT)
+
+
+def test_subquery_with_tenant_predicate_allowed():
+    sql = (
+        "SELECT day FROM gold.daily_bookings_per_tenant "
+        f"WHERE bookings_created > (SELECT avg(bookings_created) FROM gold.daily_bookings_per_tenant WHERE tenant_id = '{TENANT}')"
+    )
     out = validate_and_bind(sql, TENANT)
-    # tenant predicate goes into the TOP-LEVEL where, not the subquery's
+    # top-level injection still happens (into the OUTER where)
     assert f"WHERE tenant_id = '{TENANT}' AND bookings_created > (SELECT" in out
+    # and the subselect kept its own predicate
+    assert out.count(f"tenant_id = '{TENANT}'") == 2
+
+
+def test_set_operations_rejected():
+    """SPEC-W43 Y-02: UNION/INTERSECT/EXCEPT branches would bypass the
+    single injected top-level tenant predicate."""
+    for op in ("UNION", "UNION ALL", "INTERSECT", "EXCEPT"):
+        bad = (
+            "SELECT day FROM gold.revenue_daily "
+            f"{op} SELECT day FROM gold.no_show_rate"
+        )
+        with pytest.raises(SqlGuardError, match="forbidden keyword"):
+            validate_and_bind(bad, TENANT)
+    # ...even lowercase and even when the second branch also names an
+    # allowlisted table (allowlist alone is not tenant isolation).
+    with pytest.raises(SqlGuardError, match="forbidden keyword"):
+        validate_and_bind(
+            "SELECT day FROM gold.revenue_daily union select day from gold.revenue_daily",
+            TENANT,
+        )
 
 
 def test_tenant_id_is_escaped():

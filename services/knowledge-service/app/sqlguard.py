@@ -6,6 +6,12 @@ AST-lite SQL hardening without a parser dependency:
 * rejects ``;`` (statement chaining) and ``--``/``/*`` comments OUTSIDE
   string literals (string contents are masked before scanning);
 * rejects DDL/DML keywords outside strings (drop/insert/update/delete/...);
+* rejects set operations outright — UNION/INTERSECT/EXCEPT would let a
+  second, non-tenant-scoped SELECT branch smuggle cross-tenant rows past
+  the single injected top-level predicate (SPEC-W43 Y-02);
+* rejects subselects that lack their own ``tenant_id =`` predicate — the
+  platform predicate is injected at the TOP level only, so every
+  parenthesized SELECT must filter the tenant itself (SPEC-W43 Y-02);
 * table allowlist — only the four gold analytics tables may be referenced
   (bare, ``gold.``- or ``iceberg.gold.``-qualified);
 * injects the tenant predicate ``tenant_id = '<tenant>'`` (WHERE ... or AND)
@@ -62,6 +68,11 @@ _FORBIDDEN_KEYWORDS = frozenset(
         "rollback",
         "start",
         "with",
+        # SPEC-W43 Y-02: set operations are rejected outright — a UNION
+        # branch would bypass the single top-level tenant predicate.
+        "union",
+        "intersect",
+        "except",
     }
 )
 
@@ -140,6 +151,37 @@ def _top_level_clause_positions(masked: str) -> list[tuple[int, str]]:
     return hits
 
 
+_SUBSELECT_TENANT_RE = re.compile(r"\btenant_id\b\s*=", re.IGNORECASE)
+
+
+def _check_subselect_tenant_predicate(masked: str, sql: str) -> None:
+    """Every parenthesized SELECT (subselect) must carry its own
+    ``tenant_id =`` predicate (SPEC-W43 Y-02): the platform-injected
+    predicate only guards the top-level query, and an unfiltered subselect
+    over a gold table would read across tenants."""
+    depth = 0
+    stack: list[int] = []
+    groups: list[str] = []
+    for i, ch in enumerate(masked):
+        if ch == "(":
+            stack.append(i)
+            depth += 1
+        elif ch == ")":
+            if stack:
+                start = stack.pop()
+                groups.append(masked[start + 1:i])
+            depth = max(0, depth - 1)
+    for group in groups:
+        if re.search(r"\bselect\b", group, re.IGNORECASE) and (
+            not _SUBSELECT_TENANT_RE.search(group)
+        ):
+            raise SqlGuardError(
+                "subquery must filter tenant_id itself: subselect without a "
+                "tenant_id = predicate is not allowed",
+                sql,
+            )
+
+
 def _escape_literal(value: str) -> str:
     return value.replace("'", "''")
 
@@ -178,6 +220,9 @@ def validate_and_bind(sql: str, tenant_id: str) -> str:
         basename = ref.split(".")[-1].lower()
         if basename not in ALLOWED_TABLES:
             raise SqlGuardError(f"table not in gold allowlist: {ref!r}", sql)
+
+    # SPEC-W43 Y-02: subselects must carry their own tenant predicate.
+    _check_subselect_tenant_predicate(masked, sql)
 
     # --- inject the tenant predicate at the top level -------------------
     predicate = f"tenant_id = '{_escape_literal(tenant_id)}'"
