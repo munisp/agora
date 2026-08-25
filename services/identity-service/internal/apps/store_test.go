@@ -84,7 +84,7 @@ func newTestStore(t *testing.T) (*Store, uuid.UUID, uuid.UUID) {
 		}
 		return id
 	}
-	return st, mkTenant("t-a-"+uuid.NewString()[:8]), mkTenant("t-b-"+uuid.NewString()[:8])
+	return st, mkTenant("t-a-" + uuid.NewString()[:8]), mkTenant("t-b-" + uuid.NewString()[:8])
 }
 
 func TestStoreEnsureCatalogIdempotent(t *testing.T) {

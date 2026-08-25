@@ -46,7 +46,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.New(ctx, cfg.DatabaseURL)
+	// SPEC-W43 I-03: INTERNAL_DATABASE_URL (app_identity_internal member) is
+	// the RLS-escape pool for tenants-table access; aliases DATABASE_URL when
+	// unset (dev superuser bypasses RLS).
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.InternalDatabaseURL)
 	if err != nil {
 		return err
 	}
@@ -65,18 +68,35 @@ func run() error {
 
 	// SPEC-W12 §4: NDPA consent registry (own store/pool with RLS-enforced
 	// consents table; routes registered additively by httpapi).
-	consentStore, err := consent.New(ctx, cfg.DatabaseURL)
+	consentStore, err := consent.New(ctx, cfg.DatabaseURL, cfg.InternalDatabaseURL)
 	if err != nil {
 		return err
 	}
 	defer consentStore.Close()
+	// SPEC-W43 I-04 / SPEC-W44 K4: durable erasure outbox relay — publishes
+	// ErasureRequested (consent topic) + PrivacyEraseRequested
+	// (opendesk.privacy.events) until acknowledged.
+	consentRelay := &consent.Relay{
+		Repo:         consentStore,
+		Events:       daprClient,
+		PubSub:       cfg.PubSubName,
+		ConsentTopic: cfg.ConsentErasureTopic,
+		PrivacyTopic: cfg.PrivacyEventsTopic,
+		Logger:       logger,
+	}
+	go consentRelay.Run(ctx, cfg.ConsentRelayInterval)
 	consents := &consent.Handler{
 		Repo:         consentStore,
 		Tenants:      st,
+		Relay:        consentRelay,
 		Events:       daprClient,
 		PubSub:       cfg.PubSubName,
 		ErasureTopic: cfg.ConsentErasureTopic,
-		Logger:       logger,
+		// SPEC-W44 F4 / V2-D3: erasure + consent-record read are gated —
+		// K2 service token or K1 tenant-bound subject (dev escape logged).
+		InternalToken:      cfg.InternalToken,
+		TrustDirectTenancy: cfg.TrustDirectTenancy,
+		Logger:             logger,
 	}
 
 	// SPEC-W18 §1/§3: app platform registry. The embedded catalog.yaml is
@@ -121,6 +141,8 @@ func run() error {
 		Logger:            logger,
 		Consents:          consents,
 		Apps:              appsHandler,
+		InternalToken:     cfg.InternalToken,
+		PlatformAdmins:    cfg.PlatformAdmins,
 	}
 
 	srv := &http.Server{
