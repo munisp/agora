@@ -41,9 +41,13 @@ type ctxKey string
 
 const ctxTenant ctxKey = "tenant"
 
-// tenantMiddleware resolves X-Tenant-Slug via the configured resolver and
-// scopes the request context. Missing/unknown tenants are rejected before
-// any handler runs.
+// tenantMiddleware resolves the requested tenant (X-Tenant-Slug header or
+// ?tenant= query — both caller-supplied) BOUND to the gateway-injected
+// X-Tenant-Slugs membership list (C1/K1 extended binding, N-02): the slug
+// is honored only when the verified JWT's tenant_slugs claim contains it
+// (403 otherwise). The OPENDESK_TRUST_DIRECT_TENANT=1 dev escape is the
+// only gateway-less path (logged). The bound slug is then resolved to a
+// tenant id via the configured resolver.
 func (s *Server) tenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.Webhooks == nil || s.ResolveTenant == nil {
@@ -52,7 +56,15 @@ func (s *Server) tenantMiddleware(next http.Handler) http.Handler {
 		}
 		slug := strings.TrimSpace(r.Header.Get("X-Tenant-Slug"))
 		if slug == "" {
-			http.Error(w, `{"error":"X-Tenant-Slug header is required"}`, http.StatusBadRequest)
+			slug = strings.TrimSpace(r.URL.Query().Get("tenant"))
+		}
+		if slug == "" {
+			http.Error(w, `{"error":"tenant slug is required (X-Tenant-Slug header or tenant query)"}`, http.StatusBadRequest)
+			return
+		}
+		if !s.bindTenantSlug(r, slug) {
+			s.Log.Warn("webhook tenant binding rejected", zap.String("slug", slug))
+			http.Error(w, `{"error":"tenant is not bound to the caller"}`, http.StatusForbidden)
 			return
 		}
 		ref, err := s.ResolveTenant(r.Context(), slug)
@@ -89,6 +101,16 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 	req.URL = strings.TrimSpace(req.URL)
 	if req.URL == "" || !(strings.HasPrefix(req.URL, "https://") || strings.HasPrefix(req.URL, "http://")) {
 		http.Error(w, `{"error":"url must be an http(s) URL"}`, http.StatusBadRequest)
+		return
+	}
+	// S1-F6-03/N-02 SSRF guard: https-only outside dev, no userinfo, DNS
+	// fail-closed, private/loopback/link-local/multicast CIDRs blocked.
+	validator := s.WebhookURLValidator
+	if validator == nil {
+		validator = NewURLValidator(false)
+	}
+	if err := validator.ValidateWebhookURL(r.Context(), req.URL); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url rejected: " + err.Error()})
 		return
 	}
 	if len(req.Events) == 0 {

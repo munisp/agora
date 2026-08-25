@@ -53,22 +53,17 @@ CREATE INDEX IF NOT EXISTS idx_civic_notifications_ref
     ON civic_notifications (tenant_slug, ref, created_at DESC);
 ALTER TABLE civic_notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE civic_notifications FORCE ROW LEVEL SECURITY;
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_policies
-                   WHERE schemaname = current_schema()
-                     AND tablename = 'civic_notifications'
-                     AND policyname = 'tenant_isolation') THEN
-        -- tenant_id is TEXT here (civic refs are not UUID-keyed), so the
-        -- policy compares the GUC without the ::uuid cast.
-        CREATE POLICY tenant_isolation ON civic_notifications
-            USING (CASE
-                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
-                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
-            END);
-    END IF;
-END
-$$;`
+-- Fail-closed (N-08): tenant_id is TEXT here (civic refs are not UUID-keyed),
+-- so the NULLIF qual compares without the ::uuid cast; unset/empty GUC
+-- denies. Role-gated internal escape mirrors the webhook tables.
+DROP POLICY IF EXISTS tenant_isolation ON civic_notifications;
+CREATE POLICY tenant_isolation ON civic_notifications
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')))
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')));`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure civic_notifications table: %w", err)
 	}

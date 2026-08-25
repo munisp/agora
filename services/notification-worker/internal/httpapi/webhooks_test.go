@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"net"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -81,6 +82,11 @@ func newWebhookTestServer(t *testing.T, signingRequired bool) (http.Handler, *fa
 	srv := &Server{
 		Log:      zap.NewNop(),
 		Webhooks: st,
+		// SSRF guard with a stubbed resolver (all hosts → public IP); the
+		// DNS/parse paths are covered by urlcheck_test.go.
+		WebhookURLValidator: &URLValidator{LookupIP: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}},
 		ResolveTenant: func(_ context.Context, slug string) (TenantRef, error) {
 			if slug != "acme" {
 				return TenantRef{}, errors.New("unknown tenant")
@@ -103,6 +109,9 @@ func doReq(t *testing.T, h http.Handler, method, path, tenant string, body any) 
 	req := httptest.NewRequest(method, path, &buf)
 	if tenant != "" {
 		req.Header.Set("X-Tenant-Slug", tenant)
+		// K1: the gateway injects the verified tenant_slugs claim; the
+		// requested slug must be a member (C1 binding).
+		req.Header.Set("X-Tenant-Slugs", "acme,globex,"+tenant)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -201,10 +210,35 @@ func TestWebhookTenantScoping(t *testing.T) {
 	if code != http.StatusNotFound {
 		t.Fatalf("unknown tenant = %d, want 404", code)
 	}
+	// K1 binding: a slug outside the verified X-Tenant-Slugs claim → 403.
+	code, _ = doReq(t, h, "GET", "/v1/webhooks", "acme", nil)
+	if code != http.StatusOK {
+		t.Fatalf("bound tenant = %d, want 200", code)
+	}
 	// Another tenant's subscription id is invisible.
 	code, _ = doReq(t, h, "GET", "/v1/webhooks/"+id+"/deliveries", "globex", nil)
 	if code != http.StatusNotFound {
 		t.Fatalf("cross-tenant deliveries = %d, want 404", code)
+	}
+}
+
+func TestWebhookTenantBindingForbidden(t *testing.T) {
+	h, _, _ := newWebhookTestServer(t, false)
+	req := httptest.NewRequest("GET", "/v1/webhooks", nil)
+	req.Header.Set("X-Tenant-Slug", "acme")
+	req.Header.Set("X-Tenant-Slugs", "other-tenant") // acme NOT in the claim
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unbound tenant = %d, want 403", rec.Code)
+	}
+	// No X-Tenant-Slugs at all (no gateway claim) fails closed.
+	req = httptest.NewRequest("GET", "/v1/webhooks", nil)
+	req.Header.Set("X-Tenant-Slug", "acme")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("missing tenant claim = %d, want 403 (fail-closed)", rec.Code)
 	}
 }
 

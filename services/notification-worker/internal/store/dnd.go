@@ -8,11 +8,14 @@ package store
 // The dnd_numbers table lives in the `notifications` database alongside the
 // webhook tables and is bootstrapped idempotently like them. Tenant
 // isolation is application-level (every tenant-scoped query filters
-// tenant_id/tenant_slug) PLUS defense-in-depth RLS (SQL-003): the
-// tenant_isolation policy keeps the global NCC 2442 rows (tenant_id NULL)
-// visible to every tenant context while scoping per-tenant opt-out rows to
-// the session's app.tenant_id (unset GUC = legacy application-level
-// posture, see the package header).
+// tenant_id/tenant_slug) PLUS defense-in-depth RLS (N-08, fail-closed
+// billing-0002 idiom): the tenant_isolation policy keeps the global NCC 2442
+// rows (tenant_id NULL) visible to any SET tenant context while scoping
+// per-tenant opt-out rows to the session's app.tenant_id; an unset/empty GUC
+// denies per-tenant rows (NULL → deny), and the role-gated
+// app_notifications_internal escape authorizes the cross-tenant paths (the
+// global-list import/lookup, the slug-keyed suppression check) which run on
+// the internal pool.
 
 import (
 	"context"
@@ -67,20 +70,18 @@ CREATE INDEX IF NOT EXISTS idx_dnd_tenant_slug_phone
     ON dnd_numbers (tenant_slug, phone_e164) WHERE tenant_id IS NOT NULL;
 ALTER TABLE dnd_numbers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dnd_numbers FORCE ROW LEVEL SECURITY;
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_policies
-                   WHERE schemaname = current_schema()
-                     AND tablename = 'dnd_numbers'
-                     AND policyname = 'tenant_isolation') THEN
-        CREATE POLICY tenant_isolation ON dnd_numbers
-            USING (tenant_id IS NULL OR CASE
-                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
-                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
-            END);
-    END IF;
-END
-$$;`
+DROP POLICY IF EXISTS tenant_isolation ON dnd_numbers;
+-- Fail-closed (N-08): per-tenant rows require the matching GUC; global
+-- (tenant_id NULL) rows additionally require SOME tenant context; the
+-- role-gated internal escape authorizes the cross-tenant paths.
+CREATE POLICY tenant_isolation ON dnd_numbers
+    USING ((tenant_id IS NULL AND NULLIF(current_setting('app.tenant_id', true), '') IS NOT NULL)
+           OR tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')))
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')));`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure dnd_numbers table: %w", err)
 	}
@@ -114,7 +115,9 @@ func NormalizePhone(phone string) string {
 // ImportGlobalDND bulk-loads numbers into the GLOBAL NCC 2442 list
 // (tenant_id NULL). Idempotent: existing numbers are skipped
 // (ON CONFLICT DO NOTHING), so re-importing an updated registry snapshot is
-// safe. source defaults to ncc2442. Returns the number of NEW rows.
+// safe. source defaults to ncc2442. Returns the number of NEW rows. Runs on
+// the internal pool (N-08): writing global rows is a cross-tenant
+// operation authorized by the role-gated RLS escape.
 func (s *Store) ImportGlobalDND(ctx context.Context, phones []string, source string) (int, error) {
 	if source == "" {
 		source = DNDSourceNCC2442
@@ -125,7 +128,7 @@ func (s *Store) ImportGlobalDND(ctx context.Context, phones []string, source str
 		if p == "" {
 			continue
 		}
-		tag, err := s.pool.Exec(ctx,
+		tag, err := s.internal().Exec(ctx,
 			`INSERT INTO dnd_numbers (tenant_id, tenant_slug, phone_e164, source)
 			 VALUES (NULL, '', $1, $2) ON CONFLICT DO NOTHING`, p, source)
 		if err != nil {
@@ -160,7 +163,8 @@ func (s *Store) AddTenantOptOut(ctx context.Context, tenantID uuid.UUID, tenantS
 // IsSuppressed checks the DND registry for phone in the required order
 // (SPEC-W12): per-tenant opt-out first (when tenantSlug is known), then the
 // global NCC 2442 list. The returned reason is DNDReasonTenantOptOut or
-// DNDReasonGlobalDND.
+// DNDReasonGlobalDND. Slug-keyed + global lookups are cross-tenant reads,
+// so they run on the internal pool (N-08 role-gated escape).
 func (s *Store) IsSuppressed(ctx context.Context, tenantSlug, phone string) (bool, string, error) {
 	phone = NormalizePhone(phone)
 	if phone == "" {
@@ -168,7 +172,7 @@ func (s *Store) IsSuppressed(ctx context.Context, tenantSlug, phone string) (boo
 	}
 	if tenantSlug != "" {
 		var id uuid.UUID
-		err := s.pool.QueryRow(ctx,
+		err := s.internal().QueryRow(ctx,
 			`SELECT id FROM dnd_numbers
 			 WHERE tenant_id IS NOT NULL AND tenant_slug = $1 AND phone_e164 = $2
 			 LIMIT 1`, tenantSlug, phone).Scan(&id)
@@ -180,7 +184,7 @@ func (s *Store) IsSuppressed(ctx context.Context, tenantSlug, phone string) (boo
 		}
 	}
 	var id uuid.UUID
-	err := s.pool.QueryRow(ctx,
+	err := s.internal().QueryRow(ctx,
 		`SELECT id FROM dnd_numbers WHERE tenant_id IS NULL AND phone_e164 = $1 LIMIT 1`, phone).Scan(&id)
 	if err == nil {
 		return true, DNDReasonGlobalDND, nil
@@ -192,26 +196,49 @@ func (s *Store) IsSuppressed(ctx context.Context, tenantSlug, phone string) (boo
 }
 
 // RemoveDND honors an opt-out removal: with tenantSlug empty it deletes the
-// phone from the global list AND every tenant list (a full re-consent);
-// with a tenantSlug it deletes only that tenant's opt-out row. Returns the
-// number of rows removed.
+// phone from the global list AND every tenant list (a full re-consent — the
+// HTTP layer admin-role-gates this variant); with a tenantSlug it deletes
+// only that tenant's opt-out row. The global variant runs on the internal
+// pool; the tenant variant resolves the tenant id (internal pool) and then
+// deletes inside withTenant so the fail-closed RLS policy re-checks the
+// tenant scope of the write (N-08 defense in depth). Returns the number of
+// rows removed.
 func (s *Store) RemoveDND(ctx context.Context, phone, tenantSlug string) (int64, error) {
 	phone = NormalizePhone(phone)
 	if phone == "" {
 		return 0, fmt.Errorf("remove dnd: phone is required")
 	}
 	if tenantSlug == "" {
-		tag, err := s.pool.Exec(ctx, `DELETE FROM dnd_numbers WHERE phone_e164 = $1`, phone)
+		tag, err := s.internal().Exec(ctx, `DELETE FROM dnd_numbers WHERE phone_e164 = $1`, phone)
 		if err != nil {
 			return 0, fmt.Errorf("remove dnd number: %w", err)
 		}
 		return tag.RowsAffected(), nil
 	}
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM dnd_numbers WHERE tenant_id IS NOT NULL AND tenant_slug = $1 AND phone_e164 = $2`,
-		tenantSlug, phone)
+	var tenantID uuid.UUID
+	err := s.internal().QueryRow(ctx,
+		`SELECT tenant_id FROM dnd_numbers
+		 WHERE tenant_id IS NOT NULL AND tenant_slug = $1 AND phone_e164 = $2 LIMIT 1`,
+		tenantSlug, phone).Scan(&tenantID)
+	if isNoRows(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("resolve dnd tenant: %w", err)
+	}
+	var removed int64
+	err = s.withTenant(ctx, tenantID.String(), func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM dnd_numbers WHERE tenant_id IS NOT NULL AND tenant_slug = $1 AND phone_e164 = $2`,
+			tenantSlug, phone)
+		if err != nil {
+			return err
+		}
+		removed = tag.RowsAffected()
+		return nil
+	})
 	if err != nil {
 		return 0, fmt.Errorf("remove tenant opt-out: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	return removed, nil
 }
