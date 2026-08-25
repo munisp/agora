@@ -16,8 +16,12 @@ CREATE TABLE tenants (
     -- SPEC-CRM §C1: industry workflow pack id (salon|clinic|consultancy|support-desk).
     -- Existing installs get this column via the identity-service bootstrap ALTER.
     industry    TEXT NOT NULL DEFAULT 'salon',
+    -- 'twin' is the internal digital-twin plan (SPEC-W3 §3 innovation 12):
+    -- set ONLY by identity-service createTwin; it is NOT in the public
+    -- POST /v1/tenants plan set (httpapi validPlans). Existing installs get
+    -- the widened CHECK via the identity-service bootstrap constraint rewrite.
     plan        TEXT NOT NULL DEFAULT 'free'
-                CHECK (plan IN ('free','pro','enterprise')),
+                CHECK (plan IN ('free','pro','enterprise','twin')),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

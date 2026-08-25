@@ -12,8 +12,10 @@ global:
 
 # GF13 (SPEC-W34): alert rules live in rules.yml (mounted alongside this file;
 # see infra/docker-compose.observability.yml). There is NO Alertmanager by
-# design: the platform's alert transport is the Kafka topic `ops.alerts`
-# (services publish structured alerts there directly). These rules surface in
+# design: the platform's alert transport is the Kafka topic
+# `opendesk.ops.alerts` (K3/SPEC-W44; the legacy unprefixed `ops.alerts`
+# topic is retired — see infra/kafka/create-topics.sh). Services publish
+# structured alerts there directly. These rules surface in
 # Prometheus / Grafana's alert view as the signal layer.
 rule_files:
   - rules.yml
@@ -24,6 +26,14 @@ scrape_configs:
       - targets: ["localhost:9090"]
 
   # ---- Application services (all expose /metrics on their app port) ----
+  # SPEC-W44 F15-02 reconciliation (verified against the mirror at W44):
+  # identity/booking/notification/payments/conversation/knowledge did NOT yet
+  # serve /metrics at the W44 baseline — the jobs are RETAINED by contract
+  # (F15-02: do not remove): W44 service work orders (W-I/W-B/W-N/W-P/W-A)
+  # add /metrics on exactly these app ports, so the targets flip from DOWN to
+  # UP as those land. If a verifier confirms at gate time that a service
+  # still lacks /metrics, comment out that single job with a note — never
+  # delete the block.
   - job_name: identity
     static_configs:
       - targets: ["identity:7001"]
@@ -54,6 +64,15 @@ scrape_configs:
   - job_name: crm-sync
     static_configs:
       - targets: ["crm-sync:7010"]
+
+  # ---- voice-worker (SPEC-W44 F15-09) ----
+  # The LiveKit worker process serves /metrics (prometheus_client) on its OWN
+  # port (VOICE_WORKER_METRICS_PORT, default 9464 — set in the root compose
+  # voice-worker service; the server is added in W44 W-A). Profile-gated
+  # (`--profile voice`): target DOWN is expected in the base stack.
+  - job_name: voice-worker
+    static_configs:
+      - targets: ["voice-worker:9464"]
 
   # ---- model-registry (GF13/SPEC-W34) ----
   # Profile-gated compose service (`--profile model-registry`, port 7019,

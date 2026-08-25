@@ -1,12 +1,13 @@
 # GF13 (SPEC-W34): recording/alerting rules for the OpenDesk compose stack.
 #
 # ALERT TRANSPORT: there is deliberately NO Alertmanager in this stack. The
-# platform's alert transport is the Kafka topic `ops.alerts` — services
+# platform's alert transport is the Kafka topic `opendesk.ops.alerts` (K3,
+# SPEC-W44; the legacy unprefixed `ops.alerts` topic is retired) — services
 # (model-registry drift sweeps, payments DLQ, notification compensation
 # exhaustion, ...) publish structured alert events there directly. These
 # Prometheus rules are the complementary SIGNAL layer: they fire in the
 # Prometheus /alerts API and are scraped/displayed by Grafana's built-in
-# Prometheus alert view. Bridging them to `ops.alerts` (e.g. via a small
+# Prometheus alert view. Bridging them to `opendesk.ops.alerts` (e.g. via a small
 # webhook consumer) is intentionally out of scope for W34.
 groups:
   - name: opendesk-availability
@@ -57,7 +58,7 @@ groups:
         # opendesk_model_drift_psi{family,tenant} — emitted by
         # services/model-registry (model_registry/main.py); threshold mirrors
         # DRIFT_PSI_THRESHOLD (default 0.25) in the compose service env.
-        # The registry also publishes this alert to Kafka ops.alerts; this
+        # The registry also publishes this alert to Kafka opendesk.ops.alerts; this
         # rule is the Prometheus-side mirror for the Grafana alert view.
         # NOTE: the model-registry scrape job is profile-gated
         # (--profile model-registry); this rule simply never fires when the

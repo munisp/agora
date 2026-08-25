@@ -349,7 +349,8 @@ services:
       MODEL_REGISTRY_PG_DSN: postgresql://app_model_registry_login:app_model_registry_dev_password@postgres:5432/platform
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_ENABLED: ${MODEL_REGISTRY_KAFKA_ENABLED:-true}
-      ALERTS_TOPIC: ${ALERTS_TOPIC:-ops.alerts}
+      # SPEC-W44 K3: canonical ops-alert topic (was the retired `ops.alerts`).
+      ALERTS_TOPIC: ${ALERTS_TOPIC:-opendesk.ops.alerts}
       DRIFT_INTERVAL_MINUTES: ${DRIFT_INTERVAL_MINUTES:-15}
       DRIFT_PSI_THRESHOLD: ${DRIFT_PSI_THRESHOLD:-0.25}
       DRIFT_MANIFEST_DIR: /data/manifests

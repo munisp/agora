@@ -77,8 +77,10 @@ CREATE TABLE bookings (
 -- Bookings by tenant + starts_at (calendar/agenda queries).
 CREATE INDEX idx_bookings_tenant_starts_at ON bookings (tenant_id, starts_at);
 CREATE INDEX idx_bookings_tenant_status ON bookings (tenant_id, status);
--- Idempotency: one command result per key (null keys are not deduplicated).
-CREATE UNIQUE INDEX uq_bookings_idempotency_key ON bookings (idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- Idempotency: one command result per key PER TENANT (SPEC-W43 G-03 / C5:
+-- keys are only unique within a tenant; the store inserts with
+-- NULLIF($key,'') so empty strings land as NULL and are never deduplicated).
+CREATE UNIQUE INDEX uq_bookings_idempotency_key ON bookings (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- Transactional outbox (drained to Kafka opendesk.booking.events).
 CREATE TABLE outbox (
