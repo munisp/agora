@@ -7,7 +7,9 @@ package activities
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"text/template"
@@ -78,6 +80,19 @@ type Activities struct {
 	// exhaustion alerts); set by main after New. Zero value degrades to
 	// CRITICAL-log-only alerting.
 	Ops OpsAlertDeps
+	// Internal-call credentials (SPEC-W44 K2): the peer services gate their
+	// /internal/* and /activities/* surfaces on X-Internal-Token; these are
+	// forwarded on every Dapr invocation to that peer (header passthrough,
+	// verified against daprc.InvokeServiceMethod). Empty tokens degrade the
+	// peer call to 401/503 — logged loudly, never silently retried.
+	PaymentsInternalToken string // PAYMENTS_INTERNAL_TOKEN
+	BookingInternalToken  string // BOOKING_INTERNAL_TOKEN
+	IdentityInternalToken string // IDENTITY_INTERNAL_TOKEN
+	// PaymentsURL (PAYMENTS_URL) is the direct-HTTP fallback base for the
+	// payments /activities/* calls (no Dapr sidecar); empty → Dapr invoke
+	// with header passthrough (default, W44 decision: daprc forwards
+	// headers, verified).
+	PaymentsURL string
 	Log *zap.Logger
 
 	hc *http.Client
@@ -105,6 +120,34 @@ func New(d *daprc.Client, bookingAppID, paymentsAppID, identityAppID, smtpBindin
 // Booking saga activities (booking-svc / payments-svc via Dapr invocation)
 // ---------------------------------------------------------------------------
 
+// internalHeaders builds the K2 header set for a peer's token (empty token →
+// no header; the peer fails closed and the error surfaces).
+func internalHeaders(token string) map[string]string {
+	if token == "" {
+		return nil
+	}
+	return map[string]string{"X-Internal-Token": token}
+}
+
+// tenantSlug resolves the K5 tenant namespace value: the Keycloak slug,
+// NEVER the uuid; legacy inputs missing the slug fall back to tenant_id
+// with a WARN (payments binds by slug — a uuid tenant would mis-key the
+// ledger, so the fallback is loud).
+func (a *Activities) tenantSlug(in workflows.SagaInput) string {
+	return a.k5TenantSlug(in.BookingID, in.TenantID, in.TenantSlug)
+}
+
+// k5TenantSlug is the input-type-agnostic K5 resolver (slug preferred, uuid
+// fallback with WARN); shared by the saga and the industry-pack activities.
+func (a *Activities) k5TenantSlug(bookingID, tenantID, tenantSlug string) string {
+	if tenantSlug != "" {
+		return tenantSlug
+	}
+	a.Log.Warn("K5: input missing tenant_slug; falling back to tenant_id (ledger mis-key risk)",
+		zap.String("booking_id", bookingID), zap.String("tenant_id", tenantID))
+	return tenantID
+}
+
 type activityCallback struct {
 	BookingID  string `json:"booking_id"`
 	TenantID   string `json:"tenant_id"`
@@ -114,47 +157,107 @@ type activityCallback struct {
 
 // ReserveSlot asks booking-service to hold the pending booking's slot.
 func (a *Activities) ReserveSlot(ctx context.Context, in workflows.SagaInput) error {
-	return a.Dapr.InvokeService(ctx, a.BookingAppID, "activities/reserve-slot", activityCallback{
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "activities/reserve-slot", activityCallback{
 		BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug,
-	}, nil)
+	}, internalHeaders(a.BookingInternalToken), nil)
 }
 
 // ReleaseSlot is the compensation of ReserveSlot.
 func (a *Activities) ReleaseSlot(ctx context.Context, in workflows.SagaInput, reason string) error {
-	return a.Dapr.InvokeService(ctx, a.BookingAppID, "activities/release-slot", activityCallback{
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "activities/release-slot", activityCallback{
 		BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug, Reason: reason,
-	}, nil)
+	}, internalHeaders(a.BookingInternalToken), nil)
 }
 
 // ConfirmBooking marks the booking confirmed (emits BookingConfirmed).
 func (a *Activities) ConfirmBooking(ctx context.Context, in workflows.SagaInput) error {
-	return a.Dapr.InvokeService(ctx, a.BookingAppID, "activities/confirm-booking", activityCallback{
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "activities/confirm-booking", activityCallback{
 		BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug,
-	}, nil)
+	}, internalHeaders(a.BookingInternalToken), nil)
 }
 
-// HoldDeposit places a deposit hold in payments-service; returns the hold ID.
-// Calls the real payments-service activity route (Dapr app-id `payments`).
+// invokePayments posts one payments /activities/* call: direct HTTP against
+// PAYMENTS_URL when configured (no-sidecar fallback), else Dapr invocation
+// with header passthrough (W44 decision — daprc.InvokeServiceMethod sets
+// the X-Internal-Token header on the invoke request, which the Dapr sidecar
+// forwards to the target app; verified against the client API).
+func (a *Activities) invokePayments(ctx context.Context, method string, payload any, out any) error {
+	return a.invokePaymentsMethod(ctx, http.MethodPost, method, payload, out)
+}
+
+// invokePaymentsMethod is invokePayments with an explicit HTTP method (the
+// balance probe is a GET); a nil payload sends no request body. Both
+// transports carry X-Internal-Token = PAYMENTS_INTERNAL_TOKEN (K2).
+func (a *Activities) invokePaymentsMethod(ctx context.Context, httpMethod, method string, payload any, out any) error {
+	headers := internalHeaders(a.PaymentsInternalToken)
+	if a.PaymentsURL == "" {
+		return a.Dapr.InvokeServiceMethod(ctx, httpMethod, a.PaymentsAppID, method, payload, headers, out)
+	}
+	var bodyReader io.Reader
+	if payload != nil {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("marshal payments payload: %w", err)
+		}
+		bodyReader = bytes.NewReader(body)
+	}
+	url := strings.TrimRight(a.PaymentsURL, "/") + "/" + method
+	req, err := http.NewRequestWithContext(ctx, httpMethod, url, bodyReader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := a.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("payments %s: %w", method, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("payments %s: status %d: %s", method, resp.StatusCode, string(b))
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return fmt.Errorf("payments %s: decode response: %w", method, err)
+		}
+	}
+	return nil
+}
+
+// HoldDeposit places a deposit hold in payments-service; returns the
+// deposit ID. C2/N-04: the canonical Payments response field is deposit_id
+// (hold_id accepted as the legacy fallback). K5: the tenant namespace is
+// the Keycloak SLUG (tenant_slug), never the uuid. K2: the call carries
+// X-Internal-Token = PAYMENTS_INTERNAL_TOKEN.
 // The held amount is the pack deposit (ceil(price * depositPercent/100)) when
 // the tenant's bookingPolicy was resolved, otherwise the full price
 // (SPEC-CRM §C3).
 func (a *Activities) HoldDeposit(ctx context.Context, in workflows.SagaInput) (string, error) {
 	var out struct {
-		HoldID string `json:"hold_id"`
+		DepositID string `json:"deposit_id"` // canonical (C2)
+		HoldID    string `json:"hold_id"`    // legacy fallback
 	}
-	err := a.Dapr.InvokeService(ctx, a.PaymentsAppID, "activities/hold-deposit", map[string]any{
+	err := a.invokePayments(ctx, "activities/hold-deposit", map[string]any{
 		"booking_id":   in.BookingID,
-		"tenant_id":    in.TenantID,
+		"tenant_id":    a.tenantSlug(in),
+		"tenant_slug":  a.tenantSlug(in),
 		"amount_cents": depositAmountCents(in),
 		"currency":     in.Currency,
 	}, &out)
 	if err != nil {
 		return "", err
 	}
-	if out.HoldID == "" {
-		return "", fmt.Errorf("payments hold-deposit returned empty hold_id")
+	id := out.DepositID
+	if id == "" {
+		id = out.HoldID
 	}
-	return out.HoldID, nil
+	if id == "" {
+		return "", fmt.Errorf("payments hold-deposit returned empty deposit_id")
+	}
+	return id, nil
 }
 
 // depositAmountCents resolves the amount to hold: the pack deposit when the
@@ -166,12 +269,14 @@ func depositAmountCents(in workflows.SagaInput) int64 {
 	return in.PriceCents
 }
 
-// VoidHold is the compensation of HoldDeposit.
+// VoidHold is the compensation of HoldDeposit (K5 slug namespace; the
+// request keeps hold_id, deposit_id is accepted server-side — C2).
 func (a *Activities) VoidHold(ctx context.Context, in workflows.SagaInput, holdID string) error {
-	return a.Dapr.InvokeService(ctx, a.PaymentsAppID, "activities/void-hold", map[string]any{
-		"hold_id":    holdID,
-		"booking_id": in.BookingID,
-		"tenant_id":  in.TenantID,
+	return a.invokePayments(ctx, "activities/void-hold", map[string]any{
+		"hold_id":     holdID,
+		"booking_id":  in.BookingID,
+		"tenant_id":   a.tenantSlug(in),
+		"tenant_slug": a.tenantSlug(in),
 	}, nil)
 }
 
@@ -191,9 +296,9 @@ func (a *Activities) GetBookingStatus(ctx context.Context, bookingID, tenantSlug
 
 // MarkNoShow flips the booking to no_show via the booking activity endpoint.
 func (a *Activities) MarkNoShow(ctx context.Context, in workflows.NoShowInput) error {
-	return a.Dapr.InvokeService(ctx, a.BookingAppID, "activities/mark-no-show", activityCallback{
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "activities/mark-no-show", activityCallback{
 		BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug,
-	}, nil)
+	}, internalHeaders(a.BookingInternalToken), nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,25 +431,29 @@ func (a *Activities) sendSMS(ctx context.Context, provider, phone, text, sender 
 // ---------------------------------------------------------------------------
 
 // EnsureKeycloakGroup (idempotent) asks identity-service to ensure
-// /tenants/{slug} exists.
+// /tenants/{slug} exists (K2: identity /internal/* requires
+// X-Internal-Token = IDENTITY_INTERNAL_TOKEN).
 func (a *Activities) EnsureKeycloakGroup(ctx context.Context, in workflows.OnboardingInput) error {
-	return a.Dapr.InvokeService(ctx, a.IdentityAppID, "internal/tenants/"+in.Slug+"/ensure-group", map[string]any{}, nil)
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.IdentityAppID, "internal/tenants/"+in.Slug+"/ensure-group",
+		map[string]any{}, internalHeaders(a.IdentityInternalToken), nil)
 }
 
-// EnsurePermifyTenant (idempotent) ensures the Permify tenant exists.
+// EnsurePermifyTenant (idempotent) ensures the Permify tenant exists (K2
+// internal token as above).
 func (a *Activities) EnsurePermifyTenant(ctx context.Context, in workflows.OnboardingInput) error {
-	return a.Dapr.InvokeService(ctx, a.IdentityAppID, "internal/tenants/"+in.Slug+"/ensure-permify", map[string]any{}, nil)
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.IdentityAppID, "internal/tenants/"+in.Slug+"/ensure-permify",
+		map[string]any{}, internalHeaders(a.IdentityInternalToken), nil)
 }
 
 // SeedTenantData asks booking-service to seed the tenant's default public
 // site row (the /p/{slug} booking page).
 func (a *Activities) SeedTenantData(ctx context.Context, in workflows.OnboardingInput) error {
-	return a.Dapr.InvokeService(ctx, a.BookingAppID, "internal/sites", map[string]any{
+	return a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "internal/sites", map[string]any{
 		"tenant_id":    in.TenantID,
 		"tenant_slug":  in.Slug,
 		"slug":         in.Slug,
 		"display_name": in.Name,
-	}, nil)
+	}, internalHeaders(a.BookingInternalToken), nil)
 }
 
 // EnsureSearchAlias creates the per-tenant OpenSearch alias kb-{slug} over

@@ -24,6 +24,7 @@ import (
 	"github.com/opendesk/notification-worker/internal/daprc"
 	"github.com/opendesk/notification-worker/internal/httpapi"
 	"github.com/opendesk/notification-worker/internal/notifyoutbox"
+	"github.com/opendesk/notification-worker/internal/opsalerts"
 	"github.com/opendesk/notification-worker/internal/pacer"
 	"github.com/opendesk/notification-worker/internal/packs"
 	"github.com/opendesk/notification-worker/internal/provider"
@@ -203,18 +204,42 @@ func run() error {
 	w.RegisterActivityWithOptions(acts.SendProposalReminder, activity.RegisterOptions{Name: workflows.ActivitySendProposalReminder})
 	w.RegisterActivityWithOptions(acts.EscalateTicket, activity.RegisterOptions{Name: workflows.ActivityEscalateTicket})
 
+	// SPEC-W44 K2/K5: internal-call credentials forwarded to the peer
+	// services' internauth-gated surfaces.
+	acts.PaymentsInternalToken = cfg.PaymentsInternalToken
+	acts.BookingInternalToken = cfg.BookingInternalToken
+	acts.IdentityInternalToken = cfg.IdentityInternalToken
+	acts.PaymentsURL = cfg.PaymentsURL
+	if cfg.PaymentsInternalToken == "" {
+		logger.Warn("PAYMENTS_INTERNAL_TOKEN unset: payments /activities/* calls will fail closed (peer 503/401)")
+	}
+	if cfg.BookingInternalToken == "" {
+		logger.Warn("BOOKING_INTERNAL_TOKEN unset: booking /activities/* + civic sla-breach calls will fail closed (peer 503/401)")
+	}
+	if cfg.IdentityInternalToken == "" {
+		logger.Warn("IDENTITY_INTERNAL_TOKEN unset: identity /internal/* calls will fail closed (peer 503/401)")
+	}
+
 	// Outbound webhook platform (Wave 5 #10): Postgres-backed subscriptions +
 	// deliveries. Without DATABASE_URL the platform degrades to 503s on
 	// /v1/webhooks and no dispatcher — the rest of the worker is unaffected.
+	// N-08: INTERNAL_DATABASE_URL is the app_notifications_internal pool for
+	// the RLS fail-closed escape paths (warn-fallback to the main pool).
 	var webhookStore *store.Store
 	if cfg.DatabaseURL != "" {
-		st, err := store.New(context.Background(), cfg.DatabaseURL)
+		st, err := store.NewWithInternal(context.Background(), cfg.DatabaseURL, cfg.InternalDatabaseURL, logger)
 		if err != nil {
 			return fmt.Errorf("webhook store: %w", err)
 		}
 		webhookStore = st
 		defer webhookStore.Close()
-		acts.Webhooks = activities.WebhookDeps{Store: webhookStore, BookingAppID: cfg.BookingAppID}
+		acts.Webhooks = activities.WebhookDeps{
+			Store:        webhookStore,
+			BookingAppID: cfg.BookingAppID,
+			// N-02: the outbound delivery client refuses redirects and
+			// bounds attempts at 10s; the dial path re-checks blocked IPs.
+			HTTPClient: httpapi.NewWebhookHTTPClient(webhookURLValidator(cfg)),
+		}
 		logger.Info("webhook platform enabled",
 			zap.Bool("signing_required", cfg.WebhookSigningRequired))
 	} else {
@@ -342,7 +367,21 @@ func run() error {
 			Temporal:  tc,
 			TaskQueue: cfg.TemporalTaskQueue,
 			Log:       logger,
-			Webhooks:  webhookStore,
+			// SPEC-W44 (K1/K2, N-01, S1-F7-03/04).
+			InternalToken:          cfg.InternalToken,
+			DevEndpoints:           cfg.DevEndpoints,
+			TrustDirectTenancy:     cfg.TrustDirectTenant,
+			DNDAdminRoles:          cfg.DNDAdminRoles,
+			SignalWorkflowPrefixes: cfg.SignalWorkflowPrefixes,
+			WebhookURLValidator:    webhookURLValidator(cfg),
+			Webhooks:               webhookStore,
+			OpsAlerts:              opsAlertStore(webhookStore),
+			// F15-05/N-07: dependency-aware healthz (2s budgets handler-side).
+			HealthPostgres: healthPostgres(webhookStore),
+			HealthTemporal: func(ctx context.Context) error {
+				_, err := tc.CheckHealth(ctx, &client.CheckHealthRequest{})
+				return err
+			},
 			ResolveTenant: func(ctx context.Context, slug string) (httpapi.TenantRef, error) {
 				var out struct {
 					ID   string `json:"id"`
@@ -442,6 +481,25 @@ func run() error {
 		}()
 	}
 
+	// Ops-alerts consumer (SPEC-W44 K3/F15-04): persists opendesk.ops.alerts
+	// CloudEvents to the ops_alerts table for GET /v1/ops-alerts. Topic
+	// "off", no DATABASE_URL or no brokers disables it.
+	if topic := opsalerts.TopicEnabled(cfg.OpsAlertsTopic); topic != "" && webhookStore != nil {
+		if brokers := strings.Split(cfg.KafkaBrokers, ","); len(brokers) > 0 && brokers[0] != "" {
+			opsConsumer := opsalerts.New(brokers, topic, cfg.OpsAlertsGroup, webhookStore, logger)
+			defer opsConsumer.Close() //nolint:errcheck
+			go func() {
+				if err := opsConsumer.Run(ctx); err != nil {
+					errCh <- fmt.Errorf("ops-alerts consumer: %w", err)
+				}
+			}()
+			logger.Info("ops-alerts consumer enabled", zap.String("topic", topic),
+				zap.String("group", cfg.OpsAlertsGroup))
+		} else {
+			logger.Warn("ops-alerts consumer disabled: no Kafka brokers")
+		}
+	}
+
 	go func() {
 		logger.Info("temporal worker starting",
 			zap.String("task_queue", cfg.TemporalTaskQueue),
@@ -476,6 +534,34 @@ func fcmMode(cfg config.Config) string {
 	default:
 		return "unconfigured"
 	}
+}
+
+// webhookURLValidator builds the S1-F6-03/N-02 SSRF guard. Dev mode
+// (OPENDESK_DEV_ENDPOINTS=1) relaxes https-only and the private-CIDR block
+// so local receivers (host.docker.internal, 127.0.0.1) work; multicast /
+// unspecified stay blocked everywhere.
+func webhookURLValidator(cfg config.Config) *httpapi.URLValidator {
+	v := httpapi.NewURLValidator(cfg.DevEndpoints)
+	v.AllowPrivate = cfg.DevEndpoints
+	return v
+}
+
+// opsAlertStore adapts the store for the /v1/ops-alerts route (nil without
+// DATABASE_URL → 503).
+func opsAlertStore(st *store.Store) httpapi.OpsAlertStore {
+	if st == nil {
+		return nil
+	}
+	return st
+}
+
+// healthPostgres adapts the store ping for /healthz (nil without
+// DATABASE_URL → the check is skipped).
+func healthPostgres(st *store.Store) func(ctx context.Context) error {
+	if st == nil {
+		return nil
+	}
+	return st.Ping
 }
 
 // temporalZapAdapter bridges Temporal's log.Logger to zap.

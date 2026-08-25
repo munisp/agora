@@ -86,7 +86,7 @@ def test_sabotaged_model_stays_staging_and_alerts(store):
 
     assert len(pub.messages) == 1
     topic, payload = pub.messages[0]
-    assert topic == "ops.alerts"
+    assert topic == "opendesk.ops.alerts"
     assert payload["type"] == "training_gate_failed"
     assert payload["family"] == "fraud-clf"
     assert payload["gate"]["brier"] == 0.55

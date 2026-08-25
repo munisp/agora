@@ -109,16 +109,20 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 }
 
 // VerifyDepositHold asks payments-service for the tenant's ledger balance and
-// reports whether an open (pending) deposit hold exists.
+// reports whether an open (pending) deposit hold exists. K2: the call
+// carries X-Internal-Token = PAYMENTS_INTERNAL_TOKEN (Dapr passthrough, or
+// direct HTTP when PAYMENTS_URL is set); K5: the account is addressed by the
+// tenant SLUG (uuid fallback with WARN).
 func (a *Activities) VerifyDepositHold(ctx context.Context, in workflows.SalonDepositInput) (bool, error) {
+	slug := a.k5TenantSlug(in.BookingID, in.TenantID, in.TenantSlug)
 	var bal struct {
 		Accounts []struct {
 			DebitsPending  int64 `json:"debits_pending"`
 			CreditsPending int64 `json:"credits_pending"`
 		} `json:"accounts"`
 	}
-	if err := a.Dapr.InvokeServiceMethod(ctx, http.MethodGet, a.PaymentsAppID,
-		"v1/accounts/"+in.TenantID+"/balance", nil, nil, &bal); err != nil {
+	if err := a.invokePaymentsMethod(ctx, http.MethodGet,
+		"v1/accounts/"+slug+"/balance", nil, &bal); err != nil {
 		return false, fmt.Errorf("payments balance: %w", err)
 	}
 	for _, acc := range bal.Accounts {
@@ -130,16 +134,24 @@ func (a *Activities) VerifyDepositHold(ctx context.Context, in workflows.SalonDe
 }
 
 // ChargeNoShowFee captures the pack no-show fee from the deposit hold via
-// payments-service (idempotent by deposit id on the payments side).
+// payments-service (idempotent by deposit id on the payments side). K2:
+// X-Internal-Token = PAYMENTS_INTERNAL_TOKEN via the shared payments invoke
+// helper (Dapr passthrough / PAYMENTS_URL fallback); K5: tenant namespace is
+// the slug (uuid fallback with WARN). The deterministic idempotency_key
+// (noshowfee-{booking_id}) makes activity retries safe even if the payments
+// side dedupe by deposit id ever changes.
 func (a *Activities) ChargeNoShowFee(ctx context.Context, in workflows.SalonDepositInput) error {
 	if in.HoldID == "" {
 		return fmt.Errorf("no deposit hold to charge the no-show fee from")
 	}
-	return a.Dapr.InvokeService(ctx, a.PaymentsAppID, "v1/no-show-fee", map[string]any{
-		"tenant_id":    in.TenantID,
-		"deposit_id":   in.HoldID,
-		"amount_cents": in.NoShowFeeCents,
-		"booking_id":   in.BookingID,
+	slug := a.k5TenantSlug(in.BookingID, in.TenantID, in.TenantSlug)
+	return a.invokePayments(ctx, "v1/no-show-fee", map[string]any{
+		"tenant_id":       slug,
+		"tenant_slug":     slug,
+		"deposit_id":      in.HoldID,
+		"amount_cents":    in.NoShowFeeCents,
+		"booking_id":      in.BookingID,
+		"idempotency_key": "noshowfee-" + in.BookingID,
 	}, nil)
 }
 

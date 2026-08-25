@@ -30,6 +30,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
@@ -183,9 +184,12 @@ func (a *Activities) ReportCivicSLABreach(ctx context.Context, rep workflows.Civ
 	if rep.MDAQueue != "" {
 		body["mda_queue"] = rep.MDAQueue
 	}
-	if err := a.Dapr.InvokeServiceWithHeaders(ctx, a.BookingAppID,
+	if err := a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID,
 		"v1/civic/internal/cases/"+rep.Ref+"/sla-breach", body,
-		map[string]string{"X-Tenant-Slug": rep.TenantSlug}, nil); err != nil {
+		map[string]string{"X-Tenant-Slug": rep.TenantSlug,
+			// K2 (S1-F7-05): the sla-breach route is internauth-guarded
+			// booking-side (X-Internal-Token vs BOOKING_INTERNAL_TOKEN).
+			"X-Internal-Token": a.BookingInternalToken}, nil); err != nil {
 		return fmt.Errorf("booking-service civic sla-breach callback: %w", err)
 	}
 	a.emitCivicEscalation(ctx, rep)
