@@ -50,12 +50,12 @@ func TestReferralSelfVerifyGuard(t *testing.T) {
 		t.Fatalf("pgx connect: %v", err)
 	}
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS outbox (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_id UUID NOT NULL,
-    topic TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    sent_at TIMESTAMPTZ
-)`); err != nil {
+	    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	    aggregate_id UUID NOT NULL,
+	    topic TEXT NOT NULL,
+	    payload JSONB NOT NULL,
+	    sent_at TIMESTAMPTZ
+	)`); err != nil {
 		t.Fatalf("outbox ddl: %v", err)
 	}
 	conn.Close(ctx) //nolint:errcheck
