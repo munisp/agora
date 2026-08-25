@@ -549,6 +549,12 @@ images), and the `infra/` shell scripts' positional config.
 | REFERRAL_CYCLE_MAX_HOPS | fraud-engine | `4` | N | N | N | services/fraud-engine/fraud_engine/config.py:73 |
 | REFERRAL_CYCLE_MIN_HOPS | fraud-engine | `2` | N | N | N | services/fraud-engine/fraud_engine/config.py:72 |
 | REGISTRY_SYNC_DIR | infra | (none) | N | N | N | infra/lakehouse/spark/jobs/training_snapshot.py:900 |
+| RETENTION_BATCH_SIZE | conversation-service | `1000` | N | N | N | services/conversation-service/app/config.py:188 |
+| RETENTION_DAYS | conversation-service | `365` | N | N | N | services/conversation-service/app/config.py:186 |
+| RETENTION_ENABLED | conversation-service | `true` | N | N | N | services/conversation-service/app/config.py:185 |
+| RETENTION_SWEEP_SECONDS | conversation-service | `3600` | N | N | N | services/conversation-service/app/config.py:187 |
+| REVERSE_CONSUMER_GROUP | crm-sync-service | `crm-sync-reverse` | N | N | N | services/crm-sync-service/internal/config/config.go:64 |
+| REVERSE_ECHO_WINDOW_SECONDS | crm-sync-service | `10` | N | N | N | services/crm-sync-service/internal/config/config.go:66 |
 | S3_ACCESS_KEY | notification-worker | `minioadmin` | N | Y | N | services/notification-worker/internal/config/config.go:130 |
 | S3_ENDPOINT | infra, notification-worker | `http://minio:9000` | N | N | N | infra/lakehouse/spark/jobs/graph_enrichment.py:650 |
 | S3_EXPORTS_BUCKET | notification-worker | `exports` | N | N | N | services/notification-worker/internal/config/config.go:132 |
@@ -732,3 +738,4 @@ images), and the `infra/` shell scripts' positional config.
 | Trust-boundary map | 100% of env-named egress endpoints + all gateway webhook ingress routes | per-client TLS verification audit; dapr component yamls |
 | Gate map | 100% of W43-F3 controls + every *_MOCK/*_REQUIRED/*_ENFORCEMENT var | per-endpoint RBAC matrices (S1 owns top-20 money-mutation table); Permify schema parity |
 | Config map | 445/445 env reads (4 extractor patterns, tests excluded) | dynamically-named envs; third-party container envs |
+
