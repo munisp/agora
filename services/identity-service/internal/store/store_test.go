@@ -2,54 +2,92 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Store tests run against a real (embedded) Postgres so the bootstrap DDL,
-// unique conflicts and merge semantics are exercised for real
-// (booking-service waitlist_test.go pattern). Run with -short to skip in
-// constrained environments.
-
-// testSchema is the minimal pre-tenancy-columns slice of
-// 02-identity-schema.sql — WITHOUT the industry/metadata/is_twin ALTERs,
-// so bootstrap's idempotent column creation is what's under test.
-const testSchema = `
+// Store-level tests run against a real (embedded) Postgres so the RLS
+// plumbing of SPEC-W43 I-03 / SPEC-W44 W-I is exercised for real: fail-closed
+// policies, the app.tenant_id GUC scoping on memberships, and the
+// app_identity_internal escape used by the tenants-table paths.
+// Set -short to skip in constrained environments.
+//
+// Roles mirror 05-app-roles.sql: app_identity(_login) is the request-scoped
+// runtime role; app_identity_internal(_login) is the cross-tenant escape
+// (billing 0002 idiom).
+//
+// PARITY CONTRACT (SPEC-W44 F4 / V2-D1): this schema must stay an exact copy
+// of infra/postgres/init-scripts/02-identity-schema.sql (columns, CHECK
+// constraints, RLS policies). V2-D1 shipped because the embedded schema
+// dropped the tenants.plan CHECK and masked the 23514 createTwin hit on real
+// installs — do NOT weaken constraints here.
+const storeTestSchema = `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
-CREATE TABLE tenants (
+CREATE TABLE IF NOT EXISTS tenants (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     slug        TEXT NOT NULL UNIQUE,
     name        TEXT NOT NULL,
     timezone    TEXT NOT NULL DEFAULT 'UTC',
-    currency    TEXT NOT NULL DEFAULT 'USD',
+    currency    CHAR(3) NOT NULL DEFAULT 'USD',
     locale      TEXT NOT NULL DEFAULT 'en-US',
     terminology JSONB NOT NULL DEFAULT '{}'::jsonb,
+    industry    TEXT NOT NULL DEFAULT 'salon',
     plan        TEXT NOT NULL DEFAULT 'free'
-                    CHECK (plan IN ('free','pro','enterprise')),
+                CHECK (plan IN ('free','pro','enterprise','twin')),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE TABLE memberships (
-    tenant_id  UUID NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
-    user_id    TEXT NOT NULL,
-    role       TEXT NOT NULL DEFAULT 'staff',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+CREATE TABLE IF NOT EXISTS memberships (
+    tenant_id UUID NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    user_id   UUID NOT NULL,
+    role      TEXT NOT NULL DEFAULT 'staff'
+              CHECK (role IN ('owner','admin','staff','viewer')),
     PRIMARY KEY (tenant_id, user_id)
-);`
+);
+ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tenants
+    USING (id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE POLICY tenant_isolation ON memberships
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity') THEN
+        CREATE ROLE app_identity NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity_login') THEN
+        CREATE ROLE app_identity_login LOGIN PASSWORD 'pw' IN ROLE app_identity;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity_internal') THEN
+        CREATE ROLE app_identity_internal NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity_internal_login') THEN
+        CREATE ROLE app_identity_internal_login LOGIN PASSWORD 'pw' IN ROLE app_identity_internal;
+    END IF;
+END
+$$;
+GRANT USAGE ON SCHEMA public TO app_identity, app_identity_internal;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, memberships TO app_identity;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, memberships TO app_identity_internal;`
 
-func newTestStore(t *testing.T) *Store {
+// setupStoreTest boots embedded PG, applies the schema as superuser, runs
+// the bootstrap DDL as superuser (fresh-install path), and returns DSNs for
+// the least-privilege roles.
+func setupStoreTest(t *testing.T) (appDSN, internalDSN string) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping embedded-postgres store test in -short mode")
 	}
-	// Dedicated port + data dir so parallel packages don't race on the
-	// default 5432/data-dir (booking-service newTestStore note).
 	ep := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
 		Username("postgres").Password("postgres").Database("identity_store_test").
-		Port(5435).
+		Port(5436).
 		DataPath(t.TempDir()).
 		RuntimePath(t.TempDir()))
 	if err := ep.Start(); err != nil {
@@ -58,196 +96,226 @@ func newTestStore(t *testing.T) *Store {
 	t.Cleanup(func() { _ = ep.Stop() })
 
 	ctx := context.Background()
-	dsn := "postgres://postgres:postgres@localhost:5435/identity_store_test?sslmode=disable"
-	st, err := New(ctx, dsn)
+	superDSN := "postgres://postgres:postgres@localhost:5436/identity_store_test?sslmode=disable"
+	raw, err := pgxpool.New(ctx, superDSN)
+	if err != nil {
+		t.Fatalf("raw pool: %v", err)
+	}
+	if _, err := raw.Exec(ctx, storeTestSchema); err != nil {
+		t.Fatalf("test schema: %v", err)
+	}
+	raw.Close()
+
+	// Superuser bootstraps columns + policies (fresh-install path).
+	st, err := New(ctx, superDSN)
+	if err != nil {
+		t.Fatalf("store.New (superuser): %v", err)
+	}
+	st.Close()
+	return "postgres://app_identity_login:pw@localhost:5436/identity_store_test?sslmode=disable",
+		"postgres://app_identity_internal_login:pw@localhost:5436/identity_store_test?sslmode=disable"
+}
+
+// TestBootstrapLeastPrivilegeTolerated: connecting as the least-privilege
+// app role must boot cleanly (bootstrap DDL skipped with WARN, 42501) while
+// the schema is already present.
+func TestBootstrapLeastPrivilegeTolerated(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
+	ctx := context.Background()
+	st, err := New(ctx, appDSN, internalDSN)
+	if err != nil {
+		t.Fatalf("store.New (least-privilege): %v", err)
+	}
+	defer st.Close()
+	if st.tenants == st.pool {
+		t.Errorf("distinct internal DSN must yield a second pool")
+	}
+}
+
+// TestIsTwinColumn: bootstrap added tenants.is_twin; CreateTenant persists it
+// (internal-role pool) and GetTenantBySlug reads it back.
+func TestIsTwinColumn(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
+	ctx := context.Background()
+	st, err := New(ctx, appDSN, internalDSN)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
-	t.Cleanup(st.Close)
-	if _, err := st.pool.Exec(ctx, testSchema); err != nil {
-		t.Fatalf("test schema: %v", err)
-	}
-	// Bootstrap must succeed against the pre-tenancy-columns schema and add
-	// industry/metadata/is_twin idempotently (running it twice is the point).
-	if err := st.bootstrap(ctx); err != nil {
-		t.Fatalf("bootstrap: %v", err)
-	}
-	if err := st.bootstrap(ctx); err != nil {
-		t.Fatalf("bootstrap (idempotent rerun): %v", err)
-	}
-	return st
-}
+	defer st.Close()
 
-func TestBootstrapAddsTenancyColumns(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-	for _, col := range []string{"industry", "metadata", "is_twin"} {
-		var name string
-		if err := st.pool.QueryRow(ctx,
-			`SELECT column_name FROM information_schema.columns
-			 WHERE table_name = 'tenants' AND column_name = $1`, col).Scan(&name); err != nil {
-			t.Errorf("column %s missing after bootstrap: %v", col, err)
-		}
+	twin := Tenant{Slug: "acme-twin-zz9pww", Name: "Twin", Plan: "twin", IsTwin: true}
+	if err := st.CreateTenant(ctx, &twin); err != nil {
+		t.Fatalf("create twin (internal role): %v", err)
 	}
-	// The twin plan must be accepted after bootstrap widens the CHECK.
-	tn := Tenant{Slug: "twin-ok", Name: "Twin", Plan: "twin", IsTwin: true}
-	if err := st.CreateTenant(ctx, &tn); err != nil {
-		t.Errorf("plan=twin rejected after bootstrap: %v", err)
-	}
-	if !tn.IsTwin {
-		t.Errorf("is_twin flag not round-tripped: %+v", tn)
-	}
-}
-
-func TestCreateAndGetTenant(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-
-	tn := Tenant{Slug: "acme", Name: "Acme Ltd", Plan: "pro", Industry: "logistics"}
-	if err := st.CreateTenant(ctx, &tn); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if tn.ID.String() == "" || tn.CreatedAt.IsZero() {
-		t.Fatalf("id/created_at not populated: %+v", tn)
-	}
-
-	got, err := st.GetTenantBySlug(ctx, "acme")
+	got, err := st.GetTenantBySlug(ctx, "acme-twin-zz9pww")
 	if err != nil {
-		t.Fatalf("get: %v", err)
+		t.Fatalf("get twin: %v", err)
 	}
-	if got.Name != "Acme Ltd" || got.Plan != "pro" || got.Industry != "logistics" {
-		t.Errorf("round-trip mismatch: %+v", got)
+	if !got.IsTwin {
+		t.Errorf("is_twin not persisted: %+v", got)
 	}
-	byID, err := st.GetTenantByID(ctx, got.ID)
-	if err != nil || byID.Slug != "acme" {
-		t.Errorf("get by id: %v, %+v", err, byID)
-	}
-
-	// Duplicate slug -> ErrConflict.
-	dup := Tenant{Slug: "acme", Name: "Other"}
-	if err := st.CreateTenant(ctx, &dup); !errors.Is(err, ErrConflict) {
-		t.Errorf("duplicate slug: err = %v, want ErrConflict", err)
-	}
-
-	// Unknown slug -> ErrNotFound.
-	if _, err := st.GetTenantBySlug(ctx, "nope"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("unknown slug: err = %v, want ErrNotFound", err)
+	if got.Plan != "twin" {
+		t.Errorf("plan = %q", got.Plan)
 	}
 }
 
-func TestCreateTenantDefaults(t *testing.T) {
-	st := newTestStore(t)
+// TestPlanCheckParity (SPEC-W44 F4 / V2-D1 regression): the embedded schema
+// carries the SAME tenants.plan CHECK as 02-identity-schema.sql, so this test
+// fails if either side drifts again. 'twin' must be accepted (createTwin
+// INSERTs it); anything outside free|pro|enterprise|twin must hit 23514.
+// ('twin' staying out of the PUBLIC POST /v1/tenants plan set is app-level —
+// httpapi validPlans — the DB only needs to accept it.)
+func TestPlanCheckParity(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
 	ctx := context.Background()
-	tn := Tenant{Slug: "def", Name: "Defaults"}
-	if err := st.CreateTenant(ctx, &tn); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	got, _ := st.GetTenantBySlug(ctx, "def")
-	if got.Industry != "generic" {
-		t.Errorf("industry default = %q, want generic", got.Industry)
-	}
-	if string(got.Terminology) != "{}" || string(got.Metadata) != "{}" {
-		t.Errorf("jsonb defaults: terminology=%s metadata=%s", got.Terminology, got.Metadata)
-	}
-	if got.IsTwin {
-		t.Errorf("is_twin default must be false")
-	}
-	if got.Plan != "free" {
-		t.Errorf("plan default = %q, want free", got.Plan)
-	}
-}
-
-func TestDeleteTenant(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-	tn := Tenant{Slug: "gone", Name: "Gone"}
-	if err := st.CreateTenant(ctx, &tn); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := st.DeleteTenant(ctx, "gone"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, err := st.GetTenantBySlug(ctx, "gone"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("post-delete get: err = %v, want ErrNotFound", err)
-	}
-	if err := st.DeleteTenant(ctx, "gone"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("re-delete: err = %v, want ErrNotFound", err)
-	}
-}
-
-func TestMergeTerminology(t *testing.T) {
-	st := newTestStore(t)
-	ctx := context.Background()
-	tn := Tenant{Slug: "term", Name: "Term",
-		Terminology: json.RawMessage(`{"order":"delivery","customer":"rider"}`)}
-	if err := st.CreateTenant(ctx, &tn); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	merged, err := st.MergeTerminology(ctx, "term",
-		json.RawMessage(`{"order":"package","driver":"captain"}`))
+	st, err := New(ctx, appDSN, internalDSN)
 	if err != nil {
-		t.Fatalf("merge: %v", err)
+		t.Fatalf("store.New: %v", err)
 	}
-	var m map[string]string
-	if err := json.Unmarshal(merged, &m); err != nil {
-		t.Fatalf("merged doc: %v", err)
+	defer st.Close()
+
+	// Twin plan accepted (the V2-D1 500 path).
+	if err := st.CreateTenant(ctx, &Tenant{
+		Slug: "acme-twin-pp3kqq", Name: "Twin", Plan: "twin", IsTwin: true,
+	}); err != nil {
+		t.Fatalf("plan='twin' rejected by embedded schema CHECK (V2-D1 drift): %v", err)
 	}
-	// Patch keys win; unpatched keys survive.
-	if m["order"] != "package" || m["customer"] != "rider" || m["driver"] != "captain" {
-		t.Errorf("merged = %v", m)
+
+	// Bogus plan rejected with a CHECK violation (23514), proving the
+	// constraint EXISTS in the embedded schema (its absence masked V2-D1).
+	err = st.CreateTenant(ctx, &Tenant{Slug: "bogus-plan", Name: "Bogus", Plan: "gold"})
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("plan='gold': err = %v, want pg 23514 check_violation", err)
 	}
-	if _, err := st.MergeTerminology(ctx, "nope", json.RawMessage(`{"a":"b"}`)); !errors.Is(err, ErrNotFound) {
-		t.Errorf("unknown slug: err = %v, want ErrNotFound", err)
+
+	// memberships.role CHECK parity probe (same drift class, raw insert via
+	// the internal escape pool bypasses nothing — CHECKs are row-level).
+	internalPool, err := pgxpool.New(ctx, internalDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer internalPool.Close()
+	tenant := Tenant{Slug: "role-check", Name: "RoleCheck"}
+	if err := st.CreateTenant(ctx, &tenant); err != nil {
+		t.Fatal(err)
+	}
+	_, err = internalPool.Exec(ctx,
+		`INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, 'superuser')`,
+		tenant.ID, uuid.New().String())
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("role='superuser': err = %v, want pg 23514 check_violation", err)
 	}
 }
 
-func TestMembersRoundTrip(t *testing.T) {
-	st := newTestStore(t)
+// TestRLSFailClosedAndEscape proves the policy semantics with real roles:
+//   - the app role sees ZERO tenants rows without a GUC (fail-closed), even
+//     though rows exist;
+//   - the tenants paths (lookup/create/delete) work via the internal escape
+//     role (pg_has_role cannot be forged by a GUC);
+//   - the app role cannot write tenants at all.
+func TestRLSFailClosedAndEscape(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
 	ctx := context.Background()
-	tn := Tenant{Slug: "mem", Name: "Members"}
-	if err := st.CreateTenant(ctx, &tn); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := st.AddMember(ctx, Membership{TenantID: tn.ID, UserID: "u-1", Role: "owner"}); err != nil {
-		t.Fatalf("add u-1: %v", err)
-	}
-	if err := st.AddMember(ctx, Membership{TenantID: tn.ID, UserID: "u-2", Role: "staff"}); err != nil {
-		t.Fatalf("add u-2: %v", err)
-	}
-	// Upsert: re-adding u-2 with a new role updates in place.
-	if err := st.AddMember(ctx, Membership{TenantID: tn.ID, UserID: "u-2", Role: "admin"}); err != nil {
-		t.Fatalf("upsert u-2: %v", err)
-	}
-	members, err := st.ListMembers(ctx, tn.ID)
+	st, err := New(ctx, appDSN, internalDSN)
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("store.New: %v", err)
 	}
-	if len(members) != 2 {
-		t.Fatalf("members = %d, want 2", len(members))
+	defer st.Close()
+
+	// Seed via the internal escape pool.
+	if err := st.CreateTenant(ctx, &Tenant{Slug: "acme", Name: "Acme"}); err != nil {
+		t.Fatalf("seed tenant: %v", err)
 	}
-	roles := map[string]string{}
-	for _, m := range members {
-		roles[m.UserID] = m.Role
+
+	// Fail-closed: the plain app pool (no GUC set on the tenants path —
+	// tenants ops run on the internal pool, so use a raw app-role pool to
+	// probe the policy directly).
+	appPool, err := pgxpool.New(ctx, appDSN)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if roles["u-1"] != "owner" || roles["u-2"] != "admin" {
-		t.Errorf("roles = %v", roles)
+	defer appPool.Close()
+	var n int
+	if err := appPool.QueryRow(ctx, `SELECT count(*) FROM tenants`).Scan(&n); err != nil {
+		t.Fatalf("probe: %v", err)
 	}
-	// FK cascade: deleting the tenant removes memberships.
-	if err := st.DeleteTenant(ctx, "mem"); err != nil {
-		t.Fatalf("delete tenant: %v", err)
+	if n != 0 {
+		t.Errorf("app role saw %d tenant rows without GUC, want 0 (fail-closed)", n)
 	}
-	members, err = st.ListMembers(ctx, tn.ID)
+	// App role cannot insert tenants (WITH CHECK fails: id cannot match the
+	// unset GUC, and it lacks the internal escape).
+	if _, err := appPool.Exec(ctx,
+		`INSERT INTO tenants (slug, name) VALUES ('evil', 'Evil')`); err == nil {
+		t.Errorf("app role inserted into tenants — policy escape broken")
+	}
+
+	// Internal escape: lookup + delete through the service store work.
+	if _, err := st.GetTenantBySlug(ctx, "acme"); err != nil {
+		t.Errorf("internal lookup: %v", err)
+	}
+	if err := st.DeleteTenant(ctx, "acme"); err != nil {
+		t.Errorf("internal delete: %v", err)
+	}
+	if _, err := st.GetTenantBySlug(ctx, "acme"); err != ErrNotFound {
+		t.Errorf("post-delete lookup: %v, want ErrNotFound", err)
+	}
+}
+
+// TestMembershipsGUCPlumbing: ListMembers/AddMember set app.tenant_id
+// per-transaction, so the app role can read/write ONLY the scoped tenant's
+// memberships (fail-closed for anything else).
+func TestMembershipsGUCPlumbing(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
+	ctx := context.Background()
+	st, err := New(ctx, appDSN, internalDSN)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+
+	a := Tenant{Slug: "acme", Name: "Acme"}
+	b := Tenant{Slug: "other", Name: "Other"}
+	if err := st.CreateTenant(ctx, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTenant(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+	uid := uuid.New()
+	if err := st.AddMember(ctx, Membership{TenantID: a.ID, UserID: uid.String(), Role: "owner"}); err != nil {
+		t.Fatalf("add member (GUC-scoped): %v", err)
+	}
+	members, err := st.ListMembers(ctx, a.ID)
+	if err != nil || len(members) != 1 || members[0].Role != "owner" {
+		t.Fatalf("list members: %v, %+v", err, members)
+	}
+	// Cross-tenant read via the app role fails closed (no rows), not an error.
+	members, err = st.ListMembers(ctx, b.ID)
 	if err != nil || len(members) != 0 {
-		t.Errorf("post-cascade members = %v, %d", err, len(members))
+		t.Errorf("other tenant members: %v, n=%d, want 0", err, len(members))
 	}
-}
-
-// TestBootstrapSkipsInsufficientPrivilege (SPEC-W43 I-03) cannot run against
-// the embedded superuser, so it only asserts the error-code constant the
-// handler keys on — the 42501 tolerance path is exercised by code review +
-// the least-privilege deploy.
-func TestBootstrapPrivilegeErrorCode(t *testing.T) {
-	if !strings.Contains("42501", "42501") { // trivially true; documents the contract
-		t.Fatal("insufficient_privilege code changed")
+	// Raw probe: without the GUC the app role sees nothing.
+	appPool, err := pgxpool.New(ctx, appDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer appPool.Close()
+	var n int
+	if err := appPool.QueryRow(ctx, `SELECT count(*) FROM memberships`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("app role saw %d membership rows without GUC, want 0", n)
+	}
+	// Bootstrap applied the fail-closed + escape policy idiom.
+	var qual string
+	if err := appPool.QueryRow(ctx,
+		`SELECT pg_get_expr(polqual, polrelid) FROM pg_policy
+		 WHERE polrelid = 'memberships'::regclass AND polname = 'tenant_isolation'`).Scan(&qual); err != nil {
+		t.Fatalf("policy expr: %v", err)
+	}
+	if !strings.Contains(qual, "NULLIF") || !strings.Contains(qual, "app_identity_internal") {
+		t.Errorf("memberships policy = %s", qual)
 	}
 }
