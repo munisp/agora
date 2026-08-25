@@ -103,6 +103,21 @@ impl SimState {
     fn apply_pending(&mut self, t: &Transfer) -> Result<(), LedgerError> {
         self.account_mut(&t.debit_account)?.debits_pending += t.amount;
         self.account_mut(&t.credit_account)?.credits_pending += t.amount;
+        // SPEC-W43 P-01 (C3): pending debits RESERVE funds — on no-overdraft
+        // accounts (deposits/revenue) debits_pending + debits_posted must
+        // never exceed credits_posted, matching TigerBeetle's
+        // debits_must_not_exceed_credits (which covers pending debits).
+        for name in [&t.debit_account, &t.credit_account] {
+            if no_overdraft(name) {
+                let a = self.accounts.get(name).expect("account exists");
+                if a.debits_pending + a.debits_posted > a.credits_posted {
+                    // Roll back to keep the ledger consistent.
+                    self.account_mut(&t.debit_account)?.debits_pending -= t.amount;
+                    self.account_mut(&t.credit_account)?.credits_pending -= t.amount;
+                    return Err(LedgerError::ExceedsCredits(name.to_string()));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -253,6 +268,13 @@ impl SimLedgerClient {
         if hold.code != CODE_DEPOSIT_HOLD {
             return Err(LedgerError::NotPending(format!("{}", hold_id)));
         }
+        // P-06: cross-tenant guard — the hold's credit account pins the
+        // owning tenant; a capture/no-show-fee under another tenant is 403.
+        if hold.credit_account != deposits_account(tenant_id) {
+            return Err(LedgerError::TenantMismatch(format!(
+                "hold {hold_id} does not belong to tenant {tenant_id}"
+            )));
+        }
         match hold.state {
             TransferState::Pending => {}
             TransferState::Voided => {
@@ -265,6 +287,16 @@ impl SimLedgerClient {
         }
         if post_amount > hold.amount {
             return Err(LedgerError::ExceedsPendingAmount);
+        }
+        // P-05: checked fee math BEFORE any mutation (overflow / out-of-range
+        // fee_bps => InvalidAmount, never a wrap).
+        let (net, fee) = fee_split(post_amount, self.fee_bps)?;
+        // A 100% fee split (fee == post) would make the revenue leg a
+        // zero-amount transfer, which the double-entry invariant (and
+        // TigerBeetle's wire protocol, amount_must_not_be_zero) forbids.
+        // Reject BEFORE any mutation, like the other checks above.
+        if net == 0 {
+            return Err(LedgerError::InvalidAmount);
         }
 
         let deposits = deposits_account(tenant_id);
@@ -289,6 +321,22 @@ impl SimLedgerClient {
             let _ = existing;
             return st.rebuild_capture(tenant_id, hold_id.as_u128(), code);
         }
+
+        // P-06 atomicity: pre-validate EVERY leg against the post-resolution
+        // balances before the first mutation, so a rejected capture leaves
+        // zero mutations. Account existence is guaranteed by the
+        // ensure_account calls above; the only remaining failure mode of
+        // apply_posted is the no-overdraft rule on the deposits account.
+        {
+            let dep = st.accounts.get(&deposits).expect("ensured above");
+            let debits_after = dep.debits_posted + net + fee;
+            let credits_after = dep.credits_posted + post_amount;
+            if debits_after > credits_after {
+                return Err(LedgerError::ExceedsCredits(deposits.clone()));
+            }
+        }
+
+        // Mutation phase: no validation failures remain below.
         st.resolve_pending(&hold, post_amount, false)?;
         st.transfers
             .get_mut(&hold.id)
@@ -297,8 +345,6 @@ impl SimLedgerClient {
         let t1 = st.insert_transfer(t1);
 
         // t2: deposits -> revenue (net of platform fee).
-        let fee = post_amount * self.fee_bps / 10_000;
-        let net = post_amount - fee;
         let t2_id = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
             format!("capture-revenue:{}", t1.id_string()).as_bytes(),
@@ -439,9 +485,27 @@ impl LedgerClient for SimLedgerClient {
     ) -> Result<Transfer, LedgerError> {
         let mut st = self.state.lock().await;
 
-        // Replay by transfer id first.
+        // Replay by transfer id first, WITH kind matching (P-11 regression):
+        // the stored record must be a refund-shaped transfer consistent with
+        // this request; anything else is a parameter conflict, never a
+        // silent replay of a different operation.
         if let Some(existing) = st.transfers.get(&transfer_id.as_u128()) {
-            if existing.code == CODE_REFUND {
+            let matches = existing.code == CODE_REFUND
+                && match existing.flag {
+                    TransferFlag::VoidPending => {
+                        // Void leg: keyed by the hold it resolved; the amount
+                        // argument is ignored on the void path, exactly as on
+                        // the original call.
+                        hold_id.map(|h| h.as_u128()) == existing.pending_id
+                    }
+                    TransferFlag::None => {
+                        existing.amount == amount
+                            && existing.debit_account == revenue_account(tenant_id)
+                            && existing.credit_account == PLATFORM_CLEARING_ACCOUNT
+                    }
+                    TransferFlag::PostPending => false,
+                };
+            if matches {
                 return Ok(existing.clone());
             }
             return Err(LedgerError::ExistsWithDifferentParameters(
@@ -456,8 +520,25 @@ impl LedgerClient for SimLedgerClient {
                 .get(&h.as_u128())
                 .cloned()
                 .ok_or_else(|| LedgerError::TransferNotFound(format!("{}", h)))?;
+            // P-06: cross-tenant guard — the hold's credit account pins the
+            // owning tenant; a void/refund under another tenant is 403.
+            if hold.credit_account != deposits_account(tenant_id) {
+                return Err(LedgerError::TenantMismatch(format!(
+                    "hold {h} does not belong to tenant {tenant_id}"
+                )));
+            }
             match hold.state {
                 TransferState::Pending => {
+                    // P-11: a partial amount against a pending hold is
+                    // rejected; only 0 (full void) or exactly the hold amount
+                    // may void it — never a silent full void of a partial
+                    // request.
+                    if amount != 0 && amount != hold.amount {
+                        return Err(LedgerError::AmountMismatch(format!(
+                            "refund amount {amount} != pending hold amount {}",
+                            hold.amount
+                        )));
+                    }
                     let t = self.new_transfer(
                         transfer_id,
                         hold.debit_account.clone(),
@@ -550,6 +631,179 @@ impl LedgerClient for SimLedgerClient {
         }
         st.apply_posted(&t)?;
         Ok(st.insert_transfer(t))
+    }
+
+    async fn payout_hold(
+        &self,
+        tenant_id: &str,
+        transfer_id: Uuid,
+        amount: u64,
+    ) -> Result<Transfer, LedgerError> {
+        if amount == 0 {
+            return Err(LedgerError::InvalidAmount);
+        }
+        let mut st = self.state.lock().await;
+        let revenue = revenue_account(tenant_id);
+        st.ensure_account(self.ledger_id, &revenue, ACCOUNT_CODE_TENANT_REVENUE);
+        st.ensure_account(
+            self.ledger_id,
+            PLATFORM_PAYOUTS_ACCOUNT,
+            ACCOUNT_CODE_PLATFORM_PAYOUTS,
+        );
+        let t = self.new_transfer(
+            transfer_id,
+            revenue,
+            PLATFORM_PAYOUTS_ACCOUNT.to_string(),
+            amount,
+            CODE_PAYOUT,
+            TransferState::Pending,
+            TransferFlag::None,
+            None,
+        );
+        if let Some(existing) = st.check_replay(&t)? {
+            return Ok(existing);
+        }
+        // apply_pending reserves the funds (pending debits count against the
+        // no-overdraft rule), so an over-limit payout is rejected BEFORE any
+        // rail side effect (C3).
+        st.apply_pending(&t)?;
+        Ok(st.insert_transfer(t))
+    }
+
+    async fn payout_post(
+        &self,
+        tenant_id: &str,
+        hold_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<Transfer, LedgerError> {
+        let mut st = self.state.lock().await;
+        let hold = st
+            .transfers
+            .get(&hold_id.as_u128())
+            .cloned()
+            .ok_or_else(|| LedgerError::TransferNotFound(format!("{}", hold_id)))?;
+        if hold.code != CODE_PAYOUT {
+            return Err(LedgerError::NotPending(format!("{}", hold_id)));
+        }
+        // P-06: tenant consistency — the payout hold debits the tenant's
+        // revenue account.
+        if hold.debit_account != revenue_account(tenant_id) {
+            return Err(LedgerError::TenantMismatch(format!(
+                "payout hold {hold_id} does not belong to tenant {tenant_id}"
+            )));
+        }
+        match hold.state {
+            TransferState::Voided => {
+                return Err(LedgerError::AlreadyResolved(format!("{}", hold_id)))
+            }
+            TransferState::Posted => {
+                // Idempotent replay: return the stored posting leg.
+                if let Some(post) = st
+                    .transfers
+                    .values()
+                    .find(|t| {
+                        t.pending_id == Some(hold.id)
+                            && t.flag == TransferFlag::PostPending
+                            && t.code == CODE_PAYOUT
+                    })
+                    .cloned()
+                {
+                    return Ok(post);
+                }
+                return Err(LedgerError::Backend("payout posting leg missing".into()));
+            }
+            TransferState::Pending => {}
+        }
+        let t = self.new_transfer(
+            transfer_id,
+            hold.debit_account.clone(),
+            hold.credit_account.clone(),
+            hold.amount,
+            CODE_PAYOUT,
+            TransferState::Posted,
+            TransferFlag::PostPending,
+            Some(hold.id),
+        );
+        if let Some(existing) = st.check_replay(&t)? {
+            return Ok(existing);
+        }
+        st.resolve_pending(&hold, hold.amount, false)?;
+        st.transfers
+            .get_mut(&hold.id)
+            .expect("hold exists")
+            .state = TransferState::Posted;
+        Ok(st.insert_transfer(t))
+    }
+
+    async fn payout_void(
+        &self,
+        tenant_id: &str,
+        hold_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<Transfer, LedgerError> {
+        let mut st = self.state.lock().await;
+        let hold = st
+            .transfers
+            .get(&hold_id.as_u128())
+            .cloned()
+            .ok_or_else(|| LedgerError::TransferNotFound(format!("{}", hold_id)))?;
+        if hold.code != CODE_PAYOUT {
+            return Err(LedgerError::NotPending(format!("{}", hold_id)));
+        }
+        if hold.debit_account != revenue_account(tenant_id) {
+            return Err(LedgerError::TenantMismatch(format!(
+                "payout hold {hold_id} does not belong to tenant {tenant_id}"
+            )));
+        }
+        match hold.state {
+            TransferState::Voided => {
+                // Idempotent replay: return the stored void leg.
+                if let Some(void) = st
+                    .transfers
+                    .values()
+                    .find(|t| {
+                        t.pending_id == Some(hold.id)
+                            && t.flag == TransferFlag::VoidPending
+                            && t.code == CODE_PAYOUT
+                    })
+                    .cloned()
+                {
+                    return Ok(void);
+                }
+                return Err(LedgerError::AlreadyResolved(format!("{}", hold_id)));
+            }
+            TransferState::Posted => {
+                return Err(LedgerError::AlreadyResolved(format!("{}", hold_id)))
+            }
+            TransferState::Pending => {}
+        }
+        let t = self.new_transfer(
+            transfer_id,
+            hold.debit_account.clone(),
+            hold.credit_account.clone(),
+            hold.amount,
+            CODE_PAYOUT,
+            TransferState::Posted,
+            TransferFlag::VoidPending,
+            Some(hold.id),
+        );
+        if let Some(existing) = st.check_replay(&t)? {
+            return Ok(existing);
+        }
+        st.resolve_pending(&hold, 0, true)?;
+        st.transfers
+            .get_mut(&hold.id)
+            .expect("hold exists")
+            .state = TransferState::Voided;
+        Ok(st.insert_transfer(t))
+    }
+
+    async fn get_transfer(&self, transfer_id: Uuid) -> Result<Transfer, LedgerError> {
+        let st = self.state.lock().await;
+        st.transfers
+            .get(&transfer_id.as_u128())
+            .cloned()
+            .ok_or_else(|| LedgerError::TransferNotFound(format!("{}", transfer_id)))
     }
 
     async fn balance(&self, tenant_id: &str) -> Result<TenantBalance, LedgerError> {
@@ -847,5 +1101,269 @@ mod tests {
             }
             assert_invariants(&c).await;
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SPEC-W43 regression tests
+    // ------------------------------------------------------------------
+
+    /// Comparable snapshot of funds-relevant state (P-06 zero-mutation
+    /// assertions): sorted (account, counters) + transfer count.
+    async fn funds_snapshot(client: &SimLedgerClient) -> (Vec<(String, u64, u64, u64, u64)>, usize) {
+        let st = client.snapshot().await;
+        let mut accts: Vec<_> = st
+            .accounts
+            .values()
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    a.debits_pending,
+                    a.credits_pending,
+                    a.debits_posted,
+                    a.credits_posted,
+                )
+            })
+            .collect();
+        accts.sort();
+        (accts, st.transfers.len())
+    }
+
+    /// C5 (FIN-H2 parity anchor): replaying a posted refund with the SAME
+    /// transfer id and SAME parameters returns the stored refund verbatim —
+    /// same id, no double refund. This is the sim behavior the live
+    /// TigerBeetle client's replay short-circuit must match.
+    #[tokio::test]
+    async fn refund_replay_same_key_returns_stored_refund() {
+        let c = sim(0);
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 6_000).await.unwrap();
+        let hold_id = Uuid::from_u128(hold.id);
+        c.capture(TENANT, hold_id, Uuid::new_v4(), None).await.unwrap();
+        let rid = Uuid::new_v4();
+        let r1 = c.refund(TENANT, rid, Some(hold_id), 4_000).await.unwrap();
+        let pre = funds_snapshot(&c).await;
+        let r2 = c.refund(TENANT, rid, Some(hold_id), 4_000).await.unwrap();
+        assert_eq!(r1.id, r2.id, "replay returns the same refund id");
+        assert_eq!(r2.code, CODE_REFUND);
+        assert_eq!(r2.amount, 4_000);
+        assert_eq!(r2.debit_account, revenue_account(TENANT));
+        assert_eq!(r2.credit_account, PLATFORM_CLEARING_ACCOUNT);
+        assert_eq!(funds_snapshot(&c).await, pre, "replay moved nothing");
+        assert_invariants(&c).await;
+    }
+
+    /// P-11: replaying a posted refund id with a DIFFERENT amount is a
+    /// parameter conflict (409), not a silent replay.
+    #[tokio::test]
+    async fn refund_replay_with_different_amount_conflicts() {
+        let c = sim(0);
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 6_000).await.unwrap();
+        let hold_id = Uuid::from_u128(hold.id);
+        c.capture(TENANT, hold_id, Uuid::new_v4(), None).await.unwrap();
+        let rid = Uuid::new_v4();
+        c.refund(TENANT, rid, Some(hold_id), 4_000).await.unwrap();
+        let err = c
+            .refund(TENANT, rid, Some(hold_id), 4_500)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            LedgerError::ExistsWithDifferentParameters(_)
+        ));
+        assert_invariants(&c).await;
+    }
+
+    /// P-11 (kind matching): a transfer id already used by a non-refund
+    /// operation must conflict when presented as a refund id.
+    #[tokio::test]
+    async fn refund_transfer_id_reused_by_other_kind_conflicts() {
+        let c = sim(0);
+        let id = Uuid::new_v4();
+        c.hold_deposit(TENANT, id, 1_000).await.unwrap();
+        let err = c.refund(TENANT, id, None, 1_000).await.unwrap_err();
+        assert!(matches!(
+            err,
+            LedgerError::ExistsWithDifferentParameters(_)
+        ));
+        assert_invariants(&c).await;
+    }
+
+    /// P-11: refund(amount < hold.amount) on a still-pending hold => rejected
+    /// (400 via AmountMismatch), NO silent full void, zero mutations.
+    #[tokio::test]
+    async fn partial_refund_of_pending_hold_is_rejected() {
+        let c = sim(0);
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 4_000).await.unwrap();
+        let hold_id = Uuid::from_u128(hold.id);
+        let pre = funds_snapshot(&c).await;
+        let err = c
+            .refund(TENANT, Uuid::new_v4(), Some(hold_id), 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::AmountMismatch(_)));
+        // The hold is still pending (not silently voided) and nothing moved.
+        let h = c.get_transfer(hold_id).await.unwrap();
+        assert_eq!(h.state, TransferState::Pending);
+        assert_eq!(funds_snapshot(&c).await, pre, "zero mutations on 400");
+        assert_invariants(&c).await;
+    }
+
+    /// P-11: refund(amount == hold.amount) on a pending hold voids it in full.
+    #[tokio::test]
+    async fn full_amount_refund_of_pending_hold_voids() {
+        let c = sim(0);
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 4_000).await.unwrap();
+        let hold_id = Uuid::from_u128(hold.id);
+        let t = c
+            .refund(TENANT, Uuid::new_v4(), Some(hold_id), 4_000)
+            .await
+            .unwrap();
+        assert_eq!(t.flag, TransferFlag::VoidPending);
+        assert_eq!(t.amount, 4_000);
+        let h = c.get_transfer(hold_id).await.unwrap();
+        assert_eq!(h.state, TransferState::Voided);
+        assert_invariants(&c).await;
+    }
+
+    /// P-06: cross-tenant capture/void/refund are rejected (TenantMismatch =>
+    /// HTTP 403 at the route layer) and leave ZERO mutations behind.
+    #[tokio::test]
+    async fn cross_tenant_ops_are_rejected_without_mutation() {
+        let c = sim(250);
+        let other = "t-222";
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 5_000).await.unwrap();
+        let hold_id = Uuid::from_u128(hold.id);
+        let pre = funds_snapshot(&c).await;
+
+        // Cross-tenant capture.
+        let err = c
+            .capture(other, hold_id, Uuid::new_v4(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::TenantMismatch(_)), "{err}");
+        // Cross-tenant void (refund of the pending hold).
+        let err = c
+            .refund(other, Uuid::new_v4(), Some(hold_id), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::TenantMismatch(_)), "{err}");
+        // Cross-tenant no-show fee.
+        let err = c
+            .no_show_fee(other, hold_id, Uuid::new_v4(), 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::TenantMismatch(_)), "{err}");
+        assert_eq!(funds_snapshot(&c).await, pre, "zero mutations so far");
+
+        // Same-tenant capture succeeds; then a cross-tenant POSTED refund of
+        // that hold is still rejected.
+        c.capture(TENANT, hold_id, Uuid::new_v4(), None).await.unwrap();
+        let pre2 = funds_snapshot(&c).await;
+        let err = c
+            .refund(other, Uuid::new_v4(), Some(hold_id), 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::TenantMismatch(_)), "{err}");
+        assert_eq!(funds_snapshot(&c).await, pre2, "zero mutations on posted path");
+        assert_invariants(&c).await;
+    }
+
+    /// C4: capture(amount=None) resolves the pending hold's amount (sim side).
+    #[tokio::test]
+    async fn capture_amount_none_resolves_pending_amount() {
+        let c = sim(0);
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 7_500).await.unwrap();
+        let hold_id = Uuid::from_u128(hold.id);
+        let res = c.capture(TENANT, hold_id, Uuid::new_v4(), None).await.unwrap();
+        assert_eq!(res.post.amount, 7_500, "None resolves to the hold amount");
+        assert_eq!(res.revenue.amount, 7_500);
+        assert_invariants(&c).await;
+    }
+
+    /// P-05: fee_split checked math — bounds, exactness, overflow safety.
+    #[test]
+    fn fee_split_bounds_and_overflow() {
+        // fee never exceeds the amount; net + fee == amount always.
+        for (amount, bps) in [(10_000u64, 1_000u64), (1, 10_000), (0, 250), (u64::MAX / 10_000, 10_000)] {
+            let (net, fee) = fee_split(amount, bps).unwrap();
+            assert!(fee <= amount);
+            assert_eq!(net + fee, amount);
+        }
+        assert_eq!(fee_split(10_000, 1_000).unwrap(), (9_000, 1_000));
+        assert_eq!(fee_split(10_000, 10_000).unwrap(), (0, 10_000));
+        // Out-of-range fee_bps is rejected (defense in depth; config validates
+        // at boot too).
+        assert!(matches!(
+            fee_split(1_000, 10_001),
+            Err(LedgerError::InvalidAmount)
+        ));
+        // Overflowing multiplication (huge amount) is an error, not a wrap.
+        // u64::MAX * 10_000 overflows; fee_split must not panic.
+        let r = fee_split(u64::MAX, 10_000);
+        assert!(matches!(r, Err(LedgerError::InvalidAmount)));
+    }
+
+    /// P-01 (C3): two-phase payout — hold reserves, post settles after the
+    /// rail commits, void releases on rail failure/unknown.
+    #[tokio::test]
+    async fn payout_two_phase_happy_path_and_overdraft() {
+        let c = sim(0);
+        let hold = c.hold_deposit(TENANT, Uuid::new_v4(), 8_000).await.unwrap();
+        c.capture(TENANT, Uuid::from_u128(hold.id), Uuid::new_v4(), None)
+            .await
+            .unwrap();
+
+        // Over-limit payout hold is rejected BEFORE any rail side effect.
+        let err = c
+            .payout_hold(TENANT, Uuid::new_v4(), 9_999)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::ExceedsCredits(_)), "{err}");
+        assert_invariants(&c).await;
+
+        // Ledger-first: pending hold reserves the funds.
+        let pid = Uuid::new_v4();
+        let ph = c.payout_hold(TENANT, pid, 5_000).await.unwrap();
+        assert_eq!(ph.state, TransferState::Pending);
+        assert_eq!(ph.code, CODE_PAYOUT);
+        // A second payout hold for the remaining revenue beyond the reserved
+        // amount is now rejected (funds are reserved).
+        let err = c
+            .payout_hold(TENANT, Uuid::new_v4(), 3_001)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::ExceedsCredits(_)), "{err}");
+
+        // Rail COMMITTED -> post in full (deterministic post id).
+        let post_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"payout-post:test");
+        let posted = c
+            .payout_post(TENANT, pid, post_id)
+            .await
+            .unwrap();
+        assert_eq!(posted.flag, TransferFlag::PostPending);
+        assert_eq!(posted.amount, 5_000);
+        // Post replay is idempotent.
+        let replay = c.payout_post(TENANT, pid, post_id).await.unwrap();
+        assert_eq!(replay.id, posted.id);
+        assert_invariants(&c).await;
+
+        // Second payout: rail failure -> void releases the reservation.
+        let pid2 = Uuid::new_v4();
+        c.payout_hold(TENANT, pid2, 3_000).await.unwrap();
+        let err = c.payout_hold(TENANT, Uuid::new_v4(), 1).await.unwrap_err();
+        assert!(matches!(err, LedgerError::ExceedsCredits(_)), "{err}");
+        let void_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"payout-void:test");
+        let v = c.payout_void(TENANT, pid2, void_id).await.unwrap();
+        assert_eq!(v.flag, TransferFlag::VoidPending);
+        // Funds released: the remaining 3_000 is payable again.
+        let pid3 = Uuid::new_v4();
+        c.payout_hold(TENANT, pid3, 3_000).await.unwrap();
+        assert_invariants(&c).await;
+        // Cross-tenant payout post is rejected.
+        let err = c
+            .payout_post("t-222", pid3, Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LedgerError::TenantMismatch(_)), "{err}");
+        assert_invariants(&c).await;
     }
 }
