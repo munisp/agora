@@ -6,6 +6,7 @@
 package provider
 
 import (
+	"math/rand"
 	"context"
 	"fmt"
 	"io"
@@ -69,8 +70,25 @@ func NewClient(provider string, m *metrics.Registry, log *zap.Logger) *Client {
 	}
 }
 
+// backoffDelay computes the N-06 jittered exponential backoff for one retry
+// attempt (attempt starts at 1): base = 100ms << (attempt-1) capped at 1s,
+// with ±25% jitter so simultaneous callers (failover chains across
+// processes) never retry in lockstep. rnd is injectable for tests.
+func backoffDelay(attempt int, rnd *rand.Rand) time.Duration {
+	base := 100 * time.Millisecond
+	for i := 1; i < attempt && base < time.Second; i++ {
+		base *= 2
+	}
+	if base > time.Second {
+		base = time.Second
+	}
+	lo := base * 3 / 4
+	spread := base / 2
+	return lo + time.Duration(rnd.Int63n(int64(spread)))
+}
+
 func defaultSleep(ctx context.Context, attempt int) {
-	t := time.NewTimer(time.Duration(attempt) * 100 * time.Millisecond)
+	t := time.NewTimer(backoffDelay(attempt, rand.New(rand.NewSource(time.Now().UnixNano()))))
 	defer t.Stop()
 	select {
 	case <-ctx.Done():

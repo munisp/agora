@@ -14,6 +14,8 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -129,10 +131,27 @@ type ChainEntry struct {
 	PriceTier float64 // relative cost annotation, reporting only
 }
 
+// DedupeWindow is the N-06 redelivery window: a message (from|to|text) that
+// already sent successfully within the window returns the RECORDED result
+// instead of re-sending — a provider timeout-after-accept must never double
+// the customer's SMS (the classic failover duplicate).
+const DedupeWindow = 5 * time.Minute
+
+type sentRecord struct {
+	provider string
+	status   int
+	body     []byte
+	at       time.Time
+}
+
 // Failover is the ordered SMS provider chain.
 type Failover struct {
 	chain []ChainEntry
 	log   *zap.Logger
+
+	mu   sync.Mutex
+	sent map[string]sentRecord
+	now  func() time.Time // injectable for tests
 }
 
 // NewFailover parses the SMS_PROVIDER_CHAIN csv and links each name to an
@@ -142,7 +161,7 @@ func NewFailover(providers map[string]SMSProvider, chainCSV string, log *zap.Log
 	if strings.TrimSpace(chainCSV) == "" {
 		chainCSV = DefaultChain
 	}
-	f := &Failover{log: log}
+	f := &Failover{log: log, sent: map[string]sentRecord{}, now: time.Now}
 	seen := map[string]bool{}
 	for _, name := range strings.Split(chainCSV, ",") {
 		name = strings.TrimSpace(strings.ToLower(name))
@@ -172,11 +191,24 @@ func (f *Failover) Entries() []ChainEntry {
 	return out
 }
 
+// SetClock injects the clock used by the dedupe window (tests).
+func (f *Failover) SetClock(now func() time.Time) { f.now = now }
+
 // SendSMS tries each configured provider in chain order. Returns the name of
 // the provider that accepted the send alongside the provider status/body.
+// N-06: a successful send is remembered for DedupeWindow (5min); an exact
+// repeat (from|to|message) within the window returns the recorded result
+// WITHOUT re-sending, so failover/redelivery duplicates are impossible.
 func (f *Failover) SendSMS(ctx context.Context, to, message, from string) (string, int, []byte, error) {
 	if len(f.chain) == 0 {
 		return "", 0, nil, fmt.Errorf("sms provider chain is empty (SMS_PROVIDER_CHAIN)")
+	}
+	sum := sha256.Sum256([]byte(from + "|" + to + "|" + message))
+	key := hex.EncodeToString(sum[:])
+	if rec, ok := f.dedupeHit(key); ok {
+		f.log.Info("sms dedupe hit: returning recorded send result",
+			zap.String("provider", rec.provider), zap.String("to", to))
+		return rec.provider, rec.status, rec.body, nil
 	}
 	var failed []string
 	for i := range f.chain {
@@ -192,6 +224,7 @@ func (f *Failover) SendSMS(ctx context.Context, to, message, from string) (strin
 		status, body, err := e.Provider.SendSMS(ctx, to, message, from)
 		if err == nil {
 			e.Breaker.RecordSuccess()
+			f.dedupeRecord(key, sentRecord{provider: e.Name, status: status, body: body, at: f.now()})
 			return e.Name, status, body, nil
 		}
 		if ClientError(err) {
@@ -208,4 +241,26 @@ func (f *Failover) SendSMS(ctx context.Context, to, message, from string) (strin
 		return "", 0, nil, fmt.Errorf("no sms provider available (all unconfigured or circuit-open)")
 	}
 	return "", 0, nil, fmt.Errorf("all sms providers failed: %s", strings.Join(failed, "; "))
+}
+
+// dedupeHit returns the recorded send when the key is inside the window;
+// expired entries are swept lazily.
+func (f *Failover) dedupeHit(key string) (sentRecord, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := f.now()
+	for k, rec := range f.sent {
+		if now.Sub(rec.at) > DedupeWindow {
+			delete(f.sent, k)
+		}
+	}
+	rec, ok := f.sent[key]
+	return rec, ok
+}
+
+// dedupeRecord stores a successful send.
+func (f *Failover) dedupeRecord(key string, rec sentRecord) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent[key] = rec
 }

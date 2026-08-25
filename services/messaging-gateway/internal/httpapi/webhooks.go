@@ -1,12 +1,15 @@
 // Omnichannel inbound webhooks (SPEC-W6 Part A): Meta WhatsApp Cloud API
 // verification + message ingestion and Telegram Bot API updates.
 //
-// Reliability contract: these handlers ALWAYS answer 200 fast to the
-// provider (Meta/Telegram retry-storm on non-200). The only non-200 answers
-// are authentication failures, never internal processing errors: 403 for a
-// bad verify token (GET) or a bad shared secret (Telegram POST), and 401
-// for a missing/invalid WhatsApp X-Hub-Signature-256 (SIM-007/SIM-008).
-// Processing is synchronous but bounded by a 25s context.
+// Reliability contract (SPEC-W44 N-05, updated from the W6 "always 200"
+// posture): authentication failures answer 403/401; a BRIDGE failure
+// answers 500 (fail loud) so Meta/Telegram REDELIVER — the bridge dedupes
+// on MessageID so the redelivery skips the already-completed work instead
+// of double-replying. Malformed payloads still answer 200 (a poison
+// payload must not loop forever). Processing is synchronous but bounded by
+// a 25s context. The Telegram route does not exist (404) until
+// TELEGRAM_WEBHOOK_SECRET is configured — an unconfigured webhook is never
+// an open ingest surface. All secret comparisons are constant-time.
 package httpapi
 
 import (
@@ -14,6 +17,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -45,9 +49,11 @@ type Bridger interface {
 // challenge body; anything else → 403 (SPEC-W6 §A1).
 func (s *Server) handleWhatsAppVerify(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	// Constant-time token compare (SIM-007 posture); an unset token fails
+	// closed (403) even against an empty probe token.
 	if q.Get("hub.mode") == "subscribe" &&
 		s.WhatsAppVerifyToken != "" &&
-		q.Get("hub.verify_token") == s.WhatsAppVerifyToken {
+		subtle.ConstantTimeCompare([]byte(q.Get("hub.verify_token")), []byte(s.WhatsAppVerifyToken)) == 1 {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(q.Get("hub.challenge"))) //nolint:errcheck
@@ -145,13 +151,20 @@ func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				ts, _ := strconv.ParseInt(m.Timestamp, 10, 64)
-				s.bridge(r.Context(), channel.InboundMessage{
+				err := s.bridge(r.Context(), channel.InboundMessage{
 					Channel:   "whatsapp",
 					From:      m.From,
 					MessageID: m.ID,
 					Text:      m.Text.Body,
 					Timestamp: ts,
 				}, v.Metadata.PhoneNumberID)
+				if err != nil {
+					// N-05 fail-loud: 500 → Meta redelivers; the bridge
+					// dedupes on MessageID so the redelivery skips the
+					// already-completed steps.
+					writeError(w, http.StatusInternalServerError, "bridge processing failed")
+					return
+				}
 			}
 		}
 	}
@@ -178,13 +191,20 @@ type tgUpdate struct {
 	} `json:"message"`
 }
 
-// handleTelegramWebhook ingests Telegram Bot API updates. When
-// TELEGRAM_WEBHOOK_SECRET is set the X-Telegram-Bot-Api-Secret-Token header
-// must match (else 403). Updates without message.text are ignored.
-// Always 200 otherwise (SPEC-W6 §A1).
+// handleTelegramWebhook ingests Telegram Bot API updates. The route does
+// not exist until TELEGRAM_WEBHOOK_SECRET is configured (404 — N-05); with
+// it set, X-Telegram-Bot-Api-Secret-Token must match (constant-time, else
+// 403). Updates without message.text are ignored. A bridge failure answers
+// 500 so Telegram redelivers (bridge dedupes on MessageID).
 func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.TelegramWebhookSecret != "" &&
-		r.Header.Get("X-Telegram-Bot-Api-Secret-Token") != s.TelegramWebhookSecret {
+	if s.TelegramWebhookSecret == "" {
+		// Unconfigured webhook = no surface (404), never an open ingest.
+		http.NotFound(w, r)
+		return
+	}
+	if subtle.ConstantTimeCompare(
+		[]byte(r.Header.Get("X-Telegram-Bot-Api-Secret-Token")),
+		[]byte(s.TelegramWebhookSecret)) != 1 {
 		writeError(w, http.StatusForbidden, "bad webhook secret")
 		return
 	}
@@ -200,30 +220,36 @@ func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m := upd.Message
-	s.bridge(r.Context(), channel.InboundMessage{
+	if err := s.bridge(r.Context(), channel.InboundMessage{
 		Channel:   "telegram",
 		From:      strconv.FormatInt(m.Chat.ID, 10), // chat_id as string
 		MessageID: strconv.FormatInt(m.MessageID, 10),
 		Text:      m.Text,
 		Timestamp: m.Date,
-	}, s.TelegramBotUsername)
+	}, s.TelegramBotUsername); err != nil {
+		writeError(w, http.StatusInternalServerError, "bridge processing failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-// bridge runs the inbound bridge with the bounded 25s context and swallows
-// the outcome (already logged by the bridge) — the provider always gets 200.
-func (s *Server) bridge(parent context.Context, msg channel.InboundMessage, routeID string) {
+// bridge runs the inbound bridge with the bounded 25s context; a failure is
+// returned to the caller (N-05 fail-loud → provider redelivery; the bridge
+// dedupes on MessageID).
+func (s *Server) bridge(parent context.Context, msg channel.InboundMessage, routeID string) error {
 	if s.Bridge == nil {
 		s.Log.Warn("inbound bridge not configured, dropping message",
 			zap.String("channel", msg.Channel))
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(parent, webhookTimeout)
 	defer cancel()
 	if err := s.Bridge.Handle(ctx, msg, routeID); err != nil {
 		s.Log.Warn("inbound bridge failed",
 			zap.String("channel", msg.Channel), zap.Error(err))
+		return err
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -343,7 +369,8 @@ func (s *Server) handleIncidentWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	want, known := s.IncidentSecrets[tenantKey]
-	if !known || want == "" || body.Secret != want {
+	if !known || want == "" ||
+		subtle.ConstantTimeCompare([]byte(body.Secret), []byte(want)) != 1 {
 		writeError(w, http.StatusForbidden, "bad incident webhook secret")
 		return
 	}

@@ -1,4 +1,4 @@
-"""Alert publishing seam (SPEC-W33 §4 C2/C5: topic `ops.alerts`).
+"""Alert publishing seam (SPEC-W33 §4 C2/C5: topic `opendesk.ops.alerts`).
 
 I1 honest degradation: the Kafka producer is IMPORT-GUARDED. kafka-python is
 deliberately NOT in requirements.txt (I5 slim image); install it to enable

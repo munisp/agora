@@ -68,7 +68,7 @@ Every `DRIFT_INTERVAL_MINUTES` (default 15) per (family, tenant) production row:
 * **(b)** PSI + population KS of serving score distributions (last interval,
   `score_observations`) vs the trailing 7-day baseline.
 * PSI > `DRIFT_PSI_THRESHOLD` (default 0.25) → alert on Kafka topic
-  `ops.alerts` **and** Prometheus gauge `opendesk_model_drift_psi{family,tenant}`.
+  `opendesk.ops.alerts` **and** Prometheus gauge `opendesk_model_drift_psi{family,tenant}`.
 
 ### Reference manifest schema (`opendesk/training-manifest/v1`)
 
