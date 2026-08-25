@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"time"
 )
 
 // Embedded-postgres store tests (same harness pattern as internal/store's
@@ -196,4 +198,105 @@ func TestPayoutStoreOutboxPayloadRoundTrip(t *testing.T) {
 	var evt map[string]any
 	require.NoError(t, json.Unmarshal(raw, &evt))
 	require.Equal(t, "com.opendesk.usage.UsageRecord", evt["type"])
+}
+
+// ---------------------------------------------------------------------------
+// Payout feeding (SPEC-W44 W-B/S1-F7-08)
+// ---------------------------------------------------------------------------
+
+// feedTestSchema adds the commission_ledger + sites slices the feed query
+// reads (the payout test schema only carries outbox + the PayoutStore's own
+// commission_payouts).
+const feedTestSchema = `
+CREATE TABLE IF NOT EXISTS commission_ledger (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      UUID NOT NULL,
+    journal_id     UUID NOT NULL,
+    account_code   INTEGER NOT NULL CHECK (account_code IN (300,301,302,303)),
+    beneficiary_id TEXT NOT NULL DEFAULT '',
+    debit_ngn      BIGINT NOT NULL DEFAULT 0,
+    credit_ngn     BIGINT NOT NULL DEFAULT 0,
+    ref_type       TEXT NOT NULL,
+    ref_id         TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, ref_type, ref_id, account_code)
+);
+CREATE TABLE IF NOT EXISTS sites (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id   UUID NOT NULL,
+    tenant_slug TEXT NOT NULL,
+    slug        TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL DEFAULT '',
+    published   BOOLEAN NOT NULL DEFAULT TRUE,
+    theme       JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);`
+
+// ledgerRow inserts one commission_ledger row (feed test helper).
+func ledgerRow(t *testing.T, st *PayoutStore, tenantID uuid.UUID, account int, beneficiary, refID string, debit, credit int64, age time.Duration) {
+	t.Helper()
+	_, err := st.pool.Exec(context.Background(),
+		`INSERT INTO commission_ledger (tenant_id, journal_id, account_code, beneficiary_id, debit_ngn, credit_ngn, ref_type, ref_id, created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,'accrual',$7, now() - $8::interval)`,
+		tenantID, uuid.New(), account, beneficiary, debit, credit, refID, age.String())
+	require.NoError(t, err)
+}
+
+func TestMaturedPayoutFeed(t *testing.T) {
+	st := newTestPayoutStore(t)
+	ctx := context.Background()
+	_, err := st.pool.Exec(ctx, feedTestSchema)
+	require.NoError(t, err)
+
+	floor := int64(10000) // 100 NGN in kobo
+	tenantA, tenantB := uuid.New(), uuid.New()
+
+	// tenantA/agent-1: balance 40000 ≥ floor → feeds.
+	ledgerRow(t, st, tenantA, 300, "agent-1", "r1", 0, 50000, 2*time.Hour)
+	ledgerRow(t, st, tenantA, 300, "agent-1", "r2", 10000, 0, 2*time.Hour)
+	// tenantA/agent-2: balance 5000 < floor → excluded.
+	ledgerRow(t, st, tenantA, 300, "agent-2", "r3", 0, 5000, 2*time.Hour)
+	// tenantB/agent-3: ≥ floor BUT has an open queued payout → excluded.
+	ledgerRow(t, st, tenantB, 300, "agent-3", "r4", 0, 30000, 2*time.Hour)
+	open := queuedPayout(tenantB)
+	open.BeneficiaryID = "agent-3"
+	require.NoError(t, st.CreatePayout(ctx, &open))
+	// A non-300 account row must not count toward the payable balance.
+	ledgerRow(t, st, tenantA, 303, "agent-1", "r5", 0, 99999, 2*time.Hour)
+
+	candidates, err := st.MaturedPayoutCandidates(ctx, floor, 0, 100)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, tenantA, candidates[0].TenantID)
+	require.Equal(t, "agent-1", candidates[0].BeneficiaryID)
+	require.Equal(t, int64(40000), candidates[0].BalanceKobo)
+
+	// Maturity fence: with a 3h maturity the 2h-old accruals are not yet
+	// matured → no candidates.
+	candidates, err = st.MaturedPayoutCandidates(ctx, floor, 3*time.Hour, 100)
+	require.NoError(t, err)
+	require.Empty(t, candidates)
+
+	// Feed queues one payout per candidate, slug resolved via the sites
+	// registry, and the created row IS the open-payout fence for the next
+	// cycle (double-feed safe).
+	_, err = st.pool.Exec(ctx,
+		`INSERT INTO sites (tenant_id, tenant_slug, slug) VALUES ($1,'acme-ng','acme-ng')`, tenantA)
+	require.NoError(t, err)
+	acts := &PayoutActivities{Store: st, MinKobo: floor, Logger: zap.NewNop()}
+	fed, err := acts.FeedMatured(ctx, FeedMaturedInput{Limit: 100})
+	require.NoError(t, err)
+	require.Len(t, fed, 1)
+	require.Equal(t, tenantA.String(), fed[0].TenantID)
+	require.Equal(t, "acme-ng", fed[0].TenantSlug)
+	p, err := st.GetPayout(ctx, tenantA, uuid.MustParse(fed[0].PayoutID))
+	require.NoError(t, err)
+	require.Equal(t, int64(40000), p.AmountNGN)
+	require.Equal(t, PayoutStatusQueued, p.Status)
+	require.Equal(t, ProviderPaystack, p.Provider)
+
+	// Second feed run: agent-1 now has an open payout → nothing fed.
+	fed, err = acts.FeedMatured(ctx, FeedMaturedInput{Limit: 100})
+	require.NoError(t, err)
+	require.Empty(t, fed)
 }

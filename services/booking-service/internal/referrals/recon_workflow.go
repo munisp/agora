@@ -3,6 +3,7 @@ package referrals
 import (
 	"time"
 
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -46,6 +47,8 @@ type ReconResult struct {
 	Checked    int      `json:"checked"`
 	Mismatched int      `json:"mismatched"`
 	PayoutIDs  []string `json:"payout_ids,omitempty"`
+	// Fed counts payouts queued by the feed step (SPEC-W44 W-B/S1-F7-08).
+	Fed int `json:"fed"`
 }
 
 // CommissionReconWorkflow fans the candidate scan out into one check
@@ -68,12 +71,42 @@ func CommissionReconWorkflow(ctx workflow.Context, in ReconInput) error {
 	if limit <= 0 {
 		limit = DefaultReconLimit
 	}
+
+	// Feed FIRST (SPEC-W44 W-B/S1-F7-08): queue payouts for matured
+	// commission_payable balances and fan a CommissionPayoutWorkflow child
+	// out per queued payout (deterministic child ID
+	// "commission-payout-{payoutID}", REJECT_DUPLICATE → a schedule replay /
+	// double-feed is dropped, never double-paid). A feed failure is
+	// NON-FATAL to the recon run — the checks below still execute.
+	result := ReconResult{}
+	var fed []FedPayout
+	if err := workflow.ExecuteActivity(ao, ActivityPayoutFeed, FeedMaturedInput{Limit: limit}).Get(ctx, &fed); err != nil {
+		logger.Error("payout feed failed; continuing with recon checks", "error", err)
+	} else {
+		result.Fed = len(fed)
+		for _, p := range fed {
+			cwo := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
+				WorkflowID:            "commission-payout-" + p.PayoutID,
+				WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+			})
+			child := workflow.ExecuteChildWorkflow(cwo, WorkflowTypePayout, PayoutInput{
+				TenantID:   p.TenantID,
+				TenantSlug: p.TenantSlug,
+				PayoutID:   p.PayoutID,
+			})
+			// Wait only for the START (not completion): recon does not block
+			// on money movement. An AlreadyStarted error is the dedupe fence.
+			if err := child.GetChildWorkflowExecution().Get(ctx, nil); err != nil {
+				logger.Info("payout child not started (already running or rejected)",
+					"payout_id", p.PayoutID, "error", err)
+			}
+		}
+	}
+
 	var candidates []Payout
 	if err := workflow.ExecuteActivity(ao, ActivityReconFetch, ReconFetchInput{Limit: limit}).Get(ctx, &candidates); err != nil {
 		return err
 	}
-
-	result := ReconResult{}
 	for _, c := range candidates {
 		var m *ReconMismatch
 		err := workflow.ExecuteActivity(ao, ActivityReconCheck,

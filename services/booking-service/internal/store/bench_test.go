@@ -20,6 +20,11 @@ import (
 // packages/tests is 5432/5433/5434/5544/5546/5547/5548/5561-5566.
 const benchPort = 5570
 
+// benchGuard keeps the K-01 in-transaction overlap re-check but with a
+// capacity the seeded slot round-robin (i%2000 hours) can never exceed —
+// the benchmark measures the insert path, not contention.
+var benchGuard = SlotGuard{Capacity: 1_000_000}
+
 func newBenchStore(b *testing.B) *Store {
 	b.Helper()
 	if testing.Short() {
@@ -110,7 +115,7 @@ func BenchmarkCreateBookingTx(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bk := benchBooking(tenantID, offeringID, memberID, contactID, i)
-		if err := st.CreateBookingTx(ctx, bk, "bench.booking.created", []byte(`{"bench":true}`)); err != nil {
+		if err := st.CreateBookingTx(ctx, bk, benchGuard, "bench.booking.created", []byte(`{"bench":true}`)); err != nil {
 			b.Fatalf("create booking %d: %v", i, err)
 		}
 	}
@@ -127,7 +132,7 @@ func BenchmarkListBookings(b *testing.B) {
 	const seeded = 200
 	for i := 0; i < seeded; i++ {
 		bk := benchBooking(tenantID, offeringID, memberID, contactID, i)
-		if err := st.CreateBookingTx(ctx, bk, "bench.booking.created", []byte(`{"bench":true}`)); err != nil {
+		if err := st.CreateBookingTx(ctx, bk, benchGuard, "bench.booking.created", []byte(`{"bench":true}`)); err != nil {
 			b.Fatalf("seed booking %d: %v", i, err)
 		}
 	}

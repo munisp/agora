@@ -23,6 +23,10 @@ const (
 	ActivityPayoutTransfer   = "CommissionPayoutTransfer"
 	ActivityPayoutMarkPaid   = "CommissionPayoutMarkPaid"
 	ActivityPayoutMarkFailed = "CommissionPayoutMarkFailed"
+	// ActivityPayoutFeed (SPEC-W44 W-B/S1-F7-08): the nightly recon first
+	// feeds matured commission_payable balances into the payout queue, then
+	// fans a CommissionPayoutWorkflow child out per queued payout.
+	ActivityPayoutFeed = "CommissionPayoutFeedMatured"
 )
 
 // PayoutInput starts one CommissionPayoutWorkflow (workflow ID

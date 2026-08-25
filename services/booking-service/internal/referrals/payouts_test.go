@@ -242,6 +242,11 @@ func TestClassifyMismatch(t *testing.T) {
 		{PayoutStatusProcessing, "pending", ""},
 		{PayoutStatusQueued, "success", ""},
 		{PayoutStatusFailed, "failed", ""},
+		// SPEC-W43 K-12: failed-with-provider-ref is reconciled — provider
+		// success after we marked failed is an alertable mismatch.
+		{PayoutStatusFailed, "success", MismatchFailedSucceeded},
+		{PayoutStatusFailed, "reversed", ""},
+		{PayoutStatusFailed, "pending", ""},
 	}
 	for _, c := range cases {
 		require.Equal(t, c.want, classifyMismatch(c.ledger, c.provider),
