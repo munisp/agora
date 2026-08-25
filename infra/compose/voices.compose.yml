@@ -6,8 +6,14 @@
 #
 #   docker compose -f docker-compose.yml -f infra/compose/voices.compose.yml up -d
 #
-# Both services run REAL inference unless the mock is EXPLICITLY opted into
-# (W39 SIM-013 — mocks default OFF):
+# Both services run REAL inference when started via THIS compose file
+# (W39 SIM-013 / SPEC-W44 F16-4 — single source of truth):
+#   MMS_MOCK / XTTS_MOCK default to 0 HERE (explicit `${VAR:-0}` below) —
+#   compose is authoritative for deployments.
+#   NOTE the deliberate asymmetry: the code-level default in
+#   services/mms-tts / services/xtts-tts is MOCK ON ("1") so that bare
+#   pytest/e2e runs never download model checkpoints; running the sidecars
+#   outside this compose (or setting the vars to 1 here) selects the mock:
 #   MMS_MOCK=1  deterministic sine wav, no model downloads (e2e only)
 #   XTTS_MOCK=1 same posture (e2e only; real XTTS needs a GPU, >=6GB VRAM —
 #                build the CUDA variant per services/xtts-tts/Dockerfile and

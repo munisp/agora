@@ -1,10 +1,17 @@
 #!/bin/sh
-# OpenDesk backup — SPEC-W3 §1.
+# OpenDesk backup — SPEC-W3 §1, hardened SPEC-W43 G-04 (DATA#8/REL#14).
 #
 # Captures a timestamped snapshot of the three stateful systems:
-#   1. Postgres  — pg_dump -Fc per database (all service DBs)
+#   1. Postgres  — pg_dumpall --globals-only (roles/tablespaces) +
+#                  pg_dump -Fc per database (all service DBs)
 #   2. MinIO     — mc mirror of the `lake` and `exports` buckets
 #   3. TigerBeetle — data-file copy (container paused during copy)
+#
+# FAIL-LOUD CONTRACT (W43): ANY failed target (pg_dump, globals dump, mc
+# mirror, TB copy) makes the script exit NONZERO. The manifest records a
+# per-target success boolean (`<target>: ok|failed`) which restore.sh's
+# pre-flight reads: it refuses to destroy live state from an incomplete
+# snapshot. "Mostly worked" is a backup failure, not a backup.
 #
 # Rotation: keeps the newest BACKUP_KEEP (default 7) timestamped dirs
 # (restic-style: each snapshot is a self-contained directory).
@@ -50,6 +57,15 @@ warn() { printf '%s WARN %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
 mkdir -p "$DEST/postgres" "$DEST/minio" "$DEST/tigerbeetle"
 
+# Per-target success booleans (written to the manifest; consumed by
+# restore.sh's pre-flight). result <key> <ok|failed>.
+RESULTS=""
+FAILED=0
+result() {
+  RESULTS="${RESULTS}${1}: ${2}\n"
+  if [ "$2" != "ok" ]; then FAILED=1; fi
+}
+
 # Absolute path / volume source for the MinIO mirror container mount.
 if [ -n "${BACKUP_DOCKER_VOLUME:-}" ]; then
   MOUNT_SRC="$BACKUP_DOCKER_VOLUME"
@@ -58,15 +74,32 @@ else
   MOUNT_SRC="$(cd "$BACKUP_ROOT" && pwd)"
 fi
 
-# ---------------- 1. Postgres: pg_dump per database -------------------------
+# ---------------- 1a. Postgres: cluster globals (roles/tablespaces) ---------
+# pg_dump never carries cluster-global roles; without this a restore into a
+# FRESH cluster has no app_* roles to grant (restore.sh applies this file
+# plus the 05-app-roles.sql role layer before pg_restore).
+log "postgres: dumping cluster globals -> $DEST/postgres/globals.sql"
+if docker exec "$POSTGRES_CONTAINER" pg_dumpall -U "$PG_USER" --globals-only > "$DEST/postgres/globals.sql" 2>"$DEST/postgres/globals.err"    && [ -s "$DEST/postgres/globals.sql" ]; then
+  rm -f "$DEST/postgres/globals.err"
+  result postgres_globals ok
+  log "  globals: ok ($(wc -c < "$DEST/postgres/globals.sql" | tr -d ' ') bytes)"
+else
+  warn "  globals: pg_dumpall --globals-only failed (see globals.err)"
+  rm -f "$DEST/postgres/globals.sql"
+  result postgres_globals failed
+fi
+
+# ---------------- 1b. Postgres: pg_dump per database ------------------------
 log "postgres: dumping databases -> $DEST/postgres"
 for db in $PG_DBS; do
-  if docker exec "$POSTGRES_CONTAINER" pg_dump -U "$PG_USER" -Fc "$db" > "$DEST/postgres/$db.dump" 2>"$DEST/postgres/$db.err"; then
+  if docker exec "$POSTGRES_CONTAINER" pg_dump -U "$PG_USER" -Fc "$db" > "$DEST/postgres/$db.dump" 2>"$DEST/postgres/$db.err"      && [ -s "$DEST/postgres/$db.dump" ]; then
     rm -f "$DEST/postgres/$db.err"
+    result "postgres_db_$db" ok
     log "  $db: ok ($(wc -c < "$DEST/postgres/$db.dump" | tr -d ' ') bytes)"
   else
-    warn "  $db: pg_dump failed (see $db.err) — DB may not exist yet; continuing"
+    warn "  $db: pg_dump failed (see $db.err)"
     rm -f "$DEST/postgres/$db.dump"
+    result "postgres_db_$db" failed
   fi
 done
 
@@ -80,9 +113,11 @@ for bucket in $MINIO_BUCKETS; do
         mc alias set local '$MINIO_ALIAS_URL' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null &&
         mc mirror --overwrite 'local/$bucket' '/backup/$TS/minio/$bucket'
       "; then
+    result "minio_bucket_$bucket" ok
     log "  $bucket: ok"
   else
-    warn "  $bucket: mirror failed (bucket may not exist yet); continuing"
+    warn "  $bucket: mirror failed"
+    result "minio_bucket_$bucket" failed
   fi
 done
 
@@ -94,13 +129,21 @@ log "tigerbeetle: copying $TB_DATA_FILE (pause=$TB_PAUSE)"
 if [ "$TB_PAUSE" = "1" ]; then
   docker pause "$TB_CONTAINER" >/dev/null
 fi
-if docker cp "$TB_CONTAINER:$TB_DATA_FILE" "$DEST/tigerbeetle/0_0.tigerbeetle"; then
-  log "  tigerbeetle: ok"
-else
-  warn "  tigerbeetle: copy failed; continuing"
+TB_OK=0
+if docker cp "$TB_CONTAINER:$TB_DATA_FILE" "$DEST/tigerbeetle/0_0.tigerbeetle"    && [ -s "$DEST/tigerbeetle/0_0.tigerbeetle" ]; then
+  TB_OK=1
 fi
 if [ "$TB_PAUSE" = "1" ]; then
+  # Always unpause, even when the copy failed.
   docker unpause "$TB_CONTAINER" >/dev/null
+fi
+if [ "$TB_OK" = "1" ]; then
+  result tigerbeetle ok
+  log "  tigerbeetle: ok"
+else
+  warn "  tigerbeetle: copy failed"
+  rm -f "$DEST/tigerbeetle/0_0.tigerbeetle"
+  result tigerbeetle failed
 fi
 
 # ---------------- Manifest + rotation ---------------------------------------
@@ -109,6 +152,11 @@ fi
   echo "postgres_dbs: $PG_DBS"
   echo "minio_buckets: $MINIO_BUCKETS"
   echo "tigerbeetle_file: $TB_DATA_FILE"
+  echo "# per-target success booleans (SPEC-W43 G-04; restore.sh pre-flight"
+  echo "# refuses to restore a snapshot whose required artifacts are absent)"
+  # RESULTS accumulates literal 
+-separated lines.
+  printf '%b' "$RESULTS"
 } > "$DEST/manifest.txt"
 log "manifest written"
 
@@ -123,5 +171,11 @@ if [ "$COUNT" -gt "$KEEP" ]; then
     log "rotation: dropping $d"
     rm -rf "$d"
   done
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  warn "FAILED targets recorded in $DEST/manifest.txt — snapshot $TS is INCOMPLETE;"
+  warn "restore.sh pre-flight will refuse it. Fix the failing target and re-run."
+  exit 1
 fi
 log "done: $DEST ($COUNT snapshot(s), keep $KEEP)"
