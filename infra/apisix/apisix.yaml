@@ -283,9 +283,12 @@ global_rules:
       # `x-user-roles`, booking/identity `X-User-Id`/`X-User-Email`, graph /
       # credit-bureau `X-Tenant-Id`, booking tenant middleware `X-Tenant-Slug`,
       # ...) trust these headers on the assumption that the gateway injects
-      # them — the gateway never did, so any caller could self-assign roles /
-      # tenants. The rewrite phase runs before proxying; services behind the
-      # gateway must derive identity from the validated JWT claims instead.
+      # them. SPEC-W44 K1: on OIDC routes the gateway now DOES re-inject
+      # X-Tenant-Slugs / X-User-Id / X-User-Roles from the verified JWT (see
+      # the per-route serverless-pre-function); everything else in this strip
+      # list stays stripped end-to-end. The rewrite phase runs before
+      # proxying; services behind the gateway must derive identity from the
+      # injected claim-derived headers only (never caller-sent x-*).
       # Public/webhook routes do not trust these headers, so stripping them
       # there is harmless. Enumerated from `grep -ri "x-user-\|x-tenant-" services/`.
       serverless-pre-function:
@@ -300,12 +303,20 @@ global_rules:
               "x-tenant",
               "x-tenant-id",
               "x-tenant-slug",
+              -- SPEC-W44 K1: x-tenant-slugs is RE-INJECTED from the verified
+              -- JWT on OIDC routes (serverless-pre-function below); the
+              -- caller-sent copy must be stripped first or a client could
+              -- self-assign tenant membership.
+              "x-tenant-slugs",
               -- rate-limit example key (api-plan-tier-example, currently
               -- disabled); strip so a client can never pick its own bucket.
               "x-tenant-plan",
-              -- W39 billing internal auth: x-internal-token is INJECTED by the
-              -- gateway on billing routes only (see api-billing). A client
-              -- must never supply its own — strip it everywhere first.
+              -- Billing internal auth (W39 / SPEC-W44 F1): x-internal-token
+              -- authenticates service-to-service callers IN-CLUSTER only —
+              -- the gateway NEVER injects it (injecting it on the billing
+              -- OIDC route silently authenticated every human call as a
+              -- service caller and disabled billing's K1/K6 gates). A client
+              -- must never supply its own — strip it everywhere.
               "x-internal-token",
             }
             return function()
@@ -324,6 +335,188 @@ global_rules:
           - deployment=opendesk-dev
 
 routes:
+  # ---- SPEC-W43 G-02 (C7): internal/dev surfaces are NOT public -----------
+  # Temporal activity endpoints (*/activities/*), service-internal endpoints
+  # (*/internal/*) and the notification dev console (/api/notifications/dev/*)
+  # must never be reachable through the public API prefix — they are
+  # network-internal (direct service-to-service) or internal-token gated.
+  # Pattern proven by api-agents-resolve-internal below; here the uri-blocker
+  # plugin does the deny (route match IS the blocklist: block_rules ".*"
+  # rejects everything that lands on these routes). priority 10 makes these
+  # routes win over the default-priority /api/<svc>/* OIDC wildcards; both
+  # the bare path and the /* variant are listed (trailing-slash fallthrough,
+  # W39 INFRA-002). 404 like agents-resolve: no surface disclosure.
+
+  - id: block-identity-internal
+    uris:
+      - /api/identity/activities
+      - /api/identity/activities/*
+      - /api/identity/internal
+      - /api/identity/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-bookings-internal
+    uris:
+      - /api/bookings/activities
+      - /api/bookings/activities/*
+      - /api/bookings/internal
+      - /api/bookings/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-payments-internal
+    uris:
+      - /api/payments/activities
+      - /api/payments/activities/*
+      - /api/payments/internal
+      - /api/payments/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-billing-internal
+    uris:
+      - /api/billing/activities
+      - /api/billing/activities/*
+      - /api/billing/internal
+      - /api/billing/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-knowledge-internal
+    uris:
+      - /api/knowledge/activities
+      - /api/knowledge/activities/*
+      - /api/knowledge/internal
+      - /api/knowledge/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-conversations-internal
+    uris:
+      - /api/conversations/activities
+      - /api/conversations/activities/*
+      - /api/conversations/internal
+      - /api/conversations/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-agents-internal
+    uris:
+      - /api/agents/activities
+      - /api/agents/activities/*
+      - /api/agents/internal
+      - /api/agents/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-capture-schemas-internal
+    uris:
+      - /api/capture-schemas/activities
+      - /api/capture-schemas/activities/*
+      - /api/capture-schemas/internal
+      - /api/capture-schemas/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-capture-records-internal
+    uris:
+      - /api/capture-records/activities
+      - /api/capture-records/activities/*
+      - /api/capture-records/internal
+      - /api/capture-records/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-notifications-internal
+    uris:
+      - /api/notifications/activities
+      - /api/notifications/activities/*
+      - /api/notifications/internal
+      - /api/notifications/internal/*
+      - /api/notifications/dev
+      - /api/notifications/dev/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-graph-internal
+    uris:
+      - /api/graph/activities
+      - /api/graph/activities/*
+      - /api/graph/internal
+      - /api/graph/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  - id: block-civic-internal
+    uris:
+      - /api/civic/activities
+      - /api/civic/activities/*
+      - /api/civic/internal
+      - /api/civic/internal/*
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
   # ---- Service APIs: JWT (HS256 dev) + redis-backed rate limiting + CORS ----
   - id: api-identity
     uris:
@@ -342,6 +535,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -440,6 +692,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -477,6 +788,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 300
         time_window: 60
@@ -500,18 +870,21 @@ routes:
   # Billing engine (SPEC-W7 Part B): standard authenticated service route —
   # same jwt (openid-connect bearer_only) + rewrite + limit-count pattern as
   # api-payments. Role enforcement (owner/admin for generate/void) happens in
-  # the service via the x-user-roles header; tenant scoping via X-Tenant-ID.
+  # the service via the gateway-injected X-User-Roles header (SPEC-W44 K6);
+  # tenant scoping via the K1 X-Tenant-Slugs binding (uuid-form tenant params
+  # are resolved slug->uuid against identity-service inside billing's
+  # bind_tenant).
   #
-  # W39 internal-auth contract: every request to billing must carry
-  # x-internal-token matching the billing-engine BILLING_INTERNAL_TOKEN env.
-  # The global serverless-pre-function above STRIPS any client-supplied
-  # x-internal-token; this route then INJECTS the configured value via
-  # proxy-rewrite headers.set, so the token billing sees always comes from
-  # the gateway. DEV-ONLY STATIC VALUE below — mirrors the jwt-auth consumer
-  # secret convention in this file (gateway static secrets are not
-  # env-driven in dev; see .env.example "Gateway static secrets"). It MUST
-  # match BILLING_INTERNAL_TOKEN in docker-compose.yml / .env and be rotated
-  # for any non-local deployment (docs/runbooks/secrets.md).
+  # SPEC-W44 F1: this route must NEVER inject x-internal-token. The W39-era
+  # design injected the BILLING_INTERNAL_TOKEN value right here via
+  # proxy-rewrite headers.set — that silently authenticated EVERY
+  # gateway-proxied HUMAN call as an internal service caller, turning
+  # billing's tenant binding (K1) and money-role gate (K6) into no-ops (any
+  # Keycloak user could generate/issue/void invoices for ANY tenant).
+  # Service callers reach billing in-cluster (not via the gateway) and
+  # present BILLING_INTERNAL_TOKEN themselves; the global
+  # serverless-pre-function above still strips any client-supplied
+  # x-internal-token, so a gateway call can never carry one.
   - id: api-billing
     uris:
       - /api/billing/*
@@ -523,16 +896,71 @@ routes:
         regex_uri:
           - "^/api/billing/?(.*)"
           - "/$1"
-        headers:
-          set:
-            # DEV ONLY static gateway secret — see block comment above.
-            x-internal-token: opendesk-dev-billing-internal-token-change-in-prod
       openid-connect:
         discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
         bearer_only: true
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 300
         time_window: 60
@@ -570,6 +998,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -607,6 +1094,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -648,6 +1194,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -706,6 +1311,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -745,6 +1409,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 300
         time_window: 60
@@ -786,6 +1509,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 300
         time_window: 60
@@ -856,6 +1638,65 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%−", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
       limit-count:
         count: 300
         time_window: 60
@@ -1211,5 +2052,55 @@ routes:
         expose_headers: "*"
         max_age: 3600
         allow_credential: false
+
+  # ---- credit-bureau (SPEC-W33 §3 B2, F16-1): COMMENT-GATED, profile-gated ---
+  # The credit-bureau service (:7022) is an ORPHAN by default: it runs only
+  # under the compose profile `experimental` (see docker-compose.yml), and
+  # booking-service lending falls back to its internal rule score when the
+  # service is absent (WARN once per boot, per-call debug). Keep this route
+  # commented out unless the experimental profile is running — APISIX
+  # standalone fails config validation on a route whose upstream never
+  # resolves healthily, and an always-on route would advertise a surface the
+  # base stack does not run. When enabling, ALSO uncomment the upstream below.
+  #
+  # upstreams:
+  #   - id: credit-bureau
+  #     type: roundrobin
+  #     nodes:
+  #       "credit-bureau:7022": 1
+  #     retries: 1
+  #     timeout: {connect: 5, send: 30, read: 30}
+  #
+  # routes:
+  #   - id: api-credit
+  #     uris:
+  #       - /api/credit/*
+  #       - /api/credit
+  #     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+  #     upstream_id: credit-bureau
+  #     plugins:
+  #       proxy-rewrite:
+  #         regex_uri:
+  #           - "^/api/credit/?(.*)"
+  #           - "/$1"
+  #       openid-connect:
+  #         discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+  #         bearer_only: true
+  #         realm: opendesk
+  #         client_id: admin-web
+  #         use_pkce: true
+  #       # NOTE: when uncommenting, copy the current K1 serverless-pre-function
+  #       # injection block from any api-* route above (X-Tenant-Slugs +
+  #       # X-User-Id + X-User-Roles) — do not write a stale variant.
+  #       limit-count:
+  #         count: 300
+  #         time_window: 60
+  #         rejected_code: 429
+  #         key: remote_addr
+  #         policy: redis
+  #         redis_host: redis
+  #         redis_port: 6379
+  #         redis_database: 0
+  #         redis_timeout: 1000
 
 #END
