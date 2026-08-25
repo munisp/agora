@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/civic"
+	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/incidents"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
@@ -355,13 +356,73 @@ func TestCivicRoutesWiring(t *testing.T) {
 		t.Fatalf("operator list without tenant header = %d, want 400", rec.Code)
 	}
 
-	// Internal sla-breach: tenant middleware applies but NO Permify guard
-	// (X-Tenant-Slug only, service-to-service).
+	// Internal sla-breach (SPEC-W44 W-B/S1-F7-05): internauth runs FIRST —
+	// with BOOKING_INTERNAL_TOKEN unset the route fails closed with 503
+	// (never reaches the tenant middleware).
 	req = httptest.NewRequest(http.MethodPost, "/v1/civic/internal/cases/GOV-IKEJA-00-2026-000001/sla-breach", strings.NewReader(`{"kind":"ack"}`))
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("internal sla-breach without tenant header = %d, want 400", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("internal sla-breach with token unset = %d, want 503 (fail closed)", rec.Code)
+	}
+}
+
+// SPEC-W44 W-B/S1-F7-05 (K2): the sla-breach callback is internauth-guarded
+// — X-Internal-Token vs Deps.InternalToken (BOOKING_INTERNAL_TOKEN),
+// constant-time; 503 fail-closed when unset, 401 missing/wrong, 200 correct.
+func TestCivicSLABreachInternAuth(t *testing.T) {
+	fx := newCivicHTTPFixture(t)
+	c := fx.submitCase(t, civic.ReportInput{
+		CategorySlug: "roads", Description: "Deep pothole at the junction blocking one lane",
+		ReporterPhoneE164: "+2348012345678",
+	})
+
+	// The tenant middleware behind internAuth resolves via Deps.Resolver —
+	// point it at a stub identity-service (direct-HTTP mode).
+	identity := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/tenants/"+fx.tenant.Slug {
+			http.Error(w, "nope", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fx.tenant)
+	}))
+	defer identity.Close()
+	resolver := bookingops.NewTenantResolver(daprc.New("localhost", 1), "identity", time.Minute, zap.NewNop(),
+		bookingops.WithIdentityBaseURL(identity.URL))
+
+	post := func(d Deps, token string) *httptest.ResponseRecorder {
+		d.Logger = zap.NewNop()
+		d.Civic = fx.svc
+		d.Resolver = resolver
+		r := NewRouter(d)
+		req := httptest.NewRequest(http.MethodPost, "/v1/civic/internal/cases/"+c.Ref+"/sla-breach",
+			strings.NewReader(`{"kind":"ack"}`))
+		req.Header.Set("X-Tenant-Slug", fx.tenant.Slug)
+		if token != "" {
+			req.Header.Set("X-Internal-Token", token)
+		}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 503: token unset on the server (fail closed), even with a header sent.
+	if rec := post(Deps{}, "anything"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unset token = %d, want 503", rec.Code)
+	}
+	// 401: token configured, header missing.
+	if rec := post(Deps{InternalToken: "booking-tok"}, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing header = %d, want 401", rec.Code)
+	}
+	// 401: wrong token.
+	if rec := post(Deps{InternalToken: "booking-tok"}, "wrong-tok"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token = %d, want 401", rec.Code)
+	}
+	// 200: correct token + tenant slug → the breach flag is set.
+	rec := post(Deps{InternalToken: "booking-tok"}, "booking-tok")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"sla_breach_ack":true`) {
+		t.Fatalf("correct token = %d %s", rec.Code, rec.Body)
 	}
 }
 
