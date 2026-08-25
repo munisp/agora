@@ -43,6 +43,8 @@ mod imp {
         partitions: i32,
         shutdown: watch::Receiver<bool>,
     ) {
+        // Initial beat: the tail is alive from spawn, before connect.
+        crate::health::FLUVIO_TRANSCRIPTS.beat();
         let config = fluvio::config::FluvioConfig::new(endpoint.clone());
         let fluvio = match fluvio::Fluvio::connect_with_config(&config).await {
             Ok(f) => f,
@@ -55,6 +57,12 @@ mod imp {
 
         let mut handles = Vec::new();
         for partition in 0..partitions {
+            // fluvio 0.21 partition ids are u32; FLUVIO_PARTITIONS is i32 in
+            // config — a negative value is a config bug, not a panic.
+            let Ok(partition) = u32::try_from(partition) else {
+                warn!(partition, "negative fluvio partition id; skipping");
+                continue;
+            };
             let bus = bus.clone();
             let topic = topic.clone();
             let mut shutdown = shutdown.clone();
@@ -73,6 +81,12 @@ mod imp {
                         return;
                     }
                 };
+                // F15-07: heartbeat independent of record flow, so an idle
+                // partition does not read as a dead consumer on /healthz.
+                let mut beat = tokio::time::interval(std::time::Duration::from_secs(
+                    crate::health::BEAT_INTERVAL_SECS,
+                ));
+                beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
                         changed = shutdown.changed() => {
@@ -80,6 +94,9 @@ mod imp {
                                 info!(partition, "fluvio tail shutting down");
                             }
                             break;
+                        }
+                        _ = beat.tick() => {
+                            crate::health::FLUVIO_TRANSCRIPTS.beat();
                         }
                         item = stream.next() => {
                             match item {
@@ -131,7 +148,10 @@ pub async fn run(
     partitions: i32,
     shutdown: watch::Receiver<bool>,
 ) {
-    imp::run_live(bus, endpoint, topic, partitions, shutdown).await
+    imp::run_live(bus, endpoint, topic, partitions, shutdown).await;
+    // F15-07: any return path (connect failure, all partitions dead,
+    // shutdown) marks the consumer exited so /healthz goes degraded.
+    crate::health::FLUVIO_TRANSCRIPTS.mark_exited();
 }
 
 #[cfg(not(feature = "fluvio-live"))]
@@ -151,8 +171,28 @@ pub async fn run(
          (explicit opt-in no-op stub; rebuild with --features fluvio-live for \
          the real consumer). Kafka booking events remain the primary source"
     );
-    // Stay alive (so supervision restarts don't flap) until shutdown.
-    let _ = shutdown.changed().await;
+    // Stay alive (so supervision restarts don't flap) until shutdown. The
+    // stub still beats: the task is alive and doing exactly what the
+    // operator explicitly configured, so /healthz tracks task liveness, not
+    // transcript flow (transcript flow absence is loud in logs/metrics).
+    crate::health::FLUVIO_TRANSCRIPTS.beat();
+    let mut beat = tokio::time::interval(std::time::Duration::from_secs(
+        crate::health::BEAT_INTERVAL_SECS,
+    ));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() {
+                    break;
+                }
+            }
+            _ = beat.tick() => {
+                crate::health::FLUVIO_TRANSCRIPTS.beat();
+            }
+        }
+    }
+    crate::health::FLUVIO_TRANSCRIPTS.mark_exited();
 }
 
 #[cfg(test)]

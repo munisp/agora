@@ -67,8 +67,15 @@ def _verify_es256(signing_input: bytes, signature: bytes, key_pem: str) -> bool:
         return False
 
 
-def decode_and_verify(token: str, key: str, algorithm: str) -> dict[str, Any]:
-    """Verify signature + expiry, return claims. Raises AuthError."""
+def decode_and_verify(
+    token: str,
+    key: str,
+    algorithm: str,
+    issuer: str | None = None,
+    audience: str | None = None,
+) -> dict[str, Any]:
+    """Verify signature + REQUIRED exp (+ iss/aud when configured), return
+    claims. Raises AuthError (401)."""
     algorithm = algorithm.upper()
     if algorithm not in _SUPPORTED_ALGS:
         raise AuthError(f"unsupported JWT_ALGORITHM {algorithm!r}")
@@ -95,9 +102,25 @@ def decode_and_verify(token: str, key: str, algorithm: str) -> dict[str, Any]:
     if not ok:
         raise AuthError("JWT signature verification failed")
 
+    # SPEC-W43 Y-07: exp is REQUIRED — a token without an expiry never
+    # authenticates.
     exp = claims.get("exp")
-    if exp is not None and float(exp) <= time.time():
+    if exp is None:
+        raise AuthError("JWT missing exp claim")
+    try:
+        expired = float(exp) <= time.time()
+    except (TypeError, ValueError):
+        raise AuthError("JWT malformed exp claim") from None
+    if expired:
         raise AuthError("JWT expired")
+    # iss/aud validated when GRAPH_JWT_ISSUER / GRAPH_JWT_AUDIENCE are set.
+    if issuer is not None and claims.get("iss") != issuer:
+        raise AuthError("JWT issuer mismatch")
+    if audience is not None:
+        aud = claims.get("aud")
+        ok = aud == audience or (isinstance(aud, list) and audience in aud)
+        if not ok:
+            raise AuthError("JWT audience mismatch")
     return claims
 
 
@@ -113,7 +136,13 @@ def tenant_from_request(
             raise AuthError("Authorization must be 'Bearer <token>'")
         if not settings.jwt_public_key:
             raise AuthError("Bearer auth not configured on this deployment")
-        claims = decode_and_verify(token, settings.jwt_public_key, settings.jwt_algorithm)
+        claims = decode_and_verify(
+            token,
+            settings.jwt_public_key,
+            settings.jwt_algorithm,
+            issuer=settings.jwt_issuer or None,
+            audience=settings.jwt_audience or None,
+        )
         sub = claims.get("sub")
         if not sub or not isinstance(sub, str):
             raise AuthError("JWT missing sub claim")

@@ -48,6 +48,14 @@ class Settings:
     # (mirrors the analytics-pipeline sidecar conventions for dev compose).
     jwt_public_key: str = field(default_factory=lambda: os.getenv("JWT_PUBLIC_KEY", ""))
     jwt_algorithm: str = field(default_factory=lambda: os.getenv("JWT_ALGORITHM", "RS256"))
+    # SPEC-W44 S1-F6-01: fail-closed JWT requirement. When REQUIRE_JWT=1 and
+    # JWT_PUBLIC_KEY is empty the service would silently run in dev mode
+    # (X-Tenant-Id header IS the credential) — load_settings() raises instead.
+    require_jwt: bool = field(default_factory=lambda: _bool("REQUIRE_JWT", False))
+    # SPEC-W43 Y-07: exp is REQUIRED on every JWT (401 when absent); iss/aud
+    # are validated when these are configured (empty = not enforced).
+    jwt_issuer: str = field(default_factory=lambda: os.getenv("GRAPH_JWT_ISSUER", ""))
+    jwt_audience: str = field(default_factory=lambda: os.getenv("GRAPH_JWT_AUDIENCE", ""))
 
     # Internal service-to-service write-back API (SPEC-W29 §3 WS-B): the
     # X-Internal-Token header must equal this value (constant-time compare).
@@ -99,4 +107,13 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    # SPEC-W44 S1-F6-01: REQUIRE_JWT=1 + no JWT_PUBLIC_KEY means every request
+    # would fall into the header-trust dev mode — refuse to boot.
+    if settings.require_jwt and not settings.jwt_public_key:
+        raise RuntimeError(
+            "REQUIRE_JWT=1 but JWT_PUBLIC_KEY is empty: graph-service would "
+            "trust caller-sent X-Tenant-Id headers (dev mode). Set "
+            "JWT_PUBLIC_KEY (RS256/ES256 PEM) or explicitly unset REQUIRE_JWT."
+        )
+    return settings

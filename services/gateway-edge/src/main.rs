@@ -10,6 +10,7 @@ mod bus;
 mod config;
 mod enriched_consumer;
 mod fluvio_consumer;
+mod health;
 mod kafka_consumer;
 mod metrics;
 mod ws;
@@ -42,9 +43,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = config::Config::from_env();
+    // SEC#12: hard startup error on invariant violations (KEYCLOAK_AUDIENCE
+    // required outside explicit dev posture) — never boot half-configured.
+    if let Err(e) = cfg.validate() {
+        tracing::error!(error = %e, "gateway-edge configuration invalid; refusing to start");
+        return Err(e.into());
+    }
     info!(
         port = cfg.port,
         auth_disabled = cfg.auth_disabled,
+        dev_mode = cfg.dev_mode,
         "starting gateway-edge"
     );
 
@@ -136,11 +144,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "service": "gateway-edge",
-    }))
+/// F15-07: dependency-aware health. 200 {"status":"ok"} only while every
+/// consumer task (Kafka booking events, Kafka enriched turns, Fluvio
+/// transcript tail) is alive and has beaten within the last 30s; otherwise
+/// 503 {"status":"degraded"} with per-consumer detail. `/metrics` stays
+/// static and is unaffected.
+async fn healthz() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let (all_healthy, consumers) = health::report();
+    let detail: Vec<serde_json::Value> = consumers
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "healthy": c.healthy,
+                "exited": c.exited,
+                "last_beat_age_secs": c.age_secs,
+            })
+        })
+        .collect();
+    let (code, status) = if all_healthy {
+        (axum::http::StatusCode::OK, "ok")
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "degraded")
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "service": "gateway-edge",
+            "consumers": detail,
+        })),
+    )
 }
 
 async fn metrics_handler() -> (
@@ -174,4 +208,44 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
     }
     info!("shutdown signal received");
     let _ = shutdown_tx.send(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F15-07 contract: /healthz is 503 {"status":"degraded"} when any
+    /// consumer heartbeat is stale > 30s or the task exited, and 200
+    /// {"status":"ok"} while all consumers beat within the window.
+    #[tokio::test]
+    async fn healthz_reflects_consumer_liveness() {
+        // Stale (never beaten in the test process) -> degraded 503.
+        let (code, Json(body)) = healthz().await;
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["service"], "gateway-edge");
+        assert_eq!(body["consumers"].as_array().unwrap().len(), 3);
+
+        // All consumers beating -> ok 200.
+        for c in health::ALL {
+            c.beat();
+        }
+        let (code, Json(body)) = healthz().await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+
+        // One exited consumer (fresh beat notwithstanding) -> degraded 503.
+        health::KAFKA_ENRICHED.mark_exited();
+        let (code, Json(body)) = healthz().await;
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
+        let enriched = body["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "kafka-enriched-turns")
+            .unwrap();
+        assert_eq!(enriched["exited"], true);
+        assert_eq!(enriched["healthy"], false);
+    }
 }
