@@ -684,6 +684,10 @@ async def build_voice_agent(
 async def entrypoint(ctx: agents.JobContext) -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
+    # W44/F15-09: job processes record the per-call voice_* series into the
+    # shared app/metrics.py registry — expose it for Prometheus here too
+    # (first binder wins; SO_REUSEPORT lets multiple job procs share 9464).
+    _start_worker_metrics(settings)
     dapr = DaprClient(settings.dapr_base_url, settings.http_timeout_s)
 
     await ctx.connect()
@@ -809,9 +813,26 @@ def build_worker_options(settings: Settings) -> "agents.WorkerOptions":
         return agents.WorkerOptions(**base_kwargs)
 
 
+def _start_worker_metrics(settings: Settings) -> None:
+    """W44/F15-09: serve the app/metrics.py registry as Prometheus text on
+    VOICE_WORKER_METRICS_PORT (default 9464). Best-effort: a bind failure
+    (port already held by the supervisor or another job process) only logs."""
+    if metrics.start_http_server(settings.worker_metrics_port):
+        log.info(
+            "worker /metrics endpoint listening",
+            port=settings.worker_metrics_port,
+        )
+    elif settings.worker_metrics_port > 0:
+        log.warning(
+            "worker /metrics endpoint not started (port in use or disabled)",
+            port=settings.worker_metrics_port,
+        )
+
+
 def main() -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
+    _start_worker_metrics(settings)
     log.info(
         "starting livekit agents worker",
         backend=settings.agent_backend,
