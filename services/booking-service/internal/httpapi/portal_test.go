@@ -109,6 +109,10 @@ type portalFixture struct {
 	site      store.Site
 	offering  store.Offering
 	member    store.TeamMember
+	// slotSeq staggers fixture bookings onto distinct slots: the K-01
+	// in-transaction overlap re-check rightly rejects two capacity-1
+	// bookings on the same slot, even in fixtures.
+	slotSeq int
 }
 
 func newPortalFixture(t *testing.T) *portalFixture {
@@ -192,13 +196,15 @@ func (f *portalFixture) addContact(t *testing.T, name, phone string) (store.Cont
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	start := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+	start := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.UTC).AddDate(0, 0, 1).
+		Add(time.Duration(f.slotSeq) * 45 * time.Minute) // stagger: see slotSeq
+	f.slotSeq++
 	b := store.Booking{
 		TenantID: f.tenantID, OfferingID: f.offering.ID, TeamMemberID: f.member.ID,
 		ContactID: c.ID, StartsAt: start, EndsAt: start.Add(30 * time.Minute),
 		Status: store.StatusConfirmed, Source: "web",
 	}
-	if err := f.store.CreateBookingTx(ctx, &b, "test.events", []byte(`{}`)); err != nil {
+	if err := f.store.CreateBookingTx(ctx, &b, store.SlotGuard{}, "test.events", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
 	return c, b

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/referrals"
 	"github.com/opendesk/booking-service/internal/store"
+	"go.uber.org/zap"
 )
 
 // Referrals & commissions API (SPEC-W14 Agent A): referral CRUD + verify,
@@ -21,6 +22,16 @@ func (s *server) referralsSvc(w http.ResponseWriter) *referrals.Service {
 		return nil
 	}
 	return s.d.Referrals
+}
+
+// callerIdentity resolves the caller subject for the self-verify guard:
+// the JWT sub resolved by the tenant middleware, else the X-User-Id header
+// (SPEC-W44 W-B/S1-F7-06).
+func callerIdentity(r *http.Request) string {
+	if sub := userFrom(r.Context()); strings.TrimSpace(sub) != "" {
+		return strings.TrimSpace(sub)
+	}
+	return strings.TrimSpace(r.Header.Get("X-User-Id"))
 }
 
 // mapReferralError converts referrals/store sentinel errors to HTTP statuses.
@@ -146,6 +157,26 @@ func (s *server) verifyReferral(w http.ResponseWriter, r *http.Request) {
 	var req verifyReferralRequest
 	if !decodeJSON(w, r, &req) {
 		return
+	}
+	// SPEC-W44 W-B/S1-F7-06 self-verify guard: the referrer must not verify
+	// their own referral (409 + audit Warn). The verifier is the caller
+	// identity (JWT sub via the tenant middleware, X-User-Id header
+	// fallback); when no caller identity is resolvable the guard is skipped
+	// (unauthenticated callers can't be the referrer by construction).
+	if verifier := callerIdentity(r); verifier != "" {
+		ref, err := svc.Store.GetReferral(r.Context(), tenant.ID, id)
+		if err != nil {
+			s.mapReferralError(w, err)
+			return
+		}
+		if strings.TrimSpace(ref.ReferrerID) != "" && ref.ReferrerID == verifier {
+			s.d.Logger.Warn("referral self-verify rejected: referrer == verifier",
+				zap.String("tenant_id", tenant.ID.String()),
+				zap.String("referral_id", id.String()),
+				zap.String("referrer_id", ref.ReferrerID))
+			writeError(w, http.StatusConflict, "self-referral: the referrer cannot verify their own referral")
+			return
+		}
 	}
 	res, err := svc.Verify(r.Context(), tenant.ID, id, req.Trigger, req.BaseAmountNGN, tenant.Slug)
 	if err != nil {

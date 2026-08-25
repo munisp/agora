@@ -3,6 +3,7 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -95,7 +96,10 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 	// email-shaped sub) against team_members.email. No matching member is a
 	// 403 — the caller is authenticated but not staff of this tenant.
 	if q.Get("mine") == "true" {
-		email := parseBearerClaims(r.Header.Get("Authorization")).Email
+		// The tenant middleware already rejected malformed tokens (K-07);
+		// on any residual decode error the email stays empty (error-closed).
+		claims, _ := parseBearerClaims(r.Header.Get("Authorization"))
+		email := claims.Email
 		if email == "" {
 			email = r.Header.Get("X-User-Email")
 		}
@@ -126,6 +130,16 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.TeamMemberID = &id
+	}
+	// SPEC-W44 W-B/F15-10: ?limit= (1..500; the store clamps over-large
+	// values to 500 rather than resetting to the default).
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid limit (positive integer, clamped to 500)")
+			return
+		}
+		f.Limit = n
 	}
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
