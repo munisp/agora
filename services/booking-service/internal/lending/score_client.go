@@ -34,8 +34,69 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"go.uber.org/zap"
 )
+
+// ---------------------------------------------------------------------------
+// F16-1 (SPEC-W44 W-B): fallback visibility. The honest-degradation fallback
+// was previously SILENT — an operator could not tell whether scores came
+// from the bureau or the local rules. Posture:
+//   - SetSidecarLogger wires the service logger (main.go; nop by default).
+//   - LogCreditBureauBootStatus logs once at boot: WARN when
+//     CREDIT_BUREAU_URL is unset (every score is local rules), INFO when
+//     configured.
+//   - The FIRST unreachable/bad-answer fallback per boot logs WARN; every
+//     fallback logs DEBUG.
+// ---------------------------------------------------------------------------
+
+var (
+	sidecarLogger atomic.Value // *zap.Logger; nil → zap.NewNop()
+	warnOnce      sync.Once    // first-fallback WARN, once per boot
+)
+
+// SetSidecarLogger wires the logger the fallback path reports through
+// (SPEC-W44 W-B/F16-1). Called once from main.go.
+func SetSidecarLogger(l *zap.Logger) {
+	if l == nil {
+		l = zap.NewNop()
+	}
+	sidecarLogger.Store(l)
+}
+
+func sidecarLog() *zap.Logger {
+	if l, ok := sidecarLogger.Load().(*zap.Logger); ok && l != nil {
+		return l
+	}
+	return zap.NewNop()
+}
+
+// LogCreditBureauBootStatus logs the credit-bureau posture once at boot
+// (SPEC-W44 W-B/F16-1): WARN when CREDIT_BUREAU_URL is unset — scoring is
+// local-rules-only — INFO otherwise. Called once from main.go.
+func LogCreditBureauBootStatus() {
+	if strings.TrimSpace(os.Getenv("CREDIT_BUREAU_URL")) == "" {
+		sidecarLog().Warn("CREDIT_BUREAU_URL unset: credit scoring runs on LOCAL RULES ONLY (heuristic-v1); set CREDIT_BUREAU_URL for the bureau blend")
+		return
+	}
+	sidecarLog().Info("credit-bureau sidecar configured", zap.String("url", strings.TrimSpace(os.Getenv("CREDIT_BUREAU_URL"))))
+}
+
+// noteFallback reports one local-rules fallback (SPEC-W44 W-B/F16-1): WARN
+// on the first unreachable/bad answer per boot, DEBUG per fallback.
+func noteFallback(why string, err error) {
+	fields := []zap.Field{zap.String("reason", why)}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	sidecarLog().Debug("credit-bureau fallback: scoring with local rules", fields...)
+	warnOnce.Do(func() {
+		sidecarLog().Warn("credit-bureau sidecar unreachable or unusable — falling back to local rules (WARN once per boot; per-fallback detail at DEBUG)", fields...)
+	})
+}
 
 const (
 	// SidecarModelVersionHeuristic is the provenance id of the local
@@ -118,23 +179,28 @@ func ScoreDecisionWithSidecar(ctx context.Context, sig ScoreSignals) SidecarDeci
 	}
 	resp, err := sidecarHTTPClient.Do(req)
 	if err != nil {
-		return localSidecarDecision(sig) // timeout / transport error
+		noteFallback("timeout / transport error", err) // F16-1
+		return localSidecarDecision(sig)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 	if resp.StatusCode != http.StatusOK {
+		noteFallback("non-200 from sidecar: "+resp.Status, nil) // F16-1
 		return localSidecarDecision(sig)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
+		noteFallback("read body", err) // F16-1
 		return localSidecarDecision(sig)
 	}
 	var decoded sidecarScoreResponse
 	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return localSidecarDecision(sig) // malformed JSON
+		noteFallback("malformed JSON", err) // F16-1
+		return localSidecarDecision(sig)
 	}
 	// Sanity validation: bureau-band score + non-empty provenance.
 	if decoded.Score < sidecarScoreMin || decoded.Score > sidecarScoreMax ||
 		strings.TrimSpace(decoded.ModelVersion) == "" {
+		noteFallback("payload failed sanity validation (score band / model_version)", nil) // F16-1
 		return localSidecarDecision(sig)
 	}
 	reasons := decoded.Reasons

@@ -80,6 +80,11 @@ type Deps struct {
 	// fallback, then the body-supplied decided_by). Mirrors
 	// workforce.Deps.UserFromContext.
 	UserFromContext func(ctx context.Context) string
+	// KYCOverrideRoles (SPEC-W44 W-B/S1-F7-07) is the csv of realm roles
+	// allowed to approve via kyc_override (LENDING_KYC_OVERRIDE_ROLES,
+	// default "platform-admin"). The caller's roles come from the
+	// gateway-injected X-User-Roles header (K1).
+	KYCOverrideRoles string
 	// RealRailConfigured reports that the LIVE disbursement rail is wired
 	// (LENDING_TB_BRIDGE_URL set → the payments-service TigerBeetle
 	// bridge). When false, Disburse is only allowed under the explicit
@@ -120,6 +125,9 @@ type Handlers struct {
 	// UserFromContext extracts the caller subject (JWT sub) for
 	// decided_by; may be nil (see Deps).
 	UserFromContext func(ctx context.Context) string
+	// KYCOverrideRoles is the csv of roles allowed on the kyc_override
+	// approve path (see Deps.KYCOverrideRoles; empty → "platform-admin").
+	KYCOverrideRoles string
 	// RealRailConfigured reports the live disbursement rail is wired (see
 	// Deps.RealRailConfigured). Default false → Disburse fails closed
 	// unless ALLOW_MOCK_RAILS=1 opts into the simulation.
@@ -160,6 +168,7 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		KYCURL:             d.KYCURL,
 		KYCHTTP:            d.KYCHTTP,
 		UserFromContext:    d.UserFromContext,
+		KYCOverrideRoles:   d.KYCOverrideRoles,
 		RealRailConfigured: d.RealRailConfigured,
 	}
 	r.Route("/v1/lending", func(r chi.Router) {
@@ -227,6 +236,8 @@ func (h *Handlers) mapErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, ErrInvalidTransition), errors.Is(err, ErrKYCRequired):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrForbidden):
+		writeError(w, http.StatusForbidden, err.Error())
 	default:
 		h.log().Error("lending handler error", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "internal error")
@@ -600,6 +611,16 @@ func (h *Handlers) checkKYC(r *http.Request, tenant bookingops.TenantInfo, req p
 		if !req.KYCOverride || strings.TrimSpace(req.KYCReason) == "" {
 			return nil, fmt.Errorf("%w: kyc service not configured — pass kyc_override:true with kyc_reason", ErrKYCRequired)
 		}
+		// SPEC-W44 W-B/S1-F7-07: the override bypasses the KYC service — it
+		// is restricted to operators carrying a LENDING_KYC_OVERRIDE_ROLES
+		// role (gateway-injected X-User-Roles csv, K1). No header = no
+		// roles = denied (fail closed).
+		if !h.kycOverrideAllowed(r.Header.Get("X-User-Roles")) {
+			h.log().Warn("kyc_override rejected: caller lacks an override role",
+				zap.String("operator", h.callerSub(r)), zap.String("tenant", tenant.Slug))
+			return nil, fmt.Errorf("%w: kyc_override requires one of the roles [%s]",
+				ErrForbidden, strings.TrimSpace(h.kycOverrideRoleSet()))
+		}
 		return &KYCDecision{Mode: "override", Reason: strings.TrimSpace(req.KYCReason)}, nil
 	}
 	if req.KYC == nil || strings.TrimSpace(req.KYC.SubjectPhone) == "" ||
@@ -649,6 +670,35 @@ func (h *Handlers) checkKYC(r *http.Request, tenant bookingops.TenantInfo, req p
 	return &KYCDecision{Mode: "service", Reference: resolved.Reference, Status: resolved.Status}, nil
 }
 
+// kycOverrideRoleSet returns the configured override-roles csv (default
+// "platform-admin").
+func (h *Handlers) kycOverrideRoleSet() string {
+	if strings.TrimSpace(h.KYCOverrideRoles) == "" {
+		return "platform-admin"
+	}
+	return h.KYCOverrideRoles
+}
+
+// kycOverrideAllowed reports whether the caller's X-User-Roles csv
+// intersects the allowed override roles (SPEC-W44 W-B/S1-F7-07).
+func (h *Handlers) kycOverrideAllowed(rolesHeader string) bool {
+	if strings.TrimSpace(rolesHeader) == "" {
+		return false
+	}
+	for _, p := range strings.Split(rolesHeader, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		for _, allowed := range strings.Split(h.kycOverrideRoleSet(), ",") {
+			if p == strings.TrimSpace(allowed) && p != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // Disburse / repay / loan view / portfolio
 // ---------------------------------------------------------------------------
@@ -683,6 +733,22 @@ func (h *Handlers) Disburse(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable,
 			"lending disbursement rail not configured: set LENDING_TB_BRIDGE_URL for the live TigerBeetle bridge, or ALLOW_MOCK_RAILS=1 to opt into the dev simulation")
 		return
+	}
+	// SPEC-W44 W-B/S1-F7-07 separation of duties: the operator who APPROVED
+	// the application must not be the one disbursing it. The check applies
+	// only to a fresh approve→disburse (idempotent replays on an
+	// already-disbursed application still answer 200), and only when BOTH
+	// identities are known (approver stamped at approve, caller resolved
+	// from JWT sub / X-User-Id).
+	if app, gErr := h.Store.GetApplication(r.Context(), tenant.ID, id); gErr == nil &&
+		app.Status == StatusApproved && app.DecidedBy != nil {
+		if sub := h.callerSub(r); sub != "" && *app.DecidedBy == sub {
+			h.log().Warn("lending SoD violation: approve and disburse by the same operator",
+				zap.String("application_id", id.String()), zap.String("operator", sub),
+				zap.String("tenant", tenant.Slug))
+			writeError(w, http.StatusForbidden, "separation of duties: the approving operator cannot disburse")
+			return
+		}
 	}
 	res, err := h.Store.Disburse(r.Context(), tenant.ID, id, time.Now().UTC())
 	if err != nil {

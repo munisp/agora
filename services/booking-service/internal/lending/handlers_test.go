@@ -92,6 +92,35 @@ func patchApp(t *testing.T, r http.Handler, id uuid.UUID, body string) *httptest
 	return do(t, r, http.MethodPatch, "/v1/lending/applications/"+id.String(), body)
 }
 
+// patchAppWithRoles is patchApp carrying an X-User-Roles header (SPEC-W44
+// W-B/S1-F7-07: the kyc_override approve path requires an override role —
+// default platform-admin).
+func patchAppWithRoles(t *testing.T, r http.Handler, id uuid.UUID, body, roles string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPatch, "/v1/lending/applications/"+id.String(), strings.NewReader(body))
+	req.Header.Set("X-Tenant-Slug", "acme")
+	if roles != "" {
+		req.Header.Set("X-User-Roles", roles)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+// approveWithOverride walks an application to under_review and approves it
+// via the kyc_override path with the platform-admin role (the post-W44
+// default override role).
+func approveWithOverride(t *testing.T, r http.Handler, id uuid.UUID) {
+	t.Helper()
+	if rec := patchApp(t, r, id, `{"status":"under_review"}`); rec.Code != http.StatusOK {
+		t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := patchAppWithRoles(t, r, id,
+		`{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card"}`, "platform-admin"); rec.Code != http.StatusOK {
+		t.Fatalf("approve with override = %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 // Full lifecycle through the API with the OVERRIDE KYC path (no KYC URL
 // configured): product → application (submitted, scored) → under_review →
 // approve (override) → disburse (idempotent) → repay (clamped, repaid) →
@@ -131,12 +160,13 @@ func TestLendingLifecycle(t *testing.T) {
 	if rec := patchApp(t, r, app.ID, `{"status":"approved"}`); rec.Code != http.StatusConflict {
 		t.Fatalf("approve without override = %d (%s), want 409", rec.Code, rec.Body.String())
 	}
-	// Approve with override but no reason → 409.
-	if rec := patchApp(t, r, app.ID, `{"status":"approved","kyc_override":true}`); rec.Code != http.StatusConflict {
+	// Approve with override but no reason → 409 (carrying the override role;
+	// the reason check runs before the role gate would matter).
+	if rec := patchAppWithRoles(t, r, app.ID, `{"status":"approved","kyc_override":true}`, "platform-admin"); rec.Code != http.StatusConflict {
 		t.Fatalf("approve without reason = %d, want 409", rec.Code)
 	}
-	// Approve with override + reason.
-	rec = patchApp(t, r, app.ID, `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card","decided_by":"ops-ada"}`)
+	// Approve with override + reason + the override role.
+	rec = patchAppWithRoles(t, r, app.ID, `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card","decided_by":"ops-ada"}`, "platform-admin")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("approve = %d (%s)", rec.Code, rec.Body.String())
 	}
@@ -482,6 +512,9 @@ func TestDecidedByIdentity(t *testing.T) {
 		if xUserID != "" {
 			req.Header.Set("X-User-Id", xUserID)
 		}
+		// SPEC-W44 W-B/S1-F7-07: the kyc_override approve path additionally
+		// requires an override role (default platform-admin).
+		req.Header.Set("X-User-Roles", "platform-admin")
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
 		return rec
@@ -557,12 +590,7 @@ func TestDisburseFailsClosedWithoutRail(t *testing.T) {
 
 	prod := createProduct(t, r)
 	app := createApplication(t, r, prod.ID, contact, 2000000, "submitted")
-	if rec := patchApp(t, r, app.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
-		t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
-	}
-	if rec := patchApp(t, r, app.ID, `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card"}`); rec.Code != http.StatusOK {
-		t.Fatalf("approve = %d (%s)", rec.Code, rec.Body.String())
-	}
+	approveWithOverride(t, r, app.ID)
 
 	// Fail closed: no mock opt-in, no real rail.
 	rec := do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
@@ -625,15 +653,111 @@ func TestDisburseAllowedWithRealRail(t *testing.T) {
 
 	prod := createProduct(t, r)
 	app := createApplication(t, r, prod.ID, contact, 2000000, "submitted")
-	if rec := patchApp(t, r, app.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
-		t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
-	}
-	if rec := patchApp(t, r, app.ID, `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card"}`); rec.Code != http.StatusOK {
-		t.Fatalf("approve = %d (%s)", rec.Code, rec.Body.String())
-	}
+	approveWithOverride(t, r, app.ID)
 	rec := do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("disburse with real rail = %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// SPEC-W44 W-B/S1-F7-07 separation of duties: the operator who approved an
+// application must not disburse it (403, audited); a DIFFERENT operator
+// disburses fine; an idempotent replay on the already-disbursed application
+// by the approver still answers 200 (money movement is never re-intended).
+func TestDisburseSoDSameUserRejected(t *testing.T) {
+	t.Setenv(EnvAllowMockRails, "1")
+	var operator string
+	r, st, tenant := testRouter(t, &Deps{
+		EventsTopic:     "test.lending",
+		UserFromContext: func(context.Context) string { return operator },
+	})
+	contact := addContact(t, st, tenant.ID, "Ada")
+	prod := createProduct(t, r)
+	app := createApplication(t, r, prod.ID, contact, 2000000, "submitted")
+
+	operator = "ops-1"
+	approveWithOverride(t, r, app.ID)
+
+	// Same operator approves → disburses: 403, no state mutation.
+	rec := do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("same-operator disburse = %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	var loans int
+	if err := st.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM loan_accounts WHERE application_id=$1`, app.ID).Scan(&loans); err != nil || loans != 0 {
+		t.Fatalf("SoD-rejected disburse must not create a loan (loans=%d, err=%v)", loans, err)
+	}
+
+	// A different operator disburses: 200.
+	operator = "ops-2"
+	rec = do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("different-operator disburse = %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// Idempotent replay by the APPROVER on the already-disbursed
+	// application still answers 200 (replayed, no new money movement).
+	operator = "ops-1"
+	rec = do(t, r, http.MethodPost, "/v1/lending/applications/"+app.ID.String()+"/disburse", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approver replay disburse = %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+	var dis DisburseResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &dis); err != nil || !dis.Replayed {
+		t.Fatalf("approver replay = %+v (%v), want replayed", dis, err)
+	}
+}
+
+// SPEC-W44 W-B/S1-F7-07: the kyc_override approve path is gated on
+// LENDING_KYC_OVERRIDE_ROLES (default "platform-admin") via the
+// gateway-injected X-User-Roles header — no header / wrong role → 403; the
+// configured role → 200.
+func TestKYCOverrideRoleGate(t *testing.T) {
+	r, st, tenant := testRouter(t, &Deps{EventsTopic: "test.lending"})
+	contact := addContact(t, st, tenant.ID, "Ada")
+
+	underReview := func(t *testing.T) Application {
+		t.Helper()
+		prod := createProduct(t, r)
+		app := createApplication(t, r, prod.ID, contact, 1000000, "submitted")
+		if rec := patchApp(t, r, app.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
+			t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
+		}
+		return app
+	}
+	body := `{"status":"approved","kyc_override":true,"kyc_reason":"branch-verified ID card"}`
+
+	// No X-User-Roles header → 403 (fail closed: no header = no roles).
+	app := underReview(t)
+	if rec := patchApp(t, r, app.ID, body); rec.Code != http.StatusForbidden {
+		t.Fatalf("override without roles header = %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	// A non-override role → 403.
+	app = underReview(t)
+	if rec := patchAppWithRoles(t, r, app.ID, body, "staff,viewer"); rec.Code != http.StatusForbidden {
+		t.Fatalf("override with staff role = %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	// The default override role → 200.
+	app = underReview(t)
+	if rec := patchAppWithRoles(t, r, app.ID, body, "platform-admin"); rec.Code != http.StatusOK {
+		t.Fatalf("override with platform-admin = %d (%s), want 200", rec.Code, rec.Body.String())
+	}
+
+	// A configured role set replaces the default (platform-admin no longer
+	// suffices; risk-officer does).
+	r2, st2, tenant2 := testRouter(t, &Deps{KYCOverrideRoles: "risk-officer"})
+	contact2 := addContact(t, st2, tenant2.ID, "Bola")
+	prod2 := createProduct(t, r2)
+	app2 := createApplication(t, r2, prod2.ID, contact2, 1000000, "submitted")
+	if rec := patchApp(t, r2, app2.ID, `{"status":"under_review"}`); rec.Code != http.StatusOK {
+		t.Fatalf("→under_review = %d (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := patchAppWithRoles(t, r2, app2.ID, body, "platform-admin"); rec.Code != http.StatusForbidden {
+		t.Fatalf("override with platform-admin under custom role set = %d, want 403", rec.Code)
+	}
+	if rec := patchAppWithRoles(t, r2, app2.ID, body, "risk-officer"); rec.Code != http.StatusOK {
+		t.Fatalf("override with risk-officer = %d (%s), want 200", rec.Code, rec.Body.String())
 	}
 }
 

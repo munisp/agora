@@ -190,6 +190,11 @@ var (
 	// ErrKYCRequired rejects an approval that failed (or skipped) the KYC
 	// gate (409).
 	ErrKYCRequired = errors.New("kyc check required to approve")
+	// ErrForbidden marks an authenticated-but-not-allowed operation (403):
+	// kyc_override by an operator without a LENDING_KYC_OVERRIDE_ROLES role,
+	// or a disbursement by the same operator who approved (SPEC-W44
+	// W-B/S1-F7-07 separation of duties).
+	ErrForbidden = errors.New("forbidden")
 	// ErrUnbalancedJournal rejects a journal violating the double-entry
 	// invariants (mirrors loyalty.ErrUnbalancedJournal).
 	ErrUnbalancedJournal = errors.New("unbalanced lending journal")
