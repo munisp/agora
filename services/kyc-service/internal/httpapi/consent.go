@@ -31,19 +31,24 @@ type ConsentChecker interface {
 // set — tests / no-Dapr dev) or via Dapr service invocation against
 // IdentityAppID (production default).
 type ConsentClient struct {
-	dapr    *daprc.Client
-	appID   string
-	baseURL string // when set, Dapr is bypassed
-	hc      *http.Client
+	dapr          *daprc.Client
+	appID         string
+	baseURL       string // when set, Dapr is bypassed
+	internalToken string // X-Internal-Token for identity's /internal/* gate (SPEC-W44 K2)
+	hc            *http.Client
 }
 
-// NewConsentClient builds the consent gate client.
-func NewConsentClient(d *daprc.Client, appID, baseURL string) *ConsentClient {
+// NewConsentClient builds the consent gate client. internalToken is the
+// IDENTITY_INTERNAL_TOKEN env value (SPEC-W44 K2): identity-service gates
+// every /internal/* surface behind X-Internal-Token (401 missing/wrong, 503
+// when identity's own token env is unset), so the gate call must carry it.
+func NewConsentClient(d *daprc.Client, appID, baseURL, internalToken string) *ConsentClient {
 	return &ConsentClient{
-		dapr:    d,
-		appID:   appID,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		hc:      &http.Client{Timeout: 10 * time.Second},
+		dapr:          d,
+		appID:         appID,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		internalToken: internalToken,
+		hc:            &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -57,6 +62,11 @@ func (c *ConsentClient) CheckConsent(ctx context.Context, tenantRef, subject, pu
 		headers["X-Tenant-ID"] = tenantRef
 	} else {
 		headers["X-Tenant-Slug"] = tenantRef
+	}
+	// SPEC-W44 K2: internal-token gate on identity /internal/* (sent only
+	// when configured — an empty token would 401 against a gated identity).
+	if c.internalToken != "" {
+		headers["X-Internal-Token"] = c.internalToken
 	}
 
 	var status int

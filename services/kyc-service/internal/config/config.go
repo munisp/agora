@@ -19,6 +19,7 @@ type Config struct {
 	KYCEventsTopic  string        // Kafka topic for kyc Resolved CloudEvents (SPEC-W12 §5)
 	IdentityAppID   string        // Dapr app-id of identity-service (consent gate)
 	IdentityBaseURL string        // optional direct base URL of identity-service (tests / no-Dapr dev); when set, Dapr invoke is bypassed
+	IdentityInternalToken string  // X-Internal-Token sent on consent-gate calls (SPEC-W44 K2): identity's /internal/* is token-gated (503 fail-closed when unset)
 	Mock            bool          // KYC_MOCK (default false, SPEC-W34 GF8): deterministic mock resolver — auto-verifies fabricated IDs, dev only
 	ProviderURL     string        // live provider base URL (KYC_PROVIDER_URL, ASSUMPTION — see docs/kyc.md)
 	ProviderAPIKey  string        // live provider API key (KYC_PROVIDER_API_KEY, ASSUMPTION)
@@ -38,6 +39,8 @@ func Load() (Config, error) {
 		KYCEventsTopic:  envStr("KYC_EVENTS_TOPIC", "opendesk.kyc.resolved.v1"),
 		IdentityAppID:   envStr("IDENTITY_APP_ID", "identity"),
 		IdentityBaseURL: os.Getenv("IDENTITY_BASE_URL"),
+		// SPEC-W44 K2: identity gates /internal/* behind X-Internal-Token.
+		IdentityInternalToken: os.Getenv("IDENTITY_INTERNAL_TOKEN"),
 		// SPEC-W34 GF8: mock defaults OFF. The MockResolver auto-verifies any
 		// all-digits id with length >= 10, so a default deployment must never
 		// silently verify fabricated BVN/NIN — mock is explicit opt-in only.

@@ -67,7 +67,7 @@ func run() error {
 
 	deps := httpapi.Deps{
 		Store:       st,
-		Consent:     httpapi.NewConsentClient(daprClient, cfg.IdentityAppID, cfg.IdentityBaseURL),
+		Consent:     httpapi.NewConsentClient(daprClient, cfg.IdentityAppID, cfg.IdentityBaseURL, cfg.IdentityInternalToken),
 		Resolver:    resolver,
 		Events:      daprClient,
 		PubSub:      cfg.PubSubName,

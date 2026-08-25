@@ -251,7 +251,7 @@ func TestConsentClientAgainstIdentityStub(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	c := NewConsentClient(nil, "", stub.URL)
+	c := NewConsentClient(nil, "", stub.URL, "")
 	// uuid tenant ref -> X-Tenant-ID header.
 	got, err := c.CheckConsent(context.Background(), tid.String(), "+2348", "kyc")
 	if err != nil || got != tid {

@@ -4,9 +4,12 @@
 // record-turn → agent-reply → record-turn → same-channel-reply flow against
 // conversation-service and the voice runtime.
 //
-// Reliability contract: webhooks must answer 200 fast to the providers
-// (Meta/Telegram retry-storm on non-200), so Handle logs every internal
-// failure and reports it to the caller, which still answers 200.
+// Reliability contract (SPEC-W44 N-05): Handle reports internal failures to
+// the caller, which answers 500 so the provider REDELIVERS. The bridge
+// dedupes on <channel>:<message_id>: a redelivery of an already-completed
+// message skips agentReply + sendReply (the whole downstream pipeline) —
+// only a FAILED attempt retries, because the claim is recorded on success
+// only (failure releases it implicitly).
 package channel
 
 import (
@@ -17,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/opendesk/messaging-gateway/internal/provider"
@@ -74,7 +78,20 @@ type Bridge struct {
 
 	HC  *http.Client
 	Log *zap.Logger
+
+	// done dedupes completed <channel>:<message_id> deliveries (N-05).
+	mu       sync.Mutex
+	done     map[string]time.Time
+	now      func() time.Time // injectable for tests
+	dedupeTTL time.Duration
 }
+
+// bridgeDedupeTTL bounds how long a completed message id is remembered
+// (provider redelivery storms are minutes, not days).
+const bridgeDedupeTTL = 24 * time.Hour
+
+// SetClock injects the clock used by the dedupe window (tests).
+func (b *Bridge) SetClock(now func() time.Time) { b.now = now }
 
 // NewBridge builds a Bridge with a 10s-timeout HTTP client. convURL and
 // voiceURL must already be fully resolved (direct base or Dapr invoke
@@ -88,6 +105,9 @@ func NewBridge(sites map[string]Site, convURL, voiceURL string, wa *provider.Wha
 		Telegram:        tg,
 		HC:              &http.Client{Timeout: 10 * time.Second},
 		Log:             log,
+		done:            map[string]time.Time{},
+		now:             time.Now,
+		dedupeTTL:       bridgeDedupeTTL,
 	}
 }
 
@@ -109,13 +129,20 @@ func ResolveBases(convOverride, voiceOverride string, daprHTTPPort int) (conv, v
 
 // Handle processes one normalized inbound message. routeID is the
 // channel-routing identity: the WhatsApp metadata.phone_number_id or the
-// Telegram bot username. Unmapped routes and internal failures are logged
-// and dropped (the webhook still answers 200 — never 5xx to the provider).
+// Telegram bot username. Unmapped routes drop silently. A redelivery of an
+// already-completed message (same channel+message_id) is a no-op (N-05
+// dedupe); a failed attempt records nothing, so the next redelivery retries
+// the full pipeline.
 func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string) error {
 	site, ok := b.Sites[msg.Channel+":"+routeID]
 	if !ok {
 		b.Log.Info("inbound message dropped: no CHANNEL_SITE_MAP entry",
 			zap.String("channel", msg.Channel), zap.String("route_id", routeID))
+		return nil
+	}
+	if b.alreadyDone(msg) {
+		b.Log.Info("inbound message redelivery skipped (already bridged)",
+			zap.String("channel", msg.Channel), zap.String("message_id", msg.MessageID))
 		return nil
 	}
 	log := b.Log.With(
@@ -151,8 +178,40 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 		log.Warn("channel reply failed", zap.Error(err))
 		return err
 	}
+	b.markDone(msg) // claim recorded on SUCCESS only — failure releases it
 	log.Info("inbound message bridged", zap.String("conversation_id", convID))
 	return nil
+}
+
+// alreadyDone reports whether the message was fully bridged within the
+// dedupe window. Messages without a provider id cannot dedupe (processed
+// every time).
+func (b *Bridge) alreadyDone(msg InboundMessage) bool {
+	if msg.MessageID == "" {
+		return false
+	}
+	key := msg.Channel + ":" + msg.MessageID
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	// Lazy expiry sweep.
+	for k, at := range b.done {
+		if now.Sub(at) > b.dedupeTTL {
+			delete(b.done, k)
+		}
+	}
+	_, done := b.done[key]
+	return done
+}
+
+// markDone records a completed delivery.
+func (b *Bridge) markDone(msg InboundMessage) {
+	if msg.MessageID == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.done[msg.Channel+":"+msg.MessageID] = b.now()
 }
 
 // resolveConversation finds an existing conversation for the contact or
