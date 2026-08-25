@@ -1,441 +1,592 @@
 # tests/funds-e2e — RESULTS
 
-Status: **EXECUTED BY INDEPENDENT VERIFIER (V-Harness-R1, wave W41 repair round) — OVERALL PASS: 34/34 checks, exit 0.**
+Status: **FINAL — FIN-H3 (W44 verification re-run against the CODER-F5 refund-replay fix): BOTH suites re-run from REAL captured outputs and BOTH FULLY GREEN. Both BLOCKED items RESOLVED.**
 
-History (honest note): the R0 run of this harness (2026-08-16) **FAILED
-19/34** — two harness bugs (missing `conversation/knowledge/kyc` DB
-pre-creation; billing `DATABASE_URL` rejected by sqlx's url crate) plus ONE
-REAL SERVICE BUG: billing-engine + payments-service pinned axum 0.7.9 while
-their route tables used axum 0.8 `{param}` syntax, so every path-parameter
-route 404'd. R1 (this file) verifies the claimed repairs: harness.py now
-pre-creates all 6 DBs and uses a percent-encoded socket DSN
-(`sqlx_dsn_for()`), and both Rust services' routes are rewritten to axum
-0.7 `:param` syntax (new `tests/route_smoke.rs` in both crates). **All 34
-assertions now pass on the committed tree, unpatched.**
+* **SIM mode (`LEDGER_IMPL=sim`): 86/86 checks PASS, 0 skips, exit 0** (FIN-H3 run, 2026-08-24, 18.21s — re-run fresh, supersedes FIN-H's sim run).
+* **REAL-LEDGER mode (`LEDGER_IMPL=tigerbeetle`, TigerBeetle 0.16.28, `--features tb-live`): 91/91 checks PASS, 0 skips, exit 0** (FIN-H3 run, 2026-08-24, 164.63s) — CODER-F5's TB refund-replay parity fix **CONFIRMED** on the real ledger: refund REPLAY now returns 201 with the same refund id and byte-identical balances (BLOCKED (2) RESOLVED). CODER-F2's `classify_void_kinds()` refund-after-capture fix remains green (BLOCKED (1) RESOLVED at FIN-H2).
 
-## Environment (V-Harness-R1 run, sandbox local 2026-08-17)
+History: harness v3 (W43, 89 857 B) had never been executed end-to-end. Three
+verification phases ran it against the CURRENT mirror (W44 W-P
+payments/billing contracts K1/K2/K6/K7, B-01, F15-03; W-B booking hardening;
+W-I identity hardening), each time with harness.py unchanged at md5
+`4dbc1ce47c798e86cd9ce83dce9d8376` (109 162 B) after the one-time W44-contract
+harness update (assertions never weakened — see "Harness changes" below):
+
+* **FIN-H** — first full run: SIM 86/86; TB 89/91 (BLOCKED (1): TB-live
+  refund-after-capture 502, root-caused to `classify_void_kinds`).
+* **FIN-H2** — re-run against CODER-F2's fix: TB 90/91 (BLOCKED (1) RESOLVED;
+  unmasked BLOCKED (2): refund REPLAY 502, root-caused to the missing
+  replay-by-transfer-id short-circuit on the TB path).
+* **FIN-H3** (this file's headliner) — re-run against CODER-F5's fix:
+  **TB 91/91** (BLOCKED (2) RESOLVED); SIM re-run 86/86. Suite fully green
+  in both ledger modes.
+
+## FIN-H3 final verification run (2026-08-24 UTC, post-CODER-F5 fix) — CURRENT
+
+Fix under test: `services/payments-service/src/ledger/tigerbeetle.rs`
+md5 `bd12aa83525bca5a6ac6a0618bcdf9e3` (64 321 B; fresh rsync from the CURRENT
+mirror — byte-identical to CODER-F5's checkpoint in `backups/w44/F5/`): the TB
+refund path now mirrors the sim's replay-by-transfer-id short-circuit —
+before attempting the void leg it looks up the deterministic refund transfer
+id and, when a STORED transfer under that id matches the refund this request
+would commit (`refund_replay_matches()`: posted refund = plain posted
+`CODE_REFUND` transfer from `tenant:{id}:revenue` to `platform:clearing` with
+matching amount/ledger; void leg = `VOID_PENDING_TRANSFER` with
+`pending_id == hold_id`), returns it verbatim as an idempotent replay
+(201-class). Non-matching occupants of the id remain a P-12 409-class
+conflict, never a silent success and never a 502. CODER-F5 live-verified the
+fix 11/11 against real TB 0.16.28 (`backups/w44/F5/verify-f5-payments.log`).
+Harness unchanged: md5 `4dbc1ce47c798e86cd9ce83dce9d8376`, 109 162 B
+(mirror == run tree, re-verified this run).
+
+### Environment fingerprint (FIN-H3 run, sandbox local)
 
 | | |
 |---|---|
-| Host | sandbox, 2 CPU / 4 GB RAM |
-| Python | 3.12.12 (pgserver 0.1.4, psycopg 3.x) |
-| Go | go1.23.4 linux/amd64 (/tmp/go, GOPROXY=https://goproxy.cn,direct) |
-| Rust | rustc/cargo 1.97.1 stable (rustup minimal), cmake via pip (rdkafka-sys) |
-| Repo | /tmp/mirror — byte copy of the /mnt mirror (`OPENDESK_REPO` default = harness.py parents[2]); md5 of routes.rs x2 + harness.py verified identical to /mnt |
+| Host | sandbox, 2 CPU / 4 GB RAM, Debian 12 (bookworm), x86_64 (same class as FIN-H/FIN-H2; /tmp had been wiped — full env rebuilt from scratch) |
+| Python | 3.12.12 — pgserver 0.1.4 (embedded full PostgreSQL 16, unix socket), psycopg 3.3.4, pytest 9.1.1 |
+| Go | go1.23.4 linux/amd64 (/tmp/go, from the /mnt tarball; `GOPROXY=https://goproxy.cn,direct`, `GOFLAGS=-mod=readonly`) |
+| Rust | rustc/cargo 1.98.0 (88d9e12ae 2026-08-18; rustup minimal profile, RUSTUP via rsproxy.cn), crates via rsproxy.cn sparse mirror |
+| tb-live toolchain | cmake 4.4.2 (pip), libclang (pip `libclang` wheel, `LIBCLANG_PATH=.../clang/native`), zig 0.13.0 (`/tmp/zig`, re-downloaded ziglang.org tarball), `BINDGEN_EXTRA_CLANG_ARGS=-I/tmp/zig/lib/include` |
+| TigerBeetle | official release binary `0.16.28+e97e337`, 18 204 512 B, md5 31288566a718ce9290571d3f3982b6da — restored byte-identical from the FIN-H2 checkpoint (`backups/w44/FIN-H2/tigerbeetle-0.16.28-bin`); `tigerbeetle version` confirmed. NOTE: `/mnt/agents/tb.zip` is corrupt and a fresh GitHub release download stalled in this sandbox, so the checkpointed copy of the official binary (md5 identical to FIN-H's official-download fingerprint) was used |
+| Repo | `/tmp/work/opendesk-repo` — fresh rsync copy of the /mnt mirror; `OPENDESK_REPO` pointed at it |
 | XDG_RUNTIME_DIR | /tmp/xdg (0700) |
 
-Binaries (all real builds from the committed sources, debug profile):
-`identity-service` 17 219 492 B (md5 74b77dc1...), `booking-service`
-45 733 987 B (md5 0cb6e1a1...) via `go build ./cmd/server`
-(GOFLAGS=-mod=readonly). `billing-engine` 150 320 528 B (md5 ea116f20...),
-`cargo build --locked` 5m17s. `payments-service` 108 793 408 B
-(md5 9f1c80db...), `cargo build --locked` 2m14s. Exported via
-`IDENTITY_BIN/BOOKING_BIN/BILLING_BIN/PAYMENTS_BIN`.
+The FIN-H2 sandbox deviation is carried over unchanged (sandbox-level, not a
+harness or service change): `IDENTITY_BASE_URL=http://127.0.0.1:17001` was
+EXPORTED to the harness process, which inherits it into billing-engine's
+environment (`start_service` merges `os.environ`). Billing's compiled-in
+default is the compose hostname `http://identity:7001`, unresolvable in this
+sandbox (/etc/hosts is read-only). Demonstrated again this run: a first FIN-H3
+SIM run WITHOUT the export scored 85/86 with the billing foreign-tenant case
+failing as a 503 `tenant binding unavailable: identity resolution failed`
+(env artifact; log checkpointed as `run-sim-run1-noexport.log`); with the
+export the same case passes with the real contract answer (403 `tenant is not
+bound to the caller`) in BOTH modes. All other 90 checks are unaffected by
+the knob. The TB run additionally needs the Rust toolchain on PATH (the
+harness builds its tb-fixture crate at runtime; a first attempt without
+`CARGO_HOME`/PATH aborted before any check with `no cargo found to build the
+tb-fixture crate`).
 
-Command:
+Binaries (all real builds from the committed sources, debug profile;
+exported via `IDENTITY_BIN`/`BOOKING_BIN`/`BILLING_BIN`/`PAYMENTS_BIN`):
+
+| binary | bytes | md5 | build |
+|---|---|---|---|
+| identity-service | 20 967 606 | 7a211a6dc14759568109d7b763c68a24 | `go build ./cmd/server` |
+| booking-service | 46 936 447 | 8933598439de72afba0f57e8ec02cbb9 | `go build ./cmd/server` |
+| billing-engine | 151 260 224 | 523dff1d5636d5881fcf2ed15f2ee5ee | `cargo build --locked` |
+| payments-service (sim) | 150 530 456 | badcce7bc85995a66ebb36caae9b10ec | `cargo build --locked` |
+| payments-service (tb-live) | 156 431 968 | a57d90bcdd407e7019c938ebdf42027a | `cargo build --locked --features tb-live` (~4 min incremental; tb client `tigerbeetle-unofficial 0.8.0+0.16.28` vendored via zig) |
+
+Commands:
 
 ```bash
-XDG_RUNTIME_DIR=/tmp/xdg FUNDS_E2E_PERF_ITERS=50 \
-IDENTITY_BIN=... BOOKING_BIN=... BILLING_BIN=... PAYMENTS_BIN=... \
-python3 tests/funds-e2e/harness.py --workdir /tmp/funds-e2e-r1
-# exit code: 0
+# SIM full suite:
+XDG_RUNTIME_DIR=/tmp/xdg OPENDESK_REPO=/tmp/work/opendesk-repo \
+IDENTITY_BASE_URL=http://127.0.0.1:17001 \
+IDENTITY_BIN=... BOOKING_BIN=... BILLING_BIN=... PAYMENTS_BIN=<sim build> \
+python3 tests/funds-e2e/harness.py --workdir /tmp/funds-e2e-sim2
+# exit 0 — 86/86, 92 timed calls, 18.21s (started 2026-08-24T23:06:31Z)
+
+# REAL-LEDGER (TigerBeetle) full suite:
+XDG_RUNTIME_DIR=/tmp/xdg OPENDESK_REPO=/tmp/work/opendesk-repo TB_BINARY=/tmp/tb-bin/tigerbeetle \
+IDENTITY_BASE_URL=http://127.0.0.1:17001 \
+PATH=/tmp/zig:/tmp/cargo/bin:... RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo \
+LIBCLANG_PATH=.../clang/native BINDGEN_EXTRA_CLANG_ARGS=-I/tmp/zig/lib/include \
+IDENTITY_BIN=... BOOKING_BIN=... BILLING_BIN=... PAYMENTS_BIN=<tb-live build> \
+python3 tests/funds-e2e/harness.py --workdir /tmp/funds-e2e-tb2
+# exit 0 — 91/91, 96 timed calls, 164.63s incl. fixture-crate build
+# (started 2026-08-24T23:07:48Z)
 ```
 
-## Run R1 — committed harness.py verbatim: 34/34 PASS, exit 0
+Auth posture: identical to FIN-H/FIN-H2 (no `OPENDESK_TRUST_DIRECT_TENANT`;
+K2 internal tokens for service-style calls; explicit gateway headers
+`X-Tenant-Slugs`/`X-User-Id`/`X-User-Roles` for human-style calls).
 
-Wall time 4.31 s, 264 timed HTTP calls. Per-assertion results (verbatim from
-`funds-e2e-summary.json`):
+### Verbatim delta — FIN-H3 REAL-LEDGER run (91/91, exit 0, 164.63s, 96 timed calls)
+
+Identical suite to FIN-H/FIN-H2; the decisive lines (full log checkpointed):
+
+```
+PASS tigerbeetle: format + start --development, 127.0.0.1:3000 accepting
+PASS tigerbeetle: tenant+platform accounts created on the REAL ledger (pinned client crate, exists=idempotent)
+PASS tigerbeetle: hold visible as PENDING on the real ledger (deposits credits_pending += hold amount)  — delta=5000
+PASS tigerbeetle: capture MOVED FUNDS on the real ledger (balance deltas == post/revenue/fee amounts)   — post=5000 revenue=4875 fee=125
+PASS tigerbeetle: capture REPLAY left every balance counter byte-identical (real TB `exists`, no double-post)
+PASS billing: foreign-tenant gateway call -> 403 (K1 X-Tenant-Slugs binding)  — status=403 (with the IDENTITY_BASE_URL export, above)
+PASS payments: refund (full, post-capture) -> 201; revenue debits_posted += 2000  — status=201 refund_id=313188980701037262337851716709380156958 revenue_debits_delta=2000
+PASS payments: refund REPLAY same key -> same refund id, balances byte-identical (no double refund)  — status=201 same_id=True unchanged=True   [BLOCKED (2) FIXED — was status=502 same_id=False at FIN-H2]
+PASS payments: refund with wrong amount -> 400, balances unchanged (P-11)  — status=400 unchanged=True
+```
+
+## FIN-H2 verification run (2026-08-24 UTC, post-CODER-F2 fix) — SUPERSEDED by the FIN-H3 run above
+
+Fix under test: `services/payments-service/src/ledger/tigerbeetle.rs`
+md5 `3fb2fb4ddf9f8d17304253065e1353df` (fresh rsync from the CURRENT mirror —
+byte-identical to CODER-F2's checkpoint): `classify_void_kinds()` now maps
+`CreateTransferErrorKind::PendingTransferAlreadyPosted` (real TB 0.16.28
+result 33, voiding an ALREADY-POSTED pending transfer) to
+`VoidClassification::NotPending`, so refund-after-capture falls through to the
+posted-refund path exactly like the sim. Harness unchanged: md5
+`4dbc1ce47c798e86cd9ce83dce9d8376`, 109 162 B (mirror == run tree).
+
+### Environment fingerprint (FIN-H2 run, sandbox local)
+
+| | |
+|---|---|
+| Host | sandbox, 2 CPU / 4 GB RAM, Debian 12 (bookworm), x86_64 (same class as FIN-H) |
+| Python | 3.12.12 — pgserver 0.1.4 (embedded full PostgreSQL 16, unix socket), psycopg 3.3.4, pytest 9.1.1 |
+| Go | go1.23.4 linux/amd64 (/tmp/go, restored from /mnt go-toolchain; `GOPROXY=https://goproxy.cn,direct`, `GOFLAGS=-mod=readonly`) |
+| Rust | rustc/cargo 1.98.0 (88d9e12ae 2026-08-18; rustup minimal profile), crates via rsproxy.cn sparse mirror |
+| tb-live toolchain | cmake 4.4.2 (pip), libclang 18.1.1 (pip `libclang` wheel, `LIBCLANG_PATH=.../clang/native`), zig 0.13.0 (`/tmp/zig`), `BINDGEN_EXTRA_CLANG_ARGS=-I/tmp/zig/lib/include` |
+| TigerBeetle | official release binary `0.16.28+e97e337` (re-downloaded tigerbeetle-x86_64-linux.zip), 18 204 512 B, md5 31288566a718ce9290571d3f3982b6da — identical to FIN-H's fingerprint |
+| Repo | `/tmp/work/opendesk-repo` — fresh rsync copy of the /mnt mirror; `OPENDESK_REPO` pointed at it |
+| XDG_RUNTIME_DIR | /tmp/xdg (0700) |
+
+One environment deviation from FIN-H's run (sandbox-level, not a harness or
+service change): `IDENTITY_BASE_URL=http://127.0.0.1:17001` was EXPORTED to
+the harness process, which inherits it into billing-engine's environment
+(`start_service` merges `os.environ`). Billing's compiled-in default is the
+compose hostname `http://identity:7001`, unresolvable in this sandbox
+(/etc/hosts is read-only here, so no `identity` alias could be added); a
+first FIN-H2 TB run without the export scored 89/91 with the billing
+foreign-tenant case failing as a 503 `identity resolution failed` — an
+environment artifact, not a service regression. With the export the same
+case passes with the real contract answer (403 `tenant is not bound to the
+caller (X-Tenant-Slugs membership / identity resolution)`). All other 90
+checks are unaffected by the knob.
+
+Binaries (all real builds from the committed sources, debug profile;
+exported via `IDENTITY_BIN`/`BOOKING_BIN`/`BILLING_BIN`/`PAYMENTS_BIN`):
+
+| binary | bytes | md5 | build |
+|---|---|---|---|
+| identity-service | 20 967 606 | 87074317ae5ce23bcce423291068fdb0 | `go build ./cmd/server` |
+| booking-service | 46 936 447 | fd6dc71d666295a271c7a83c1fbe427b | `go build ./cmd/server` |
+| billing-engine | 151 244 888 | 95c628862ec2ce63814ad4736d76866e | `cargo build --locked` (3m21s) |
+| payments-service (tb-live) | 156 410 224 | c211179dc961b5c043cfd36f9d2907d5 | `cargo build --locked --features tb-live` (9m30s; deterministic — a later relink reproduced the identical md5) |
+
+Commands:
+
+```bash
+# unit test (CODER-F2's new classification coverage), from the fresh rsync:
+cd services/payments-service && cargo test --locked --features tb-live void_classification
+# -> test result: ok. 6 passed; 0 failed (44/104 filtered out), incl.
+#    void_classification_already_posted_falls_through  (result-33 regression test)
+#    void_classification_not_pending_falls_through ... void_classification_anything_else_is_backend
+
+# REAL-LEDGER (TigerBeetle) full suite:
+XDG_RUNTIME_DIR=/tmp/xdg OPENDESK_REPO=/tmp/work/opendesk-repo TB_BINARY=/tmp/tb-bin/tigerbeetle \
+IDENTITY_BASE_URL=http://127.0.0.1:17001 \
+LIBCLANG_PATH=.../clang/native BINDGEN_EXTRA_CLANG_ARGS=-I/tmp/zig/lib/include \
+IDENTITY_BIN=... BOOKING_BIN=... BILLING_BIN=... PAYMENTS_BIN=<tb-live build> \
+python3 tests/funds-e2e/harness.py --workdir /tmp/funds-e2e-tb4
+# exit 1 — 90/91, 96 timed calls, 168.1s incl. fixture-crate build
+# (started 2026-08-24T22:03:04Z)
+```
+
+Auth posture: identical to FIN-H (no `OPENDESK_TRUST_DIRECT_TENANT`; K2
+internal tokens for service-style calls; explicit gateway headers
+`X-Tenant-Slugs`/`X-User-Id`/`X-User-Roles` for human-style calls).
+
+### Verbatim delta — FIN-H2 REAL-LEDGER run (90/91, exit 1, 168.1s, 96 timed calls)
+
+Identical suite to FIN-H; only the TB-specific and changed lines:
+
+```
+PASS tigerbeetle: format + start --development, 127.0.0.1:3000 accepting
+PASS tigerbeetle: tenant+platform accounts created on the REAL ledger (pinned client crate, exists=idempotent)
+PASS tigerbeetle: hold visible as PENDING on the real ledger (deposits credits_pending += hold amount)  — delta=5000
+PASS tigerbeetle: capture MOVED FUNDS on the real ledger (balance deltas == post/revenue/fee amounts)   — post=5000 revenue=4875 fee=125
+PASS tigerbeetle: capture REPLAY left every balance counter byte-identical (real TB `exists`, no double-post)
+PASS billing: foreign-tenant gateway call -> 403 (K1 X-Tenant-Slugs binding)  — status=403 (with the IDENTITY_BASE_URL export, above)
+PASS payments: refund (full, post-capture) -> 201; revenue debits_posted += 2000  — status=201 refund_id=228559830838374876030499153043944871468 revenue_debits_delta=2000   [BLOCKED (1) FIXED]
+FAIL payments: refund REPLAY same key -> same refund id, balances byte-identical (no double refund)  — status=502 same_id=False unchanged=True   [BLOCKED (2), below]
+```
+
+## RESOLVED (FIN-H3-verified): former BLOCKED (2): TB-live refund REPLAY → 502 (real service bug, sim/TB parity gap)
+
+**Resolution:** CODER-F5 applied exactly the fix FIN-H2 pinned below
+(`services/payments-service/src/ledger/tigerbeetle.rs` md5
+`bd12aa83525bca5a6ac6a0618bcdf9e3`): the TB refund path now does the sim's
+replay-by-transfer-id short-circuit FIRST — a stored transfer under the
+deterministic refund id that matches the request (`refund_replay_matches()`:
+posted-refund arm = plain posted `CODE_REFUND`, `tenant:{id}:revenue` →
+`platform:clearing`, matching amount/ledger; void arm = `VOID_PENDING_TRANSFER`
+with `pending_id == hold_id`) is returned verbatim (201 idempotent replay);
+non-matching occupants stay a P-12 409-class conflict.
+FIN-H3 re-ran the full TB suite against it: **refund REPLAY now PASSES on the
+real ledger — status=201, same_id=True, balances byte-identical
+(unchanged=True)** — and CODER-F5 independently live-verified the parity fix
+11/11 against real TB 0.16.28 (`backups/w44/F5/verify-f5-payments.log`).
+The original diagnosis is kept verbatim below for the record.
+
+**Symptom (1 check, at FIN-H2):** replaying the SAME refund request (same idempotency
+key) after a now-SUCCESSFUL post-capture refund returns `502`
+(`LedgerError::Backend`) against the real TigerBeetle; the identical replay
+in sim mode returns the same refund id. Balances were verified byte-identical
+across the replay (harness: `unchanged=True`) — nothing moved twice; the
+replay is wrongly REFUSED.
+
+**Isolated reproduction (harness-independent, real TB 0.16.28 + the canonical
+tb-live binary above; script + service log checkpointed to
+backups/w44/FIN-H2/):**
+
+```
+hold 1000 -> 201; capture 1000 -> 200;
+POST /v1/refunds {deposit_id, amount_cents:1000, key K} ->
+  201 posted refund (revenue debits_posted 0 -> 1000)          [the F2 fix]
+POST /v1/refunds {identical body, key K} ->
+  502 {"error":"ledger backend error: tigerbeetle void transfer rejected:
+       [ExistsWithDifferentFlags]"}
+post-replay balances: revenue debits_posted STILL 1000 — exactly ONE refund
+```
+
+**Root cause (pinned to source):** `TigerBeetleLedger::refund`
+(`services/payments-service/src/ledger/tigerbeetle.rs`) re-attempts the VOID
+leg with the SAME deterministic transfer id (`transfer_id_from_key(K)`) that
+the first call already committed as the POSTED refund transfer. Real TB
+0.16.28 rejects the replayed void with `exists_with_different_flags` (stored:
+flag none / code CODE_REFUND; attempt: void-pending leg with the hold's
+code), and `classify_void_kinds` correctly refuses to swallow
+`exists_with_different_*` (P-12: a 409-class parameter conflict) → `Backend`
+→ 502. The sim avoids this entirely: `ledger/sim.rs refund()` does a
+replay-by-transfer-id short-circuit FIRST and returns the stored refund when
+it is refund-shaped; the TB path has no equivalent short-circuit. Fix
+(service-side, owned by W-P — NOT applied by FIN-H2 per scope): mirror the
+sim — look up `transfer_id` before the void attempt and return the stored
+transfer when it is the refund-shaped one (code CODE_REFUND, matching
+amount/accounts); keep `exists_with_different_*` as a conflict otherwise.
+
+**Impact:** pre-fix this leg also failed, but was masked by BLOCKED (1) (both
+refund checks 502'd at the void classification with
+`PendingTransferAlreadyPosted`). CODER-F2's fix unmasked this second,
+distinct parity gap. Capture replay (byte-identical), no-show replay, void of
+a pending hold, and the P-11 wrong-amount 400 all PASS on the real ledger.
+
+## Environment fingerprint (FIN-H run, sandbox local, 2026-08-24 UTC)
+
+| | |
+|---|---|
+| Host | sandbox, 2 CPU / 4 GB RAM, Debian 12 (bookworm), x86_64 |
+| Python | 3.12.12 — pgserver 0.1.4 (embedded full PostgreSQL 16, unix socket), psycopg 3.3.4, pytest 9.1.1 |
+| Go | go1.23.4 linux/amd64 (/tmp/go, `GOPROXY=https://goproxy.cn,direct`, `GOFLAGS=-mod=readonly`) |
+| Rust | rustc/cargo 1.98.0 (rustup minimal profile), crates via rsproxy.cn sparse mirror |
+| tb-live toolchain | cmake 4.4.2 (pip), libclang (pip `libclang` wheel, `LIBCLANG_PATH=.../clang/native`), zig 0.13.0 (`/tmp/zig`), `BINDGEN_EXTRA_CLANG_ARGS=-I/tmp/zig/lib/include` (stddef.h) |
+| TigerBeetle | official release binary `0.16.28+e97e337` (tigerbeetle-x86_64-linux.zip), 18 204 512 B, md5 31288566a718ce9290571d3f3982b6da |
+| Repo | `/tmp/opendesk-repo` — rsync copy of the /mnt mirror; `OPENDESK_REPO` pointed at it; harness.py md5-identical between mirror and run tree (4dbc1ce47c798e86cd9ce83dce9d8376, 109 162 B) |
+| XDG_RUNTIME_DIR | /tmp/xdg (0700) |
+
+Binaries (all real builds from the committed sources, debug profile;
+exported via `IDENTITY_BIN`/`BOOKING_BIN`/`BILLING_BIN`/`PAYMENTS_BIN`):
+
+| binary | bytes | md5 | build |
+|---|---|---|---|
+| identity-service | 20 954 184 | f8b9cfb8866be9b2fb1dac0ae523eb05 | `go build ./cmd/server` |
+| booking-service | 46 932 103 | 86affd1b5244fc50919de74227a0c5c8 | `go build ./cmd/server` |
+| billing-engine | 150 920 648 | 920c424d3f1f744e70579cfac248448c | `cargo build --locked` |
+| payments-service (sim) | 150 534 224 | e06591b15a0b9c669e06ccb8b2f661fc | `cargo build --locked` |
+| payments-service (tb-live) | 156 433 688 | 7ca0db28263c20d7665d6f4f094b6bb3 | `cargo build --locked --features tb-live` (7m23s, vendored tb client via zig) |
+
+Commands:
+
+```bash
+# SIM
+XDG_RUNTIME_DIR=/tmp/xdg OPENDESK_REPO=/tmp/opendesk-repo \
+IDENTITY_BIN=... BOOKING_BIN=... BILLING_BIN=... PAYMENTS_BIN=<sim build> \
+python3 tests/funds-e2e/harness.py --workdir /tmp/funds-e2e-sim
+# exit 0 — 86/86, 92 timed calls, 18.2s (started 2026-08-24T19:55:51Z)
+
+# REAL-LEDGER (TigerBeetle)
+XDG_RUNTIME_DIR=/tmp/xdg OPENDESK_REPO=/tmp/opendesk-repo TB_BINARY=/tmp/tb-bin/tigerbeetle \
+LIBCLANG_PATH=.../clang/native BINDGEN_EXTRA_CLANG_ARGS=-I/tmp/zig/lib/include \
+IDENTITY_BIN=... BOOKING_BIN=... BILLING_BIN=... PAYMENTS_BIN=<tb-live build> \
+python3 tests/funds-e2e/harness.py --workdir /tmp/funds-e2e-tb
+# exit 1 — 89/91, 96 timed calls, 164.2s incl. fixture-crate build
+# (started 2026-08-24T20:13:08Z)
+```
+
+Auth posture (stronger than the dev escape): the harness runs WITHOUT
+`OPENDESK_TRUST_DIRECT_TENANT=1`. Service-style calls authenticate with the
+per-run internal tokens (K2: `PAYMENTS_INTERNAL_TOKEN` /
+`BILLING_INTERNAL_TOKEN` / `IDENTITY_INTERNAL_TOKEN`); human-style calls use
+explicit gateway headers (`X-Tenant-Slugs` / `X-User-Id` / `X-User-Roles`),
+which the W44 services honor exactly as gateway-injected claims.
+
+## Execution matrix
+
+| suite section | sim | tigerbeetle (real ledger) |
+|---|---|---|
+| service boot / healthz | 4/4 | 5/5 (incl. TB format+start) |
+| identity tenant create (W44 subject auth) | 2/2 | 3/3 (incl. TB account fixture) |
+| booking public reads + W42 write path (authed/public create, pending + unsent-outbox degraded honesty, idempotent replay) | 9/9 | 9/9 |
+| billing rate-card/generate/issue/payment-link | 4/4 | 4/4 |
+| billing W44 gateway-auth matrix (owner 200 / member 403 / foreign tenant 403) | 3/3 | 3/3 |
+| billing paystack webhook (bad-sig 401, real HMAC paid, same-tx outbox+ledger, replay idempotency) | 8/8 | 8/8 |
+| billing B-01 webhook amount/currency mismatch — **flipped LIVE** (202, invoice NOT paid, payment_mismatch outbox row) | 2/2 | 2/2 |
+| payments deposit→capture→replay→balance | 5/5 | 5/5 |
+| real-ledger assertions (hold PENDING on TB, capture balance deltas == response amounts, replay byte-identical) | n/a | 3/3 |
+| payments provision auth + F15-03 healthz/metrics | 4/4 | 4/4 |
+| over-capture / void / capture-after-void (balances unchanged) | 4/4 | 4/4 |
+| cross-tenant capture/void/refund 403 (P-06) | 3/3 | 3/3 |
+| payments W44 gateway matrix (gateway hold 201 + provenance row; member 403; foreign tenant 403) | 5/5 | 5/5 |
+| refund happy path (post-capture) | 1/1 | 1/1 — **FIXED by CODER-F2, FIN-H2-verified; re-verified FIN-H3** |
+| refund replay (same-key idempotency) | 1/1 | 1/1 — **FIXED by CODER-F5, FIN-H3-verified (was 0/1 at FIN-H2)** |
+| refund wrong amount 400 (P-11, zero mutations) | 2/2 | 2/2 |
+| no-show fee (partial capture, remainder released, replay) | 3/3 | 3/3 |
+| beneficiary registry (create/list/disable) | 4/4 | 4/4 |
+| payout negatives: raw payee 422, foreign beneficiary 422, disabled beneficiary 422 — all with ZERO ledger/rail side effects | 3/3 | 3/3 |
+| payout happy path (K7 beneficiary_id, C3 ledger-first, rail exactly once, committed payout_attempts row) + over-limit rejected before rail | 3/3 | 3/3 |
+| capture without amount (C4 lookup) / PLATFORM_FEE_BPS boot refusal (P-05) | 3/3 | 3/3 |
+| RLS adversarial (app_billing_login: wrong/empty/unset GUC → 0; own tenant only) | 4/4 | 4/4 |
+| **TOTAL** | **86/86 PASS (exit 0)** — FIN-H3 re-run | **91/91 PASS (exit 0)** — FIN-H3 final run |
+
+DLQ note (honest scope): the Kafka commands consumer is disabled in this
+harness (no broker), so DLQ redelivery cannot be exercised; what IS asserted
+live is the F15-03 reporting surface — `/healthz` dependency detail (ledger
+probe, postgres probe, `dlq_producer` state, `commands_dead_lettered` gauge)
+and the `/metrics` counters (`payments_commands_processed_total`,
+`payments_commands_dead_lettered`, `payments_payout_attempts_total{outcome=...}`).
+
+## RESOLVED (FIN-H2-verified): former BLOCKED (1): TB-live refund-after-capture → 502 (real service bug)
+
+**Resolution:** CODER-F2 applied exactly the fix FIN-H pinned below (`PendingTransferAlreadyPosted` → `VoidClassification::NotPending` in `classify_void_kinds`), and FIN-H2 re-ran the full TB suite against it: refund-after-capture now returns 201 with the posted refund and the revenue debit delta == response amount (real-ledger balance assertion green), 6/6 new `void_classification` unit tests pass, and the isolated repro confirms the posted-refund path end-to-end. The original diagnosis is kept verbatim below for the record. FIN-H's side-note in it (`PendingTransferAlreadyVoided` → AlreadyResolved for void-after-void parity) remains unimplemented but is NOT exercised by this suite; the then-surviving in-suite gap (refund replay, former BLOCKED (2)) was subsequently FIXED by CODER-F5 and verified green by FIN-H3 — see the RESOLVED section above.
+
+
+**Symptom (both TB-run checks):**
+`POST /v1/refunds` for a deposit whose hold was already CAPTURED returns
+`502` (`LedgerError::Backend`) against the real TigerBeetle; the identical
+flow returns `201` in sim mode. Refund replay fails the same way (the
+deterministic id makes the two FAILs one bug). Balances were verified
+unchanged — no money moved incorrectly; the operation is wrongly REFUSED.
+
+**Isolated reproduction (harness-independent, real TB 0.16.28 + tb-live
+binary; script + service log checkpointed):**
+
+```
+hold 1000 -> 201; capture 1000 -> 200;
+POST /v1/refunds {deposit_id, amount_cents:1000} ->
+  502 {"error":"ledger backend error: tigerbeetle void transfer rejected:
+       [PendingTransferAlreadyPosted]"}
+```
+
+**Root cause (pinned to source):** the refund path first attempts to VOID
+the hold, expecting "already resolved" to fall through to a posted refund.
+Real TigerBeetle 0.16.28 answers `pending_transfer_already_posted` (result
+33 — `state_machine.zig:2522`, `.posted => return .pending_transfer_already_posted`)
+when the pending transfer was already POSTED, but
+`services/payments-service/src/ledger/tigerbeetle.rs classify_void_kinds()`
+only maps `PendingTransferNotPending` (result 26 — a NON-pending transfer
+id) to the `NotPending` fall-through; `PendingTransferAlreadyPosted` falls
+into `Backend` → 502. Fix (service-side, owned by W-P — NOT applied by
+FIN-H per scope): treat `CreateTransferErrorKind::PendingTransferAlreadyPosted`
+as `VoidClassification::NotPending` in `classify_void_kinds` (and consider
+`PendingTransferAlreadyVoided` → AlreadyResolved semantics for void-after-void
+parity with the sim).
+
+**Impact:** sim mode proves the route/contract logic; the live-ledger
+mapping is wrong for the post-capture refund leg only. Void-of-pending
+(409/rejected capture-after-void), P-11 wrong-amount 400, and the
+cross-tenant refund 403 all PASS on the real ledger.
+
+## Harness changes made for the moved W44 contracts (harness.py, mirror +
+backup; 89 857 B → 109 162 B, md5 4dbc1ce47c798e86cd9ce83dce9d8376)
+
+1. **Payout flow → beneficiary registry (K7):** happy-path and over-limit
+   payouts now register a beneficiary first and pass `beneficiary_id` (raw
+   `payee` bodies are 422 post-W44). Added negatives: raw payee 422, foreign
+   beneficiary 422, disabled beneficiary 422 — each asserting ZERO rail
+   calls, zero balance drift, and no `payout_attempts` row (resolve_payee
+   precedes the ledger hold). Beneficiary create/list/disable happy paths
+   asserted.
+2. **Gateway-auth matrix (K1/K6) on payments + billing:** new human-style
+   calls with `X-Tenant-Slugs`/`X-User-Id`/`X-User-Roles`: owner 200/201,
+   role-less member 403, foreign tenant 403. The pre-existing internal-token
+   calls (K2) are unchanged — they remain valid and now also prove the
+   role-gate exemption.
+3. **Deposit provenance (K7):** gateway-authed hold carries
+   `psp_reference`; the harness asserts the `deposit_provenance` row in the
+   real `payments` DB (`declared_by == X-User-Id`, psp_reference + tenant
+   persisted).
+4. **No-show fee suite (new):** partial fee capture from a pending hold
+   (post.amount == fee, `credits_pending -= hold`, revenue += response
+   amount — response-driven, mode-agnostic) + same-key replay with zero
+   drift.
+5. **B-01 flipped live:** the webhook amount/currency mismatch cases now hit
+   the post-W44 billing handler and PASS (202, invoice stays `issued`,
+   `payment_mismatch` outbox row); the SKIP-pending-B branch remains as an
+   honest fallback only. (Also fixed a latent psycopg bug in that block:
+   `ILIKE '%mismatch%'` → `'%%mismatch%%'`.)
+6. **Boot/auth contract moves:** booking now fails closed on the checked-in
+   `PORTAL_SECRET` default (W-B) → harness sets a per-run random
+   `PORTAL_SECRET`; booking's `tenantMiddleware` is error-closed on
+   undecodable bearers (K-07) → the harness mints a structurally valid
+   unsigned dev JWT with real `sub`/`tenant_slugs` claims; identity's
+   createTenant/getTenant now require an authenticated subject (W-I-1) →
+   harness sends `X-User-Id` on create and configures
+   `IDENTITY_INTERNAL_TOKEN` on both identity and booking (booking forwards
+   it as `X-Internal-Token` on `IDENTITY_BASE_URL` tenant resolution).
+7. **F15-03:** payments `/healthz` dependency detail and `/metrics` counters
+   asserted.
+8. **Latent harness bug fixed (TB mode):** the post-capture balance snapshot
+   (`payments.balance_post_capture`) was taken WITHOUT the internal token —
+   post-P-09 balance reads are tenant-bound, so it silently mapped to `{}`
+   and corrupted the two real-ledger capture assertions. Fixed; both now
+   PASS with real deltas (post=5000 → revenue 4875 + fee 125 at 250 bps).
+
+## Verbatim check list — SIM run (86/86 PASS, exit 0, 18.2s, 92 timed calls)
 
 ```
 PASS service up: identity /healthz
 PASS service up: booking /healthz
 PASS service up: billing /healthz
 PASS service up: payments /healthz
-PASS identity: POST /v1/tenants -> 201   (id=c2034021-3aa1-4d26-bdce-444935880782, slug=e2e-38df848b)
+PASS identity: POST /v1/tenants (X-User-Id subject, W44) -> 201
 PASS identity: GET /v1/tenants/{slug} returns id
 PASS booking: GET /healthz -> 200
-PASS booking: GET /public/sites/{slug} -> 200 (Dapr-free tenant ctx fallback)
-PASS booking: GET /public/sites/{slug}/context -> 200 with 1 offering
+PASS booking: GET /public/sites/{slug} -> 200 (Dapr-free: tenant ctx fallback)
+PASS booking: GET /public/sites/{slug}/context -> 200 with offerings
 PASS booking: GET /public/sites/{slug}/offerings -> 200 with seeded offering
-PASS billing: PUT /v1/rate-cards/{t} -> 200          [R0: 404 — axum route bug, NOW FIXED]
-PASS billing: POST /v1/invoices/generate -> 201   (id=15f4efbd-2225-44d2-97d7-a0f77ab3cf5a)
-PASS billing: generated invoice subtotal == 3000 cents (30 calls x 100)   [R0: subtotal=0 cascade]
-PASS billing: POST /v1/invoices/{id}/issue -> 200 status=issued           [R0: 404, NOW FIXED]
-PASS billing: POST /v1/invoices/{id}/payment-link -> 200 mode=static (EMVCo payload, BILLING_STATIC_ACCOUNT)   [R0: 404, NOW FIXED]
+PASS booking: POST /v1/bookings (authed, IDENTITY_BASE_URL resolution) -> 201 pending
+PASS booking: authed create committed booking row status=pending (no saga — honest degraded mode)
+PASS booking: authed create outbox row committed, sent_at IS NULL (no Dapr — honest degraded mode)
+PASS booking: authed create REPLAY same idempotency_key -> same booking, exactly 1 row
+PASS booking: POST /public/sites/{slug}/bookings -> 201 pending (IDENTITY_BASE_URL resolution)
+PASS booking: public create committed booking row status=pending (no saga — honest degraded mode)
+PASS booking: public create outbox row committed, sent_at IS NULL (no Dapr — honest degraded mode)
+PASS booking: public create REPLAY same idempotency_key -> same booking, exactly 1 row
+PASS billing: PUT /v1/rate-cards/{t} -> 200
+PASS billing: POST /v1/invoices/generate -> 201
+PASS billing: generated invoice subtotal == 3000 cents (30 calls x 100)
+PASS billing: POST /v1/invoices/{id}/issue -> 200 status=issued
+PASS billing: POST /v1/invoices/{id}/payment-link -> 200 mode=static
+PASS billing: gateway call (X-Tenant-Slugs bound + owner role) rate-card PUT -> 200 (K1 binding + K6 role)
+PASS billing: role-less member money mutation -> 403 (K6 money-role gate)
+PASS billing: foreign-tenant gateway call -> 403 (K1 X-Tenant-Slugs binding)
 PASS billing: restarted with PAYSTACK_SECRET_KEY, /healthz ok
-PASS billing: webhook with WRONG signature -> 401   (negative control — HMAC really enforced)
-PASS billing: webhook with REAL HMAC-SHA512 -> 200 status=paid            [R0: 409 cascade, NOW PAID]
-PASS billing: invoice now paid   (GET /v1/invoices/{id} 200, status=paid) [R0: 404, NOW FIXED]
-PASS billing: invoice_issued ledger transfer posted (code 200, deterministic uuid5 id)   rows=1
-PASS billing: invoice_paid ledger transfer posted (code 202, deterministic uuid5 id)     rows=1
-PASS billing: billing_outbox InvoicePaid row committed (same-tx durability, RS-001)      rows=1
-PASS billing: webhook REPLAY -> 200 already_paid   (50 identical-byte replays)
-PASS billing: replay caused NO second ledger posting   rows=1 (SQL count)
-PASS billing: replay caused NO second outbox row       rows=1 (SQL count)
-PASS payments: POST /v1/deposits (hold) -> 201   (deposit_id=0340cead-c7be-577a-baec-39f66f12fc59)
+PASS billing: webhook with WRONG signature -> 401
+PASS billing: webhook with REAL HMAC-SHA512 -> 200 status=paid
+PASS billing: invoice now paid
+PASS billing: invoice_issued ledger transfer posted (code 200, deterministic id)
+PASS billing: invoice_paid ledger transfer posted (code 202, deterministic id)
+PASS billing: billing_outbox InvoicePaid row committed (same-tx durability)
+PASS billing: webhook REPLAY -> 200 already_paid
+PASS billing: replay caused NO second ledger posting
+PASS billing: replay caused NO second outbox row
+PASS billing: webhook amount mismatch -> 202, invoice NOT paid, payment_mismatch event recorded (B-01)
+PASS billing: webhook currency mismatch -> 202, invoice NOT paid, payment_mismatch event recorded (B-01)
+PASS payments: POST /v1/deposits (hold) -> 201
 PASS payments: hold REPLAY same key -> same deposit_id (no double-hold)
-PASS payments: POST /v1/deposits/{id}/capture -> 200                      [R0: 404, NOW FIXED]
-PASS payments: capture REPLAY -> identical result, no double-post         [R0: 404, NOW FIXED]
-PASS payments: GET /v1/accounts/{t}/balance -> 200 with accounts          [R0: 404, NOW FIXED]
+PASS payments: POST /v1/deposits/{id}/capture -> 200
+PASS payments: capture REPLAY -> identical result, no double-post
+PASS payments: GET /v1/accounts/{t}/balance -> 200 with accounts
+PASS payments: POST /v1/internal/accounts/provision WITHOUT token -> 401 (fail-closed)
+PASS payments: provision WITH internal token -> 200 (idempotent, exists-ok)
+PASS payments: /healthz dependency-aware (F15-03): 200 ok; ledger+postgres probes ok; dlq_producer state reported; dead-letter gauge exposed
+PASS payments: /metrics exposes commands/dead-letter/payout-outcome counters (F15-03)
+PASS payments: fixture hold A (4000) -> 201
+PASS payments: capture > hold REJECTED (400/409/422; TB-mode 502 accepted), balances unchanged
+PASS payments: void hold -> 200; deposits credits_pending -= 4000, no posted drift
+PASS payments: capture AFTER void REJECTED (400/409/422; TB-mode 502 accepted), balances unchanged
+PASS payments: fixture hold X (1000) -> 201
+PASS payments: cross-tenant CAPTURE -> 403 (P-06)
+PASS payments: cross-tenant VOID -> 403 (P-06)
+PASS payments: cross-tenant REFUND -> 403 (P-06)
+PASS payments: gateway-authed hold (bound tenant + owner role) -> 201 (K1+K6)
+PASS payments: deposit provenance recorded (K7): declared_by == X-User-Id, psp_reference + tenant persisted
+PASS payments: role-less member money mutation -> 403 (K6 money-role gate)
+PASS payments: foreign-tenant gateway call -> 403 (K1 X-Tenant-Slugs binding)
+PASS payments: fixture hold B (2000) -> 201
+PASS payments: capture B -> 200
+PASS payments: refund (full, post-capture) -> 201; revenue debits_posted += 2000
+PASS payments: refund REPLAY same key -> same refund id, balances byte-identical (no double refund)
+PASS payments: fixture hold C (3000) -> 201
+PASS payments: refund with wrong amount -> 400, balances unchanged (P-11)
+PASS payments: fixture hold NS (2500) -> 201
+PASS payments: no-show fee (1000 of 2500 hold) -> 201; post.amount == 1000, hold remainder released (credits_pending -= 2500), revenue += response amount
+PASS payments: no-show fee REPLAY same key -> same post leg, balances unchanged (no double fee)
+PASS payments: revenue has withdrawable funds for payout case
+PASS payments: POST /v1/beneficiaries -> 201 (K7 vetted-destination registry)
+PASS payments: GET /v1/beneficiaries?tenant_id -> lists the registered destination
+PASS payments: payout with a RAW per-call payee (S1-F7-01 class) -> 422; zero ledger/rail side effects (K7 resolution precedes the hold)
+PASS payments: fixture foreign beneficiary (other tenant) -> 201
+PASS payments: payout referencing a FOREIGN beneficiary -> 422; zero ledger/rail side effects (K7 resolution precedes the hold)
+PASS payments: fixture beneficiary (to disable) -> 201
+PASS payments: POST /v1/beneficiaries/{id}/disable -> 200 disabled_at set
+PASS payments: payout referencing a DISABLED beneficiary -> 422; zero ledger/rail side effects (K7 resolution precedes the hold)
+PASS payments: payout happy path (K7 beneficiary_id) -> 201; LEDGER-FIRST pending->posted (post_pending leg, pending net 0), revenue debits += amount exactly, rail hit exactly once, payout_attempts row committed (P-01/C3)
+PASS payments: payout OVER-LIMIT rejected BEFORE rail — no rail side effect, balances unchanged, no attempt row (C3 ledger-first)
+PASS payments: fixture hold D (1500) -> 201
+PASS payments: capture WITHOUT amount_cents resolved via lookup -> 200 post.amount == hold amount (C4/P-04)
+PASS payments: PLATFORM_FEE_BPS=10001 boot REFUSED with explicit error (P-05)
 PASS RLS: app_billing_login with WRONG app.tenant_id sees 0 invoices
 PASS RLS: app_billing_login with '' app.tenant_id sees 0 invoices (W40-6 fail-closed)
 PASS RLS: app_billing_login with GUC unset sees 0 invoices (fail-closed)
-PASS RLS: app_billing_login with CORRECT app.tenant_id sees only its invoices (rows=13)
+PASS RLS: app_billing_login with CORRECT app.tenant_id sees only its invoices
 ```
 
-Exit code: **0**. 34/34. `[harness] OK: 34/34 checks passed, 264 timed calls, 4.31s`.
+## Verbatim delta — FIN-H REAL-LEDGER run (89/91, exit 1, 164.2s, 96 timed calls) — SUPERSEDED by the FIN-H2 run above
 
-## Timings (input to tests/perf/aggregate.py)
+Identical suite plus the real-ledger lines; only differences from SIM:
 
-`/tmp/funds-e2e-r1/timings/funds-e2e-timings.json` — 264 calls, wall 4.31 s.
-Unlike R0, every budgeted line is now measured on the SUCCESS path:
-invoice_generate n=50 p50=3.0 ms p99=12.6 ms (rated against a REAL rate
-card); paystack webhook n=51 p50=2.4 ms p99=12.3 ms (1 real paid transition
-+ 50 replays; the 401 negative control is a separate call name and is NOT in
-these samples); deposit hold n=51 p50=1.3 ms p99=4.4 ms; deposit capture
-n=100 p50=1.7 ms p99=2.6 ms (real 200 captures, not 404 fast-paths).
-Aggregator: ATOMIC PASS, 4/5 measured; booking create NOT-MEASURED at HTTP
-(Dapr-bound, EXTERNAL_BLOCKED) with the V-Go store bench (0.86 ms/op)
-consumed as the bench note. See tests/perf/RESULTS.md.
-
-## Adversarial confirmations (V-Harness-R1)
-
-(a) Route fix is IN the binaries: `strings` on the built billing-engine
-    shows the registered route blob `/v1/rate-cards/:tenant_id`,
-    `/v1/invoices/:id[/issue|/void|/payment-link|/qr]`; the only `{...}`
-    occurrences are doc/error-message strings, not route registrations.
-    payments-service binary shows `/v1/deposits/:id/capture` and
-    `/v1/accounts/:tenant_id/balance`; zero `{param}` route strings. Source
-    side: `grep '\.route(' src/routes.rs` shows `:param` for every
-    parameterized route in both services; md5 of both routes.rs and
-    harness.py identical between the /mnt mirror and the /tmp build tree.
-(b) Wrong-signature negative control really returns **401** (live, run R1)
-    before the correctly-signed webhook returns 200 `{"status":"paid"}` —
-    the HMAC is enforced, not stubbed.
-(c) RLS legs run as `app_billing_login` (harness.py connects with
-    `dsn_for(srv, "billing", user="app_billing_login", ...)`); the role is
-    `LOGIN ... IN ROLE app_billing` with `app_billing NOLOGIN NOINHERIT`
-    (05-app-roles.sql:90-94) and no SUPERUSER/BYPASSRLS anywhere in the
-    script. All four probes passed live.
-(d) Replay idempotency is asserted by SQL ROW COUNTS, not HTTP status:
-    post-replay `SELECT count(*)` on `ledger_transfers` (deterministic
-    uuid5 ids `billing-issued:{id}`/`billing-paid:{id}`) and
-    `billing_outbox` must stay exactly 1 after 50 identical-byte webhook
-    replays — observed rows=1/rows=1.
-
-## Known environment limits (honest scope, unchanged from R0)
-
-* Booking create / availability at HTTP level: Dapr-bound
-  (resolver.go:108) — EXTERNAL_BLOCKED in sandbox, never mocked;
-  store-level coverage via tests/race + the W41-5 benchmark (consumed by
-  tests/perf/aggregate.py).
-* Payments uses `LEDGER_IMPL=sim` (TigerBeetle EXTERNAL_BLOCKED); billing
-  uses the durable postgres ledger and its rows ARE asserted in Postgres.
-* Paystack live API is unusable in sandbox; static EMV payment-link mode is
-  exercised and webhook signature verification is fully real (local
-  HMAC-SHA512, negative + positive control both live-verified).
-* Rust binaries are debug-profile builds; timings are indicative sandbox
-  numbers, not production-representative.
-
-
----
-
-## W42 — EXECUTED (fresh verifier V-W42, gates G2+G4, 2026-08-17)
-
-Verification-only execution of the committed W42 v2 harness
-(`tests/funds-e2e/harness.py`, unmodified) by a verifier that did not write
-the code. Workspace: pristine copy of the repo at `/tmp/ws`; builds run with
-`GOPROXY=https://goproxy.cn,direct`, `GOFLAGS=-mod=readonly -p=1`,
-`XDG_RUNTIME_DIR=/tmp/xdg`; `go1.23.4 linux/amd64`; `cargo 1.97.1` /
-`rustc 1.97.1` (rustup stable, ustc dist mirror); `pgserver==0.1.4`
-(embedded PostgreSQL 16), `psycopg 3.3.4`; TigerBeetle server binary
-`0.16.28+e97e337` (`/tmp/tigerbeetle`, zip sha verified by unzip -t);
-`libclang` from the pip wheel
-(`LIBCLANG_PATH=~/.local/lib/python3.12/site-packages/clang/native`) plus
-`BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/12/include
--I/usr/include/x86_64-linux-gnu` — REQUIRED: the libclang pip wheel ships no
-builtin headers, so bindgen otherwise dies on `stddef.h`; Zig 0.13.0
-tarball prefetched from ziglang.org and sha256-verified against the
-official index (`d45312e6...1230ea`) because the per-connection throttle
-made the in-build download impractical (served to the vendored
-`zig/download` script via a PATH wget shim; no repo/harness file touched).
-
-### 1. SIM mode — PASS (exit 0, 42/42), twice
-
-Run A (full builds, default iters):
-`python3 tests/funds-e2e/harness.py --workdir /tmp/funds-sim`
--> `[harness] OK: 42/42 checks passed, 23 timed calls, 462.81s` (wall
-includes identity 45s + booking 70s + billing 211s + payments 134s builds),
-timings -> `/tmp/funds-sim/timings/funds-e2e-timings.json`, summary ->
-`/tmp/funds-sim/funds-e2e-summary.json`.
-
-Run B (PERF_ITERS=50, same binaries via IDENTITY_BIN/BOOKING_BIN/
-BILLING_BIN/PAYMENTS_BIN, fresh workdir/pgdata):
-`FUNDS_E2E_PERF_ITERS=50 ... python3 tests/funds-e2e/harness.py --workdir
-/tmp/funds-sim2` -> `[harness] OK: 42/42 checks passed, 366 timed calls,
-7.7s`, 0 FAIL lines.
-
-The NEW W42 booking-create assertions all PASS (run A observed values):
-* `booking: POST /v1/bookings (authed, IDENTITY_BASE_URL resolution) -> 201
-  pending` — status=201, body has id/status=pending (Coder G's direct-GET
-  fallback against the REAL identity-service works; no Dapr anywhere).
-* `booking: authed create committed booking row status=pending` —
-  row_status=pending (honest degraded mode, no Temporal saga).
-* `booking: authed create outbox row committed, sent_at IS NULL` —
-  outbox_rows=2 unsent=2 (no Dapr dispatcher; asserted, not faked).
-* `booking: authed create REPLAY same idempotency_key -> same booking,
-  exactly 1 row` — status=201 replay_id identical, rows_for_key=1.
-* Same four assertions for `POST /public/sites/{slug}/bookings` — all PASS
-  (201 pending, row pending, outbox 2/2 unsent, replay rows_for_key=1).
-All W41 assertions (identity, billing two-phase + webhook HMAC 401/200 +
-SQL row-count idempotency, payments sim hold/capture/replay/balance, 4 RLS
-probes) still PASS — 42/42 total, up from R1's 34/34 by the 8 new
-booking-create checks.
-
-### 2. REAL-LEDGER (TB) mode — FAIL (build-time defect, both crates)
-
-Command:
-`TB_BINARY=/tmp/tigerbeetle FUNDS_E2E_PERF_ITERS=50 python3
-tests/funds-e2e/harness.py --workdir /tmp/funds-tb`
-
-What works: `tigerbeetle format --cluster=0 --replica=0 --replica-count=1`
-+ `start --addresses=127.0.0.1:3000 --development` ->
-`PASS  tigerbeetle: format + start --development, 127.0.0.1:3000 accepting`
-(real 0.16.28 server came up fine).
-
-What fails — the harness-generated tb-fixture crate does NOT COMPILE
-(`logs/build-tb-fixture.log`):
 ```
-error[E0369]: binary operation `==` cannot be applied to type
-`CreateAccountErrorKind`
-  --> main.rs:41:63
-   41 | ... if api.as_slice().iter().all(|e| e.kind() ==
-      tb::error::CreateAccountErrorKind::Exists) => {}
-note: `CreateAccountErrorKind` does not implement `PartialEq`
+PASS tigerbeetle: format + start --development, 127.0.0.1:3000 accepting
+PASS tigerbeetle: tenant+platform accounts created on the REAL ledger (pinned client crate, exists=idempotent)
+PASS tigerbeetle: hold visible as PENDING on the real ledger (deposits credits_pending += hold amount)  — delta=5000
+PASS tigerbeetle: capture MOVED FUNDS on the real ledger (balance deltas == post/revenue/fee amounts)   — post=5000 revenue=4875 fee=125
+PASS tigerbeetle: capture REPLAY left every balance counter byte-identical (real TB `exists`, no double-post)
+FAIL payments: refund (full, post-capture) -> 201; revenue debits_posted += 2000   — status=502 refund_id=None revenue_debits_delta=0   [BLOCKED #1]
+FAIL payments: refund REPLAY same key -> same refund id, balances byte-identical (no double refund)   — status=502   [same root cause]
 ```
-Root cause verified in the pinned dependency
-(`tigerbeetle-unofficial-sys 0.8.0+0.16.28`, Cargo.lock checksum
-1c71963b..., bindgen 0.71.1): the generated-safe error-kind enums are
-emitted with `#[derive(Debug, Clone, Copy)]` ONLY — no PartialEq
-(confirmed in the build OUT_DIR `generated.rs`).
 
-Independent probe, UNMODIFIED service tree:
-`cargo build --locked --features tb-live` in services/payments-service
--> `error: could not compile `payments-service` due to 2 previous errors`:
-* src/ledger/tigerbeetle.rs:241:39 — `e.kind() ==
-  CreateTransferErrorKind::Exists` — E0369 (no PartialEq)
-* src/ledger/tigerbeetle.rs:305:39 — `e.kind() ==
-  CreateAccountErrorKind::Exists` — E0369 (no PartialEq)
+## Artifacts / checksums — FIN-H3 run (checkpointed to /mnt/agents/output/backups/w44/FIN-H3/)
 
-So the tb-live build of the shipped W42 tree CANNOT have been run against a
-real TigerBeetle as claimed ("live-proven" in tigerbeetle.rs:32 is
-falsified by this compile error): the service fails to compile with the
-feature enabled, and the harness's own account-provisioning fixture fails
-the same way before any ledger assertion executes. The TB-mode balance
-assertions (hold pending, capture 5000 -> 4875 revenue + 125 fee, replay
-byte-identical) are therefore UNVERIFIED — never reached.
-
-### 3. Mutation check (SPEC-W42 G2) — FAIL (mandated signature unreachable)
-
-Mutation applied to a scratch copy `/tmp/mut` of services/payments-service
-(`git diff` of src/ledger/tigerbeetle.rs vs the pristine tree):
-```
-118:  build_void_hold_transfer: CODE_DEPOSIT_HOLD -> CODE_REFUND  (102)
-181:  build_capture_batch leg 0 post: CODE_DEPOSIT_HOLD -> code   (101 for captures)
-```
-i.e. exactly the pre-W42 code-matching defect.
-
-* Mutated tb-live build: `cargo build --locked --features tb-live` in
-  /tmp/mut -> SAME 2xE0369 at tigerbeetle.rs:241/305 (exit 1). The
-  `pending_transfer_has_different_code` runtime rejection can never occur
-  because the binary cannot be built.
-* Full harness TB-mode run against the mutated context (prebuilt
-  sim-mode binaries for the other services, fresh workdir /tmp/funds-mut):
-  exit=1, failing at `tb_fixture_bin` (the same fixture E0369) — TB server
-  format+start PASSed first. The run fails, but NOT with the mandated
-  `pending_transfer_has_different_code`; that signature is unreachable in
-  this tree.
-
-Conclusion: the mutation check as specified CANNOT demonstrate the intended
-kill condition; W42's real-ledger leg fails at compile time upstream of it.
-(The in-crate unit tests at tigerbeetle.rs:589+ that pin the code-matching
-rule also cannot run: they compile the same non-compiling module under
-`--features tb-live`.)
-
-### 4. W42 verdicts
-
-| leg | verdict | evidence |
+| artifact | bytes | md5 |
 |---|---|---|
-| SIM mode (baseline, incl. new booking-create checks) | **PASS** | 42/42 exit 0, twice (iters=1 and 50); logs above |
-| REAL-LEDGER (TB) mode | **FAIL** | tb-fixture E0369; service tb-live 2xE0369 at tigerbeetle.rs:241,305; ledger assertions never reached |
-| Mutation check (must fail with `pending_transfer_has_different_code`) | **FAIL** | mutated tree fails at compile time instead; mandated runtime signature unobservable |
-| PERF (G4) | **PASS with gap** | `tests/perf/aggregate.py` exit 0, ATOMIC PASS 7/7 measured — B1/B2 booking create now MEASURED-at-HTTP (n=51 each); see tests/perf/RESULTS.md. Gap: no TB-mode timings exist (build failure), so perf covers sim mode only |
+| run-tb-final.log (full TB run, **91/91, exit 0**) | 15 004 | 3475c5e820a4d6a88a494dead40c27e5 |
+| tb/funds-e2e-summary.json | 19 686 | 45a06f0d10cc3e9b904ccc574fedc95b |
+| tb/timings/funds-e2e-timings.json | 18 594 | af918ea609339bdb7a7dc7902b9e0516 |
+| run-sim-final.log (full SIM re-run, **86/86, exit 0**) | 12 554 | 555dff98b7bd17da46a798b9c9687e24 |
+| sim/funds-e2e-summary.json | 17 048 | f1ade0b8ac0811d798da4aa0f26abc2c |
+| sim/timings/funds-e2e-timings.json | 17 724 | aa395b017bd229016b6cae0788466401 |
+| run-sim-run1-noexport.log (85/86 without the IDENTITY_BASE_URL export — env-artifact evidence) | 12 600 | 1808ad622948e9a5ea988351f2c15ae9 |
+| build logs x5 (identity/booking/billing/payments-sim/payments-tb) | — | in backup dir |
+| per-service logs (sim/logs, tb/logs incl. tigerbeetle.log) + tb fixture crate (tb/cargo-target) | — | in backup dir |
 
-Environment fixes the verifier had to add (no repo files changed): pip
-`cmake`/`libclang` wheels, `BINDGEN_EXTRA_CLANG_ARGS` for bindgen builtin
-headers, ustc mirrors for crates/rustup (per-connection throttle), zig
-0.13.0 prefetch + wget shim (sha256-verified).
+## Artifacts / checksums — FIN-H2 run (checkpointed to /mnt/agents/output/backups/w44/FIN-H2/)
 
+| artifact | bytes | md5 |
+|---|---|---|
+| tb-final/run-tb4.log (canonical-binary full TB run, 90/91) | 15 058 | a975bc63798a8065a2eed6852f7543e6 |
+| tb-final/funds-e2e-summary.json | 19 688 | d3fe7a978cd63e0b864d12f627feea7b |
+| tb-final/funds-e2e-timings.json | 18 593 | 2a3393da9b757fad085843ab3b180431 |
+| test-void-classification.log (6/6 unit tests) | 7 697 | 3cd857a3474ce465f1ce2cbebceffeb9 |
+| repro_refund_replay.py (BLOCKED (2) isolated repro) | 3 540 | cbf29fbacc24c89a689d71ee4f135ad0 |
+| repro2-payments.log (502 ExistsWithDifferentFlags evidence) | 4 688 | 66d669185f8ddfffc536c003b3dda72 |
+| payments-service-tblive.bin.part0/.part1/.part2 (canonical tb-live binary, split for the /mnt 100-MiB write cap; concat = 156 410 224 B, md5 c211179dc961b5c043cfd36f9d2907d5) | 52 428 800 / 52 428 800 / 51 552 624 | c964c9d2be234a704866cd6e1802ca57 / 851cb4cadce5dab62cf415f16bf6ef02 / 4e6805f37046e1150f52fefb7589af4d |
+| tigerbeetle-0.16.28-bin | 18 204 512 | 31288566a718ce9290571d3f3982b6da |
+| tb-run1/ (interim 89/91 run without the IDENTITY_BASE_URL export; billing foreign-tenant 503 env artifact) | — | in backup dir |
+| tb-run2/ (90/91 run, pre-canonical relink binary — same sources) | — | in backup dir |
+| build logs x5 (billing/payments-tb/identity/booking + unit-test build) | — | in backup dir |
+| per-service logs (tb-final/logs incl. tigerbeetle.log) | — | in backup dir |
 
----
+## Artifacts / checksums (checkpointed to /mnt/agents/output/backups/w44/FIN-H/)
 
-## W42 R1 (repair round) — fresh-verifier execution evidence (2026-08-17, verifier W42-gate-G2+G4-R1)
+| artifact | bytes | md5 |
+|---|---|---|
+| sim/run-sim.log | 12 551 | d20152fa5140b2466068e9814601b542 |
+| sim/funds-e2e-summary.json | 17 051 | 081faa1e0057ebe51b2dd7303f4aa78c |
+| sim/funds-e2e-timings.json | 17 721 | 3d8a8fa7e2c936f47c5e2b8038928e22 |
+| tb/run-tb.log | 14 968 | bb1f3559fb445d6cbc31087fedc728c5 |
+| tb/funds-e2e-summary.json | 19 654 | c67f783e097e7da68c19398c17a31d5b |
+| tb/funds-e2e-timings.json | 18 589 | 3f614604389b2426725bea02a88336e9 |
+| tb/repro-refund-payments.log (isolated 502 evidence) | 3 502 | c0a9ca294d58577802ec12bc0b8ad0c1 |
+| tb/repro_refund.py | 2 857 | 2adfa37fbcae660d1b78ea3441cf038d |
+| harness.py.final (== mirror tests/funds-e2e/harness.py) | 109 162 | 4dbc1ce47c798e86cd9ce83dce9d8376 |
+| build logs x5 (billing/payments-sim/payments-tb/identity/booking) | — | in backup dir |
+| per-service logs (sim/logs, tb/logs incl. tigerbeetle.log) | — | in backup dir |
 
-Environment (sandbox, built from scratch this round): Go 1.23.4 (/tmp/go), Rust 1.97.1 stable
-(manual toolchain from static.rust-lang.org dist 2026-07-16, sha256-verified components
-cargo/rustc/rust-std/rustfmt), cmake 4.4.2 + libclang 18.1.1 (pip wheels, sha256-verified),
-TigerBeetle 0.16.28+e97e337 (official release zip, `/tmp/tigerbeetle version` =>
-"TigerBeetle version 0.16.28+e97e337"), pgserver 0.1.4 + psycopg + pytest.
-Zig 0.13.0 prefetched from ziglang.org (sha256 d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea,
-verified) and served to the tigerbeetle-unofficial-sys build script via a PATH `wget` shim
-(offline/throttled network). crates.io via ustc sparse mirror; `cargo fetch --locked` clean.
-
-### 1. TB (real-ledger) mode run
-
-Command:
-`TB_BINARY=/tmp/tigerbeetle FUNDS_E2E_PERF_ITERS=50 python3 tests/funds-e2e/harness.py --workdir /tmp/funds-tb`
-(repo=/tmp/ws, a copy of /mnt/agents/output/opendesk)
-
-Two executed runs, identical outcome (deterministic):
-- run A (cold builds): `HARNESS_EXIT=1 wall=943s` — `[harness] FAILED: 46/47 checks passed, 370 timed calls, 934.76s`
-  (build times: tb-fixture 2m06s, booking 69s, billing-engine 292s, payments --features tb-live incl. zig tb_client C build)
-- run B (cached builds, fresh pgdata + fresh TB datafile): `HARNESS_EXIT=1 wall=33s` —
-  `[harness] FAILED: 46/47 checks passed, 370 timed calls, 23.16s`
-
-PASS evidence (both runs), verbatim lines:
-```
-PASS  tigerbeetle: format + start --development, 127.0.0.1:3000 accepting
-PASS  tigerbeetle: tenant+platform accounts created on the REAL ledger (pinned client crate, exists=idempotent)
-PASS  payments: POST /v1/deposits (hold) -> 201
-PASS  payments: hold REPLAY same key -> same deposit_id (no double-hold)
-PASS  payments: POST /v1/deposits/{id}/capture -> 200
-PASS  tigerbeetle: hold visible as PENDING on the real ledger (deposits credits_pending += hold amount)  — delta=5000
-PASS  tigerbeetle: capture MOVED FUNDS on the real ledger (balance deltas == post/revenue/fee amounts)  — post=5000 revenue=4875 fee=125
-PASS  tigerbeetle: capture REPLAY left every balance counter byte-identical (real TB `exists`, no double-post)
-PASS  booking: POST /v1/bookings (authed, IDENTITY_BASE_URL resolution) -> 201 pending
-PASS  booking: POST /public/sites/{slug}/bookings -> 201 pending (IDENTITY_BASE_URL resolution)
-PASS  booking: authed/public create REPLAY same idempotency_key -> same booking, exactly 1 row
-```
-(booking-create checks PASS via the IDENTITY_BASE_URL fallback; RLS adversarial 4/4 PASS; billing suite PASS.)
-
-The R0 tb-live compile defects are confirmed FIXED: `cargo build --locked --features tb-live`
-succeeds for payments-service (matches!/derive(Debug) repairs compile clean) and the generated
-tb-fixture crate builds and provisions accounts against the real server.
-
-### 2. REMAINING DEFECT (live-proven, deterministic): capture replay returns 502 in TB mode
-
-```
-FAIL  payments: capture REPLAY -> identical result, no double-post  — status=502 identical=False
-```
-All 50 replay iterations returned HTTP 502 (timings JSON: capture_replay statuses all 502, ~1.8 ms each).
-Manual reproduction against the committed ledger (verbatim):
-```
-$ curl -X POST .../v1/deposits/83053016-88e6-564c-9e40-2725430a110e/capture -d '{"tenant_id":"...","amount_cents":5000}'
-{"error":"ledger backend error: tigerbeetle transfer rejected: Failed to create transfers: 3 api errors occurred at transfers' creation"}
-HTTP=502
-```
-Root cause, proven with a purpose-built probe crate linking the SAME pinned
-tigerbeetle-unofficial 0.8.0+0.16.28 client against a fresh real TB 0.16.28 (verbatim probe output):
-```
-first fixed-code capture committed
-REPLAY index=0 kind=Exists
-REPLAY index=1 kind=LinkedEventFailed
-REPLAY index=2 kind=LinkedEventFailed
-```
-TigerBeetle treats `exists` as a chain-breaking result inside a LINKED batch: on replay of the
-committed capture batch, leg 0 (post leg, code=CODE_DEPOSIT_HOLD — the W42 fix works, the first
-capture commits) resolves to `Exists`, and the two linked split legs fail with `LinkedEventFailed`.
-The service's submit() (GF11) only accepts the all-`Exists` case, so replay surfaces as 502.
-The ledger itself stayed correct — balances after 50 replays are byte-identical (the separate
-byte-identical assertion PASSED; no double-post). The defect is the replay API contract
-(200 + identical result), not fund safety. SIM mode (42/42, R0) is unaffected because the sim
-ledger reuses stored transfers.
-
-### 3. Runtime mutation check (the R0 gap — executed)
-
-Mutant: copy of services/payments-service at /tmp/mut with the W42 fix REVERTED in
-src/ledger/tigerbeetle.rs — capture post leg code CODE_DEPOSIT_HOLD -> `code` (CODE_CAPTURE=101)
-in build_capture_batch leg 0, and void leg CODE_DEPOSIT_HOLD -> CODE_REFUND=102 in
-build_void_hold_transfer. Built: `cargo build --locked --features tb-live` => MUT_BUILD_EXIT=0.
-
-Run (verbatim tail):
-```
-TB_BINARY=/tmp/tigerbeetle PAYMENTS_BIN=/tmp/mut-target/debug/payments-service FUNDS_E2E_PERF_ITERS=1 python3 tests/funds-e2e/harness.py --workdir /tmp/funds-tb
-PASS  payments: POST /v1/deposits (hold) -> 201  — deposit_id=480f61dacd1b593b9ede5ac12bc6c014
-PASS  payments: hold REPLAY same key -> same deposit_id (no double-hold)
-FAIL  payments: POST /v1/deposits/{id}/capture -> 200  — status=502 body={'error': "ledger backend error: tigerbeetle transfer rejected: Failed to create transfers: 3 api errors occurred at transfers' creation"}
-[harness] FAILED: 42/44 checks passed, 26 timed calls, 18.46s
-MUT_HARNESS_EXIT=1
-```
-The mutant FAILS at runtime on the FIRST capture, as required. Verbatim server-side error kinds
-for the mutant-style batch (same probe crate, fresh TB):
-```
-MUTANT index=0 kind=PendingTransferHasDifferentCode
-MUTANT index=1 kind=LinkedEventFailed
-MUTANT index=2 kind=LinkedEventFailed
-```
-i.e. exactly `pending_transfer_has_different_code` on the mis-coded post leg — the W42 unit-test
-comment's prediction confirmed against the real server.
-
-### R1 verdict (this gate)
-
-- TB real-ledger mode: **FAIL** — 46/47; the money path, hold-pending visibility, capture fee
-  split (5000 -> 4875 revenue + 125 fee) and balance idempotency all proven on the real ledger,
-  but the capture-replay API contract returns 502 (Exists/LinkedEventFailed linked-batch semantic).
-  Remaining work: submit() must treat `Exists` + trailing `LinkedEventFailed`-after-`Exists` on a
-  verbatim replayed batch as idempotent success (or TB-side retry semantics revisited).
-- Runtime mutation check: **PASS** (mutant detected at runtime; verbatim PendingTransferHasDifferentCode).
-- R0 compile repairs (matches!/derive(Debug), created_at stripping in TB-mode comparison): confirmed compiled
-  and exercised; the created_at normalization was not reached because replay 502s before comparison.
-
-
----
-
-## W42 R2 — TB-mode reverification after is_idempotent_replay repair (verifier gate G2, fresh env)
-
-R1 live-proven defect (replay of a committed LINKED capture batch returned Exists+LinkedEventFailed
--> 502) is FIXED by `is_idempotent_replay()` in services/payments-service/src/ledger/tigerbeetle.rs:246
-(accepts iff every kind in {Exists, LinkedEventFailed} AND >=1 Exists anchor; empty set keeps prior
-vacuous acceptance).
-
-### 1. cargo test --locked --features tb-live (in /tmp/ws copy, CARGO_TARGET_DIR=/tmp/ttarget)
-
-    test ledger::tigerbeetle::tests::replay_all_exists_is_accepted ... ok
-    test ledger::tigerbeetle::tests::replay_linked_exists_then_linked_event_failed_is_accepted ... ok
-    test ledger::tigerbeetle::tests::linked_event_failed_without_exists_anchor_is_rejected ... ok
-    test ledger::tigerbeetle::tests::mutant_different_code_plus_linked_event_failed_is_rejected ... ok
-    test ledger::tigerbeetle::tests::any_genuine_error_kind_defeats_replay_acceptance ... ok
-    test ledger::tigerbeetle::tests::empty_error_set_keeps_prior_vacuous_acceptance ... ok
-    test result: ok. 48 passed; 0 failed; 0 ignored (final suite; 45- and 30-test suites also ok)
-    TEST_EXIT=0
-
-All 6 new is_idempotent_replay tests PASS; all prior tests PASS.
-
-### 2. TB mode (REAL TigerBeetle 0.16.28, single-replica --development)
-
-    TB_BINARY=/tmp/tigerbeetle FUNDS_E2E_PERF_ITERS=50 python3 tests/funds-e2e/harness.py --workdir /tmp/funds-tb-r2
-    (prebuilt bins via PAYMENTS_BIN/BILLING_BIN/IDENTITY_BIN/BOOKING_BIN; payments built --features tb-live)
-
-    [harness] OK: 47/47 checks passed, 370 timed calls, 145.92s   (wall 156s)  HARNESS_EXIT=0
-
-Key checks (verbatim):
-    PASS  payments: POST /v1/deposits/{id}/capture -> 200  — status=200
-    PASS  payments: capture REPLAY -> identical result, no double-post  — status=200 identical=True
-    PASS  tigerbeetle: capture MOVED FUNDS on the real ledger — post=5000 revenue=4875 fee=125
-    PASS  tigerbeetle: capture REPLAY left every balance counter byte-identical (real TB `exists`, no double-post)
-
-The R1 502-on-replay defect no longer reproduces: replay returns 200 with an identical (modulo
-created_at) result and every ledger balance counter byte-identical.
-
-### 3. Runtime mutation check (MUST still fail) — /tmp/mut copy, post leg code 100->101, void leg 100->102
-
-    PAYMENTS_BIN=<mutant tb-live build> python3 tests/funds-e2e/harness.py --workdir /tmp/funds-tb-mut
-
-    FAIL  payments: POST /v1/deposits/{id}/capture -> 200  — status=502 body={'error': "ledger backend error:
-          tigerbeetle transfer rejected: Failed to create transfers: 3 api errors occurred at transfers' creation"}
-    FAIL  payments: capture REPLAY -> identical result, no double-post  — status=502 identical=True
-    [harness] FAILED: 42/44 checks passed, 369 timed calls, 144.44s   HARNESS_EXIT=1
-
-Mutant detected at the FIRST capture (502; the 3 api errors = pending_transfer_has_different_code on the
-post leg + linked_event_failed x2 on the linked split legs — exactly the kind vector the R2 unit test
-`mutant_different_code_plus_linked_event_failed_is_rejected` rejects). Mutation check: **PASS** (still fails).
+Previous W41-era results (V-Harness-R1, 34/34) are superseded by this file;
+the W41 harness predates the W42 booking-write-path/W43 funds-hardening/W44
+gateway-auth coverage.
