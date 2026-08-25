@@ -3,6 +3,7 @@
 //! Dapr pubsub outbox to Kafka, Temporal activity handlers, and an idempotent
 //! Kafka commands consumer.
 
+mod auth;
 mod config;
 mod consumer;
 mod dapr;
@@ -10,6 +11,8 @@ mod events;
 mod flutterwave;
 mod ledger;
 mod mojaloop;
+mod payouts;
+mod registry;
 mod routes;
 
 use std::net::SocketAddr;
@@ -48,10 +51,26 @@ pub struct AppState {
     /// (`opendesk.dlq`, booking-service idiom). When the Kafka producer could
     /// not be created this is the fail-closed `UnavailableDlqSink`.
     pub dlq: Arc<dyn consumer::DlqSink>,
+    /// SPEC-W43 P-09 (C1): internal-token auth + gateway tenant binding.
+    pub auth: auth::AuthConfig,
+    /// SPEC-W43 P-01 (C3): durable payout attempt records for the reconciler
+    /// (Postgres when a DSN is configured; in-memory dev fallback otherwise).
+    pub payout_attempts: Arc<dyn payouts::PayoutAttemptStore>,
+    /// SPEC-W44 K7: payee registry (payout beneficiaries) + deposit
+    /// provenance. Postgres when a DSN is configured; in-memory dev fallback
+    /// otherwise (same lifecycle as `payout_attempts`).
+    pub registry: Arc<dyn registry::Registry>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
     /// GF11 error metric: commands dead-lettered after bounded retries.
     pub commands_dead_lettered: Arc<AtomicU64>,
+    /// F15-03 (/metrics): commands handled successfully.
+    pub commands_processed: Arc<AtomicU64>,
+    /// F15-03 (/metrics): payout attempts by outcome.
+    pub payouts_attempted: Arc<AtomicU64>,
+    pub payouts_committed: Arc<AtomicU64>,
+    pub payouts_failed: Arc<AtomicU64>,
+    pub payouts_unknown: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -169,6 +188,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(consumer::UnavailableDlqSink)
         }
     };
+    // P-01 (C3): durable payout_attempts store. When a DSN is configured
+    // (PAYMENTS_DATABASE_URL / DATABASE_URL / PG_DSN) the table is
+    // bootstrapped at startup and an unreachable database fails the boot
+    // (fail-closed). Without a DSN the store is in-memory (dev only).
+    let payout_attempts: Arc<dyn payouts::PayoutAttemptStore> = match &cfg.database_url {
+        Some(dsn) => Arc::new(payouts::PgPayoutAttemptStore::connect_with_retry(dsn).await?),
+        None => {
+            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: payout_attempts store is                    in-memory (dev only — reconciliation records are lost on restart)");
+            Arc::new(payouts::MemPayoutAttemptStore::default())
+        }
+    };
+    // SPEC-W44 K7: payee registry + deposit provenance store (same DSN
+    // posture as payout_attempts: fail-closed when configured, in-memory dev
+    // fallback otherwise).
+    let registry: Arc<dyn registry::Registry> = match &cfg.database_url {
+        Some(dsn) => Arc::new(registry::PgRegistry::connect_with_retry(dsn).await?),
+        None => {
+            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: payee registry / deposit                    provenance store is in-memory (dev only — beneficiary records are lost on restart)");
+            Arc::new(registry::MemRegistry::default())
+        }
+    };
+    if cfg.internal_token.is_none() && !cfg.trust_direct_tenant {
+        warn!("PAYMENTS_INTERNAL_TOKEN unset and OPENDESK_TRUST_DIRECT_TENANT off: money routes                fail closed (503) unless the gateway injects X-Tenant-Slugs (C1)");
+    }
     let state = AppState {
         ledger,
         outbox,
@@ -176,9 +219,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
         config: Arc::new(cfg.clone()),
         dlq,
+        auth: auth::AuthConfig::new(
+            cfg.internal_token.clone(),
+            cfg.trust_direct_tenant,
+            cfg.money_roles.clone(),
+        ),
+        payout_attempts,
+        registry,
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
         commands_dead_lettered: Arc::new(AtomicU64::new(0)),
+        commands_processed: Arc::new(AtomicU64::new(0)),
+        payouts_attempted: Arc::new(AtomicU64::new(0)),
+        payouts_committed: Arc::new(AtomicU64::new(0)),
+        payouts_failed: Arc::new(AtomicU64::new(0)),
+        payouts_unknown: Arc::new(AtomicU64::new(0)),
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -187,6 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // P-01 (C3): reconciler sweeping unknown payout rail outcomes.
+    let reconciler_handle = tokio::spawn(payouts::run_reconciler(
+        state.clone(),
+        shutdown_tx.subscribe(),
+    ));
 
     // SPEC-W12 §6: Flutterwave routes merged additively (module self-registers
     // /v1/payments/flutterwave/initialize + /webhooks/flutterwave).
@@ -201,6 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(handle) = consumer_handle {
         let _ = handle.await;
     }
+    let _ = reconciler_handle.await;
     info!("payments-service stopped");
     Ok(())
 }
