@@ -1,17 +1,30 @@
 //! REST API (SPEC-W7 B2/B3): rate cards, invoicing, payment links/QR, and the
 //! public Paystack webhook.
 //!
-//! Auth contract (B2 + RS-002): every route except /healthz and
-//! /webhooks/paystack first requires the `x-internal-token` header to match
-//! BILLING_INTERNAL_TOKEN (boot fails closed when the env is unset). APISIX
-//! strips any client-supplied copy and injects the real one; without it even
-//! a well-formed X-Tenant-ID is rejected (401), so the tenant/role headers
-//! below can never be spoofed from the docker network. On top of that every
-//! /v1/* route requires the `X-Tenant-ID` header to match the target tenant
-//! (service-to-service via APISIX). Mutating generate/void additionally
-//! require the gateway-injected `x-user-roles` header to contain the Keycloak
-//! realm role `owner` or `admin` (403 otherwise). `/webhooks/paystack` is
-//! exempt from both: it authenticates via the Paystack HMAC signature instead.
+//! Auth contract (SPEC-W44 K1/K2/K6 — the W43-era header-trust contract is
+//! RETIRED: APISIX now strips caller-sent x-tenant-id/x-user-roles on OIDC
+//! routes, so trusting them would be trusting nothing):
+//! - **Service callers (K2)**: a valid `x-internal-token` (vs
+//!   BILLING_INTERNAL_TOKEN, constant-time; boot fails closed when unset)
+//!   fully authenticates the call; the tenant comes from the caller's
+//!   path/query/body param.
+//! - **Human calls via the gateway (K1)**: no internal token; APISIX injects
+//!   `X-Tenant-Slugs` (verified JWT claim; SPEC-W44 F1: the gateway NEVER
+//!   injects x-internal-token — the W39-era injection silently authenticated
+//!   every human call as a service caller) and the caller-supplied tenant
+//!   param must bind to the claim: directly, or — since billing tenants are
+//!   uuid-keyed while the claim carries slugs — by resolving each slug to
+//!   its uuid via identity-service (see `bind_tenant` / src/identity.rs;
+//!   fail-closed on identity errors).
+//! - **Money mutations (K6)**: rate-card upsert, generate/issue/void and
+//!   payment-link additionally require `X-User-Roles` ∩ `MONEY_ROLES`
+//!   (default owner/admin; internal-token callers exempt; fail-closed when
+//!   the header is absent).
+//! - `/webhooks/paystack` is exempt from both: it authenticates via the
+//!   Paystack HMAC signature instead. `/healthz` + `/metrics` are exempt
+//!   liveness/observability probes.
+//! - Dev escape `OPENDESK_TRUST_DIRECT_TENANT=1` (standalone dev only,
+//!   never set in compose) bypasses binding/roles for headerless calls.
 
 use axum::{
     body::Bytes,
@@ -79,7 +92,12 @@ impl From<BillingError> for ApiError {
                 ApiError::new(StatusCode::CONFLICT, e.to_string())
             }
             BillingError::NotFound(_) => ApiError::new(StatusCode::NOT_FOUND, e.to_string()),
-            BillingError::Db(_) => ApiError::internal(e.to_string()),
+            // MixedCurrency is a defensive invariant violation (the rate-card
+            // upsert gate already rejects mixed currencies at write time), so
+            // it surfaces as a 500, not a client error (B-05).
+            BillingError::MixedCurrency { .. } | BillingError::Db(_) => {
+                ApiError::internal(e.to_string())
+            }
         }
     }
 }
@@ -91,33 +109,96 @@ impl From<sqlx::Error> for ApiError {
 }
 
 // ---------------------------------------------------------------------------
-// Auth helpers (B2)
+// Auth helpers (SPEC-W44 K1/K2/K6)
 // ---------------------------------------------------------------------------
 
-/// `X-Tenant-ID` must be present and equal the route's tenant.
-fn require_tenant(headers: &HeaderMap, tenant_id: Uuid) -> Result<(), ApiError> {
-    let parsed = tenant_from_header(headers)?;
-    if parsed != tenant_id {
-        return Err(ApiError::forbidden("X-Tenant-ID does not match tenant"));
+/// Gateway-injected tenant slugs (K1: csv of the verified JWT's
+/// `tenant_slugs` claim; APISIX strips caller-sent copies). An absent or
+/// empty header means the request is NOT a gateway call.
+fn gateway_slugs(headers: &HeaderMap) -> Option<Vec<String>> {
+    let raw = headers
+        .get("x-tenant-slugs")
+        .and_then(|v| v.to_str().ok())?;
+    let slugs: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if slugs.is_empty() {
+        None
+    } else {
+        Some(slugs)
     }
-    Ok(())
 }
 
-/// Parse the request's tenant context (`X-Tenant-ID`, gateway-validated; the
-/// gateway strips client-spoofed copies since W34 GF4). This tenant is what
-/// the RLS GUC is set to for the request's transactions (GF6).
-fn tenant_from_header(headers: &HeaderMap) -> Result<Uuid, ApiError> {
-    let hdr = headers
-        .get("x-tenant-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ApiError::forbidden("missing X-Tenant-ID header"))?;
-    Uuid::parse_str(hdr.trim())
-        .map_err(|_| ApiError::forbidden("malformed X-Tenant-ID header"))
+/// K1/K2 tenant binding: the caller-supplied tenant (path/query/body param)
+/// is trusted for internal-token service callers; gateway (human) calls must
+/// bind it to the verified `X-Tenant-Slugs` claim (403 on mismatch). The
+/// claim carries Keycloak SLUGS while billing tenants are uuid-keyed, so
+/// binding is two-stage (SPEC-W44 F1):
+///   1. direct match — the param equals a claimed slug (slug-keyed tenants,
+///      or a uuid-string slug), no network call;
+///   2. otherwise each claimed slug is resolved to its tenant uuid via
+///      identity-service `GET /v1/tenants/{slug}` (src/identity.rs, TTL
+///      cache); the binding succeeds when any resolved id == the param.
+/// Resolution is FAIL-CLOSED: identity unreachable/erroring is a 503 (never
+/// a silent allow), a resolved-but-different id is a 403, and resolution
+/// disabled (IDENTITY_BASE_URL empty) is a 403. Dev escape
+/// `OPENDESK_TRUST_DIRECT_TENANT=1` allows headerless standalone calls.
+/// This bound tenant is what the RLS GUC is pinned to (GF6).
+async fn bind_tenant(st: &AppState, headers: &HeaderMap, tenant_id: Uuid) -> Result<(), ApiError> {
+    // K2: internal-token service callers are fully authenticated.
+    if internal_token_matches(&st.config.internal_token, headers) {
+        return Ok(());
+    }
+    // K1: gateway call — the tenant must be listed in the verified claim.
+    if let Some(slugs) = gateway_slugs(headers) {
+        let t = tenant_id.to_string();
+        if slugs.iter().any(|s| *s == t) {
+            return Ok(());
+        }
+        if !st.identity.configured() {
+            return Err(ApiError::forbidden(
+                "tenant is not bound to the caller (X-Tenant-Slugs membership; \
+                 slug-to-uuid resolution disabled: IDENTITY_BASE_URL unset)",
+            ));
+        }
+        for slug in &slugs {
+            match st.identity.resolve(slug).await {
+                Ok(Some(id)) if id == tenant_id => return Ok(()),
+                Ok(Some(_)) | Ok(None) => {}
+                Err(e) => {
+                    // Fail CLOSED: an identity outage must never widen
+                    // access; 503 (retryable) rather than a 403 the caller
+                    // cannot distinguish from a real non-membership.
+                    tracing::warn!(error = %e, tenant = %tenant_id, "K1 binding: identity resolution failed");
+                    return Err(ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("tenant binding unavailable: {e}"),
+                    ));
+                }
+            }
+        }
+        return Err(ApiError::forbidden(
+            "tenant is not bound to the caller (X-Tenant-Slugs membership / identity resolution)",
+        ));
+    }
+    if st.config.trust_direct_tenant {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "tenant binding required: no internal token and no gateway-injected X-Tenant-Slugs",
+    ))
 }
 
-/// `x-user-roles` (gateway-injected, comma/space separated realm roles) must
-/// contain owner or admin for generate/void.
-fn require_owner_or_admin(headers: &HeaderMap) -> Result<(), ApiError> {
+/// K6 money-role gate for mutations (rate-card upsert, generate, issue,
+/// void, payment-link): `X-User-Roles` (gateway-injected, csv) must
+/// intersect `MONEY_ROLES`; internal-token service callers (K2) are exempt;
+/// fail-closed when the header is absent unless the dev escape is on.
+fn require_money_role(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if internal_token_matches(&st.config.internal_token, headers) {
+        return Ok(());
+    }
     let roles: Vec<String> = headers
         .get("x-user-roles")
         .and_then(|v| v.to_str().ok())
@@ -128,33 +209,44 @@ fn require_owner_or_admin(headers: &HeaderMap) -> Result<(), ApiError> {
                 .collect()
         })
         .unwrap_or_default();
-    if roles.iter().any(|r| r == "owner" || r == "admin") {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "realm role owner or admin required for this operation",
-        ))
+    if roles
+        .iter()
+        .any(|r| st.config.money_roles.iter().any(|m| m == r))
+    {
+        return Ok(());
     }
+    if st.config.trust_direct_tenant && !headers.contains_key("x-user-roles") {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "a money role is required for this operation (X-User-Roles intersect MONEY_ROLES)",
+    ))
 }
 
-/// Begin a tenant-scoped transaction (GF6: `app.tenant_id` GUC from the
-/// gateway-validated header) and load the invoice inside it. Under RLS a
-/// cross-tenant id is simply invisible (404); when RLS is bypassed (dev
-/// superuser pool) the explicit tenant check below still forbids it (403) —
-/// the header check is kept as a second layer, not the only one.
+/// Begin a tenant-scoped transaction for an invoice-ID-addressed route.
+/// The caller does not supply the tenant for these routes, so the invoice is
+/// looked up on the internal pool (role-gated cross-tenant read, GF6), its
+/// OWN tenant is then bound to the caller (K1: X-Tenant-Slugs membership;
+/// K2: internal token), and the request transaction runs with the RLS GUC
+/// pinned to that tenant — a cross-tenant id is a 403 after a successful
+/// lookup, never a leak.
 async fn begin_scoped_invoice_tx(
     st: &AppState,
     headers: &HeaderMap,
     id: Uuid,
 ) -> Result<(Transaction<'static, Postgres>, Invoice), ApiError> {
-    let tenant_id = tenant_from_header(headers)?;
-    let mut tx = tenant::begin_tenant_tx(&st.pool, tenant_id).await?;
+    let mut lookup_tx = tenant::begin_internal_tx(&st.internal_pool).await?;
+    let looked_up = invoices::get_invoice(&mut lookup_tx, id).await?;
+    lookup_tx.commit().await?;
+    let inv = looked_up
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("invoice not found: {id}")))?;
+    bind_tenant(st, headers, inv.tenant_id).await?;
+    let mut tx = tenant::begin_tenant_tx(&st.pool, inv.tenant_id).await?;
+    // Re-read inside the tenant-scoped transaction (the row visible under
+    // RLS is authoritative for the mutation).
     let inv = invoices::get_invoice(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("invoice not found: {id}")))?;
-    if inv.tenant_id != tenant_id {
-        return Err(ApiError::forbidden("X-Tenant-ID does not match tenant"));
-    }
     Ok((tx, inv))
 }
 
@@ -216,6 +308,10 @@ fn internal_token_matches(expected: &str, headers: &HeaderMap) -> bool {
         && payments_qr::constant_time_eq(expected.trim().as_bytes(), presented.trim().as_bytes())
 }
 
+/// Request auth gate (K1+K2): passes for (a) token-exempt probes/webhook,
+/// (b) a valid internal token (service callers), (c) a gateway-injected
+/// X-Tenant-Slugs header (human OIDC call — the per-route tenant binding
+/// then decides), or (d) the dev escape. Everything else is 401.
 async fn require_internal_token(
     State(st): State<AppState>,
     req: Request,
@@ -224,14 +320,19 @@ async fn require_internal_token(
     if is_token_exempt(req.uri().path()) {
         return next.run(req).await;
     }
-    if !internal_token_matches(&st.config.internal_token, req.headers()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "missing or invalid x-internal-token" })),
-        )
-            .into_response();
+    if internal_token_matches(&st.config.internal_token, req.headers())
+        || gateway_slugs(req.headers()).is_some()
+        || st.config.trust_direct_tenant
+    {
+        return next.run(req).await;
     }
-    next.run(req).await
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "unauthorized: valid x-internal-token or gateway-injected X-Tenant-Slugs required"
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -257,15 +358,54 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz(State(st): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "service": "billing-engine",
-        "payment_mode": st.config.payment_mode(),
-        "ledger_impl": st.config.billing_ledger_impl,
-        "events_published": st.events_published.load(std::sync::atomic::Ordering::Relaxed),
-        "events_failed": st.events_failed.load(std::sync::atomic::Ordering::Relaxed),
-    }))
+/// SPEC-W44 F15-07: dependency-aware liveness. `status: "degraded"` + 503
+/// when the Postgres ping (2s budget) fails or usage events have been
+/// dead-lettered (`usage_dead_lettered > 0`). The Kafka producer state is
+/// REPORTED but does not flip the status: with the producer down events stay
+/// durable in billing_outbox (RS-001) and are relayed after recovery.
+async fn healthz(State(st): State<AppState>) -> Response {
+    use std::sync::atomic::Ordering;
+    let pg_ok = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query("SELECT 1").execute(&st.pool),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "healthz: postgres ping failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("healthz: postgres ping timed out (2s budget)");
+            false
+        }
+    };
+    let dead_lettered = st.usage_dead_lettered.load(Ordering::Relaxed);
+    let degraded = !pg_ok || dead_lettered > 0;
+    let status = if degraded { "degraded" } else { "ok" };
+    let code = if degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "service": "billing-engine",
+            "payment_mode": st.config.payment_mode(),
+            "ledger_impl": st.config.billing_ledger_impl,
+            "checks": {
+                "postgres": if pg_ok { "ok" } else { "fail" },
+                "kafka_producer": if st.producer.is_some() { "up" } else { "down" },
+            },
+            "events_published": st.events_published.load(Ordering::Relaxed),
+            "events_failed": st.events_failed.load(Ordering::Relaxed),
+            "usage_dead_lettered": dead_lettered,
+        })),
+    )
+        .into_response()
 }
 
 /// Prometheus text exposition (RS-001): the outbox failure counter is the
@@ -279,9 +419,17 @@ async fn metrics(State(st): State<AppState>) -> Response {
          billing_events_published_total {}\n\
          # HELP billing_events_failed_total Billing event publish failures (retried from the durable outbox).\n\
          # TYPE billing_events_failed_total counter\n\
-         billing_events_failed_total {}\n",
+         billing_events_failed_total {}\n\
+         # HELP billing_usage_processed_total Usage events handled by the commands consumer.\n\
+         # TYPE billing_usage_processed_total counter\n\
+         billing_usage_processed_total {}\n\
+         # HELP billing_usage_dead_lettered Usage events dead-lettered after bounded retries.\n\
+         # TYPE billing_usage_dead_lettered gauge\n\
+         billing_usage_dead_lettered {}\n",
         st.events_published.load(Ordering::Relaxed),
         st.events_failed.load(Ordering::Relaxed),
+        st.usage_processed.load(Ordering::Relaxed),
+        st.usage_dead_lettered.load(Ordering::Relaxed),
     );
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -299,7 +447,8 @@ async fn upsert_rate_card(
     headers: HeaderMap,
     Json(body): Json<RateCardBody>,
 ) -> Result<Json<RateCard>, ApiError> {
-    require_tenant(&headers, tenant_id)?;
+    bind_tenant(&st, &headers, tenant_id).await?;
+    require_money_role(&st, &headers)?;
     if body.metric.trim().is_empty() {
         return Err(ApiError::bad_request("metric must not be empty"));
     }
@@ -308,7 +457,31 @@ async fn upsert_rate_card(
             "unit_price_cents and included_quota must be >= 0",
         ));
     }
+    let new_currency = body.currency.trim().to_ascii_uppercase();
     let mut tx = tenant::begin_tenant_tx(&st.pool, tenant_id).await?;
+    // SPEC-W43 B-05: a tenant's rate cards must be single-currency, otherwise
+    // generate() would rate different metrics in different currencies and
+    // stamp the invoice with an arbitrary one. Reject a card whose currency
+    // differs from any existing card for this tenant (checked inside the
+    // same transaction as the upsert so concurrent writers cannot race past
+    // the gate).
+    let conflicting: Option<String> = sqlx::query_scalar(
+        "SELECT currency FROM rate_cards WHERE tenant_id = $1 AND currency <> $2 LIMIT 1",
+    )
+    .bind(tenant_id)
+    .bind(&new_currency)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(other) = conflicting {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "rate card currency {new_currency} conflicts with the tenant's \
+                 existing rate card currency {other}; a tenant's rate cards must \
+                 be single-currency"
+            ),
+        ));
+    }
     sqlx::query(
         "INSERT INTO rate_cards (tenant_id, metric, unit_price_cents, included_quota, currency) \
          VALUES ($1, $2, $3, $4, $5) \
@@ -321,7 +494,7 @@ async fn upsert_rate_card(
     .bind(body.metric.trim())
     .bind(body.unit_price_cents)
     .bind(body.included_quota)
-    .bind(body.currency.trim().to_ascii_uppercase())
+    .bind(&new_currency)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -330,7 +503,7 @@ async fn upsert_rate_card(
         metric: body.metric.trim().to_string(),
         unit_price_cents: body.unit_price_cents,
         included_quota: body.included_quota,
-        currency: body.currency.trim().to_ascii_uppercase(),
+        currency: new_currency,
     }))
 }
 
@@ -342,8 +515,8 @@ async fn generate_invoice(
     headers: HeaderMap,
     Json(body): Json<GenerateBody>,
 ) -> Result<(StatusCode, Json<Invoice>), ApiError> {
-    require_tenant(&headers, body.tenant_id)?;
-    require_owner_or_admin(&headers)?;
+    bind_tenant(&st, &headers, body.tenant_id).await?;
+    require_money_role(&st, &headers)?;
     let mut tx = tenant::begin_tenant_tx(&st.pool, body.tenant_id).await?;
     let inv = invoices::generate_invoice(&mut tx, body.tenant_id, &body.period).await?;
     tx.commit().await?;
@@ -355,7 +528,7 @@ async fn list_invoices(
     headers: HeaderMap,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
-    require_tenant(&headers, params.tenant_id)?;
+    bind_tenant(&st, &headers, params.tenant_id).await?;
     let status = match &params.status {
         Some(s) => Some(
             InvoiceStatus::parse(s)
@@ -385,16 +558,35 @@ async fn issue_invoice(
     headers: HeaderMap,
 ) -> Result<Json<Invoice>, ApiError> {
     let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    require_money_role(&st, &headers)?;
     invoices::transition_invoice(&mut tx, id, InvoiceStatus::Issued).await?;
     let updated = invoices::get_invoice(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::internal("invoice vanished after issue"))?;
-    tx.commit().await?;
     // Ledger: invoice issued -> DR AR-control / CR revenue (code 200).
-    // Zero-amount invoices skip the posting (the ledger rejects 0). Posted
-    // after the DB commit, exactly like before GF6 (failures are warn-level,
-    // not rolled back).
+    // Zero-amount invoices skip the posting (the ledger rejects 0).
+    // SPEC-W43 B-03: the postgres ledger posts INSIDE this transaction, so
+    // the ledger entry and the issued transition commit atomically (a crash
+    // can no longer strand an issued invoice without its AR/revenue entry);
+    // a posting failure now rolls the transition back instead of being a
+    // warn-level skip. Only backends that cannot enlist (the dev-only sim)
+    // fall back to posting after commit.
+    let mut post_after_commit = false;
     if inv.subtotal_cents > 0 {
+        let enlisted = st
+            .ledger
+            .invoice_issued_in_tx(
+                &mut tx,
+                &inv.tenant_id.to_string(),
+                id,
+                inv.subtotal_cents as u64,
+            )
+            .await
+            .map_err(|e| ApiError::internal(format!("ledger issued posting failed: {e}")))?;
+        post_after_commit = enlisted.is_none();
+    }
+    tx.commit().await?;
+    if post_after_commit {
         if let Err(e) = st
             .ledger
             .invoice_issued(&inv.tenant_id.to_string(), id, inv.subtotal_cents as u64)
@@ -411,13 +603,72 @@ async fn void_invoice(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Invoice>, ApiError> {
-    let (mut tx, _inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
-    require_owner_or_admin(&headers)?;
-    invoices::transition_invoice(&mut tx, id, InvoiceStatus::Void).await?;
+    let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    require_money_role(&st, &headers)?;
+    let prev = invoices::transition_invoice(&mut tx, id, InvoiceStatus::Void).await?;
+    // SPEC-W43 B-02: voiding an ISSUED/PAST_DUE invoice must unwind its
+    // receivable — reversing entry DR revenue / CR AR (deterministic
+    // transfer id `billing-void:{invoice_id}`, so retries replay) plus an
+    // InvoiceVoided outbox event, both in the SAME transaction as the void
+    // transition (B-03/RS-001). Voiding a draft stays free: nothing was ever
+    // posted for it, so there is nothing to reverse and no event to emit.
+    let reverses = matches!(prev, InvoiceStatus::Issued | InvoiceStatus::PastDue);
+    let mut post_after_commit = false;
+    if reverses {
+        let event = crate::models::CloudEvent::new(
+            "billing-engine",
+            "com.opendesk.billing.InvoiceVoided",
+            &id.to_string(),
+            &inv.tenant_id.to_string(),
+            serde_json::json!({
+                "invoiceId": id.to_string(),
+                "tenantId": inv.tenant_id.to_string(),
+                "period": inv.period,
+                "previousStatus": prev.as_str(),
+                "subtotalCents": inv.subtotal_cents,
+                "currency": inv.currency,
+            }),
+        );
+        let payload = serde_json::to_value(&event)
+            .map_err(|e| ApiError::internal(format!("invoice voided event serialize: {e}")))?;
+        outbox::enqueue(
+            &mut tx,
+            &st.config.billing_events_topic,
+            &inv.tenant_id.to_string(),
+            &payload,
+        )
+        .await?;
+        if inv.subtotal_cents > 0 {
+            let enlisted = st
+                .ledger
+                .invoice_voided_in_tx(
+                    &mut tx,
+                    &inv.tenant_id.to_string(),
+                    id,
+                    inv.subtotal_cents as u64,
+                )
+                .await
+                .map_err(|e| ApiError::internal(format!("ledger void reversal failed: {e}")))?;
+            post_after_commit = enlisted.is_none();
+        }
+    }
     let updated = invoices::get_invoice(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::internal("invoice vanished after void"))?;
     tx.commit().await?;
+    if post_after_commit {
+        // Dev-only sim backend could not enlist in the transaction.
+        if let Err(e) = st
+            .ledger
+            .invoice_voided(&inv.tenant_id.to_string(), id, inv.subtotal_cents as u64)
+            .await
+        {
+            tracing::warn!(error = %e, invoice_id = %id, "ledger void reversal failed");
+        }
+    }
+    if reverses {
+        st.outbox_notify.notify_one();
+    }
     Ok(Json(updated))
 }
 
@@ -431,6 +682,7 @@ async fn payment_link(
     body: Option<Json<PaymentLinkBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    require_money_role(&st, &headers)?;
     tx.commit().await?; // don't hold a pooled connection across the Paystack HTTP call
     if !matches!(inv.status, InvoiceStatus::Issued | InvoiceStatus::PastDue) {
         return Err(ApiError::new(
@@ -524,7 +776,7 @@ async fn paystack_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let secret = st.config.paystack_secret_key.as_deref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -552,7 +804,10 @@ async fn paystack_webhook(
         .unwrap_or_default();
     if event != "charge.success" {
         // Acknowledge non-charge events so Paystack stops retrying them.
-        return Ok(Json(serde_json::json!({ "status": "ignored", "event": event })));
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ignored", "event": event })),
+        ));
     }
     let reference = payload
         .get("data")
@@ -564,7 +819,7 @@ async fn paystack_webhook(
         Err(_) => {
             // Not one of our invoice references; ack to avoid retry storms.
             tracing::warn!(reference, "paystack webhook: unknown reference");
-            return Ok(Json(serde_json::json!({ "status": "ignored" })));
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ignored" }))));
         }
     };
 
@@ -586,13 +841,119 @@ async fn paystack_webhook(
         let _ = tx.rollback().await;
         // Reference shaped like our invoices but unknown; ack.
         tracing::warn!(invoice_id = %invoice_id, "paystack webhook: invoice not found");
-        return Ok(Json(serde_json::json!({ "status": "ignored" })));
+        return Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ignored" }))));
     };
     tenant::set_tenant_guc(&mut tx, inv.tenant_id).await?;
+
+    // SPEC-W43 B-01: a charge against a VOID invoice can never settle it
+    // (void is terminal; attempting the transition 409'd and Paystack kept
+    // retrying forever). Acknowledge and ignore — the provider stops
+    // retrying and nothing is recorded.
+    if inv.status == InvoiceStatus::Void {
+        tx.commit().await?;
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ignored", "reason": "invoice_void" })),
+        ));
+    }
+
+    // SPEC-W43 B-06: a duplicate charge.success for an already-paid invoice
+    // stays a 200 replay, but it is no longer silently absorbed — a durable
+    // DuplicatePaymentIgnored event (with the provider reference) goes to
+    // the outbox in the same ack transaction so reconciliation can see it.
+    if inv.status == InvoiceStatus::Paid {
+        let event = crate::models::CloudEvent::new(
+            "billing-engine",
+            "com.opendesk.billing.DuplicatePaymentIgnored",
+            &invoice_id.to_string(),
+            &inv.tenant_id.to_string(),
+            serde_json::json!({
+                "invoiceId": invoice_id.to_string(),
+                "tenantId": inv.tenant_id.to_string(),
+                "paystackReference": reference,
+            }),
+        );
+        let event_payload = serde_json::to_value(&event).map_err(|e| {
+            ApiError::internal(format!("duplicate payment event serialize: {e}"))
+        })?;
+        outbox::enqueue(
+            &mut tx,
+            &st.config.billing_events_topic,
+            &inv.tenant_id.to_string(),
+            &event_payload,
+        )
+        .await?;
+        tx.commit().await?;
+        st.outbox_notify.notify_one();
+        return Ok((StatusCode::OK, Json(serde_json::json!({ "status": "already_paid" }))));
+    }
+
+    // SPEC-W43 B-01: the charge must settle EXACTLY this invoice — after
+    // the HMAC check, the charged amount and currency must equal the
+    // invoice's before any paid transition. A mismatch (underpayment,
+    // overpayment, wrong currency, or a payload missing the fields) NEVER
+    // settles the invoice: it is recorded as a durable payment_mismatch
+    // outbox event and acknowledged with 202 so Paystack stops retrying
+    // while the mismatch is investigated.
+    let paid_amount = payload
+        .get("data")
+        .and_then(|d| d.get("amount"))
+        .and_then(|a| a.as_i64());
+    let paid_currency = payload
+        .get("data")
+        .and_then(|d| d.get("currency"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_default();
+    if paid_amount != Some(inv.subtotal_cents)
+        || !paid_currency.eq_ignore_ascii_case(&inv.currency)
+    {
+        tracing::warn!(
+            invoice_id = %invoice_id,
+            reference,
+            expected_amount = inv.subtotal_cents,
+            expected_currency = %inv.currency,
+            received_amount = ?paid_amount,
+            received_currency = paid_currency,
+            "paystack webhook: amount/currency mismatch; invoice NOT marked paid"
+        );
+        let event = crate::models::CloudEvent::new(
+            "billing-engine",
+            "com.opendesk.billing.PaymentMismatch",
+            &invoice_id.to_string(),
+            &inv.tenant_id.to_string(),
+            serde_json::json!({
+                "invoiceId": invoice_id.to_string(),
+                "tenantId": inv.tenant_id.to_string(),
+                "paystackReference": reference,
+                "expectedAmountCents": inv.subtotal_cents,
+                "expectedCurrency": inv.currency,
+                "receivedAmountCents": paid_amount,
+                "receivedCurrency": paid_currency,
+            }),
+        );
+        let event_payload = serde_json::to_value(&event)
+            .map_err(|e| ApiError::internal(format!("payment mismatch event serialize: {e}")))?;
+        outbox::enqueue(
+            &mut tx,
+            &st.config.billing_events_topic,
+            &inv.tenant_id.to_string(),
+            &event_payload,
+        )
+        .await?;
+        tx.commit().await?;
+        st.outbox_notify.notify_one();
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "payment_mismatch" })),
+        ));
+    }
+
     match invoices::mark_paid_idempotent(&mut tx, invoice_id).await {
         Ok(None) => {
+            // Race: another delivery transitioned the invoice between the
+            // lookup and the update. Still a 200 replay.
             tx.commit().await?;
-            Ok(Json(serde_json::json!({ "status": "already_paid" })))
+            Ok((StatusCode::OK, Json(serde_json::json!({ "status": "already_paid" }))))
         }
         Ok(Some(_prev)) => {
             let inv = invoices::get_invoice(&mut tx, invoice_id)
@@ -619,18 +980,38 @@ async fn paystack_webhook(
                     "paystackReference": reference,
                 }),
             );
-            let payload = serde_json::to_value(&event)
+            let event_payload = serde_json::to_value(&event)
                 .map_err(|e| ApiError::internal(format!("invoice paid event serialize: {e}")))?;
             outbox::enqueue(
                 &mut tx,
                 &st.config.billing_events_topic,
                 &inv.tenant_id.to_string(),
-                &payload,
+                &event_payload,
             )
             .await?;
-            tx.commit().await?;
             // Ledger: invoice paid -> DR payments-clearing / CR AR (code 202).
+            // SPEC-W43 B-03: posted INSIDE this transaction by the postgres
+            // ledger so the entry and the paid transition commit atomically;
+            // a posting failure rolls the transition back. Only the dev-only
+            // sim backend falls back to posting after commit.
+            let mut post_after_commit = false;
             if inv.subtotal_cents > 0 {
+                let enlisted = st
+                    .ledger
+                    .invoice_paid_in_tx(
+                        &mut tx,
+                        &inv.tenant_id.to_string(),
+                        invoice_id,
+                        inv.subtotal_cents as u64,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ApiError::internal(format!("ledger paid posting failed: {e}"))
+                    })?;
+                post_after_commit = enlisted.is_none();
+            }
+            tx.commit().await?;
+            if post_after_commit {
                 if let Err(e) = st
                     .ledger
                     .invoice_paid(&inv.tenant_id.to_string(), invoice_id, inv.subtotal_cents as u64)
@@ -641,14 +1022,14 @@ async fn paystack_webhook(
             }
             // Flush immediately (the poll tick is the backstop).
             st.outbox_notify.notify_one();
-            Ok(Json(serde_json::json!({ "status": "paid" })))
+            Ok((StatusCode::OK, Json(serde_json::json!({ "status": "paid" }))))
         }
         // NotFound cannot occur here (the row was just loaded above), but
         // keep the ack-on-missing contract for defense in depth.
         Err(BillingError::NotFound(_)) => {
             let _ = tx.rollback().await;
             tracing::warn!(invoice_id = %invoice_id, "paystack webhook: invoice not found");
-            Ok(Json(serde_json::json!({ "status": "ignored" })))
+            Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ignored" }))))
         }
         Err(e) => {
             let _ = tx.rollback().await;
