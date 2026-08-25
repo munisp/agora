@@ -52,10 +52,22 @@ class Settings(BaseSettings):
     # a kb_suggestions row for staff review.
     suggest_threshold: float = 0.35
 
+    # SPEC-W43 C1: tenant context comes from the gateway-injected
+    # X-Tenant-Slugs header; explicit tenant params must exactly match one
+    # of its entries (else 403). OPENDESK_TRUST_DIRECT_TENANT=1 is the
+    # standalone-dev escape (legacy direct tenant selection) — OFF by
+    # default, never set in compose.
+    trust_direct_tenant: bool = Field(
+        default=False, validation_alias=AliasChoices("OPENDESK_TRUST_DIRECT_TENANT")
+    )
+
     # Dapr sidecar (for resolving tenant slugs via identity-service).
     dapr_host: str = "daprd-knowledge"
     dapr_http_port: int = 3500
     identity_app_id: str = "identity"
+    # SPEC-W44 K2: X-Internal-Token sent on the identity tenant lookup
+    # (IDENTITY_INTERNAL_TOKEN env; empty = header not sent).
+    identity_internal_token: str = ""
 
     # Text-to-SQL (SPEC-W3 §3, innovation 8): OpenAI-compatible LLM
     # (default qwen3:8b via Ollama) + Trino HTTP API.
