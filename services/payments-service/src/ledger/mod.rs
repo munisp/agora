@@ -195,10 +195,35 @@ pub enum LedgerError {
     ExceedsPendingAmount,
     #[error("amount must be greater than zero")]
     InvalidAmount,
+    /// SPEC-W43 P-11: a refund amount smaller than the pending hold amount is
+    /// rejected instead of silently voiding the full hold.
+    #[error("refund amount does not match the hold amount: {0}")]
+    AmountMismatch(String),
+    /// SPEC-W43 P-06: the referenced hold belongs to a different tenant than
+    /// the request's `tenant_id` (mapped to HTTP 403).
+    #[error("tenant mismatch: {0}")]
+    TenantMismatch(String),
     #[error("operation would overdraw account {0} (debits must not exceed credits)")]
     ExceedsCredits(String),
     #[error("ledger backend error: {0}")]
     Backend(String),
+}
+
+/// Platform fee split with checked arithmetic (SPEC-W43 P-05):
+/// `fee = amount * fee_bps / 10_000`, never exceeding `amount`. Any overflow
+/// or an out-of-range `fee_bps` (> 10_000, i.e. more than 100%) is an
+/// [`LedgerError::InvalidAmount`] instead of a wrap/panic. Returns
+/// `(net, fee)` with `net + fee == amount`.
+pub fn fee_split(amount: u64, fee_bps: u64) -> Result<(u64, u64), LedgerError> {
+    if fee_bps > 10_000 {
+        return Err(LedgerError::InvalidAmount);
+    }
+    let fee = amount
+        .checked_mul(fee_bps)
+        .ok_or(LedgerError::InvalidAmount)?
+        / 10_000;
+    let net = amount.checked_sub(fee).ok_or(LedgerError::InvalidAmount)?;
+    Ok((net, fee))
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +300,52 @@ pub trait LedgerClient: Send + Sync {
         amount: u64,
     ) -> Result<Transfer, LedgerError>;
 
+    /// Two-phase payout (SPEC-W43 P-01, contract C3 ledger-first ordering),
+    /// phase 1: PENDING transfer `tenant:{id}:revenue -> platform:payouts`
+    /// with [`CODE_PAYOUT`]. The pending debit reserves the funds, so an
+    /// over-limit payout is rejected BEFORE any rail side effect.
+    /// Idempotent by `transfer_id`.
+    async fn payout_hold(
+        &self,
+        tenant_id: &str,
+        transfer_id: Uuid,
+        amount: u64,
+    ) -> Result<Transfer, LedgerError>;
+
+    /// Phase 2a: post the pending payout in full after the rail reported an
+    /// explicit COMMITTED. Idempotent by `transfer_id` (deterministic
+    /// `payout-post:{payout_id}` id shared between the route and the
+    /// reconciler).
+    async fn payout_post(
+        &self,
+        tenant_id: &str,
+        hold_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<Transfer, LedgerError>;
+
+    /// Phase 2b: void the pending payout after a rail failure/unknown
+    /// outcome, releasing the reserved funds.
+    async fn payout_void(
+        &self,
+        tenant_id: &str,
+        hold_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<Transfer, LedgerError>;
+
+    /// Look up a stored transfer by id (C4 amount resolution for
+    /// `capture(amount=None)` on the live client; P-11 refund replay
+    /// fidelity; Flutterwave verify-before-capture amount check).
+    async fn get_transfer(&self, transfer_id: Uuid) -> Result<Transfer, LedgerError>;
+
     /// Balance snapshot for the tenant's accounts.
     async fn balance(&self, tenant_id: &str) -> Result<TenantBalance, LedgerError>;
+
+    /// SPEC-W44 F15-03: cheap liveness probe for /healthz. The sim is always
+    /// up (default); the live TigerBeetle client (`tb-live` feature) overrides
+    /// this with a lookup round-trip against the server.
+    async fn ping(&self) -> Result<(), LedgerError> {
+        Ok(())
+    }
 }
 
 /// Derive a deterministic transfer id from an idempotency key (or random when

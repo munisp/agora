@@ -48,6 +48,13 @@ pub trait DlqSink: Send + Sync {
         error: &str,
         origin_topic: &str,
     ) -> Result<(), String>;
+
+    /// SPEC-W44 F15-03: cheap producer-availability signal for /healthz and
+    /// /metrics. The Kafka sink is up once constructed (librdkafka dials
+    /// lazily); the unavailable sink reports down.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 /// Kafka-backed DLQ sink; headers mirror booking-service's deadLetter()
@@ -114,6 +121,10 @@ impl DlqSink for UnavailableDlqSink {
         _origin_topic: &str,
     ) -> Result<(), String> {
         Err("DLQ producer unavailable (Kafka producer creation failed at boot)".to_string())
+    }
+
+    fn available(&self) -> bool {
+        false
     }
 }
 
@@ -270,6 +281,9 @@ pub async fn process_payload(
                 match handle_command(state, &event).await {
                     Ok(()) => {
                         debug!(event_id = %event.id, "payments command processed");
+                        state
+                            .commands_processed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return ProcessOutcome::Processed;
                     }
                     Err(e) => {
@@ -438,6 +452,11 @@ mod tests {
             mojaloop_endpoint: "http://127.0.0.1:1".to_string(),
             mojaloop_allow_sim: false,
             platform_fee_bps: 0,
+            internal_token: None,
+            trust_direct_tenant: true,
+            database_url: None,
+            payout_reconciler_interval_secs: 30,
+            money_roles: vec!["owner".to_string(), "admin".to_string()],
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -450,9 +469,21 @@ mod tests {
             flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
             config: Arc::new(cfg),
             dlq,
+            auth: crate::auth::AuthConfig::new(
+                None,
+                true,
+                vec!["owner".to_string(), "admin".to_string()],
+            ),
+            payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
+            registry: Arc::new(crate::registry::MemRegistry::default()),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),
+            commands_processed: Arc::new(AtomicU64::new(0)),
+            payouts_attempted: Arc::new(AtomicU64::new(0)),
+            payouts_committed: Arc::new(AtomicU64::new(0)),
+            payouts_failed: Arc::new(AtomicU64::new(0)),
+            payouts_unknown: Arc::new(AtomicU64::new(0)),
         }
     }
 
