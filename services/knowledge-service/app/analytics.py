@@ -1,168 +1,237 @@
 """Text-to-SQL analytics (SPEC-W3 §3, innovation 8).
 
-POST /v1/analytics/query: natural-language question -> LLM (OpenAI-compatible,
-default qwen3:8b via Ollama) generates SELECT-only SQL -> validated -> executed
-against Trino (PostgreSQL connector, read-only role) -> rows returned. The LLM
-never sees tenant data: the schema prompt lists tables, the generated SQL is
-validated, and a mandatory ``tenant_id = '<slug>'`` predicate is injected.
+POST /v1/analytics/query {tenant, question}:
+  1. an OpenAI-compatible LLM (LLM_BASE_URL/LLM_MODEL/LLM_API_KEY, default
+     qwen3:8b via Ollama) translates the question into one SELECT against
+     the gold dbt models (schema embedded in the system prompt below);
+  2. app.sqlguard validates + tenant-scopes + LIMIT-caps the statement;
+  3. it executes via Trino's HTTP API (TRINO_URL, X-Trino-User) with a 20s
+     budget and returns {sql, columns, rows, truncated}.
 
-SPEC-W44 V2-D1 / S1-F7-04: the endpoint is now gated on an authenticated
-tenant-scoped caller (X-User-Id + tenant binding via resolve_tenant_slug) —
-previously anonymous and tenant-spoofable. The LLM/Trino execution path is
-unchanged.
+Failure contract (SPEC-W43 Y-02): every failure (LLM error, guardrail
+rejection, Trino error) surfaces as a GENERIC 400 — the bound SQL and
+backend error text are NEVER returned to clients (they leak schema and
+infrastructure detail); the detail is logged server-side. The success
+response likewise no longer echoes the bound SQL.
 """
 
 from __future__ import annotations
 
-import logging
-import re
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from . import sqlguard
 from .config import settings
-from .tenancy import resolve_tenant_slug
+from .db import bind_tenant_value, parse_tenant_slugs
+from .logging import get_logger
 
-logger = logging.getLogger(__name__)
+log = get_logger("knowledge-service.analytics")
 
-router = APIRouter(tags=["analytics"])
+router = APIRouter()
 
-# Schema the LLM is allowed to query (Trino catalog `postgres`). Kept in sync
-# with the per-service schemas; columns the NL questions reference.
-SCHEMA_PROMPT = """You translate questions into one read-only Trino SQL SELECT.
-Schema (Trino catalog `postgres`):
-- postgres.public.bookings(id, tenant_id, contact_id, service_id, site_id, status,
-  scheduled_start, scheduled_end, price_minor, currency, created_at)
-- postgres.public.contacts(id, tenant_id, phone, email, display_name, created_at)
-- postgres.public.services(id, tenant_id, name, duration_minutes, price_minor, currency)
-- postgres.public.sites(id, tenant_id, slug, name, industry, plan, created_at)
-- postgres.public.tenants(id, slug, name, plan, industry, created_at)
-- postgres.public.orders(id, tenant_id, contact_id, status, total_minor, currency, created_at)
-- postgres.public.payments(id, tenant_id, order_id, amount_minor, currency, status, created_at)
+STATEMENT_TIMEOUT_SECONDS = 20.0
+
+# Gold schema (dbt infra/lakehouse/dbt/models/gold) embedded in the prompt.
+GOLD_SCHEMA_PROMPT = """You translate natural-language analytics questions into ONE Trino SQL
+SELECT statement against the gold layer of a booking-platform lakehouse.
+
+Available tables (Trino catalog `iceberg`, schema `gold`; reference them as gold.<name>):
+
+gold.daily_bookings_per_tenant(
+  tenant_id varchar, day date,
+  bookings_created bigint, bookings_confirmed bigint, bookings_rescheduled bigint,
+  bookings_cancelled bigint, no_shows bigint,
+  bookings_created_voice bigint, bookings_created_web bigint, bookings_created_chat bigint)
+
+gold.revenue_daily(
+  tenant_id varchar, day date, currency char(3),
+  captured_revenue_cents bigint, refunded_cents bigint, no_show_fees_cents bigint,
+  net_revenue_cents bigint)
+
+gold.no_show_rate(
+  tenant_id varchar, day date, bookings_confirmed bigint, no_shows bigint, no_show_rate double)
+
+gold.agent_containment_rate(
+  tenant_id varchar, day date, conversations_total bigint,
+  contained_conversations bigint, containment_rate double)
+
 Rules:
-- Output ONLY the SQL, no explanation, no markdown fences.
-- Single SELECT statement. Never INSERT/UPDATE/DELETE/DROP/ALTER/GRANT.
-- ALWAYS filter tenant-scoped tables with tenant_id = '<TENANT>'.
-- Use ILIKE for case-insensitive text match. LIMIT 100 unless asked otherwise.
+- Output ONLY the SQL, no markdown fences, no explanation, no semicolon.
+- Exactly ONE SELECT statement; never INSERT/UPDATE/DELETE/DDL, never WITH.
+- Only the four tables above; joins between them on (tenant_id, day) are fine.
+- Do NOT filter on tenant_id yourself; the platform injects the tenant predicate.
+- Monetary amounts are integer cents; day is a DATE (use date_trunc, current_date, interval).
 """
 
-FORBIDDEN = re.compile(
-    r"\b(insert|update|delete|drop|alter|grant|revoke|truncate|create|merge|call|execute|copy)\b",
-    re.IGNORECASE,
-)
+
+class AnalyticsQueryRequest(BaseModel):
+    tenant: str = Field(..., description="tenant slug or UUID")
+    question: str = Field(..., min_length=1)
 
 
-class AnalyticsQuery(BaseModel):
-    """Natural-language analytics request."""
-
-    question: str = Field(min_length=3, max_length=2000)
-    tenant: str | None = None  # slug; defaults to X-Tenant-Slugs binding
-    limit: int = Field(default=100, ge=1, le=1000)
-
-
-class AnalyticsResult(BaseModel):
-    question: str
-    tenant: str
-    sql: str
+class AnalyticsQueryResponse(BaseModel):
+    # SPEC-W43 Y-02: the bound SQL is deliberately NOT part of the response
+    # (it would leak the injected tenant predicate and schema internals).
     columns: list[str]
     rows: list[list[Any]]
-    row_count: int
+    truncated: bool
 
 
-async def _generate_sql(question: str, tenant: str) -> str:
-    prompt = SCHEMA_PROMPT.replace("<TENANT>", tenant)
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{settings.llm_base_url.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json={
-                    "model": settings.llm_model,
-                    "messages": [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": question},
-                    ],
-                    "temperature": 0,
-                },
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-    except Exception as exc:  # noqa: BLE001 - surfaced as 502
-        logger.error("analytics llm failed: %s", exc)
-        raise HTTPException(status_code=502, detail="llm backend error") from exc
-
-
-def _clean_and_validate_sql(raw: str, tenant: str, limit: int) -> str:
-    sql = raw.strip()
-    # Strip markdown fences / stray semicolons the model may emit.
-    sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", sql).strip().rstrip(";")
-    if not re.match(r"^\s*select\b", sql, re.IGNORECASE):
-        raise HTTPException(status_code=422, detail="generated SQL is not a SELECT")
-    if FORBIDDEN.search(sql):
-        raise HTTPException(status_code=422, detail="generated SQL contains a forbidden statement")
-    # Mandatory tenant predicate (S1-F7-04: never let the LLM drop it).
-    if "tenant_id" not in sql:
-        raise HTTPException(status_code=422, detail="generated SQL is missing the tenant filter")
-    if f"tenant_id = '{tenant}'" not in sql and f'tenant_id = "{tenant}"' not in sql:
-        raise HTTPException(status_code=422, detail="tenant filter mismatch")
-    if "limit" not in sql.lower():
-        sql = f"{sql} LIMIT {limit}"
+def _extract_sql(text: str) -> str:
+    """Strip markdown fences / chatter around the LLM's SQL."""
+    sql = text.strip()
+    if sql.startswith("```"):
+        lines = sql.splitlines()
+        lines = lines[1:] if lines[0].startswith("```") else lines
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        sql = "\n".join(lines).strip()
     return sql
 
 
-async def _run_trino(sql: str) -> tuple[list[str], list[list[Any]]]:
-    """Execute via Trino's HTTP API, following nextUri pages to completion."""
+async def generate_sql(question: str, *, client: httpx.AsyncClient | None = None) -> str:
+    """Ask the OpenAI-compatible LLM for the SQL translation."""
+    payload = {
+        "model": settings.llm_model,
+        "messages": [
+            {"role": "system", "content": GOLD_SCHEMA_PROMPT},
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0.0,
+    }
+    headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
+    own = client is None
+    if own:
+        client = httpx.AsyncClient(timeout=STATEMENT_TIMEOUT_SECONDS)
+    try:
+        resp = await client.post(
+            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return _extract_sql(data["choices"][0]["message"]["content"])
+    finally:
+        if own:
+            await client.aclose()
+
+
+class TrinoExecutionError(RuntimeError):
+    pass
+
+
+async def execute_trino(
+    sql: str, *, client: httpx.AsyncClient | None = None
+) -> tuple[list[str], list[list[Any]]]:
+    """Run the statement through Trino's HTTP API, following nextUri pages
+    until the query finishes (or the 20s client timeout fires)."""
+    headers = {
+        "X-Trino-User": settings.trino_user,
+        "X-Trino-Catalog": "iceberg",
+        "X-Trino-Schema": "gold",
+    }
     columns: list[str] = []
     rows: list[list[Any]] = []
+    own = client is None
+    if own:
+        client = httpx.AsyncClient(timeout=STATEMENT_TIMEOUT_SECONDS)
     try:
-        async with httpx.AsyncClient(
-            timeout=120,
-            headers={"X-Trino-User": settings.trino_user},
-        ) as client:
-            resp = await client.post(f"{settings.trino_url.rstrip('/')}/v1/statement", content=sql)
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=502, detail=f"trino error: {resp.text[:300]}")
+        resp = await client.post(
+            f"{settings.trino_url.rstrip('/')}/v1/statement", content=sql, headers=headers
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        while True:
+            if "error" in payload:
+                msg = payload["error"].get("message", "trino error")
+                raise TrinoExecutionError(msg)
+            if "columns" in payload and not columns:
+                columns = [c["name"] for c in payload["columns"]]
+            if "data" in payload:
+                rows.extend(payload["data"])
+            next_uri = payload.get("nextUri")
+            if not next_uri:
+                break
+            resp = await client.get(next_uri, headers=headers)
+            resp.raise_for_status()
             payload = resp.json()
-            while True:
-                if "error" in payload:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"query failed: {payload['error'].get('message', 'unknown')[:300]}",
-                    )
-                if not columns and payload.get("columns"):
-                    columns = [c["name"] for c in payload["columns"]]
-                rows.extend(payload.get("data", []))
-                nxt = payload.get("nextUri")
-                if not nxt:
-                    break
-                resp = await client.get(nxt)
-                resp.raise_for_status()
-                payload = resp.json()
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 - surfaced as 502
-        logger.error("trino call failed: %s", exc)
-        raise HTTPException(status_code=502, detail="trino backend error") from exc
-    return columns, rows
+        return columns, rows
+    finally:
+        if own:
+            await client.aclose()
 
 
-@router.post("/analytics/query", response_model=AnalyticsResult)
-async def analytics_query(body: AnalyticsQuery, request: Request) -> AnalyticsResult:
-    # SPEC-W44 V2-D1 / S1-F7-04: was anonymous + tenant-spoofable. Now the
-    # caller is resolved and tenant-bound exactly like /search (X-User-Id +
-    # X-Tenant-Slugs K1 binding), so generated SQL can only ever carry the
-    # caller's own tenant filter.
-    tenant = resolve_tenant_slug(request, body.tenant)
-    raw_sql = await _generate_sql(body.question, tenant)
-    sql = _clean_and_validate_sql(raw_sql, tenant, body.limit)
-    columns, rows = await _run_trino(sql)
-    return AnalyticsResult(
-        question=body.question,
-        tenant=tenant,
-        sql=sql,
+async def run_analytics_query(tenant_id: str, question: str) -> AnalyticsQueryResponse:
+    """Full pipeline; failures raise a GENERIC 400 (SPEC-W43 Y-02: bound SQL
+    and backend error text are logged server-side, never returned)."""
+    try:
+        llm_sql = await generate_sql(question)
+    except Exception as exc:
+        log.warning("analytics.llm_failed", error=str(exc))
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "analytics query translation failed"},
+        ) from exc
+
+    try:
+        bound_sql = sqlguard.validate_and_bind(llm_sql, tenant_id)
+    except sqlguard.SqlGuardError as exc:
+        log.info("analytics.guard_rejected", reason=exc.reason, sql=llm_sql)
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "question could not be translated into an "
+                             "allowed analytics query"},
+        ) from exc
+
+    try:
+        columns, rows = await execute_trino(bound_sql)
+    except TrinoExecutionError as exc:
+        log.warning("analytics.trino_failed", error=str(exc), sql=bound_sql)
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "analytics query execution failed"},
+        ) from exc
+    except Exception as exc:
+        log.warning("analytics.trino_unreachable", error=str(exc))
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "analytics backend unreachable"},
+        ) from exc
+
+    return AnalyticsQueryResponse(
         columns=columns,
         rows=rows,
-        row_count=len(rows),
+        truncated=len(rows) >= sqlguard.MAX_LIMIT,
     )
+
+
+@router.post("/v1/analytics/query", response_model=AnalyticsQueryResponse)
+async def analytics_query(
+    body: AnalyticsQueryRequest, request: Request
+) -> AnalyticsQueryResponse:
+    """Natural-language analytics over the lakehouse gold layer. The tenant
+    filter is always injected server-side by sqlguard.
+
+    SPEC-W43 C1: body.tenant is bound to the gateway-injected
+    X-Tenant-Slugs header (exact match, else 403; no header -> 401 unless
+    the OPENDESK_TRUST_DIRECT_TENANT=1 dev escape is on)."""
+    from .dapr_client import DaprClient
+    from .db import resolve_tenant_id
+
+    value = bind_tenant_value(
+        parse_tenant_slugs(request.headers.get("x-tenant-slugs")),
+        body.tenant,
+        trust_direct=settings.trust_direct_tenant,
+    )
+    dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
+    try:
+        tenant_id = await resolve_tenant_id(
+            dapr, settings.identity_app_id, value, settings.identity_internal_token
+        )
+    finally:
+        await dapr.aclose()
+    return await run_analytics_query(tenant_id, body.question)
