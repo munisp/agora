@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
@@ -114,8 +115,16 @@ func run() error {
 	// resolution to a direct HTTP GET, removing the hard daprd dependency
 	// from the booking write path (used by tests and no-Dapr dev). Empty =
 	// unchanged Dapr behavior.
+	// SPEC-W44 W-B (K2): identity's internal endpoints + tenant-resolution
+	// service call are internal-token gated (CODER-I2). Unset is a boot WARN
+	// — the identity calls then answer 503/401 — never a startup error
+	// (other gates own that).
+	if cfg.IdentityInternalToken == "" {
+		logger.Warn("IDENTITY_INTERNAL_TOKEN unset — booking→identity service calls (entitlement check, tenant resolution) will fail once identity enforces internauth (503/401)")
+	}
 	resolver := bookingops.NewTenantResolver(daprClient, cfg.IdentityAppID, cfg.IdentityCacheTTL, logger,
-		bookingops.WithIdentityBaseURL(cfg.IdentityBaseURL))
+		bookingops.WithIdentityBaseURL(cfg.IdentityBaseURL),
+		bookingops.WithInternalToken(cfg.IdentityInternalToken))
 	if cfg.IdentityBaseURL != "" {
 		logger.Info("IDENTITY_BASE_URL set: tenant resolution uses direct HTTP (no Dapr sidecar required)",
 			zap.String("identity_base_url", cfg.IdentityBaseURL))
@@ -134,6 +143,8 @@ func run() error {
 		BaseURL:       fmt.Sprintf("http://%s:%d", cfg.DaprHost, cfg.DaprHTTPPort),
 		CacheTTL:      cfg.AppGateCacheTTL,
 		Logger:        logger,
+		// SPEC-W44 W-B (K2): X-Internal-Token on GET /internal/entitlements/check.
+		InternalToken: cfg.IdentityInternalToken,
 	})
 	if cfg.AppGateEnabled {
 		logger.Info("app entitlement gate ENABLED (APP_GATE_ENABLED=true)",
@@ -152,9 +163,11 @@ func run() error {
 	// Temporal is unreachable → journey send steps defer (sends_deferred)
 	// instead of erroring (campaignstudio.Handlers contract).
 	var studioStarter campaignstudio.SendStarter
-	tc, err := temporalclient.Dial(cfg.TemporalHostPort, cfg.TemporalNamespace, cfg.TemporalTaskQueue)
+	// SPEC-W43 K-08: retry the Temporal dial with backoff — a slow Temporal
+	// pod must not permanently disable saga starts at boot.
+	tc, err := temporalclient.DialWithRetry(ctx, cfg.TemporalHostPort, cfg.TemporalNamespace, cfg.TemporalTaskQueue, 5, time.Second)
 	if err != nil {
-		logger.Warn("temporal unavailable at boot; saga starts will fail until redeploy",
+		logger.Warn("temporal unavailable at boot (after retries); saga starts will fail until redeploy",
 			zap.String("host_port", cfg.TemporalHostPort), zap.Error(err))
 	} else {
 		defer tc.Close()
@@ -206,6 +219,8 @@ func run() error {
 					MinKobo:    referrals.MinPayoutFromEnv(),
 					UsageTopic: cfg.UsageEventsTopic,
 					Logger:     logger,
+					// SPEC-W44 W-B/S1-F7-08: COMMISSION_MATURITY_SECONDS (default 0).
+					Maturity: time.Duration(cfg.CommissionMaturitySeconds) * time.Second,
 				}
 				reconActs := &referrals.ReconActivities{
 					Store:              payoutStore,
@@ -219,6 +234,9 @@ func run() error {
 				w.RegisterActivityWithOptions(payoutActs.ExecuteTransfer, activity.RegisterOptions{Name: referrals.ActivityPayoutTransfer})
 				w.RegisterActivityWithOptions(payoutActs.FinalizePaid, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkPaid})
 				w.RegisterActivityWithOptions(payoutActs.MarkFailed, activity.RegisterOptions{Name: referrals.ActivityPayoutMarkFailed})
+				// SPEC-W44 W-B/S1-F7-08: the nightly recon feeds matured
+				// balances into the payout queue first (non-fatal on failure).
+				w.RegisterActivityWithOptions(payoutActs.FeedMatured, activity.RegisterOptions{Name: referrals.ActivityPayoutFeed})
 				w.RegisterActivityWithOptions(reconActs.FetchCandidates, activity.RegisterOptions{Name: referrals.ActivityReconFetch})
 				w.RegisterActivityWithOptions(reconActs.CheckTransfer, activity.RegisterOptions{Name: referrals.ActivityReconCheck})
 				if err := tc.EnsureCommissionReconSchedule(ctx, os.Getenv("RECON_CRON")); err != nil {
@@ -432,6 +450,12 @@ func run() error {
 		logger.Error("lending store unavailable; /v1/lending disabled", zap.Error(lsErr))
 	} else {
 		defer ls.Close()
+		// SPEC-W44 W-B/F16-1: credit-bureau fallback visibility — wire the
+		// logger and log the scoring posture once at boot (WARN when
+		// CREDIT_BUREAU_URL is unset; the per-fallback WARN/DEBUG rides the
+		// score path).
+		lending.SetSidecarLogger(logger)
+		lending.LogCreditBureauBootStatus()
 		lendingDeps = &lending.Deps{
 			Store:       ls,
 			Resolver:    resolver,
@@ -439,6 +463,8 @@ func run() error {
 			EventsTopic: cfg.LendingEventsTopic,
 			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W20 Agent C: metering rides USAGE_EVENTS_TOPIC
 			KYCURL:      cfg.LendingKYCURL,    // empty = override-only approval mode (documented in docs/apps/lending.md)
+			// SPEC-W44 W-B/S1-F7-07: kyc_override approve role gate.
+			KYCOverrideRoles: cfg.LendingKYCOverrideRoles,
 			// W39 SIM-001: the live rail is "configured" only when the TB
 			// bridge URL is set; otherwise Disburse fails closed unless
 			// ALLOW_MOCK_RAILS=1 opts into the simulation.
@@ -511,18 +537,56 @@ func run() error {
 		}
 	}
 
+	// SPEC-W43 K-08: pending-booking sweeper — periodically re-drives
+	// StartBookingSaga for `pending` rows whose saga start failed at create
+	// (idempotent by deterministic workflow id). On by default; requires a
+	// Temporal client.
+	if cfg.BookingSweeperEnabled {
+		if saga != nil {
+			sweeper := &bookingops.Sweeper{
+				Store:    st,
+				Saga:     saga,
+				Log:      logger,
+				Interval: cfg.BookingSweeperInterval,
+				ResolveSlug: func(ctx context.Context, tenantID uuid.UUID) string {
+					site, err := st.GetSiteByTenant(ctx, tenantID)
+					if err != nil {
+						return "" // slug unknown; the saga start is still idempotent
+					}
+					return site.TenantSlug
+				},
+			}
+			go sweeper.Run(ctx)
+			logger.Info("pending-booking saga sweeper enabled",
+				zap.Duration("interval", cfg.BookingSweeperInterval))
+		} else {
+			logger.Warn("pending-booking sweeper enabled but Temporal is unavailable; sweeper inert until redeploy")
+		}
+	}
+
+	// SPEC-W43 K-09: per-consumer liveness registry read by /healthz — a
+	// fatally exited consumer (Run returned with the root context alive)
+	// clears its flag, turning /healthz into a 503 so the pod is restarted.
+	consumerHealth := httpapi.NewConsumerHealth()
+
 	// Outbox dispatcher goroutine: outbox → Dapr pubsub `pubsub-kafka` →
-	// topic opendesk.booking.events.
-	dispatcher := outbox.New(st, daprClient, cfg.PubSubName, cfg.OutboxPollInterval, logger)
+	// topic opendesk.booking.events. SPEC-W44 W-B/F15-13: three consecutive
+	// failed dispatch cycles clear the health flag → /healthz 503 (a wedged
+	// sidecar must page, not sit silently while the outbox backs up);
+	// recovery restores it.
+	dispatcher := outbox.New(st, daprClient, cfg.PubSubName, cfg.OutboxPollInterval, logger).
+		WithHealth(consumerHealth.Register("outbox-dispatcher"))
 	go dispatcher.Run(ctx)
 
 	// Kafka command consumer (direct broker connection, NOT dapr, SPEC §4).
 	var cmdConsumer *consumer.Consumer
 	if cfg.ConsumerEnabled {
 		cmdConsumer = consumer.New(cfg.KafkaBrokers, cfg.CommandsTopic, cfg.CommandsGroup, cfg.DLQTopic, ops, resolver, logger)
+		cmdHealth := consumerHealth.Register("commands")
 		go func() {
 			if err := cmdConsumer.Run(ctx); err != nil && ctx.Err() == nil {
-				logger.Error("command consumer exited", zap.Error(err))
+				cmdHealth.Store(false)
+				logger.Error("command consumer exited; liveness flag cleared", zap.Error(err))
 			}
 		}()
 		defer cmdConsumer.Close() //nolint:errcheck
@@ -530,9 +594,11 @@ func run() error {
 		// GDPR erase consumer (SPEC-W3 §2): anonymizes contacts on
 		// PrivacyEraseRequested tombstones from opendesk.privacy.events.
 		privacyConsumer := consumer.NewPrivacy(cfg.KafkaBrokers, cfg.PrivacyEventsTopic, cfg.PrivacyGroup, cfg.DLQTopic, st, logger)
+		privacyHealth := consumerHealth.Register("privacy")
 		go func() {
 			if err := privacyConsumer.Run(ctx); err != nil && ctx.Err() == nil {
-				logger.Error("privacy consumer exited", zap.Error(err))
+				privacyHealth.Store(false)
+				logger.Error("privacy consumer exited; liveness flag cleared", zap.Error(err))
 			}
 		}()
 		defer privacyConsumer.Close() //nolint:errcheck
@@ -540,9 +606,11 @@ func run() error {
 		// SPEC-W11 Part B §2: IDP consumer (group booking-incidents) on
 		// opendesk.incidents → idempotent persist + auto-dispatch/outreach.
 		incidentsConsumer := incidents.NewConsumer(cfg.KafkaBrokers, cfg.IncidentsTopic, cfg.IncidentsGroup, cfg.DLQTopic, incidentSvc, logger)
+		incidentsHealth := consumerHealth.Register("incidents")
 		go func() {
 			if err := incidentsConsumer.Run(ctx); err != nil && ctx.Err() == nil {
-				logger.Error("incidents consumer exited", zap.Error(err))
+				incidentsHealth.Store(false)
+				logger.Error("incidents consumer exited; liveness flag cleared", zap.Error(err))
 			}
 		}()
 		defer incidentsConsumer.Close() //nolint:errcheck
@@ -569,9 +637,11 @@ func run() error {
 					zap.Error(railErr), zap.String("topic", cfg.LendingEventsTopic))
 			} else {
 				lendingConsumer := consumer.NewLendingDisbursements(cfg.KafkaBrokers, cfg.LendingEventsTopic, lendingGroup, cfg.DLQTopic, lendingRail, logger)
+				lendingHealth := consumerHealth.Register("lending-disbursements")
 				go func() {
 					if err := lendingConsumer.Run(ctx); err != nil && ctx.Err() == nil {
-						logger.Error("lending disbursement consumer exited", zap.Error(err))
+						lendingHealth.Store(false)
+						logger.Error("lending disbursement consumer exited; liveness flag cleared", zap.Error(err))
 					}
 				}()
 				defer lendingConsumer.Close() //nolint:errcheck
@@ -599,30 +669,39 @@ func run() error {
 		PortalSecret:       cfg.PortalSecret,
 		PubSubName:         cfg.PubSubName,
 		NotificationsTopic: cfg.NotificationsTopic,
-		Geo:                geoHandlers,
-		Incidents:          incidentSvc,
-		Leads:              leadSvc,
-		Referrals:          referralSvc,
-		Payouts:            payoutStore,          // SPEC-W14 Agent B (additive): GET /v1/payouts
-		Devices:            deviceHandlers,       // SPEC-W16 Agent B (additive): /v1/devices + /internal/devices
-		FieldCapture:       fieldCaptureHandlers, // SPEC-W16 Agent B (additive): POST /v1/field/capture
-		AppGate:            appGate,              // SPEC-W18 Agent D (additive): /v1/leads gated behind app "cac" (opt-in)
-		Helpdesk:           helpdeskDeps,         // SPEC-W19 integrator (additive): /v1/helpdesk gated behind app "helpdesk" (opt-in)
-		Workorders:         workordersDeps,       // SPEC-W19 integrator (additive): /v1/field-service gated behind app "field-service" (opt-in)
-		Loyalty:            loyaltyDeps,          // SPEC-W19 integrator (additive): /v1/loyalty gated behind app "loyalty-wallet" (opt-in)
-		Studio:             studioDeps,           // SPEC-W19 integrator (additive): /v1/studio gated behind app "campaign-studio" (opt-in)
-		CRM360:             crm360Deps,           // SPEC-W20 integrator (additive): /v1/crm gated behind app "crm-360" (opt-in)
-		Surveys:            surveysDeps,          // SPEC-W20 integrator (additive): /v1/surveys gated behind app "surveys-voc" (opt-in; respond stays public)
-		Lending:            lendingDeps,          // SPEC-W20 integrator (additive): /v1/lending gated behind app "lending" (opt-in)
-		Workforce:          workforceDeps,        // SPEC-W20 integrator (additive): /v1/workforce gated behind app "workforce" (opt-in)
-		Social:             socialDeps,           // SPEC-W21 integrator (additive): /v1/social gated behind app "social-publisher" (opt-in)
-		Civic:              civicSvc,             // SPEC-W32 WS-A (additive): /v1/civic public intake + operator console
+		// SPEC-W44 W-B/S1-F7-05 (K2): internauth on the civic sla-breach
+		// callback (BOOKING_INTERNAL_TOKEN, no default — fail closed).
+		InternalToken: cfg.InternalToken,
+		Geo:           geoHandlers,
+		Incidents:     incidentSvc,
+		Leads:         leadSvc,
+		Referrals:     referralSvc,
+		Payouts:       payoutStore,          // SPEC-W14 Agent B (additive): GET /v1/payouts
+		Devices:       deviceHandlers,       // SPEC-W16 Agent B (additive): /v1/devices + /internal/devices
+		FieldCapture:  fieldCaptureHandlers, // SPEC-W16 Agent B (additive): POST /v1/field/capture
+		AppGate:       appGate,              // SPEC-W18 Agent D (additive): /v1/leads gated behind app "cac" (opt-in)
+		Helpdesk:      helpdeskDeps,         // SPEC-W19 integrator (additive): /v1/helpdesk gated behind app "helpdesk" (opt-in)
+		Workorders:    workordersDeps,       // SPEC-W19 integrator (additive): /v1/field-service gated behind app "field-service" (opt-in)
+		Loyalty:       loyaltyDeps,          // SPEC-W19 integrator (additive): /v1/loyalty gated behind app "loyalty-wallet" (opt-in)
+		Studio:        studioDeps,           // SPEC-W19 integrator (additive): /v1/studio gated behind app "campaign-studio" (opt-in)
+		CRM360:        crm360Deps,           // SPEC-W20 integrator (additive): /v1/crm gated behind app "crm-360" (opt-in)
+		Surveys:       surveysDeps,          // SPEC-W20 integrator (additive): /v1/surveys gated behind app "surveys-voc" (opt-in; respond stays public)
+		Lending:       lendingDeps,          // SPEC-W20 integrator (additive): /v1/lending gated behind app "lending" (opt-in)
+		Workforce:     workforceDeps,        // SPEC-W20 integrator (additive): /v1/workforce gated behind app "workforce" (opt-in)
+		Social:        socialDeps,           // SPEC-W21 integrator (additive): /v1/social gated behind app "social-publisher" (opt-in)
+		Civic:         civicSvc,             // SPEC-W32 WS-A (additive): /v1/civic public intake + operator console
+		Health:        consumerHealth,       // SPEC-W43 K-09: consumer liveness flags read by /healthz
 	}
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           httpapi.NewRouter(deps),
+		Addr:    fmt.Sprintf(":%d", cfg.Port),
+		Handler: httpapi.NewRouter(deps),
+		// SPEC-W43 K-10: full server timeouts — a slow-loris or stalled
+		// handler goroutine must not pin connections/goroutines forever.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
