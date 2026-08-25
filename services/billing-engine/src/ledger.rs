@@ -9,17 +9,27 @@
 //! Postings:
 //!   invoice issued -> DR AR-control   / CR revenue           (code 200)
 //!   invoice paid   -> DR clearing     / CR AR-control        (code 202)
+//!   invoice voided -> DR revenue      / CR AR-control        (code 201,
+//!   reversal of the issued entry for issued/past_due voids — SPEC-W43 B-02)
 //!
 //! Transfers are posted (single-phase) and idempotent by transfer id, which
 //! callers derive deterministically from the invoice id — webhook retries and
 //! consumer redeliveries replay without double-posting.
+//!
+//! SPEC-W43 B-03: the postgres backend can post INSIDE the caller's open
+//! sqlx transaction (`*_in_tx` variants), so the ledger write commits
+//! atomically with the invoice state transition — a crash between the two
+//! can no longer strand an issued/paid/void invoice without its ledger
+//! entry. The sim backend cannot enlist (dev/CI only, non-durable anyway);
+//! its `*_in_tx` variants return `Ok(None)` and the caller posts after
+//! commit as before.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -34,6 +44,7 @@ pub const ACCOUNT_CODE_CLEARING: u16 = 202;
 // Transfer codes: the debited control account's code.
 pub const CODE_INVOICE_ISSUED: u16 = 200; // DR AR / CR revenue
 pub const CODE_INVOICE_PAID: u16 = 202; // DR clearing / CR AR
+pub const CODE_INVOICE_VOIDED: u16 = 201; // DR revenue / CR AR (reversal)
 
 pub fn ar_account(tenant_id: &str) -> String {
     format!("tenant:{tenant_id}:ar")
@@ -151,6 +162,76 @@ pub trait BillingLedger: Send + Sync {
             CODE_INVOICE_PAID,
         )
         .await
+    }
+
+    /// Invoice voided after issuance (SPEC-W43 B-02): reversing entry
+    /// DR revenue / CR AR-control (code 201), deterministic transfer id
+    /// `billing-void:{invoice_id}` so void retries replay idempotently.
+    /// Only meaningful for voids from issued/past_due; voiding a draft has
+    /// no ledger effect (the caller skips this entirely).
+    async fn invoice_voided(
+        &self,
+        tenant_id: &str,
+        invoice_id: Uuid,
+        amount: u64,
+    ) -> Result<Transfer, LedgerError> {
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("billing-void:{invoice_id}").as_bytes(),
+        );
+        self.post(
+            id,
+            &revenue_account(tenant_id),
+            &ar_account(tenant_id),
+            amount,
+            CODE_INVOICE_VOIDED,
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction-enlisting variants (SPEC-W43 B-03, crash safety).
+    //
+    // The postgres backend overrides these to post INSIDE the caller's open
+    // transaction, so the ledger entry and the invoice status transition
+    // commit — or roll back — atomically. They return `Ok(Some(transfer))`
+    // when the posting was enlisted. The default returns `Ok(None)`
+    // ("cannot enlist"): the sim backend has no sqlx transaction to join
+    // (dev/CI only, non-durable by design), and callers fall back to the
+    // post-commit `invoice_*` helpers above.
+    // -----------------------------------------------------------------------
+
+    /// In-transaction variant of [`BillingLedger::invoice_issued`].
+    async fn invoice_issued_in_tx(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        _tenant_id: &str,
+        _invoice_id: Uuid,
+        _amount: u64,
+    ) -> Result<Option<Transfer>, LedgerError> {
+        Ok(None)
+    }
+
+    /// In-transaction variant of [`BillingLedger::invoice_paid`].
+    async fn invoice_paid_in_tx(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        _tenant_id: &str,
+        _invoice_id: Uuid,
+        _amount: u64,
+    ) -> Result<Option<Transfer>, LedgerError> {
+        Ok(None)
+    }
+
+    /// In-transaction variant of [`BillingLedger::invoice_voided`].
+    async fn invoice_voided_in_tx(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        _tenant_id: &str,
+        _invoice_id: Uuid,
+        _amount: u64,
+    ) -> Result<Option<Transfer>, LedgerError> {
+        Ok(None)
     }
 }
 
@@ -324,10 +405,15 @@ impl PgLedgerClient {
     }
 }
 
-#[async_trait]
-impl BillingLedger for PgLedgerClient {
-    async fn post(
+impl PgLedgerClient {
+    /// Post one transfer inside `tx`. The replay check, account upserts,
+    /// balance updates, and the transfer insert all run on the caller's
+    /// transaction; committing (or rolling back) is the caller's job, which
+    /// is what lets the invoice state machine and the ledger commit
+    /// atomically (SPEC-W43 B-03).
+    async fn post_in(
         &self,
+        tx: &mut Transaction<'_, Postgres>,
         transfer_id: Uuid,
         debit: &str,
         credit: &str,
@@ -338,7 +424,6 @@ impl BillingLedger for PgLedgerClient {
             return Err(LedgerError::InvalidAmount);
         }
         let amt = i64::try_from(amount).map_err(|_| LedgerError::InvalidAmount)?;
-        let mut tx = self.pool.begin().await.map_err(|e| pg_err("begin", e))?;
 
         // Idempotent replay: same id + same parameters returns the recorded
         // transfer; same id + different parameters is a conflict.
@@ -347,7 +432,7 @@ impl BillingLedger for PgLedgerClient {
              FROM ledger_transfers WHERE id = $1",
         )
         .bind(transfer_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| pg_err("replay check", e))?;
         if let Some(row) = existing {
@@ -361,7 +446,6 @@ impl BillingLedger for PgLedgerClient {
                 && ex_credit == credit
                 && ex_amount == amt
                 && ex_code == i32::from(code);
-            tx.commit().await.map_err(|e| pg_err("commit", e))?;
             if same {
                 return Ok(Transfer {
                     id: transfer_id.as_u128(),
@@ -387,20 +471,20 @@ impl BillingLedger for PgLedgerClient {
             .bind(format!("{:032x}", account_id(name)))
             .bind(self.ledger_id as i32)
             .bind(i32::from(code_for_account(name)))
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(|e| pg_err("ensure account", e))?;
         }
         sqlx::query("UPDATE ledger_accounts SET debits_posted = debits_posted + $2 WHERE name = $1")
             .bind(debit)
             .bind(amt)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(|e| pg_err("debit update", e))?;
         sqlx::query("UPDATE ledger_accounts SET credits_posted = credits_posted + $2 WHERE name = $1")
             .bind(credit)
             .bind(amt)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(|e| pg_err("credit update", e))?;
 
@@ -417,11 +501,10 @@ impl BillingLedger for PgLedgerClient {
         .bind(self.ledger_id as i32)
         .bind(i32::from(code))
         .bind(created_at)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| pg_err("insert transfer", e))?;
 
-        tx.commit().await.map_err(|e| pg_err("commit", e))?;
         Ok(Transfer {
             id: transfer_id.as_u128(),
             debit_account: debit.to_string(),
@@ -431,6 +514,94 @@ impl BillingLedger for PgLedgerClient {
             code,
             created_at,
         })
+    }
+}
+
+#[async_trait]
+impl BillingLedger for PgLedgerClient {
+    async fn post(
+        &self,
+        transfer_id: Uuid,
+        debit: &str,
+        credit: &str,
+        amount: u64,
+        code: u16,
+    ) -> Result<Transfer, LedgerError> {
+        let mut tx = self.pool.begin().await.map_err(|e| pg_err("begin", e))?;
+        let transfer = self
+            .post_in(&mut tx, transfer_id, debit, credit, amount, code)
+            .await?;
+        tx.commit().await.map_err(|e| pg_err("commit", e))?;
+        Ok(transfer)
+    }
+
+    async fn invoice_issued_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &str,
+        invoice_id: Uuid,
+        amount: u64,
+    ) -> Result<Option<Transfer>, LedgerError> {
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("billing-issued:{invoice_id}").as_bytes(),
+        );
+        self.post_in(
+            tx,
+            id,
+            &ar_account(tenant_id),
+            &revenue_account(tenant_id),
+            amount,
+            CODE_INVOICE_ISSUED,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn invoice_paid_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &str,
+        invoice_id: Uuid,
+        amount: u64,
+    ) -> Result<Option<Transfer>, LedgerError> {
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("billing-paid:{invoice_id}").as_bytes(),
+        );
+        self.post_in(
+            tx,
+            id,
+            CLEARING_ACCOUNT,
+            &ar_account(tenant_id),
+            amount,
+            CODE_INVOICE_PAID,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn invoice_voided_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &str,
+        invoice_id: Uuid,
+        amount: u64,
+    ) -> Result<Option<Transfer>, LedgerError> {
+        let id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("billing-void:{invoice_id}").as_bytes(),
+        );
+        self.post_in(
+            tx,
+            id,
+            &revenue_account(tenant_id),
+            &ar_account(tenant_id),
+            amount,
+            CODE_INVOICE_VOIDED,
+        )
+        .await
+        .map(Some)
     }
 
     async fn balance(&self, tenant_id: &str) -> Result<TenantBalance, LedgerError> {
@@ -510,6 +681,32 @@ mod tests {
             .find(|a| a.account == revenue_account(TENANT))
             .unwrap();
         assert_eq!(revenue.posted_net, 12_500);
+    }
+
+    #[tokio::test]
+    async fn void_reverses_the_issued_posting_idempotently() {
+        // SPEC-W43 B-02: voiding an issued invoice posts DR revenue / CR AR
+        // keyed billing-void:{invoice_id}; AR and revenue net back to zero
+        // and replays do not double-post.
+        let c = SimLedgerClient::new();
+        let invoice = Uuid::new_v4();
+        c.invoice_issued(TENANT, invoice, 7_500).await.unwrap();
+        let t = c.invoice_voided(TENANT, invoice, 7_500).await.unwrap();
+        assert_eq!(t.code, CODE_INVOICE_VOIDED);
+        assert_eq!(t.debit_account, revenue_account(TENANT));
+        assert_eq!(t.credit_account, ar_account(TENANT));
+        // Replay (void retry) is absorbed.
+        c.invoice_voided(TENANT, invoice, 7_500).await.unwrap();
+        assert_conservation(&c).await;
+        let st = c.snapshot().await;
+        assert_eq!(st.transfers.len(), 2, "issued + one reversal only");
+        let bal = c.balance(TENANT).await.unwrap();
+        for a in &bal.accounts {
+            assert_eq!(a.posted_net, 0, "{} must net to zero after void", a.account);
+        }
+        // A conflicting replay (different amount) is rejected, not absorbed.
+        let err = c.invoice_voided(TENANT, invoice, 7_501).await.unwrap_err();
+        assert!(matches!(err, LedgerError::ExistsWithDifferentParameters(_)));
     }
 
     #[tokio::test]
