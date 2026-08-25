@@ -66,14 +66,14 @@ func TestLoadPackWithGrowthAndI18n(t *testing.T) {
 
 func TestValidateGrowth(t *testing.T) {
 	bad := []string{
-		`growth: {referral_bounty_ngn: -1, primary_channels: [ussd], cac_target_ngn: 100}`, // negative bounty
-		`growth: {referral_bounty_ngn: 0, cac_target_ngn: 100}`,                            // missing channels
-		`growth: {referral_bounty_ngn: 0, primary_channels: [], cac_target_ngn: 100}`,      // empty channels
+		`growth: {referral_bounty_ngn: -1, primary_channels: [ussd], cac_target_ngn: 100}`,            // negative bounty
+		`growth: {referral_bounty_ngn: 0, cac_target_ngn: 100}`,                                       // missing channels
+		`growth: {referral_bounty_ngn: 0, primary_channels: [], cac_target_ngn: 100}`,                 // empty channels
 		`growth: {referral_bounty_ngn: 0, primary_channels: ["whatsapp", ""], cac_target_ngn: 100}`,   // blank channel
 		`growth: {referral_bounty_ngn: 0, primary_channels: ["whatsapp", "  "], cac_target_ngn: 100}`, // whitespace channel
-		`growth: {referral_bounty_ngn: 0, primary_channels: [ussd]}`,                       // missing cac target
-		`growth: {referral_bounty_ngn: 0, primary_channels: [ussd], cac_target_ngn: 0}`,    // zero cac target
-		`growth: {referral_bounty_ngn: 0, primary_channels: [ussd], cac_target_ngn: -500}`, // negative cac target
+		`growth: {referral_bounty_ngn: 0, primary_channels: [ussd]}`,                                  // missing cac target
+		`growth: {referral_bounty_ngn: 0, primary_channels: [ussd], cac_target_ngn: 0}`,               // zero cac target
+		`growth: {referral_bounty_ngn: 0, primary_channels: [ussd], cac_target_ngn: -500}`,            // negative cac target
 	}
 	for i, body := range bad {
 		if err := mustValidate(t, "\n"+body+"\n"); err == nil {
@@ -93,9 +93,9 @@ func TestValidateGrowth(t *testing.T) {
 
 func TestValidateI18n(t *testing.T) {
 	bad := []string{
-		`i18n: {fr: {greeting: "Bonjour"}}`,     // locale not in allowlist
-		`i18n: {pcm: {greeting: ""}}`,           // empty value
-		`i18n: {pcm: {greeting: "   "}}`,        // whitespace-only value
+		`i18n: {fr: {greeting: "Bonjour"}}`,                     // locale not in allowlist
+		`i18n: {pcm: {greeting: ""}}`,                           // empty value
+		`i18n: {pcm: {greeting: "   "}}`,                        // whitespace-only value
 		`i18n: {en: {greeting: "Hi"}, de: {greeting: "Hallo"}}`, // one bad locale among good
 	}
 	for i, body := range bad {
