@@ -6,11 +6,13 @@
 //! as its first statement, so the policy sees exactly the request's tenant and
 //! the setting can never leak across pooled connections.
 //!
-//! The tenant id comes from the request's tenant context (the
-//! gateway-validated `X-Tenant-ID` header — the gateway strips client-spoofed
-//! copies since W34 GF4, and the gateway is the only entry point), from the
-//! usage event payload (metering consumer), or from the invoice row itself
-//! after a signature-authenticated webhook lookup.
+//! The tenant id comes from the request's tenant context — SPEC-W44 K1: the
+//! caller-supplied tenant param BOUND to the gateway-injected
+//! `X-Tenant-Slugs` claim (APISIX strips caller-sent x-tenant-* and re-injects
+//! from the verified JWT; the retired `X-Tenant-ID` header is no longer
+//! trusted) or, for internal-token service callers (K2), the caller param
+//! directly — from the usage event payload (metering consumer), or from the
+//! invoice row itself after a signature-authenticated webhook lookup.
 //!
 //! Cross-tenant batch jobs (dunning sweep, webhook invoice lookup) connect
 //! through the internal pool (`INTERNAL_DATABASE_URL`, role
