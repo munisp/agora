@@ -8,15 +8,37 @@ include:
 networks:
   opendesk:
     driver: bridge
+# ---------------------------------------------------------------------------
+# DB CREDENTIAL POLICY (SPEC-W43 G-01, SEC#4/DATA#3): the opendesk/opendesk
+# Postgres SUPERUSER is reserved for migration/bootstrap jobs only (schema
+# DDL, pg_restore, billing migrations 0001-0004, service first-boot DDL that
+# has not yet moved into infra/postgres/init-scripts). Every service that has
+# a per-service role in infra/postgres/init-scripts/05-app-roles.sql connects
+# with its least-privilege app_*_login role BY DEFAULT below (env-overridable
+# via <SVC>_PG_USER/<SVC>_PG_PASS — see .env.example). Rationale: the
+# superuser bypasses FORCE ROW LEVEL SECURITY, so tenant isolation is only
+# real when runtime traffic uses the app roles.
+#   migrated:  identity, booking, notification, conversation, knowledge,
+#              crm-sync, billing-engine, kyc
+#   still superuser (no per-service role exists yet — their PG_DSN is a base
+#   DSN for cross-DB/infra access or TigerBeetle-backed): payments, edge,
+#   voice, analytics. Extend 05-app-roles.sql before migrating these.
+# ---------------------------------------------------------------------------
 x-app-env:
   DAPR_HOST: ${DAPR_HOST:-}
   DAPR_HTTP_PORT: '3500'
   KAFKA_BROKERS: kafka:9092
   REDIS_ADDR: redis:6379
+  # Superuser base DSN — BOOTSTRAP/MIGRATION TEMPLATE ONLY (see policy above);
+  # services with app_* roles override this in their own environment block.
   PG_DSN: postgres://opendesk:opendesk@postgres:5432
   KEYCLOAK_URL: http://keycloak:8080
-  PERMIFY_HTTP: http://permify:3476
-  TEMPORAL_ADDRESS: temporal:7233
+  # SPEC-W44 F16-2/F16-3: env names match what the code actually reads —
+  # PERMIFY_URL (booking/identity config.go) and TEMPORAL_HOST_PORT
+  # (booking/notification config.go). The old PERMIFY_HTTP/TEMPORAL_ADDRESS
+  # names were DEAD (no code path read them); removed, no dual-write.
+  PERMIFY_URL: http://permify:3476
+  TEMPORAL_HOST_PORT: temporal:7233
   TEMPORAL_NAMESPACE: opendesk
   TEMPORAL_TASK_QUEUE: opendesk-main
   OPENSEARCH_ADDR: http://opensearch:9200
@@ -51,10 +73,10 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      PG_DSN: postgres://${IDENTITY_PG_USER:-app_identity_login}:${IDENTITY_PG_PASS:-app_identity_dev_password}@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
@@ -64,8 +86,21 @@ services:
       # GF5: matches the dev placeholder in infra/keycloak/realm-opendesk.json;
       # override via .env in any real environment (see infra/keycloak/README.md).
       KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:-CHANGE_ME_DEV_ONLY}
-      DATABASE_URL: postgres://opendesk:opendesk@postgres:5432/identity
+      # SPEC-W43 G-01: least-privilege per-service role by default (see
+      # 05-app-roles.sql). The opendesk superuser is for migration/bootstrap
+      # jobs only — override via IDENTITY_PG_USER/IDENTITY_PG_PASS in .env.
+      DATABASE_URL: postgres://${IDENTITY_PG_USER:-app_identity_login}:${IDENTITY_PG_PASS:-app_identity_dev_password}@postgres:5432/identity
       INDUSTRIES_DIR: /industries
+      # SPEC-W44 K2 internal-auth contract: every /internal/* surface requires
+      # X-Internal-Token matching this value (constant-time compare; 503
+      # fail-closed when unset, 401 on mismatch). DEV ONLY default below
+      # (repo convention: compose boots without .env); prod MUST set
+      # IDENTITY_INTERNAL_TOKEN via the secrets store (docs/runbooks/secrets.md).
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # W44 caller side: outbound /dev/trigger-* calls to notification-worker
+      # carry X-Internal-Token == this value (must match the notification
+      # block's NOTIFICATION_INTERNAL_TOKEN). DEV ONLY default.
+      NOTIFICATION_INTERNAL_TOKEN: ${NOTIFICATION_INTERNAL_TOKEN:-opendesk-dev-notification-internal-token-change-in-prod}
     volumes:
     - ./industries:/industries:ro
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
@@ -99,24 +134,50 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      PG_DSN: postgres://${BOOKING_PG_USER:-app_booking_login}:${BOOKING_PG_PASS:-app_booking_dev_password}@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
       PORT: '7002'
       PG_DATABASE: booking
-      # Per-service DB role (SPEC-W3 §2): set BOOKING_PG_USER=app_booking_login
-      # + BOOKING_PG_PASS in .env (see 05-app-roles.sql). Default stays
-      # opendesk/opendesk for dev parity.
-      PG_USER: ${BOOKING_PG_USER:-opendesk}
-      PG_PASS: ${BOOKING_PG_PASS:-opendesk}
-      DATABASE_URL: postgres://${BOOKING_PG_USER:-opendesk}:${BOOKING_PG_PASS:-opendesk}@postgres:5432/booking
+      # Per-service DB role (SPEC-W3 §2 / SPEC-W43 G-01): defaults to the
+      # least-privilege app_booking_login role (see 05-app-roles.sql). The
+      # opendesk superuser is for migration/bootstrap jobs only; override via
+      # BOOKING_PG_USER/BOOKING_PG_PASS in .env if a bootstrap job needs it.
+      PG_USER: ${BOOKING_PG_USER:-app_booking_login}
+      PG_PASS: ${BOOKING_PG_PASS:-app_booking_dev_password}
+      DATABASE_URL: postgres://${BOOKING_PG_USER:-app_booking_login}:${BOOKING_PG_PASS:-app_booking_dev_password}@postgres:5432/booking
       # Wave 5 #7 customer portal: HMAC secret for 15-min portal JWTs.
-      # Dev default keeps the stack bootable; prod MUST override via .env.
+      # Dev default is repo-known; prod MUST override via .env. Bootable
+      # only because OPENDESK_DEV_INSECURE is explicitly set below (W44 D4).
       PORTAL_SECRET: ${PORTAL_SECRET:-opendesk-dev-portal-secret-change-in-prod}
+      # SPEC-W44 K2 internal-auth contract: /internal/* and /activities/*
+      # surfaces (incl. the civic sla-breach hook, S1-F7-05) require
+      # X-Internal-Token matching this value (constant-time compare; 503
+      # fail-closed when unset, 401 on mismatch). DEV ONLY default below;
+      # prod MUST set BOOKING_INTERNAL_TOKEN via the secrets store
+      # (docs/runbooks/secrets.md).
+      BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+      # SPEC-W44 K2 caller side: identity tenant-resolution calls
+      # (bookingops appgate/resolver) carry X-Internal-Token matching the
+      # identity block's IDENTITY_INTERNAL_TOKEN. Same DEV ONLY default;
+      # prod MUST set via the secrets store (docs/runbooks/secrets.md).
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # SPEC-W44 W-B-1 (S1-F6-02): PORTAL_SECRET is fail-closed — the
+      # service refuses to boot on the dev default above unless this
+      # explicit escape is set. NEVER set outside local dev.
+      OPENDESK_DEV_INSECURE: ${OPENDESK_DEV_INSECURE:-'1'}  # DEV ONLY escape for the PORTAL_SECRET boot gate; NEVER set outside local dev
+      # SPEC-W44 W-B-3 (S1-F7-07): X-User-Roles entries allowed to approve a
+      # lending KYC override (code default "platform-admin"; csv). Uncomment
+      # to widen:
+      # LENDING_KYC_OVERRIDE_ROLES: ${LENDING_KYC_OVERRIDE_ROLES:-platform-admin}
+      # SPEC-W44 W-B-4 (S1-F7-08): approved referral commissions mature this
+      # many seconds before the recon schedule enqueues payout. Uncomment to
+      # override the code default:
+      # COMMISSION_MATURITY_SECONDS: ${COMMISSION_MATURITY_SECONDS:-2592000}
       NOTIFICATIONS_TOPIC: opendesk.notifications.outbox
       # SPEC-W32 civic reporting: CloudEvents topic + public intake throttle.
       CIVIC_EVENTS_TOPIC: opendesk.civic.events.v1
@@ -165,10 +226,17 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      # SPEC-W43 G-01: least-privilege app_notifications_login by default
+      # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
+      # SPEC-W44: code reads DATABASE_URL (internal/config/config.go), not
+      # PG_DSN — and the DSN MUST carry the /notifications dbname (pgx
+      # otherwise defaults the database to the user name).
+      DATABASE_URL: postgres://${NOTIFICATIONS_PG_USER:-app_notifications_login}:${NOTIFICATIONS_PG_PASS:-app_notifications_dev_password}@postgres:5432/notifications
       KEYCLOAK_URL: http://keycloak:8080
       PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      # SPEC-W44 F16-3: code reads TEMPORAL_HOST_PORT (notification
+      # config.go); the old TEMPORAL_ADDRESS name was never read.
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
@@ -201,6 +269,44 @@ services:
       DND_ENFORCEMENT: ${DND_ENFORCEMENT:-true}
       QUIET_HOURS_DEFAULT: ${QUIET_HOURS_DEFAULT:-20:00-08:00}
       QUIET_HOURS_OVERRIDES: ${QUIET_HOURS_OVERRIDES:-}
+      # SPEC-W44 K2 internal-auth contract: Temporal-signal + /internal/*
+      # surfaces require X-Internal-Token matching this value (constant-time
+      # compare; 503 fail-closed when unset, 401 on mismatch). DEV ONLY
+      # default below; prod MUST set NOTIFICATION_INTERNAL_TOKEN via the
+      # secrets store (docs/runbooks/secrets.md).
+      NOTIFICATION_INTERNAL_TOKEN: ${NOTIFICATION_INTERNAL_TOKEN:-opendesk-dev-notification-internal-token-change-in-prod}
+      # SPEC-W44 K2 caller side (W-N-4/W-N-5): outbound calls to gated
+      # /internal/* + dev/* surfaces (identity tenant delete, payments
+      # hold-deposit/void, booking activities) carry X-Internal-Token
+      # matching each target's server block. Same DEV ONLY defaults; prod
+      # MUST set via the secrets store (docs/runbooks/secrets.md).
+      PAYMENTS_INTERNAL_TOKEN: ${PAYMENTS_INTERNAL_TOKEN:-opendesk-dev-payments-internal-token-change-in-prod}
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+      # W-N-5 (K5): direct HTTP base URL for payments internal calls when
+      # Dapr header passthrough is unavailable (hold-deposit/void).
+      PAYMENTS_URL: ${PAYMENTS_URL:-http://payments:7004}  # W44 V1 fix: payments listens on 7004 (7010 is crm-sync)
+      # Optional RLS escape DSN (app_notifications_internal member, the
+      # identity INTERNAL_DATABASE_URL idiom): intentionally UNSET in dev —
+      # 05-app-roles.sql grants no LOGIN member of the escape role, so set
+      # this only with a provisioned member login.
+      # INTERNAL_DATABASE_URL: postgres://...@postgres:5432/notifications
+      # SPEC-W44 W-N-2: X-User-Roles entries allowed to import/delete DND
+      # registry entries (admin claim), csv.
+      DND_ADMIN_ROLES: ${DND_ADMIN_ROLES:-platform-admin}
+      # SPEC-W44 W-N-1: /dev/* trigger endpoints (onboarding, twin cleanup)
+      # are a dev convenience — explicit opt-in, and additionally gated by
+      # NOTIFICATION_INTERNAL_TOKEN above. W44 F3: even when enabled, /dev/*
+      # requires X-Internal-Token == NOTIFICATION_INTERNAL_TOKEN. Default OFF;
+      # opt in for local dev only.
+      OPENDESK_DEV_ENDPOINTS: ${OPENDESK_DEV_ENDPOINTS:-0}  # DEV opt-in — /dev/* triggers (token-gated)
+      # K1 dev escape (explicit, logged): trust a caller-supplied tenant
+      # without the gateway-injected X-Tenant-Slugs header. OFF by default.
+      # OPENDESK_TRUST_DIRECT_TENANT: '1'  # DEV ONLY — never set in prod
+      # SPEC-W44 K3/W-N-6: ops-alerts consumer (opendesk.ops.alerts ->
+      # ops_alerts table + GET /v1/ops-alerts, DND-admin gated).
+      OPS_ALERTS_TOPIC: ${OPS_ALERTS_TOPIC:-opendesk.ops.alerts}
+      OPS_ALERTS_GROUP: ${OPS_ALERTS_GROUP:-notification-ops-alerts}
       # W39 mock-rail contract — dev has no FCM credentials and no Meta
       # WhatsApp app secret, so the mocks are opted in EXPLICITLY here. Code
       # defaults are OFF (fail-closed); production must leave unset/0.
@@ -295,8 +401,8 @@ services:
       REDIS_ADDR: redis:6379
       PG_DSN: postgres://opendesk:opendesk@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
@@ -316,6 +422,15 @@ services:
       # unset this (code default OFF; fail-closed) and use a real FSPIOP
       # endpoint.
       MOJALOOP_ALLOW_SIM: ${MOJALOOP_ALLOW_SIM:-1}
+      # SPEC-W44 K2 internal-auth contract (S1-R2/F16-6): every /internal/*
+      # and /activities/* surface (deposit sagas, no-show-fees, ...) requires
+      # X-Internal-Token matching this value (constant-time compare; 503
+      # fail-closed when unset, 401 on mismatch). Without this default the
+      # gate was OFF and post-P-09 saga/activity flows were permanently dead.
+      # DEV ONLY default below; prod MUST set PAYMENTS_INTERNAL_TOKEN via the
+      # secrets store (docs/runbooks/secrets.md). Callers (notification-worker
+      # hold-deposit/void activities) get the same value via their own env.
+      PAYMENTS_INTERNAL_TOKEN: ${PAYMENTS_INTERNAL_TOKEN:-opendesk-dev-payments-internal-token-change-in-prod}
       # SPEC-W12 §6/§8: Flutterwave mirror of the Paystack path.
       FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
       FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:-}
@@ -337,7 +452,17 @@ services:
       DAPR_APP_ID: payments
       DAPR_APP_PORT: '7004'
   edge:
-    build: ./services/gateway-edge
+    build:
+      context: ./services/gateway-edge
+      args:
+        # SPEC-W44 F15-01: main.rs REFUSES to boot when the fluvio-live
+        # feature is not compiled in (unless GATEWAY_EDGE_ALLOW_SIM=true), and
+        # the Dockerfile ARG CARGO_FEATURES defaulted to "" — the default
+        # image crash-looped the realtime plane. Pass the feature explicitly
+        # here; pairs with the W44 Dockerfile-side default flip (CODER-H2,
+        # ARG default "fluvio-live"). Keep both in sync; value is the feature
+        # NAME (the Dockerfile adds `--features`).
+        CARGO_FEATURES: ${GATEWAY_EDGE_CARGO_FEATURES:-fluvio-live}
     environment:
       DAPR_HOST: ${DAPR_HOST:-}
       DAPR_HTTP_PORT: '3500'
@@ -345,8 +470,8 @@ services:
       REDIS_ADDR: redis:6379
       PG_DSN: postgres://opendesk:opendesk@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
@@ -381,8 +506,8 @@ services:
       REDIS_ADDR: redis:6379
       PG_DSN: postgres://opendesk:opendesk@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
@@ -404,6 +529,10 @@ services:
       # TENANT_PHONE_MAP remains the fallback when the registry misses.
       AGENTS_REGISTRY_URL: ${AGENTS_REGISTRY_URL:-http://conversation:7007}
       AGENTS_CACHE_TTL_S: ${AGENTS_CACHE_TTL_S:-30}
+      # SPEC-W44 K2 caller side: the identity tenant-context enrichment
+      # (fetch_tenant_context step 2) carries X-Internal-Token. Same DEV
+      # ONLY default as the identity block; prod via the secrets store.
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -443,15 +572,22 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      # SPEC-W43 G-01: least-privilege app_conversation_login by default
+      # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
+      PG_DSN: postgres://${CONVERSATION_PG_USER:-app_conversation_login}:${CONVERSATION_PG_PASS:-app_conversation_dev_password}@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
       PORT: '7007'
       PG_DATABASE: conversation
+      # SPEC-W44 K2 caller side: TenantResolver GET identity
+      # /v1/tenants/{slug} carries X-Internal-Token (service callers allowed
+      # on identity's tenant-scoped read). Same DEV ONLY default as the
+      # identity block; prod MUST set via the secrets store.
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
       FLUVIO_ADDR: fluvio:9003
       TRANSCRIPT_SINK: ${TRANSCRIPT_SINK:-kafka}
       # Retention + intel toggles (NDPA profile: infra/privacy/ndpa-profile.env).
@@ -486,15 +622,21 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      # SPEC-W43 G-01: least-privilege app_knowledge_login by default
+      # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
+      PG_DSN: postgres://${KNOWLEDGE_PG_USER:-app_knowledge_login}:${KNOWLEDGE_PG_PASS:-app_knowledge_dev_password}@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
       PORT: '7008'
       PG_DATABASE: knowledge
+      # SPEC-W44 K2 caller side: resolve_tenant_id GET identity
+      # /v1/tenants/{slug} carries X-Internal-Token. Same DEV ONLY default
+      # as the identity block; prod MUST set via the secrets store.
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
       EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
@@ -522,8 +664,8 @@ services:
       REDIS_ADDR: redis:6379
       PG_DSN: postgres://opendesk:opendesk@postgres:5432
       KEYCLOAK_URL: http://keycloak:8080
-      PERMIFY_HTTP: http://permify:3476
-      TEMPORAL_ADDRESS: temporal:7233
+      PERMIFY_URL: http://permify:3476
+      TEMPORAL_HOST_PORT: temporal:7233
       TEMPORAL_NAMESPACE: opendesk
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
@@ -535,6 +677,10 @@ services:
       AWS_ENDPOINT_URL: http://minio:9000
       BATCH_SIZE: '500'
       FLUSH_INTERVAL: '15'
+      # SPEC-W44 K2 caller side: TenantResolver (CAC spend join) GET identity
+      # /v1/tenants/{slug} carries X-Internal-Token. Same DEV ONLY default
+      # as the identity block; prod MUST set via the secrets store.
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -638,6 +784,14 @@ services:
       # TENANT_PHONE_MAP remains the fallback when the registry misses.
       AGENTS_REGISTRY_URL: ${AGENTS_REGISTRY_URL:-http://conversation:7007}
       AGENTS_CACHE_TTL_S: ${AGENTS_CACHE_TTL_S:-30}
+      # SPEC-W44 F15-09: voice-worker serves /metrics (prometheus_client) on
+      # its own port; scraped by the prometheus voice-worker job
+      # (infra/observability/prometheus/prometheus.yml, voice-worker:9464).
+      VOICE_WORKER_METRICS_PORT: ${VOICE_WORKER_METRICS_PORT:-9464}
+      # SPEC-W44 K2 caller side: session bootstrap calls identity
+      # /v1/tenants/{slug} (fetch_tenant_context) with X-Internal-Token.
+      # Same DEV ONLY default as the identity block; prod via secrets store.
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
     depends_on:
     - livekit
     - voice
@@ -653,9 +807,11 @@ services:
       DAPR_HOST: daprd-crm-sync
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      PG_DSN: postgres://${CRM_SYNC_PG_USER:-app_crm_sync_login}:${CRM_SYNC_PG_PASS:-app_crm_sync_dev_password}@postgres:5432
       PORT: '7010'
-      DATABASE_URL: postgres://opendesk:opendesk@postgres:5432/crm_sync
+      # SPEC-W43 G-01: least-privilege app_crm_sync_login by default
+      # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
+      DATABASE_URL: postgres://${CRM_SYNC_PG_USER:-app_crm_sync_login}:${CRM_SYNC_PG_PASS:-app_crm_sync_dev_password}@postgres:5432/crm_sync
       TWENTY_API_URL: http://twenty-api:3000
       TWENTY_API_KEY: ${TWENTY_API_KEY:-opendesk-dev-twenty-api-key}
       TWENTY_WEBHOOK_SECRET: ${TWENTY_WEBHOOK_SECRET:-opendesk-dev-twenty-webhook-secret}
@@ -696,12 +852,17 @@ services:
       required: false
     environment:
       KAFKA_BROKERS: kafka:9092
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      PG_DSN: postgres://${BILLING_PG_USER:-app_billing_login}:${BILLING_PG_PASS:-app_billing_dev_password}@postgres:5432
       PORT: '7012'
-      # Per-service DB role (SPEC-W3 §2): set BILLING_PG_USER=app_billing_login
-      # + BILLING_PG_PASS in .env (see 05-app-roles.sql). Default stays
-      # opendesk/opendesk for dev parity.
-      DATABASE_URL: postgres://${BILLING_PG_USER:-opendesk}:${BILLING_PG_PASS:-opendesk}@postgres:5432/billing
+      # Per-service DB role (SPEC-W3 §2 / SPEC-W43 G-01): defaults to the
+      # least-privilege app_billing_login role (see 05-app-roles.sql).
+      # MIGRATION/BOOTSTRAP NOTE: billing-engine applies migrations 0001-0004
+      # on the DATABASE_URL connection at boot, which needs DDL privileges —
+      # for least-privilege runtime, run the migrations as the opendesk
+      # superuser first (e.g. psql -f services/billing-engine/migrations/
+      # against the billing DB) and keep BILLING_PG_USER=app_billing_login,
+      # or point DATABASE_URL at the superuser for the bootstrap deploy only.
+      DATABASE_URL: postgres://${BILLING_PG_USER:-app_billing_login}:${BILLING_PG_PASS:-app_billing_dev_password}@postgres:5432/billing
       KAFKA_GROUP_ID: billing-engine
       USAGE_EVENTS_TOPIC: opendesk.usage.events
       BILLING_EVENTS_TOPIC: opendesk.billing.events
@@ -727,13 +888,18 @@ services:
       BILLING_LEDGER_IMPL: ${BILLING_LEDGER_IMPL:-postgres}
       # W39 RS-007 internal-auth contract: billing rejects any request whose
       # x-internal-token header does not match this value. APISIX strips
-      # client-supplied x-internal-token globally and injects this same value
-      # on /api/billing/* (see infra/apisix/apisix.yaml, api-billing route) —
-      # keep the two in sync.
+      # client-supplied x-internal-token globally; W44 F1 REMOVED the former
+      # injection on /api/billing/* — human calls now authenticate via K1
+      # (X-Tenant-Slugs binding + X-User-Roles); this token is for in-cluster
+      # service callers only.
       # DEV ONLY default below (repo convention: compose boots without .env);
       # prod MUST set BILLING_INTERNAL_TOKEN via the secrets store
       # (docs/runbooks/secrets.md).
       BILLING_INTERNAL_TOKEN: ${BILLING_INTERNAL_TOKEN:-opendesk-dev-billing-internal-token-change-in-prod}
+      # W44 F1: human uuid-tenant binding resolves slugs via identity
+      # GET /v1/tenants/{slug} (service-caller auth). Must match the identity
+      # block's IDENTITY_INTERNAL_TOKEN. DEV ONLY default; prod via secrets.
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -755,14 +921,23 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      PG_DSN: postgres://${KYC_PG_USER:-app_kyc_login}:${KYC_PG_PASS:-app_kyc_dev_password}@postgres:5432
       PORT: '7013'
       PG_DATABASE: kyc
-      DATABASE_URL: postgres://opendesk:opendesk@postgres:5432/kyc
+      # SPEC-W43 G-01: least-privilege app_kyc_login by default
+      # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
+      DATABASE_URL: postgres://${KYC_PG_USER:-app_kyc_login}:${KYC_PG_PASS:-app_kyc_dev_password}@postgres:5432/kyc
       KYC_MOCK: ${KYC_MOCK:-0}  # W34 GF8: safe default off; DEV ONLY — mock resolver via explicit KYC_MOCK=1 (CRITICAL startup log)
       # Consent gate: identity GET /internal/consents/check (Dapr app-id
       # identity); empty = Dapr invoke via the sidecar.
-      IDENTITY_URL: ${IDENTITY_URL:-}
+      # SPEC-W44 F16: code reads IDENTITY_BASE_URL (config.go); the old
+      # IDENTITY_URL key was dead config.
+      IDENTITY_BASE_URL: ${IDENTITY_BASE_URL:-}
+      # SPEC-W44 K2 caller side: the consent-gate call to identity
+      # /internal/consents/check carries X-Internal-Token matching the
+      # identity block's IDENTITY_INTERNAL_TOKEN (same DEV ONLY default;
+      # prod MUST set via the secrets store, docs/runbooks/secrets.md).
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
       KYC_RESOLVED_TOPIC: opendesk.kyc.resolved.v1
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
@@ -782,5 +957,26 @@ services:
     environment:
       DAPR_APP_ID: kyc
       DAPR_APP_PORT: '7013'
+  # SPEC-W33 §3 B2 credit-bureau (:7022) — F16-1: this service was an ORPHAN
+  # (no compose entry, no gateway route). It is NOT part of the default
+  # stack: profile-gated `experimental` (booking-service lending falls back
+  # to its internal rule score when absent — WARN once per boot, per-call
+  # debug). Start with: docker compose --profile experimental up -d credit-bureau
+  # and uncomment the matching comment-gated route in infra/apisix/apisix.yaml.
+  credit-bureau:
+    build: ./services/credit-bureau
+    profiles:
+    - experimental
+    environment:
+      PORT: '7022'
+      # Same JWT auth seam as graph-service: JWT_PUBLIC_KEY set => Bearer JWT
+      # required; unset => dev mode (X-Tenant-Id header). Learned scorer stays
+      # OFF unless CREDIT_ML_REGISTRY_DIR holds credit-ml-v{N} artifacts.
+      JWT_PUBLIC_KEY: ${CREDIT_BUREAU_JWT_PUBLIC_KEY:-}
+      CREDIT_ML_REGISTRY_DIR: ${CREDIT_ML_REGISTRY_DIR:-}
+    # GF4 (SPEC-W34): no host port published — reachable only on the opendesk
+    # network (booking -> CREDIT_BUREAU_URL=http://credit-bureau:7022).
+    networks:
+    - opendesk
 volumes:
   ollama-models: null
