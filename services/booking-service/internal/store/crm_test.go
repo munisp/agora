@@ -137,7 +137,7 @@ func TestAppendBookingCRMNote(t *testing.T) {
 		StartsAt: time.Now().UTC().Add(24 * time.Hour), EndsAt: time.Now().UTC().Add(25 * time.Hour),
 		Status: StatusConfirmed, Source: "web",
 	}
-	if err := st.CreateBookingTx(ctx, b, "test.topic", []byte(`{}`)); err != nil {
+	if err := st.CreateBookingTx(ctx, b, SlotGuard{}, "test.topic", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
 

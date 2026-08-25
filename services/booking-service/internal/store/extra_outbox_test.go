@@ -31,7 +31,7 @@ func TestCreateBookingTxWritesExtraOutboxRows(t *testing.T) {
 		{Topic: "", Payload: []byte(`skipped`)}, // empty topic skipped
 		{Topic: "also-skipped", Payload: nil},   // nil payload skipped
 	}
-	err := st.CreateBookingTx(ctx, &booking, "opendesk.booking.events", []byte(`{"type":"com.opendesk.booking.BookingCreated"}`), extra...)
+	err := st.CreateBookingTx(ctx, &booking, SlotGuard{}, "opendesk.booking.events", []byte(`{"type":"com.opendesk.booking.BookingCreated"}`), extra...)
 	if err != nil {
 		t.Fatalf("CreateBookingTx: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestSetBookingStatusWritesExtraOutboxRows(t *testing.T) {
 		Status:       StatusPending,
 		Source:       "api",
 	}
-	if err := st.CreateBookingTx(ctx, &booking, "opendesk.booking.events", []byte(`{}`)); err != nil {
+	if err := st.CreateBookingTx(ctx, &booking, SlotGuard{}, "opendesk.booking.events", []byte(`{}`)); err != nil {
 		t.Fatalf("CreateBookingTx: %v", err)
 	}
 

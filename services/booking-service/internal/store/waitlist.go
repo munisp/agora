@@ -275,7 +275,7 @@ func (s *Store) ClaimWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID
 		}
 
 		const ins = `INSERT INTO bookings (` + bookingCols + `)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now())
+		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),now(),now())
 		             RETURNING created_at, updated_at`
 		err = tx.QueryRow(ctx, ins, booking.ID, booking.TenantID, booking.OfferingID, booking.TeamMemberID,
 			booking.ContactID, booking.StartsAt, booking.EndsAt, booking.Status, booking.Source,

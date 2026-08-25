@@ -43,8 +43,14 @@ const bookingCols = `id, tenant_id, offering_id, team_member_id, contact_id, sta
 
 func scanBooking(row pgx.Row) (Booking, error) {
 	var b Booking
+	// idempotency_key is NULL for keyless bookings (NULLIF at insert,
+	// SPEC-W43 K-02) — scan through a pointer so NULL decodes to "".
+	var key *string
 	err := row.Scan(&b.ID, &b.TenantID, &b.OfferingID, &b.TeamMemberID, &b.ContactID,
-		&b.StartsAt, &b.EndsAt, &b.Status, &b.Source, &b.IdempotencyKey, &b.CreatedAt, &b.UpdatedAt)
+		&b.StartsAt, &b.EndsAt, &b.Status, &b.Source, &key, &b.CreatedAt, &b.UpdatedAt)
+	if key != nil {
+		b.IdempotencyKey = *key
+	}
 	return b, err
 }
 
@@ -80,16 +86,87 @@ func insertExtraOutbox(ctx context.Context, tx pgx.Tx, aggregateID uuid.UUID, ex
 	return nil
 }
 
+// ErrSlotConflict is returned by the in-transaction overlap re-check of
+// CreateBookingTx/RescheduleBooking when a conflicting active booking exists
+// for the same team member (double-booking TOCTOU guard, SPEC-W43 K-01).
+// bookingops maps it to ErrSlotUnavailable (HTTP 409).
+var ErrSlotConflict = errors.New("slot conflict: overlapping booking")
+
+// SlotGuard configures the in-transaction overlap re-check (SPEC-W43 K-01).
+// The fast application-level pre-check stays in bookingops; the guard is the
+// authoritative check, serialized per team member by an advisory xact lock.
+type SlotGuard struct {
+	// Buffer is the offering's buffer enforced against neighbouring
+	// non-overlapping bookings (mirrors availability.Fits).
+	Buffer time.Duration
+	// Capacity is how many overlapping bookings are allowed; <= 0 means 1.
+	Capacity int
+}
+
+// lockTeamMemberTx takes a transaction-scoped advisory lock keyed on
+// (tenant_id, team_member_id) so concurrent booking writes for the same
+// member serialize at the database — closing the check-then-insert TOCTOU
+// window. The lock is released automatically at commit/rollback.
+func lockTeamMemberTx(ctx context.Context, tx pgx.Tx, tenantID, teamMemberID uuid.UUID) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 7919))`,
+		tenantID.String()+"|"+teamMemberID.String()); err != nil {
+		return fmt.Errorf("lock team member slot: %w", err)
+	}
+	return nil
+}
+
+// checkSlotOverlapTx re-checks availability INSIDE the transaction (after
+// lockTeamMemberTx): counts active bookings overlapping [start,end) and,
+// separately, non-overlapping bookings inside the buffer zone — mirroring
+// availability.Fits. excludeID is ignored (self-exclusion on reschedule;
+// uuid.Nil on create matches nothing).
+func checkSlotOverlapTx(ctx context.Context, tx pgx.Tx, tenantID, teamMemberID, excludeID uuid.UUID, start, end time.Time, guard SlotGuard) error {
+	capacity := guard.Capacity
+	if capacity <= 0 {
+		capacity = 1
+	}
+	from, to := start, end
+	if guard.Buffer > 0 {
+		from = start.Add(-guard.Buffer)
+		to = end.Add(guard.Buffer)
+	}
+	var overlapping, withinBuffer int64
+	err := tx.QueryRow(ctx, `SELECT
+	    count(*) FILTER (WHERE starts_at < $4 AND ends_at > $3),
+	    count(*) FILTER (WHERE starts_at < $6 AND ends_at > $5
+	                     AND NOT (starts_at < $4 AND ends_at > $3))
+	  FROM bookings
+	  WHERE tenant_id=$1 AND team_member_id=$2 AND status <> 'cancelled' AND id <> $7`,
+		tenantID, teamMemberID, start, end, from, to, excludeID).Scan(&overlapping, &withinBuffer)
+	if err != nil {
+		return fmt.Errorf("slot overlap re-check: %w", err)
+	}
+	if overlapping >= int64(capacity) || withinBuffer > 0 {
+		return ErrSlotConflict
+	}
+	return nil
+}
+
 // CreateBookingTx inserts a booking and its outbox event atomically
 // (transactional outbox pattern, SPEC §6/§9). Optional extra outbox rows
-// (usage metering) join the same transaction.
-func (s *Store) CreateBookingTx(ctx context.Context, b *Booking, outboxTopic string, eventPayload []byte, extra ...ExtraOutbox) error {
+// (usage metering) join the same transaction. The insert re-validates the
+// slot inside the transaction under a per-member advisory lock (SPEC-W43
+// K-01), and stores an empty idempotency key as NULL (SPEC-W43 K-02) so the
+// (tenant_id, idempotency_key) partial unique index dedupes only real keys.
+func (s *Store) CreateBookingTx(ctx context.Context, b *Booking, guard SlotGuard, outboxTopic string, eventPayload []byte, extra ...ExtraOutbox) error {
 	if b.ID == uuid.Nil {
 		b.ID = uuid.New()
 	}
 	return s.withTenant(ctx, b.TenantID, func(tx pgx.Tx) error {
+		if err := lockTeamMemberTx(ctx, tx, b.TenantID, b.TeamMemberID); err != nil {
+			return err
+		}
+		if err := checkSlotOverlapTx(ctx, tx, b.TenantID, b.TeamMemberID, uuid.Nil, b.StartsAt, b.EndsAt, guard); err != nil {
+			return err
+		}
 		const ins = `INSERT INTO bookings (` + bookingCols + `)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now())
+		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),now(),now())
 		             RETURNING created_at, updated_at`
 		err := tx.QueryRow(ctx, ins, b.ID, b.TenantID, b.OfferingID, b.TeamMemberID, b.ContactID,
 			b.StartsAt, b.EndsAt, b.Status, b.Source, b.IdempotencyKey).Scan(&b.CreatedAt, &b.UpdatedAt)
@@ -156,8 +233,14 @@ type BookingFilter struct {
 
 // ListBookings returns tenant bookings newest-first, honoring the filter.
 func (s *Store) ListBookings(ctx context.Context, tenantID uuid.UUID, f BookingFilter) ([]Booking, error) {
-	if f.Limit <= 0 || f.Limit > 500 {
+	// SPEC-W44 W-B/F15-10: an over-large limit is CLAMPED to 500, not
+	// silently reset to the default (a client asking for 500+ rows got 100
+	// before — a surprising, lossy answer).
+	if f.Limit <= 0 {
 		f.Limit = 100
+	}
+	if f.Limit > 500 {
+		f.Limit = 500
 	}
 	q := `SELECT ` + bookingCols + ` FROM bookings WHERE tenant_id=$1`
 	args := []any{tenantID}
@@ -268,8 +351,16 @@ func (s *Store) SetBookingStatus(ctx context.Context, tenantID, id uuid.UUID, st
 }
 
 // RescheduleBooking moves a booking to new times (+outbox event) atomically.
-func (s *Store) RescheduleBooking(ctx context.Context, tenantID, id uuid.UUID, startsAt, endsAt time.Time, outboxTopic string, eventPayload []byte) error {
+// The target slot is re-validated inside the transaction under the
+// per-member advisory lock, excluding the booking itself (SPEC-W43 K-01).
+func (s *Store) RescheduleBooking(ctx context.Context, tenantID, id, teamMemberID uuid.UUID, startsAt, endsAt time.Time, guard SlotGuard, outboxTopic string, eventPayload []byte) error {
 	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := lockTeamMemberTx(ctx, tx, tenantID, teamMemberID); err != nil {
+			return err
+		}
+		if err := checkSlotOverlapTx(ctx, tx, tenantID, teamMemberID, id, startsAt, endsAt, guard); err != nil {
+			return err
+		}
 		tag, err := tx.Exec(ctx,
 			`UPDATE bookings SET starts_at=$3, ends_at=$4, updated_at=now()
 			 WHERE tenant_id=$1 AND id=$2 AND status != 'cancelled'`,
@@ -345,19 +436,69 @@ func hashPii(v string) string {
 // intentionally does NOT set app.tenant_id. The outbox table carries no RLS
 // policy (see 01-booking-schema.sql).
 func (s *Store) FetchUnsentOutbox(ctx context.Context, limit int) ([]OutboxEvent, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, aggregate_id, topic, payload FROM outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1`, limit)
+	// SPEC-W43 K-11: FOR UPDATE SKIP LOCKED claiming — concurrent dispatchers
+	// (or a doubled deploy) skip rows another dispatcher is holding instead of
+	// double-publishing them. The lock is held only for the fetch transaction;
+	// MarkOutboxSent finalizes delivery afterwards (single-replica deployment
+	// documented — this is defence-in-depth, not a lease).
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer tx.Rollback(ctx) //nolint:errcheck
+	rows, err := tx.Query(ctx,
+		`SELECT id, aggregate_id, topic, payload FROM outbox WHERE sent_at IS NULL ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
 	var out []OutboxEvent
 	for rows.Next() {
 		var e OutboxEvent
 		if err := rows.Scan(&e.ID, &e.AggregateID, &e.Topic, &e.Payload); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, tx.Commit(ctx)
+}
+
+// ListStalePendingBookings returns pending bookings created more than
+// minAge ago, oldest first — the candidates of the pending-booking saga
+// sweeper (SPEC-W43 K-08), which re-drives StartBookingSaga for rows whose
+// saga start failed at create time.
+//
+// NOTE (RLS): cross-tenant background path — like FetchUnsentOutbox it
+// intentionally runs outside withTenant. Under a least-privilege role with
+// FORCE RLS the bookings policy hides rows without app.tenant_id; the
+// sweeper therefore requires a superuser/owner connection (as today) and
+// silently sees no rows otherwise (fail-safe direction: no spurious sagas).
+func (s *Store) ListStalePendingBookings(ctx context.Context, minAge time.Duration, limit int) ([]Booking, error) {
+	if minAge <= 0 {
+		minAge = 2 * time.Minute
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+bookingCols+` FROM bookings
+		 WHERE status='pending' AND created_at < now() - ($1 * interval '1 second')
+		 ORDER BY created_at LIMIT $2`, minAge.Seconds(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Booking
+	for rows.Next() {
+		b, err := scanBooking(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
 	}
 	return out, rows.Err()
 }

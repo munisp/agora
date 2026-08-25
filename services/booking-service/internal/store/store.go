@@ -54,6 +54,15 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 	if maxConns > 0 {
 		poolCfg.MaxConns = maxConns
 	}
+	// SPEC-W43 K-10: bound every statement on pool connections so a runaway
+	// query cannot pin a worker forever; statement_timeout is per-session,
+	// hence AfterConnect.
+	poolCfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		if _, err := conn.Exec(ctx, `SET statement_timeout = '15s'`); err != nil {
+			return fmt.Errorf("set statement_timeout: %w", err)
+		}
+		return nil
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -100,6 +109,13 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 	// SPEC-W32 WS-A: civic_categories + civic_routing_rules + civic_cases +
 	// civic_ref_seqs (idempotent bootstrap, RLS-enabled).
 	if err := s.ensureCivicTables(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W43 K-02: bookings idempotency index becomes tenant-scoped
+	// composite (infra init scripts own fresh installs; this bootstrap
+	// migrates existing dev DBs idempotently).
+	if err := s.ensureIdempotencyIndex(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -159,6 +175,33 @@ CREATE INDEX IF NOT EXISTS sites_tenant_idx ON sites(tenant_id);
 ALTER TABLE sites ADD COLUMN IF NOT EXISTS theme JSONB NOT NULL DEFAULT '{}';`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure sites table: %w", err)
+	}
+	return nil
+}
+
+// ensureIdempotencyIndex migrates the bookings idempotency unique index
+// from the legacy GLOBAL (idempotency_key) form to the tenant-scoped
+// composite (tenant_id, idempotency_key) required by SPEC-W43 C5/K-02. The
+// insert path stores NULL for empty keys (NULLIF), so the partial index
+// dedupes only real keys — and now only within one tenant, so two tenants
+// may legitimately reuse the same client-side key. Idempotent; a no-op when
+// the bookings table does not exist yet (init scripts create fresh installs
+// with the composite index directly). A legacy DB holding cross-tenant
+// duplicate keys fails here loudly instead of corrupting replay semantics.
+//
+// NOTE (RLS): superuser bootstrap path, intentionally outside withTenant.
+func (s *Store) ensureIdempotencyIndex(ctx context.Context) error {
+	const ddl = `
+DO $$
+BEGIN
+    IF to_regclass('public.bookings') IS NOT NULL THEN
+        DROP INDEX IF EXISTS uq_bookings_idempotency_key;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_bookings_tenant_idempotency_key
+            ON bookings (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+    END IF;
+END $$;`
+	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("ensure bookings idempotency index: %w", err)
 	}
 	return nil
 }
