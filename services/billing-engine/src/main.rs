@@ -8,6 +8,7 @@
 mod config;
 mod consumer;
 mod dunning;
+mod identity;
 mod invoices;
 mod ledger;
 mod metering;
@@ -57,6 +58,10 @@ pub struct AppState {
     pub producer: Option<FutureProducer>,
     pub http: reqwest::Client,
     pub config: Arc<config::Config>,
+    /// K1 slug -> uuid resolver (SPEC-W44 F1): binds a gateway-claimed
+    /// X-Tenant-Slugs entry to a uuid-form tenant param via identity's
+    /// GET /v1/tenants/{slug}. Fail-closed on identity errors.
+    pub identity: Arc<identity::SlugResolver>,
     /// Signalled after a transaction commits with a fresh outbox row so the
     /// relay flushes immediately instead of waiting for the poll tick.
     pub outbox_notify: Arc<tokio::sync::Notify>,
@@ -64,6 +69,13 @@ pub struct AppState {
     pub events_published: Arc<AtomicU64>,
     /// billing_events_failed_total.
     pub events_failed: Arc<AtomicU64>,
+    /// Usage events dead-lettered after bounded retries (B-04).
+    pub usage_dead_lettered: Arc<AtomicU64>,
+    /// F15-07 (/metrics): usage events handled successfully.
+    pub usage_processed: Arc<AtomicU64>,
+    /// DLQ sink for failed usage events (Kafka-backed when the producer was
+    /// created at boot, otherwise the fail-closed unavailable sink — B-04).
+    pub dlq: Arc<dyn consumer::DlqSink>,
 }
 
 async fn connect_pool(database_url: &str) -> Result<PgPool, Box<dyn std::error::Error>> {
@@ -157,7 +169,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(include_str!("../migrations/0004_outbox.sql"))
         .execute(&pool)
         .await?;
-    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox)");
+    // SPEC-W43 B-07: hardening — billing_outbox RLS (internal-role gated),
+    // REVOKE DELETE on the ledger tables from the app roles, and the
+    // invoices.period format CHECK.
+    sqlx::raw_sql(include_str!("../migrations/0005_hardening.sql"))
+        .execute(&pool)
+        .await?;
+    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox, 0005 hardening)");
 
     let internal_pool = match &cfg.internal_database_url {
         Some(dsn) => {
@@ -192,6 +210,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // B-04: DLQ sink for the usage consumer. Kafka-backed when the producer
+    // exists; otherwise the fail-closed unavailable sink (failed events are
+    // then never offset-committed and get redelivered instead of lost).
+    let dlq: Arc<dyn consumer::DlqSink> = match &producer {
+        Some(p) => Arc::new(consumer::KafkaDlqSink::new(p.clone(), cfg.dlq_topic.clone())),
+        None => Arc::new(consumer::UnavailableDlqSink),
+    };
+
     let state = AppState {
         pool,
         internal_pool,
@@ -199,9 +225,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         producer,
         http: http_client(),
         config: Arc::new(cfg.clone()),
+        identity: Arc::new(identity::SlugResolver::new(
+            http_client(),
+            &cfg.identity_base_url,
+            cfg.identity_internal_token.clone(),
+            Duration::from_secs(cfg.tenant_cache_ttl_s),
+        )),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
+        usage_dead_lettered: Arc::new(AtomicU64::new(0)),
+        usage_processed: Arc::new(AtomicU64::new(0)),
+        dlq,
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

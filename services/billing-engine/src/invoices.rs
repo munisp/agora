@@ -21,6 +21,12 @@ pub enum BillingError {
     NotFound(String),
     #[error("illegal transition {from} -> {to}")]
     IllegalTransition { from: String, to: String },
+    #[error("mixed currencies in rate cards for metric '{metric}': expected {expected}, found {found}")]
+    MixedCurrency {
+        expected: String,
+        found: String,
+        metric: String,
+    },
     #[error("database error: {0}")]
     Db(String),
 }
@@ -166,12 +172,35 @@ pub async fn generate_invoice(
 
     // Only metrics with a rate card are billed (others stay metered but free).
     let mut line_items: Vec<LineItem> = Vec::new();
-    let mut currency = "USD".to_string();
+    let mut currency: Option<String> = None;
     for row in &usage_rows {
         let metric: String = row.try_get("metric")?;
         let total: i64 = row.try_get("total")?;
         if let Some(card) = cards.iter().find(|c| c.metric == metric) {
-            currency = card.currency.clone();
+            // SPEC-W43 B-05: an invoice must be single-currency. The rate-card
+            // upsert gate (routes.rs) already rejects mixed currencies at
+            // write time, so this branch is defense in depth for rows written
+            // before the gate existed — refuse loudly instead of silently
+            // rating different metrics in different currencies and stamping
+            // the invoice with whichever card came last.
+            if let Some(existing) = &currency {
+                if *existing != card.currency {
+                    tracing::error!(
+                        expected = %existing,
+                        found = %card.currency,
+                        metric = %metric,
+                        tenant_id = %tenant_id,
+                        "refusing to generate a mixed-currency invoice"
+                    );
+                    return Err(BillingError::MixedCurrency {
+                        expected: existing.clone(),
+                        found: card.currency.clone(),
+                        metric,
+                    });
+                }
+            } else {
+                currency = Some(card.currency.clone());
+            }
             line_items.push(rate_line(
                 &metric,
                 total,
@@ -180,6 +209,7 @@ pub async fn generate_invoice(
             ));
         }
     }
+    let currency = currency.unwrap_or_else(|| "USD".to_string());
     let subtotal: i64 = line_items
         .iter()
         .fold(0i64, |acc, li| acc.saturating_add(li.amount_cents));
