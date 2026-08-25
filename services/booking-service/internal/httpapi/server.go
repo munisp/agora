@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -35,6 +36,7 @@ import (
 	"github.com/opendesk/booking-service/internal/surveys"
 	"github.com/opendesk/booking-service/internal/workforce"
 	"github.com/opendesk/booking-service/internal/workorders"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -106,6 +108,16 @@ type Deps struct {
 	// Reference wiring: /v1/leads is gated behind app_id "cac"
 	// (docs/app-developer-guide.md).
 	AppGate *appgate.Gate
+	// Health tracks background-consumer liveness for /healthz (SPEC-W43
+	// K-09): any consumer with a cleared flag turns /healthz into a 503.
+	// Nil → healthz checks the DB only (legacy behavior).
+	Health *ConsumerHealth
+	// InternalToken gates the internauth middleware (SPEC-W44 W-B/S1-F7-05,
+	// K2) on service-to-service routes (the civic sla-breach callback).
+	// BOOKING_INTERNAL_TOKEN; NO default — unset fails the guarded route
+	// closed with 503; a missing/wrong X-Internal-Token header answers 401
+	// (constant-time compare).
+	InternalToken string
 
 	// SPEC-W19 integrator (additive): the four enterprise app packages.
 	// Each Deps bundle is built in cmd/server/main.go (store + topics); the
@@ -189,6 +201,9 @@ func NewRouter(d Deps) http.Handler {
 	}
 
 	r.Get("/healthz", s.healthz)
+	// SPEC-W44 W-B: Prometheus scrape endpoint (default registry — the
+	// Go runtime + process collectors; no business metrics this wave).
+	r.Handle("/metrics", promhttp.Handler())
 
 	// Tenant-scoped management API (SPEC §8: tenant from JWT claim or
 	// X-Tenant-Slug header, validated by middleware).
@@ -287,10 +302,11 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_bookings")).Post("/routing-rules", s.createCivicRoutingRule)
 			r.With(s.require("manage_bookings")).Patch("/routing-rules/{id}", s.patchCivicRoutingRule)
 			r.With(s.require("manage_bookings")).Delete("/routing-rules/{id}", s.deleteCivicRoutingRule)
-			// Internal SLA-breach callback (SPEC-W32 WS-B → booking-service):
-			// X-Tenant-Slug only, no Permify guard — invoked via Dapr by the
-			// notification-worker's CivicSLAWorkflow.
-			r.Post("/internal/cases/{ref}/sla-breach", s.civicSLABreach)
+			// NOTE (SPEC-W44 W-B/S1-F7-05): the internal SLA-breach callback
+			// moved OUT of this tenant group into an internauth-guarded
+			// registration below (X-Internal-Token vs BOOKING_INTERNAL_TOKEN,
+			// K2 semantics) — an unauthenticated service-to-service route
+			// inside the tenant API was the audit finding.
 		})
 		// Leads + CAC (SPEC-W13 Agent A): manage_bookings for mutations,
 		// view_analytics for reads (docs/security/roles.md).
@@ -559,6 +575,13 @@ func NewRouter(d Deps) http.Handler {
 	// graph audiences. Tenant via X-Tenant-Slug middleware; internal only.
 	r.With(s.tenantMiddleware).Post("/v1/leads/resolve", s.resolveLeadPhones)
 
+	// Internal SLA-breach callback (SPEC-W32 WS-B → booking-service), invoked
+	// via Dapr by the notification-worker's CivicSLAWorkflow. SPEC-W44
+	// W-B/S1-F7-05 (K2): internauth-guarded — X-Internal-Token must match
+	// BOOKING_INTERNAL_TOKEN (constant-time; 503 fail-closed when unset, 401
+	// on missing/wrong) BEFORE the tenant middleware resolves the tenant.
+	r.With(s.internAuth, s.tenantMiddleware).Post("/v1/civic/internal/cases/{ref}/sla-breach", s.civicSLABreach)
+
 	return r
 }
 
@@ -575,6 +598,15 @@ func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "db unreachable")
 		return
 	}
+	// SPEC-W43 K-09: a fatally exited consumer fails liveness so the pod is
+	// restarted instead of silently not consuming.
+	if failed := s.d.Health.Failed(); len(failed) > 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status":           "degraded",
+			"failed_consumers": failed,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -583,7 +615,13 @@ func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
 // the token carries the tenant_slugs claim (SPEC §8).
 func (s *server) tenantMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims := parseBearerClaims(r.Header.Get("Authorization"))
+		claims, err := parseBearerClaims(r.Header.Get("Authorization"))
+		if err != nil {
+			// SPEC-W43 K-07: error-closed — a presented but undecodable
+			// token is rejected, never treated as anonymous/partial claims.
+			writeError(w, http.StatusUnauthorized, "malformed bearer token")
+			return
+		}
 
 		slug := r.Header.Get("X-Tenant-Slug")
 		if slug == "" {
@@ -621,6 +659,26 @@ func (s *server) tenantMiddleware(next http.Handler) http.Handler {
 		}
 		ctx = context.WithValue(ctx, ctxRoles, roles)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// internAuth (SPEC-W44 W-B, K2) gates service-to-service routes behind the
+// X-Internal-Token header, compared in constant time against
+// Deps.InternalToken (BOOKING_INTERNAL_TOKEN). Fail-CLOSED: an unset token
+// answers 503 (never silently open); a missing or wrong header answers 401.
+func (s *server) internAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.d.InternalToken == "" {
+			s.d.Logger.Error("internal route hit but BOOKING_INTERNAL_TOKEN is unset (fail closed)")
+			writeError(w, http.StatusServiceUnavailable, "internal token not configured")
+			return
+		}
+		tok := r.Header.Get("X-Internal-Token")
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(s.d.InternalToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid internal token")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
