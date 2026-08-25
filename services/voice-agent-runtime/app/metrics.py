@@ -238,6 +238,94 @@ def render() -> str:
     return _registry.render()
 
 
+# ---------------------------------------------------------------------------
+# W44/F15-09: Prometheus scrape endpoint for the LiveKit WORKER process.
+#
+# The control plane (app/control_plane.py) already serves /metrics on the app
+# port, but the per-call voice_* series are recorded in the worker's job
+# processes, which the control plane never sees. This stdlib HTTP server
+# (threading-based, daemon thread, no new dependency — the registry above is
+# deliberately hand-rolled) exposes the SAME registry on
+# VOICE_WORKER_METRICS_PORT (default 9464).
+#
+# Multi-process note: livekit-agents runs each job in its own process, so
+# each process accumulates its own registry. The server enables
+# SO_REUSEPORT when the platform supports it so the supervisor AND every
+# warm job process can share the port; a scrape then returns one process'
+# view (the kernel picks). That keeps the dashboards' series populated; for
+# single-series-per-call fidelity run with AGENT_IDLE_PROCESSES=0 (jobs
+# still fork per call, but the warm process handles the instrumented
+# prewarm path) or aggregate via Prometheus recording rules.
+# ---------------------------------------------------------------------------
+_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+_server_started = False
+_server_lock = threading.Lock()
+
+
+def start_http_server(port: int, host: str = "0.0.0.0") -> bool:
+    """Serve GET /metrics on ``port`` in a daemon thread.
+
+    Idempotent per process; returns False (never raises) when the port could
+    not be bound or port <= 0, so callers can fire-and-forget from both the
+    worker supervisor and job processes.
+    """
+    global _server_started
+    if port <= 0:
+        return False
+    with _server_lock:
+        if _server_started:
+            return True
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                if self.path.split("?", 1)[0] != "/metrics":
+                    self.send_error(404)
+                    return
+                body = render().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", _CONTENT_TYPE)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: Any) -> None:
+                return  # structlog owns logging; no stderr access log
+
+        class _Server(ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def server_bind(self) -> None:
+                # Let the supervisor and every job process share the scrape
+                # port where the platform supports it (Linux does).
+                import socket
+
+                if hasattr(socket, "SO_REUSEPORT"):
+                    try:
+                        self.socket.setsockopt(
+                            socket.SOL_SOCKET, socket.SO_REUSEPORT, 1
+                        )
+                    except OSError:
+                        pass
+                super().server_bind()
+
+        try:
+            server = _Server((host, port), _Handler)
+        except OSError:
+            # Port already held (another worker process bound it first
+            # without SO_REUSEPORT support, or a stale instance) — degrade.
+            return False
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="voice-worker-metrics-http",
+            daemon=True,
+        )
+        thread.start()
+        _server_started = True
+        return True
+
+
 def tts_provider_failure(provider: str) -> None:
     """SPEC-W10: one failed hop in the TTS provider fallback chain."""
     _registry.tts_provider_failures.inc(provider=provider)
