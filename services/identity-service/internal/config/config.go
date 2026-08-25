@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,6 +25,12 @@ type Config struct {
 	IdentityEventsTopic  string        // Kafka topic for identity events
 	NotificationAppID    string        // Dapr app-id of notification-worker (onboarding trigger)
 	ConsentErasureTopic  string        // Kafka topic for consent erasure CloudEvents (SPEC-W12 §4)
+	PrivacyEventsTopic   string        // Kafka topic for K4 PrivacyEraseRequested tombstones (PRIVACY_EVENTS_TOPIC)
+	InternalToken        string        // K2: X-Internal-Token gate for /internal/* (IDENTITY_INTERNAL_TOKEN; unset = fail-closed 503)
+	InternalDatabaseURL  string        // optional INTERNAL_DATABASE_URL — app_identity_internal member (RLS escape)
+	PlatformAdmins       []string      // OPENDESK_PLATFORM_ADMINS csv of platform-admin subjects (SPEC-W43 I-01)
+	TrustDirectTenancy   bool          // OPENDESK_TRUST_DIRECT_TENANT=1 — logged dev escape for gateway-less runs (K1; SPEC-W44 F4 / V2-D3)
+	ConsentRelayInterval time.Duration // consent erasure outbox relay sweep interval
 	AppsLifecycleTopic   string        // Kafka topic for app lifecycle CloudEvents (SPEC-W18 §1)
 	IndustriesDir        string        // mounted industry packs dir (INDUSTRIES_DIR, default /industries)
 	ShutdownTimeout      time.Duration // graceful shutdown budget
@@ -46,6 +53,12 @@ func Load() (Config, error) {
 		IdentityEventsTopic:  envStr("IDENTITY_EVENTS_TOPIC", "opendesk.identity.events"),
 		NotificationAppID:    envStr("NOTIFICATION_APP_ID", "notification"),
 		ConsentErasureTopic:  envStr("CONSENT_ERASURE_TOPIC", "opendesk.consent.erasure.v1"),
+		PrivacyEventsTopic:   envStr("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
+		InternalToken:        os.Getenv("IDENTITY_INTERNAL_TOKEN"),
+		InternalDatabaseURL:  os.Getenv("INTERNAL_DATABASE_URL"),
+		PlatformAdmins:       envCSV("OPENDESK_PLATFORM_ADMINS"),
+		TrustDirectTenancy:   envBool("OPENDESK_TRUST_DIRECT_TENANT"),
+		ConsentRelayInterval: time.Duration(envInt("CONSENT_OUTBOX_RELAY_INTERVAL_SECONDS", 10)) * time.Second,
 		AppsLifecycleTopic:   envStr("APPS_LIFECYCLE_TOPIC", "opendesk.apps.lifecycle.v1"),
 		IndustriesDir:        envStr("INDUSTRIES_DIR", "/industries"),
 		ShutdownTimeout:      time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 15)) * time.Second,
@@ -63,6 +76,16 @@ func envStr(key, def string) string {
 	return def
 }
 
+func envCSV(key string) []string {
+	var out []string
+	for _, p := range strings.Split(os.Getenv(key), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -70,4 +93,14 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// envBool reports whether the variable is set to a truthy value ("1"/"true",
+// case-insensitive) — the explicit dev-escape idiom (default false).
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true":
+		return true
+	}
+	return false
 }
