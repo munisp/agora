@@ -32,6 +32,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
@@ -44,6 +45,71 @@ log = get_logger(__name__)
 
 class NotFoundError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W43 Y-03/Y-06/Y-08: durable relay tables (incident_counters,
+# incident_emitted, conversation_outbox). DDL is applied at service boot by
+# Database.ensure_relay_tables() — NEVER inside a tenant-scoped transaction
+# (DATA#15: lazy CREATE inside the GUC-scoped tx mixed DDL with RLS-scoped
+# DML). Policies use the platform fail-closed NULLIF idiom + FORCE ROW LEVEL
+# SECURITY, with a role-gated internal escape via app_conversation_internal
+# when that role exists (billing 0002 pattern; the plain app login role is
+# not a member, so a missing GUC stays fail-closed).
+# ---------------------------------------------------------------------------
+
+_INCIDENT_COUNTERS_DDL = """
+CREATE TABLE IF NOT EXISTS incident_counters (
+    tenant_id UUID NOT NULL,
+    year      INTEGER NOT NULL,
+    seq       BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, year)
+)
+"""
+
+_INCIDENT_EMITTED_DDL = """
+CREATE TABLE IF NOT EXISTS incident_emitted (
+    tenant_id    UUID NOT NULL,
+    dedupe_key   TEXT NOT NULL,
+    payload      JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, dedupe_key)
+)
+"""
+
+_CONVERSATION_OUTBOX_DDL = """
+CREATE TABLE IF NOT EXISTS conversation_outbox (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL,
+    topic           TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at    TIMESTAMPTZ
+)
+"""
+
+_CONVERSATION_OUTBOX_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_conversation_outbox_unsent
+ON conversation_outbox (created_at) WHERE published_at IS NULL
+"""
+
+_INCIDENT_COUNTER_UPSERT = """
+INSERT INTO incident_counters (tenant_id, year, seq)
+VALUES ($1, $2, 1)
+ON CONFLICT (tenant_id, year)
+DO UPDATE SET seq = incident_counters.seq + 1
+RETURNING seq
+"""
+
+_INCIDENT_SELECT = """
+SELECT payload, published_at FROM incident_emitted
+WHERE tenant_id = $1 AND dedupe_key = $2
+"""
+
+_RELAY_TABLES = ("incident_counters", "incident_emitted", "conversation_outbox")
 
 
 class Database:
@@ -144,6 +210,197 @@ class Database:
                 "CHECK (channel IN ('voice','chat','phone','api','ussd')) NOT VALID"
             )
         log.info("conversation ussd channel check ensured")
+
+    # ------------------------------------------------------------------
+    # SPEC-W43 Y-03/Y-06/Y-08: durable relay tables + accessors
+    # ------------------------------------------------------------------
+
+    async def ensure_relay_tables(self) -> None:
+        """Bootstrap DDL for incident_counters / incident_emitted /
+        conversation_outbox with fail-closed RLS (SPEC-W43 Y-06).
+
+        Runs at service boot OUTSIDE any tenant-scoped transaction (the
+        previous lazy CREATE inside the tenant tx is removed). Policy:
+        tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+        with a role-gated internal escape via app_conversation_internal
+        when that role exists (billing 0002 idiom) so cross-tenant
+        maintenance jobs (unsent relay scans) can run with the internal
+        role while the plain login role stays fail-closed.
+        """
+        async with self._pool_acquire() as conn:
+            await conn.execute(_INCIDENT_COUNTERS_DDL)
+            await conn.execute(_INCIDENT_EMITTED_DDL)
+            await conn.execute(_CONVERSATION_OUTBOX_DDL)
+            await conn.execute(_CONVERSATION_OUTBOX_INDEX)
+            internal_role = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM pg_roles"
+                " WHERE rolname = 'app_conversation_internal')"
+            )
+            escape = (
+                " OR pg_has_role(current_user,"
+                " 'app_conversation_internal', 'member')"
+                if internal_role
+                else ""
+            )
+            predicate = (
+                "tenant_id = NULLIF(current_setting('app.tenant_id', true),"
+                " '')::uuid" + escape
+            )
+            for table in _RELAY_TABLES:
+                await conn.execute(
+                    f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"
+                )
+                await conn.execute(
+                    f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY"
+                )
+                await conn.execute(
+                    f"DROP POLICY IF EXISTS tenant_isolation ON {table}"
+                )
+                await conn.execute(
+                    f"CREATE POLICY tenant_isolation ON {table}"
+                    f" USING ({predicate}) WITH CHECK ({predicate})"
+                )
+        log.info(
+            "durable relay tables ensured",
+            tables=list(_RELAY_TABLES),
+            internal_role_escape=bool(internal_role),
+        )
+
+    # ------------------------------------------------------------- incidents
+
+    async def incident_emit_record(
+        self,
+        tenant_id: uuid.UUID,
+        dedupe_key: str,
+        build: Any,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Durable emission gate (SPEC-W43 Y-03): counter upsert AND the
+        incident_emitted dedupe row in ONE tenant-scoped transaction.
+
+        ``build(reference_number)`` assembles the CloudEvent payload for a
+        first-time emission. Returns (payload, state) with state in:
+          - "created":   row inserted now; payload freshly built — publish it;
+          - "retry":     row exists but published_at IS NULL (a previous
+                         publish failed) — republish the STORED payload;
+          - "duplicate": row exists and is published — emit nothing
+                         (payload is None).
+        """
+        year = datetime.now(UTC).year
+        async with self._tenant_tx(tenant_id) as conn:
+            existing = await conn.fetchrow(
+                _INCIDENT_SELECT, tenant_id, dedupe_key
+            )
+            if existing is None:
+                seq = await conn.fetchval(
+                    _INCIDENT_COUNTER_UPSERT, tenant_id, year
+                )
+                payload = build(f"INC-{year}-{int(seq):06d}")
+                inserted = await conn.fetchrow(
+                    "INSERT INTO incident_emitted (tenant_id, dedupe_key, payload)"
+                    " VALUES ($1, $2, $3::jsonb)"
+                    " ON CONFLICT (tenant_id, dedupe_key) DO NOTHING"
+                    " RETURNING payload",
+                    tenant_id,
+                    dedupe_key,
+                    json.dumps(payload),
+                )
+                if inserted is not None:
+                    return payload, "created"
+                # Lost the same-key race: the winner's row decides.
+                existing = await conn.fetchrow(
+                    _INCIDENT_SELECT, tenant_id, dedupe_key
+                )
+            if existing is None:  # pragma: no cover - defensive
+                raise RuntimeError("incident_emitted row vanished mid-tx")
+            if existing["published_at"] is not None:
+                return None, "duplicate"
+            payload = existing["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return payload, "retry"
+
+    async def incident_mark_published(
+        self, tenant_id: uuid.UUID, dedupe_key: str
+    ) -> None:
+        async with self._tenant_tx(tenant_id) as conn:
+            await conn.execute(
+                "UPDATE incident_emitted SET published_at = now()"
+                " WHERE tenant_id = $1 AND dedupe_key = $2",
+                tenant_id,
+                dedupe_key,
+            )
+
+    async def incident_unsent(
+        self, limit: int = 100
+    ) -> list[tuple[uuid.UUID, str, dict[str, Any]]]:
+        """Unpublished incident rows for the retry worker.
+
+        Cross-tenant maintenance read — same documented RLS exemption as
+        ``list_tenant_ids``: under the least-privilege app role the policy
+        fails closed (empty list); the worker needs a maintenance DSN or
+        the app_conversation_internal role to see rows.
+        """
+        async with self._pool_acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT tenant_id, dedupe_key, payload FROM incident_emitted"
+                " WHERE published_at IS NULL ORDER BY created_at LIMIT $1",
+                limit,
+            )
+        out: list[tuple[uuid.UUID, str, dict[str, Any]]] = []
+        for r in rows:
+            payload = r["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            out.append((r["tenant_id"], r["dedupe_key"], payload))
+        return out
+
+    # ---------------------------------------------------------------- outbox
+
+    async def outbox_unsent(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Due, unpublished conversation_outbox rows (backoff-aware).
+
+        Cross-tenant maintenance read — same documented exemption as
+        ``incident_unsent`` (fail-closed under the plain app role).
+        """
+        async with self._pool_acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, tenant_id, topic, payload, attempts"
+                " FROM conversation_outbox"
+                " WHERE published_at IS NULL"
+                "   AND (next_attempt_at IS NULL OR next_attempt_at <= now())"
+                " ORDER BY created_at LIMIT $1",
+                limit,
+            )
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d["payload"], str):
+                d["payload"] = json.loads(d["payload"])
+            out.append(d)
+        return out
+
+    async def outbox_mark_sent(
+        self, outbox_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> None:
+        async with self._tenant_tx(tenant_id) as conn:
+            await conn.execute(
+                "UPDATE conversation_outbox SET published_at = now()"
+                " WHERE id = $1",
+                outbox_id,
+            )
+
+    async def outbox_mark_failed(
+        self, outbox_id: uuid.UUID, tenant_id: uuid.UUID, delay_seconds: float
+    ) -> None:
+        async with self._tenant_tx(tenant_id) as conn:
+            await conn.execute(
+                "UPDATE conversation_outbox"
+                " SET attempts = attempts + 1,"
+                "     next_attempt_at = now() + make_interval(secs => $2)"
+                " WHERE id = $1",
+                outbox_id,
+                float(delay_seconds),
+            )
 
     def _pool_acquire(self) -> Any:
         assert self._pool is not None, "Database.connect() not called"
@@ -381,7 +638,8 @@ class Database:
         intent: str | None = None,
         entities: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
-    ) -> tuple[asyncpg.Record, bool]:
+        outbox: tuple[str, Any] | None = None,
+    ) -> tuple[asyncpg.Record, bool, uuid.UUID | None]:
         """Append a turn with seq = max(seq)+1, atomically per conversation.
 
         Returns (row, created). The (conversation_id, seq) UNIQUE constraint
@@ -393,6 +651,13 @@ class Database:
         (same conversation + key) returns the ORIGINAL turn with
         created=False instead of inserting a duplicate; the unique partial
         index uq_turns_idempotency_key decides concurrent same-key races.
+
+        SPEC-W43 Y-08: ``outbox=(topic, builder)`` writes a
+        conversation_outbox row (payload = builder(turn_row)) in the SAME
+        transaction as the turn insert, so the Dapr publish can never be
+        lost by a crash between commit and publish; the OutboxRelay
+        republishes until sent. Returns (row, created, outbox_id) —
+        outbox_id is None for idempotency replays and outbox-less calls.
         """
         async with self._tenant_tx(tenant_id) as conn:
             # serialize concurrent turn appends for this conversation
@@ -407,7 +672,7 @@ class Database:
                     idempotency_key,
                 )
                 if existing is not None:
-                    return existing, False
+                    return existing, False, None
             try:
                 row = await conn.fetchrow(
                     """
@@ -442,10 +707,20 @@ class Database:
                 )
                 if row is None:
                     raise
-                return row, False
+                return row, False, None
             if row is None:  # INSERT ... SELECT with bad FK raises instead
                 raise NotFoundError(f"conversation {conversation_id} not found")
-            return row, True
+            outbox_id: uuid.UUID | None = None
+            if outbox is not None:
+                topic, builder = outbox
+                outbox_id = await conn.fetchval(
+                    "INSERT INTO conversation_outbox (tenant_id, topic, payload)"
+                    " VALUES ($1, $2, $3::jsonb) RETURNING id",
+                    tenant_id,
+                    topic,
+                    json.dumps(builder(row)),
+                )
+            return row, True, outbox_id
 
     async def list_turns(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID

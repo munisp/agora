@@ -31,6 +31,10 @@ class Config:
     # identity-service via Dapr service invocation, TTL-cached like
     # booking-service / analytics-pipeline.
     identity_app_id: str = "identity"
+    # SPEC-W44 K2: X-Internal-Token sent on the identity tenant lookup
+    # (IDENTITY_INTERNAL_TOKEN); identity 503s its /internal/* + gates
+    # tenant-scoped reads when the token env is unset server-side.
+    identity_internal_token: str = ""
     tenant_cache_ttl_seconds: float = 300.0
 
     # Raw transcript sink (SPEC §5). "kafka" (aiokafka fallback) or "fluvio".
@@ -88,6 +92,26 @@ class Config:
     incident_min_score: float = 0.6
     incidents_topic: str = "opendesk.incidents"
 
+    # SPEC-W43 C1: gateway tenant binding. Tenant context is taken ONLY
+    # from the gateway-injected X-Tenant-Slugs header (validated JWT claim
+    # projection); explicit ?tenant=/body tenant params must exactly match
+    # one of its entries (else 403). OPENDESK_TRUST_DIRECT_TENANT=1 is the
+    # standalone-dev escape restoring legacy direct ?tenant=/X-Tenant-ID
+    # selection — OFF by default, never set in compose.
+    trust_direct_tenant: bool = False
+
+    # SPEC-W43 Y-03: durable incident emission — incident_emitted rows whose
+    # Dapr publish failed are republished by this background loop (never
+    # silent).
+    incident_retry_seconds: float = 30.0
+
+    # SPEC-W43 Y-08: conversation_outbox relay — one outbox row per created
+    # turn written in the SAME tx as the turn insert; a background relay
+    # publishes with backoff and marks rows sent.
+    outbox_relay_enabled: bool = True
+    outbox_relay_seconds: float = 5.0
+    outbox_relay_batch: int = 100
+
     # USSD inbound (SPEC-W12 contract §1/§2): synchronous hook at
     # POST /v1/ussd/turns invoked by messaging-gateway via Dapr.
     # ussd_text_mode_reply is the acknowledgement returned in pass-through
@@ -128,6 +152,7 @@ def load() -> Config:
         dapr_http_port=int(_env("DAPR_HTTP_PORT", "3500")),
         dapr_pubsub_name=_env("DAPR_PUBSUB_NAME", "pubsub-kafka"),
         identity_app_id=_env("IDENTITY_APP_ID", "identity"),
+        identity_internal_token=_env("IDENTITY_INTERNAL_TOKEN", ""),
         tenant_cache_ttl_seconds=float(_env("TENANT_CACHE_TTL_SECONDS", "300")),
         transcripts_topic=_env("TRANSCRIPTS_TOPIC", "opendesk.conversation.transcripts"),
         transcript_sink=_env("TRANSCRIPT_SINK", "kafka").lower(),
@@ -169,6 +194,12 @@ def load() -> Config:
         incident_enabled=_env("INCIDENT_ENABLED", "true").lower() == "true",
         incident_min_score=float(_env("INCIDENT_MIN_SCORE", "0.6")),
         incidents_topic=_env("INCIDENTS_TOPIC", "opendesk.incidents"),
+        trust_direct_tenant=_env("OPENDESK_TRUST_DIRECT_TENANT", "off").lower()
+        in ("1", "on", "true", "yes"),
+        incident_retry_seconds=float(_env("INCIDENT_RETRY_SECONDS", "30")),
+        outbox_relay_enabled=_env("OUTBOX_RELAY_ENABLED", "true").lower() == "true",
+        outbox_relay_seconds=float(_env("OUTBOX_RELAY_SECONDS", "5")),
+        outbox_relay_batch=int(_env("OUTBOX_RELAY_BATCH", "100")),
         ussd_enabled=_env("USSD_ENABLED", "true").lower() == "true",
         ussd_text_mode_reply=_env(
             "USSD_TEXT_MODE_REPLY",

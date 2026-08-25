@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/geo"
@@ -52,6 +53,43 @@ func Dial(hostPort, namespace, taskQueue string) (*Client, error) {
 		return nil, fmt.Errorf("dial temporal: %w", err)
 	}
 	return &Client{tc: tc, taskQueue: taskQueue}, nil
+}
+
+// DialWithRetry connects with exponential backoff between attempts
+// (SPEC-W43 K-08): a Temporal pod that is briefly slower to come up than
+// booking-service must not permanently disable saga starts (the service
+// boots degraded otherwise and needs the pending-booking sweeper to recover
+// every booking created meanwhile). attempts <= 0 means 1 (no retry);
+// backoff starts at base and doubles per attempt, capped at 10s. A nil
+// client with the last error is returned after the attempts are exhausted.
+func DialWithRetry(ctx context.Context, hostPort, namespace, taskQueue string, attempts int, base time.Duration) (*Client, error) {
+	if attempts <= 0 {
+		attempts = 1
+	}
+	if base <= 0 {
+		base = time.Second
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		c, err := Dial(hostPort, namespace, taskQueue)
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+		if i == attempts-1 {
+			break
+		}
+		wait := base << i
+		if wait > 10*time.Second {
+			wait = 10 * time.Second
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dial temporal: %w (last error: %v)", ctx.Err(), lastErr)
+		case <-time.After(wait):
+		}
+	}
+	return nil, lastErr
 }
 
 // Close releases the underlying connection.

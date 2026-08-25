@@ -37,12 +37,13 @@ class DaprClient:
         method: str,
         *,
         params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         """GET-invoke `method` on `app_id` via the sidecar (service
         invocation building block). Raises DaprError on non-2xx so callers
         can map 404 vs outage (mirrors analytics-pipeline's client)."""
         url = f"{self._base}/v1.0/invoke/{app_id}/method/{method.lstrip('/')}"
-        resp = await self._client.get(url, params=params)
+        resp = await self._client.get(url, params=params, headers=headers)
         if resp.status_code >= 400:
             raise DaprError(
                 f"invoke {app_id}/{method}: {resp.status_code} {resp.text[:400]}",

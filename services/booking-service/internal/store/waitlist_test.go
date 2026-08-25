@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_bookings_idempotency_key ON bookings (idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bookings_tenant_idempotency_key ON bookings (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS outbox (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     aggregate_id UUID NOT NULL,
@@ -229,7 +229,7 @@ func TestClaimWaitlistTxRejectsBadTokenAndTakenSlot(t *testing.T) {
 	// on the availability re-check.
 	existing := claimBooking(tenantID, offeringID, memberID, contact.ID, startsAt)
 	existing.IdempotencyKey = "regular"
-	if err := st.CreateBookingTx(ctx, existing, "t", []byte(`{}`)); err != nil {
+	if err := st.CreateBookingTx(ctx, existing, SlotGuard{}, "t", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
 	b2 := claimBooking(tenantID, offeringID, memberID, contact.ID, startsAt)
