@@ -23,6 +23,9 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 thiserror = "1"
+# SPEC-W43 P-01 (contract C3): durable payout_attempts store in Postgres.
+# Runtime queries only (no sqlx macros), so no compile-time DATABASE_URL.
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 # Gated behind `tb-live`; the community-published official Rust client for
 # TigerBeetle. Only used when LEDGER_IMPL=tigerbeetle and built with --features tb-live.
 # Pin note (SPEC-W42 R1): 0.8.0+0.16.28 speaks the TigerBeetle 0.16.28 wire

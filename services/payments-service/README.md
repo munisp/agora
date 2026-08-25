@@ -5,7 +5,23 @@ double-entry against a TigerBeetle-compatible `LedgerClient` trait
 (ADR-0007 fallback: default build ships an in-memory sim ledger).
 
 - Port: **7004** (SPEC §3). Dapr sidecar expected at `daprd-payments:3500`.
-- Stack: Rust 2021, axum 0.7, tokio, reqwest (no sqlx — payments is ledger-centric).
+- Stack: Rust 2021, axum 0.7, tokio, reqwest; sqlx (Postgres) only for the durable
+  `payout_attempts` reconciliation table (P-01/C3) — the ledger stays the source of truth.
+- **NGN-only** (P-13): holds and payouts with `currency != "NGN"` are rejected with
+  400 until multi-currency lands.
+- **Auth (P-09, contract C1)**: tenant-scoped routes accept either a valid
+  `X-Internal-Token` (constant-time compare against `PAYMENTS_INTERNAL_TOKEN`)
+  or the gateway-injected `X-Tenant-Slugs` header whose list must contain the
+  request's `tenant_id` (else 403). `/activities/*` and `/v1/internal/*`
+  require the internal token. With no token configured, no gateway header and
+  no dev escape, money routes fail closed with 503.
+  `OPENDESK_TRUST_DIRECT_TENANT=1` is the documented dev escape (standalone,
+  no gateway) — never set it in compose/production.
+- **Idempotency (P-12, C5)**: money-moving endpoints (`/v1/deposits`,
+  `/v1/refunds`, `/v1/no-show-fee`, `/v1/payouts`,
+  `/v1/payments/flutterwave/initialize`) REQUIRE a non-empty `idempotency_key`
+  (400 when absent). Capture is idempotent by construction (transfer id
+  derived from the deposit id).
 
 ## Ledger model (SPEC §9)
 
@@ -34,17 +50,20 @@ is **mandatory** — the service refuses to start when it is unset/unknown
 | Method | Path | Body | Notes |
 |---|---|---|---|
 | GET | `/healthz` | — | liveness |
-| POST | `/v1/deposits` | `{tenant_id, booking_id?, amount_cents, currency?, idempotency_key?}` | hold (code 100) |
-| POST | `/v1/deposits/{id}/capture` | `{tenant_id, amount_cents?}` | capture (101), full when amount omitted |
-| POST | `/v1/refunds` | `{tenant_id, deposit_id?, amount_cents, reason?, idempotency_key?}` | void pending hold or post-capture refund (102) |
-| POST | `/v1/no-show-fee` | `{tenant_id, deposit_id, amount_cents, booking_id?}` | charge fee from hold (103) |
-| GET | `/v1/accounts/{tenant_id}/balance` | — | account snapshots |
-| POST | `/v1/payouts` | `{tenant_id, amount_cents, currency, payee:{party_id_type, party_identifier}, idempotency_key?}` | Mojaloop quote→transfer, then ledger payout (104) |
-| POST | `/activities/hold-deposit` | `{tenant_id, booking_id, amount_cents, currency?}` | Temporal `HoldDeposit` activity (SPEC §6) |
-| POST | `/activities/void-hold` | `{tenant_id, deposit_id? \| booking_id?}` | Temporal `VoidHold` compensation |
+| POST | `/v1/deposits` | `{tenant_id, booking_id?, amount_cents, currency?, idempotency_key}` | hold (code 100); key REQUIRED; auto-provisions tenant accounts (P-10) |
+| POST | `/v1/deposits/{id}/capture` | `{tenant_id, amount_cents?}` | capture (101), full when amount omitted (resolved via hold lookup, C4) |
+| POST | `/v1/refunds` | `{tenant_id, deposit_id?, amount_cents, reason?, idempotency_key}` | void pending hold or post-capture refund (102); key REQUIRED; `amount_cents` on a pending hold must be 0 or the exact hold amount (P-11: partial => 400, never a silent full void) |
+| POST | `/v1/no-show-fee` | `{tenant_id, deposit_id, amount_cents, booking_id?, idempotency_key}` | charge fee from hold (103); key REQUIRED |
+| GET | `/v1/accounts/{tenant_id}/balance` | — | account snapshots (tenant-bound, P-09) |
+| POST | `/v1/payouts` | `{tenant_id, amount_cents, currency, payee:{party_id_type, party_identifier}, idempotency_key}` | ledger-first two-phase payout (104): pending hold → rail → post/void (P-01/C3); key REQUIRED |
+| POST | `/v1/internal/accounts/provision` | `{tenant_id}` | explicit idempotent account provisioning (internal token, P-10) |
+| POST | `/activities/hold-deposit` | `{tenant_id, booking_id, amount_cents, currency?}` | Temporal `HoldDeposit` activity (SPEC §6); internal token |
+| POST | `/activities/void-hold` | `{tenant_id, deposit_id? \| booking_id?}` | Temporal `VoidHold` compensation; internal token |
 
-Idempotency: pass `idempotency_key`; without one, ids are derived
-deterministically from `booking_id` / `deposit_id` so retries are safe.
+Idempotency: money-moving endpoints REQUIRE an explicit `idempotency_key`
+(P-12/C5); transfer ids are derived deterministically from it, so retries are
+safe. Temporal activity endpoints keep saga-deterministic ids and are
+internal-token gated.
 
 ## Events & commands
 
@@ -61,9 +80,22 @@ deterministically from `booking_id` / `deposit_id` so retries are safe.
 
 `src/mojaloop.rs`: FSPIOP-style `POST {MOJALOOP_ENDPOINT}/quotes` then
 `POST {MOJALOOP_ENDPOINT}/transfers` (mojaloop-simulator compatible, FSPIOP
-headers included). Payout ordering: rail first (deterministic `transferId`
-from idempotency key), then ledger transfer; a ledger failure after a
-committed rail transfer is logged CRITICAL for operator reconciliation.
+headers included). Payout ordering is **ledger-first** (P-01, contract C3):
+1. a PENDING payout transfer (`revenue → platform:payouts`) reserves the funds
+   — an over-limit payout is rejected here with NO rail side effect;
+2. the rail executes; ONLY an explicit `COMMITTED` from a well-formed response
+   posts the payout (decode failure / missing state / `RECEIVED` / transport
+   error after the transfer was sent are UNKNOWN — never defaulted to
+   COMMITTED). The quote echo (amount + currency) is verified before the
+   transfer is sent (P-08);
+3. on rail failure/unknown the pending transfer is voided and a durable
+   `payout_attempts` row is recorded (Postgres `payout_attempts` table,
+   bootstrapped at startup; in-memory fallback only when no DSN is
+   configured). A background reconciler
+   (`PAYOUT_RECONCILER_INTERVAL_SECS`, default 30s) sweeps unknown rows,
+   re-queries the rail (`GET /transfers/{id}`) and settles or fails them.
+   A ledger post failure after a committed rail transfer is logged CRITICAL
+   and swept by the reconciler.
 
 ## Env vars
 
@@ -74,7 +106,6 @@ committed rail transfer is logged CRITICAL for operator reconciliation.
 | `LEDGER_IMPL` | — (required; GF11) | `sim` \| `tigerbeetle` (latter needs `--features tb-live`); startup fails when unset |
 | `TB_ADDRESSES` | `tigerbeetle:3000` | TigerBeetle replica addresses |
 | `TB_CLUSTER_ID` | `0` | TigerBeetle cluster id (SPEC §9: cluster 0) |
-| `PLATFORM_FEE_BPS` | `250` | platform fee in basis points on capture/no-show |
 | `KAFKA_BROKERS` | `kafka:9092` | Kafka bootstrap servers |
 | `KAFKA_GROUP_ID` | `payments-service` | consumer group |
 | `PAYMENTS_COMMANDS_TOPIC` | `opendesk.payments.commands` | commands topic |
@@ -86,6 +117,11 @@ committed rail transfer is logged CRITICAL for operator reconciliation.
 | `PAYMENTS_EVENTS_TOPIC` | `opendesk.payments.events` | events topic |
 | `MOJALOOP_ENDPOINT` | — (required unless sim opted in; SIM-003) | real Mojaloop rail base URL; startup fails closed when unset and `MOJALOOP_ALLOW_SIM` is not `true` |
 | `MOJALOOP_ALLOW_SIM` | `false` | dev/CI opt-in: allow the payout rail to target the mojaloop-simulator (`http://mojaloop:8444` default) |
+| `PLATFORM_FEE_BPS` | `250` | platform fee bps on capture/no-show; validated 0..=10000 at boot (P-05), checked arithmetic (overflow => 422) |
+| `PAYMENTS_INTERNAL_TOKEN` | — (unset) | shared secret for `X-Internal-Token` (P-09/C1); unset + no gateway header + no dev escape => money routes fail closed 503 |
+| `OPENDESK_TRUST_DIRECT_TENANT` | `false` | C1 dev escape: accept tenant context from request bodies without a gateway header; never set in production |
+| `PAYMENTS_DATABASE_URL` | — (falls back to `DATABASE_URL`, then `PG_DSN`) | Postgres DSN for the durable `payout_attempts` table (P-01/C3); bootstrapped at boot, fail-closed when configured but unreachable; in-memory dev fallback when unset |
+| `PAYOUT_RECONCILER_INTERVAL_SECS` | `30` | reconciler sweep interval for unknown payout rail outcomes |
 
 ## Run
 
