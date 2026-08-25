@@ -112,8 +112,63 @@ impl FlutterwaveAdapter {
         }
     }
 
+    /// Explicit constructor (tests / non-env wiring).
+    pub fn with_credentials(
+        base_url: &str,
+        secret_key: &str,
+        secret_hash: Option<&str>,
+        redirect_url: Option<String>,
+    ) -> Self {
+        Self {
+            http: crate::http_client(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            secret_key: secret_key.to_string(),
+            secret_hash: secret_hash.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+            redirect_url,
+        }
+    }
+
     fn verif_hash(&self) -> Option<&str> {
         self.secret_hash.as_deref()
+    }
+
+    /// P-04 (contract C4): verify a charge server-side
+    /// (`GET /transactions/{id}/verify`) before capturing. Only the VERIFIED
+    /// charged amount may capture a hold; the webhook never trusts the
+    /// payload's own amount.
+    pub async fn verify_transaction(
+        &self,
+        id: u64,
+    ) -> Result<FwVerifiedTransaction, FlutterwaveError> {
+        if self.secret_key.is_empty() {
+            return Err(FlutterwaveError::Rejected(
+                "FLUTTERWAVE_SECRET_KEY is not configured".to_string(),
+            ));
+        }
+        let url = format!("{}/transactions/{}/verify", self.base_url, id);
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.secret_key)
+            .send()
+            .await
+            .map_err(FlutterwaveError::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(FlutterwaveError::Rejected(format!(
+                "verify transaction {id} failed: {status}: {body}"
+            )));
+        }
+        let body: FwVerifyResponse = resp.json().await.map_err(FlutterwaveError::Http)?;
+        if body.status != "success" {
+            return Err(FlutterwaveError::Rejected(format!(
+                "verify transaction {id}: status={} {}",
+                body.status,
+                body.message.unwrap_or_default()
+            )));
+        }
+        Ok(body.data)
     }
 
     /// ASSUMPTION-shaped v3 standard-checkout initialize:
@@ -193,6 +248,25 @@ struct FwInitializeData {
     link: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FwVerifyResponse {
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+    data: FwVerifiedTransaction,
+}
+
+/// Server-side verified charge facts (P-04).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FwVerifiedTransaction {
+    pub id: u64,
+    pub tx_ref: String,
+    /// Major units (v3 verify returns a number).
+    pub amount: f64,
+    pub currency: String,
+    pub status: String,
+}
+
 /// Minor units -> exact major-unit decimal string (mojaloop.rs idiom).
 fn minor_to_decimal(amount_cents: u64) -> String {
     format!("{}.{:02}", amount_cents / 100, amount_cents % 100)
@@ -232,6 +306,10 @@ fn map_ledger_error(e: LedgerError) -> Response {
         LedgerError::ExistsWithDifferentParameters(_)
         | LedgerError::NotPending(_)
         | LedgerError::AlreadyResolved(_) => StatusCode::CONFLICT,
+        // P-11: partial refund amount against a pending hold => 400.
+        LedgerError::AmountMismatch(_) => StatusCode::BAD_REQUEST,
+        // P-06: cross-tenant money operations => 403.
+        LedgerError::TenantMismatch(_) => StatusCode::FORBIDDEN,
         LedgerError::ExceedsPendingAmount
         | LedgerError::InvalidAmount
         | LedgerError::ExceedsCredits(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -255,12 +333,29 @@ pub struct InitializeBody {
     pub redirect_url: Option<String>,
 }
 
-async fn initialize(State(st): State<AppState>, Json(body): Json<InitializeBody>) -> Response {
+async fn initialize(State(st): State<AppState>, headers: HeaderMap, Json(body): Json<InitializeBody>) -> Response {
+    // P-09 (C1): tenant-scoped auth (internal token or gateway binding).
+    if let Err(r) = st.auth.authorize_tenant(&headers, &body.tenant_id) {
+        return err_json(r.status(), r.message());
+    }
+    // SPEC-W44 K6 (V1): initialize moves money (it posts a deposit hold), so
+    // it is role-gated exactly like routes.rs `require_money_mutation` gates
+    // deposits — tenant binding alone never authorizes a money mutation.
+    if let Err(r) = st.auth.require_money_role(&headers) {
+        return err_json(r.status(), r.message());
+    }
     if body.amount_cents == 0 {
         return err_json(StatusCode::BAD_REQUEST, "amount_cents must be > 0");
     }
-    if body.currency.is_empty() {
-        return err_json(StatusCode::BAD_REQUEST, "currency is required");
+    // P-13: NGN-only until multi-currency lands.
+    if body.currency != "NGN" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported currency '{}': payments are NGN-only until multi-currency lands",
+                body.currency
+            ),
+        );
     }
     if body.email.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "email is required (flutterwave customer)");
@@ -272,19 +367,34 @@ async fn initialize(State(st): State<AppState>, Json(body): Json<InitializeBody>
         );
     }
 
+    // P-12 (C5): money-moving endpoints REQUIRE an explicit, non-empty
+    // idempotency key (400 when absent).
+    let key = match body
+        .idempotency_key
+        .as_ref()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+    {
+        Some(k) => k.to_string(),
+        None => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "idempotency_key is required on money-moving endpoints",
+            )
+        }
+    };
     // Deterministic hold id => initialize retries are idempotent end-to-end
     // (transfer_id_from_key idiom from routes.rs hold_deposit).
-    let key = body.idempotency_key.clone().or_else(|| {
-        body.booking_id
-            .as_ref()
-            .map(|b| format!("fw-hold:{b}"))
-    });
-    let hold_id = transfer_id_from_key(key.as_deref());
+    let hold_id = transfer_id_from_key(Some(&key));
     let tx_ref = make_tx_ref(hold_id);
 
     // 1. Ledger hold first (code 100): the webhook capture is then a pure,
-    //    idempotent ledger op. Rail-first ordering used by payouts does not
-    //    apply here — the "rail" commit IS the webhook, not the initialize.
+    //    idempotent ledger op. The rail commit IS the webhook, not the
+    //    initialize call, so ledger-first applies here too. P-10: tenant
+    //    accounts are auto-provisioned on first hold (idempotent, exists-ok).
+    if let Err(e) = st.ledger.create_accounts(&body.tenant_id).await {
+        return map_ledger_error(e);
+    }
     let hold = match st
         .ledger
         .hold_deposit(&body.tenant_id, hold_id, body.amount_cents)
@@ -419,14 +529,84 @@ async fn webhook(
         }
     };
 
-    // Capture the full hold (code 101). Deterministic capture id => webhook
-    // replays are idempotent; an already-captured hold is a 200 replay, not
-    // an error (paystack_webhook "already_paid" idiom).
+    // P-04 (contract C4): verify the charge server-side BEFORE capturing.
+    // Only the VERIFIED charged amount may capture, and it must equal the
+    // hold amount — a mismatch is a 409 with NO state change (previously the
+    // payload's own amount was only logged post-hoc).
+    let hold = match st.ledger.get_transfer(hold_id).await {
+        Ok(t) => t,
+        Err(LedgerError::TransferNotFound(_)) => {
+            // Reference shaped like ours but unknown to the ledger; ack.
+            tracing::warn!(tx_ref, "flutterwave webhook: hold not found");
+            return Json(serde_json::json!({ "status": "ignored" })).into_response();
+        }
+        Err(e) => return map_ledger_error(e),
+    };
+    let fw_id = match data.get("id").and_then(|v| v.as_u64()) {
+        Some(id) => id,
+        None => {
+            // Without the transaction id we cannot verify; retryable 502,
+            // NO state change (Flutterwave re-delivers the webhook).
+            return err_json(
+                StatusCode::BAD_GATEWAY,
+                "flutterwave webhook: missing data.id; cannot verify before capture",
+            );
+        }
+    };
+    let verified = match st.flutterwave.verify_transaction(fw_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Verification unavailable/failed: NO state change; retryable.
+            return err_json(
+                StatusCode::BAD_GATEWAY,
+                format!("flutterwave verification failed: {e}"),
+            );
+        }
+    };
+    if verified.tx_ref != tx_ref {
+        return err_json(
+            StatusCode::CONFLICT,
+            format!(
+                "verified tx_ref {} does not match webhook tx_ref {tx_ref}",
+                verified.tx_ref
+            ),
+        );
+    }
+    if verified.status != "successful" {
+        return Json(
+            serde_json::json!({ "status": "ignored", "verified_status": verified.status }),
+        )
+        .into_response();
+    }
+    let charged_cents = (verified.amount * 100.0).round() as u64;
+    if charged_cents != hold.amount {
+        tracing::warn!(
+            tx_ref,
+            charged_cents,
+            hold_cents = hold.amount,
+            "flutterwave verify/hold amount mismatch; refusing capture"
+        );
+        return err_json(
+            StatusCode::CONFLICT,
+            format!(
+                "charged amount {charged_cents} does not match hold amount {}",
+                hold.amount
+            ),
+        );
+    }
+
+    // Capture the full hold (code 101) for the VERIFIED amount. Deterministic
+    // capture id => webhook replays are idempotent; an already-captured hold
+    // is a 200 replay, not an error (paystack_webhook "already_paid" idiom).
     let capture_id = Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!("fw-capture:{tx_ref}").as_bytes(),
     );
-    let result = match st.ledger.capture(&tenant_id, hold_id, capture_id, None).await {
+    let result = match st
+        .ledger
+        .capture(&tenant_id, hold_id, capture_id, Some(charged_cents))
+        .await
+    {
         Ok(r) => r,
         Err(LedgerError::AlreadyResolved(_)) => {
             return Json(serde_json::json!({ "status": "already_captured" })).into_response();
@@ -438,21 +618,6 @@ async fn webhook(
         }
         Err(e) => return map_ledger_error(e),
     };
-
-    // Sanity: the charged amount should equal the captured hold. We never
-    // block the capture on a mismatch (money already moved on the rail) —
-    // alert via logs for reconciliation instead.
-    if let Some(charged) = data.get("amount").and_then(|v| v.as_f64()) {
-        let charged_cents = (charged * 100.0).round() as u64;
-        if charged_cents != result.post.amount {
-            tracing::warn!(
-                tx_ref,
-                charged_cents,
-                captured_cents = result.post.amount,
-                "flutterwave webhook: charged/captured amount mismatch"
-            );
-        }
-    }
 
     st.publish_event(
         "FlutterwavePaymentCaptured",
@@ -588,7 +753,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
-    fn test_state(secret_hash: Option<&str>) -> AppState {
+    fn test_state(secret_hash: Option<&str>, fw_base_url: &str) -> AppState {
         let cfg = Config {
             port: 0,
             ledger_impl: "sim".to_string(),
@@ -606,6 +771,11 @@ mod tests {
             mojaloop_endpoint: "http://127.0.0.1:1".to_string(),
             mojaloop_allow_sim: false,
             platform_fee_bps: 0,
+            internal_token: None,
+            trust_direct_tenant: true,
+            database_url: None,
+            payout_reconciler_interval_secs: 30,
+            money_roles: vec!["owner".to_string(), "admin".to_string()],
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -615,18 +785,29 @@ mod tests {
                 "opendesk.payments.events".to_string(),
             ),
             mojaloop: MojaloopAdapter::new("http://127.0.0.1:1".to_string()),
-            flutterwave: FlutterwaveAdapter {
-                http: crate::http_client(),
-                base_url: "http://127.0.0.1:1".to_string(),
-                secret_key: "sk_test".to_string(),
-                secret_hash: secret_hash.map(|s| s.to_string()),
-                redirect_url: None,
-            },
+            flutterwave: FlutterwaveAdapter::with_credentials(
+                fw_base_url,
+                "sk_test",
+                secret_hash,
+                None,
+            ),
             config: Arc::new(cfg),
             dlq: Arc::new(UnavailableDlqSink),
+            auth: crate::auth::AuthConfig::new(
+                None,
+                true,
+                vec!["owner".to_string(), "admin".to_string()],
+            ),
+            payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
+            registry: Arc::new(crate::registry::MemRegistry::default()),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),
+            commands_processed: Arc::new(AtomicU64::new(0)),
+            payouts_attempted: Arc::new(AtomicU64::new(0)),
+            payouts_committed: Arc::new(AtomicU64::new(0)),
+            payouts_failed: Arc::new(AtomicU64::new(0)),
+            payouts_unknown: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -653,9 +834,45 @@ mod tests {
             .expect("seed hold");
     }
 
+    /// Stub Flutterwave v3 verify endpoint: GET /transactions/:id/verify
+    /// returns a fixed verified charge (P-04 handler tests).
+    async fn spawn_verify_stub(tx_ref: String, amount: f64, id: u64) -> String {
+        #[derive(Clone)]
+        struct Stub {
+            tx_ref: String,
+            amount: f64,
+            id: u64,
+        }
+        async fn handler(
+            axum::extract::State(s): axum::extract::State<Stub>,
+            axum::extract::Path(_id): axum::extract::Path<u64>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "status": "success",
+                "message": "Transaction fetched successfully",
+                "data": {
+                    "id": s.id,
+                    "tx_ref": s.tx_ref,
+                    "amount": s.amount,
+                    "currency": "NGN",
+                    "status": "successful"
+                }
+            }))
+        }
+        let app = Router::new()
+            .route("/transactions/:id/verify", axum::routing::get(handler))
+            .with_state(Stub { tx_ref, amount, id });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn webhook_missing_verif_hash_is_401_and_no_state_change() {
-        let st = test_state(Some("s3cret"));
+        let st = test_state(Some("s3cret"), "http://127.0.0.1:1");
         let hold_id = Uuid::new_v4();
         seed_hold(&st, hold_id, 1_200).await;
         let resp = webhook(
@@ -678,7 +895,7 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_invalid_verif_hash_is_401_and_no_state_change() {
-        let st = test_state(Some("s3cret"));
+        let st = test_state(Some("s3cret"), "http://127.0.0.1:1");
         let hold_id = Uuid::new_v4();
         seed_hold(&st, hold_id, 1_200).await;
         let mut headers = HeaderMap::new();
@@ -697,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_without_configured_hash_is_503_fail_closed() {
-        let st = test_state(None);
+        let st = test_state(None, "http://127.0.0.1:1");
         let hold_id = Uuid::new_v4();
         seed_hold(&st, hold_id, 1_200).await;
         let mut headers = HeaderMap::new();
@@ -708,8 +925,10 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_valid_hash_captures_once_and_replay_is_idempotent() {
-        let st = test_state(Some("s3cret"));
         let hold_id = Uuid::new_v4();
+        // P-04: the stub rail verifies the charge at exactly the hold amount.
+        let base = spawn_verify_stub(make_tx_ref(hold_id), 12.0, 123).await;
+        let st = test_state(Some("s3cret"), &base);
         seed_hold(&st, hold_id, 1_200).await;
         let mut headers = HeaderMap::new();
         headers.insert("verif-hash", "s3cret".parse().unwrap());
@@ -728,5 +947,71 @@ mod tests {
             .map(|a| a.posted_net)
             .unwrap_or(0);
         assert_eq!(revenue, 1_200, "duplicate webhook must not double-apply");
+    }
+
+    /// P-04: verified charged amount != hold amount => 409, NO state change.
+    #[tokio::test]
+    async fn webhook_amount_mismatch_is_409_and_no_state_change() {
+        let hold_id = Uuid::new_v4();
+        // Rail verifies only 10.00 while the hold is 12.00.
+        let base = spawn_verify_stub(make_tx_ref(hold_id), 10.0, 123).await;
+        let st = test_state(Some("s3cret"), &base);
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+
+        let resp = webhook(State(st.clone()), headers.clone(), webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // Hold still pending; nothing captured.
+        let bal = st.ledger.balance("t-1").await.unwrap();
+        let revenue = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0);
+        assert_eq!(revenue, 0, "mismatch must not move money");
+        let deposits = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":deposits"))
+            .unwrap();
+        assert_eq!(deposits.pending_net, 1_200, "hold still pending");
+
+        // A corrected delivery (matching amount) still captures afterwards.
+        let base2 = spawn_verify_stub(make_tx_ref(hold_id), 12.0, 123).await;
+        let st2 = test_state(Some("s3cret"), &base2);
+        seed_hold(&st2, hold_id, 1_200).await;
+        let resp = webhook(State(st2.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bal = st2.ledger.balance("t-1").await.unwrap();
+        let revenue = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0);
+        assert_eq!(revenue, 1_200);
+    }
+
+    /// P-04: when verification is unavailable the webhook is a retryable 502
+    /// with NO state change.
+    #[tokio::test]
+    async fn webhook_verify_unavailable_is_502_and_no_state_change() {
+        let st = test_state(Some("s3cret"), "http://127.0.0.1:1"); // unreachable
+        let hold_id = Uuid::new_v4();
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bal = st.ledger.balance("t-1").await.unwrap();
+        let revenue = bal
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0);
+        assert_eq!(revenue, 0, "unverifiable charge must not move money");
     }
 }
