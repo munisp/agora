@@ -53,6 +53,13 @@ func (s *server) activityReserveSlot(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	if booking.Status == store.StatusCancelled {
+		// SPEC-W43 K-06: a cancelled booking holds NO slot — the saga must
+		// see reserved:false (and compensate) instead of an idempotent
+		// "reserved" success that would confirm a dead booking.
+		writeJSON(w, http.StatusOK, map[string]any{"reserved": false, "status": booking.Status})
+		return
+	}
 	if booking.Status != store.StatusPending {
 		// already processed — idempotent success
 		writeJSON(w, http.StatusOK, map[string]any{"reserved": true, "status": booking.Status})
@@ -127,8 +134,13 @@ func (s *server) activityMarkNoShow(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	if booking.Status == store.StatusNoShow {
-		writeJSON(w, http.StatusOK, map[string]any{"no_show": true, "status": booking.Status})
+	// SPEC-W43 K-06: terminal states are rejected, never flipped to no_show
+	// (a cancelled/completed booking cannot become a no-show; an existing
+	// no_show is already terminal). 409 lets the saga fail loudly instead of
+	// emitting a false BookingNoShow.
+	switch booking.Status {
+	case store.StatusCancelled, store.StatusCompleted, store.StatusNoShow:
+		writeError(w, http.StatusConflict, "cannot mark no_show from terminal status "+booking.Status)
 		return
 	}
 	offering, _ := s.d.Store.GetOffering(r.Context(), tenantID, booking.OfferingID)

@@ -79,8 +79,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 			c.log.Error("command dead-lettered",
 				zap.String("key", string(msg.Key)), zap.Error(err))
 			if dlqErr := c.deadLetter(ctx, msg, err); dlqErr != nil {
-				c.log.Error("failed to write DLQ", zap.Error(dlqErr))
-				continue // do not commit; redelivery attempted
+				// SPEC-W43 K-03: kafka-go commits are CUMULATIVE — a later
+				// successful CommitMessages would silently advance the offset
+				// PAST this failed message even if we never commit it
+				// ourselves, so "continue" cannot guarantee redelivery. Stop
+				// the loop and surface the failure instead: the consumer
+				// restarts (supervised in main) and re-fetches from the last
+				// committed offset.
+				return fmt.Errorf("dlq write failed; stopping consumer to keep offset at the failed message: %w", dlqErr)
 			}
 		}
 		if err := c.reader.CommitMessages(ctx, msg); err != nil {
@@ -130,9 +136,21 @@ func (c *Consumer) process(ctx context.Context, msg kafka.Message) error {
 	if err != nil {
 		return fmt.Errorf("%w: bad tenantid %q", bookingops.ErrInvalidInput, env.TenantID)
 	}
-	var info bookingops.TenantInfo
-	if resolved, err := c.resolver.BySlug(ctx, env.Subject); err == nil {
-		info = resolved
+	// SPEC-W43 K-05: tenant context must resolve — the previous silent
+	// fallback left the command with a zero TenantInfo (UTC timezone, no
+	// pack policy), mis-booking the tenant's calendar. A resolver failure
+	// is retryable (not ErrInvalidInput), so it goes through the retry
+	// budget and then the DLQ.
+	info, err := c.resolver.BySlug(ctx, env.Subject)
+	if err != nil {
+		return fmt.Errorf("resolve tenant slug %q: %w", env.Subject, err)
+	}
+	// Cross-check: the subject (slug) must resolve to the SAME tenant the
+	// envelope's tenantid extension claims — a mismatch means a confused
+	// producer and is deterministically undeliverable (straight to DLQ).
+	if info.ID != tenantID {
+		return fmt.Errorf("%w: subject %q resolves to tenant %s, not envelope tenantid %s",
+			bookingops.ErrInvalidInput, env.Subject, info.ID, tenantID)
 	}
 	timezone := info.Timezone
 

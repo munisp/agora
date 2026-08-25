@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 )
 
@@ -27,25 +28,36 @@ type jwtClaims struct {
 // roles returns the caller's Keycloak realm roles (empty when absent).
 func (c jwtClaims) roles() []string { return c.RealmAccess.Roles }
 
+// errMalformedToken marks a presented Bearer token that cannot be decoded
+// (SPEC-W43 K-07: error-closed — callers must 401, never act on partial
+// claims).
+var errMalformedToken = errors.New("malformed bearer token")
+
 // parseBearerClaims decodes the payload segment of a JWT without verifying
-// the signature (verified upstream at the gateway).
-func parseBearerClaims(authHeader string) jwtClaims {
+// the signature (verified upstream at the gateway). A missing/non-Bearer
+// header yields zero claims and nil error (anonymous request — downstream
+// guards decide); a PRESENTED but undecodable token yields zero claims and
+// errMalformedToken so middleware can reject error-closed instead of
+// silently trusting partial/empty claims.
+func parseBearerClaims(authHeader string) (jwtClaims, error) {
 	var claims jwtClaims
 	const prefix = "Bearer "
 	if !strings.HasPrefix(authHeader, prefix) {
-		return claims
+		return claims, nil
 	}
 	token := strings.TrimPrefix(authHeader, prefix)
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return claims
+		return claims, errMalformedToken
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return claims
+		return claims, errMalformedToken
 	}
-	_ = json.Unmarshal(payload, &claims)
-	return claims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return jwtClaims{}, errMalformedToken
+	}
+	return claims, nil
 }
 
 func (c jwtClaims) hasTenant(slug string) bool {
