@@ -21,6 +21,9 @@ pub struct Config {
     pub kafka_consumer_enabled: bool,
     /// Outbound topic for com.opendesk.billing.* CloudEvents (B3).
     pub billing_events_topic: String,
+    /// Dead-letter topic for usage events that fail after bounded retries
+    /// (SPEC-W43 B-04; same topic/convention as payments-service GF11).
+    pub dlq_topic: String,
     /// Ledger implementation selection (SIM-029): `postgres` (the real,
     /// durable implementation — DEFAULT) or `sim` (in-memory, dev/CI opt-in
     /// only). The service never silently falls back to the sim.
@@ -39,16 +42,61 @@ pub struct Config {
     /// Public callback URL handed to Paystack initialize.
     pub paystack_callback_url: String,
     /// Static-mode merchant account ("name/account") for the EMVCo-style
-    /// fallback payload when PAYSTACK_SECRET_KEY is unset (SIM-030: REQUIRED
-    /// in static mode — no hardcoded account default).
+    /// fallback payload when PAYSTACK_SECRET_KEY is unset. SPEC-W44 F16-11:
+    /// REQUIRED (boot error) when APP_ENV is production-like
+    /// (production|staging); in dev a placeholder default is used with a WARN.
     pub billing_static_account: String,
-    /// Merchant display name embedded in the static EMV payload (SIM-030:
-    /// REQUIRED in static mode).
+    /// Merchant display name embedded in the static EMV payload (same
+    /// F16-11 posture as the account).
     pub billing_merchant_name: String,
+    /// SPEC-W44 K6: roles allowed to perform money mutations (`MONEY_ROLES`,
+    /// comma-separated, default "owner,admin"); compared case-insensitively
+    /// against the gateway-injected `X-User-Roles`.
+    pub money_roles: Vec<String>,
+    /// K1 dev escape (`OPENDESK_TRUST_DIRECT_TENANT=1`): accept the tenant
+    /// context from caller params without the gateway-injected
+    /// `X-Tenant-Slugs` binding (standalone dev only; never set in compose).
+    pub trust_direct_tenant: bool,
+    /// Direct HTTP base of identity-service (`IDENTITY_BASE_URL`), used by
+    /// the K1 uuid binding: `GET {base}/v1/tenants/{slug}` resolves a
+    /// gateway-claimed slug to its tenant uuid (src/identity.rs). Dev
+    /// default `http://identity:7001` (compose service name); set EMPTY to
+    /// disable resolution, which fails the uuid binding CLOSED (403).
+    pub identity_base_url: String,
+    /// `IDENTITY_INTERNAL_TOKEN` forwarded as `X-Internal-Token` on the
+    /// identity tenant-resolution call (K2 — identity's getTenant accepts
+    /// internal-token service callers). Unset/empty = no header; identity
+    /// then answers 401 and resolution fails closed (503 to the caller).
+    pub identity_internal_token: Option<String>,
+    /// Slug->uuid resolution cache TTL (`TENANT_CACHE_TTL_SECONDS`,
+    /// default 60). Only POSITIVE resolutions are cached; identity errors
+    /// and unknown slugs always re-fetch (fail-closed authz decision — no
+    /// stale serving, unlike booking's availability-oriented resolver).
+    pub tenant_cache_ttl_s: u64,
     /// Dunning sweep cadence (B3).
     pub dunning_interval_s: u64,
     /// Issued invoices older than this many days become past_due.
     pub invoice_due_days: i64,
+}
+
+/// K6: csv env -> lowercase trimmed role list; empty input falls back to the
+/// safe default so a misconfigured MONEY_ROLES="" never disables the gate.
+fn parse_roles(raw: &str) -> Vec<String> {
+    let roles: Vec<String> = raw
+        .split(',')
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if roles.is_empty() {
+        vec!["owner".to_string(), "admin".to_string()]
+    } else {
+        roles
+    }
+}
+
+/// F16-11: production-like environments never get silent defaults.
+fn is_production_like(app_env: &str) -> bool {
+    matches!(app_env.to_ascii_lowercase().as_str(), "production" | "staging")
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -84,8 +132,9 @@ impl Config {
         let internal_token = env_required("BILLING_INTERNAL_TOKEN").map_err(|e| {
             format!(
                 "{e}; refusing to start: internal-token auth would be disabled \
-                 (set BILLING_INTERNAL_TOKEN and have APISIX inject x-internal-token \
-                 after stripping any client-supplied copy)"
+                 (set BILLING_INTERNAL_TOKEN; in-cluster service callers present it \
+                 as x-internal-token — APISIX strips caller-sent copies and, since \
+                 SPEC-W44 F1, never injects one on gateway routes)"
             )
         })?;
 
@@ -96,27 +145,63 @@ impl Config {
             ));
         }
 
-        // SIM-030: static-mode merchant coordinates must be explicitly
-        // configured — a hardcoded default account would silently misdirect
-        // customer payments.
+        // SIM-030 + SPEC-W44 F16-11: static-mode merchant coordinates must be
+        // explicitly configured in production-like environments (APP_ENV in
+        // {production, staging}) — a hardcoded default account would silently
+        // misdirect customer payments. In dev (any other APP_ENV, unset
+        // included) a clearly-marked placeholder default is used with a WARN.
+        let app_env = env_or("APP_ENV", "development");
         let static_mode = paystack_secret_key.is_none();
         let billing_static_account = if static_mode {
-            env_required("BILLING_STATIC_ACCOUNT").map_err(|e| {
-                format!(
-                    "{e}; refusing to start in static payment mode (PAYSTACK_SECRET_KEY \
-                     unset): the QR payment account must be explicitly configured"
-                )
-            })?
+            match std::env::var("BILLING_STATIC_ACCOUNT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
+                Some(v) => v,
+                None if is_production_like(&app_env) => {
+                    return Err(
+                        "BILLING_STATIC_ACCOUNT is not set; refusing to start in static \
+                         payment mode (PAYSTACK_SECRET_KEY unset) with APP_ENV=\
+                         production-like: the QR payment account must be explicitly \
+                         configured"
+                            .to_string(),
+                    )
+                }
+                None => {
+                    tracing::warn!(
+                        "BILLING_STATIC_ACCOUNT unset in dev (APP_ENV={app_env}): using the \
+                         placeholder dev account for static QR payloads — set it explicitly \
+                         for any real environment"
+                    );
+                    "OPENDESK-DEV/0000000000".to_string()
+                }
+            }
         } else {
             env_or("BILLING_STATIC_ACCOUNT", "")
         };
         let billing_merchant_name = if static_mode {
-            env_required("BILLING_MERCHANT_NAME").map_err(|e| {
-                format!(
-                    "{e}; refusing to start in static payment mode (PAYSTACK_SECRET_KEY \
-                     unset): the merchant display name must be explicitly configured"
-                )
-            })?
+            match std::env::var("BILLING_MERCHANT_NAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+            {
+                Some(v) => v,
+                None if is_production_like(&app_env) => {
+                    return Err(
+                        "BILLING_MERCHANT_NAME is not set; refusing to start in static \
+                         payment mode (PAYSTACK_SECRET_KEY unset) with APP_ENV=\
+                         production-like: the merchant display name must be explicitly \
+                         configured"
+                            .to_string(),
+                    )
+                }
+                None => {
+                    tracing::warn!(
+                        "BILLING_MERCHANT_NAME unset in dev (APP_ENV={app_env}): using the \
+                         placeholder dev merchant name"
+                    );
+                    "OpenDesk Dev".to_string()
+                }
+            }
         } else {
             env_or("BILLING_MERCHANT_NAME", "")
         };
@@ -135,6 +220,7 @@ impl Config {
             usage_events_topic: env_or("USAGE_EVENTS_TOPIC", "opendesk.usage.events"),
             kafka_consumer_enabled: env_parse("KAFKA_CONSUMER_ENABLED", true),
             billing_events_topic: env_or("BILLING_EVENTS_TOPIC", "opendesk.billing.events"),
+            dlq_topic: env_or("DLQ_TOPIC", "opendesk.dlq"),
             billing_ledger_impl,
             internal_token,
             paystack_secret_key,
@@ -145,6 +231,15 @@ impl Config {
             ),
             billing_static_account,
             billing_merchant_name,
+            money_roles: parse_roles(&env_or("MONEY_ROLES", "owner,admin")),
+            trust_direct_tenant: env_parse("OPENDESK_TRUST_DIRECT_TENANT", false),
+            identity_base_url: env_or("IDENTITY_BASE_URL", "http://identity:7001")
+                .trim_end_matches('/')
+                .to_string(),
+            identity_internal_token: std::env::var("IDENTITY_INTERNAL_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            tenant_cache_ttl_s: env_parse("TENANT_CACHE_TTL_SECONDS", 60),
             dunning_interval_s: env_parse("DUNNING_INTERVAL_S", 3600),
             invoice_due_days: env_parse("INVOICE_DUE_DAYS", 14),
         })
@@ -179,6 +274,7 @@ mod tests {
             "PAYSTACK_SECRET_KEY",
             "BILLING_STATIC_ACCOUNT",
             "BILLING_MERCHANT_NAME",
+            "APP_ENV",
         ] {
             std::env::remove_var(k);
         }
@@ -220,13 +316,15 @@ mod tests {
         clear_posture_env();
     }
 
-    /// SIM-030: static payment mode without explicit merchant coordinates
-    /// must fail closed (no hardcoded OPENDESK/0123456789 fallback).
+    /// SIM-030 + F16-11: static payment mode without explicit merchant
+    /// coordinates fails closed in production-like APP_ENV (no silent
+    /// fallback), while dev gets a placeholder default.
     #[test]
     fn static_mode_requires_explicit_account_and_merchant_name() {
         let _g = env_lock();
         clear_posture_env();
         std::env::set_var("BILLING_INTERNAL_TOKEN", "tok");
+        std::env::set_var("APP_ENV", "production");
         // Static mode (no PAYSTACK_SECRET_KEY): both must be required.
         let err = Config::from_env().unwrap_err();
         assert!(
@@ -244,6 +342,31 @@ mod tests {
         assert_eq!(cfg.payment_mode(), "static");
         assert_eq!(cfg.billing_static_account, "MERCHANT/123");
         assert_eq!(cfg.billing_merchant_name, "MERCHANT LTD");
+        // staging is production-like too (F16-11).
+        std::env::remove_var("BILLING_STATIC_ACCOUNT");
+        std::env::set_var("APP_ENV", "staging");
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.contains("BILLING_STATIC_ACCOUNT"),
+            "staging must fail closed as well: {err}"
+        );
+        clear_posture_env();
+    }
+
+    /// F16-11: in dev (APP_ENV unset/non-production) the static coordinates
+    /// fall back to a placeholder default (WARN logged) instead of failing.
+    #[test]
+    fn static_mode_dev_default_account_with_warn() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("BILLING_INTERNAL_TOKEN", "tok");
+        // No APP_ENV, no PAYSTACK_SECRET_KEY, no static coordinates: loads.
+        let cfg = Config::from_env().expect("dev static mode must load with defaults");
+        assert_eq!(cfg.payment_mode(), "static");
+        assert_eq!(cfg.billing_static_account, "OPENDESK-DEV/0000000000");
+        assert_eq!(cfg.billing_merchant_name, "OpenDesk Dev");
+        // K6 default roles.
+        assert_eq!(cfg.money_roles, vec!["owner".to_string(), "admin".to_string()]);
         clear_posture_env();
     }
 

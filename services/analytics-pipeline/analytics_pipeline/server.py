@@ -1,6 +1,16 @@
 """FastAPI sidecar: GET /healthz (consumer lag per topic), GET /metrics,
 GET /v1/recommendations (SPEC-W3 §3), GET /v1/metering (Wave 5 #9) and
-GET /v1/cac/summary (SPEC-W13 contract §5)."""
+GET /v1/cac/summary (SPEC-W13 contract §5).
+
+TRUST BOUNDARY (W44/F15-15): this service is NOT behind the APISIX gateway
+and does no request authentication itself. It must only be reachable on the
+internal container network. Browser traffic arrives exclusively via the
+admin-web BFF (apps/admin-web/app/api/[[...path]]/route.ts), which requires
+a NextAuth session (401 anonymous) and injects the tenant from the session's
+verified `tenant_slugs` claim as X-Tenant-Slug / ?tenant=, ignoring
+caller-supplied tenant values. The X-Tenant-Slug header (and ?tenant= query)
+is therefore an IN-NETWORK TRUST contract: never expose port 7009 publicly
+and never treat these values as caller input from an untrusted network."""
 
 from __future__ import annotations
 

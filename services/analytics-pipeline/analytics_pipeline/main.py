@@ -95,7 +95,10 @@ async def amain() -> None:
             store=cac_store,
             spend=BookingSpendClient(dapr, settings.booking_app_id),
             tenants=TenantResolver(
-                dapr, settings.identity_app_id, settings.tenant_cache_ttl_seconds
+                dapr,
+                settings.identity_app_id,
+                settings.tenant_cache_ttl_seconds,
+                internal_token=settings.identity_internal_token,
             ),
         )
         cac_consumer = CacConsumer(settings, cac_store)
