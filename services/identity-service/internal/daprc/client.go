@@ -56,6 +56,15 @@ func (c *Client) PublishEvent(ctx context.Context, pubsub, topic string, data an
 // InvokeService performs Dapr service-to-service invocation:
 // POST /v1.0/invoke/{appID}/method/{method}.
 func (c *Client) InvokeService(ctx context.Context, appID, method string, payload any, out any) error {
+	return c.InvokeServiceWithHeaders(ctx, appID, method, payload, nil, out)
+}
+
+// InvokeServiceWithHeaders is InvokeService with optional extra request
+// headers (SPEC-W44 K2): internal-token-gated targets (e.g. notification-
+// worker's /dev/* triggers) require X-Internal-Token, which Dapr HTTP
+// invoke passes through verbatim. Nil/empty headers behave exactly like
+// InvokeService.
+func (c *Client) InvokeServiceWithHeaders(ctx context.Context, appID, method string, payload any, headers map[string]string, out any) error {
 	var body io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -70,6 +79,9 @@ func (c *Client) InvokeService(ctx context.Context, appID, method string, payloa
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return fmt.Errorf("invoke %s/%s: %w", appID, method, err)
