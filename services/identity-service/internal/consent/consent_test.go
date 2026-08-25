@@ -22,9 +22,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeRepo struct {
-	mu    sync.Mutex
-	recs  map[string]Record // key tenant|subject|purpose
-	calls int
+	mu     sync.Mutex
+	recs   map[string]Record // key tenant|subject|purpose
+	calls  int
+	outbox []OutboxEvent
+	nextID int64
 }
 
 func newFakeRepo() *fakeRepo { return &fakeRepo{recs: map[string]Record{}} }
@@ -93,15 +95,63 @@ func (f *fakeRepo) Erase(_ context.Context, tenantID uuid.UUID, subject, purpose
 		f.recs[k] = r
 		n++
 	}
+	if n > 0 {
+		// Mirrors the Postgres Erase: tombstone + durable outbox row are one
+		// atomic unit (SPEC-W43 I-04).
+		f.nextID++
+		f.outbox = append(f.outbox, OutboxEvent{
+			ID:            f.nextID,
+			TenantID:      tenantID,
+			DataSubjectID: subject,
+			Purpose:       purpose,
+			ErasedRecords: n,
+			Synthetic:     EvaluateErasureEligibility(subject).Synthetic,
+			CreatedAt:     now,
+		})
+	}
 	return n, nil
+}
+
+// MarkOutboxSent deletes the row, so FetchUnsentOutbox returns what is left.
+func (f *fakeRepo) FetchUnsentOutbox(_ context.Context, limit int) ([]OutboxEvent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := append([]OutboxEvent{}, f.outbox...)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeRepo) MarkOutboxSent(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, e := range f.outbox {
+		if e.ID == id {
+			f.outbox = append(f.outbox[:i], f.outbox[i+1:]...)
+			return nil
+		}
+	}
+	return nil
 }
 
 func (f *fakeRepo) Ping(context.Context) error { return nil }
 
-type fakeTenants struct{ bySlug map[string]uuid.UUID }
+type fakeTenants struct {
+	bySlug map[string]uuid.UUID
+	byID   map[uuid.UUID]string
+}
 
 func (f fakeTenants) GetTenantBySlug(_ context.Context, slug string) (store.Tenant, error) {
 	id, ok := f.bySlug[slug]
+	if !ok {
+		return store.Tenant{}, store.ErrNotFound
+	}
+	return store.Tenant{ID: id, Slug: slug}, nil
+}
+
+func (f fakeTenants) GetTenantByID(_ context.Context, id uuid.UUID) (store.Tenant, error) {
+	slug, ok := f.byID[id]
 	if !ok {
 		return store.Tenant{}, store.ErrNotFound
 	}
@@ -122,8 +172,11 @@ type fakePublisher struct {
 func (f *fakePublisher) PublishEvent(_ context.Context, _, topic string, data any) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err // failed publish records nothing (real Dapr semantics)
+	}
 	f.events = append(f.events, publishedEvent{topic: topic, data: data})
-	return f.err
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -131,31 +184,58 @@ func (f *fakePublisher) PublishEvent(_ context.Context, _, topic string, data an
 // ---------------------------------------------------------------------------
 
 type harness struct {
-	repo *fakeRepo
-	pub  *fakePublisher
-	slug string
-	tid  uuid.UUID
-	http http.Handler
+	repo  *fakeRepo
+	pub   *fakePublisher
+	Relay *Relay
+	h     *Handler // exposed so auth-matrix tests can mutate gate config
+	slug  string
+	tid   uuid.UUID
+	http  http.Handler
 }
+
+// testInternalToken is the K2 service credential the harness injects by
+// default (the V2-D3 gate requires auth on erasure + list; pre-existing
+// behaviour tests exercise the handler logic as a service caller).
+const testInternalToken = "test-internal-token"
 
 func newHarness() *harness {
 	repo := newFakeRepo()
 	pub := &fakePublisher{}
 	tid := uuid.New()
-	h := &Handler{
+	relay := &Relay{
 		Repo:         repo,
-		Tenants:      fakeTenants{bySlug: map[string]uuid.UUID{"acme": tid}},
 		Events:       pub,
 		PubSub:       "pubsub-kafka",
-		ErasureTopic: DefaultErasureTopic,
+		ConsentTopic: DefaultErasureTopic,
+		PrivacyTopic: DefaultPrivacyTopic,
 		Logger:       zap.NewNop(),
+	}
+	h := &Handler{
+		Repo:          repo,
+		Tenants:       fakeTenants{bySlug: map[string]uuid.UUID{"acme": tid}, byID: map[uuid.UUID]string{tid: "acme"}},
+		Relay:         relay,
+		InternalToken: testInternalToken,
+		Logger:        zap.NewNop(),
 	}
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)
-	return &harness{repo: repo, pub: pub, slug: "acme", tid: tid, http: r}
+	return &harness{repo: repo, pub: pub, Relay: relay, h: h, slug: "acme", tid: tid, http: r}
 }
 
 func (h *harness) do(method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	// Default to the K2 service credential; explicit X-Internal-Token in
+	// headers (including a wrong one, for the auth matrix) wins.
+	if _, ok := headers["X-Internal-Token"]; !ok {
+		if headers == nil {
+			headers = map[string]string{}
+		}
+		headers["X-Internal-Token"] = testInternalToken
+	}
+	return h.doRaw(method, path, body, headers)
+}
+
+// doRaw sends a request WITHOUT injecting any credential (auth-matrix tests).
+func (h *harness) doRaw(method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
 	var rdr *strings.Reader
 	if body != "" {
 		rdr = strings.NewReader(body)
@@ -307,9 +387,11 @@ func TestErasureTombstonesAndPublishes(t *testing.T) {
 		t.Errorf("erased_records: %v", out)
 	}
 
-	// CloudEvent on the contract topic.
-	if len(h.pub.events) != 1 {
-		t.Fatalf("published events = %d, want 1", len(h.pub.events))
+	// CloudEvents on BOTH contract topics (K4): the consent erasure event
+	// plus the PrivacyEraseRequested tombstone the booking/conversation
+	// consumers actually listen for (F15-06).
+	if len(h.pub.events) != 2 {
+		t.Fatalf("published events = %d, want 2 (consent + privacy)", len(h.pub.events))
 	}
 	evt := h.pub.events[0]
 	if evt.topic != DefaultErasureTopic {
@@ -324,6 +406,26 @@ func TestErasureTombstonesAndPublishes(t *testing.T) {
 	data, _ := ce["data"].(map[string]any)
 	if data["data_subject_id"] != "+2348012345678" || data["purpose"] != "kyc" {
 		t.Errorf("event data: %v", data)
+	}
+
+	// K4 privacy tombstone — exact shape of booking-service
+	// internal/consumer/privacy.go's privacyEnvelope.
+	pevt := h.pub.events[1]
+	if pevt.topic != DefaultPrivacyTopic {
+		t.Errorf("privacy topic = %q, want %q", pevt.topic, DefaultPrivacyTopic)
+	}
+	ppayload, _ := json.Marshal(pevt.data)
+	var pce map[string]any
+	_ = json.Unmarshal(ppayload, &pce)
+	if pce["type"] != PrivacyEraseEventType {
+		t.Errorf("privacy event type = %v", pce["type"])
+	}
+	pdata, _ := pce["data"].(map[string]any)
+	if pdata["phone"] != "+2348012345678" || pdata["email"] != "" {
+		t.Errorf("privacy event locators: %v", pdata)
+	}
+	if pdata["tenant_id"] != h.tid.String() {
+		t.Errorf("privacy tenant_id = %v", pdata["tenant_id"])
 	}
 
 	// Gate now denies kyc but the marketing consent survives.
@@ -420,5 +522,61 @@ func TestErasurePublishFailureStillTombstones(t *testing.T) {
 		map[string]string{"X-Tenant-Slug": "acme"})
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("tombstone must hold despite publish failure: status = %d", rec.Code)
+	}
+
+	// SPEC-W43 I-04: the outbox row survives the publish failure and the
+	// relay republishes once Dapr recovers (durable, not best-effort).
+	if len(h.repo.outbox) != 1 {
+		t.Fatalf("unsent outbox rows = %d, want 1", len(h.repo.outbox))
+	}
+	h.pub.err = nil
+	if _, err := h.Relay.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.repo.outbox) != 0 {
+		t.Errorf("outbox not drained after successful sweep")
+	}
+	if len(h.pub.events) != 2 {
+		t.Errorf("republished events = %d, want 2 (consent + privacy)", len(h.pub.events))
+	}
+}
+
+// TestErasureSkipsPrivacyEventForNonContactSubject: uuid-shaped subjects
+// carry no phone/email locator — the K4 privacy event would be a poison
+// message downstream (booking dead-letters empty phone+email), so only the
+// consent event is published.
+func TestErasureSkipsPrivacyEventForNonContactSubject(t *testing.T) {
+	h := newHarness()
+	subject := uuid.NewString()
+	h.do(http.MethodPost, "/v1/consents",
+		`{"tenant":"acme","subject":"`+subject+`","purpose":"kyc"}`, nil)
+	rec := h.do(http.MethodPost, "/v1/consents/erasure",
+		`{"tenant":"acme","subject":"`+subject+`","purpose":"kyc"}`, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if len(h.pub.events) != 1 {
+		t.Fatalf("published events = %d, want 1 (consent only)", len(h.pub.events))
+	}
+	if h.pub.events[0].topic != DefaultErasureTopic {
+		t.Errorf("topic = %q", h.pub.events[0].topic)
+	}
+}
+
+// TestRelaySweepPublishesOnce: a second sweep over a drained outbox must not
+// republish (no duplicate fanout).
+func TestRelaySweepPublishesOnce(t *testing.T) {
+	h := newHarness()
+	h.captureOnce(t, "kyc")
+	h.do(http.MethodPost, "/v1/consents/erasure",
+		`{"tenant":"acme","subject":"+2348012345678","purpose":"kyc"}`, nil)
+	if len(h.pub.events) != 2 {
+		t.Fatalf("published events = %d, want 2", len(h.pub.events))
+	}
+	if _, err := h.Relay.Sweep(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.pub.events) != 2 {
+		t.Errorf("second sweep republished: events = %d", len(h.pub.events))
 	}
 }
