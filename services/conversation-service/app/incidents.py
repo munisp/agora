@@ -20,20 +20,26 @@ Emission contract:
 - idempotent per (conversation_id, turn_id): the dedupe key gates emission and
   incident_id is deterministic (uuid5 of the key), so downstream consumers can
   upsert on incident_id; the CloudEvent id IS the incident_id;
+- DURABLE (SPEC-W43 Y-03): the dedupe gate is the `incident_emitted` table
+  (PK (tenant_id, dedupe_key)), written in the SAME transaction as the
+  `incident_counters` reference-number upsert. A Dapr publish failure leaves
+  the row with published_at NULL and the IncidentRetryWorker republishes it
+  — a failed emission is never silently dropped (the in-process
+  `_emitted_keys` set is only a fast-path cache on top of the durable state);
 - reference numbers are INC-{YYYY}-{seq:06d} per tenant per year from the
-  Postgres `incident_counters` table (the service's existing store — there is
-  no Redis here; the counter follows the idempotent ensure/ALTER bootstrap
-  pattern used for the intel/idempotency columns, created lazily on first use).
+  Postgres `incident_counters` table (no Redis here). SPEC-W43 Y-06: the
+  table is created by bootstrap DDL at service boot
+  (Database.ensure_relay_tables, with fail-closed RLS + FORCE) — it is no
+  longer lazily created inside the tenant-scoped transaction.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
-
-import asyncpg
 
 from .config import Config
 from .intel import normalize_text
@@ -281,18 +287,10 @@ def idp_created_event(idp: dict[str, Any], *, subject: str = "") -> dict[str, An
 
 # ---------------------------------------------------------------------------
 # Reference number: INC-{YYYY}-{seq:06d} per tenant per year (Postgres counter;
-# conversation-service has no Redis — the counter table follows the service's
-# idempotent-bootstrap pattern and is created lazily on first use).
+# conversation-service has no Redis). SPEC-W43 Y-06: incident_counters is
+# created by bootstrap DDL at service boot (Database.ensure_relay_tables)
+# with fail-closed RLS + FORCE — NOT lazily inside the tenant-scoped tx.
 # ---------------------------------------------------------------------------
-
-_COUNTER_DDL = """
-CREATE TABLE IF NOT EXISTS incident_counters (
-    tenant_id UUID NOT NULL,
-    year      INTEGER NOT NULL,
-    seq       BIGINT NOT NULL,
-    PRIMARY KEY (tenant_id, year)
-)
-"""
 
 _COUNTER_UPSERT = """
 INSERT INTO incident_counters (tenant_id, year, seq)
@@ -308,22 +306,21 @@ async def next_reference_number(
 ) -> str:
     """Next tenant-facing reference number (atomic per tenant+year upsert)."""
     year = (now or datetime.now(UTC)).year
-    # Reuses Database._tenant_tx (RLS-scoped tx); the counter table itself
-    # carries tenant_id and needs no policy of its own.
     async with db._tenant_tx(tenant_id) as conn:
-        try:
-            seq = await conn.fetchval(_COUNTER_UPSERT, tenant_id, year)
-        except (asyncpg.UndefinedTableError, asyncpg.DuplicateTableError):
-            try:
-                await conn.execute(_COUNTER_DDL)
-            except asyncpg.DuplicateTableError:
-                pass  # concurrent first-use race — table now exists
-            seq = await conn.fetchval(_COUNTER_UPSERT, tenant_id, year)
+        seq = await conn.fetchval(_COUNTER_UPSERT, tenant_id, year)
     return f"INC-{year}-{int(seq):06d}"
 
 
 # ---------------------------------------------------------------------------
-# Emission (non-blocking, deduplicated, failures logged never raised)
+# Emission (non-blocking, DURABLY deduplicated, failures logged never raised)
+#
+# SPEC-W43 Y-03: the dedupe gate lives in Postgres (incident_emitted, PK
+# (tenant_id, dedupe_key)) written in the SAME tenant transaction as the
+# incident_counters reference upsert (Database.incident_emit_record). A Dapr
+# publish failure leaves the row unpublished; the IncidentRetryWorker below
+# republishes unsent rows — a crashed/failed publish is NEVER silent. The
+# in-process _emitted_keys set is only a fast-path cache over the durable
+# state (durable state wins on restart).
 # ---------------------------------------------------------------------------
 
 _emitted_keys: set[str] = set()
@@ -365,9 +362,10 @@ async def emit_for_turn(
                 turn_id=str(turn_id),
             )
             return None
-        _emitted_keys.add(dedupe_key)
-        try:
-            reference = await next_reference_number(db, tenant_id)
+
+        holder: dict[str, Any] = {}
+
+        def _build(reference: str) -> dict[str, Any]:
             idp = build_idp(
                 tenant_id=tenant_id,
                 conversation_id=conversation_id,
@@ -380,25 +378,114 @@ async def emit_for_turn(
                 callback_number=contact_phone,
             )
             event = idp_created_event(idp, subject=site_slug)
-            await dapr.publish_event(cfg.incidents_topic, event)
-        except Exception:
-            _emitted_keys.discard(dedupe_key)
-            raise
+            holder["event"] = event
+            return event
+
+        # Same-tx counter upsert + durable dedupe row (SPEC-W43 Y-03).
+        event, state = await db.incident_emit_record(
+            tenant_id, dedupe_key, _build
+        )
+        if state == "duplicate":
+            _emitted_keys.add(dedupe_key)
+            log.info(
+                "incident already emitted for turn; skipping",
+                conversation_id=str(conversation_id),
+                turn_id=str(turn_id),
+            )
+            return None
+        if state == "created":
+            event = holder["event"]
+        # state == "retry": republish the STORED event (reference number and
+        # incident id are the original ones — no counter burn, no drift).
+
+        # Publish failure propagates to the outer handler: the durable row
+        # stays unpublished and the retry worker republishes it later.
+        await dapr.publish_event(cfg.incidents_topic, event)
+        await db.incident_mark_published(tenant_id, dedupe_key)
+        _emitted_keys.add(dedupe_key)
+        idp = event["data"]
         log.info(
             "incident IDP emitted",
             incident_id=idp["incident_id"],
-            reference=reference,
+            reference=idp["reference_number"],
             severity=idp["severity"],
             incident_type=idp["incident_type"],
             score=classification["score"],
             conversation_id=str(conversation_id),
+            retry=(state == "retry"),
         )
         return idp
     except Exception as exc:  # noqa: BLE001 - never break turn ingestion
         log.error(
-            "incident IDP emission failed",
+            "incident IDP emission failed (durable row kept for retry)",
             error=str(exc),
             conversation_id=str(conversation_id),
             turn_id=str(turn_id),
         )
         return None
+
+
+class IncidentRetryWorker:
+    """Background loop republishing incident_emitted rows whose Dapr publish
+    failed (published_at IS NULL). SPEC-W43 Y-03: publish failure leaves
+    durable state; this worker makes the retry loud and automatic instead of
+    silently losing the incident.
+
+    Mirrors RetentionSweeper: start()/stop() lifecycle, run_once() is the
+    testable unit, the loop never dies on a cycle failure.
+    """
+
+    def __init__(self, cfg: Config, db: Any, dapr: Any) -> None:
+        self._cfg = cfg
+        self._db = db
+        self._dapr = dapr
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run(), name="incident-retry")
+        log.info(
+            "incident retry worker started",
+            interval_seconds=self._cfg.incident_retry_seconds,
+        )
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — worker must not die
+                log.error("incident retry sweep failed; will retry next cycle",
+                          error=str(exc))
+            await asyncio.sleep(self._cfg.incident_retry_seconds)
+
+    async def run_once(self) -> int:
+        """Republish every unsent incident row; returns the count published."""
+        unsent = await self._db.incident_unsent()
+        published = 0
+        for tenant_id, dedupe_key, payload in unsent:
+            try:
+                await self._dapr.publish_event(self._cfg.incidents_topic, payload)
+                await self._db.incident_mark_published(tenant_id, dedupe_key)
+                published += 1
+                log.info(
+                    "incident IDP republished after earlier failure",
+                    tenant_id=str(tenant_id),
+                    dedupe_key=dedupe_key,
+                )
+            except Exception as exc:  # noqa: BLE001 — keep sweeping others
+                log.error(
+                    "incident IDP republish failed; row stays unsent",
+                    tenant_id=str(tenant_id),
+                    dedupe_key=dedupe_key,
+                    error=str(exc),
+                )
+        return published

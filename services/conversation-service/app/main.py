@@ -13,7 +13,8 @@ from dataclasses import dataclass
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .config import Config, load
 from .dapr_client import DaprClient
@@ -22,9 +23,11 @@ from .agent_db import AgentStore
 from .agent_routes import router as agent_router
 from .capture import CaptureExtractor
 from .indexer import TranscriptIndexer
+from . import incidents as incidents_mod
 from .logging import get_logger, setup
 from .privacy import PrivacyEraseConsumer
 from .quality import CallQualityEnricher
+from .outbox import OutboxRelay
 from .retention import RetentionSweeper
 from .routes import router
 from .sinks import KafkaSink, TranscriptSink, build_sink
@@ -80,6 +83,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.error("ussd bootstrap failed; ussd conversations will fail",
                   error=str(exc))
 
+    # SPEC-W43 Y-03/Y-06/Y-08: durable relay tables (incident_counters +
+    # incident_emitted + conversation_outbox) created at boot OUTSIDE any
+    # tenant-scoped tx, with fail-closed RLS + FORCE (NULLIF idiom).
+    try:
+        await db.ensure_relay_tables()
+    except Exception as exc:
+        log.error("relay table bootstrap failed; incident dedupe and the turn "
+                  "outbox will fail", error=str(exc))
+
     # SPEC-W38 F1/F3: agents registry + capture tables (init script
     # 07-agents-capture-schema.sql is authoritative on fresh installs; the
     # idempotent ensure covers already-initialized databases).
@@ -101,6 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg.identity_app_id,
         cfg.tenant_cache_ttl_seconds,
         remember=agent_store.remember_tenant_slug,
+        internal_token=cfg.identity_internal_token,
     )
 
     sink = build_sink(cfg)
@@ -161,6 +174,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         privacy = PrivacyEraseConsumer(cfg, db)
         privacy.start()
 
+    # SPEC-W43 Y-08: conversation_outbox relay — republishes unsent turn
+    # events (inline publish failure or crash) with backoff.
+    outbox_relay: OutboxRelay | None = None
+    if cfg.outbox_relay_enabled:
+        outbox_relay = OutboxRelay(cfg, db, dapr)
+        outbox_relay.start()
+
+    # SPEC-W43 Y-03: incident retry worker — republishes incident_emitted
+    # rows whose Dapr publish failed (durable, never silent).
+    incident_retry: incidents_mod.IncidentRetryWorker | None = None
+    if cfg.incident_enabled:
+        incident_retry = incidents_mod.IncidentRetryWorker(cfg, db, dapr)
+        incident_retry.start()
+
     # NDPA/GDPR storage limitation: hourly hard-delete of aged turns
     # (RETENTION_DAYS, default 365; NDPA profile sets 180).
     retention: RetentionSweeper | None = None
@@ -200,6 +227,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if retention is not None:
             with contextlib.suppress(Exception):
                 await retention.stop()
+        if outbox_relay is not None:
+            with contextlib.suppress(Exception):
+                await outbox_relay.stop()
+        if incident_retry is not None:
+            with contextlib.suppress(Exception):
+                await incident_retry.stop()
         with contextlib.suppress(Exception):
             await sink.close()
         with contextlib.suppress(Exception):
@@ -234,6 +267,15 @@ async def healthz() -> JSONResponse:
             {"status": "unavailable", "error": str(exc)}, status_code=503
         )
     return JSONResponse({"status": "ok"})
+
+
+@app.get("/metrics")
+async def metrics() -> PlainTextResponse:
+    """W44: Prometheus scrape endpoint (default registry: process + platform
+    collectors) on the existing app port — closes the F15-02 scrape gap."""
+    return PlainTextResponse(
+        generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST
+    )
 
 
 def main() -> None:

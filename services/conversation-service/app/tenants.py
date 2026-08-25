@@ -58,12 +58,16 @@ class TenantResolver:
         identity_app_id: str = "identity",
         ttl_seconds: float = DEFAULT_TENANT_CACHE_TTL_SECONDS,
         remember: Callable[[str, str], Awaitable[None]] | None = None,
+        internal_token: str = "",
     ):
         self._dapr = dapr
         self._app_id = identity_app_id
         self._ttl = ttl_seconds if ttl_seconds > 0 else DEFAULT_TENANT_CACHE_TTL_SECONDS
         self._cache: dict[str, tuple[TenantInfo, float]] = {}
         self._remember = remember
+        # SPEC-W44 K2: identity gates tenant lookup for service callers
+        # behind X-Internal-Token (IDENTITY_INTERNAL_TOKEN env).
+        self._internal_token = internal_token
 
     async def by_slug(self, slug: str) -> TenantInfo:
         entry = self._cache.get(slug)
@@ -71,7 +75,14 @@ class TenantResolver:
         if fresh:
             return entry[0]
         try:
-            payload = await self._dapr.invoke(self._app_id, f"v1/tenants/{slug}")
+            headers = (
+                {"X-Internal-Token": self._internal_token}
+                if self._internal_token
+                else None
+            )
+            payload = await self._dapr.invoke(
+                self._app_id, f"v1/tenants/{slug}", headers=headers
+            )
         except Exception as exc:  # noqa: BLE001 — daprd/identity outage
             status = getattr(exc, "status_code", None)
             if status == 404:

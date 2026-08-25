@@ -21,6 +21,7 @@ class FakeDB:
     def __init__(self):
         self.convs = {}
         self.turns = {}
+        self.outbox = {}
 
     async def ping(self):
         return None
@@ -48,21 +49,32 @@ class FakeDB:
 
     async def add_turn(self, cid, tenant_id, role, text, tool_calls,
                        sentiment=None, intent=None, entities=None,
-                       idempotency_key=None):
+                       idempotency_key=None, outbox=None):
         import asyncpg
         if cid not in self.convs:
             raise asyncpg.ForeignKeyViolationError("fk")
         if idempotency_key:
             for t in self.turns.get(cid, []):
                 if t.get("idempotency_key") == idempotency_key:
-                    return t, False
+                    return t, False, None
         seq = len(self.turns.get(cid, [])) + 1
         rec = dict(id=uuid.uuid4(), conversation_id=cid, seq=seq, role=role, text=text,
                    tool_calls=tool_calls, sentiment=sentiment, intent=intent,
                    entities=entities, idempotency_key=idempotency_key,
                    ts=datetime.now(UTC))
         self.turns.setdefault(cid, []).append(rec)
-        return rec, True
+        outbox_id = None
+        if outbox is not None:
+            topic, builder = outbox
+            outbox_id = uuid.uuid4()
+            self.outbox[outbox_id] = {
+                "id": outbox_id, "tenant_id": tenant_id, "topic": topic,
+                "payload": builder(rec), "sent": False,
+            }
+        return rec, True, outbox_id
+
+    async def outbox_mark_sent(self, outbox_id, tenant_id):
+        self.outbox[outbox_id]["sent"] = True
 
     async def list_turns(self, cid, tenant_id):
         return self.turns.get(cid, [])
@@ -87,7 +99,10 @@ class FakeDapr:
 @contextlib.asynccontextmanager
 async def fake_lifespan(app):
     from app.config import Config
-    app.state.cfg = Config()
+    # SPEC-W43 C1: this smoke suite exercises the standalone-dev path
+    # (direct ?tenant=/X-Tenant-ID selection) — the gateway-bound
+    # X-Tenant-Slugs matrix lives in tests/test_tenant_binding.py.
+    app.state.cfg = Config(trust_direct_tenant=True)
     app.state.db = FakeDB()
     app.state.sink = FakeSink()
     app.state.intel_sink = FakeSink()

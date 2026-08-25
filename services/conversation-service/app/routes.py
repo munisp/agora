@@ -25,53 +25,133 @@ def _tenant_header(x_tenant_id: Annotated[str | None, Header()] = None) -> uuid.
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid X-Tenant-ID header") from None
 
 
+def _parse_tenant_slugs(raw: str | None) -> list[str]:
+    """Gateway-injected X-Tenant-Slugs header (comma-separated slugs/uuids
+    from the validated JWT tenant_slugs claim — SPEC-W43 C1)."""
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _tenant_slugs_header(
+    x_tenant_slugs: Annotated[str | None, Header()] = None,
+) -> list[str]:
+    return _parse_tenant_slugs(x_tenant_slugs)
+
+
+async def _resolve_tenant_value(request: Request, value: str) -> uuid.UUID:
+    """Resolve a tenant selector (UUID fast path, else slug via identity)."""
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        pass
+    resolver = getattr(request.app.state, "tenant_resolver", None)
+    if resolver is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "tenant slug resolution unavailable",
+        )
+    try:
+        info = await resolver.by_slug(value)
+    except TenantNotFoundError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"tenant {value!r} not found"
+        ) from None
+    except TenantResolutionError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
+    return uuid.UUID(info.id)
+
+
+def _trust_direct(request: Request) -> bool:
+    """SPEC-W43 C1 standalone-dev escape (OPENDESK_TRUST_DIRECT_TENANT=1;
+    default OFF, never set in compose)."""
+    cfg = getattr(request.app.state, "cfg", None)
+    return bool(cfg is not None and getattr(cfg, "trust_direct_tenant", False))
+
+
 async def _require_tenant(
     request: Request,
     tenant: Annotated[str | None, Query()] = None,
     header_tenant: uuid.UUID | None = Depends(_tenant_header),
+    tenant_slugs: list[str] = Depends(_tenant_slugs_header),
 ) -> uuid.UUID:
-    """Tenant scope comes from ?tenant= or X-Tenant-ID (required by RLS).
+    """Tenant scope per SPEC-W43 C1 (gateway tenant binding).
 
-    J-14 fail-closed rule (SPEC-W42): a request whose tenant context cannot
-    be resolved NEVER reaches a tenant-scoped query with app.tenant_id
-    unset — missing scope is rejected 401 here (no app-level fallback
-    filtering on RLS tables), an unknown slug is 404, and an
-    identity-service outage with no cache is 502.
+    Tenant context comes from the gateway-injected X-Tenant-Slugs header
+    (comma-separated slugs/uuids from the validated JWT). An explicit
+    ?tenant= (or X-Tenant-ID) selector is honored ONLY when it exactly
+    matches one of the header entries — otherwise 403. Without an explicit
+    selector a single-entry header unambiguously selects that tenant; a
+    multi-tenant principal must name one (400 otherwise).
 
-    ?tenant= accepts a UUID (back-compat) OR a tenant slug (admin-web passes
-    the org slug, e.g. ?tenant=acme): non-UUID values are resolved through
-    identity-service via the app-state TenantResolver (Dapr invoke, same
-    mechanism as booking-service / analytics-pipeline). The X-Tenant-ID UUID
-    fast path is unchanged: a valid header UUID is used as-is."""
-    if tenant is not None:
-        try:
-            return uuid.UUID(tenant)
-        except ValueError:
-            pass
-        resolver = getattr(request.app.state, "tenant_resolver", None)
-        if resolver is None:
+    Standalone dev escape: with OPENDESK_TRUST_DIRECT_TENANT=1 (never set in
+    compose) the legacy behavior is restored — ?tenant=<uuid-or-slug> or
+    X-Tenant-ID selects the tenant directly.
+
+    J-14 fail-closed rule (SPEC-W42) still holds: a request whose tenant
+    context cannot be resolved NEVER reaches a tenant-scoped query with
+    app.tenant_id unset — missing scope is 401, an ungranted selector is
+    403, an unknown slug is 404, identity outage with no cache is 502.
+    """
+    if tenant_slugs:
+        explicit = tenant
+        if explicit is None and header_tenant is not None:
+            explicit = str(header_tenant)
+        if explicit is not None:
+            if explicit not in tenant_slugs:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "tenant selector not granted to the authenticated "
+                    "principal (must match X-Tenant-Slugs)",
+                )
+            return await _resolve_tenant_value(request, explicit)
+        if len(tenant_slugs) > 1:
             raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "tenant slug resolution unavailable",
+                status.HTTP_400_BAD_REQUEST,
+                "principal has multiple tenants; pass ?tenant= naming one "
+                "of the X-Tenant-Slugs entries",
             )
-        try:
-            info = await resolver.by_slug(tenant)
-        except TenantNotFoundError:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, f"tenant {tenant!r} not found"
-            ) from None
-        except TenantResolutionError as exc:
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
-        return uuid.UUID(info.id)
+        return await _resolve_tenant_value(request, tenant_slugs[0])
+
+    # No gateway header: only the documented dev escape permits direct
+    # tenant selection; otherwise there is no authenticated tenant context.
+    if not _trust_direct(request):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "tenant context required: X-Tenant-Slugs header (injected by "
+            "the gateway from the validated JWT)",
+        )
+    if tenant is not None:
+        return await _resolve_tenant_value(request, tenant)
     if header_tenant is None:
-        # J-14: fail closed — no tenant scope means NO tenant-scoped query
-        # runs (401, not an app-level filtered read with the GUC unset).
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "tenant scope required: ?tenant=<uuid-or-slug> query param or "
             "X-Tenant-ID header",
         )
     return header_tenant
+
+
+def _bind_body_tenant(request: Request, tenant_id: uuid.UUID) -> uuid.UUID:
+    """SPEC-W43 C1 for request bodies (POST /v1/conversations): body
+    tenant_id is honored only when it exactly matches an X-Tenant-Slugs
+    entry (else 403); without the gateway header the dev escape governs."""
+    slugs = _parse_tenant_slugs(request.headers.get("x-tenant-slugs"))
+    if slugs:
+        if str(tenant_id) not in slugs:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "body tenant_id not granted to the authenticated principal "
+                "(must match X-Tenant-Slugs)",
+            )
+        return tenant_id
+    if not _trust_direct(request):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "tenant context required: X-Tenant-Slugs header (injected by "
+            "the gateway from the validated JWT)",
+        )
+    return tenant_id
 
 
 def _state(request: Request) -> Any:
@@ -82,9 +162,13 @@ def _state(request: Request) -> Any:
 async def create_conversation(
     body: models.ConversationCreate, request: Request
 ) -> models.Conversation:
+    # SPEC-W43 C1: body.tenant_id is bound to the gateway-injected
+    # X-Tenant-Slugs header (exact match) — no unauthenticated tenant
+    # selection (dev escape: OPENDESK_TRUST_DIRECT_TENANT=1).
+    tenant_id = _bind_body_tenant(request, body.tenant_id)
     db = _state(request).db
     row = await db.create_conversation(
-        body.tenant_id, body.site_slug, body.channel, body.contact_phone
+        tenant_id, body.site_slug, body.channel, body.contact_phone
     )
     return models.Conversation(**dict(row))
 
@@ -188,13 +272,47 @@ async def _persist_turn(
     # optional LLM NER when INTEL_LLM=on (failure degrades to lexicon-only).
     enrichment = await intel.enrich_turn(text, st.cfg)
 
+    # Conversation context for the event subject + incident IDP. Fetched
+    # BEFORE the insert because the outbox payload is built inside the turn
+    # transaction (SPEC-W43 Y-08).
     try:
-        row, created = await st.db.add_turn(
+        conv = await st.db.get_conversation(conversation_id, tenant_id)
+    except NotFoundError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"conversation {conversation_id} not found"
+        ) from None
+    site_slug = conv["site_slug"]
+    conv_channel = conv["channel"]
+    contact_phone = conv["contact_phone"]
+
+    # SPEC-W34 GF3: this Dapr path bypasses the Fluvio pii-redact
+    # smartmodule, so phone/email PII is redacted BEFORE publishing — the
+    # event lands directly in Iceberg bronze.transcripts. The conversation
+    # DB keeps the original text; only the published event is redacted.
+    event_holder: dict[str, Any] = {}
+
+    def _build_turn_event(turn_row: Any) -> dict[str, Any]:
+        event = events.conversation_turn_event(
+            conversation_id=conversation_id,
+            tenant_id=tenant_id,
+            site_slug=site_slug,
+            role=turn_row["role"],
+            text=redact.redact_text(turn_row["text"]),
+            ts=turn_row["ts"],
+            audio_url=audio_url,
+            redacted=True,
+        )
+        event_holder["event"] = event
+        return event
+
+    try:
+        row, created, outbox_id = await st.db.add_turn(
             conversation_id, tenant_id, role, text, tool_calls,
             sentiment=enrichment["sentiment"],
             intent=enrichment["intent"],
             entities=enrichment["entities"],
             idempotency_key=idempotency_key,
+            outbox=(st.cfg.transcripts_topic, _build_turn_event),
         )
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(
@@ -212,19 +330,6 @@ async def _persist_turn(
     if not created:
         return turn, False
 
-    # Fetch site_slug for the event subject (plus channel/contact for the
-    # SPEC-W11 incident IDP context).
-    site_slug = ""
-    conv_channel = "voice"
-    contact_phone = None
-    try:
-        conv = await st.db.get_conversation(conversation_id, tenant_id)
-        site_slug = conv["site_slug"]
-        conv_channel = conv["channel"]
-        contact_phone = conv["contact_phone"]
-    except Exception:
-        pass
-
     # 1) raw record to the high-throughput transcript sink (Fluvio/Kafka)
     raw = {
         "conversationId": str(conversation_id),
@@ -240,26 +345,19 @@ async def _persist_turn(
                      conversation_id=str(conversation_id))
 
     # 2) CloudEvent to Kafka via Dapr pubsub `pubsub-kafka` (always, SPEC §4).
-    #    SPEC-W34 GF3: this path bypasses the Fluvio pii-redact smartmodule,
-    #    so redact phone/email PII here BEFORE publishing — the event lands
-    #    directly in Iceberg bronze.transcripts. The conversation DB keeps
-    #    the original text; only the published event is redacted.
-    redacted_text = redact.redact_text(turn.text)
-    event = events.conversation_turn_event(
-        conversation_id=conversation_id,
-        tenant_id=tenant_id,
-        site_slug=site_slug,
-        role=turn.role,
-        text=redacted_text,
-        ts=turn.ts,
-        audio_url=audio_url,
-        redacted=True,
-    )
+    #    SPEC-W43 Y-08: the event was already persisted to
+    #    conversation_outbox in the SAME tx as the turn insert. The inline
+    #    publish marks the row sent on success; on failure the row stays
+    #    unsent and the OutboxRelay republishes with backoff — a crash or
+    #    broker outage can never silently lose a transcript event.
+    event = event_holder["event"]
     try:
         await st.dapr.publish_event(st.cfg.transcripts_topic, event)
+        if outbox_id is not None:
+            await st.db.outbox_mark_sent(outbox_id, tenant_id)
     except Exception as exc:
-        st.log.error("dapr transcript publish failed", error=str(exc),
-                     conversation_id=str(conversation_id))
+        st.log.error("dapr transcript publish failed; outbox relay will retry",
+                     error=str(exc), conversation_id=str(conversation_id))
 
     # 3) Enriched turn to opendesk.conversation.enriched via aiokafka
     #    (SPEC-W3 §4, innovation 3; best-effort like the raw sink).
