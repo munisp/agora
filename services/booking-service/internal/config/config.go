@@ -4,224 +4,302 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// Config holds all booking-service configuration.
+// DevPortalSecretDefault is the checked-in development fallback for
+// PORTAL_SECRET (SPEC-W44 W-B/F16-5/S1-F6-02: fail-closed startup — the
+// gateway-edge config.rs validate() pattern). Booting with this value is a
+// startup error unless OPENDESK_DEV_INSECURE=1 explicitly opts into the
+// insecure dev posture.
+const DevPortalSecretDefault = "opendesk-dev-portal-secret-change-in-prod"
+
+// EnvDevInsecure (OPENDESK_DEV_INSECURE=1) explicitly opts into dev-insecure
+// defaults (currently: the checked-in PORTAL_SECRET fallback).
+const EnvDevInsecure = "OPENDESK_DEV_INSECURE"
+
+// Config holds all runtime configuration for booking-service.
 type Config struct {
-	// HTTP listen address, e.g. ":8080".
-	HTTPAddr string
-	// GRPCAddr is reserved for the future gRPC health/reflection endpoint.
-	GRPCAddr string
-
-	// Postgres DSN, e.g. postgres://user:pass@host:5432/booking?sslmode=disable
-	PostgresDSN string
-	// Max open connections to Postgres.
-	DBMaxOpenConns int
-	DBMaxIdleConns int
-	DBConnMaxLife  time.Duration
-
-	// Kafka bootstrap servers (comma separated) and topics.
-	KafkaBrokers  []string
-	TopicCommands string // opendesk.booking.commands
-	TopicEvents   string // opendesk.booking.events
-	TopicDLQ      string // opendesk.dlq
-	ConsumerGroup string
-
-	// Dapr sidecar HTTP endpoint, e.g. http://localhost:3500
-	DaprHTTPAddr string
-	// Dapr pub/sub component and state store names.
-	DaprPubSubName  string
-	DaprStateStore  string
-	DaprSecretStore string
-
-	// OIDC / JWT validation (Keycloak realm).
-	OIDCIssuer   string
-	OIDCAudience string
-	// If true, JWT signature validation is skipped (local dev only).
-	AuthDevMode bool
-
-	// Lending / credit-score integration.
-	LendingEnabled  bool
-	ScoreServiceURL string // e.g. http://localhost:8081 (mock) or internal DNS
-	ScoreMaxAmountCents int64
-
-	// Referral self-verify: requires booking.analytics.events projections.
-	ReferralSelfVerify bool
-
-	// Idempotency: dedup window for consumer keys.
-	IdempotencyTTL time.Duration
-
-	// Graceful shutdown timeout.
-	ShutdownTimeout time.Duration
-
-	// Observability.
-	LogLevel  string
-	LogFormat string // "json" or "text"
+	Port               int           // HTTP listen port (PORT, default 7002)
+	DatabaseURL        string        // postgres DSN for the booking DB (DATABASE_URL)
+	PGMaxConns         int32         // pgxpool MaxConns (PG_MAX_CONNS, default 20 — peak-sized per capacity runbook)
+	PermifyURL         string        // Permify HTTP API base (http://permify:3476)
+	DaprHost           string        // daprd host (default daprd-booking)
+	DaprHTTPPort       int           // daprd HTTP port (default 3500)
+	PubSubName         string        // Dapr pubsub component (pubsub-kafka)
+	BookingEventsTopic string        // opendesk.booking.events
+	IdentityAppID      string        // Dapr app-id of identity-service
+	IdentityBaseURL    string        // IDENTITY_BASE_URL: direct HTTP base for tenant resolution, bypassing Dapr (default empty = Dapr; used by tests and no-Dapr dev)
+	TemporalHostPort   string        // temporal:7233
+	TemporalNamespace  string        // opendesk
+	TemporalTaskQueue  string        // opendesk-main
+	KafkaBrokers       []string      // direct broker list for the command consumer
+	CommandsTopic      string        // opendesk.booking.commands
+	CommandsGroup      string        // consumer group id
+	DLQTopic           string        // opendesk.dlq
+	PrivacyEventsTopic string        // opendesk.privacy.events (GDPR erase tombstones)
+	PrivacyGroup       string        // consumer group of the privacy erase consumer
+	RedisAddr          string        // REDIS_ADDR for the availability cache (empty = cache disabled)
+	CacheTTL           time.Duration // availability cache entry TTL (CACHE_TTL_SECONDS, default 120s)
+	CacheStaleTTL      time.Duration // serve-stale window after CacheTTL (CACHE_STALE_TTL_SECONDS, default 15min)
+	UsageEventsTopic   string        // opendesk.usage.events (usage metering, Wave 5 #9; empty disables)
+	IdentityCacheTTL   time.Duration // tenant-context resolver cache TTL (TENANT_CACHE_TTL_SECONDS, default 5min)
+	OutboxPollInterval time.Duration // outbox dispatcher poll cadence
+	ShutdownTimeout    time.Duration
+	AuthzDisabled      bool   // dev escape hatch: skip Permify checks (AUTHZ_DISABLED=true)
+	AuthzOutagePolicy  string // fail_closed (default) | fail_open — behavior when Permify itself errors
+	ConsumerEnabled    bool   // run the Kafka command consumer (default true)
+	// Pending-booking saga sweeper (SPEC-W43 K-08): re-drives
+	// StartBookingSaga for pending rows whose saga start failed at create.
+	BookingSweeperEnabled  bool          // BOOKING_SWEEPER_ENABLED (default true)
+	BookingSweeperInterval time.Duration // BOOKING_SWEEPER_INTERVAL_SECONDS (default 120)
+	// Customer portal (Wave 5 #7)
+	PortalSecret       string // HMAC secret signing 15-min portal JWTs (PORTAL_SECRET)
+	NotificationsTopic string // opendesk.notifications.outbox (SendPortalCode delivery)
+	// InternalToken gates the service-to-service internauth middleware
+	// (SPEC-W44 W-B/S1-F7-05, K2): POST /v1/civic/internal/cases/{ref}/sla-breach.
+	// BOOKING_INTERNAL_TOKEN; NO default — unset fails the guarded routes
+	// closed (503).
+	InternalToken string
+	// IdentityInternalToken is forwarded as X-Internal-Token on booking→identity
+	// service calls (SPEC-W44 W-B, K2): the appgate entitlement check and the
+	// tenant-resolution GET /v1/tenants/{slug}. IDENTITY_INTERNAL_TOKEN; no
+	// default — unset is a boot WARN (identity answers 503/401), never a
+	// startup error (other gates own that).
+	IdentityInternalToken string
+	// Geospatial (SPEC-W8 Part A)
+	GeocodeEnabled   bool   // GEOCODE_ENABLED: Nominatim address geocoding hook (default false)
+	GeocodeBaseURL   string // GEOCODE_BASE_URL (default https://nominatim.openstreetmap.org)
+	GeoCampaignBatch int    // GEO_CAMPAIGN_BATCH: recipients per campaign batch (default 50)
+	// Incidents (SPEC-W11 Part B)
+	IncidentsTopic       string // opendesk.incidents (IDP ingestion)
+	IncidentsGroup       string // consumer group booking-incidents
+	IncidentAutoDispatch bool   // INCIDENT_AUTO_DISPATCH: auto-deliver new incidents to active endpoints (default true)
+	// Leads / CAC (SPEC-W13 Agent A)
+	CACEventsTopic                string // cac.events funnel topic (CAC_EVENTS_TOPIC; empty disables emission)
+	LeadAttributionFirstTouchOnly bool   // LEAD_ATTRIBUTION_FIRST_TOUCH_ONLY (default true)
+	// Referrals + commissions (SPEC-W14, contract §7)
+	CommissionsEnabled bool   // COMMISSIONS_ENABLED (default true; false → referral/commission endpoints 503)
+	PayoutProvider     string // PAYOUT_PROVIDER (default paystack; Agent B payout execution)
+	PayoutMinNGN       int64  // PAYOUT_MIN_NGN (default 100 — minimum payout, naira)
+	ReconCron          string // RECON_CRON (default "30 2 * * *" — commission-recon-nightly, Africa/Lagos 02:30)
+	// CommissionMaturitySeconds (SPEC-W44 W-B/S1-F7-08): how old a
+	// commission-ledger accrual must be before its balance feeds the payout
+	// queue (COMMISSION_MATURITY_SECONDS, default 0 = immediately matured).
+	CommissionMaturitySeconds int
+	// Field capture (SPEC-W16 Agent B, contract §4)
+	FieldCaptureBatchLimit int // FIELD_CAPTURE_BATCH_LIMIT: max offline-queue items per POST /v1/field/capture (default 100)
+	// Civic reporting (SPEC-W32 WS-A)
+	CivicEventsTopic       string // CIVIC_EVENTS_TOPIC (default opendesk.civic.events.v1; empty disables emission)
+	CivicPublicRatePerHour int    // CIVIC_PUBLIC_RATE_PER_HOUR: public intake per-IP+per-phone hourly limit (default 10; <=0 disables)
+	CivicPublicRatePerDay  int    // CIVIC_PUBLIC_RATE_PER_DAY: public intake per-IP+per-phone daily limit (default 50; <=0 disables)
+	// App entitlement gate (SPEC-W18 Agent D, contract §4)
+	AppGateEnabled  bool          // APP_GATE_ENABLED: DEFAULT false → gate is a pure pass-through; production behavior UNCHANGED unless opted in
+	AppGateCacheTTL time.Duration // APP_GATE_CACHE_TTL_SECONDS: entitlement decision cache TTL (default 60s)
+	// Helpdesk app (SPEC-W19 Agent A; integrator-wired)
+	HelpdeskEventsTopic string // HELPDESK_EVENTS_TOPIC (default opendesk.helpdesk.events.v1; empty disables emission)
+	HelpdeskUsageTopic  string // HELPDESK_USAGE_TOPIC (default opendesk.usage.events; empty disables metering)
+	HelpdeskDBMaxConns  int32  // HELPDESK_DB_MAX_CONNS: dedicated pool size (default 4, devices idiom)
+	// Field-service app (SPEC-W19 Agent B; integrator-wired)
+	WorkordersNotificationsTopic string // WORKORDERS_NOTIFICATIONS_TOPIC (default opendesk.notifications.outbox; empty disables dispatch push)
+	WorkordersUsageTopic         string // WORKORDERS_USAGE_TOPIC (default opendesk.usage.events; empty disables metering)
+	WorkordersFSMEventsTopic     string // WORKORDERS_FSM_EVENTS_TOPIC (default opendesk.fsm.events.v1; empty disables events)
+	// Loyalty-wallet app (SPEC-W19 Agent C; integrator-wired). Metering rides
+	// the existing UsageEventsTopic (USAGE_EVENTS_TOPIC).
+	LoyaltyEventsTopic string // LOYALTY_EVENTS_TOPIC (default opendesk.loyalty.events.v1; empty disables events)
+	// Campaign-studio app (SPEC-W19 Agent D; integrator-wired)
+	StudioDatabaseURL string // STUDIO_DATABASE_URL (default "" → falls back to DATABASE_URL)
+	StudioStepBatch   int    // STUDIO_STEP_BATCH: enrollments advanced per step call (default 200)
+	StudioEventsTopic string // STUDIO_EVENTS_TOPIC (default opendesk.studio.events.v1; empty disables events)
+	// CRM-360 app (SPEC-W20 Agent A; integrator-wired). No metering
+	// (internal-ops app, contract §4).
+	CRM360EventsTopic string // CRM360_EVENTS_TOPIC (default opendesk.crm.events.v1; empty disables events)
+	// Surveys/VoC app (SPEC-W20 Agent B; integrator-wired). Metering
+	// (survey_response_received) rides the existing UsageEventsTopic
+	// (USAGE_EVENTS_TOPIC) — same posture as loyalty (SPEC-W19 Agent C).
+	SurveysEventsTopic        string // SURVEYS_EVENTS_TOPIC (default opendesk.surveys.events.v1; empty disables events)
+	SurveysNotificationsTopic string // SURVEYS_NOTIFICATIONS_TOPIC (default opendesk.notifications.outbox; empty disables invite sends)
+	SurveysPublicBaseURL      string // SURVEYS_PUBLIC_BASE_URL (default https://app.opendesk.ng/s — invite link base)
+	SurveysDatabaseURL        string // SURVEYS_DATABASE_URL (default "" → falls back to DATABASE_URL)
+	// Lending app (SPEC-W20 Agent C; integrator-wired). Metering
+	// (loan_disbursed) rides UsageEventsTopic.
+	LendingEventsTopic string // LENDING_EVENTS_TOPIC (default opendesk.lending.events.v1; empty disables events)
+	LendingKYCURL      string // LENDING_KYC_URL (default "" → kyc-service not wired; approvals require explicit kyc_override)
+	// LendingKYCOverrideRoles (SPEC-W44 W-B/S1-F7-07): csv of realm roles
+	// allowed to use the kyc_override approve path
+	// (LENDING_KYC_OVERRIDE_ROLES, default "platform-admin").
+	LendingKYCOverrideRoles string
+	// Workforce app (SPEC-W20 Agent D; integrator-wired). No metering
+	// (internal-ops app, contract §4).
+	WorkforceEventsTopic string // WORKFORCE_EVENTS_TOPIC (default opendesk.workforce.events.v1; empty disables events)
+	// Social Publisher app (SPEC-W21 Agent B; integrator-wired). Metering
+	// (social_ad_launched) rides UsageEventsTopic — same posture as
+	// lending. The mock switches are strings (not bools) so the provider
+	// package's MockEnabled can apply its "explicit truthy → mock" rule;
+	// W39 SIM-005: every mock switch defaults OFF (fail closed — the
+	// honest real-API stub), the deterministic mock is a dev opt-in.
+	SocialEventsTopic string // SOCIAL_EVENTS_TOPIC (default opendesk.social.events.v1; empty disables events)
+	SocialMock        string // SOCIAL_MOCK (default "0" — master provider mock switch, opt-in)
+	MetaMock          string // META_MOCK (default "0")
+	TikTokMock        string // TIKTOK_MOCK (default "0")
+	XMock             string // X_MOCK (default "0")
 }
 
-// Load reads configuration from environment variables, applying defaults
-// that match deploy/k3s/booking-deployment.yaml and docker-compose.yml.
-func Load() (*Config, error) {
-	c := &Config{
-		HTTPAddr:            getEnv("HTTP_ADDR", ":8080"),
-		GRPCAddr:            getEnv("GRPC_ADDR", ":9090"),
-		PostgresDSN:         getEnv("POSTGRES_DSN", "postgres://booking:booking@localhost:5432/booking?sslmode=disable"),
-		DBMaxOpenConns:      getEnvInt("DB_MAX_OPEN_CONNS", 25),
-		DBMaxIdleConns:      getEnvInt("DB_MAX_IDLE_CONNS", 5),
-		DBConnMaxLife:       getEnvDur("DB_CONN_MAX_LIFE", 30*time.Minute),
-		KafkaBrokers:        splitCSV(getEnv("KAFKA_BROKERS", "localhost:9092")),
-		TopicCommands:       getEnv("TOPIC_COMMANDS", "opendesk.booking.commands"),
-		TopicEvents:         getEnv("TOPIC_EVENTS", "opendesk.booking.events"),
-		TopicDLQ:            getEnv("TOPIC_DLQ", "opendesk.dlq"),
-		ConsumerGroup:       getEnv("CONSUMER_GROUP", "booking-service"),
-		DaprHTTPAddr:        getEnv("DAPR_HTTP_ADDR", "http://localhost:3500"),
-		DaprPubSubName:      getEnv("DAPR_PUBSUB_NAME", "kafka-pubsub"),
-		DaprStateStore:      getEnv("DAPR_STATE_STORE", "booking-state"),
-		DaprSecretStore:     getEnv("DAPR_SECRET_STORE", "opendesk-secrets"),
-		OIDCIssuer:          getEnv("OIDC_ISSUER", "http://localhost:8180/realms/opendesk"),
-		OIDCAudience:        getEnv("OIDC_AUDIENCE", "opendesk"),
-		AuthDevMode:         getEnvBool("AUTH_DEV_MODE", false),
-		LendingEnabled:      getEnvBool("LENDING_ENABLED", false),
-		ScoreServiceURL:     getEnv("SCORE_SERVICE_URL", "http://localhost:8081"),
-		ScoreMaxAmountCents: getEnvInt64("SCORE_MAX_AMOUNT_CENTS", 5000000),
-		ReferralSelfVerify:  getEnvBool("REFERRAL_SELF_VERIFY", false),
-		IdempotencyTTL:      getEnvDur("IDEMPOTENCY_TTL", 24*time.Hour),
-		ShutdownTimeout:     getEnvDur("SHUTDOWN_TIMEOUT", 15*time.Second),
-		LogLevel:            getEnv("LOG_LEVEL", "info"),
-		LogFormat:           getEnv("LOG_FORMAT", "json"),
+// Load reads configuration from the environment.
+func Load() (Config, error) {
+	cfg := Config{
+		Port:        envInt("PORT", 7002),
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		// Voice turns fan out into availability lookups; default 20 covers
+		// ~10 peak concurrent calls at 2 mid-call turns each (runbook §DB).
+		PGMaxConns:         int32(envInt("PG_MAX_CONNS", 20)),
+		PermifyURL:         envStr("PERMIFY_URL", "http://permify:3476"),
+		DaprHost:           envStr("DAPR_HOST", "daprd-booking"),
+		DaprHTTPPort:       envInt("DAPR_HTTP_PORT", 3500),
+		PubSubName:         envStr("DAPR_PUBSUB_NAME", "pubsub-kafka"),
+		BookingEventsTopic: envStr("BOOKING_EVENTS_TOPIC", "opendesk.booking.events"),
+		IdentityAppID:      envStr("IDENTITY_APP_ID", "identity"),
+		// IDENTITY_BASE_URL (used by tests and no-Dapr dev): when set,
+		// TenantResolver.BySlug issues a direct HTTP GET
+		// {IDENTITY_BASE_URL}/v1/tenants/{slug} instead of Dapr service
+		// invocation. Empty = unchanged Dapr behavior.
+		IdentityBaseURL:    os.Getenv("IDENTITY_BASE_URL"),
+		TemporalHostPort:   envStr("TEMPORAL_HOST_PORT", "temporal:7233"),
+		TemporalNamespace:  envStr("TEMPORAL_NAMESPACE", "opendesk"),
+		TemporalTaskQueue:  envStr("TEMPORAL_TASK_QUEUE", "opendesk-main"),
+		KafkaBrokers:       strings.Split(envStr("KAFKA_BROKERS", "kafka:9092"), ","),
+		CommandsTopic:      envStr("BOOKING_COMMANDS_TOPIC", "opendesk.booking.commands"),
+		CommandsGroup:      envStr("BOOKING_COMMANDS_GROUP", "booking-service-commands"),
+		DLQTopic:           envStr("DLQ_TOPIC", "opendesk.dlq"),
+		PrivacyEventsTopic: envStr("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
+		PrivacyGroup:       envStr("PRIVACY_EVENTS_GROUP", "booking-service-privacy"),
+		RedisAddr:          os.Getenv("REDIS_ADDR"),
+		CacheTTL:           time.Duration(envInt("CACHE_TTL_SECONDS", 120)) * time.Second,
+		CacheStaleTTL:      time.Duration(envInt("CACHE_STALE_TTL_SECONDS", 900)) * time.Second,
+		UsageEventsTopic:   envStr("USAGE_EVENTS_TOPIC", "opendesk.usage.events"),
+		IdentityCacheTTL:   time.Duration(envInt("TENANT_CACHE_TTL_SECONDS", 300)) * time.Second,
+		OutboxPollInterval: time.Duration(envInt("OUTBOX_POLL_INTERVAL_SECONDS", 2)) * time.Second,
+		ShutdownTimeout:    time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
+		AuthzDisabled:      envStr("AUTHZ_DISABLED", "false") == "true",
+		AuthzOutagePolicy:  envStr("AUTHZ_OUTAGE_POLICY", "fail_closed"),
+		ConsumerEnabled:    envStr("CONSUMER_ENABLED", "true") == "true",
+		// SPEC-W43 K-08: pending-booking saga sweeper — ON by default.
+		BookingSweeperEnabled:  envStr("BOOKING_SWEEPER_ENABLED", "true") == "true",
+		BookingSweeperInterval: time.Duration(envInt("BOOKING_SWEEPER_INTERVAL_SECONDS", 120)) * time.Second,
+		// Dev fallback keeps the portal bootable locally under
+		// OPENDESK_DEV_INSECURE=1; prod MUST override (fail-closed below).
+		PortalSecret:                  envStr("PORTAL_SECRET", DevPortalSecretDefault),
+		NotificationsTopic:            envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		InternalToken:                 os.Getenv("BOOKING_INTERNAL_TOKEN"),
+		IdentityInternalToken:         os.Getenv("IDENTITY_INTERNAL_TOKEN"),
+		GeocodeEnabled:                envStr("GEOCODE_ENABLED", "false") == "true",
+		GeocodeBaseURL:                envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
+		GeoCampaignBatch:              envInt("GEO_CAMPAIGN_BATCH", 50),
+		IncidentsTopic:                envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
+		IncidentsGroup:                envStr("INCIDENTS_GROUP", "booking-incidents"),
+		IncidentAutoDispatch:          envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",
+		CACEventsTopic:                envStr("CAC_EVENTS_TOPIC", "cac.events"),
+		LeadAttributionFirstTouchOnly: envStr("LEAD_ATTRIBUTION_FIRST_TOUCH_ONLY", "true") == "true",
+		CommissionsEnabled:            envStr("COMMISSIONS_ENABLED", "true") == "true",
+		PayoutProvider:                envStr("PAYOUT_PROVIDER", "paystack"),
+		PayoutMinNGN:                  int64(envInt("PAYOUT_MIN_NGN", 100)),
+		ReconCron:                     envStr("RECON_CRON", "30 2 * * *"),
+		CommissionMaturitySeconds:     envInt("COMMISSION_MATURITY_SECONDS", 0),
+		FieldCaptureBatchLimit:        envInt("FIELD_CAPTURE_BATCH_LIMIT", 100),
+		// SPEC-W32 WS-A (additive): civic reporting module.
+		CivicEventsTopic:       envStr("CIVIC_EVENTS_TOPIC", "opendesk.civic.events.v1"),
+		CivicPublicRatePerHour: envInt("CIVIC_PUBLIC_RATE_PER_HOUR", 10),
+		CivicPublicRatePerDay:  envInt("CIVIC_PUBLIC_RATE_PER_DAY", 50),
+		// SPEC-W18 Agent D (additive): off by default — opt-in only.
+		AppGateEnabled:  envStr("APP_GATE_ENABLED", "false") == "true",
+		AppGateCacheTTL: time.Duration(envInt("APP_GATE_CACHE_TTL_SECONDS", 60)) * time.Second,
+		// SPEC-W19 integrator (additive): the four enterprise apps are
+		// functional with zero config — every default matches the package
+		// doc contracts; empty string disables the corresponding emission.
+		HelpdeskEventsTopic:          envStr("HELPDESK_EVENTS_TOPIC", "opendesk.helpdesk.events.v1"),
+		HelpdeskUsageTopic:           envStr("HELPDESK_USAGE_TOPIC", "opendesk.usage.events"),
+		HelpdeskDBMaxConns:           int32(envInt("HELPDESK_DB_MAX_CONNS", 4)),
+		WorkordersNotificationsTopic: envStr("WORKORDERS_NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		WorkordersUsageTopic:         envStr("WORKORDERS_USAGE_TOPIC", "opendesk.usage.events"),
+		WorkordersFSMEventsTopic:     envStr("WORKORDERS_FSM_EVENTS_TOPIC", "opendesk.fsm.events.v1"),
+		LoyaltyEventsTopic:           envStr("LOYALTY_EVENTS_TOPIC", "opendesk.loyalty.events.v1"),
+		StudioDatabaseURL:            os.Getenv("STUDIO_DATABASE_URL"),
+		StudioStepBatch:              envInt("STUDIO_STEP_BATCH", 200),
+		StudioEventsTopic:            envStr("STUDIO_EVENTS_TOPIC", "opendesk.studio.events.v1"),
+		// SPEC-W20 integrator (additive): the four batch-2 enterprise apps
+		// are functional with zero config — every default matches the
+		// package doc contracts; empty string disables the corresponding
+		// emission (or, for LENDING_KYC_URL, switches approvals to
+		// override-only mode).
+		CRM360EventsTopic:         envStr("CRM360_EVENTS_TOPIC", "opendesk.crm.events.v1"),
+		SurveysEventsTopic:        envStr("SURVEYS_EVENTS_TOPIC", "opendesk.surveys.events.v1"),
+		SurveysNotificationsTopic: envStr("SURVEYS_NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		SurveysPublicBaseURL:      envStr("SURVEYS_PUBLIC_BASE_URL", "https://app.opendesk.ng/s"),
+		SurveysDatabaseURL:        os.Getenv("SURVEYS_DATABASE_URL"),
+		LendingEventsTopic:        envStr("LENDING_EVENTS_TOPIC", "opendesk.lending.events.v1"),
+		LendingKYCURL:             os.Getenv("LENDING_KYC_URL"),
+		LendingKYCOverrideRoles:   envStr("LENDING_KYC_OVERRIDE_ROLES", "platform-admin"),
+		WorkforceEventsTopic:      envStr("WORKFORCE_EVENTS_TOPIC", "opendesk.workforce.events.v1"),
+		// SPEC-W21 integrator (additive): social-publisher — the events
+		// default matches the package doc contract (empty disables
+		// emission). W39 SIM-005: every provider mock switch defaults OFF
+		// (fail closed — the honest real-API stub answers "not
+		// configured"); the deterministic mock is an explicit dev opt-in.
+		SocialEventsTopic: envStr("SOCIAL_EVENTS_TOPIC", "opendesk.social.events.v1"),
+		SocialMock:        envStr("SOCIAL_MOCK", "0"),
+		MetaMock:          envStr("META_MOCK", "0"),
+		TikTokMock:        envStr("TIKTOK_MOCK", "0"),
+		XMock:             envStr("X_MOCK", "0"),
 	}
-	if err := c.Validate(); err != nil {
-		return nil, err
+	if cfg.DatabaseURL == "" {
+		return cfg, fmt.Errorf("DATABASE_URL is required")
 	}
-	return c, nil
+	// SPEC-W44 W-B (F16-5/S1-F6-02): fail closed on the checked-in dev
+	// PORTAL_SECRET (gateway-edge config.rs validate() pattern). The only
+	// escape is the explicit OPENDESK_DEV_INSECURE=1 dev opt-in.
+	if cfg.PortalSecret == DevPortalSecretDefault && os.Getenv(EnvDevInsecure) != "1" {
+		return cfg, fmt.Errorf("PORTAL_SECRET is set to the checked-in dev default (%q); set a real secret, or %s=1 to opt into the insecure dev posture",
+			DevPortalSecretDefault, EnvDevInsecure)
+	}
+	return cfg, nil
 }
 
-// Validate enforces invariants that would otherwise fail at runtime deep
-// inside the service. Called by Load and by tests.
-func (c *Config) Validate() error {
-	if c.HTTPAddr == "" {
-		return fmt.Errorf("config: HTTP_ADDR must not be empty")
+// databaseURL resolves the booking DB DSN. DATABASE_URL wins; otherwise the
+// DSN is constructed from PG_DSN (base) + PG_DATABASE with an optional
+// PG_USER/PG_PASS credential override (per-service DB roles, SPEC-W3 §2).
+// The default credentials stay opendesk/opendesk for local dev.
+func databaseURL() string {
+	if v := os.Getenv("DATABASE_URL"); v != "" {
+		return v
 	}
-	if !strings.HasPrefix(c.HTTPAddr, ":") && !strings.Contains(c.HTTPAddr, ":") {
-		return fmt.Errorf("config: HTTP_ADDR %q must be host:port or :port", c.HTTPAddr)
+	base := envStr("PG_DSN", "postgres://opendesk:opendesk@postgres:5432")
+	u, err := url.Parse(base)
+	if err != nil {
+		return ""
 	}
-	if c.PostgresDSN == "" {
-		return fmt.Errorf("config: POSTGRES_DSN must not be empty")
+	if user := os.Getenv("PG_USER"); user != "" {
+		u.User = url.UserPassword(user, os.Getenv("PG_PASS"))
 	}
-	if !strings.HasPrefix(c.PostgresDSN, "postgres://") && !strings.HasPrefix(c.PostgresDSN, "postgresql://") {
-		return fmt.Errorf("config: POSTGRES_DSN must be a postgres:// URL")
-	}
-	if len(c.KafkaBrokers) == 0 {
-		return fmt.Errorf("config: KAFKA_BROKERS must not be empty")
-	}
-	for _, b := range c.KafkaBrokers {
-		if !strings.Contains(b, ":") {
-			return fmt.Errorf("config: KAFKA_BROKERS entry %q must be host:port", b)
-		}
-	}
-	if c.TopicCommands == "" || c.TopicEvents == "" || c.TopicDLQ == "" {
-		return fmt.Errorf("config: topic names must not be empty")
-	}
-	if c.TopicCommands == c.TopicEvents || c.TopicCommands == c.TopicDLQ || c.TopicEvents == c.TopicDLQ {
-		return fmt.Errorf("config: topics must be distinct")
-	}
-	if c.ConsumerGroup == "" {
-		return fmt.Errorf("config: CONSUMER_GROUP must not be empty")
-	}
-	if c.DaprHTTPAddr == "" {
-		return fmt.Errorf("config: DAPR_HTTP_ADDR must not be empty")
-	}
-	if c.DBMaxOpenConns < 1 {
-		return fmt.Errorf("config: DB_MAX_OPEN_CONNS must be >= 1")
-	}
-	if c.DBMaxIdleConns > c.DBMaxOpenConns {
-		return fmt.Errorf("config: DB_MAX_IDLE_CONNS (%d) must be <= DB_MAX_OPEN_CONNS (%d)", c.DBMaxIdleConns, c.DBMaxOpenConns)
-	}
-	if c.IdempotencyTTL < time.Minute {
-		return fmt.Errorf("config: IDEMPOTENCY_TTL must be >= 1m, got %s", c.IdempotencyTTL)
-	}
-	if c.ShutdownTimeout < time.Second {
-		return fmt.Errorf("config: SHUTDOWN_TIMEOUT must be >= 1s, got %s", c.ShutdownTimeout)
-	}
-	if c.LendingEnabled {
-		if !strings.HasPrefix(c.ScoreServiceURL, "http://") && !strings.HasPrefix(c.ScoreServiceURL, "https://") {
-			return fmt.Errorf("config: SCORE_SERVICE_URL must be an http(s) URL when LENDING_ENABLED")
-		}
-		if c.ScoreMaxAmountCents <= 0 {
-			return fmt.Errorf("config: SCORE_MAX_AMOUNT_CENTS must be > 0 when LENDING_ENABLED")
-		}
-	}
-	if !c.AuthDevMode && c.OIDCIssuer == "" {
-		return fmt.Errorf("config: OIDC_ISSUER must not be empty unless AUTH_DEV_MODE")
-	}
-	switch strings.ToLower(c.LogLevel) {
-	case "debug", "info", "warn", "error":
-	default:
-		return fmt.Errorf("config: LOG_LEVEL %q invalid", c.LogLevel)
-	}
-	switch strings.ToLower(c.LogFormat) {
-	case "json", "text":
-	default:
-		return fmt.Errorf("config: LOG_FORMAT %q invalid", c.LogFormat)
-	}
-	return nil
+	u.Path = "/" + strings.TrimPrefix(envStr("PG_DATABASE", "booking"), "/")
+	return u.String()
 }
 
-func getEnv(key, def string) string {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
+func envStr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func getEnvInt(key string, def int) int {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
 	}
 	return def
-}
-
-func getEnvInt64(key string, def int64) int64 {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
-func getEnvBool(key string, def bool) bool {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
-	}
-	return def
-}
-
-func getEnvDur(key string, def time.Duration) time.Duration {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		if dd, err := time.ParseDuration(v); err == nil {
-			return dd
-		}
-	}
-	return def
-}
-
-func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
