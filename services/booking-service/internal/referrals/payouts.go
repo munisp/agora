@@ -656,8 +656,11 @@ func (s *PayoutStore) MarkFailed(ctx context.Context, tenantID, id uuid.UUID, re
 }
 
 // ReconCandidates returns payouts needing reconciliation (contract §5):
-// still processing (in-flight or stuck), or paid within the last 72h
-// (provider could still report a reversal).
+// still processing (in-flight or stuck), paid within the last 72h
+// (provider could still report a reversal), or failed WITH a provider_ref
+// (SPEC-W43 K-12: a payout marked failed after the provider acknowledged a
+// reference is not recon-blind — the provider may still report success for
+// money that actually moved).
 //
 // NOTE (RLS): cross-tenant reconciliation path — like the outbox
 // dispatcher it intentionally runs outside withTenant; the nightly recon
@@ -670,6 +673,7 @@ func (s *PayoutStore) ReconCandidates(ctx context.Context, limit int) ([]Payout,
 		`SELECT `+payoutCols+` FROM commission_payouts
 		 WHERE status='processing'
 		    OR (status='paid' AND paid_at > now() - interval '72 hours')
+		    OR (status='failed' AND provider_ref <> '')
 		 ORDER BY created_at LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -684,6 +688,74 @@ func (s *PayoutStore) ReconCandidates(ctx context.Context, limit int) ([]Payout,
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// MaturedPayoutCandidate is one (tenant, beneficiary) whose matured
+// commission_payable (account 300) balance reaches the payout floor and has
+// NO open payout (SPEC-W44 W-B/S1-F7-08 payout feeding).
+type MaturedPayoutCandidate struct {
+	TenantID      uuid.UUID `json:"tenant_id"`
+	BeneficiaryID string    `json:"beneficiary_id"`
+	BalanceKobo   int64     `json:"balance_kobo"`
+}
+
+// MaturedPayoutCandidates scans the commission ledger for account-300
+// (commission_payable) beneficiary balances whose accruals are all at least
+// `maturity` old (cutoff = now − maturity; COMMISSION_MATURITY_SECONDS,
+// default 0 = everything is matured) and that reach floorKobo, EXCLUDING
+// (tenant, beneficiary) pairs with an open (queued|processing) payout —
+// the balance is only re-fed after the in-flight payout settles.
+//
+// NOTE (RLS): cross-tenant scan path — like ReconCandidates it
+// intentionally runs outside withTenant; the nightly feed is a
+// platform-level cron, not a tenant request.
+func (s *PayoutStore) MaturedPayoutCandidates(ctx context.Context, floorKobo int64, maturity time.Duration, limit int) ([]MaturedPayoutCandidate, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	if maturity < 0 {
+		maturity = 0
+	}
+	cutoff := time.Now().UTC().Add(-maturity)
+	rows, err := s.pool.Query(ctx,
+		`SELECT l.tenant_id, l.beneficiary_id, SUM(l.credit_ngn) - SUM(l.debit_ngn) AS balance
+		 FROM commission_ledger l
+		 WHERE l.account_code = 300 AND l.beneficiary_id <> '' AND l.created_at <= $1
+		 GROUP BY l.tenant_id, l.beneficiary_id
+		 HAVING SUM(l.credit_ngn) - SUM(l.debit_ngn) >= $2
+		    AND NOT EXISTS (SELECT 1 FROM commission_payouts p
+		                    WHERE p.tenant_id = l.tenant_id AND p.beneficiary_id = l.beneficiary_id
+		                      AND p.status IN ('queued','processing'))
+		 ORDER BY balance DESC LIMIT $3`, cutoff, floorKobo, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MaturedPayoutCandidate
+	for rows.Next() {
+		var c MaturedPayoutCandidate
+		if err := rows.Scan(&c.TenantID, &c.BeneficiaryID, &c.BalanceKobo); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// TenantSlug resolves a tenant's slug via the sites registry (the same
+// source the saga sweeper's ResolveSlug uses); "" when the tenant has no
+// site row yet — the slug is only the CloudEvent subject / payload context,
+// never a correctness input of the payout itself.
+func (s *PayoutStore) TenantSlug(ctx context.Context, tenantID uuid.UUID) string {
+	var slug string
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT tenant_slug FROM sites WHERE tenant_id=$1 ORDER BY created_at LIMIT 1`, tenantID).Scan(&slug)
+	})
+	if err != nil {
+		return ""
+	}
+	return slug
 }
 
 // EnqueueOutbox appends one row to the transactional outbox (mirrors
@@ -712,6 +784,10 @@ type PayoutActivities struct {
 	Provider PayoutProvider
 	// MinKobo is the payout floor in kobo (PAYOUT_MIN_NGN × 100).
 	MinKobo int64
+	// Maturity is how old a commission accrual must be before its balance
+	// feeds the payout queue (COMMISSION_MATURITY_SECONDS, default 0 =
+	// immediately matured). Read by FeedMatured (SPEC-W44 W-B/S1-F7-08).
+	Maturity time.Duration
 	// UsageTopic is opendesk.usage.events (empty disables metering).
 	UsageTopic string
 	Logger     *zap.Logger
@@ -722,6 +798,61 @@ func (a *PayoutActivities) log() *zap.Logger {
 		return a.Logger
 	}
 	return zap.NewNop()
+}
+
+// ---------------------------------------------------------------------------
+// Payout feeding (SPEC-W44 W-B/S1-F7-08)
+// ---------------------------------------------------------------------------
+
+// FedPayout is one payout queued by FeedMatured: the recon workflow fans a
+// CommissionPayoutWorkflow child out per entry (deterministic child ID
+// "commission-payout-{payoutID}", REJECT_DUPLICATE → double-feeds are
+// dropped, not double-paid).
+type FedPayout struct {
+	TenantID   string `json:"tenant_id"`
+	TenantSlug string `json:"tenant_slug"`
+	PayoutID   string `json:"payout_id"`
+}
+
+// FeedMaturedInput bounds one feed cycle.
+type FeedMaturedInput struct {
+	Limit int `json:"limit,omitempty"` // candidates per run (default 200, cap 1000)
+}
+
+// FeedMatured (ActivityPayoutFeed): finds matured commission_payable
+// (account-300) beneficiary balances at/above the floor with NO open
+// payout, queues a payout row per candidate, and returns the queued ids
+// (with tenant slugs resolved via the sites registry) so the recon workflow
+// can fan out CommissionPayoutWorkflow children. Creating the payout row IS
+// the "open-payout exclusion" fence for the next cycle — a beneficiary
+// feeds at most one in-flight payout at a time.
+func (a *PayoutActivities) FeedMatured(ctx context.Context, in FeedMaturedInput) ([]FedPayout, error) {
+	candidates, err := a.Store.MaturedPayoutCandidates(ctx, a.MinKobo, a.Maturity, in.Limit)
+	if err != nil {
+		return nil, err
+	}
+	provider := ProviderPaystack
+	if a.Provider != nil {
+		provider = a.Provider.Name()
+	}
+	fed := make([]FedPayout, 0, len(candidates))
+	for _, c := range candidates {
+		p := Payout{
+			TenantID:      c.TenantID,
+			BeneficiaryID: c.BeneficiaryID,
+			AmountNGN:     c.BalanceKobo,
+			Provider:      provider,
+		}
+		if err := a.Store.CreatePayout(ctx, &p); err != nil {
+			return fed, fmt.Errorf("feed payout for %s/%s: %w", c.TenantID, c.BeneficiaryID, err)
+		}
+		fed = append(fed, FedPayout{
+			TenantID:   c.TenantID.String(),
+			TenantSlug: a.Store.TenantSlug(ctx, c.TenantID),
+			PayoutID:   p.ID.String(),
+		})
+	}
+	return fed, nil
 }
 
 // TransferActivityInput identifies the payout to execute.
@@ -913,6 +1044,10 @@ const (
 	// MismatchProcessingFailed: ledger processing, provider says
 	// failed/reversed (workflow failure path missed).
 	MismatchProcessingFailed = "ledger_processing_provider_failed"
+	// MismatchFailedSucceeded: ledger failed, but the provider reports the
+	// transfer as SUCCESS — money moved although we marked the payout
+	// failed (SPEC-W43 K-12: failed-with-provider-ref is recon-checked).
+	MismatchFailedSucceeded = "ledger_failed_provider_successful"
 )
 
 // ReconActivities bundles the nightly reconciliation dependencies.
@@ -1020,6 +1155,14 @@ func classifyMismatch(ledgerStatus, providerStatus string) string {
 		default: // pending — still in flight, consistent
 			return ""
 		}
+	case PayoutStatusFailed:
+		// SPEC-W43 K-12: only reached for failed payouts that carry a
+		// provider_ref (ReconCandidates filter). Provider success means the
+		// money actually moved despite our failed marking — alert.
+		if providerStatus == "success" {
+			return MismatchFailedSucceeded
+		}
+		return ""
 	default:
 		return ""
 	}
