@@ -109,8 +109,8 @@ func TestDispatcherFansOutToMatchingSubscriptions(t *testing.T) {
 	if in.URL != "https://a.example/hook" || in.Secret != "s1" || in.DeliveryID != dlv.ID.String() {
 		t.Fatalf("workflow input = %+v", in)
 	}
-	if starter.ids[0] != "webhook-delivery-"+dlv.ID.String() {
-		t.Fatalf("workflow id = %q", starter.ids[0])
+	if starter.ids[0] != "whd-"+st.subs[0].ID.String()+"-evt-1" {
+		t.Fatalf("workflow id = %q, want whd-{sub}-{event} (N-03)", starter.ids[0])
 	}
 	// The raw envelope is the delivery body (signed verbatim downstream).
 	if string(in.Body) != string(bookingEvent(tenantA.String(), "com.opendesk.booking.BookingCreated")) {

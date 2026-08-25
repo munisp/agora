@@ -39,9 +39,12 @@ type Dispatcher struct {
 }
 
 // New builds the dispatcher: one reader per topic, all in the
-// notification-webhooks consumer group (explicit commits, like the signal
-// bridge — a failed fan-out is logged and acknowledged, never hot-looped;
-// the durable retry story lives in WebhookDeliveryWorkflow).
+// notification-webhooks consumer group (explicit commits). N-03: a failed
+// fan-out is NOT committed — the offset is left behind so the event is
+// redelivered (restart/rebalance); delivery rows dedupe on
+// UNIQUE(sub_id, event_id) and workflow ids are deterministic
+// (whd-{sub_id}-{event_id}), so redelivery converges instead of
+// duplicating.
 func New(brokers []string, topics []string, group string, st SubscriptionStore, starter WorkflowStarter, taskQueue string, log *zap.Logger) *Dispatcher {
 	d := &Dispatcher{store: st, starter: starter, taskQueue: taskQueue, log: log}
 	for _, topic := range topics {
@@ -75,8 +78,13 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 					return
 				}
 				if err := d.Process(ctx, msg.Value); err != nil {
-					d.log.Error("webhook fan-out failed; acknowledging anyway",
+					// N-03: never commit a failed fan-out — the offset stays
+					// behind and the event is redelivered on the next
+					// restart/rebalance. Delivery rows + workflow ids are
+					// deterministic, so redelivery is safe.
+					d.log.Error("webhook fan-out failed; offset NOT committed (redelivery pending)",
 						zap.String("key", string(msg.Key)), zap.Error(err))
+					continue
 				}
 				if err := r.CommitMessages(ctx, msg); err != nil {
 					d.log.Error("commit failed", zap.Error(err))
@@ -108,6 +116,12 @@ type eventEnvelope struct {
 	Subject  string          `json:"subject"`  // tenant slug
 	TenantID string          `json:"tenantid"` // CloudEvents extension
 	Data     json.RawMessage `json:"data"`
+}
+
+// DeliveryWorkflowID is the deterministic Temporal workflow id of one
+// (subscription, event) delivery (N-03): whd-{sub_id}-{event_id}.
+func DeliveryWorkflowID(subID, eventID string) string {
+	return "whd-" + subID + "-" + eventID
 }
 
 // Process handles one raw event payload (exported for testing): match
@@ -146,7 +160,10 @@ func (d *Dispatcher) Process(ctx context.Context, raw []byte) error {
 			continue
 		}
 		_, err := d.starter.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-			ID:        "webhook-delivery-" + delivery.ID.String(),
+			// N-03: deterministic workflow id — a redelivered event maps to
+			// the SAME workflow (Temporal dedupes the start), so redelivery
+			// after a partial fan-out converges.
+			ID:        DeliveryWorkflowID(sub.ID.String(), env.ID),
 			TaskQueue: d.taskQueue,
 		}, "WebhookDeliveryWorkflow", workflows.WebhookDeliveryInput{
 			DeliveryID: delivery.ID.String(),

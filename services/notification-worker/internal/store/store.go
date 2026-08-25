@@ -1,22 +1,17 @@
-// Package store provides Postgres persistence for the outbound webhook
-// platform (Wave 5 #10): webhook_subscriptions (per-tenant endpoint +
-// signing secret + event filter) and webhook_deliveries (one row per
-// subscription×event attempt, driven by WebhookDeliveryWorkflow).
+// Tenant isolation (N-08, billing-0002 idiom): every table carries ENABLE +
+// FORCE ROW LEVEL SECURITY with a FAIL-CLOSED tenant_isolation policy keyed
+// on the app.tenant_id GUC:
 //
-// The tables live in the `notifications` database (00-create-dbs.sql) and
-// are bootstrapped idempotently here so upgrades need no manual migration.
+//	tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+//	    OR pg_has_role(current_user, 'app_notifications_internal', 'member')
 //
-// Tenant isolation (SQL-003): every table carries ENABLE + FORCE ROW LEVEL
-// SECURITY with a tenant_isolation policy keyed on the app.tenant_id GUC
-// (identity-service consent/apps store idiom). Tenant-scoped webhook
-// queries run inside withTenant (`SET LOCAL app.tenant_id`) so isolation is
-// enforced at the database layer even if a future caller forgets the WHERE
-// clause. The policies deliberately treat an UNSET app.tenant_id as
-// "no database-level scoping" (the pre-existing application-level
-// filtering posture): several paths legitimately run without a single
-// tenant context (UpdateDelivery by delivery id, the slug-keyed DND
-// lookups, the global NCC 2442 import). Once a session sets app.tenant_id,
-// cross-tenant rows are invisible and cross-tenant writes are rejected.
+// An unset/empty GUC yields NULL → deny (0 rows). Cross-tenant/internal
+// paths (id-keyed UpdateDelivery, the global NCC 2442 DND list, the
+// ops-alerts read-back) go through the INTERNAL pool (INTERNAL_DATABASE_URL,
+// the app_notifications_internal member) so the escape is role-gated —
+// membership cannot be spoofed by a GUC. Without INTERNAL_DATABASE_URL the
+// internal pool falls back to the main pool with a WARN (dev compose uses
+// the superuser, which bypasses RLS anyway).
 package store
 
 import (
@@ -28,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 )
 
 // ErrNotFound is returned when a row does not exist.
@@ -41,13 +37,26 @@ const (
 	StatusDLQ       = "dlq"
 )
 
+// internalRole is the NOLOGIN group role gating the RLS internal escape
+// (billing 0002 idiom; mirrored in 05-app-roles.sql by infra).
+const internalRole = "app_notifications_internal"
+
 // Store wraps a pgx connection pool.
 type Store struct {
-	pool *pgxpool.Pool
+	pool         *pgxpool.Pool // tenant-scoped traffic (withTenant GUC)
+	internalPool *pgxpool.Pool // cross-tenant/internal traffic; nil → pool
 }
 
-// New connects to Postgres and ensures the webhook tables exist.
+// New connects to Postgres (main pool) and ensures the schema. Equivalent
+// to NewWithInternal(ctx, databaseURL, "", nil).
 func New(ctx context.Context, databaseURL string) (*Store, error) {
+	return NewWithInternal(ctx, databaseURL, "", nil)
+}
+
+// NewWithInternal connects the main pool plus, when internalDatabaseURL is
+// set, the internal pool (N-08 role-gated RLS escape). Without it the
+// internal paths fall back to the main pool with a WARN.
+func NewWithInternal(ctx context.Context, databaseURL, internalDatabaseURL string, log *zap.Logger) (*Store, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -57,29 +66,94 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	s := &Store{pool: pool}
+	if internalDatabaseURL != "" {
+		ip, err := pgxpool.New(ctx, internalDatabaseURL)
+		if err != nil {
+			pool.Close()
+			return nil, fmt.Errorf("connect internal postgres: %w", err)
+		}
+		if err := ip.Ping(ctx); err != nil {
+			ip.Close()
+			pool.Close()
+			return nil, fmt.Errorf("ping internal postgres: %w", err)
+		}
+		s.internalPool = ip
+	} else if log != nil {
+		log.Warn("INTERNAL_DATABASE_URL unset: internal/cross-tenant queries share the main pool " +
+			"(RLS internal escape needs the app_notifications_internal member in least-privilege deploys)")
+	}
 	if err := s.ensureSchema(ctx); err != nil {
-		pool.Close()
+		s.Close()
 		return nil, err
 	}
 	// SPEC-W12 Agent B: DND registry (dnd.go), same bootstrap pattern.
 	if err := s.ensureDNDSchema(ctx); err != nil {
-		pool.Close()
+		s.Close()
 		return nil, err
 	}
 	// SPEC-W32 WS-B: civic delivery ledger (civic_ledger.go), same pattern.
 	if err := s.ensureCivicLedgerSchema(ctx); err != nil {
-		pool.Close()
+		s.Close()
+		return nil, err
+	}
+	// SPEC-W44 K3: ops-alerts table (ops_alerts.go), same pattern.
+	if err := s.ensureOpsAlertsSchema(ctx); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-// Close releases the pool.
-func (s *Store) Close() { s.pool.Close() }
+// internal returns the pool for cross-tenant/internal queries (the RLS
+// escape role's pool when configured, else the main pool).
+func (s *Store) internal() *pgxpool.Pool {
+	if s.internalPool != nil {
+		return s.internalPool
+	}
+	return s.pool
+}
+
+// Ping probes the main pool (used by /healthz, F15-05).
+func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
+// Close releases both pools.
+func (s *Store) Close() {
+	if s.internalPool != nil {
+		s.internalPool.Close()
+	}
+	s.pool.Close()
+}
 
 // ensureSchema bootstraps the webhook tables idempotently.
+//
+// N-03: webhook_deliveries carries a UNIQUE(sub_id, event_id) partial index
+// (event_id present) so at-least-once event redelivery dedupes at the
+// database; CreateDelivery is ON CONFLICT idempotent.
+//
+// N-08: the tenant_isolation policies are FAIL-CLOSED (NULLIF idiom — an
+// unset/empty app.tenant_id GUC denies) with a role-gated internal escape
+// via pg_has_role(..., 'app_notifications_internal', 'member'); the EXISTS
+// short-circuit keeps the policy valid on clusters where the role was never
+// provisioned (pg_has_role on a missing role would error).
 func (s *Store) ensureSchema(ctx context.Context) error {
 	const ddl = `
+DO $$
+BEGIN
+    -- Role-gated internal escape (billing 0002 idiom). Skip-if-no-privilege:
+    -- a least-privilege bootstrap role cannot CREATE ROLE — the policy's
+    -- EXISTS guard keeps RLS correct (fail-closed) regardless.
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal') THEN
+            CREATE ROLE app_notifications_internal NOLOGIN NOINHERIT;
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal_login') THEN
+            CREATE ROLE app_notifications_internal_login LOGIN PASSWORD 'app_notifications_internal_dev_password' IN ROLE app_notifications_internal;
+        END IF;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'cannot create app_notifications_internal roles (insufficient privilege); RLS stays fail-closed without the internal escape';
+    END;
+END
+$$;
 CREATE TABLE IF NOT EXISTS webhook_subscriptions (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id   UUID NOT NULL,
@@ -106,34 +180,28 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_sub ON webhook_deliveries (sub_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_sub_event
+    ON webhook_deliveries (sub_id, event_id) WHERE event_id <> '';
 ALTER TABLE webhook_subscriptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_subscriptions FORCE ROW LEVEL SECURITY;
 ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_deliveries FORCE ROW LEVEL SECURITY;
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_policies
-                   WHERE schemaname = current_schema()
-                     AND tablename = 'webhook_subscriptions'
-                     AND policyname = 'tenant_isolation') THEN
-        CREATE POLICY tenant_isolation ON webhook_subscriptions
-            USING (CASE
-                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
-                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
-            END);
-    END IF;
-    IF NOT EXISTS (SELECT FROM pg_policies
-                   WHERE schemaname = current_schema()
-                     AND tablename = 'webhook_deliveries'
-                     AND policyname = 'tenant_isolation') THEN
-        CREATE POLICY tenant_isolation ON webhook_deliveries
-            USING (CASE
-                WHEN current_setting('app.tenant_id', true) IS NULL THEN true
-                ELSE tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
-            END);
-    END IF;
-END
-$$;`
+DROP POLICY IF EXISTS tenant_isolation ON webhook_subscriptions;
+CREATE POLICY tenant_isolation ON webhook_subscriptions
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')))
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')));
+DROP POLICY IF EXISTS tenant_isolation ON webhook_deliveries;
+CREATE POLICY tenant_isolation ON webhook_deliveries
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')))
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR (EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal')
+               AND pg_has_role(current_user, 'app_notifications_internal', 'member')));`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure webhook tables: %w", err)
 	}
@@ -303,17 +371,30 @@ func scanDelivery(row pgx.Row) (WebhookDelivery, error) {
 	return d, err
 }
 
-// CreateDelivery inserts a pending delivery row.
+// CreateDelivery inserts a pending delivery row. Idempotent on
+// (sub_id, event_id) (N-03): a redelivered event hits the partial unique
+// index and the EXISTING row is read back instead, so the dispatcher's
+// deterministic whd-{sub}-{event} workflow start is the only side effect.
 func (s *Store) CreateDelivery(ctx context.Context, d *WebhookDelivery) error {
 	if d.ID == uuid.Nil {
 		d.ID = uuid.New()
 	}
 	d.Status = StatusPending
 	const q = `INSERT INTO webhook_deliveries (id, sub_id, tenant_id, event_id, event_type, status)
-	           VALUES ($1,$2,$3,$4,$5,'pending') RETURNING created_at, updated_at`
+	           VALUES ($1,$2,$3,$4,$5,'pending')
+	           ON CONFLICT (sub_id, event_id) WHERE event_id <> '' DO NOTHING
+	           RETURNING id, created_at, updated_at`
 	return s.withTenant(ctx, d.TenantID.String(), func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, q, d.ID, d.SubID, d.TenantID, d.EventID, d.EventType).
-			Scan(&d.CreatedAt, &d.UpdatedAt)
+		err := tx.QueryRow(ctx, q, d.ID, d.SubID, d.TenantID, d.EventID, d.EventType).
+			Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Conflict on (sub_id, event_id): fetch the existing delivery.
+			return tx.QueryRow(ctx,
+				`SELECT id, created_at, updated_at FROM webhook_deliveries
+				 WHERE sub_id=$1 AND event_id=$2`, d.SubID, d.EventID).
+				Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt)
+		}
+		return err
 	})
 }
 
@@ -347,11 +428,13 @@ func (s *Store) ListDeliveries(ctx context.Context, tenantID, subID uuid.UUID, l
 // UpdateDelivery records the outcome of one delivery attempt (called by the
 // UpdateWebhookDelivery activity after every attempt: retrying → schedules
 // the next timer, delivered/dlq are terminal). It is keyed by delivery id
-// only (the workflow carries no tenant id), so it runs without a tenant
-// context — the tenant_isolation policy's unset-context clause keeps the
-// application-level posture for this path (see package header).
+// only (the workflow carries no tenant id), so it runs on the INTERNAL pool
+// (N-08): the role-gated app_notifications_internal escape authorizes the
+// cross-tenant update at the database layer; without INTERNAL_DATABASE_URL
+// it falls back to the main pool (WARNed at boot — dev superuser bypasses
+// RLS anyway).
 func (s *Store) UpdateDelivery(ctx context.Context, id uuid.UUID, status string, attempts int, statusCode *int, nextRetryAt *time.Time) error {
-	tag, err := s.pool.Exec(ctx,
+	tag, err := s.internal().Exec(ctx,
 		`UPDATE webhook_deliveries
 		 SET status=$2, attempts=$3, last_status_code=$4, next_retry_at=$5, updated_at=now()
 		 WHERE id=$1`, id, status, attempts, statusCode, nextRetryAt)

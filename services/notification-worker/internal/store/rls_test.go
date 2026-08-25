@@ -36,7 +36,7 @@ BEGIN
 END
 $$;
 GRANT USAGE ON SCHEMA public TO %[1]s;
-GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_subscriptions, webhook_deliveries, dnd_numbers, civic_notifications TO %[1]s;`, rlsTestRole))
+GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_subscriptions, webhook_deliveries, dnd_numbers, civic_notifications, ops_alerts TO %[1]s;`, rlsTestRole))
 	require.NoError(t, err)
 
 	pool, err := pgxpool.New(ctx,
@@ -66,7 +66,7 @@ func asTenant(t *testing.T, pool *pgxpool.Pool, tenantID string, q string, args 
 func TestRLSPoliciesPresent(t *testing.T) {
 	st := newDNDTestStore(t)
 	ctx := context.Background()
-	for _, table := range []string{"webhook_subscriptions", "webhook_deliveries", "dnd_numbers", "civic_notifications"} {
+	for _, table := range []string{"webhook_subscriptions", "webhook_deliveries", "dnd_numbers", "civic_notifications", "ops_alerts"} {
 		var enabled, forced bool
 		require.NoError(t, st.pool.QueryRow(ctx,
 			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, table).
@@ -139,15 +139,11 @@ func TestRLSCrossTenantInvisibility(t *testing.T) {
 		`INSERT INTO webhook_subscriptions (tenant_id, url) VALUES ($1, 'https://evil.example/')`, tenantA)
 	require.Error(t, err, "inserting tenant A's row under tenant B's context must be rejected")
 
-	// Documented escape hatch (SQL-003, unchanged): a session WITHOUT
-	// app.tenant_id (NULL — never set; RESET only restores '') keeps
-	// the legacy
-	// application-level filtering posture (all rows visible). W40-6: an
-	// EMPTY-string GUC is NOT the escape hatch — it denies by default
-	// (TestRLSEmptyStringTenantGucDeniesWithoutError).
-	// Note: RESET on a custom GUC only restores the placeholder boot value
-	// (''), NOT NULL — that recycled-'' state is exactly the W40-6 defect, so
-	// the true NULL case needs a fresh physical connection (new pool).
+	// N-08 FAIL-CLOSED: a session WITHOUT app.tenant_id (NULL — never set)
+	// sees NOTHING on the tenant tables; the legacy "NULL = no scoping"
+	// escape hatch is gone. The only escape is role-gated
+	// (app_notifications_internal membership), proven by
+	// TestRLSInternalRoleEscape below.
 	nullPool := newRLSRolePool(t, st)
 	connNull, err := nullPool.Acquire(ctx)
 	require.NoError(t, err)
@@ -159,8 +155,8 @@ func TestRLSCrossTenantInvisibility(t *testing.T) {
 	var allRows int64
 	require.NoError(t, connNull.QueryRow(ctx,
 		`SELECT count(*) FROM webhook_subscriptions`).Scan(&allRows))
-	require.EqualValues(t, 2, allRows,
-		"NULL (unset) GUC keeps the documented escape hatch")
+	require.Zero(t, allRows,
+		"NULL (unset) GUC is fail-closed (N-08): zero rows without a tenant context")
 }
 
 // W40-6: a recycled pool connection may carry app.tenant_id='' (EMPTY string,
@@ -202,6 +198,49 @@ func TestRLSEmptyStringTenantGucDeniesWithoutError(t *testing.T) {
 			"%s must not error under empty-string tenant GUC", q)
 		require.Zero(t, n, "%s must return 0 rows under empty-string tenant GUC", q)
 	}
+}
+
+// N-08: the ONLY way to see rows without a tenant GUC is membership in the
+// app_notifications_internal role (the INTERNAL_DATABASE_URL login). The
+// bootstrap DDL creates the NOLOGIN group role; the test adds a LOGIN
+// member and proves the escape is role-gated, not GUC-gated.
+func TestRLSInternalRoleEscape(t *testing.T) {
+	st := newDNDTestStore(t)
+	ctx := context.Background()
+	tenantA := uuid.New()
+	subA := &WebhookSubscription{TenantID: tenantA, TenantSlug: "acme", URL: "https://a.example/hook", Events: []string{"*"}}
+	require.NoError(t, st.CreateSubscription(ctx, subA))
+
+	const role = "notif_rls_internal_test"
+	_, err := st.pool.Exec(ctx, fmt.Sprintf(`
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '%[1]s') THEN
+        CREATE ROLE %[1]s LOGIN PASSWORD '%[1]s' IN ROLE app_notifications_internal;
+    END IF;
+END
+$$;
+GRANT USAGE ON SCHEMA public TO %[1]s;
+GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_subscriptions, webhook_deliveries, dnd_numbers, civic_notifications, ops_alerts TO %[1]s;`, role))
+	require.NoError(t, err)
+
+	pool, err := pgxpool.New(ctx,
+		fmt.Sprintf("postgres://%[1]s:%[1]s@localhost:5434/notifications_test?sslmode=disable", role))
+	require.NoError(t, err)
+	defer pool.Close()
+	require.NoError(t, pool.Ping(ctx))
+
+	// No GUC set at all: the role-gated escape sees cross-tenant rows.
+	var n int64
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM webhook_subscriptions`).Scan(&n))
+	require.EqualValues(t, 1, n, "app_notifications_internal member sees rows without a tenant GUC")
+
+	// And the global DND list (tenant_id NULL) is visible without a GUC.
+	_, err = st.ImportGlobalDND(ctx, []string{"+2348012341234"}, "ncc2442")
+	require.NoError(t, err)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM dnd_numbers WHERE tenant_id IS NULL`).Scan(&n))
+	require.EqualValues(t, 1, n)
 }
 
 // The store's tenant-scoped methods set app.tenant_id themselves: reading
