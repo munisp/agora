@@ -10,7 +10,11 @@
 #   1. Apply Postgres DDL      sql/postgres/ddl/*.sql (idempotent, schema cac)
 #   2. Apply Iceberg DDL       sql/iceberg/seed_ddl.sql via trino/spark-sql when
 #                              the lakehouse is up, else skip-with-log
-#   3. seed_lgas.py            774 LGAs
+#   3. seed_lgas.py + seed_wards.py + seed_locale.py
+#                              774 LGAs, 8,812 wards (drift.sql gates BOTH —
+#                              SPEC-W43 G-05/DATA#7: wards/locale used to be
+#                              uninvoked here, so the drift gate could never
+#                              pass), locale coverage report (seed_run_log row)
 #   4. seed_channels.py + seed_channel_costs.py  (32 channels, 32x24 cost rows)
 #   5. seed_agents.py + seed_customers.py        (5k / 200k x SEED_SCALE)
 #   6. seed_events.py          FunnelEvents (Kafka when SEED_KAFKA=on, else JSONL)
@@ -148,7 +152,23 @@ step_iceberg_ddl() {
     fi
 }
 
-# --- 4/5. Reference + entity seed groups --------------------------------------
+# --- 3/4/5. Reference + entity seed groups --------------------------------------
+# SPEC-W43 G-05 (DATA#7): seed_wards.py MUST run here — drift.sql check 4
+# expects exactly int(8812*SEED_SCALE) rows in cac.wards with a seed_run_log
+# row, so a bootstrap that skips wards can never pass the drift gate. Wards
+# derive from LGAs (seed_wards imports seed_lgas), so ordering is lgas ->
+# wards. seed_locale.py is a validation report (locale_coverage seed_run_log
+# row) over industries/*.yaml i18n blocks; run it while reference data is
+# being seeded so the audit row is durable from the first bootstrap.
+step_geo() {
+    run_seed seed_lgas.py
+    run_seed seed_wards.py
+    if [ -f "$SCRIPT_DIR/seed_locale.py" ]; then
+        run_seed seed_locale.py
+    else
+        log "  seed_locale.py absent — skip-with-log (optional validation report)"
+    fi
+}
 step_channels() { run_seed seed_channels.py; run_seed seed_channel_costs.py; }
 step_entities() { run_seed seed_agents.py; run_seed seed_customers.py; }
 
@@ -205,7 +225,7 @@ step_snapshot() {
 log "SEED_SCALE=$SEED_SCALE SEED_KAFKA=$SEED_KAFKA DRY_RUN=$DRY DATABASE_URL=$DATABASE_URL"
 step "postgres DDL (sql/postgres/ddl)"          step_pg_ddl
 step "iceberg DDL (sql/iceberg)"                step_iceberg_ddl
-step "seed LGAs (774)"                          run_seed seed_lgas.py
+step "seed LGAs (774) + wards (8812) + locale"  step_geo
 step "seed channels + unit costs (32, 32x24)"   step_channels
 step "seed agents + customers (x$SEED_SCALE)"   step_entities
 step "seed events (FunnelEvents)"               run_seed seed_events.py

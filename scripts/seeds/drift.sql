@@ -91,24 +91,31 @@ drift AS (
            'table exists but _lib.log_seed_run never recorded a run'
     FROM tables t
     WHERE t.table_name <> 'seed_run_log'
-      AND NOT EXISTS (SELECT 1 FROM cac.seed_run_log l WHERE l.table_name = t.table_name)
+      -- W43 (G-05): seed scripts log schema-qualified names ('cac.wards');
+      -- accept both spellings or every run reads as a missing log row.
+      AND NOT EXISTS (SELECT 1 FROM cac.seed_run_log l
+                      WHERE l.table_name IN (t.table_name, 'cac.' || t.table_name))
     UNION ALL
     -- 3. logged rowcount != live rowcount (reseed partial failure / manual edits)
     SELECT 'rowcount_mismatch', c.table_name, l.rowcount::text, c.n::text,
            'id_hash=' || c.id_hash || '; last seeded_at=' || l.seeded_at::text
     FROM counts c
-    JOIN cac.seed_run_log l ON l.table_name = c.table_name
+    JOIN cac.seed_run_log l ON l.table_name IN (c.table_name, 'cac.' || c.table_name)
     WHERE l.rowcount <> c.n
     UNION ALL
     -- 4. cardinality expectations: fixed for reference data, int(N*scale)
     --    for scaled tables (wards/agents/customers — matches _lib.scaled())
-    SELECT 'cardinality_drift', c.table_name, e.expected, c.n::text,
+    -- W43 (G-05): e.expected is integer; the UNION's expected column is
+    -- text ('present'/'>=365'/...) — cast or the whole gate errors out.
+    SELECT 'cardinality_drift', c.table_name, e.expected::text, c.n::text,
            'id_hash=' || c.id_hash
     FROM counts c
+    -- W43 (G-05): floor() — ::int on float8 ROUNDS in Postgres while
+    -- _lib.scaled() TRUNCATES (int(N*scale)); the gate must match the seeder.
     JOIN (VALUES ('lgas', 774), ('channels', 32), ('channel_unit_costs', 768),
-                 ('wards', (8812 * :seed_scale::float)::int),
-                 ('agents', (5000 * :seed_scale::float)::int),
-                 ('customers', (200000 * :seed_scale::float)::int)) AS e(table_name, expected)
+                 ('wards', floor(8812 * :seed_scale::float)::int),
+                 ('agents', floor(5000 * :seed_scale::float)::int),
+                 ('customers', floor(200000 * :seed_scale::float)::int)) AS e(table_name, expected)
       ON e.table_name = c.table_name
     WHERE c.n <> e.expected
     UNION ALL

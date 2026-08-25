@@ -7,8 +7,8 @@
 -- the repo convention; there is no Flyway in this stack.
 --
 -- Layout follows the existing scripts: cluster-global roles first (same pattern
--- as 05-app-roles.sql), then `CREATE DATABASE platform` (plain, like
--- 00-create-dbs.sql — init scripts run once on a fresh volume), then `\c platform`
+-- as 05-app-roles.sql), then `CREATE DATABASE platform` (SELECT-gated
+-- \gexec since SPEC-W43 G-06 — idempotent under replay), then `\c platform`
 -- and the schema with FORCE ROW LEVEL SECURITY exactly like 03/04.
 --
 -- RLS convention (matches 01/03/04): tenant rows are visible/writable only when
@@ -52,8 +52,13 @@ $$;
 
 -- ---------------------------------------------------------------------------
 -- platform database (ML platform catalog; SPEC-W33 §4 C1 "platform DB")
+-- SPEC-W43 G-06 (DATA#17): SELECT-gated \gexec so re-applying this script
+-- (restore drills, manual replays against an existing cluster) is idempotent
+-- instead of erroring with 42P04 duplicate_database. Requires the psql path
+-- (docker-entrypoint-initdb.d *.sql / drill harness) for \gexec.
 -- ---------------------------------------------------------------------------
-CREATE DATABASE platform;
+SELECT 'CREATE DATABASE platform'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'platform')\gexec
 
 \c platform
 

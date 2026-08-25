@@ -139,6 +139,188 @@ ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_kyc;
 
 -- ---------------------------------------------------------------------------
+-- Wave 43 (SPEC-W43 G-01, SEC#4/DATA#3): identity / notifications / crm-sync
+-- roles. Same NOLOGIN group + LOGIN member pattern as above; the group holds
+-- the grants and services connect with the LOGIN variant so FORCE ROW LEVEL
+-- SECURITY actually binds them (the opendesk superuser bypasses RLS).
+--
+-- The *_internal roles are NOLOGIN NOINHERIT cross-tenant escape groups
+-- (post-GF1 idiom from 30-model-registry.sql / billing 0002_rls.sql):
+-- privilege is reached ONLY through membership, and RLS policies gate
+-- internal access on pg_has_role(current_user, '<role>', ...) — a role
+-- property no request-scoped GUC can forge. Services add their own LOGIN
+-- member in their bootstrap migrations when they need one (billing 0002
+-- idiom: app_billing_internal_login).
+--
+-- TEMPORARY BOOTSTRAP EXCEPTION (documented, SPEC-W43 G-01): app_identity,
+-- app_notifications and app_crm_sync keep CREATE ON SCHEMA public because
+-- those services still apply bootstrap DDL at startup (identity store.go
+-- ALTERs; notification-worker webhook/DND schema; crm-sync sync_map).
+-- 08-code-bootstrap-parity.sql (G-07) is phase-1 of moving that DDL into
+-- the infra layer; once a service's ensure_* path is verify-only (phase-2),
+-- revoke with: REVOKE CREATE ON SCHEMA public FROM <role>.
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity') THEN
+        CREATE ROLE app_identity NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity_login') THEN
+        CREATE ROLE app_identity_login LOGIN PASSWORD 'app_identity_dev_password' IN ROLE app_identity;
+    END IF;
+    -- Cross-tenant internal escape group (SPEC-W43 I-03): tenants-table
+    -- writes (createTenant twin provisioning) need it — the tenants RLS
+    -- policy is keyed on app.tenant_id, which cannot pre-exist for a tenant
+    -- being created.
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_identity_internal') THEN
+        CREATE ROLE app_identity_internal NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications') THEN
+        CREATE ROLE app_notifications NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_login') THEN
+        CREATE ROLE app_notifications_login LOGIN PASSWORD 'app_notifications_dev_password' IN ROLE app_notifications;
+    END IF;
+    -- Cross-tenant internal escape group (SPEC-W43 N-08): notification
+    -- internal jobs (workflow-driven sends, civic escalation) enumerate rows
+    -- across tenants; policies gate on this role, billing 0002 idiom.
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_notifications_internal') THEN
+        CREATE ROLE app_notifications_internal NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_crm_sync') THEN
+        CREATE ROLE app_crm_sync NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_crm_sync_login') THEN
+        CREATE ROLE app_crm_sync_login LOGIN PASSWORD 'app_crm_sync_dev_password' IN ROLE app_crm_sync;
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- identity database
+-- The \gset/\if guard lets this script apply on clusters where the DB does
+-- not exist yet (tests/restore-drill's fresh instance B recreates only the
+-- schema-bearing DBs before the role layer; the guarded section is then a
+-- logged skip). Docker init and restore.sh always have the DB present.
+-- ---------------------------------------------------------------------------
+SELECT EXISTS (SELECT FROM pg_database WHERE datname = 'identity') AS identity_db_exists\gset
+\if :identity_db_exists
+\c identity
+
+GRANT CONNECT ON DATABASE identity TO app_identity;
+GRANT CONNECT ON DATABASE identity TO app_identity_internal;
+GRANT USAGE ON SCHEMA public TO app_identity;
+GRANT USAGE ON SCHEMA public TO app_identity_internal;
+-- TEMPORARY bootstrap exception (see header note above): identity-service
+-- still applies DDL at startup. Revoke once ensure_* is verify-only.
+GRANT CREATE ON SCHEMA public TO app_identity;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_identity;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_identity_internal;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_identity;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_identity_internal;
+-- Future tables created by the bootstrap superuser stay reachable. Docker's
+-- bootstrap role is `opendesk`; the embedded test Postgres (pgserver, used
+-- by tests/restore-drill) bootstraps as `postgres` — cover whichever exists
+-- (billing 0002_rls.sql idiom, generalized).
+DO $$
+DECLARE
+    bootstrap TEXT;
+BEGIN
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_identity', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_identity', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_identity_internal', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_identity_internal', bootstrap);
+        END IF;
+    END LOOP;
+END
+$$;
+\else
+\echo '05-app-roles: database identity absent — skipping its grants section'
+\endif
+
+-- ---------------------------------------------------------------------------
+-- notifications database (schema is bootstrapped by notification-worker at
+-- startup — Wave 5 #10 — so on a fresh volume ALL TABLES below is a no-op
+-- and the default privileges + CREATE grant are what matter)
+-- ---------------------------------------------------------------------------
+SELECT EXISTS (SELECT FROM pg_database WHERE datname = 'notifications') AS notifications_db_exists\gset
+\if :notifications_db_exists
+\c notifications
+
+GRANT CONNECT ON DATABASE notifications TO app_notifications;
+GRANT CONNECT ON DATABASE notifications TO app_notifications_internal;
+GRANT USAGE ON SCHEMA public TO app_notifications;
+GRANT USAGE ON SCHEMA public TO app_notifications_internal;
+-- TEMPORARY bootstrap exception (see header note above): notification-worker
+-- creates webhook_subscriptions / webhook_deliveries / dnd / civic_ledger at
+-- startup. Revoke once its ensure_* path is verify-only.
+GRANT CREATE ON SCHEMA public TO app_notifications;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_notifications;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_notifications_internal;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_notifications;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_notifications_internal;
+DO $$
+DECLARE
+    bootstrap TEXT;
+BEGIN
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_notifications', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_notifications', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_notifications_internal', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_notifications_internal', bootstrap);
+        END IF;
+    END LOOP;
+END
+$$;
+\else
+\echo '05-app-roles: database notifications absent — skipping its grants section'
+\endif
+
+-- ---------------------------------------------------------------------------
+-- crm_sync database (sync_map is created by crm-sync-service at startup —
+-- same fresh-volume caveat as notifications above)
+-- ---------------------------------------------------------------------------
+SELECT EXISTS (SELECT FROM pg_database WHERE datname = 'crm_sync') AS crm_sync_db_exists\gset
+\if :crm_sync_db_exists
+\c crm_sync
+
+GRANT CONNECT ON DATABASE crm_sync TO app_crm_sync;
+GRANT USAGE ON SCHEMA public TO app_crm_sync;
+-- TEMPORARY bootstrap exception (see header note above): crm-sync-service
+-- creates sync_map at startup. Revoke once its bootstrap is verify-only.
+GRANT CREATE ON SCHEMA public TO app_crm_sync;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_crm_sync;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_crm_sync;
+DO $$
+DECLARE
+    bootstrap TEXT;
+BEGIN
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_crm_sync', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_crm_sync', bootstrap);
+        END IF;
+    END LOOP;
+END
+$$;
+\else
+\echo '05-app-roles: database crm_sync absent — skipping its grants section'
+\endif
+
+-- ---------------------------------------------------------------------------
 -- Wave 38 (SPEC-W38 F1/F3): agents registry + capture tables
 -- ---------------------------------------------------------------------------
 -- Explicit grants on the three W38 tables (created by

@@ -69,6 +69,17 @@ raw casing and lets dbt normalize.
 
 ## Sidecar API (port 7009)
 
+> **Trust boundary (W44/F15-15).** This service is **not** routed through the
+> APISIX gateway and performs **no authentication** of its own. Port 7009 must
+> stay on the internal container network only. Browser access goes through the
+> admin-web BFF (`/api/analytics/*`), which requires a NextAuth session (401
+> for anonymous callers), derives the tenant from the session's verified
+> `tenant_slugs` Keycloak claim, and injects it as `X-Tenant-Slug` (and the
+> `?tenant=` query for the UUID-style endpoints), **ignoring caller-supplied
+> tenant values**. Treat `X-Tenant-Slug` / `?tenant=` as trusted in-network
+> input only — never publish the port, and never rely on these endpoints being
+> safe to expose directly.
+
 | Endpoint | Description |
 |---|---|
 | `GET /healthz` | 200 once Kafka consumer is running and Iceberg bootstrap done (503 while starting). Body: per-topic `lag` (highwater − position), buffered count, target table, `last_error`. |

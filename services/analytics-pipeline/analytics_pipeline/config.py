@@ -109,6 +109,11 @@ class Settings:
     identity_app_id: str = field(
         default_factory=lambda: os.getenv("IDENTITY_APP_ID", "identity")
     )
+    # SPEC-W44 K2: X-Internal-Token sent on the identity tenant lookup
+    # (IDENTITY_INTERNAL_TOKEN; empty = header not sent).
+    identity_internal_token: str = field(
+        default_factory=lambda: os.getenv("IDENTITY_INTERNAL_TOKEN", "")
+    )
     tenant_cache_ttl_seconds: float = field(
         default_factory=lambda: float(os.getenv("TENANT_CACHE_TTL_SECONDS", "300"))
     )
