@@ -91,6 +91,12 @@ type TenantResolver struct {
 	baseURL    string
 	httpClient *http.Client
 
+	// internalToken (SPEC-W44 W-B, K2) rides as X-Internal-Token on the
+	// identity service call — identity accepts internal-token service
+	// callers (CODER-I2). IDENTITY_INTERNAL_TOKEN; empty = no header
+	// (identity then answers 503/401 and resolution fails/stale-serves).
+	internalToken string
+
 	mu    sync.Mutex
 	cache map[string]tenantCacheEntry
 }
@@ -110,6 +116,16 @@ func WithIdentityBaseURL(base string) TenantResolverOption {
 		}
 		r.baseURL = base
 		r.httpClient = &http.Client{Timeout: identityDirectTimeout}
+	}
+}
+
+// WithInternalToken forwards IDENTITY_INTERNAL_TOKEN as X-Internal-Token on
+// the tenant-resolution service call (SPEC-W44 W-B, K2 — identity's
+// /v1/tenants/{slug} accepts internal-token service callers). Empty is a
+// no-op.
+func WithInternalToken(token string) TenantResolverOption {
+	return func(r *TenantResolver) {
+		r.internalToken = strings.TrimSpace(token)
 	}
 }
 
@@ -172,13 +188,22 @@ func (r *TenantResolver) BySlug(ctx context.Context, slug string) (TenantInfo, e
 // 404 "tenant not found", public booking POST → 500) behave identically on
 // both paths.
 func (r *TenantResolver) fetch(ctx context.Context, slug string, out *TenantInfo) error {
+	// SPEC-W44 W-B (K2): identity's service calls are internal-token gated —
+	// forward IDENTITY_INTERNAL_TOKEN as X-Internal-Token on both paths.
+	var headers map[string]string
+	if r.internalToken != "" {
+		headers = map[string]string{"X-Internal-Token": r.internalToken}
+	}
 	if r.baseURL == "" {
-		return r.dapr.InvokeService(ctx, r.appID, "v1/tenants/"+slug, nil, out)
+		return r.dapr.InvokeServiceWithHeaders(ctx, r.appID, "v1/tenants/"+slug, nil, out, headers)
 	}
 	url := r.baseURL + "/v1/tenants/" + slug
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("identity direct get %s: %w", url, err)
+	}
+	if r.internalToken != "" {
+		req.Header.Set("X-Internal-Token", r.internalToken)
 	}
 	resp, err := r.httpClient.Do(req)
 	if err != nil {

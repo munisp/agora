@@ -186,8 +186,17 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (store.Booking, er
 	if err != nil {
 		return store.Booking{}, err
 	}
-	if err := s.Store.CreateBookingTx(ctx, &booking, s.EventsTopic, payload,
+	guard := store.SlotGuard{
+		Buffer:   time.Duration(offering.BufferMin) * time.Minute,
+		Capacity: offering.Capacity,
+	}
+	if err := s.Store.CreateBookingTx(ctx, &booking, guard, s.EventsTopic, payload,
 		s.UsageExtra(in.TenantSlug, booking.TenantID, booking.ID, offering)...); err != nil {
+		if errors.Is(err, store.ErrSlotConflict) {
+			// In-transaction re-check fired (SPEC-W43 K-01): a concurrent
+			// writer won the slot after the fast pre-check passed.
+			return store.Booking{}, ErrSlotUnavailable
+		}
 		if errors.Is(err, store.ErrConflict) && in.IdempotencyKey != "" {
 			// Lost the unique race — the other writer won; return its row.
 			return s.Store.GetBookingByIdempotencyKey(ctx, in.TenantID, in.IdempotencyKey)
@@ -252,7 +261,15 @@ func (s *Service) Reschedule(ctx context.Context, tenantID uuid.UUID, tenantSlug
 	if err != nil {
 		return store.Booking{}, err
 	}
-	if err := s.Store.RescheduleBooking(ctx, tenantID, bookingID, startsAt, endsAt, s.EventsTopic, payload); err != nil {
+	guard := store.SlotGuard{
+		Buffer:   time.Duration(offering.BufferMin) * time.Minute,
+		Capacity: offering.Capacity,
+	}
+	if err := s.Store.RescheduleBooking(ctx, tenantID, bookingID, booking.TeamMemberID, startsAt, endsAt, guard, s.EventsTopic, payload); err != nil {
+		if errors.Is(err, store.ErrSlotConflict) {
+			// In-transaction re-check fired (SPEC-W43 K-01).
+			return store.Booking{}, ErrSlotUnavailable
+		}
 		return store.Booking{}, err
 	}
 	s.Cache.Invalidate(ctx, tenantID, booking.OfferingID, booking.TeamMemberID, oldStart, oldEnd)
