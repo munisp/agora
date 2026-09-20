@@ -2,6 +2,7 @@ package helpdesk
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -319,8 +320,9 @@ func TestAutoAssignLeastLoaded(t *testing.T) {
 	}
 }
 
-// CSAT: only resolved|closed tickets; rating persisted.
-func TestRecordCSAT(t *testing.T) {
+// CSAT capability-token flow (SPEC-W45 K24): issue on resolve → redeem
+// (single-use); unknown/expired/used tokens → ErrCSATInvalid.
+func TestCSATTokenFlow(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	tenantID := uuid.New()
@@ -329,21 +331,86 @@ func TestRecordCSAT(t *testing.T) {
 	if err := st.CreateTicket(ctx, &tk, ""); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := st.RecordCSAT(ctx, tenantID, tk.ID, 5, "great"); err == nil {
-		t.Fatal("csat on open ticket must fail")
-	}
 	if _, err := st.PatchTicket(ctx, tenantID, tk.ID, PatchInput{Status: strptr(StatusResolved)}, "a"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	got, err := st.RecordCSAT(ctx, tenantID, tk.ID, 5, "great")
+
+	// Unknown token → ErrCSATInvalid (never an existence leak).
+	if _, err := st.RedeemCSATToken(ctx, strings.Repeat("ab", 32), 5, ""); !errors.Is(err, ErrCSATInvalid) {
+		t.Fatalf("unknown token = %v, want ErrCSATInvalid", err)
+	}
+
+	token, err := st.IssueCSATToken(ctx, tenantID, tk.ID)
 	if err != nil {
-		t.Fatalf("csat: %v", err)
+		t.Fatalf("issue: %v", err)
+	}
+	if len(token) != 64 {
+		t.Fatalf("token format: %q", token)
+	}
+	got, err := st.RedeemCSATToken(ctx, token, 5, "great")
+	if err != nil {
+		t.Fatalf("redeem: %v", err)
 	}
 	if got.CSATRating == nil || *got.CSATRating != 5 || got.CSATAt == nil {
 		t.Fatalf("csat not persisted: %+v", got)
 	}
 	if got.CSATComment == nil || *got.CSATComment != "great" {
 		t.Fatalf("csat comment: %+v", got)
+	}
+	// Single-use: the burned token can never rate again.
+	if _, err := st.RedeemCSATToken(ctx, token, 1, ""); !errors.Is(err, ErrCSATInvalid) {
+		t.Fatalf("replayed token = %v, want ErrCSATInvalid", err)
+	}
+
+	// Re-issue (reopen→resolve cycle) supersedes the old link; the new
+	// token redeems, the old one stays burned.
+	token2, err := st.IssueCSATToken(ctx, tenantID, tk.ID)
+	if err != nil {
+		t.Fatalf("re-issue: %v", err)
+	}
+	if token2 == token {
+		t.Fatal("re-issue must mint a fresh token")
+	}
+	if _, err := st.RedeemCSATToken(ctx, token2, 4, ""); err != nil {
+		t.Fatalf("redeem re-issued token: %v", err)
+	}
+
+	// Expired token → ErrCSATInvalid.
+	tk2 := mkTicket(tenantID, "expired link", PriorityNormal)
+	if err := st.CreateTicket(ctx, &tk2, ""); err != nil {
+		t.Fatalf("create tk2: %v", err)
+	}
+	if _, err := st.PatchTicket(ctx, tenantID, tk2.ID, PatchInput{Status: strptr(StatusResolved)}, "a"); err != nil {
+		t.Fatalf("resolve tk2: %v", err)
+	}
+	token3, err := st.IssueCSATToken(ctx, tenantID, tk2.ID)
+	if err != nil {
+		t.Fatalf("issue tk2: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE csat_tokens SET expires_at = now() - interval '1 hour' WHERE ticket_id=$1`, tk2.ID); err != nil {
+		t.Fatalf("backdate expiry: %v", err)
+	}
+	if _, err := st.RedeemCSATToken(ctx, token3, 5, ""); !errors.Is(err, ErrCSATInvalid) {
+		t.Fatalf("expired token = %v, want ErrCSATInvalid", err)
+	}
+
+	// Cross-tenant safety: a token resolves ITS OWN ticket's tenant (the
+	// redeem path has no tenant input — RLS inside the tx scopes the write).
+	tk3 := mkTicket(uuid.New(), "other tenant", PriorityNormal)
+	if err := st.CreateTicket(ctx, &tk3, ""); err != nil {
+		t.Fatalf("create tk3: %v", err)
+	}
+	if _, err := st.PatchTicket(ctx, tk3.TenantID, tk3.ID, PatchInput{Status: strptr(StatusResolved)}, "a"); err != nil {
+		t.Fatalf("resolve tk3: %v", err)
+	}
+	token4, err := st.IssueCSATToken(ctx, tk3.TenantID, tk3.ID)
+	if err != nil {
+		t.Fatalf("issue tk3: %v", err)
+	}
+	got4, err := st.RedeemCSATToken(ctx, token4, 3, "")
+	if err != nil || got4.TenantID != tk3.TenantID || got4.ID != tk3.ID {
+		t.Fatalf("cross-tenant redeem: %+v, %v", got4, err)
 	}
 }
 
@@ -380,7 +447,11 @@ func TestStatsAndBreaches(t *testing.T) {
 	if _, err := st.PatchTicket(ctx, tenantID, resTk.ID, PatchInput{Status: strptr(StatusResolved)}, "a"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if _, err := st.RecordCSAT(ctx, tenantID, resTk.ID, 4, ""); err != nil {
+	csatTok, err := st.IssueCSATToken(ctx, tenantID, resTk.ID)
+	if err != nil {
+		t.Fatalf("issue csat token: %v", err)
+	}
+	if _, err := st.RedeemCSATToken(ctx, csatTok, 4, ""); err != nil {
 		t.Fatalf("csat: %v", err)
 	}
 

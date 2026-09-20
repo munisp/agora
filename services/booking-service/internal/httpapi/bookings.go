@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -226,4 +227,107 @@ func (s *server) cancelBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, booking)
+}
+
+// completeBookingRequest is the POST /v1/bookings/{id}/complete body
+// (SPEC-W45 K11). deposit_id references the verified deposit hold to
+// capture via the payments rail; omit it when no hold exists.
+type completeBookingRequest struct {
+	DepositID string `json:"deposit_id,omitempty"`
+}
+
+// callerIdentityFrom builds the operator identity forwarded to payments
+// (K6 money-role gate + K7 provenance) from the resolved tenant context.
+func callerIdentityFrom(ctx context.Context) bookingops.CallerIdentity {
+	return bookingops.CallerIdentity{
+		UserID: userFrom(ctx),
+		Roles:  rolesFrom(ctx),
+	}
+}
+
+// completeBooking handles POST /v1/bookings/{id}/complete (manage_bookings,
+// SPEC-W45 K11): confirmed|checked_in → completed, BookingCompleted event,
+// deposit capture via payments (fail-closed without PAYMENTS_URL), loyalty
+// accrual hook.
+func (s *server) completeBooking(w http.ResponseWriter, r *http.Request) {
+	// Money endpoints are authentication-gated even when Permify is disabled
+	// (AuthzDisabled drops AUTHORIZATION, never authentication): completing a
+	// booking triggers deposit capture, so an operator identity (JWT sub or
+	// X-User-Id) is mandatory — anonymous callers 401 before the handler.
+	if callerIdentity(r) == "" {
+		writeError(w, http.StatusUnauthorized, "authenticated subject required (JWT sub or X-User-Id)")
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req completeBookingRequest
+	_ = decodeOptionalJSON(r, &req) // empty body = complete without capture
+	var depositID *uuid.UUID
+	if strings.TrimSpace(req.DepositID) != "" {
+		d, err := uuid.Parse(strings.TrimSpace(req.DepositID))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid deposit_id")
+			return
+		}
+		depositID = &d
+	}
+	res, err := s.d.Ops.Complete(r.Context(), tenant.ID, tenant.Slug, id, depositID, callerIdentityFrom(r.Context()))
+	if err != nil {
+		s.mapOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// refundBookingRequest is the POST /v1/bookings/{id}/refund body
+// (SPEC-W45 K12).
+type refundBookingRequest struct {
+	DepositID      string `json:"deposit_id,omitempty"`
+	AmountCents    int64  `json:"amount_cents"`
+	Reason         string `json:"reason,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
+// refundBooking handles POST /v1/bookings/{id}/refund (manage_bookings,
+// SPEC-W45 K12): posts the refund to payments /v1/refunds (rail execution —
+// Flutterwave vs queued_manual — is payments-side, CODER-K). Fail-closed
+// without PAYMENTS_URL.
+func (s *server) refundBooking(w http.ResponseWriter, r *http.Request) {
+	// Same authentication gate as completeBooking (money movement).
+	if callerIdentity(r) == "" {
+		writeError(w, http.StatusUnauthorized, "authenticated subject required (JWT sub or X-User-Id)")
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req refundBookingRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	var depositID *uuid.UUID
+	if strings.TrimSpace(req.DepositID) != "" {
+		d, err := uuid.Parse(strings.TrimSpace(req.DepositID))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid deposit_id")
+			return
+		}
+		depositID = &d
+	}
+	res, err := s.d.Ops.Refund(r.Context(), tenant.ID, id, bookingops.RefundRequest{
+		DepositID:      depositID,
+		AmountCents:    req.AmountCents,
+		Reason:         req.Reason,
+		IdempotencyKey: req.IdempotencyKey,
+	}, callerIdentityFrom(r.Context()))
+	if err != nil {
+		s.mapOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, res)
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/store"
 )
 
@@ -159,6 +160,11 @@ type teamMemberRequest struct {
 	Email  string `json:"email"`
 	Role   string `json:"role"`
 	Active *bool  `json:"active"`
+	// UserID optionally links the member to an identity-service user
+	// (SPEC-W45 CODER-M, STK O14 completion). Format-validated as UUID but
+	// NOT existence-checked — identity-service owns users; this is a soft
+	// reference for the team UI.
+	UserID string `json:"user_id"`
 }
 
 func (s *server) createTeamMember(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +183,14 @@ func (s *server) createTeamMember(w http.ResponseWriter, r *http.Request) {
 		Email:    req.Email,
 		Role:     defaultStr(req.Role, "staff"),
 		Active:   req.Active == nil || *req.Active,
+	}
+	if req.UserID != "" {
+		uid, err := uuid.Parse(req.UserID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "user_id must be a uuid")
+			return
+		}
+		m.UserID = &uid
 	}
 	if err := s.d.Store.CreateTeamMember(r.Context(), &m); err != nil {
 		s.internal(w, err)
