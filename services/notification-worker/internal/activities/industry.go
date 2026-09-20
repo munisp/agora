@@ -96,9 +96,11 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 		a.Log.Info("pack knowledge doc seeded", zap.String("slug", in.Slug), zap.String("title", doc.Title))
 	}
 
-	// 3. Terminology — merge-patch into the tenant record.
+	// 3. Terminology — merge-patch into the tenant record (K2: identity's
+	// /internal/* surface is internauth-gated — forward the identity token).
 	if len(pack.Terminology) > 0 {
-		if err := a.Dapr.InvokeService(ctx, a.IdentityAppID, "internal/tenants/"+in.Slug+"/terminology", pack.Terminology, nil); err != nil {
+		if err := a.Dapr.InvokeServiceWithHeaders(ctx, a.IdentityAppID, "internal/tenants/"+in.Slug+"/terminology", pack.Terminology,
+			internalHeaders(a.IdentityInternalToken), nil); err != nil {
 			return fmt.Errorf("apply pack terminology: %w", err)
 		}
 	}
@@ -228,11 +230,14 @@ func (a *Activities) CreateCRMFollowupTask(ctx context.Context, in workflows.Con
 	})
 }
 
-// createCRMTask posts a task to crm-sync's helper endpoint.
+// createCRMTask posts a task to crm-sync's helper endpoint (SPEC-W45 K21:
+// crm-sync gates /v1/tasks behind X-Internal-Token = CRM_SYNC_INTERNAL_TOKEN;
+// an empty token fails closed at the peer and the error surfaces here).
 func (a *Activities) createCRMTask(ctx context.Context, tenantSlug, tenantID string, task map[string]any) error {
 	task["tenant_slug"] = tenantSlug
 	task["tenant_id"] = tenantID
-	if err := a.Dapr.InvokeService(ctx, a.Industry.CRMSyncAppID, "v1/tasks", task, nil); err != nil {
+	if err := a.Dapr.InvokeServiceWithHeaders(ctx, a.Industry.CRMSyncAppID, "v1/tasks", task,
+		internalHeaders(a.CRMSyncInternalToken), nil); err != nil {
 		return fmt.Errorf("crm-sync create task: %w", err)
 	}
 	return nil
