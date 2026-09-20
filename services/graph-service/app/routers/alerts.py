@@ -2,11 +2,15 @@
 
   GET  /v1/graph/alerts                  list (filters status/type/severity)
   GET  /v1/graph/alerts/{alert_id}       detail (404 cross-tenant)
-  POST /v1/graph/alerts/{alert_id}/resolve   adjudicate
+  POST /v1/graph/alerts/{alert_id}/resolve   adjudicate (SPEC-W45 OOS-12:
+                                             admin realm role, or
+                                             X-Internal-Token for service
+                                             callers)
 
 Tenant scoping rides the existing workforce auth seam (JWT sub, or
 X-Tenant-Id in dev mode). Resolve requires a reason (min 10 chars), stamps
-resolved_at/resolved_by (JWT sub), and on ``dismissed`` clears the flagged
+resolved_at/resolved_by (JWT sub; ``service:internal`` on the internal-token
+path), and on ``dismissed`` clears the flagged
 person's quarantine ONLY when no other open high-severity alert still flags
 them (``confirmed`` keeps quarantine). Every resolution emits the audit
 CloudEvent ``com.opendesk.fraud.AlertResolved`` to the fraud alerts topic.
@@ -22,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .. import metrics
-from ..auth import current_tenant
+from ..auth import current_tenant, resolve_admin_principal
 from ..events import build_alert_resolved_event
 from ..templates import TemplateError, compile_template
 from ..templates.alerts import ALERT_SEVERITIES, ALERT_STATUSES, ALERT_TYPES
@@ -100,12 +104,13 @@ async def get_alert(
 async def resolve_alert(
     alert_id: str,
     payload: ResolveRequest,
-    tenant_id: str = Depends(current_tenant),
+    principal: tuple[str, str] = Depends(resolve_admin_principal),
     deps: Any = Depends(get_deps),
 ) -> dict[str, Any]:
-    # The workforce auth seam resolves the caller from the JWT `sub` claim
-    # (X-Tenant-Id in dev mode); that principal is the resolver identity.
-    resolved_by = tenant_id
+    # SPEC-W45 OOS-12: humans need the admin realm role (X-User-Roles);
+    # service callers authenticate with X-Internal-Token (+ X-Tenant-Id)
+    # and are recorded as the service actor.
+    tenant_id, resolved_by = principal
     alert = await _load_alert(deps, tenant_id, alert_id)
     if alert.get("status") != "open":
         raise HTTPException(

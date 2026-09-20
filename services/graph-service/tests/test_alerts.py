@@ -18,6 +18,12 @@ from app.main import create_app
 from app.store import SegmentStore
 from conftest import HDR_A, HDR_B, StubLLM, build_graph
 
+# SPEC-W45 OOS-12: alert resolution is admin-only (X-User-Roles, injected
+# by the gateway from JWT realm roles); service callers use X-Internal-Token.
+HDR_ADMIN_A = {**HDR_A, "X-User-Roles": "admin"}
+HDR_STAFF_A = {**HDR_A, "X-User-Roles": "staff"}
+HDR_INTERNAL_A = {"X-Internal-Token": "tok", "X-Tenant-Id": "tenant-a"}
+
 
 class FakePublisher:
     def __init__(self):
@@ -141,13 +147,13 @@ def test_resolve_requires_reason_min_10(alerts_env):
     resp = client.post(
         "/v1/graph/alerts/al-med-1/resolve",
         json={"decision": "dismissed", "reason": "short"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 422
     resp = client.post(
         "/v1/graph/alerts/al-med-1/resolve",
         json={"decision": "dismissed"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 422
 
@@ -157,7 +163,7 @@ def test_resolve_invalid_decision_422(alerts_env):
     resp = client.post(
         "/v1/graph/alerts/al-med-1/resolve",
         json={"decision": "maybe", "reason": "not a valid decision"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 422
 
@@ -167,7 +173,7 @@ def test_resolve_dismissed_clears_quarantine_when_no_other_open_high(alerts_env)
     resp = client.post(
         "/v1/graph/alerts/al-high-1/resolve",
         json={"decision": "dismissed", "reason": "false positive, reviewed by hand"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -199,7 +205,7 @@ def test_resolve_dismissed_keeps_quarantine_with_other_open_high(alerts_env):
     resp = client.post(
         "/v1/graph/alerts/al-high-1/resolve",
         json={"decision": "dismissed", "reason": "duplicate of al-high-2"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 200
     assert resp.json()["quarantine_cleared"] is False
@@ -211,7 +217,7 @@ def test_resolve_confirmed_keeps_quarantine(alerts_env):
     resp = client.post(
         "/v1/graph/alerts/al-high-1/resolve",
         json={"decision": "confirmed", "reason": "verified referral ring of 3"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 200
     assert resp.json()["quarantine_cleared"] is False
@@ -225,7 +231,7 @@ def test_resolve_already_resolved_409(alerts_env):
     resp = client.post(
         "/v1/graph/alerts/al-old-1/resolve",
         json={"decision": "dismissed", "reason": "re-resolving an old alert"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 409
 
@@ -235,7 +241,7 @@ def test_resolve_cross_tenant_404(alerts_env):
     resp = client.post(
         "/v1/graph/alerts/al-b-1/resolve",
         json={"decision": "dismissed", "reason": "cross tenant attempt here"},
-        headers=HDR_A,
+        headers=HDR_ADMIN_A,
     )
     assert resp.status_code == 404
 
@@ -247,3 +253,81 @@ def test_resolve_requires_auth(alerts_env):
         json={"decision": "confirmed", "reason": "no auth header present"},
     )
     assert resp.status_code == 401
+
+
+# ------------------------------------------------------- OOS-12 admin gate
+def test_resolve_forbidden_without_admin_role(alerts_env):
+    client, g, _ = alerts_env
+    # Authenticated tenant but no realm roles → 403 (SPEC-W45 OOS-12).
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed", "reason": "no roles on this caller"},
+        headers=HDR_A,
+    )
+    assert resp.status_code == 403
+    # A non-admin role (staff) is not enough.
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed", "reason": "staff role is not admin"},
+        headers=HDR_STAFF_A,
+    )
+    assert resp.status_code == 403
+    # Neither attempt mutated the alert.
+    assert g.nodes["tenant-a:al-med-1"].props["status"] == "open"
+
+
+def test_resolve_admin_role_case_insensitive(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed", "reason": "capitalised role header"},
+        headers={**HDR_A, "X-User-Roles": "ops, Admin"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_resolve_internal_token_path(alerts_env):
+    client, g, events = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "confirmed", "reason": "automated adjudication run"},
+        headers=HDR_INTERNAL_A,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["resolved_by"] == "service:internal"
+    alert = g.nodes["tenant-a:al-med-1"].props
+    assert alert["status"] == "confirmed"
+    assert alert["resolved_by"] == "service:internal"
+    assert events.events[0][1]["data"]["resolved_by"] == "service:internal"
+
+
+def test_resolve_internal_token_wrong_401(alerts_env):
+    client, g, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed", "reason": "forged token attempt"},
+        headers={"X-Internal-Token": "forged", "X-Tenant-Id": "tenant-a"},
+    )
+    assert resp.status_code == 401
+    assert g.nodes["tenant-a:al-med-1"].props["status"] == "open"
+
+
+def test_resolve_internal_token_requires_tenant_header(alerts_env):
+    client, _, _ = alerts_env
+    resp = client.post(
+        "/v1/graph/alerts/al-med-1/resolve",
+        json={"decision": "dismissed", "reason": "token but no tenant id"},
+        headers={"X-Internal-Token": "tok"},
+    )
+    assert resp.status_code == 400
+
+
+def test_resolve_internal_token_scopes_tenant(alerts_env):
+    client, _, _ = alerts_env
+    # A valid token for tenant-a must not touch tenant-b's alert (404).
+    resp = client.post(
+        "/v1/graph/alerts/al-b-1/resolve",
+        json={"decision": "dismissed", "reason": "cross tenant via token"},
+        headers=HDR_INTERNAL_A,
+    )
+    assert resp.status_code == 404

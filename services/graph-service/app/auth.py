@@ -163,3 +163,45 @@ async def current_tenant(
     """FastAPI dependency: the tenant id for this request."""
     settings: Settings = request.app.state.settings
     return tenant_from_request(settings, authorization, x_tenant_id)
+
+
+async def resolve_admin_principal(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_tenant_id: str | None = Header(default=None),
+    x_internal_token: str | None = Header(default=None),
+    x_user_roles: str | None = Header(default=None),
+) -> tuple[str, str]:
+    """SPEC-W45 OOS-12 principal for alert-resolution routes.
+
+    Returns ``(tenant_id, resolved_by)``:
+
+    - ``X-Internal-Token`` present → service-to-service path (constant-time
+      compare, fail-closed — the same semantics as
+      ``app.routers.require_internal_token``). The tenant comes from the
+      ``X-Tenant-Id`` header (a service caller holds no JWT in prod) and
+      the resolver is recorded as ``service:internal``.
+    - Otherwise → human path: tenant via the standard workforce seam (JWT
+      sub / dev header), then the caller must carry the ``admin`` realm
+      role on ``X-User-Roles`` (injected by the trusted gateway from the
+      JWT realm roles — the same posture as booking-service). Resolving an
+      alert suppresses a fraud signal, hence 403 for any non-admin role.
+    """
+    settings: Settings = request.app.state.settings
+    if x_internal_token:
+        expected = (settings.internal_token or "").strip()
+        if not expected or not hmac.compare_digest(x_internal_token, expected):
+            raise HTTPException(status_code=401, detail="invalid X-Internal-Token")
+        if not x_tenant_id or not x_tenant_id.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="X-Tenant-Id header required for service callers",
+            )
+        return x_tenant_id.strip(), "service:internal"
+    tenant_id = tenant_from_request(settings, authorization, x_tenant_id)
+    roles = {r.strip().lower() for r in (x_user_roles or "").split(",") if r.strip()}
+    if "admin" not in roles:
+        raise HTTPException(
+            status_code=403, detail="admin realm role required to resolve alerts"
+        )
+    return tenant_id, tenant_id

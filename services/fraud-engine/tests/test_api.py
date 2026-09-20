@@ -11,14 +11,25 @@ from conftest import TENANT, make_cycle
 from fakes import FakeGraphClient, PropertyGraph
 
 
+# SPEC-W45 K23: /v1/detect/* is gated by X-Internal-Token; the shared
+# fixture configures one and sends it (the auth matrix lives below).
+TEST_INTERNAL_TOKEN = "test-fraud-internal-token"
+
+
 @pytest.fixture()
-def api(client, publisher):
-    # sweep/kafka off: background loops must not run under TestClient
+def api_settings():
     import dataclasses
 
-    settings = dataclasses.replace(Settings(), sweep_enabled=False, kafka_enabled=False)
-    app = create_app(client=client, publisher=publisher, settings=settings)
-    with TestClient(app) as tc:
+    # sweep/kafka off: background loops must not run under TestClient
+    return dataclasses.replace(
+        Settings(), sweep_enabled=False, kafka_enabled=False,
+        internal_token=TEST_INTERNAL_TOKEN)
+
+
+@pytest.fixture()
+def api(client, publisher, api_settings):
+    app = create_app(client=client, publisher=publisher, settings=api_settings)
+    with TestClient(app, headers={"X-Internal-Token": TEST_INTERNAL_TOKEN}) as tc:
         yield tc
 
 
@@ -62,10 +73,56 @@ def test_detect_status(api):
     resp = api.get("/v1/detect/status")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["sweep_minutes"] == 15
+    assert body["sweep_enabled"] is False  # fixture disables the sweep loop
     assert body["alerts_topic"] == "opendesk.fraud.alerts.v1"
     assert len(body["detectors"]) == 8
-    assert body["thresholds"]["CAPTURE_VELOCITY_MAX"] == 30
-    assert body["thresholds"]["ANOMALY_ALERT_THRESHOLD"] == 0.9
-    assert body["thresholds"]["CIVIC_REPORT_MAX_PER_DAY"] == 5
-    assert body["thresholds"]["CIVIC_COORD_RADIUS_M"] == 500.0
+    assert body["detector_count"] == 8
+    # SPEC-W45 K23 (OOS-20): status must NOT leak evasion thresholds.
+    assert "thresholds" not in body
+    assert "sweep_minutes" not in body
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W45 K23 (OOS-20): X-Internal-Token gate on /v1/detect/*
+# ---------------------------------------------------------------------------
+
+
+def test_detect_run_missing_token_401(client, publisher, api_settings):
+    app = create_app(client=client, publisher=publisher, settings=api_settings)
+    with TestClient(app) as tc:  # no token header
+        resp = tc.post("/v1/detect/run", json={})
+        assert resp.status_code == 401
+        resp = tc.get("/v1/detect/status")
+        assert resp.status_code == 401
+
+
+def test_detect_run_wrong_token_401(client, publisher, api_settings):
+    app = create_app(client=client, publisher=publisher, settings=api_settings)
+    with TestClient(app, headers={"X-Internal-Token": "wrong"}) as tc:
+        assert tc.post("/v1/detect/run", json={}).status_code == 401
+        assert tc.get("/v1/detect/status").status_code == 401
+
+
+def test_detect_unset_server_token_503_fail_closed(client, publisher):
+    import dataclasses
+
+    settings = dataclasses.replace(
+        Settings(), sweep_enabled=False, kafka_enabled=False, internal_token="")
+    app = create_app(client=client, publisher=publisher, settings=settings)
+    with TestClient(app, headers={"X-Internal-Token": "anything"}) as tc:
+        assert tc.post("/v1/detect/run", json={}).status_code == 503
+        assert tc.get("/v1/detect/status").status_code == 503
+        # healthz stays open for probes even when the gate is unconfigured
+        assert tc.get("/healthz").status_code == 200
+
+
+def test_kafka_trigger_topics_default_matches_producers():
+    """ORPH O11: the default FRAUD_KAFKA_TOPICS must name topics producers
+    actually write — `cac.events` (unprefixed; booking-service leads) plus
+    the booking/identity/civic topics — never the dead `opendesk.cac.events`."""
+    topics = Settings().kafka_trigger_topics.split(",")
+    assert "cac.events" in topics
+    assert "opendesk.booking.events" in topics
+    assert "opendesk.identity.events" in topics
+    assert "opendesk.civic.events.v1" in topics
+    assert "opendesk.cac.events" not in topics
