@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS waitlist (
     CHECK (window_end > window_start)
 );
 CREATE INDEX IF NOT EXISTS idx_waitlist_tenant_offering_status ON waitlist (tenant_id, offering_id, status);
+-- SPEC-W45 CODER-M (K13 completion): the public claim-info/claim endpoints
+-- resolve entries by the unguessable claim_token capability.
+CREATE INDEX IF NOT EXISTS idx_waitlist_claim_token ON waitlist (claim_token);
 ALTER TABLE waitlist ENABLE ROW LEVEL SECURITY;
 ALTER TABLE waitlist FORCE ROW LEVEL SECURITY;
 DO $$
@@ -160,6 +163,26 @@ func (s *Store) GetWaitlistEntry(ctx context.Context, tenantID, id uuid.UUID) (W
 		w, err = scanWaitlist(tx.QueryRow(ctx, q, tenantID, id))
 		return err
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return w, ErrNotFound
+	}
+	return w, err
+}
+
+// GetWaitlistEntryByToken resolves a waitlist entry by its unguessable
+// claim_token for the PUBLIC claim endpoints (GET /v1/waitlist/claim-info,
+// POST /v1/waitlist/claim — SPEC-W45 CODER-M, K13 completion), which carry
+// no tenant context: the token is the capability that binds the caller to
+// exactly one entry, and the entry's tenant_id then scopes every
+// downstream query.
+//
+// NOTE (RLS): public token resolution path — like LookupPromoCode and
+// GetSiteBySlug it intentionally runs outside withTenant and returns only
+// the row needed to enter the correct tenant scope. Tokens are random
+// UUIDs (unguessable), and the endpoints are rate-limited.
+func (s *Store) GetWaitlistEntryByToken(ctx context.Context, token uuid.UUID) (WaitlistEntry, error) {
+	const q = `SELECT ` + waitlistCols + ` FROM waitlist WHERE claim_token=$1`
+	w, err := scanWaitlist(s.pool.QueryRow(ctx, q, token))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return w, ErrNotFound
 	}

@@ -116,6 +116,11 @@ func newTestStore(t *testing.T) *Store {
 	if err := st.ensureCRMColumns(ctx); err != nil {
 		t.Fatalf("crm columns: %v", err)
 	}
+	// Same re-run for the SPEC-W45 team_members.user_id column (STK O14):
+	// the bare fixture table predates the bootstrap ALTER.
+	if err := st.ensureTeamMemberUserIDColumn(ctx); err != nil {
+		t.Fatalf("team_members.user_id column: %v", err)
+	}
 	return st
 }
 
