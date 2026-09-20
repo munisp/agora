@@ -113,15 +113,6 @@ func envCSV(key string) []string {
 	return out
 }
 
-func envBool(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -129,4 +120,14 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// envBool reports whether the variable is set to a truthy value ("1"/"true",
+// case-insensitive) — the explicit dev-escape idiom (default false).
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true":
+		return true
+	}
+	return false
 }
