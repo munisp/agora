@@ -133,11 +133,11 @@ func checkSlotOverlapTx(ctx context.Context, tx pgx.Tx, tenantID, teamMemberID, 
 	}
 	var overlapping, withinBuffer int64
 	err := tx.QueryRow(ctx, `SELECT
-	    count(*) FILTER (WHERE starts_at < $4 AND ends_at > $3),
-	    count(*) FILTER (WHERE starts_at < $6 AND ends_at > $5
-	                     AND NOT (starts_at < $4 AND ends_at > $3))
-	  FROM bookings
-	  WHERE tenant_id=$1 AND team_member_id=$2 AND status <> 'cancelled' AND id <> $7`,
+    count(*) FILTER (WHERE starts_at < $4 AND ends_at > $3),
+    count(*) FILTER (WHERE starts_at < $6 AND ends_at > $5
+                     AND NOT (starts_at < $4 AND ends_at > $3))
+  FROM bookings
+  WHERE tenant_id=$1 AND team_member_id=$2 AND status <> 'cancelled' AND id <> $7`,
 		tenantID, teamMemberID, start, end, from, to, excludeID).Scan(&overlapping, &withinBuffer)
 	if err != nil {
 		return fmt.Errorf("slot overlap re-check: %w", err)
@@ -229,6 +229,10 @@ type BookingFilter struct {
 	// Wave 5 #7 — exact id match, no contact-table join needed).
 	ContactID *uuid.UUID
 	Limit     int
+	// Offset skips the first N rows of the (stable starts_at DESC, id DESC)
+	// order — SPEC-W45 K17 ext pagination. <= 0 = no OFFSET clause (the
+	// pre-K17 behavior is byte-identical).
+	Offset int
 }
 
 // ListBookings returns tenant bookings newest-first, honoring the filter.
@@ -275,9 +279,17 @@ func (s *Store) ListBookings(ctx context.Context, tenantID uuid.UUID, f BookingF
 		q += fmt.Sprintf(` AND starts_at < $%d`, n)
 		args = append(args, *f.To)
 	}
+	// id DESC tie-break makes the order total so OFFSET pagination (K17)
+	// cannot skip/repeat rows across equal starts_at ties; without an offset
+	// the tie-break only orders ties deterministically.
 	n++
-	q += fmt.Sprintf(` ORDER BY starts_at DESC LIMIT $%d`, n)
+	q += fmt.Sprintf(` ORDER BY starts_at DESC, id DESC LIMIT $%d`, n)
 	args = append(args, f.Limit)
+	if f.Offset > 0 {
+		n++
+		q += fmt.Sprintf(` OFFSET $%d`, n)
+		args = append(args, f.Offset)
+	}
 
 	var out []Booking
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {

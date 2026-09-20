@@ -492,21 +492,6 @@ func (s *Store) CompletePublish(ctx context.Context, tenantID, id uuid.UUID, pro
 	})
 }
 
-// SetPostQueued flips a draft post to queued.
-func (s *Store) SetPostQueued(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx,
-			`UPDATE social_posts SET status='queued' WHERE id=$1 AND status='draft'`, id)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("%w: post status draft → queued", ErrInvalidTransition)
-		}
-		return nil
-	})
-}
-
 // ---------------------------------------------------------------------------
 // Ads
 // ---------------------------------------------------------------------------
