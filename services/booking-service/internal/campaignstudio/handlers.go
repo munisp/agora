@@ -51,6 +51,9 @@ type Handlers struct {
 	UsageTopic  string      // opendesk.usage.events; empty disables metering
 	EventsTopic string      // opendesk.studio.events.v1; empty disables lifecycle events
 	StepBatch   int         // per-step advancement cap (<=0 → DefaultStepBatch)
+	// Registry (SPEC-W45 U6) reports conversion outcomes to the
+	// model-registry (fail-closed). nil → reporting skipped (logged).
+	Registry *RegistryClient
 }
 
 func (h *Handlers) log() *zap.Logger {
@@ -507,6 +510,88 @@ func (h *Handlers) Step(w http.ResponseWriter, r *http.Request, tenant bookingop
 		resp["workflow_id"] = workflowID
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ---------------------------------------------------------------------------
+// Conversions (SPEC-W45 U6)
+// ---------------------------------------------------------------------------
+
+type conversionRequest struct {
+	EnrollmentID uuid.UUID `json:"enrollment_id"`
+	StepIdx      int       `json:"step_idx"`
+	ExperimentID uuid.UUID `json:"experiment_id"`
+	Variant      string    `json:"variant"` // champion | challenger (registry contract)
+	Converted    bool      `json:"converted"`
+}
+
+// ReportConversion (POST /v1/studio/journeys/{id}/conversions) records a
+// conversion against an experiment-tagged send and reports the outcome to
+// the model-registry. Recording is durable (conversion_reported step
+// event, enrollment↔journey verified); the registry report is FAIL-CLOSED
+// — a configured registry that rejects/fails the report answers 502 so the
+// caller can retry (the step event keeps the signal replayable). With no
+// registry wired (MODEL_REGISTRY_URL unset) the report is skipped
+// honestly ("registry_report":"skipped") and the call still succeeds.
+func (h *Handlers) ReportConversion(w http.ResponseWriter, r *http.Request, tenant bookingops.TenantInfo) {
+	id, err := urlUUID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req conversionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.EnrollmentID == uuid.Nil {
+		writeError(w, http.StatusBadRequest, "enrollment_id is required")
+		return
+	}
+	if req.ExperimentID == uuid.Nil {
+		writeError(w, http.StatusBadRequest, "experiment_id is required")
+		return
+	}
+	if req.Variant != ControlArm && req.Variant != ChallengerArm {
+		writeError(w, http.StatusBadRequest, "variant must be champion|challenger")
+		return
+	}
+	j, err := h.Store.GetJourney(r.Context(), tenant.ID, id)
+	if err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	if err := h.Store.RecordConversion(r.Context(), tenant.ID, j.ID, req.EnrollmentID,
+		req.StepIdx, req.ExperimentID, req.Variant, req.Converted); err != nil {
+		h.mapErr(w, err)
+		return
+	}
+
+	report := "skipped"
+	if h.Registry != nil {
+		// Fail-closed: the outcome report must land or the caller sees 502.
+		if err := h.Registry.ReportOutcome(r.Context(), req.ExperimentID, tenant.ID,
+			req.EnrollmentID.String(), req.Variant, req.Converted); err != nil {
+			h.log().Error("conversion recorded but registry outcome report failed (fail closed)",
+				zap.String("journey_id", j.ID.String()),
+				zap.String("experiment_id", req.ExperimentID.String()), zap.Error(err))
+			writeError(w, http.StatusBadGateway, "conversion recorded but registry outcome report failed: "+err.Error())
+			return
+		}
+		report = "ok"
+	} else {
+		h.log().Warn("conversion recorded; MODEL_REGISTRY_URL unset so outcome reporting was skipped",
+			zap.String("journey_id", j.ID.String()),
+			zap.String("experiment_id", req.ExperimentID.String()))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"journey_id":      j.ID,
+		"enrollment_id":   req.EnrollmentID,
+		"experiment_id":   req.ExperimentID,
+		"variant":         req.Variant,
+		"converted":       req.Converted,
+		"recorded":        true,
+		"registry_report": report,
+	})
 }
 
 // Stats (GET /v1/studio/journeys/{id}/stats): enrolled/active/completed/

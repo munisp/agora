@@ -34,6 +34,10 @@ type QueuedSend struct {
 	TemplateName string   `json:"template_name,omitempty"`
 	Language     string   `json:"language,omitempty"`
 	Params       []string `json:"params,omitempty"`
+	// ExperimentID (SPEC-W45 U6) carries the send step's model-registry
+	// experiment; the send workflow resolves the recipient's arm per send
+	// (fail-open to the control arm) when non-nil.
+	ExperimentID *uuid.UUID `json:"experiment_id,omitempty"`
 }
 
 // AdvanceResult summarizes one POST /journeys/{id}/step invocation.
@@ -184,10 +188,15 @@ func (s *Store) AdvanceDue(ctx context.Context, tenantID uuid.UUID, j Journey, n
 					TemplateName: step.TemplateName,
 					Language:     step.Language,
 					Params:       step.Params,
+					ExperimentID: step.ExperimentID,
 				}
 				payload, _ := json.Marshal(map[string]any{"kind": qs.Kind, "phone": qs.Phone})
+				queuedPayload := map[string]any{"kind": qs.Kind, "payload": json.RawMessage(payload)}
+				if step.ExperimentID != nil {
+					queuedPayload["experiment_id"] = step.ExperimentID.String()
+				}
 				if err := s.advanceOne(ctx, tx, tenantID, j.ID, e, EventSendQueued,
-					map[string]any{"kind": qs.Kind, "payload": json.RawMessage(payload)}, len(j.Steps)); err != nil {
+					queuedPayload, len(j.Steps)); err != nil {
 					return err
 				}
 				res.Sends = append(res.Sends, qs)
@@ -254,7 +263,7 @@ func (s *Store) exitEnrollment(ctx context.Context, tx pgx.Tx, tenantID, journey
 }
 
 // completeEnrollment completes an enrollment already past the last step.
-func (s *Store) completeEnrollment(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, e Enrollment) error {
+func (s *Store) completeEnrollment(ctx context.Context, tx pgx.Tx, tenantID, journeyID uuid.UUID, e Enrollment) error {
 	if _, err := tx.Exec(ctx,
 		`UPDATE studio_enrollments SET state='completed', last_step_at=now()
 		  WHERE tenant_id=$1 AND id=$2`,
@@ -328,13 +337,46 @@ func (s *Store) loadContactAttrs(ctx context.Context, tx pgx.Tx, tenantID, conta
 
 // RecordSendOutcome writes the send_sent / send_suppressed / send_failed
 // step event for a previously queued send (called by the StudioSendWorkflow
-// activity after each paced send resolves).
-func (s *Store) RecordSendOutcome(ctx context.Context, tenantID, journeyID, enrollmentID uuid.UUID, stepIdx int, kind, reason string) error {
+// activity after each paced send resolves). variant/experimentID (SPEC-W45
+// U6) carry the resolved experiment arm — empty for non-experiment sends.
+func (s *Store) RecordSendOutcome(ctx context.Context, tenantID, journeyID, enrollmentID uuid.UUID, stepIdx int, kind, reason, variant, experimentID string) error {
 	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		payload := map[string]any{}
 		if reason != "" {
 			payload["reason"] = reason
 		}
+		if variant != "" {
+			payload["variant"] = variant
+		}
+		if experimentID != "" {
+			payload["experiment_id"] = experimentID
+		}
 		return s.insertStepEvent(ctx, tx, tenantID, journeyID, enrollmentID, stepIdx, kind, payload)
+	})
+}
+
+// RecordConversion writes the conversion_reported step event for an
+// experiment-tagged send (SPEC-W45 U6; POST /journeys/{id}/conversions).
+// The enrollment must belong to the journey in the tenant — a mismatched
+// triple is ErrNotFound (the registry report MUST NOT be fed by
+// cross-journey guesses).
+func (s *Store) RecordConversion(ctx context.Context, tenantID, journeyID, enrollmentID uuid.UUID, stepIdx int, experimentID uuid.UUID, variant string, converted bool) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM studio_enrollments
+			                WHERE tenant_id=$1 AND journey_id=$2 AND id=$3)`,
+			tenantID, journeyID, enrollmentID).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		return s.insertStepEvent(ctx, tx, tenantID, journeyID, enrollmentID, stepIdx, EventConversionReported,
+			map[string]any{
+				"experiment_id": experimentID.String(),
+				"variant":       variant,
+				"converted":     converted,
+			})
 	})
 }

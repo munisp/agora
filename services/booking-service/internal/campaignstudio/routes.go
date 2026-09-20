@@ -59,6 +59,10 @@ type Deps struct {
 	// StepBatchSize caps enrollments advanced per step call (<=0 →
 	// DefaultStepBatch).
 	StepBatchSize int
+	// Registry (SPEC-W45 U6) is the model-registry experiments client
+	// (integrator: RegistryFromEnv) used by the conversion webhook's
+	// fail-closed outcome report. nil → reports are skipped (logged).
+	Registry *RegistryClient
 }
 
 type handlerFunc func(*Handlers, http.ResponseWriter, *http.Request, bookingops.TenantInfo)
@@ -78,6 +82,7 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		UsageTopic:  d.UsageTopic,
 		EventsTopic: d.EventsTopic,
 		StepBatch:   d.StepBatchSize,
+		Registry:    d.Registry,
 	}
 	tenantOf := d.TenantFromContext
 	if tenantOf == nil {
@@ -106,6 +111,7 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		r.Method(http.MethodPatch, "/journeys/{id}", adapt(d.RequireWrite, (*Handlers).PatchJourney))
 		r.Method(http.MethodPost, "/journeys/{id}/enroll", adapt(d.RequireWrite, (*Handlers).Enroll))
 		r.Method(http.MethodPost, "/journeys/{id}/step", adapt(d.RequireWrite, (*Handlers).Step))
+		r.Method(http.MethodPost, "/journeys/{id}/conversions", adapt(d.RequireWrite, (*Handlers).ReportConversion))
 		r.Method(http.MethodGet, "/journeys/{id}/stats", adapt(d.RequireRead, (*Handlers).Stats))
 	})
 }

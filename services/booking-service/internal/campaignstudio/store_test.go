@@ -395,7 +395,7 @@ func TestRecordSendOutcome(t *testing.T) {
 		{EventSendSuppressed, "global_dnd"},
 		{EventSendFailed, "provider boom"},
 	} {
-		if err := st.RecordSendOutcome(ctx, tenantID, j.ID, e.ID, 0, outcome.kind, outcome.reason); err != nil {
+		if err := st.RecordSendOutcome(ctx, tenantID, j.ID, e.ID, 0, outcome.kind, outcome.reason, "", ""); err != nil {
 			t.Fatalf("record %s: %v", outcome.kind, err)
 		}
 	}
