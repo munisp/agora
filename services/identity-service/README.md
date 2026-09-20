@@ -11,8 +11,25 @@ Tenant provisioning and identity context for OpenDesk (SPEC §7 identity schema,
 - Tenant provisioning: DB row + Keycloak group `/tenants/{slug}` + Permify
   tenant/relationships + `TenantProvisioned` CloudEvent on
   `opendesk.identity.events` via the Dapr pubsub component `pubsub-kafka`.
-- Member invites: Keycloak user creation (+ group join), membership row,
-  Permify relationship, `MemberInvited` CloudEvent.
+- Member invites: Keycloak user creation (+ group join + execute-actions
+  e-mail when realm SMTP is live, K8/K10), membership row, Permify
+  relationship, realm-role mirror via role-mappings (STK O4), `MemberInvited`
+  CloudEvent (payload `tenant_slug,email,display_name,role,invited_by,
+  invite_ts` — notification-worker sends the invite e-mail from it).
+- Member lifecycle (SPEC-W45 K16): `DELETE`/`PATCH
+  /v1/tenants/{slug}/members/{user_id}` — Keycloak disable + session
+  revocation, Permify unlink/write, realm-role swap, `MemberRemoved` /
+  `MemberRoleChanged` events. Admin-gated (Permify `manage_catalog`);
+  owner-only for the owner role. Re-invite of an existing e-mail →
+  `409 {"error":"already_invited_or_member","resend":true}` (STK O3).
+- Tenant API keys (SPEC-W45 K17): `POST`/`GET`/`DELETE
+  /v1/tenants/{slug}/api-keys` (owner/admin; full key `prefix.secret` shown
+  once, SHA-256 hash stored) + `POST /internal/api-keys/validate`
+  (X-Internal-Token) → `{tenant_slug,scopes}` for service middleware.
+- Plan enforcement (SPEC-W45 K18): member cap per plan (free 3, pro 20,
+  scale/enterprise/twin unlimited) enforced at invite time (403 with upgrade
+  message); `PATCH /v1/tenants/{slug}/plan` (owner or platform-admin,
+  audit-logged, `TenantPlanChanged` event).
 - Idempotent internal endpoints for the `TenantOnboardingWorkflow`.
 
 ## Endpoints
@@ -23,7 +40,14 @@ Tenant provisioning and identity context for OpenDesk (SPEC §7 identity schema,
 | GET | `/v1/tenants/{slug}` | Public tenant context (incl. `id`) |
 | POST | `/v1/tenants` | Provision a tenant |
 | GET | `/v1/tenants/{slug}/members` | List memberships |
-| POST | `/v1/tenants/{slug}/members` | Invite member (role owner\|admin\|staff\|viewer) |
+| POST | `/v1/tenants/{slug}/members` | Invite member (role owner\|admin\|staff\|viewer; `realm_roles` analyst\|billing platform-admin-only; 409 already_invited_or_member+resend on re-invite) |
+| DELETE | `/v1/tenants/{slug}/members/{user_id}` | Remove member (K16: disable IdP user, revoke sessions, Permify unlink, `MemberRemoved`) |
+| PATCH | `/v1/tenants/{slug}/members/{user_id}` | Change member role (K16: Permify + realm-role swap, `MemberRoleChanged`) |
+| POST | `/v1/tenants/{slug}/api-keys` | Create tenant API key (K17; full key returned once) |
+| GET | `/v1/tenants/{slug}/api-keys` | List keys (prefix/scopes/status only — never hashes) |
+| DELETE | `/v1/tenants/{slug}/api-keys/{key_id}` | Revoke key (soft delete) |
+| PATCH | `/v1/tenants/{slug}/plan` | Change plan (K18; owner or platform-admin, audit + `TenantPlanChanged`) |
+| POST | `/internal/api-keys/validate` | Validate an API key → `{tenant_slug,tenant_id,scopes,key_id,prefix}` or 401 (X-Internal-Token, K2) |
 | POST | `/internal/tenants/{slug}/ensure-group` | Idempotent Keycloak group creation (Temporal onboarding) |
 | POST | `/internal/tenants/{slug}/ensure-permify` | Idempotent Permify tenant creation |
 
@@ -112,6 +136,32 @@ Dapr component on topic `opendesk.apps.lifecycle.v1`):
 (incl. re-enable and DELETE); an enabled→enabled replay publishes nothing.
 Payload `{tenant_id, app_id, status, actor, ts}`.
 
+## Event stream contracts (operator/tenant streams)
+
+`opendesk.identity.events` and `opendesk.apps.lifecycle.v1` are PUBLIC
+operator event streams (SPEC-W45 ORPH O9 — declared contract, resolving the
+create-topics comment drift where the lifecycle topic was listed with
+placeholder event names):
+
+- **`opendesk.apps.lifecycle.v1`** — app-platform operator stream.
+  Event types: `com.opendesk.apps.AppProvisioned`,
+  `com.opendesk.apps.AppStatusChanged`. Payload `{tenant_id, app_id, status,
+  actor, ts}` (CloudEvents 1.0 envelope, `tenantid` extension). Retention:
+  Kafka default (7d). Consumers welcome: subscribe with your own consumer
+  group; the schema is additive-stable (new fields may appear, existing
+  fields never change meaning).
+- **`opendesk.identity.events`** — tenant/member operator stream.
+  Event types: `com.opendesk.identity.TenantProvisioned` `{tenant_id, slug,
+  name, plan, industry}`; `com.opendesk.identity.MemberInvited`
+  `{tenant_slug, email, display_name, role, invited_by, invite_ts}`
+  (notification-worker invite e-mail, K8); `com.opendesk.identity.
+  MemberRemoved` / `MemberRoleChanged` (K16); `com.opendesk.identity.
+  TenantDeleted` `{tenant_slug, tenant_id, deleted_at, actor}` (K9 purge
+  cascade — booking/conversation/graph-sync/crm-sync consume);
+  `com.opendesk.identity.TenantPlanChanged` `{tenant_slug, tenant_id,
+  old_plan, new_plan, actor, changed_at}` (K18). Same envelope/retention/
+  additive-stability contract as above.
+
 ## Environment variables
 
 | Var | Default | Description |
@@ -129,6 +179,12 @@ Payload `{tenant_id, app_id, status, actor, ts}`.
 | `IDENTITY_EVENTS_TOPIC` | `opendesk.identity.events` | Identity events topic |
 | `APPS_LIFECYCLE_TOPIC` | `opendesk.apps.lifecycle.v1` | App lifecycle CloudEvents topic (SPEC-W18; `AppProvisioned`/`AppStatusChanged`) |
 | `NOTIFICATION_APP_ID` | `notification` | Dapr app-id of notification-worker (fire-and-forget `POST /dev/trigger-onboarding` after provisioning starts the `TenantOnboardingWorkflow`) |
+| `KC_REALM_SMTP_HOST` | — (unset = skip) | Realm SMTP bootstrap (K10): when set, PATCHes the realm `smtpServer` at boot (fail-soft warn) so Keycloak's own credentials e-mails (K8 execute-actions) fire |
+| `KC_REALM_SMTP_PORT` | `587` | Realm SMTP port |
+| `KC_REALM_SMTP_FROM` | — | Realm SMTP sender address |
+| `KC_REALM_SMTP_USER` | — | Realm SMTP auth user |
+| `KC_REALM_SMTP_PASSWORD` | — | Realm SMTP auth password |
+| `PORTAL_SECRET` | — (unset = portal path off) | Booking portal JWT HMAC secret (shared with booking-service). Lets data subjects self-serve consent data-access/erasure with their portal session (STK O13) |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `15` | Graceful shutdown budget |
 
 ## Run
@@ -152,7 +208,12 @@ docker build -t opendesk/identity-service .
   to the durable `TenantOnboardingWorkflow` (which calls the idempotent
   `/internal/.../ensure-*` endpoints) instead of failing provisioning.
 - Realm role `staff` maps to the Permify relation `member` (SPEC §8 schema
-  relations: owner/admin/member/viewer).
+  relations: owner/admin/member/viewer). Since SPEC-W45 (STK O4) the
+  membership roles admin/staff/viewer are ALSO mirrored to same-named
+  Keycloak realm roles via role-mappings at invite/role-change time
+  (fail-soft — Permify stays the authorization source of truth); the
+  functional realm roles `analyst`/`billing` are grantable at invite time by
+  platform-admins only (`realm_roles` field).
 - CloudEvents 1.0 envelope per SPEC §4: `{specversion, id, source, type,
   subject, time, tenantid, data}`.
 
@@ -167,12 +228,20 @@ docker build -t opendesk/identity-service .
   `POST /dev/trigger-twin-cleanup` (24h timer → Dapr
   `DELETE /v1/tenants/{slug}`).
 - `DELETE /v1/tenants/{slug}` deletes a tenant + its memberships.
-  **Guard (permify-free by design):** slugs containing `-twin-` delete
-  freely — the cleanup workflow calls over the private Dapr mesh and
-  operators via the admin UI; every other slug requires the caller (JWT
-  `sub` or `X-User-Id`) to hold `manage_catalog` on the organization
+  **Guard:** tenants flagged `is_twin=true` delete freely (the cleanup
+  workflow calls over the internal token; SPEC-W44 W-I-3 — the old
+  slug-substring heuristic is gone); every other slug requires the caller
+  (JWT `sub` or `X-User-Id`) to hold `manage_catalog` on the organization
   (Permify check).
-- **Cascade note:** only the identity rows (tenant + memberships) are
-  removed. Twin data in booking/conversation/knowledge expires with the
-  twin's 24h lifetime and is reclaimed by those services' own retention —
-  twins are short-lived sandboxes, not production tenants.
+- **Cascade note (SPEC-W45 K9):** deletion (both the guarded `/v1` path and
+  the internauth `/internal` path — `deleteTenantInternal` is shared by twin
+  cleanup and admin delete) now (1) removes the identity rows (tenant +
+  memberships; `tenant_api_keys` via FK cascade), (2) publishes
+  `com.opendesk.identity.TenantDeleted` `{tenant_slug, tenant_id,
+  deleted_at, actor}` on `opendesk.identity.events` — booking-service
+  (anonymize contacts, cancel open bookings), conversation-service (purge
+  sessions/history), graph-sync (delete tenant subgraph) and crm-sync
+  (disable sync_map entries) consume it —, (3) deletes the Keycloak group
+  `/tenants/{slug}`, and (4) deletes the Permify tenant. Steps 2–4 are
+  best-effort: failures are logged at Error and surfaced in the response
+  `warnings` array, never silently swallowed.
