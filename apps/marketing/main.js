@@ -44,4 +44,16 @@
       }
     });
   }
+
+  /* SPEC-W45 STK O5: signup CTA → admin-web /signup. This is a static,
+   * no-build site, so the app URL is injected at deploy time as a global
+   * (window.NEXT_PUBLIC_APP_URL, e.g. via a tiny templated config script);
+   * absent that, the CTA falls back to the local-dev default. */
+  var appUrl =
+    (typeof window.NEXT_PUBLIC_APP_URL === "string" &&
+      window.NEXT_PUBLIC_APP_URL.replace(/\/+$/, "")) ||
+    "http://localhost:3000";
+  document.querySelectorAll("a[data-app-signup]").forEach(function (a) {
+    a.setAttribute("href", appUrl + "/signup");
+  });
 })();

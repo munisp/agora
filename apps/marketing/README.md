@@ -34,3 +34,16 @@ step and no module loading, so `file://` works too.
 
 Serve the directory with any static host (nginx, Caddy, GitHub Pages, S3 + CDN, …).
 No environment variables, server-side code, or build pipeline required.
+
+### Signup CTA target
+
+The "Sign up free" CTAs (`a[data-app-signup]`) link to the admin-web signup
+page. Because the site is static, the app origin is injected at deploy time
+as a global before `main.js` runs, e.g. a one-line `config.js`:
+
+```html
+<script>window.NEXT_PUBLIC_APP_URL = "https://app.example.com";</script>
+```
+
+When unset, the CTAs fall back to the local-dev default
+`http://localhost:3000/signup`.

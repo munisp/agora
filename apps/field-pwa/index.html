@@ -76,15 +76,6 @@ summary{cursor:pointer}
       with your Agora staff account (Keycloak).</p>
     <label for="f-slug">Tenant slug</label>
     <input id="f-slug" autocomplete="organization" placeholder="e.g. sunrise-dental">
-    <details>
-      <summary>Server settings</summary>
-      <label for="f-issuer">Keycloak issuer</label>
-      <input id="f-issuer" placeholder="http://localhost:8080/realms/opendesk">
-      <label for="f-client">Client ID</label>
-      <input id="f-client" placeholder="admin-web">
-      <label for="f-api">API base</label>
-      <input id="f-api" placeholder="/api/bookings">
-    </details>
     <button id="btn-login" class="btn-primary">Sign in with Keycloak</button>
     <button id="btn-demo" class="btn-ghost">No staff account? Continue in demo mode (offline queue only)</button>
     <p id="auth-msg" class="muted"></p>
@@ -121,6 +112,10 @@ summary{cursor:pointer}
 </main>
 <div id="toast" role="status"></div>
 <noscript><p style="padding:16px">Agora Field needs JavaScript.</p></noscript>
+<!-- SPEC-W45 K25: endpoints are build-time constants. A deploy may inject
+     window.__FIELD_CONFIG__ = { issuer, apiBase } via a templated config
+     script served BEFORE app.js; the Keycloak client is always the
+     dedicated public client `opendesk-field`. -->
 <script src="app.js"></script>
 </body>
 </html>

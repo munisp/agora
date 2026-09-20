@@ -16,6 +16,13 @@ export interface ToastItem {
   /** optional call-to-action link rendered under the description */
   href?: string;
   hrefLabel?: string;
+  /**
+   * Optional call-to-action button rendered under the description (used
+   * when the target URL is not known up-front, e.g. SPEC-W45 K15(e) staff
+   * escalation tokens minted on click). Takes precedence over `href`.
+   */
+  actionLabel?: string;
+  onAction?: () => void;
 }
 
 interface ToastInput {
@@ -24,6 +31,8 @@ interface ToastInput {
   variant?: ToastVariant;
   href?: string;
   hrefLabel?: string;
+  actionLabel?: string;
+  onAction?: () => void;
 }
 
 const ToastContext = React.createContext<{
@@ -55,6 +64,8 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
         variant: input.variant ?? "default",
         href: input.href,
         hrefLabel: input.hrefLabel,
+        actionLabel: input.actionLabel,
+        onAction: input.onAction,
       };
       setToasts((prev) => [...prev.slice(-4), item]);
       setTimeout(() => dismiss(id), 5000);
@@ -82,7 +93,15 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
                   {t.description}
                 </p>
               ) : null}
-              {t.href ? (
+              {t.onAction ? (
+                <button
+                  type="button"
+                  onClick={t.onAction}
+                  className="mt-1 inline-block cursor-pointer text-xs font-medium text-primary underline underline-offset-2"
+                >
+                  {t.actionLabel ?? "Open"}
+                </button>
+              ) : t.href ? (
                 <a
                   href={t.href}
                   className="mt-1 inline-block text-xs font-medium text-primary underline underline-offset-2"

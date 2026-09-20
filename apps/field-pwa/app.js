@@ -14,15 +14,26 @@
 
 var LS = {
   slug: "od.field.slug",
-  cfg: "od.field.cfg",
+  cfg: "od.field.cfg", // legacy key — scrubbed below (SPEC-W45 K25)
   tokens: "od.field.tokens",
   mode: "od.field.mode", // "live" | "demo" | null
 };
 
+/* SPEC-W45 K25: endpoints are BUILD-TIME constants, not user-editable. A
+ * deploy may inject window.__FIELD_CONFIG__ (e.g. a templated config script
+ * served before app.js) to pin the issuer/apiBase for the environment; the
+ * Keycloak client is always the dedicated public client `opendesk-field`
+ * (never the admin-web client, and never overridable at runtime). The old
+ * "Server settings" override UI was removed — a field device must not be
+ * repointable at an attacker-controlled issuer/API by typing into the page.
+ */
+var BUILD_CONFIG =
+  (typeof window !== "undefined" && window.__FIELD_CONFIG__) || {};
+
 var DEFAULTS = {
-  issuer: "http://localhost:8080/realms/opendesk",
-  clientId: "admin-web",
-  apiBase: "/api/bookings", // APISIX: /api/bookings/* -> booking-service
+  issuer: BUILD_CONFIG.issuer || "http://localhost:8080/realms/opendesk",
+  clientId: "opendesk-field",
+  apiBase: BUILD_CONFIG.apiBase || "/api/bookings", // APISIX: /api/bookings/* -> booking-service
 };
 
 function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -30,15 +41,14 @@ function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
 
 function cfg() {
-  var c = {};
-  try { c = JSON.parse(lsGet(LS.cfg) || "{}"); } catch (e) {}
   return {
-    issuer: c.issuer || DEFAULTS.issuer,
-    clientId: c.clientId || DEFAULTS.clientId,
-    apiBase: c.apiBase || DEFAULTS.apiBase,
+    issuer: DEFAULTS.issuer,
+    clientId: DEFAULTS.clientId,
+    apiBase: DEFAULTS.apiBase,
   };
 }
-function saveCfg(c) { lsSet(LS.cfg, JSON.stringify(c)); syncMeta(); }
+/* One-time scrub of any pre-K25 user-supplied endpoint override. */
+lsDel(LS.cfg);
 
 /* Token storage posture (TS-003, mission-critical assurance): bearer and
  * refresh tokens live ONLY in this in-memory variable, mirrored into
@@ -144,12 +154,7 @@ function redirectUri() { return location.origin + location.pathname; }
 function startLogin() {
   var slug = document.getElementById("f-slug").value.trim();
   if (!slug) { authMsg("Enter your tenant slug first."); return; }
-  var c = {
-    issuer: document.getElementById("f-issuer").value.trim() || DEFAULTS.issuer,
-    clientId: document.getElementById("f-client").value.trim() || DEFAULTS.clientId,
-    apiBase: document.getElementById("f-api").value.trim() || DEFAULTS.apiBase,
-  };
-  saveCfg(c);
+  var c = cfg(); // pinned build-time endpoints (K25)
   lsSet(LS.slug, slug);
 
   var verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -434,10 +439,6 @@ function render() {
   if (m) renderOutbox();
   // prefill auth form
   $("f-slug").value = lsGet(LS.slug) || "";
-  var c = cfg();
-  $("f-issuer").value = c.issuer;
-  $("f-client").value = c.clientId;
-  $("f-api").value = c.apiBase;
 }
 
 /* ---------------- boot ---------------- */
@@ -447,11 +448,6 @@ function boot() {
   $("btn-demo").onclick = function () {
     var slug = $("f-slug").value.trim();
     if (slug) lsSet(LS.slug, slug);
-    saveCfg({
-      issuer: $("f-issuer").value.trim() || DEFAULTS.issuer,
-      clientId: $("f-client").value.trim() || DEFAULTS.clientId,
-      apiBase: $("f-api").value.trim() || DEFAULTS.apiBase,
-    });
     setMode("demo");
     render();
   };

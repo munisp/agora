@@ -79,15 +79,20 @@ metadata:
 type: Opaque
 stringData:
   # ========================================================================
-  # W39 SIM-024 — NO DEFAULTS SHIPPED. The values below are placeholders;
-  # applying this manifest AS-IS is INVALID and will break media auth.
-  # Generate a real keypair and rotate it per docs/runbooks/secrets.md
-  # BEFORE `kubectl apply`, e.g. inject via SOPS/ExternalSecrets or:
+  # W39 SIM-024 — NO DEFAULTS SHIPPED.
+  # OOS-28 (SPEC-W45) CORRECTION: the placeholder values below are FAIL-OPEN,
+  # not fail-closed — LiveKit does NOT refuse to start on them. Applied
+  # AS-IS the server boots happily and accepts tokens signed with these
+  # committed, publicly known values, i.e. ANYONE who has read this repo can
+  # mint valid room/admin tokens for the media plane (full call join +
+  # eavesdrop). The placeholders MUST be replaced with a generated keypair
+  # BEFORE `kubectl apply` — treat an unchanged REPLACE_ME_* value as a
+  # live credential leak. Inject via SOPS/ExternalSecrets or:
   #   kubectl -n opendesk create secret generic livekit-keys \
   #     --from-literal=LIVEKIT_API_KEY=<generated> \
   #     --from-literal=LIVEKIT_API_SECRET=<generated>
   # Every LiveKit client (voice-agent-runtime, avatar-renderer, SIP bridge)
-  # must be handed the SAME pair.
+  # must be handed the SAME pair. Rotate per docs/runbooks/secrets.md.
   # ========================================================================
   LIVEKIT_API_KEY: REPLACE_ME_LIVEKIT_API_KEY
   LIVEKIT_API_SECRET: REPLACE_ME_LIVEKIT_API_SECRET

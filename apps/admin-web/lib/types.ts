@@ -453,7 +453,15 @@ export interface EscalationRequestedEvent {
   data: {
     conversation_id: string;
     room: string;
-    join_token_staff: string;
+    /**
+     * SPEC-W45 K15(e): the staff LiveKit join token is NO LONGER on the
+     * event (the events topic is fan-out — any consumer could hijack the
+     * room). Staff mint a token on demand via
+     * POST /api/voice-admin/escalations/{conversation_id}/staff-token
+     * (see bookings-client.tsx).
+     */
+    staff_token_endpoint?: string;
+    reason?: string;
     site_slug?: string;
   };
   tenant_id?: string;

@@ -29,6 +29,7 @@ import {
   Filter,
   Shield,
   FileWarning,
+  Bell,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -72,6 +73,8 @@ const items: NavItem[] = [
   { segment: "segments", label: "Segments", icon: Filter },
   // SPEC-W30: fraud & trust alert queue — same gate as segments.
   { segment: "alerts", label: "Alerts", icon: Shield },
+  // SPEC-W45 ORPH O15: platform ops alerts read-back — admin/platform-admin.
+  { segment: "ops-alerts", label: "Ops alerts", icon: Bell },
   // SPEC-W32: civic case triage console — operational, owner/admin/staff.
   { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
@@ -149,6 +152,10 @@ export function OrgNav({
     // gate as voices; the pages enforce it server-side too.
     if ("segment" in item && item.segment === "agents")
       return canViewAgents(roles);
+    // SPEC-W45 ORPH O15: ops alerts mirror the gateway gate — admin or
+    // platform-admin only; the page redirects everyone else.
+    if ("segment" in item && item.segment === "ops-alerts")
+      return roles.includes("admin") || roles.includes("platform-admin");
     return true;
   });
 
