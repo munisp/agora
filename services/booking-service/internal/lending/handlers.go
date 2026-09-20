@@ -72,6 +72,20 @@ type Deps struct {
 	// KYC service is not wired: approvals then REQUIRE an explicit
 	// {kyc_override: true, reason}, recorded in the decision event payload.
 	KYCURL string
+	// KYCInternalToken is sent as X-Internal-Token on the kyc resolve call
+	// (SPEC-W45 K22: /v1/kyc/resolve is internal-token gated; the shared
+	// KYC_INTERNAL_TOKEN value lives on both services). Empty = no header
+	// (dev against an ungated kyc-service only — compose sets it).
+	KYCInternalToken string
+	// Ledger is the kobo double-entry ledger seam (SPEC-W45 ORPH O4):
+	// cmd/server/main.go wires NewPostgresLedger; the disburse/repay
+	// handlers route their journal CONFIRMATION through PostBalanced so
+	// validateJournal/PostBalanced have live production callers (the
+	// authoritative posting stays inside the store's disburse/repay
+	// transaction; PostBalanced is idempotent on
+	// (ref_type, ref_id, account_code), so the confirmation is a replay-
+	// safe no-op when the in-tx journal already landed). Nil = skip.
+	Ledger Ledger
 	// KYCHTTP is the HTTP client for the KYC call (nil → a 5s-timeout
 	// default). Tests inject a client against httptest servers.
 	KYCHTTP *http.Client
@@ -122,6 +136,11 @@ type Handlers struct {
 	UsageTopic  string
 	KYCURL      string
 	KYCHTTP     *http.Client
+	// KYCInternalToken rides the kyc resolve call as X-Internal-Token
+	// (SPEC-W45 K22; see Deps).
+	KYCInternalToken string
+	// Ledger is the journal-confirmation seam (SPEC-W45 ORPH O4; see Deps).
+	Ledger Ledger
 	// UserFromContext extracts the caller subject (JWT sub) for
 	// decided_by; may be nil (see Deps).
 	UserFromContext func(ctx context.Context) string
@@ -167,6 +186,8 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		UsageTopic:         d.UsageTopic,
 		KYCURL:             d.KYCURL,
 		KYCHTTP:            d.KYCHTTP,
+		KYCInternalToken:   d.KYCInternalToken,
+		Ledger:             d.Ledger,
 		UserFromContext:    d.UserFromContext,
 		KYCOverrideRoles:   d.KYCOverrideRoles,
 		RealRailConfigured: d.RealRailConfigured,
@@ -646,6 +667,10 @@ func (h *Handlers) checkKYC(r *http.Request, tenant bookingops.TenantInfo, req p
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// SPEC-W45 K22: kyc /v1/kyc/resolve is internal-token gated.
+	if h.KYCInternalToken != "" {
+		httpReq.Header.Set("X-Internal-Token", h.KYCInternalToken)
+	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		h.log().Warn("kyc-service call failed", zap.Error(err))
@@ -756,10 +781,39 @@ func (h *Handlers) Disburse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !res.Replayed {
+		// SPEC-W45 ORPH O4: journal confirmation through the Ledger seam
+		// (idempotent — see Deps.Ledger). disbursement = debit 501 /
+		// credit 500, ref_id = application id.
+		h.confirmJournal(r.Context(), BalancedPosting{
+			TenantID:      tenant.ID,
+			DebitAccount:  AccountRepaymentReceived,
+			CreditAccount: AccountPrincipalDisbursed,
+			AmountKobo:    res.Loan.PrincipalKobo,
+			RefType:       RefTypeDisbursement,
+			RefID:         id.String(),
+			BeneficiaryID: res.Loan.ContactID.String(),
+		})
 		h.publishDisbursed(r.Context(), tenant.Slug, res)
 		h.meterLoanDisbursed(r.Context(), tenant.Slug, res)
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// confirmJournal routes one balanced posting through the Ledger seam
+// (SPEC-W45 ORPH O4). The authoritative journal was already posted inside
+// the store's disburse/repay transaction; this PostBalanced is idempotent
+// on (ref_type, ref_id, account_code), so it is a replay-safe no-op when
+// the journal landed and the repair path when it did not. Failures are
+// logged loudly — the money state is durable either way.
+func (h *Handlers) confirmJournal(ctx context.Context, p BalancedPosting) {
+	if h.Ledger == nil {
+		return
+	}
+	if err := h.Ledger.PostBalanced(ctx, p); err != nil {
+		h.log().Error("lending ledger confirmation failed — journal durable in-tx but the Ledger seam errored; reconcile",
+			zap.String("ref_type", p.RefType), zap.String("ref_id", p.RefID),
+			zap.Int64("amount_kobo", p.AmountKobo), zap.Error(err))
+	}
 }
 
 // repayRequest is the POST /v1/lending/loans/{id}/repay body. ref_id is
@@ -797,6 +851,20 @@ func (h *Handlers) Repay(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.mapErr(w, err)
 		return
+	}
+	if !res.Replayed {
+		// SPEC-W45 ORPH O4: journal confirmation through the Ledger seam
+		// (idempotent — see Deps.Ledger). repayment = debit 500 /
+		// credit 501, ref_id = the caller's repayment ref_id.
+		h.confirmJournal(r.Context(), BalancedPosting{
+			TenantID:      tenant.ID,
+			DebitAccount:  AccountPrincipalDisbursed,
+			CreditAccount: AccountRepaymentReceived,
+			AmountKobo:    res.Repayment.AmountKobo,
+			RefType:       RefTypeRepayment,
+			RefID:         res.Repayment.RefID,
+			BeneficiaryID: res.Loan.ContactID.String(),
+		})
 	}
 	if !res.Replayed && res.LoanRepaid {
 		h.publishRepaid(r.Context(), tenant.Slug, res)
