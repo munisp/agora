@@ -7,6 +7,7 @@ started in lifespan, jobs wrapped so they never crash the scheduler — I1).
 
 from __future__ import annotations
 
+import hmac
 import logging
 import math
 from contextlib import asynccontextmanager
@@ -15,7 +16,7 @@ from typing import Any, Mapping
 from uuid import UUID
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -188,6 +189,27 @@ def create_app(
     app = FastAPI(title="opendesk-model-registry",
                   version="0.1.0", lifespan=lifespan)
 
+    # ------------------------------------------------- K23 internal-token gate
+    # SPEC-W45 K23 (OOS-08): the mutating registry routes (register /
+    # promote / rollback) and every experiments route are service-to-service
+    # only — X-Internal-Token must match MODEL_REGISTRY_INTERNAL_TOKEN via
+    # constant-time compare. Fail-closed (identity-service K2 pattern): 503
+    # when the env token is unset, 401 on missing/wrong. Read-only lookups
+    # (production/versions GETs, drift observation intake) are not gated
+    # this wave — contract scope is exactly the routes above.
+    def require_internal_token(request: Request) -> None:
+        configured = state.settings.internal_token
+        if not configured:
+            log.error("MODEL_REGISTRY_INTERNAL_TOKEN unset — refusing "
+                      "request (fail-closed, K23): %s", request.url.path)
+            raise HTTPException(status_code=503,
+                                detail="internal token not configured")
+        presented = request.headers.get("x-internal-token", "")
+        if not presented or not hmac.compare_digest(presented, configured):
+            raise HTTPException(status_code=401, detail="invalid internal token")
+
+    _gated = [Depends(require_internal_token)]
+
     # ------------------------------------------------------------ errors (honest)
     @app.exception_handler(RequestValidationError)
     async def _rv(_: Request, exc: RequestValidationError):
@@ -233,7 +255,7 @@ def create_app(
                                  media_type=CONTENT_TYPE_LATEST)
 
     # ----------------------------------------------------------- C1 registry
-    @app.post("/v1/registry/register", status_code=201)
+    @app.post("/v1/registry/register", status_code=201, dependencies=_gated)
     def register(req: RegisterRequest):
         return state.store.register_version(
             family=req.family, tenant_id=req.tenant_id,
@@ -241,11 +263,11 @@ def create_app(
             seed=req.seed, dataset_hash=req.dataset_hash,
             git_sha=req.git_sha, version=req.version)
 
-    @app.post("/v1/registry/promote")
+    @app.post("/v1/registry/promote", dependencies=_gated)
     def promote(req: PromoteRequest):
         return state.store.promote(req.family, req.tenant_id, req.version)
 
-    @app.post("/v1/registry/rollback")
+    @app.post("/v1/registry/rollback", dependencies=_gated)
     def rollback(req: RollbackRequest):
         return state.store.rollback(req.family, req.tenant_id)
 
@@ -262,7 +284,7 @@ def create_app(
                 "versions": state.store.list_versions(family, tenant_id)}
 
     # ---------------------------------------------------------------- C3 A/B
-    @app.post("/v1/registry/experiments", status_code=201)
+    @app.post("/v1/registry/experiments", status_code=201, dependencies=_gated)
     def create_experiment(req: ExperimentRequest):
         return state.store.create_experiment(
             family=req.family, tenant_id=req.tenant_id,
@@ -270,7 +292,7 @@ def create_app(
             challenger_version=req.challenger_version, pct=req.pct,
             starts_at=req.starts_at, ends_at=req.ends_at)
 
-    @app.get("/v1/registry/experiments/assignment")
+    @app.get("/v1/registry/experiments/assignment", dependencies=_gated)
     def assignment(family: str = Query(...), tenant_id: UUID = Query(...),
                    person_id: str = Query(...)):
         """Per-request assignment for scoring services. FAIL-CLOSED to
@@ -294,7 +316,7 @@ def create_app(
         }
 
     @app.post("/v1/registry/experiments/{experiment_id}/outcomes",
-              status_code=201)
+              status_code=201, dependencies=_gated)
     def record_outcome(experiment_id: UUID, req: OutcomeRequest):
         return state.store.record_outcome(
             experiment_id=experiment_id, tenant_id=req.tenant_id,
@@ -302,7 +324,7 @@ def create_app(
             predicted_label=req.predicted_label,
             predicted_score=req.predicted_score, true_label=req.true_label)
 
-    @app.get("/v1/registry/experiments/{experiment_id}/report")
+    @app.get("/v1/registry/experiments/{experiment_id}/report", dependencies=_gated)
     def experiment_report(experiment_id: UUID):
         """Champion vs challenger precision/recall/Brier over labeled
         outcomes. 404 when the experiment does not exist (honest empty)."""
