@@ -33,6 +33,25 @@ type Config struct {
 	ConsentRelayInterval time.Duration // consent erasure outbox relay sweep interval
 	AppsLifecycleTopic   string        // Kafka topic for app lifecycle CloudEvents (SPEC-W18 §1)
 	IndustriesDir        string        // mounted industry packs dir (INDUSTRIES_DIR, default /industries)
+	// SPEC-W45 K10: realm SMTP bootstrap. When RealmSMTPHost is set the
+	// bootstrap PATCHes the Keycloak realm smtpServer map (fail-soft warn
+	// otherwise) so Keycloak's own credentials e-mails (K8
+	// execute-actions-email) can fire.
+	RealmSMTPHost     string // KC_REALM_SMTP_HOST
+	RealmSMTPPort     string // KC_REALM_SMTP_PORT
+	RealmSMTPFrom     string // KC_REALM_SMTP_FROM
+	RealmSMTPUser     string // KC_REALM_SMTP_USER
+	RealmSMTPPassword string // KC_REALM_SMTP_PASSWORD
+	// SPEC-W45 STK O13: booking portal JWT HMAC secret (PORTAL_SECRET, shared
+	// with booking-service). Lets data subjects self-serve consent
+	// data-access/erasure with their portal session. Unset = portal path
+	// unavailable (fail-closed).
+	PortalSecret string
+	// SPEC-W45 K contract note: billing plan push. BillingURL empty disables
+	// the push (dev default); BillingInternalToken is forwarded as
+	// X-Internal-Token (billing-engine RS-002 gate).
+	BillingURL           string        // BILLING_URL
+	BillingInternalToken string        // BILLING_INTERNAL_TOKEN
 	ShutdownTimeout      time.Duration // graceful shutdown budget
 }
 
@@ -61,6 +80,14 @@ func Load() (Config, error) {
 		ConsentRelayInterval: time.Duration(envInt("CONSENT_OUTBOX_RELAY_INTERVAL_SECONDS", 10)) * time.Second,
 		AppsLifecycleTopic:   envStr("APPS_LIFECYCLE_TOPIC", "opendesk.apps.lifecycle.v1"),
 		IndustriesDir:        envStr("INDUSTRIES_DIR", "/industries"),
+		RealmSMTPHost:        os.Getenv("KC_REALM_SMTP_HOST"),
+		RealmSMTPPort:        envStr("KC_REALM_SMTP_PORT", "587"),
+		RealmSMTPFrom:        os.Getenv("KC_REALM_SMTP_FROM"),
+		RealmSMTPUser:        os.Getenv("KC_REALM_SMTP_USER"),
+		RealmSMTPPassword:    os.Getenv("KC_REALM_SMTP_PASSWORD"),
+		PortalSecret:         os.Getenv("PORTAL_SECRET"),
+		BillingURL:           os.Getenv("BILLING_URL"),
+		BillingInternalToken: os.Getenv("BILLING_INTERNAL_TOKEN"),
 		ShutdownTimeout:      time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 15)) * time.Second,
 	}
 	if cfg.DatabaseURL == "" {
@@ -86,6 +113,15 @@ func envCSV(key string) []string {
 	return out
 }
 
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -93,14 +129,4 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
-}
-
-// envBool reports whether the variable is set to a truthy value ("1"/"true",
-// case-insensitive) — the explicit dev-escape idiom (default false).
-func envBool(key string) bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
-	case "1", "true":
-		return true
-	}
-	return false
 }
