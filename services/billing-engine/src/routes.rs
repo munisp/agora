@@ -32,7 +32,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -261,6 +261,9 @@ pub struct RateCardBody {
     pub included_quota: i64,
     #[serde(default = "default_currency")]
     pub currency: String,
+    /// VAT-ready tax basis points (0..=10000, default 0).
+    #[serde(default)]
+    pub tax_bps: i64,
 }
 
 fn default_currency() -> String {
@@ -271,6 +274,23 @@ fn default_currency() -> String {
 pub struct GenerateBody {
     pub tenant_id: Uuid,
     pub period: String,
+    /// Optional billing contact; stored on the invoice (COALESCE-kept on
+    /// regenerate when absent).
+    #[serde(default)]
+    pub billing_email: Option<String>,
+}
+
+/// SPEC-W45 K18: identity-service pushes the tenant's plan here on plan
+/// change (TenantPlanChanged); billing is the plan's rating-side source.
+#[derive(Debug, Deserialize)]
+pub struct PlanBody {
+    pub plan: String,
+}
+
+/// SPEC-W45: PATCH the invoice billing contact. `null` clears it.
+#[derive(Debug, Deserialize)]
+pub struct BillingEmailBody {
+    pub billing_email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,9 +363,11 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/rate-cards/:tenant_id", put(upsert_rate_card))
+        .route("/v1/tenants/:id/plan", put(set_tenant_plan))
         .route("/v1/invoices", get(list_invoices))
         .route("/v1/invoices/generate", post(generate_invoice))
         .route("/v1/invoices/:id", get(get_invoice))
+        .route("/v1/invoices/:id/billing-email", patch(set_billing_email))
         .route("/v1/invoices/:id/issue", post(issue_invoice))
         .route("/v1/invoices/:id/void", post(void_invoice))
         .route("/v1/invoices/:id/payment-link", post(payment_link))
@@ -438,6 +460,25 @@ async fn metrics(State(st): State<AppState>) -> Response {
         .into_response()
 }
 
+/// Light billing-email sanity check (not deliverability proof): one `@`,
+/// no whitespace/control chars, sane length. Storage stays unconstrained —
+/// this is the API-layer gate.
+fn validate_billing_email(email: &str) -> Result<String, ApiError> {
+    let e = email.trim();
+    let bad = e.is_empty()
+        || e.len() > 254
+        || e.chars().any(|c| c.is_control() || c.is_whitespace())
+        || e.matches('@').count() != 1
+        || e.starts_with('@')
+        || e.ends_with('@');
+    if bad {
+        return Err(ApiError::bad_request(
+            "billing_email must look like an email address (local@domain)",
+        ));
+    }
+    Ok(e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Rate cards (B2)
 // ---------------------------------------------------------------------------
@@ -456,6 +497,9 @@ async fn upsert_rate_card(
         return Err(ApiError::bad_request(
             "unit_price_cents and included_quota must be >= 0",
         ));
+    }
+    if !(0..=10000).contains(&body.tax_bps) {
+        return Err(ApiError::bad_request("tax_bps must be in 0..=10000"));
     }
     let new_currency = body.currency.trim().to_ascii_uppercase();
     let mut tx = tenant::begin_tenant_tx(&st.pool, tenant_id).await?;
@@ -483,18 +527,20 @@ async fn upsert_rate_card(
         ));
     }
     sqlx::query(
-        "INSERT INTO rate_cards (tenant_id, metric, unit_price_cents, included_quota, currency) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO rate_cards (tenant_id, metric, unit_price_cents, included_quota, currency, tax_bps) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (tenant_id, metric) DO UPDATE SET \
            unit_price_cents = EXCLUDED.unit_price_cents, \
            included_quota = EXCLUDED.included_quota, \
-           currency = EXCLUDED.currency",
+           currency = EXCLUDED.currency, \
+           tax_bps = EXCLUDED.tax_bps",
     )
     .bind(tenant_id)
     .bind(body.metric.trim())
     .bind(body.unit_price_cents)
     .bind(body.included_quota)
     .bind(&new_currency)
+    .bind(body.tax_bps as i32)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -504,7 +550,47 @@ async fn upsert_rate_card(
         unit_price_cents: body.unit_price_cents,
         included_quota: body.included_quota,
         currency: new_currency,
+        tax_bps: body.tax_bps,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Tenant plan (SPEC-W45 K18: billing's plan source; identity pushes on plan
+// change). The rating side reads it in invoices::generate_invoice.
+// ---------------------------------------------------------------------------
+async fn set_tenant_plan(
+    State(st): State<AppState>,
+    Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<PlanBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    bind_tenant(&st, &headers, tenant_id).await?;
+    require_money_role(&st, &headers)?;
+    let plan = body.plan.trim().to_ascii_lowercase();
+    if plan.is_empty()
+        || plan.len() > 64
+        || !plan
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::bad_request(
+            "plan must be a non-empty slug (alphanumeric, '-' or '_', <= 64 chars)",
+        ));
+    }
+    let mut tx = tenant::begin_tenant_tx(&st.pool, tenant_id).await?;
+    sqlx::query(
+        "INSERT INTO tenant_plans (tenant_id, plan, updated_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (tenant_id) DO UPDATE SET plan = EXCLUDED.plan, updated_at = now()",
+    )
+    .bind(tenant_id)
+    .bind(&plan)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": tenant_id,
+        "plan": plan,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -517,10 +603,51 @@ async fn generate_invoice(
 ) -> Result<(StatusCode, Json<Invoice>), ApiError> {
     bind_tenant(&st, &headers, body.tenant_id).await?;
     require_money_role(&st, &headers)?;
+    let billing_email = body
+        .billing_email
+        .as_deref()
+        .map(validate_billing_email)
+        .transpose()?;
     let mut tx = tenant::begin_tenant_tx(&st.pool, body.tenant_id).await?;
-    let inv = invoices::generate_invoice(&mut tx, body.tenant_id, &body.period).await?;
+    let inv = invoices::generate_invoice(&mut tx, body.tenant_id, &body.period, billing_email.as_deref()).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(inv)))
+}
+
+/// SPEC-W45: PATCH /v1/invoices/:id/billing-email — set (or with `null`,
+/// clear) the invoice's billing contact. K1 tenant binding (the invoice's
+/// own tenant, via the scoped lookup) + K6 money-role gate.
+async fn set_billing_email(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<BillingEmailBody>,
+) -> Result<Json<Invoice>, ApiError> {
+    let (mut tx, _inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    require_money_role(&st, &headers)?;
+    let email = body
+        .billing_email
+        .as_deref()
+        .map(validate_billing_email)
+        .transpose()?;
+    let res = sqlx::query(
+        "UPDATE invoices SET billing_email = $1 WHERE id = $2 AND status <> 'void'",
+    )
+    .bind(&email)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("invoice not found or void: {id}"),
+        ));
+    }
+    let updated = invoices::get_invoice(&mut tx, id)
+        .await?
+        .ok_or_else(|| ApiError::internal("invoice vanished after billing-email update"))?;
+    tx.commit().await?;
+    Ok(Json(updated))
 }
 
 async fn list_invoices(
@@ -615,19 +742,25 @@ async fn void_invoice(
     let reverses = matches!(prev, InvoiceStatus::Issued | InvoiceStatus::PastDue);
     let mut post_after_commit = false;
     if reverses {
+        // billingEmail rides along WHEN the invoice carries a billing
+        // contact (SPEC-W45: billing-contact notifications downstream).
+        let mut data = serde_json::json!({
+            "invoiceId": id.to_string(),
+            "tenantId": inv.tenant_id.to_string(),
+            "period": inv.period,
+            "previousStatus": prev.as_str(),
+            "subtotalCents": inv.subtotal_cents,
+            "currency": inv.currency,
+        });
+        if let Some(email) = &inv.billing_email {
+            data["billingEmail"] = serde_json::Value::String(email.clone());
+        }
         let event = crate::models::CloudEvent::new(
             "billing-engine",
             "com.opendesk.billing.InvoiceVoided",
             &id.to_string(),
             &inv.tenant_id.to_string(),
-            serde_json::json!({
-                "invoiceId": id.to_string(),
-                "tenantId": inv.tenant_id.to_string(),
-                "period": inv.period,
-                "previousStatus": prev.as_str(),
-                "subtotalCents": inv.subtotal_cents,
-                "currency": inv.currency,
-            }),
+            data,
         );
         let payload = serde_json::to_value(&event)
             .map_err(|e| ApiError::internal(format!("invoice voided event serialize: {e}")))?;
@@ -965,20 +1098,26 @@ async fn paystack_webhook(
             // broker down, ...). The relay republishes with backoff until
             // Kafka accepts it; the paid commit is never rolled back by a
             // publication failure.
+            // billingEmail is included WHEN the invoice carries a billing
+            // contact (SPEC-W45).
+            let mut data = serde_json::json!({
+                "invoiceId": invoice_id.to_string(),
+                "tenantId": inv.tenant_id.to_string(),
+                "period": inv.period,
+                "subtotalCents": inv.subtotal_cents,
+                "currency": inv.currency,
+                "paymentRef": inv.payment_ref,
+                "paystackReference": reference,
+            });
+            if let Some(email) = &inv.billing_email {
+                data["billingEmail"] = serde_json::Value::String(email.clone());
+            }
             let event = crate::models::CloudEvent::new(
                 "billing-engine",
                 "com.opendesk.billing.InvoicePaid",
                 &invoice_id.to_string(),
                 &inv.tenant_id.to_string(),
-                serde_json::json!({
-                    "invoiceId": invoice_id.to_string(),
-                    "tenantId": inv.tenant_id.to_string(),
-                    "period": inv.period,
-                    "subtotalCents": inv.subtotal_cents,
-                    "currency": inv.currency,
-                    "paymentRef": inv.payment_ref,
-                    "paystackReference": reference,
-                }),
+                data,
             );
             let event_payload = serde_json::to_value(&event)
                 .map_err(|e| ApiError::internal(format!("invoice paid event serialize: {e}")))?;
@@ -1066,6 +1205,16 @@ mod tests {
         // Exact match passes (surrounding whitespace tolerated).
         assert!(internal_token_matches("tok-123", &headers_with(Some("tok-123"))));
         assert!(internal_token_matches("tok-123", &headers_with(Some(" tok-123 "))));
+    }
+
+    #[test]
+    fn billing_email_light_validation() {
+        for good in ["a@b.co", "billing+acme@example.com", " x@y.ng "] {
+            assert!(validate_billing_email(good).is_ok(), "{good} must pass");
+        }
+        for bad in ["", "no-at-sign", "a@@b.co", "@b.co", "a@", "a b@c.co", "a\nb@c.co"] {
+            assert!(validate_billing_email(bad).is_err(), "{bad:?} must fail");
+        }
     }
 
     #[test]
