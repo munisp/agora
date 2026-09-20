@@ -2,6 +2,9 @@ package helpdesk
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -149,7 +152,25 @@ BEGIN
         CREATE POLICY tenant_isolation ON ticket_events
             USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
-END $$;`
+END $$;
+
+-- SPEC-W45 K24/OOS-11: customer CSAT capability tokens. One row per issued
+-- token; only the SHA-256 hash is stored (the raw token travels once in the
+-- resolution response/notification). Single-use (used_at), 72h expiry.
+-- NOTE (RLS): deliberately NO tenant_isolation policy — the public
+-- /v1/helpdesk/csat/{token} endpoint resolves the tenant FROM the token row
+-- (capability pattern, same posture as the waitlist claim token); rows are
+-- only ever read by their unguessable 256-bit hash, never enumerated.
+CREATE TABLE IF NOT EXISTS csat_tokens (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id  UUID NOT NULL,
+    ticket_id  UUID NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at    TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_csat_tokens_ticket ON csat_tokens (tenant_id, ticket_id);`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure helpdesk tables: %w", err)
 	}
@@ -184,6 +205,21 @@ var ErrNoAssignee = errors.New("no active team member available for auto-assignm
 
 // ErrInvalidTransition is returned for CSAT before resolution (409).
 var ErrInvalidTransition = errors.New("invalid ticket state for this action")
+
+// ErrCSATInvalid is returned when a CSAT capability token is unknown,
+// expired or already used (404 at the public API — one honest answer, no
+// existence/state leak).
+var ErrCSATInvalid = errors.New("invalid or expired csat token")
+
+// csatTokenTTL is the SPEC-W45 K24 single-use CSAT link lifetime (72h).
+const csatTokenTTL = 72 * time.Hour
+
+// csatTokenHash derives the stored lookup key for a raw CSAT token (only
+// the hash persists — a database read never reveals a redeemable token).
+func csatTokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
 
 const ticketCols = `id, tenant_id, contact_id, conversation_id, subject, channel, priority, status,
                     assignee_id, sla_policy_id, due_first_response_at, due_resolve_at,
@@ -510,6 +546,10 @@ type PatchResult struct {
 	ResolvedNow      bool // transitioned INTO resolved on this patch
 	AutoAssignedTo   *uuid.UUID
 	FirstResponseNow bool // first_response_at stamped on this patch
+	// DetachedPolicyID carries the previously attached policy id when this
+	// patch detached the SLA policy (admin-only at the API; the handler
+	// emits the K24 audit event).
+	DetachedPolicyID *uuid.UUID
 }
 
 // PatchTicket applies one operator mutation and writes the matching
@@ -573,6 +613,7 @@ func (s *Store) PatchTicket(ctx context.Context, tenantID, id uuid.UUID, in Patc
 		var policy *SLAPolicy
 		switch {
 		case in.DetachPolicy:
+			res.DetachedPolicyID = t.SLAPolicyID // audit trail for the K24 event
 			t.SLAPolicyID = nil
 			policyChanged = true
 		case in.SLAPolicyID != nil:
@@ -694,43 +735,103 @@ func (s *Store) PatchTicket(ctx context.Context, tenantID, id uuid.UUID, in Patc
 	return res, err
 }
 
-// RecordCSAT stores the customer satisfaction rating (1-5). Only a resolved
-// or closed ticket can be rated (ErrInvalidTransition otherwise) — CSAT
-// measures the completed service interaction.
-func (s *Store) RecordCSAT(ctx context.Context, tenantID, id uuid.UUID, rating int, comment string) (Ticket, error) {
-	var t Ticket
+// IssueCSATToken mints the single-use customer CSAT capability token for a
+// freshly resolved ticket (SPEC-W45 K24/OOS-11): 32 random bytes,
+// hex-encoded — only the SHA-256 hash persists. Any still-unused token for
+// the ticket is superseded (a reopen→re-resolve cycle never leaves two
+// live links). The RAW token is returned for the resolution
+// response/notification payload; it is never stored.
+func (s *Store) IssueCSATToken(ctx context.Context, tenantID, ticketID uuid.UUID) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("mint csat token: %w", err)
+	}
+	token := hex.EncodeToString(raw)
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var err error
-		t, err = scanTicket(tx.QueryRow(ctx,
-			`SELECT `+ticketCols+` FROM tickets WHERE tenant_id=$1 AND id=$2 FOR UPDATE`, tenantID, id))
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
+		// Supersede prior live tokens for this ticket (single active link).
+		if _, err := tx.Exec(ctx,
+			`UPDATE csat_tokens SET used_at=now() WHERE tenant_id=$1 AND ticket_id=$2 AND used_at IS NULL`,
+			tenantID, ticketID); err != nil {
 			return err
 		}
-		if t.Status != StatusResolved && t.Status != StatusClosed {
-			return fmt.Errorf("%w: csat can only be recorded on a resolved or closed ticket", ErrInvalidTransition)
-		}
-		var commentArg *string
-		if c := strings.TrimSpace(comment); c != "" {
-			commentArg = &c
-		}
-		return tx.QueryRow(ctx,
-			`UPDATE tickets SET csat_rating=$3, csat_comment=$4, csat_at=now(), updated_at=now()
-			 WHERE tenant_id=$1 AND id=$2
-			 RETURNING csat_at, updated_at`, tenantID, id, rating, commentArg).
-			Scan(&t.CSATAt, &t.UpdatedAt)
+		_, err := tx.Exec(ctx,
+			`INSERT INTO csat_tokens (tenant_id, ticket_id, token_hash, expires_at)
+			 VALUES ($1,$2,$3, now() + $4::interval)`,
+			tenantID, ticketID, csatTokenHash(token), csatTokenTTL.String())
+		return err
 	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// RedeemCSATToken records the customer satisfaction rating (1-5) against
+// the ticket a valid capability token points at (SPEC-W45 K24: public
+// POST /v1/helpdesk/csat/{token}). The token must be known, unexpired and
+// unused — anything else answers ErrCSATInvalid (the API maps it to one
+// honest 404). The ticket must be resolved|closed (ErrInvalidTransition —
+// a token issued at resolution can only lag the state machine if the
+// ticket was reopened). The token is burned in the same transaction
+// (single-use). The tenant context is resolved FROM the token row inside
+// the tx (capability pattern — no RLS on csat_tokens, see ensureSchema).
+func (s *Store) RedeemCSATToken(ctx context.Context, token string, rating int, comment string) (Ticket, error) {
+	var t Ticket
+	hash := csatTokenHash(token)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Ticket{}, err
 	}
-	t.CSATRating = &rating
-	if c := strings.TrimSpace(comment); c != "" {
-		t.CSATComment = &c
-	} else {
-		t.CSATComment = nil
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var tenantID, ticketID uuid.UUID
+	var expiresAt time.Time
+	var usedAt *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT tenant_id, ticket_id, expires_at, used_at FROM csat_tokens WHERE token_hash=$1`, hash).
+		Scan(&tenantID, &ticketID, &expiresAt, &usedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Ticket{}, ErrCSATInvalid
 	}
+	if err != nil {
+		return Ticket{}, err
+	}
+	if usedAt != nil || time.Now().After(expiresAt) {
+		return Ticket{}, ErrCSATInvalid
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, tenantID.String()); err != nil {
+		return Ticket{}, fmt.Errorf("set tenant context: %w", err)
+	}
+	t, err = scanTicket(tx.QueryRow(ctx,
+		`SELECT `+ticketCols+` FROM tickets WHERE tenant_id=$1 AND id=$2 FOR UPDATE`, tenantID, ticketID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Ticket{}, ErrNotFound
+	}
+	if err != nil {
+		return Ticket{}, err
+	}
+	if t.Status != StatusResolved && t.Status != StatusClosed {
+		return Ticket{}, fmt.Errorf("%w: csat can only be recorded on a resolved or closed ticket", ErrInvalidTransition)
+	}
+	var commentArg *string
+	if c := strings.TrimSpace(comment); c != "" {
+		commentArg = &c
+	}
+	if err := tx.QueryRow(ctx,
+		`UPDATE tickets SET csat_rating=$3, csat_comment=$4, csat_at=now(), updated_at=now()
+		 WHERE tenant_id=$1 AND id=$2
+		 RETURNING csat_at, updated_at`, tenantID, ticketID, rating, commentArg).
+		Scan(&t.CSATAt, &t.UpdatedAt); err != nil {
+		return Ticket{}, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE csat_tokens SET used_at=now() WHERE token_hash=$1 AND used_at IS NULL`, hash); err != nil {
+		return Ticket{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Ticket{}, err
+	}
+	t.CSATRating = &rating
+	t.CSATComment = commentArg
 	return t, nil
 }
 

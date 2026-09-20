@@ -32,8 +32,9 @@ func testRouter(t *testing.T, tenant bookingops.TenantInfo) (http.Handler, *Stor
 			return tenant, true
 		},
 		UserFromContext: func(ctx context.Context) string { return "agent-1" },
-		EventsTopic:     "opendesk.helpdesk.events.v1",
-		UsageTopic:      "opendesk.usage.events",
+		// No RolesFromContext: the zero-role posture (detach → 403).
+		EventsTopic: "opendesk.helpdesk.events.v1",
+		UsageTopic: "opendesk.usage.events",
 	})
 	return r, st
 }
@@ -133,36 +134,47 @@ func TestTicketJourneyEndpoints(t *testing.T) {
 		t.Fatalf("auto assign picked %+v, want %s", assigned.Ticket.AssigneeID, member)
 	}
 
-	// Resolve → resolved_at; metering + lifecycle event hit the outbox.
+	// Resolve → resolved_at; metering + lifecycle event hit the outbox;
+	// the K24 single-use CSAT token rides the response.
 	rec = do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+tk.ID.String(),
 		`{"status":"resolved"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("resolve = %d (%s)", rec.Code, rec.Body.String())
 	}
 	resolved := decodeEnv[struct {
-		Ticket Ticket `json:"ticket"`
+		Ticket    Ticket `json:"ticket"`
+		CSATToken string `json:"csat_token"`
+		CSATURL   string `json:"csat_url"`
 	}](t, rec)
 	if resolved.Ticket.ResolvedAt == nil || resolved.Ticket.Status != StatusResolved {
 		t.Fatalf("resolution: %+v", resolved.Ticket)
 	}
+	if len(resolved.CSATToken) != 64 || resolved.CSATURL != "/v1/helpdesk/csat/"+resolved.CSATToken {
+		t.Fatalf("csat token missing from resolution: %+v", resolved)
+	}
 
-	var metered, evtCreated, evtResolved int
+	var metered, evtCreated, evtResolved, evtWithToken int
 	if err := st.pool.QueryRow(context.Background(),
 		`SELECT COUNT(*) FILTER (WHERE topic='opendesk.usage.events'
 		            AND payload->'data'->>'metric'='ticket_resolved'),
 		        COUNT(*) FILTER (WHERE topic='opendesk.helpdesk.events.v1'
 		            AND payload->'data'->>'event_name'='ticket_created'),
 		        COUNT(*) FILTER (WHERE topic='opendesk.helpdesk.events.v1'
-		            AND payload->'data'->>'event_name'='ticket_resolved')
-		 FROM outbox`).Scan(&metered, &evtCreated, &evtResolved); err != nil {
+		            AND payload->'data'->>'event_name'='ticket_resolved'),
+		        COUNT(*) FILTER (WHERE topic='opendesk.helpdesk.events.v1'
+		            AND payload->'data'->>'event_name'='ticket_resolved'
+		            AND payload->'data'->>'csat_token' IS NOT NULL)
+		 FROM outbox`).Scan(&metered, &evtCreated, &evtResolved, &evtWithToken); err != nil {
 		t.Fatalf("outbox query: %v", err)
 	}
-	if metered != 1 || evtCreated != 1 || evtResolved != 1 {
-		t.Fatalf("outbox rows: metered=%d created=%d resolved=%d (want 1/1/1)", metered, evtCreated, evtResolved)
+	if metered != 1 || evtCreated != 1 || evtResolved != 1 || evtWithToken != 1 {
+		t.Fatalf("outbox rows: metered=%d created=%d resolved=%d with_token=%d (want 1/1/1/1)",
+			metered, evtCreated, evtResolved, evtWithToken)
 	}
 
-	// CSAT after resolution.
-	rec = do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+tk.ID.String()+"/csat",
+	// CSAT after resolution via the PUBLIC token link (K24): the customer
+	// submits against the single-use token — no staff route, no auth.
+	rec = do(t, r, http.MethodPost, "/v1/helpdesk/csat/"+resolved.CSATToken,
 		`{"rating":5,"comment":"fast fix"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("csat = %d (%s)", rec.Code, rec.Body.String())
@@ -172,6 +184,12 @@ func TestTicketJourneyEndpoints(t *testing.T) {
 	}](t, rec)
 	if rated.Ticket.CSATRating == nil || *rated.Ticket.CSATRating != 5 {
 		t.Fatalf("csat: %+v", rated.Ticket)
+	}
+
+	// Single-use: a replay against the burned token is an honest 404.
+	if rec := do(t, r, http.MethodPost, "/v1/helpdesk/csat/"+resolved.CSATToken,
+		`{"rating":1}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("csat token replay = %d, want 404 (single-use)", rec.Code)
 	}
 
 	// Stats + list + team members endpoints answer.
@@ -229,7 +247,9 @@ func TestEndpointValidation(t *testing.T) {
 		{"patch bad status", http.MethodPatch, "/v1/helpdesk/tickets/" + someID, `{"status":"weird"}`, 400},
 		{"patch bad assignee", http.MethodPatch, "/v1/helpdesk/tickets/" + someID, `{"assignee_id":"zzz"}`, 400},
 		{"patch missing ticket", http.MethodPatch, "/v1/helpdesk/tickets/" + someID, `{"note":"hi"}`, 404},
-		{"csat bad rating", http.MethodPatch, "/v1/helpdesk/tickets/" + someID + "/csat", `{"rating":9}`, 400},
+		{"csat bad rating", http.MethodPost, "/v1/helpdesk/csat/" + strings.Repeat("ab", 32), `{"rating":9}`, 400},
+		{"csat unknown token", http.MethodPost, "/v1/helpdesk/csat/" + strings.Repeat("ab", 32), `{"rating":4}`, 404},
+		{"csat malformed token", http.MethodPost, "/v1/helpdesk/csat/not-a-token", `{"rating":4}`, 404},
 		{"policy missing name", http.MethodPost, "/v1/helpdesk/sla-policies", `{"priority":"high","first_response_minutes":5,"resolve_minutes":60}`, 400},
 		{"policy bad minutes", http.MethodPost, "/v1/helpdesk/sla-policies", `{"name":"x","priority":"high","first_response_minutes":0,"resolve_minutes":60}`, 400},
 		{"policy patch missing", http.MethodPatch, "/v1/helpdesk/sla-policies/" + someID, `{"name":"x"}`, 404},
@@ -241,7 +261,8 @@ func TestEndpointValidation(t *testing.T) {
 	}
 }
 
-// CSAT before resolution → 409; auto-assign with no members → 409.
+// Staff self-rating is gone (K24): the old staff CSAT route answers 404;
+// auto-assign with no members → 409.
 func TestConflictPaths(t *testing.T) {
 	tenant := bookingops.TenantInfo{ID: uuid.New(), Slug: "acme"}
 	r, _ := testRouter(t, tenant)
@@ -255,11 +276,88 @@ func TestConflictPaths(t *testing.T) {
 	}](t, rec)
 	id := created.Ticket.ID.String()
 
-	if rec := do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+id+"/csat", `{"rating":4}`); rec.Code != http.StatusConflict {
-		t.Fatalf("csat on open = %d, want 409", rec.Code)
+	// K24/OOS-11: the staff PATCH /tickets/{id}/csat route was removed —
+	// customers rate via the public single-use token link only.
+	if rec := do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+id+"/csat", `{"rating":4}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("staff csat route = %d, want 404 (removed in W45)", rec.Code)
 	}
 	if rec := do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+id, `{"assignee_id":"auto"}`); rec.Code != http.StatusConflict {
 		t.Fatalf("auto assign without members = %d (%s), want 409", rec.Code, rec.Body.String())
+	}
+}
+
+// SPEC-W45 K24/OOS-11: SLA-policy detach is restricted to the admin realm
+// role and emits the sla_policy_detached audit event.
+func TestDetachPolicyAdminGate(t *testing.T) {
+	tenant := bookingops.TenantInfo{ID: uuid.New(), Slug: "acme"}
+	// One router whose role set the test flips between requests (requests
+	// run sequentially, so the closure read is race-free).
+	st := newTestStore(t)
+	roles := []string{"staff"}
+	r := chi.NewRouter()
+	RegisterRoutes(r, &Deps{
+		Store: st,
+		TenantFromContext: func(ctx context.Context) (bookingops.TenantInfo, bool) {
+			return tenant, true
+		},
+		UserFromContext:   func(ctx context.Context) string { return "agent-1" },
+		RolesFromContext:  func(ctx context.Context) []string { return roles },
+		EventsTopic:       "opendesk.helpdesk.events.v1",
+		UsageTopic:        "opendesk.usage.events",
+	})
+
+	rec := do(t, r, http.MethodPost, "/v1/helpdesk/sla-policies",
+		`{"name":"High tier","priority":"high","first_response_minutes":15,"resolve_minutes":240}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create policy = %d (%s)", rec.Code, rec.Body.String())
+	}
+	rec = do(t, r, http.MethodPost, "/v1/helpdesk/tickets",
+		`{"subject":"POS offline","priority":"high"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create ticket = %d (%s)", rec.Code, rec.Body.String())
+	}
+	created := decodeEnv[struct {
+		Ticket Ticket `json:"ticket"`
+	}](t, rec)
+	tk := created.Ticket
+	if tk.SLAPolicyID == nil {
+		t.Fatalf("policy not auto-attached: %+v", tk)
+	}
+
+	// Staff (no admin role): detach → 403; the policy stays attached.
+	if rec := do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+tk.ID.String(),
+		`{"sla_policy_id":null}`); rec.Code != http.StatusForbidden {
+		t.Fatalf("staff detach = %d (%s), want 403", rec.Code, rec.Body.String())
+	}
+	after, err := st.GetTicket(context.Background(), tenant.ID, tk.ID)
+	if err != nil || after.SLAPolicyID == nil {
+		t.Fatalf("staff detach must not apply: %+v, %v", after, err)
+	}
+
+	// Admin: detach → 200, policy + dues cleared, audit event on the bus.
+	roles = []string{"admin"}
+	rec = do(t, r, http.MethodPatch, "/v1/helpdesk/tickets/"+tk.ID.String(),
+		`{"sla_policy_id":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin detach = %d (%s)", rec.Code, rec.Body.String())
+	}
+	detached := decodeEnv[struct {
+		Ticket Ticket `json:"ticket"`
+	}](t, rec)
+	if detached.Ticket.SLAPolicyID != nil || detached.Ticket.DueResolveAt != nil || detached.Ticket.DueFirstResponseAt != nil {
+		t.Fatalf("detach did not clear policy/dues: %+v", detached.Ticket)
+	}
+	var auditRows int
+	if err := st.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM outbox
+		 WHERE topic='opendesk.helpdesk.events.v1'
+		   AND payload->'data'->>'event_name'='sla_policy_detached'
+		   AND payload->'data'->>'detached_policy_id'=$1
+		   AND payload->'data'->>'actor'='agent-1'`, tk.SLAPolicyID.String()).Scan(&auditRows); err != nil {
+		t.Fatalf("audit query: %v", err)
+	}
+	if auditRows != 1 {
+		t.Fatalf("sla_policy_detached audit rows = %d, want 1", auditRows)
 	}
 }
 
