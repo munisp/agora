@@ -54,6 +54,29 @@ class DaprClient:
         ct = resp.headers.get("content-type", "")
         return resp.json() if "json" in ct else resp.text
 
+    async def invoke_post(
+        self,
+        app_id: str,
+        method: str,
+        *,
+        json_body: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        """POST-invoke `method` on `app_id` via the sidecar (SPEC-W45:
+        helpdesk ticket creation on booking-service). Raises DaprError on
+        non-2xx so callers can map 4xx vs outage."""
+        url = f"{self._base}/v1.0/invoke/{app_id}/method/{method.lstrip('/')}"
+        resp = await self._client.post(url, json=json_body, headers=headers)
+        if resp.status_code >= 400:
+            raise DaprError(
+                f"invoke {app_id}/{method}: {resp.status_code} {resp.text[:400]}",
+                status_code=resp.status_code,
+            )
+        if not resp.content:
+            return None
+        ct = resp.headers.get("content-type", "")
+        return resp.json() if "json" in ct else resp.text
+
     async def publish_event(self, topic: str, event: dict[str, Any]) -> None:
         """Publish a CloudEvents envelope to a pubsub component topic.
 

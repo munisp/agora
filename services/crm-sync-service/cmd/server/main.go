@@ -106,6 +106,12 @@ func run() error {
 		logger.Warn("CONSUMER_ENABLED=false; Kafka consumers disabled")
 	}
 
+	if cfg.InternalToken == "" {
+		// Runtime fail-closed (503 on the /v1 surface, K2 pattern) — logged
+		// loudly here so the misconfig is obvious at boot.
+		logger.Error("CRM_SYNC_INTERNAL_TOKEN unset — /v1/tasks + /v1/people/lookup will refuse all requests (503 fail-closed, SPEC-W45 K21)")
+	}
+
 	// HTTP server.
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.Port),
@@ -119,6 +125,7 @@ func run() error {
 			Map:            st,
 			Dedupe:         st, // SPEC-W43 K-13: webhook_events_seen replay guard
 			Metrics:        reg,
+			InternalToken:  cfg.InternalToken,
 			Log:            logger,
 		}).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
