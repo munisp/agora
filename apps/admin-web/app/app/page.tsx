@@ -21,12 +21,16 @@ export default async function AppIndexPage() {
         <CardContent className="space-y-4">
           <p className="text-sm text-muted-foreground">
             Your account is not a member of any tenant. Ask an owner to invite
-            you, or provision a tenant via the identity service onboarding
-            workflow.
+            you, or create your own free workspace now.
           </p>
-          <Link href="/">
-            <Button variant="outline">Back to home</Button>
-          </Link>
+          <div className="flex justify-center gap-2">
+            <Link href="/signup">
+              <Button>Create a workspace</Button>
+            </Link>
+            <Link href="/">
+              <Button variant="outline">Back to home</Button>
+            </Link>
+          </div>
         </CardContent>
       </Card>
     </div>

@@ -39,7 +39,11 @@ import type {
  * POST /voice/session), which forwards to the voice runtime control plane:
  *   GET  /voice/voices        → { providers: [{ name, available, voices }] }
  *   POST /voice/tts-preview   { text, language?, provider?, voice? } → audio/wav
- *   POST /voice/voices/enroll { name, sample_base64, tenant } → { voice_id }
+ *
+ * Brand-voice enrollment is biometric onboarding (NDPA-sensitive) and moved
+ * off the public prefix per SPEC-W45 K15(d):
+ *   POST /api/voice-admin/voices/enroll { name, sample_base64, tenant } → { voice_id }
+ * (BFF → APISIX voice-admin route: JWT + staff/admin role required.)
  */
 
 const MAX_SAMPLE_BYTES = 5 * 1024 * 1024; // 5 MB
@@ -262,7 +266,10 @@ export function VoicesClient({
     setEnrolledVoiceId(null);
     try {
       const sampleBase64 = await fileToBase64(sampleFile);
-      const res = await api.post<VoiceEnrollResponse>("/voice/voices/enroll", {
+      // SPEC-W45 K15(d): enrollment moved off the public /voice/* prefix —
+      // it now rides the BFF → APISIX /api/voice-admin/* route (JWT + staff
+      // role). The legacy /voice/voices/enroll path 404s at the gateway.
+      const res = await api.post<VoiceEnrollResponse>("/api/voice-admin/voices/enroll", {
         name: voiceName.trim(),
         sample_base64: sampleBase64,
         tenant: orgSlug,
@@ -492,7 +499,8 @@ export function VoicesClient({
               </CardTitle>
               <CardDescription>
                 Clone a voice for the XTTS provider from a clean reference
-                sample (POST /voice/voices/enroll). Owner/admin only.
+                sample (POST /api/voice-admin/voices/enroll, staff-gated).
+                Owner/admin only.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4">

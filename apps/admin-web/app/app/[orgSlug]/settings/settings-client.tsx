@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowRight, MessagesSquare, Save } from "lucide-react";
+import { ArrowRight, KeyRound, MessagesSquare, Save, Users } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -179,6 +179,49 @@ export function SettingsClient({ orgSlug }: { orgSlug: string }) {
                 {tenant ? new Date(tenant.created_at).toLocaleDateString() : "—"}
               </p>
             </div>
+            <Link href={`/app/${orgSlug}/settings/plan`}>
+              <Button variant="outline" size="sm">
+                Manage plan <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </Link>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Users className="h-4 w-4" /> Members
+            </CardTitle>
+            <CardDescription>
+              Invite teammates, change roles and remove access. Plan member
+              limits apply (free ≤ 3, pro ≤ 20).
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Link href={`/app/${orgSlug}/settings/members`}>
+              <Button variant="outline" size="sm">
+                Manage members <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </Link>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <KeyRound className="h-4 w-4" /> API keys
+            </CardTitle>
+            <CardDescription>
+              Programmatic credentials for external integrations (read-only
+              bookings scope).
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Link href={`/app/${orgSlug}/settings/api-keys`}>
+              <Button variant="outline" size="sm">
+                Manage API keys <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </Link>
           </CardContent>
         </Card>
 

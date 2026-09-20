@@ -30,6 +30,18 @@ import { useToast } from "@/components/ui/toast";
 import { titleCase } from "@/lib/utils";
 import type { TeamMember } from "@/lib/types";
 
+/**
+ * SPEC-W45 STK O14: identity tenant member (GET
+ * /api/identity/v1/tenants/{slug}/members → { members: [...] }). The
+ * booking team-member record can optionally link to one of these login
+ * accounts (user_id) so schedule assignments map to a real staff identity.
+ */
+export interface IdentityMember {
+  tenant_id: string;
+  user_id: string;
+  role: string;
+}
+
 export function TeamClient({ orgSlug }: { orgSlug: string }) {
   const { toast } = useToast();
   const [members, setMembers] = React.useState<TeamMember[]>([]);
@@ -59,10 +71,21 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
     void load();
   }, [load]);
 
-  const add = async (form: { name: string; email: string; role: string }) => {
+  const add = async (form: {
+    name: string;
+    email: string;
+    role: string;
+    user_id?: string;
+  }) => {
     setBusy(true);
     try {
-      await api.post("/api/bookings/v1/team-members", form, { tenant: orgSlug });
+      // STK O14: user_id is the optional identity-account link. The booking
+      // team-members API predates the field; unknown JSON fields are ignored
+      // by the Go decoder until the service persists it (CONTRACT NOTE).
+      const body = form.user_id
+        ? form
+        : { name: form.name, email: form.email, role: form.role };
+      await api.post("/api/bookings/v1/team-members", body, { tenant: orgSlug });
       toast({ title: "Team member added", variant: "success" });
       setAdding(false);
       await load();
@@ -186,6 +209,7 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
       <AddMemberDialog
         open={adding}
         busy={busy}
+        orgSlug={orgSlug}
         onClose={() => setAdding(false)}
         onAdd={add}
       />
@@ -206,25 +230,58 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
 function AddMemberDialog({
   open,
   busy,
+  orgSlug,
   onClose,
   onAdd,
 }: {
   open: boolean;
   busy: boolean;
+  orgSlug: string;
   onClose: () => void;
-  onAdd: (form: { name: string; email: string; role: string }) => void;
+  onAdd: (form: {
+    name: string;
+    email: string;
+    role: string;
+    user_id?: string;
+  }) => void;
 }) {
   const [name, setName] = React.useState("");
   const [email, setEmail] = React.useState("");
   const [role, setRole] = React.useState("staff");
+  const [userId, setUserId] = React.useState("");
+  const [identityMembers, setIdentityMembers] = React.useState<IdentityMember[]>(
+    [],
+  );
 
   React.useEffect(() => {
     if (open) {
       setName("");
       setEmail("");
       setRole("staff");
+      setUserId("");
     }
   }, [open]);
+
+  // STK O14: the optional linked-user select lists the tenant's identity
+  // members (login accounts). Best-effort — a staff caller without the
+  // identity read permission still gets the plain create form.
+  React.useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await api.get<{ members?: IdentityMember[] }>(
+          `/api/identity/v1/tenants/${orgSlug}/members`,
+        );
+        if (!cancelled) setIdentityMembers(data.members ?? []);
+      } catch {
+        if (!cancelled) setIdentityMembers([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, orgSlug]);
 
   const valid = name.trim().length > 0 && /.+@.+\..+/.test(email);
 
@@ -266,12 +323,36 @@ function AddMemberDialog({
               <option value="owner">Owner</option>
             </Select>
           </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="tm-user">Linked user account (optional)</Label>
+            <Select
+              id="tm-user"
+              value={userId}
+              onChange={(e) => setUserId(e.target.value)}
+            >
+              <option value="">— not linked —</option>
+              {identityMembers.map((m) => (
+                <option key={m.user_id} value={m.user_id}>
+                  {m.user_id} · {titleCase(m.role)}
+                </option>
+              ))}
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Links this person to their sign-in account so schedule
+              assignments map to a staff identity.
+            </p>
+          </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button onClick={() => onAdd({ name, email, role })} disabled={busy || !valid}>
+          <Button
+            onClick={() =>
+              onAdd(userId ? { name, email, role, user_id: userId } : { name, email, role })
+            }
+            disabled={busy || !valid}
+          >
             {busy ? "Adding…" : "Add member"}
           </Button>
         </DialogFooter>
