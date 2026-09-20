@@ -23,6 +23,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// defaultIdentityURL is the direct identity-service base for sidecar-less
+// deployments (SPEC-W45 ORPH O2, compose service name/port).
+const defaultIdentityURL = "http://identity:7001"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
@@ -91,8 +95,31 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	convBase, voiceBase := channel.ResolveBases(cfg.ConversationURL, cfg.VoiceRuntimeURL, cfg.DaprHTTPPort)
+	// SPEC-W45 ORPH O2: resolve the internal upstream bases once and log
+	// them — with no Dapr sidecar (the compose posture) these are the
+	// direct service URLs; the Dapr invoke form uses the REGISTERED
+	// app-ids conversation/voice/booking.
+	convBase, voiceBase := channel.ResolveBases(cfg.ConversationURL, cfg.VoiceRuntimeURL, cfg.DaprHTTPPort, cfg.DaprSidecar)
+	bookingBase := httpapi.ResolveIncidentBase(cfg.BookingURL, cfg.DaprHTTPPort, cfg.DaprSidecar)
 	srv.Bridge = channel.NewBridge(siteMap, convBase, voiceBase, srv.WhatsApp, srv.Telegram, logger)
+	logger.Info("inbound bridge bases resolved",
+		zap.String("conversation_base", convBase),
+		zap.String("voice_base", voiceBase),
+		zap.String("booking_base", bookingBase),
+		zap.Bool("dapr_sidecar", cfg.DaprSidecar))
+	srv.Upstreams = []httpapi.UpstreamCheck{
+		{Name: "conversation", Base: convBase},
+		{Name: "voice", Base: voiceBase},
+		{Name: "booking", Base: bookingBase},
+	}
+	// Boot-time reachability probe: fail-loud (WARN) but never fatal — the
+	// gateway still serves provider webhooks and /healthz keeps reporting.
+	for _, u := range srv.Upstreams {
+		if err := httpapi.ProbeBase(context.Background(), u.Base); err != nil {
+			logger.Warn("upstream base unreachable at boot (inbound paths degraded until it recovers)",
+				zap.String("upstream", u.Name), zap.String("base", u.Base), zap.Error(err))
+		}
+	}
 
 	// IoT incident ingest (SPEC-W11 Part B §6): per-tenant shared secrets +
 	// the booking-service forwarder (BOOKING_URL override or Dapr invoke).
@@ -101,7 +128,7 @@ func run() error {
 		return err
 	}
 	srv.IncidentSecrets = incidentSecrets
-	srv.IncidentIngest = httpapi.NewIncidentIngester(httpapi.ResolveIncidentBase(cfg.BookingURL, cfg.DaprHTTPPort))
+	srv.IncidentIngest = httpapi.NewIncidentIngester(bookingBase)
 	logger.Info("incident webhook configured", zap.Int("tenant_secrets", len(incidentSecrets)))
 
 	// NG SMS aggregator failover chain (SPEC-W12 Agent A): ordered chain
@@ -145,13 +172,22 @@ func run() error {
 	srv.USSD = &httpapi.USSDConfig{
 		Sites:        siteMap,
 		Store:        ussdStore,
-		Menus:        channel.NewUSSDMenuFetcher(channel.ResolveInvokeBase(cfg.IdentityURL, "identity", cfg.DaprHTTPPort)),
+		Menus:        channel.NewUSSDMenuFetcher(channel.ResolveInvokeBase(cfg.IdentityURL, "identity", defaultIdentityURL, cfg.DaprHTTPPort, cfg.DaprSidecar)),
 		Conversation: channel.NewUSSDConversation(convBase),
 		SessionTTL:   time.Duration(cfg.USSDSessionTTL) * time.Second,
+		// SPEC-W45 K14/OOS-06: shared-secret path auth (fail-closed unset)
+		// + per-phone sliding-window rate limit.
+		CallbackSecret: cfg.ATCallbackSecret,
+		RatePerMinute:  cfg.USSDRatePerMinute,
+	}
+	if cfg.ATCallbackSecret == "" {
+		logger.Warn("AT_CALLBACK_SECRET unset: USSD callback rejects every post (503, fail-closed) until configured")
 	}
 	logger.Info("ussd channel configured",
 		zap.String("session_backend", cfg.USSDSessionBackend),
-		zap.Int("session_ttl_s", cfg.USSDSessionTTL))
+		zap.Int("session_ttl_s", cfg.USSDSessionTTL),
+		zap.Bool("callback_auth", cfg.ATCallbackSecret != ""),
+		zap.Int("rate_per_minute", cfg.USSDRatePerMinute))
 
 	logger.Info("messaging-gateway configured",
 		zap.Bool("termii", srv.Termii.Configured()),

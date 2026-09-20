@@ -37,11 +37,16 @@ type Config struct {
 	TelegramBaseURL       string // TELEGRAM_BASE_URL override (tests), default https://api.telegram.org
 	ChannelSiteMap        string // CHANNEL_SITE_MAP raw JSON (channel identity → site/tenant)
 
-	// Internal upstreams for the inbound bridge. Direct-base overrides win;
-	// empty means "via Dapr sidecar invoke on DAPR_HTTP_PORT".
+	// Internal upstreams for the inbound bridge (SPEC-W45 ORPH O2).
+	// Direct-base overrides win; with a Dapr sidecar (DaprSidecar) the
+	// invoke API is used; without one the direct-base defaults
+	// (http://conversation:7007 / http://voice:7006 / http://booking:7002).
 	ConversationURL string // CONVERSATION_URL override (tests, no-Dapr dev)
 	VoiceRuntimeURL string // VOICE_RUNTIME_URL override (tests, no-Dapr dev)
 	DaprHTTPPort    int    // DAPR_HTTP_PORT, default 3500
+	// DaprSidecar is true when dapr injected its env (DAPR_HTTP_PORT or
+	// DAPR_HOST set) — compose runs messaging-gateway WITHOUT a sidecar.
+	DaprSidecar bool
 
 	// IoT incident ingest (SPEC-W11 Part B §6): POST /webhooks/incidents.
 	IncidentWebhookSecrets string // INCIDENT_WEBHOOK_SECRETS raw JSON {"<tenant_slug|tenant_id>": "<secret>"}
@@ -57,11 +62,19 @@ type Config struct {
 	// SMS failover chain (SPEC-W12 Agent A).
 	SMSProviderChain string // SMS_PROVIDER_CHAIN csv, default "africastalking,termii,ebulksms"
 
-	// USSD inbound (SPEC-W12 Agent A): POST /webhooks/ussd.
+	// USSD inbound (SPEC-W12 Agent A + SPEC-W45 K14): POST
+	// /ussd/callback/{secret}.
 	IdentityURL        string // IDENTITY_URL override (tests, no-Dapr dev); empty = Dapr invoke identity
 	USSDSessionBackend string // USSD_SESSION_BACKEND: "memory" (default) | "dapr"
 	USSDStateStore     string // USSD_STATE_STORE Dapr component name (backend=dapr), default "statestore"
 	USSDSessionTTL     int    // USSD_SESSION_TTL_SECONDS, default 180 (contract §1)
+	// ATCallbackSecret (AT_CALLBACK_SECRET) authenticates the USSD callback
+	// path (K14). Empty = fail-closed: every callback answers 503.
+	ATCallbackSecret string
+	// USSDRatePerMinute (USSD_RATE_LIMIT_PER_MINUTE) bounds callbacks per
+	// phoneNumber (sliding window, in-memory — per-replica, see
+	// httpapi/ratelimit.go). Default 30.
+	USSDRatePerMinute int
 }
 
 // Load reads configuration from the environment.
@@ -82,15 +95,19 @@ func Load() Config {
 		WhatsAppAppSecret:     os.Getenv("WHATSAPP_APP_SECRET"),
 		// WHATSAPP_MOCK defaults OFF (SIM-007/SIM-008 fail-closed posture,
 		// KYC_MOCK idiom): only an explicit truthy value opts in.
-		WhatsAppMock:           envBool("WHATSAPP_MOCK", false),
-		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramBotUsername:    os.Getenv("TELEGRAM_BOT_USERNAME"),
-		TelegramWebhookSecret:  os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
-		TelegramBaseURL:        envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
-		ChannelSiteMap:         os.Getenv("CHANNEL_SITE_MAP"),
-		ConversationURL:        os.Getenv("CONVERSATION_URL"),
-		VoiceRuntimeURL:        os.Getenv("VOICE_RUNTIME_URL"),
-		DaprHTTPPort:           envInt("DAPR_HTTP_PORT", 3500),
+		WhatsAppMock:          envBool("WHATSAPP_MOCK", false),
+		TelegramBotToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramBotUsername:   os.Getenv("TELEGRAM_BOT_USERNAME"),
+		TelegramWebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
+		TelegramBaseURL:       envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
+		ChannelSiteMap:        os.Getenv("CHANNEL_SITE_MAP"),
+		ConversationURL:       os.Getenv("CONVERSATION_URL"),
+		VoiceRuntimeURL:       os.Getenv("VOICE_RUNTIME_URL"),
+		DaprHTTPPort:          envInt("DAPR_HTTP_PORT", 3500),
+		// A sidecar is present only when dapr injected its env — compose
+		// runs messaging-gateway WITHOUT one, so the bridge/ingest bases
+		// default to the direct service URLs (ORPH O2).
+		DaprSidecar:            os.Getenv("DAPR_HTTP_PORT") != "" || os.Getenv("DAPR_HOST") != "",
 		IncidentWebhookSecrets: os.Getenv("INCIDENT_WEBHOOK_SECRETS"),
 		BookingURL:             os.Getenv("BOOKING_URL"),
 		EBulkAPIKey:            os.Getenv("EBULK_API_KEY"),
@@ -102,6 +119,8 @@ func Load() Config {
 		USSDSessionBackend:     envStr("USSD_SESSION_BACKEND", "memory"),
 		USSDStateStore:         envStr("USSD_STATE_STORE", "statestore"),
 		USSDSessionTTL:         envInt("USSD_SESSION_TTL_SECONDS", 180),
+		ATCallbackSecret:       os.Getenv("AT_CALLBACK_SECRET"),
+		USSDRatePerMinute:      envInt("USSD_RATE_LIMIT_PER_MINUTE", 30),
 	}
 }
 
