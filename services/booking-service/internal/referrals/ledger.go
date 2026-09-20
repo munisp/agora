@@ -209,23 +209,3 @@ func NewAccrualPair(tenantID uuid.UUID, ref Referral, a Award) []LedgerEntry {
 	credit.CreditNGN = a.AmountKobo
 	return []LedgerEntry{debit, credit}
 }
-
-// NewPayoutPair builds the balanced payout settlement pair (contract §3:
-// debit 300 commission_payable / credit 302 agent_float-or-303
-// house_clearing) with ref_type RefTypePayout and ref_id = payout id — the
-// same posting PostBalanced produces for a payout BalancedPosting; kept as
-// the explicit-pair form for callers that need the journal id up front.
-func NewPayoutPair(tenantID, payoutID uuid.UUID, beneficiaryID string, amountKobo int64, creditAccount int) []LedgerEntry {
-	journalID := uuid.NewSHA1(uuid.NameSpaceOID,
-		[]byte("opendesk:balanced:"+RefTypePayout+":"+payoutID.String()))
-	base := LedgerEntry{TenantID: tenantID, JournalID: journalID, RefType: RefTypePayout, RefID: payoutID.String()}
-	debit := base // reduce the liability
-	debit.AccountCode = AccountCommissionPayable
-	debit.BeneficiaryID = beneficiaryID
-	debit.DebitNGN = amountKobo
-	credit := base // settle via agent float (302) or house clearing (303)
-	credit.AccountCode = creditAccount
-	credit.BeneficiaryID = beneficiaryID
-	credit.CreditNGN = amountKobo
-	return []LedgerEntry{debit, credit}
-}

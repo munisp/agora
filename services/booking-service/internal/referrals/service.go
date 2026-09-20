@@ -83,6 +83,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Referral, bool, e
 	if err := ValidateReferral(&ref); err != nil {
 		return ref, false, err
 	}
+	// SPEC-W45 STK O18: the referrer must resolve in this tenant (contact /
+	// team member / registered agent) — unknown referrers are a 422, not a
+	// dangling attribution.
+	if err := s.validateReferrer(ctx, ref.TenantID, ref.ReferrerType, ref.ReferrerID); err != nil {
+		return ref, false, err
+	}
 	created, err := s.Store.InsertReferral(ctx, &ref)
 	return ref, created, err
 }
@@ -126,6 +132,13 @@ func (s *Service) Verify(ctx context.Context, tenantID, referralID uuid.UUID, tr
 	if ref.Status != StatusPending {
 		// Idempotent replay: return current state, no double posting.
 		return VerifyResult{Referral: ref, AlreadyVerified: true, Awards: []Award{}}, nil
+	}
+	// SPEC-W45 STK O10: commissions to an agent require status=approved AND
+	// a beneficiary_id (the W44 K7 payout-beneficiary link).
+	if ref.ReferrerType == ReferrerAgent {
+		if err := s.requireAgentPayable(ctx, tenantID, ref.ReferrerID); err != nil {
+			return VerifyResult{}, err
+		}
 	}
 
 	rules, err := s.Store.ListRules(ctx, tenantID)
