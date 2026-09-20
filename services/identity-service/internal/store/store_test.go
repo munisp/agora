@@ -49,13 +49,30 @@ CREATE TABLE IF NOT EXISTS memberships (
               CHECK (role IN ('owner','admin','staff','viewer')),
     PRIMARY KEY (tenant_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS tenant_api_keys (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id  UUID NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    prefix     TEXT NOT NULL,
+    key_hash   TEXT NOT NULL UNIQUE,
+    scopes     TEXT[] NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_tenant ON tenant_api_keys (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_hash ON tenant_api_keys (key_hash) WHERE revoked_at IS NULL;
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
 ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
+ALTER TABLE tenant_api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_api_keys FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON tenants
     USING (id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 CREATE POLICY tenant_isolation ON memberships
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE POLICY tenant_isolation ON tenant_api_keys
     USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 DO $$
 BEGIN
@@ -74,8 +91,8 @@ BEGIN
 END
 $$;
 GRANT USAGE ON SCHEMA public TO app_identity, app_identity_internal;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, memberships TO app_identity;
-GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, memberships TO app_identity_internal;`
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, memberships, tenant_api_keys TO app_identity;
+GRANT SELECT, INSERT, UPDATE, DELETE ON tenants, memberships, tenant_api_keys TO app_identity_internal;`
 
 // setupStoreTest boots embedded PG, applies the schema as superuser, runs
 // the bootstrap DDL as superuser (fresh-install path), and returns DSNs for
@@ -317,5 +334,162 @@ func TestMembershipsGUCPlumbing(t *testing.T) {
 	}
 	if !strings.Contains(qual, "NULLIF") || !strings.Contains(qual, "app_identity_internal") {
 		t.Errorf("memberships policy = %s", qual)
+	}
+}
+
+// TestAPIKeysParity (SPEC-W45 K17): the tenant_api_keys table exists in the
+// embedded parity schema with the SAME columns/RLS as
+// 02-identity-schema.sql, and the store round trip works under RLS: CRUD is
+// GUC-scoped to the owning tenant, hash validation resolves via the internal
+// escape (cross-tenant by design), revocation hides the key from validation,
+// and the raw app role sees nothing without the GUC (fail-closed).
+func TestAPIKeysParity(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
+	ctx := context.Background()
+	st, err := New(ctx, appDSN, internalDSN)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+
+	a := Tenant{Slug: "acme", Name: "Acme"}
+	b := Tenant{Slug: "other", Name: "Other"}
+	if err := st.CreateTenant(ctx, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTenant(ctx, &b); err != nil {
+		t.Fatal(err)
+	}
+
+	k := APIKey{
+		TenantID: a.ID, Name: "ext-read", Prefix: "odk_testpref",
+		KeyHash: strings.Repeat("a", 64), Scopes: []string{"bookings:read"},
+		CreatedBy: "user:owner",
+	}
+	if err := st.CreateAPIKey(ctx, &k); err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	if k.CreatedAt.IsZero() {
+		t.Errorf("created_at not returned")
+	}
+
+	// Tenant-scoped list (GUC plumbing).
+	keys, err := st.ListAPIKeys(ctx, a.ID)
+	if err != nil || len(keys) != 1 || keys[0].Prefix != "odk_testpref" {
+		t.Fatalf("list keys: %v, %+v", err, keys)
+	}
+	if keys[0].RevokedAt != nil {
+		t.Errorf("fresh key must not be revoked")
+	}
+	keys, err = st.ListAPIKeys(ctx, b.ID)
+	if err != nil || len(keys) != 0 {
+		t.Errorf("other tenant keys: %v, n=%d, want 0", err, len(keys))
+	}
+
+	// Cross-tenant hash validation via the internal escape pool.
+	got, slug, err := st.GetAPIKeyByHash(ctx, strings.Repeat("a", 64))
+	if err != nil || slug != "acme" || got.TenantID != a.ID {
+		t.Fatalf("validate hash: %v, slug=%q, %+v", err, slug, got)
+	}
+	if len(got.Scopes) != 1 || got.Scopes[0] != "bookings:read" {
+		t.Errorf("scopes = %v", got.Scopes)
+	}
+	if _, _, err := st.GetAPIKeyByHash(ctx, strings.Repeat("b", 64)); err != ErrNotFound {
+		t.Errorf("unknown hash: err = %v, want ErrNotFound", err)
+	}
+
+	// Revoke: soft delete, hidden from validation, second revoke 404s.
+	if err := st.RevokeAPIKey(ctx, a.ID, k.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if _, _, err := st.GetAPIKeyByHash(ctx, strings.Repeat("a", 64)); err != ErrNotFound {
+		t.Errorf("revoked key must not validate: err = %v", err)
+	}
+	if err := st.RevokeAPIKey(ctx, a.ID, k.ID); err != ErrNotFound {
+		t.Errorf("re-revoke: err = %v, want ErrNotFound", err)
+	}
+	// Cross-tenant revoke of acme's key id must not touch it.
+	if err := st.RevokeAPIKey(ctx, b.ID, k.ID); err != ErrNotFound {
+		t.Errorf("cross-tenant revoke: err = %v, want ErrNotFound", err)
+	}
+	keys, err = st.ListAPIKeys(ctx, a.ID)
+	if err != nil || len(keys) != 1 || keys[0].RevokedAt == nil {
+		t.Errorf("revoked row retained for audit: %v, %+v", err, keys)
+	}
+
+	// Fail-closed RLS probe: the raw app role sees nothing without the GUC.
+	appPool, err := pgxpool.New(ctx, appDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer appPool.Close()
+	var n int
+	if err := appPool.QueryRow(ctx, `SELECT count(*) FROM tenant_api_keys`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("app role saw %d api-key rows without GUC, want 0", n)
+	}
+}
+
+// TestMemberLifecycleStore (SPEC-W45 K16/K18): GetMember/RemoveMember/
+// CountMembers/SetTenantPlan round trips under RLS.
+func TestMemberLifecycleStore(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
+	ctx := context.Background()
+	st, err := New(ctx, appDSN, internalDSN)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+
+	a := Tenant{Slug: "acme", Name: "Acme"}
+	if err := st.CreateTenant(ctx, &a); err != nil {
+		t.Fatal(err)
+	}
+	u1, u2 := uuid.NewString(), uuid.NewString()
+	if err := st.AddMember(ctx, Membership{TenantID: a.ID, UserID: u1, Role: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddMember(ctx, Membership{TenantID: a.ID, UserID: u2, Role: "staff"}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.GetMember(ctx, a.ID, u2)
+	if err != nil || m.Role != "staff" {
+		t.Fatalf("get member: %v, %+v", err, m)
+	}
+	if _, err := st.GetMember(ctx, a.ID, uuid.NewString()); err != ErrNotFound {
+		t.Errorf("unknown member: err = %v, want ErrNotFound", err)
+	}
+	n, err := st.CountMembers(ctx, a.ID)
+	if err != nil || n != 2 {
+		t.Fatalf("count: %v, n=%d, want 2", err, n)
+	}
+	if err := st.RemoveMember(ctx, a.ID, u2); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := st.RemoveMember(ctx, a.ID, u2); err != ErrNotFound {
+		t.Errorf("re-remove: err = %v, want ErrNotFound", err)
+	}
+	n, err = st.CountMembers(ctx, a.ID)
+	if err != nil || n != 1 {
+		t.Errorf("count after remove: %v, n=%d, want 1", err, n)
+	}
+
+	// Plan update (K18) via the internal pool; DB CHECK still bites.
+	if err := st.SetTenantPlan(ctx, "acme", "pro"); err != nil {
+		t.Fatalf("set plan: %v", err)
+	}
+	got, err := st.GetTenantBySlug(ctx, "acme")
+	if err != nil || got.Plan != "pro" {
+		t.Fatalf("plan readback: %v, %q", err, got.Plan)
+	}
+	if err := st.SetTenantPlan(ctx, "ghost", "pro"); err != ErrNotFound {
+		t.Errorf("unknown slug: err = %v, want ErrNotFound", err)
+	}
+	err = st.SetTenantPlan(ctx, "acme", "gold")
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Errorf("bogus plan: err = %v, want pg 23514", err)
 	}
 }

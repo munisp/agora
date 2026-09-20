@@ -117,6 +117,29 @@ DROP POLICY IF EXISTS tenant_isolation ON memberships;
 CREATE POLICY tenant_isolation ON memberships
     USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR pg_has_role(current_user, 'app_identity_internal', 'member'))`},
+		// SPEC-W45 K17: tenant API keys (hashed server-side; the secret is
+		// shown once at creation). Same fail-closed RLS idiom as memberships;
+		// hash validation is cross-tenant and runs on the internal pool.
+		{"ensure tenant_api_keys", `
+CREATE TABLE IF NOT EXISTS tenant_api_keys (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id  UUID NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    prefix     TEXT NOT NULL,
+    key_hash   TEXT NOT NULL UNIQUE,
+    scopes     TEXT[] NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_tenant ON tenant_api_keys (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_hash ON tenant_api_keys (key_hash) WHERE revoked_at IS NULL;
+ALTER TABLE tenant_api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_api_keys FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tenant_api_keys;
+CREATE POLICY tenant_isolation ON tenant_api_keys
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
+           OR pg_has_role(current_user, 'app_identity_internal', 'member'))`},
 	}
 	for _, st := range stmts {
 		if _, err := s.pool.Exec(ctx, st.sql); err != nil {
@@ -336,4 +359,170 @@ func (s *Store) AddMember(ctx context.Context, m Membership) error {
 		}
 		return nil
 	})
+}
+
+// GetMember fetches one membership (SPEC-W45 K16 member lifecycle: role
+// change/removal need the CURRENT role to scope the owner-only guard and to
+// publish the old→new transition).
+func (s *Store) GetMember(ctx context.Context, tenantID uuid.UUID, userID string) (Membership, error) {
+	const q = `SELECT tenant_id, user_id, role FROM memberships WHERE tenant_id = $1 AND user_id = $2`
+	var m Membership
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, q, tenantID, userID).Scan(&m.TenantID, &m.UserID, &m.Role)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return m, ErrNotFound
+	}
+	if err != nil {
+		return m, fmt.Errorf("get member: %w", err)
+	}
+	return m, nil
+}
+
+// RemoveMember deletes one membership row (SPEC-W45 K16). ErrNotFound when
+// the pair does not exist.
+func (s *Store) RemoveMember(ctx context.Context, tenantID uuid.UUID, userID string) error {
+	const q = `DELETE FROM memberships WHERE tenant_id = $1 AND user_id = $2`
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, q, tenantID, userID)
+		if err != nil {
+			return fmt.Errorf("remove member: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// CountMembers returns the tenant's membership count (SPEC-W45 K18 plan
+// member-limit gate in inviteMember).
+func (s *Store) CountMembers(ctx context.Context, tenantID uuid.UUID) (int, error) {
+	var n int
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT count(*) FROM memberships WHERE tenant_id = $1`, tenantID).Scan(&n)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count members: %w", err)
+	}
+	return n, nil
+}
+
+// SetTenantPlan updates tenants.plan (SPEC-W45 K18 PATCH
+// /v1/tenants/{slug}/plan). Runs on the tenants pool (internal escape role —
+// the tenants RLS policy is keyed on the row's own id). ErrNotFound for an
+// unknown slug.
+func (s *Store) SetTenantPlan(ctx context.Context, slug, plan string) error {
+	tag, err := s.tenants.Exec(ctx, `UPDATE tenants SET plan = $2 WHERE slug = $1`, slug, plan)
+	if err != nil {
+		return fmt.Errorf("set tenant plan: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Tenant API keys (SPEC-W45 K17)
+// ---------------------------------------------------------------------------
+
+// APIKey mirrors identity.tenant_api_keys. KeyHash is the SHA-256 hex of the
+// full key (prefix.secret) and is NEVER serialised to API clients.
+type APIKey struct {
+	ID        uuid.UUID  `json:"id"`
+	TenantID  uuid.UUID  `json:"tenant_id"`
+	Name      string     `json:"name"`
+	Prefix    string     `json:"prefix"`
+	KeyHash   string     `json:"-"`
+	Scopes    []string   `json:"scopes"`
+	CreatedBy string     `json:"created_by"`
+	CreatedAt time.Time  `json:"created_at"`
+	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+}
+
+// CreateAPIKey inserts a key row (the caller generates prefix/hash and keeps
+// the plaintext secret out of the store entirely).
+func (s *Store) CreateAPIKey(ctx context.Context, k *APIKey) error {
+	if k.ID == uuid.Nil {
+		k.ID = uuid.New()
+	}
+	const q = `INSERT INTO tenant_api_keys (id, tenant_id, name, prefix, key_hash, scopes, created_by)
+	           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING created_at`
+	return s.withTenant(ctx, k.TenantID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, q, k.ID, k.TenantID, k.Name, k.Prefix, k.KeyHash, k.Scopes, k.CreatedBy).
+			Scan(&k.CreatedAt); err != nil {
+			return fmt.Errorf("create api key: %w", err)
+		}
+		return nil
+	})
+}
+
+// ListAPIKeys returns all keys of a tenant (revoked included — audit
+// visibility), newest first. Hashes are selected only into the struct and
+// never leave the service.
+func (s *Store) ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]APIKey, error) {
+	const q = `SELECT id, tenant_id, name, prefix, key_hash, scopes, created_by, created_at, revoked_at
+	           FROM tenant_api_keys WHERE tenant_id = $1 ORDER BY created_at DESC`
+	var out []APIKey
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, q, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var k APIKey
+			if err := rows.Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &k.KeyHash,
+				&k.Scopes, &k.CreatedBy, &k.CreatedAt, &k.RevokedAt); err != nil {
+				return err
+			}
+			out = append(out, k)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list api keys: %w", err)
+	}
+	return out, nil
+}
+
+// RevokeAPIKey sets revoked_at (soft delete — the row stays for audit).
+// ErrNotFound when the (tenant, id) pair is unknown or already revoked.
+func (s *Store) RevokeAPIKey(ctx context.Context, tenantID, keyID uuid.UUID) error {
+	const q = `UPDATE tenant_api_keys SET revoked_at = now()
+	           WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL`
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, q, tenantID, keyID)
+		if err != nil {
+			return fmt.Errorf("revoke api key: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+// GetAPIKeyByHash resolves an ACTIVE key by its SHA-256 hash and returns the
+// key plus the owning tenant's slug (the /internal/api-keys/validate
+// contract). Cross-tenant by design (the validator does not know the tenant
+// upfront), so it runs on the internal pool with the RLS escape; the tenants
+// join is covered by the same escape. ErrNotFound for unknown/revoked keys.
+func (s *Store) GetAPIKeyByHash(ctx context.Context, keyHash string) (APIKey, string, error) {
+	const q = `SELECT k.id, k.tenant_id, k.name, k.prefix, k.key_hash, k.scopes, k.created_by, k.created_at, k.revoked_at,
+	                  t.slug
+	           FROM tenant_api_keys k JOIN tenants t ON t.id = k.tenant_id
+	           WHERE k.key_hash = $1 AND k.revoked_at IS NULL`
+	var k APIKey
+	var slug string
+	err := s.tenants.QueryRow(ctx, q, keyHash).Scan(&k.ID, &k.TenantID, &k.Name, &k.Prefix, &k.KeyHash,
+		&k.Scopes, &k.CreatedBy, &k.CreatedAt, &k.RevokedAt, &slug)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return k, "", ErrNotFound
+	}
+	if err != nil {
+		return k, "", fmt.Errorf("get api key by hash: %w", err)
+	}
+	return k, slug, nil
 }
