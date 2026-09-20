@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,6 +96,20 @@ func (f *fakeMap) DeleteByTwentyID(_ context.Context, twentyID string) (int64, e
 		}
 	}
 	return removed, nil
+}
+
+// disabled tracks tenant tombstones (SPEC-W45 K9/K21 DisableTenant).
+func (f *fakeMap) DisableTenant(_ context.Context, tenantID uuid.UUID) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int64
+	for k, m := range f.rows {
+		if m.TenantID != nil && *m.TenantID == tenantID {
+			delete(f.rows, k) // fake: disabled rows behave as unmapped
+			n++
+		}
+	}
+	return n, nil
 }
 
 // twentyStub records requests and answers with Twenty-style envelopes.
@@ -426,5 +441,160 @@ func TestPermanentErrorWrapping(t *testing.T) {
 	err := permanent(errors.New("bad payload"))
 	if !errors.Is(err, errPermanent) {
 		t.Fatal("permanent() should wrap errPermanent")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W45 K21 (OOS-09/OOS-25): person upsert keyed (tenant_id, email|phone)
+// ---------------------------------------------------------------------------
+
+// The same email under TWO tenants must create TWO Twenty persons (no global
+// cross-tenant merge), while a repeat event for the same tenant reuses the
+// tenant's existing person (update, not create).
+func TestSyncPersonTenantKeyedNoCrossTenantMerge(t *testing.T) {
+	s, fm, stub := newTestSyncer(t)
+	tenantA, tenantB := uuid.NewString(), uuid.NewString()
+	booking := func(id string) map[string]any {
+		return map[string]any{
+			"booking_id": id, "starts_at": "2026-03-01T10:00:00Z",
+			"ends_at": "2026-03-01T10:30:00Z", "status": "pending",
+			"offering_name": "Haircut", "contact_name": "Jane Doe",
+			"phone": "+1555000111", "email": "jane@example.com",
+		}
+	}
+	evtA := bookingEvent(events.TypeBookingCreated, booking("bk-a1"))
+	evtA.TenantID = tenantA
+	if err := s.HandleBooking(context.Background(), evtA); err != nil {
+		t.Fatal(err)
+	}
+	// Repeat: same tenant, same email (different booking) -> person REUSED.
+	evtA2 := bookingEvent(events.TypeBookingCreated, booking("bk-a2"))
+	evtA2.TenantID = tenantA
+	if err := s.HandleBooking(context.Background(), evtA2); err != nil {
+		t.Fatal(err)
+	}
+	// Same email, DIFFERENT tenant -> a NEW person must be created.
+	evtB := bookingEvent(events.TypeBookingCreated, booking("bk-b1"))
+	evtB.TenantID = tenantB
+	if err := s.HandleBooking(context.Background(), evtB); err != nil {
+		t.Fatal(err)
+	}
+
+	var creates, patches int
+	var createdIDs []string
+	for _, r := range stub.requests {
+		if r.method == http.MethodPost && r.path == "/rest/people" {
+			creates++
+		}
+		if r.method == http.MethodPatch && strings.HasPrefix(r.path, "/rest/people/") {
+			patches++
+		}
+	}
+	if creates != 2 {
+		t.Errorf("person creates = %d, want 2 (one per tenant; no global merge)", creates)
+	}
+	if patches != 1 {
+		t.Errorf("person patches = %d, want 1 (repeat event reuses the tenant's person)", patches)
+	}
+	// Distinct persons per tenant via the natural-key mappings.
+	tidA, _ := uuid.Parse(tenantA)
+	tidB, _ := uuid.Parse(tenantB)
+	mA, err := fm.Get(context.Background(), syncmap.KindContactIdentity, "email:jane@example.com", &tidA)
+	if err != nil {
+		t.Fatalf("tenant A identity mapping missing: %v", err)
+	}
+	mB, err := fm.Get(context.Background(), syncmap.KindContactIdentity, "email:jane@example.com", &tidB)
+	if err != nil {
+		t.Fatalf("tenant B identity mapping missing: %v", err)
+	}
+	if mA.TwentyID == mB.TwentyID {
+		t.Errorf("cross-tenant merge: both tenants map to person %q", mA.TwentyID)
+	}
+	createdIDs = append(createdIDs, mA.TwentyID, mB.TwentyID)
+	// The phone natural key is mapped too (email|phone per K21).
+	if _, err := fm.Get(context.Background(), syncmap.KindContactIdentity, "phone:+1555000111", &tidA); err != nil {
+		t.Errorf("tenant A phone identity mapping missing: %v", err)
+	}
+}
+
+// The second tenant's events must resolve persons only through ITS OWN
+// mappings: a phone-only event for tenant A after the email-keyed sync must
+// reuse tenant A's person (the phone natural key was recorded).
+func TestSyncPersonPhoneKeyReuseWithinTenant(t *testing.T) {
+	s, _, stub := newTestSyncer(t)
+	tenantA := uuid.NewString()
+	evt := bookingEvent(events.TypeBookingCreated, map[string]any{
+		"booking_id": "bk-1", "starts_at": "2026-03-01T10:00:00Z",
+		"ends_at": "2026-03-01T10:30:00Z", "offering_name": "Cut",
+		"contact_name": "Jane Doe", "phone": "+1555000111", "email": "jane@example.com",
+	})
+	evt.TenantID = tenantA
+	if err := s.HandleBooking(context.Background(), evt); err != nil {
+		t.Fatal(err)
+	}
+	// Phone-only follow-up event, same tenant.
+	evt2 := bookingEvent(events.TypeBookingCreated, map[string]any{
+		"booking_id": "bk-2", "starts_at": "2026-03-02T10:00:00Z",
+		"ends_at": "2026-03-02T10:30:00Z", "offering_name": "Cut",
+		"contact_name": "Jane Doe", "phone": "+1555000111",
+	})
+	evt2.TenantID = tenantA
+	if err := s.HandleBooking(context.Background(), evt2); err != nil {
+		t.Fatal(err)
+	}
+	var creates int
+	for _, r := range stub.requests {
+		if r.method == http.MethodPost && r.path == "/rest/people" {
+			creates++
+		}
+	}
+	if creates != 1 {
+		t.Errorf("person creates = %d, want 1 (phone key reuses the tenant's person)", creates)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W45 K9: TenantDeleted disables the tenant's sync_map entries
+// ---------------------------------------------------------------------------
+
+func TestTenantDeletedDisablesSyncMap(t *testing.T) {
+	s, fm, _ := newTestSyncer(t)
+	tenantA, tenantB := uuid.NewString(), uuid.NewString()
+	tidA, _ := uuid.Parse(tenantA)
+	tidB, _ := uuid.Parse(tenantB)
+	now := time.Now()
+	fm.seed(KindBooking, "bk-a", "task-a", &tidA, now, &now)
+	fm.seed(syncmap.KindContactIdentity, "email:jane@example.com", "person-a", &tidA, now, &now)
+	fm.seed(KindBooking, "bk-b", "task-b", &tidB, now, &now)
+
+	evt := events.CloudEvent{
+		SpecVersion: "1.0", ID: uuid.NewString(), Source: "identity-service",
+		Type: events.TypeTenantDeleted, Time: now,
+		Data: map[string]any{"tenant_id": tenantA, "tenant_slug": "acme",
+			"deleted_at": now.Format(time.RFC3339), "actor": "owner@acme"},
+	}
+	if err := s.HandleIdentity(context.Background(), evt); err != nil {
+		t.Fatal(err)
+	}
+	// Tenant A rows are disabled (invisible to Get)...
+	if _, err := fm.Get(context.Background(), KindBooking, "bk-a", &tidA); !errors.Is(err, syncmap.ErrNotFound) {
+		t.Errorf("deleted tenant mapping must be invisible, got %v", err)
+	}
+	if _, err := fm.Get(context.Background(), syncmap.KindContactIdentity, "email:jane@example.com", &tidA); !errors.Is(err, syncmap.ErrNotFound) {
+		t.Errorf("deleted tenant identity mapping must be invisible, got %v", err)
+	}
+	// ...tenant B untouched.
+	if _, err := fm.Get(context.Background(), KindBooking, "bk-b", &tidB); err != nil {
+		t.Errorf("tenant B mapping must survive: %v", err)
+	}
+	// Idempotent: a redelivery is a no-op success.
+	if err := s.HandleIdentity(context.Background(), evt); err != nil {
+		t.Errorf("TenantDeleted redelivery must be idempotent: %v", err)
+	}
+	// Missing tenant_id is a poison payload (permanent, no panic).
+	bad := events.CloudEvent{SpecVersion: "1.0", ID: uuid.NewString(),
+		Type: events.TypeTenantDeleted, Time: now, Data: map[string]any{"tenant_slug": "x"}}
+	if err := s.HandleIdentity(context.Background(), bad); err == nil {
+		t.Error("TenantDeleted without tenant_id must error (DLQ)")
 	}
 }

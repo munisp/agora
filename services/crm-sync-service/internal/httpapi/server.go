@@ -12,6 +12,7 @@ package httpapi
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,7 +60,11 @@ type Server struct {
 	// Nil → dedupe disabled (tests / no-DB deployments).
 	Dedupe  WebhookDedupe
 	Metrics *metrics.Registry
-	Log     *zap.Logger
+	// InternalToken (CRM_SYNC_INTERNAL_TOKEN, SPEC-W45 K21): X-Internal-Token
+	// gate on the service-to-service /v1 surface — 503 fail-closed when
+	// unset, 401 missing/wrong (identity-service K2 pattern).
+	InternalToken string
+	Log           *zap.Logger
 }
 
 // Router builds the chi router.
@@ -68,9 +73,33 @@ func (s *Server) Router() http.Handler {
 	r.Get("/healthz", s.healthz)
 	r.Get("/metrics", s.metricsHandler)
 	r.Post("/webhooks/twenty", s.twentyWebhook)
-	r.Post("/v1/tasks", s.createTask)
-	r.Get("/v1/people/lookup", s.lookupPerson)
+	// SPEC-W45 K21 (OOS-09): the /v1 helper surface is internal-only.
+	r.Group(func(r chi.Router) {
+		r.Use(s.internauth)
+		r.Post("/v1/tasks", s.createTask)
+		r.Get("/v1/people/lookup", s.lookupPerson)
+	})
 	return r
+}
+
+// internauth gates the /v1 surface (SPEC-W45 K21): X-Internal-Token must
+// match CRM_SYNC_INTERNAL_TOKEN via constant-time compare. Fail-closed: 503
+// when the env token is unset, 401 on missing/wrong.
+func (s *Server) internauth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.InternalToken == "" {
+			s.Log.Error("CRM_SYNC_INTERNAL_TOKEN unset — refusing request (fail-closed, K21)",
+				zap.String("path", r.URL.Path))
+			writeError(w, http.StatusServiceUnavailable, "internal token not configured")
+			return
+		}
+		got := r.Header.Get("X-Internal-Token")
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.InternalToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid internal token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // lookupPerson handles GET /v1/people/lookup?email=|phone= (GDPR export

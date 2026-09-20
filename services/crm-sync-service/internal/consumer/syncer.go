@@ -50,6 +50,8 @@ type MapStore interface {
 	Get(ctx context.Context, kind, opendeskID string, tenantID *uuid.UUID) (syncmap.Mapping, error)
 	Put(ctx context.Context, kind, opendeskID, twentyID string, tenantID *uuid.UUID) error
 	DeleteByTwentyID(ctx context.Context, twentyID string) (int64, error)
+	// DisableTenant tombstones all rows of a deleted tenant (SPEC-W45 K9).
+	DisableTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 }
 
 // Syncer applies CloudEvents to Twenty via the REST client + sync_map.
@@ -64,10 +66,16 @@ type Syncer struct {
 func (s *Syncer) HandleIdentity(ctx context.Context, evt events.CloudEvent) error {
 	switch evt.Type {
 	case events.TypeTenantProvisioned:
+		return s.handleTenantProvisioned(ctx, evt)
+	case events.TypeTenantDeleted, "TenantDeleted":
+		return s.handleTenantDeleted(ctx, evt)
 	default:
 		s.Log.Debug("ignoring identity event", zap.String("type", evt.Type))
 		return nil
 	}
+}
+
+func (s *Syncer) handleTenantProvisioned(ctx context.Context, evt events.CloudEvent) error {
 	d, err := events.DataAs[events.TenantProvisionedData](evt)
 	if err != nil {
 		return permanent(err)
@@ -87,6 +95,34 @@ func (s *Syncer) HandleIdentity(ctx context.Context, evt events.CloudEvent) erro
 	}
 	s.Log.Info("tenant synced to Twenty company",
 		zap.String("slug", d.Slug), zap.String("company_id", companyID))
+	return nil
+}
+
+// handleTenantDeleted implements the crm-sync leg of the SPEC-W45 K9
+// TenantDeleted cascade: every sync_map entry of the deleted tenant is
+// DISABLED (tombstoned, not deleted — the mapping is the forensic record of
+// which Twenty objects belonged to the tenant). Disabled rows are invisible
+// to Get/GetByTwentyID, so neither the forward syncer nor the reverse
+// worker touches the dead tenant's Twenty records afterwards. Idempotent
+// (DisableTenant only re-stamps rows not yet disabled); a store error is
+// returned for retry — never silently swallowed (K9 error surfacing).
+func (s *Syncer) handleTenantDeleted(ctx context.Context, evt events.CloudEvent) error {
+	d, err := events.DataAs[events.TenantDeletedData](evt)
+	if err != nil {
+		return permanent(err)
+	}
+	tenantUUID := parseUUID(d.TenantID)
+	if tenantUUID == nil {
+		return permanent(fmt.Errorf("TenantDeleted missing/invalid tenant_id %q", d.TenantID))
+	}
+	disabled, err := s.Map.DisableTenant(ctx, *tenantUUID)
+	if err != nil {
+		return fmt.Errorf("disable sync_map entries for deleted tenant: %w", err)
+	}
+	s.Log.Info("tenant deleted: sync_map entries disabled",
+		zap.String("tenant_id", d.TenantID),
+		zap.String("tenant_slug", d.TenantSlug),
+		zap.Int64("disabled", disabled))
 	return nil
 }
 
@@ -184,6 +220,14 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 }
 
 // syncPerson find-then-create/updates the Person and stores the contact mapping.
+//
+// SPEC-W45 K21 (OOS-09/OOS-25): the upsert is keyed (tenant_id, email|phone)
+// through sync_map kind=contact_identity. The old path used Twenty's GLOBAL
+// find-by-email/phone (UpsertPerson), which merged a person record shared
+// across tenants — a contact of tenant A could end up owning tenant B's
+// notes/tasks. Now: a person is only ever REUSED when this tenant previously
+// synced the same natural key; otherwise a NEW Twenty person is created
+// (one person per tenant per natural key — no cross-tenant merge).
 func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUID *uuid.UUID) (string, error) {
 	if d.Email == "" && d.Phone == "" {
 		return "", nil // nothing to key a person on; task still gets created
@@ -205,9 +249,31 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 			return "", err
 		}
 	}
-	personID, err := s.Twenty.UpsertPerson(ctx, d.ContactName, d.Email, d.Phone)
+	// Tenant-scoped natural-key lookup (K21) — replaces the global
+	// Twenty-side find. Email wins over phone (mirrors FindPerson order).
+	if personID, err := s.findTenantPerson(ctx, d.Email, d.Phone, tenantUUID); err != nil {
+		return "", err
+	} else if personID != "" {
+		if err := s.Twenty.UpdatePerson(ctx, personID,
+			twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone)); err != nil {
+			s.Log.Warn("person update failed; keeping existing record",
+				zap.String("person_id", personID), zap.Error(err))
+		}
+		if d.ContactID != "" {
+			if err := s.Map.Put(ctx, KindContact, d.ContactID, personID, tenantUUID); err != nil {
+				return "", err
+			}
+		}
+		return personID, nil
+	}
+	// No mapping for this tenant: CREATE a new person (never merge into
+	// another tenant's record).
+	personID, err := s.Twenty.CreatePerson(ctx, twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone))
 	if err != nil {
-		return "", fmt.Errorf("upsert person: %w", err)
+		return "", fmt.Errorf("create person: %w", err)
+	}
+	if err := s.rememberTenantPerson(ctx, personID, d.Email, d.Phone, tenantUUID); err != nil {
+		return "", err
 	}
 	if d.ContactID != "" {
 		if err := s.Map.Put(ctx, KindContact, d.ContactID, personID, tenantUUID); err != nil {
@@ -215,6 +281,53 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 		}
 	}
 	return personID, nil
+}
+
+// personNaturalKeys derives the tenant-scoped natural keys for a contact:
+// "email:<lower(email)>" when an e-mail is present, "phone:<trimmed phone>"
+// when a phone is present (SPEC-W45 K21: the upsert key is
+// (tenant_id, email|phone); the tenant scoping comes from the sync_map
+// tenant_id column, which is part of the table's UNIQUE constraint).
+func personNaturalKeys(email, phone string) []string {
+	var keys []string
+	if e := strings.ToLower(strings.TrimSpace(email)); e != "" {
+		keys = append(keys, "email:"+e)
+	}
+	if p := strings.TrimSpace(phone); p != "" {
+		keys = append(keys, "phone:"+p)
+	}
+	return keys
+}
+
+// findTenantPerson resolves the Twenty person this TENANT previously synced
+// for the same email|phone natural key ("" when unmapped). Store errors
+// other than not-found are returned (retried).
+func (s *Syncer) findTenantPerson(ctx context.Context, email, phone string, tenantUUID *uuid.UUID) (string, error) {
+	for _, k := range personNaturalKeys(email, phone) {
+		m, err := s.Map.Get(ctx, syncmap.KindContactIdentity, k, tenantUUID)
+		if errors.Is(err, syncmap.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("lookup contact_identity mapping: %w", err)
+		}
+		if m.TwentyID != "" {
+			return m.TwentyID, nil
+		}
+	}
+	return "", nil
+}
+
+// rememberTenantPerson records the (tenant, email|phone) -> person mapping
+// after a create. A failure is returned (retried) rather than swallowed:
+// losing the mapping would create a duplicate person on the next event.
+func (s *Syncer) rememberTenantPerson(ctx context.Context, personID, email, phone string, tenantUUID *uuid.UUID) error {
+	for _, k := range personNaturalKeys(email, phone) {
+		if err := s.Map.Put(ctx, syncmap.KindContactIdentity, k, personID, tenantUUID); err != nil {
+			return fmt.Errorf("record contact_identity mapping: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Syncer) handleBookingCancelled(ctx context.Context, d events.BookingData, tenantUUID *uuid.UUID) error {

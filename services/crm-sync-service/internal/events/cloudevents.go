@@ -27,6 +27,11 @@ type CloudEvent struct {
 // Event type constants consumed from the backbone.
 const (
 	TypeTenantProvisioned = "com.opendesk.identity.TenantProvisioned"
+	// TypeTenantDeleted is published by identity-service on
+	// opendesk.identity.events (SPEC-W45 K9 cascade): consumers purge /
+	// disable their per-tenant state. The bare "TenantDeleted" form is also
+	// accepted (see Syncer.HandleIdentity).
+	TypeTenantDeleted = "com.opendesk.identity.TenantDeleted"
 
 	TypeBookingCreated     = "com.opendesk.booking.BookingCreated"
 	TypeBookingConfirmed   = "com.opendesk.booking.BookingConfirmed"
@@ -52,6 +57,15 @@ type TenantProvisionedData struct {
 	Slug     string `json:"slug"`
 	Name     string `json:"name"`
 	Plan     string `json:"plan"`
+}
+
+// TenantDeletedData mirrors identity-service's SPEC-W45 K9 TenantDeleted
+// payload: {tenant_slug, tenant_id, deleted_at, actor}.
+type TenantDeletedData struct {
+	TenantID   string `json:"tenant_id"`
+	TenantSlug string `json:"tenant_slug"`
+	DeletedAt  string `json:"deleted_at"`
+	Actor      string `json:"actor"`
 }
 
 // BookingData mirrors booking-service bookingops.marshalEvent payloads.
