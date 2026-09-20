@@ -101,6 +101,32 @@ services:
       # carry X-Internal-Token == this value (must match the notification
       # block's NOTIFICATION_INTERNAL_TOKEN). DEV ONLY default.
       NOTIFICATION_INTERNAL_TOKEN: ${NOTIFICATION_INTERNAL_TOKEN:-opendesk-dev-notification-internal-token-change-in-prod}
+      # SPEC-W45 STK O13 (internal/consent/portal.go, config.go PortalSecret):
+      # the consent portal path VERIFIES booking portal JWTs — HMAC-signed by
+      # booking-service with the SAME shared PORTAL_SECRET (one .env entry
+      # wires both sides; booking + identity MUST carry the same value).
+      # Unset = the portal path is unavailable (fail-closed). Same DEV ONLY
+      # default as the booking block; prod via the secrets store.
+      PORTAL_SECRET: ${PORTAL_SECRET:-opendesk-dev-portal-secret-change-in-prod}
+      # SPEC-W45 K contract note: after a successful PATCH /v1/tenants/{slug}/plan,
+      # identity best-effort pushes the plan to billing-engine
+      # (PUT {BILLING_URL}/v1/tenants/{uuid}/plan, X-Internal-Token). Must match
+      # the billing-engine block's BILLING_INTERNAL_TOKEN (RS-002). Same DEV ONLY
+      # default; prod MUST set via the secrets store.
+      BILLING_URL: ${BILLING_URL:-http://billing-engine:7012}
+      BILLING_INTERNAL_TOKEN: ${BILLING_INTERNAL_TOKEN:-opendesk-dev-billing-internal-token-change-in-prod}
+      # K10 (SPEC-W45): realm SMTP bootstrap — identity PATCHes the Keycloak
+      # realm smtpServer via the admin API at startup (fail-soft/log-warn
+      # when unreachable) so Keycloak's own execute-actions emails (invite
+      # credentials, verify-email, reset-password) actually send. Wired to
+      # the bundled mailpit dev catcher below; prod points at the real
+      # relay via .env/secrets store (docs/runbooks/secrets.md).
+      KC_REALM_SMTP_HOST: ${KC_REALM_SMTP_HOST:-mailpit}
+      KC_REALM_SMTP_PORT: ${KC_REALM_SMTP_PORT:-1025}
+      KC_REALM_SMTP_FROM: ${KC_REALM_SMTP_FROM:-no-reply@opendesk.local}
+      # Empty defaults: mailpit (and many internal relays) need no auth.
+      KC_REALM_SMTP_USER: ${KC_REALM_SMTP_USER:-}
+      KC_REALM_SMTP_PASSWORD: ${KC_REALM_SMTP_PASSWORD:-}
     volumes:
     - ./industries:/industries:ro
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
@@ -114,6 +140,7 @@ services:
     - keycloak
     - permify
     - kafka
+    - mailpit
   daprd-identity:
     image: daprio/daprd:1.14.4
     command: *id001
@@ -166,6 +193,11 @@ services:
       # identity block's IDENTITY_INTERNAL_TOKEN. Same DEV ONLY default;
       # prod MUST set via the secrets store (docs/runbooks/secrets.md).
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # Direct-HTTP base for identity tenant resolution (bookingops
+      # resolver) and the FX1 api-key validator — bypasses Dapr header
+      # passthrough (config.go IdentityBaseURL; empty would fall back to
+      # Dapr invoke). In-cluster address by default.
+      IDENTITY_BASE_URL: ${IDENTITY_BASE_URL:-http://identity:7001}
       # SPEC-W44 W-B-1 (S1-F6-02): PORTAL_SECRET is fail-closed — the
       # service refuses to boot on the dev default above unless this
       # explicit escape is set. NEVER set outside local dev.
@@ -195,6 +227,30 @@ services:
       ALLOW_MOCK_RAILS: ${ALLOW_MOCK_RAILS:-1}  # DEV ONLY — mock rail (lending disbursement intents)
       PAYOUT_MOCK: ${PAYOUT_MOCK:-1}            # DEV ONLY — mock rail (referral/commission payouts)
       SOCIAL_MOCK: ${SOCIAL_MOCK:-1}            # DEV ONLY — mock rail (social-publisher providers)
+      # K11/K12 (SPEC-W45): booking completion captures the verified deposit
+      # hold and the refund endpoint executes via payments-service
+      # (:7004 — NOT 7010, that is crm-sync). The payments client is
+      # FAIL-CLOSED when PAYMENTS_URL is unset/empty (no silent skip of money
+      # movement); the default below is the in-cluster address.
+      PAYMENTS_URL: ${PAYMENTS_URL:-http://payments:7004}
+      # Caller side of the payments internal-auth contract (W44 K2): capture/
+      # refund calls carry X-Internal-Token matching the payments block's
+      # PAYMENTS_INTERNAL_TOKEN. Same DEV ONLY default; prod via secrets store.
+      PAYMENTS_INTERNAL_TOKEN: ${PAYMENTS_INTERNAL_TOKEN:-opendesk-dev-payments-internal-token-change-in-prod}
+      # K22 (SPEC-W45): lending approval consumes kyc-service /v1/kyc/resolve
+      # (no more permanent override fallback). LENDING_KYC_URL empty =
+      # approvals require an explicit platform-admin override.
+      LENDING_KYC_URL: ${LENDING_KYC_URL:-http://kyc:7013}
+      # Caller side of the kyc internal-auth contract: the resolve call
+      # carries X-Internal-Token matching the kyc block's KYC_INTERNAL_TOKEN
+      # (SAME shared secret var — one .env entry wires both sides).
+      KYC_INTERNAL_TOKEN: ${KYC_INTERNAL_TOKEN:-opendesk-dev-kyc-internal-token-change-in-prod}
+      # U6/K23 (SPEC-W45): campaignstudio A/B variant selection calls
+      # model-registry (:7019 — profile-gated `model-registry`; fail-open to
+      # control when unreachable). The call carries X-Internal-Token matching
+      # the model-registry block's MODEL_REGISTRY_INTERNAL_TOKEN.
+      MODEL_REGISTRY_URL: ${MODEL_REGISTRY_URL:-http://model-registry:7019}
+      MODEL_REGISTRY_INTERNAL_TOKEN: ${MODEL_REGISTRY_INTERNAL_TOKEN:-opendesk-dev-model-registry-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -283,6 +339,18 @@ services:
       PAYMENTS_INTERNAL_TOKEN: ${PAYMENTS_INTERNAL_TOKEN:-opendesk-dev-payments-internal-token-change-in-prod}
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
       BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+      # SPEC-W45 K21 caller side: crm-sync gates /v1/tasks + /v1/people/lookup
+      # behind X-Internal-Token; must match the crm-sync block's
+      # CRM_SYNC_INTERNAL_TOKEN. Same DEV ONLY default; prod via secrets store.
+      CRM_SYNC_INTERNAL_TOKEN: ${CRM_SYNC_INTERNAL_TOKEN:-opendesk-dev-crm-sync-internal-token-change-in-prod}
+      # SPEC-W45 K19 caller side: GDPR export/delete activities
+      # (internal/activities/gdpr.go) call conversation-service /internal/*
+      # with X-Internal-Token matching the conversation block's
+      # CONVERSATION_INTERNAL_TOKEN (SAME shared secret var — one .env entry
+      # wires both sides). The server gate is fail-closed when unset. Same
+      # DEV ONLY default; prod MUST set via the secrets store
+      # (docs/runbooks/secrets.md).
+      CONVERSATION_INTERNAL_TOKEN: ${CONVERSATION_INTERNAL_TOKEN:-opendesk-dev-conversation-internal-token-change-in-prod}
       # W-N-5 (K5): direct HTTP base URL for payments internal calls when
       # Dapr header passthrough is unavailable (hold-deposit/void).
       PAYMENTS_URL: ${PAYMENTS_URL:-http://payments:7004}  # W44 V1 fix: payments listens on 7004 (7010 is crm-sync)
@@ -312,6 +380,16 @@ services:
       # defaults are OFF (fail-closed); production must leave unset/0.
       FCM_MOCK: ${FCM_MOCK:-1}            # DEV ONLY — mock rail (push sends logged, no network)
       WHATSAPP_MOCK: ${WHATSAPP_MOCK:-1}  # DEV ONLY — mock rail (WhatsApp sends simulated)
+      # K8 (SPEC-W45): MemberInvited/TenantProvisioned emails contain the app
+      # URL (login + instructions). Dev default is the gateway origin; prod
+      # sets the public https origin via .env/secrets store.
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:9080}
+      # NOTE (SPEC-W45 FX3/D2): PORTAL_SECRET was removed from this block —
+      # no notification-worker code reads it (waitlist-claim links use
+      # random tokens, not portal JWTs). The two REAL consumers of the
+      # shared PORTAL_SECRET are booking-service (signs 15-min portal JWTs)
+      # and identity-service (verifies them on the consent portal path,
+      # internal/consent/portal.go) — see those blocks.
     volumes:
     - ./industries:/industries:ro
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
@@ -340,6 +418,14 @@ services:
       AT_API_KEY: ${AT_API_KEY:-}
       AT_USERNAME: ${AT_USERNAME:-}
       AT_FROM: ${AT_FROM:-}
+      # K14 (SPEC-W45): the Africa's Talking USSD callback URL carries this
+      # shared secret as a path segment — POST /ussd/callback/{secret}
+      # (constant-time compare; 503 fail-closed when unset, 401 on mismatch,
+      # per-phone rate limit). Register the full URL incl. the secret in the
+      # AT dashboard; the APISIX ussd-callback route passes the segment
+      # through. DEV ONLY default; prod MUST set via the secrets store
+      # (docs/runbooks/secrets.md).
+      AT_CALLBACK_SECRET: ${AT_CALLBACK_SECRET:-opendesk-dev-at-callback-secret-change-in-prod}
       # SPEC-W12 §8: NG SMS aggregator chain (eBulksms + failover order).
       EBULK_API_KEY: ${EBULK_API_KEY:-}
       EBULK_USERNAME: ${EBULK_USERNAME:-}
@@ -379,6 +465,20 @@ services:
     # service directly and self-assign identity headers).
     networks:
     - opendesk
+  # Dev mail catcher (SPEC-W45 K8/K10): terminates all outbound SMTP in the
+  # dev stack — notification-worker's dapr bindings-smtp (invite/welcome/
+  # booking-confirmation email) and the Keycloak realm smtpServer that
+  # identity bootstraps (K10, KC_REALM_SMTP_* above). In-cluster address:
+  # mailpit:1025. Prod replaces it via SMTP_HOST/KC_REALM_SMTP_HOST in .env.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    restart: unless-stopped
+    ports:
+    # Web UI LOOPBACK ONLY (GF4 posture): it renders full message content
+    # (invite links, reset tokens = credentials). http://localhost:8025
+    - 127.0.0.1:8025:8025/tcp
+    networks:
+    - opendesk
   daprd-notification:
     image: daprio/daprd:1.14.4
     command: *id001
@@ -387,6 +487,15 @@ services:
     environment:
       DAPR_APP_ID: notification
       DAPR_APP_PORT: '7003'
+      # K8 (SPEC-W45): resolve the infra/dapr/components/bindings.smtp.yaml
+      # placeholders (env-var substitution happens in the sidecar process).
+      # Dev default is the bundled mailpit catcher; empty user/password =
+      # no SMTP auth (mailpit needs none).
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-OpenDesk <no-reply@opendesk.local>}
   payments:
     build: ./services/payments-service
     # Optional: secrets/dev overrides (compose still boots without it —
@@ -476,7 +585,9 @@ services:
       TEMPORAL_TASK_QUEUE: opendesk-main
       OPENSEARCH_ADDR: http://opensearch:9200
       PORT: '7005'
-      FLUVIO_ADDR: fluvio:9003
+      # ORPH O13 (SPEC-W45): the code reads FLUVIO_ENDPOINT (src/config.rs);
+      # the previous FLUVIO_ADDR key was never read.
+      FLUVIO_ENDPOINT: ${FLUVIO_ENDPOINT:-fluvio:9003}
       KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/opendesk/protocol/openid-connect/certs
       # W39 contract: GATEWAY_EDGE_ALLOW_SIM (Fluvio stub) is deliberately NOT
       # set — dev runs the real fluvio service (depends_on below). Opt in only
@@ -533,6 +644,26 @@ services:
       # (fetch_tenant_context step 2) carries X-Internal-Token. Same DEV
       # ONLY default as the identity block; prod via the secrets store.
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # K15c (SPEC-W45): verified-session OTP — mutating voice tools call the
+      # booking portal request-code/verify-code endpoints with
+      # X-Internal-Token matching the BOOKING block's BOOKING_INTERNAL_TOKEN
+      # (SAME shared secret var, distinct caller-side name per contract).
+      VOICE_BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+      # K15c (SPEC-W45) OTP gate base URL: the verified-session client
+      # (app/verification.py) POSTs {BOOKING_URL}/public/sites/{slug}/
+      # portal/request + /portal/verify and is FAIL-CLOSED when BOOKING_URL
+      # is unset (verification_unavailable on every mutating tool). Default
+      # is the in-cluster booking address.
+      BOOKING_URL: ${BOOKING_URL:-http://booking:7002}
+      # K15d (SPEC-W45): server-side guard on the /voice-admin/* surface
+      # (enrollment moved off the public /voice/* prefix; APISIX
+      # /api/voice-admin/* adds jwt + staff-role in front). DEV ONLY default;
+      # prod MUST set via the secrets store (docs/runbooks/secrets.md).
+      VOICE_ADMIN_INTERNAL_TOKEN: ${VOICE_ADMIN_INTERNAL_TOKEN:-opendesk-dev-voice-admin-internal-token-change-in-prod}
+      # K15f (SPEC-W45): caller phone is SHA-256+salt hashed in
+      # ToolInvoked/capture_location events (W28 scheme, same shared salt as
+      # graph-sync/graph-service). DEV ONLY default — rotate per environment.
+      PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -554,6 +685,14 @@ services:
       DAPR_APP_PORT: '7006'
   livekit:
     image: livekit/livekit-server:v1.7
+    # OOS-28 (SPEC-W45) STARTUP GUARD: `--dev` hardcodes the WELL-KNOWN
+    # keypair devkey/secret and skips all config-file auth hardening — any
+    # host that can reach :7880 can mint valid room tokens (fail-OPEN by
+    # design). This is acceptable ONLY because the dev stack is single-host;
+    # NEVER run this flag on a shared/public host or in staging/prod. Real
+    # deployments use deploy/k3s/livekit-server.yaml (config file + keys from
+    # a Secret, no --dev); the voice block's LIVEKIT_API_KEY/SECRET must
+    # match the server's keypair or token validation fails.
     command: --dev --bind 0.0.0.0
     # Ports stay published on purpose (GF4 exception): LiveKit is the WebRTC
     # SFU — browsers/clients negotiate media (7881 TCP, 7882/udp) directly
@@ -588,7 +727,22 @@ services:
       # on identity's tenant-scoped read). Same DEV ONLY default as the
       # identity block; prod MUST set via the secrets store.
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
-      FLUVIO_ADDR: fluvio:9003
+      # SPEC-W44 K2 internal-auth contract (server side): the /internal/*
+      # surface (app/internal_routes.py — GDPR export/delete, called by
+      # notification-worker's GDPR activities, SPEC-W45 K19) requires
+      # X-Internal-Token matching this value (constant-time compare;
+      # 503 fail-closed when unset, 401 on mismatch). DEV ONLY default
+      # below; prod MUST set CONVERSATION_INTERNAL_TOKEN via the secrets
+      # store (docs/runbooks/secrets.md).
+      CONVERSATION_INTERNAL_TOKEN: ${CONVERSATION_INTERNAL_TOKEN:-opendesk-dev-conversation-internal-token-change-in-prod}
+      # ORPH O13 (SPEC-W45): FLUVIO_ADDR removed — conversation-service never
+      # read it (no Fluvio client in the codebase); gateway-edge owns the
+      # Fluvio consumer (FLUVIO_ENDPOINT there).
+      # W45 UC-helpdesk: channel→ticket escalation calls booking
+      # /v1/helpdesk/tickets with X-Internal-Token matching the booking
+      # block's BOOKING_INTERNAL_TOKEN (SAME shared secret var, distinct
+      # caller-side name per contract).
+      CONVERSATION_BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
       TRANSCRIPT_SINK: ${TRANSCRIPT_SINK:-kafka}
       # Retention + intel toggles (NDPA profile: infra/privacy/ndpa-profile.env).
       RETENTION_ENABLED: ${RETENTION_ENABLED:-true}
@@ -672,8 +826,10 @@ services:
       PORT: '7009'
       ICEBERG_REST: http://iceberg-rest:8181
       ICEBERG_WAREHOUSE: s3://lake/warehouse
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      # OOS-18 (SPEC-W45): MinIO credentials via the shared indirection —
+      # must match the minio block (infra/docker-compose.lakehouse.yml).
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       AWS_ENDPOINT_URL: http://minio:9000
       BATCH_SIZE: '500'
       FLUSH_INTERVAL: '15'
@@ -776,7 +932,10 @@ services:
       LLM_BASE_URL: http://ollama:11434/v1
       LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
       LLM_API_KEY: ${LLM_API_KEY:-ollama}
-      PIPER_URL: http://piper:5500
+      # ORPH O14 (SPEC-W45): the code reads PIPER_HTTP_URL
+      # (app/config.py -> pipeline/tts.py POSTs {PIPER_HTTP_URL}/speak);
+      # the previous PIPER_URL key was never read.
+      PIPER_HTTP_URL: ${PIPER_HTTP_URL:-http://piper:5500}
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
       KAFKA_BROKERS: kafka:9092
       AGENT_BACKEND: ${AGENT_BACKEND:-livekit}
@@ -792,6 +951,16 @@ services:
       # /v1/tenants/{slug} (fetch_tenant_context) with X-Internal-Token.
       # Same DEV ONLY default as the identity block; prod via secrets store.
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # K15c/K15f (SPEC-W45): the worker runs the same tool layer as the
+      # voice runtime — booking OTP calls use VOICE_BOOKING_INTERNAL_TOKEN
+      # (must equal booking's BOOKING_INTERNAL_TOKEN) and caller phones are
+      # hashed with the shared PHONE_HASH_SALT. See the voice block comments.
+      VOICE_BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+      PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
+      # K15c (SPEC-W45): same fail-closed OTP gate as the voice block —
+      # the worker runs the same tool/verification layer, so BOOKING_URL
+      # must be set here too (see the voice block comment).
+      BOOKING_URL: ${BOOKING_URL:-http://booking:7002}
     depends_on:
     - livekit
     - voice
@@ -825,6 +994,13 @@ services:
       CAPTURES_TOPIC: opendesk.conversation.captures
       CONSUMER_GROUP: crm-sync
       DLQ_TOPIC: opendesk.dlq
+      # K21 (SPEC-W45): /v1/tasks + /v1/people/lookup require X-Internal-Token
+      # matching this value (K2 pattern: constant-time compare; fail-closed
+      # when unset). In-cluster callers carry the SAME value. DEV ONLY
+      # default; prod MUST set via the secrets store
+      # (docs/runbooks/secrets.md). Human traffic stays on the APISIX /crm/*
+      # route (jwt + admin|staff role claim).
+      CRM_SYNC_INTERNAL_TOKEN: ${CRM_SYNC_INTERNAL_TOKEN:-opendesk-dev-crm-sync-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -938,7 +1114,21 @@ services:
       # identity block's IDENTITY_INTERNAL_TOKEN (same DEV ONLY default;
       # prod MUST set via the secrets store, docs/runbooks/secrets.md).
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
-      KYC_RESOLVED_TOPIC: opendesk.kyc.resolved.v1
+      # K22 (SPEC-W45): /v1/kyc/resolve requires X-Internal-Token matching
+      # this value (K2 pattern: constant-time compare; fail-closed when
+      # unset). The booking block carries the SAME shared secret var as the
+      # lending-approval caller. DEV ONLY default; prod MUST set via the
+      # secrets store (docs/runbooks/secrets.md).
+      KYC_INTERNAL_TOKEN: ${KYC_INTERNAL_TOKEN:-opendesk-dev-kyc-internal-token-change-in-prod}
+      # K22 (SPEC-W45): id_value_hash is HMAC-SHA256 keyed with this secret
+      # (was unsalted SHA-256 — rainbow-tableable BVN/NIN). Fail-closed unset
+      # in the prod profile; the DEV ONLY default below keeps dev booting.
+      KYC_HASH_SECRET: ${KYC_HASH_SECRET:-opendesk-dev-kyc-hash-secret-change-in-prod}
+      # ORPH O12 (SPEC-W45): the code reads KYC_EVENTS_TOPIC
+      # (internal/config/config.go); the previous KYC_RESOLVED_TOPIC key was
+      # never read (the default below happens to equal the old value, which
+      # is why nothing noticed).
+      KYC_EVENTS_TOPIC: ${KYC_EVENTS_TOPIC:-opendesk.kyc.resolved.v1}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
