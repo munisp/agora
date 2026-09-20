@@ -65,14 +65,26 @@ func run() error {
 			zap.String("kyc_mock", "1"))
 	}
 
+	if cfg.HashSecret == config.DevHashSecretDefault {
+		logger.Error("CRITICAL: KYC running with the checked-in dev HMAC secret (OPENDESK_DEV_INSECURE=1) — NOT FOR PRODUCTION: set KYC_HASH_SECRET",
+			zap.String("dev_insecure", "1"))
+	}
+	if cfg.InternalToken == "" {
+		// Runtime fail-closed (503 on every /v1/kyc/* call, K2 pattern) —
+		// logged loudly here so the misconfig is obvious at boot.
+		logger.Error("KYC_INTERNAL_TOKEN unset — /v1/kyc/* will refuse all requests (503 fail-closed, SPEC-W45 K22)")
+	}
+
 	deps := httpapi.Deps{
-		Store:       st,
-		Consent:     httpapi.NewConsentClient(daprClient, cfg.IdentityAppID, cfg.IdentityBaseURL, cfg.IdentityInternalToken),
-		Resolver:    resolver,
-		Events:      daprClient,
-		PubSub:      cfg.PubSubName,
-		EventsTopic: cfg.KYCEventsTopic,
-		Logger:      logger,
+		Store:         st,
+		Consent:       httpapi.NewConsentClient(daprClient, cfg.IdentityAppID, cfg.IdentityBaseURL, cfg.IdentityInternalToken),
+		Resolver:      resolver,
+		Events:        daprClient,
+		PubSub:        cfg.PubSubName,
+		EventsTopic:   cfg.KYCEventsTopic,
+		InternalToken: cfg.InternalToken,
+		HashSecret:    cfg.HashSecret,
+		Logger:        logger,
 	}
 
 	srv := &http.Server{
