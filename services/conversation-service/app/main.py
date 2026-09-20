@@ -22,8 +22,10 @@ from .db import Database
 from .agent_db import AgentStore
 from .agent_routes import router as agent_router
 from .capture import CaptureExtractor
+from .helpdesk import HelpdeskAutomation
 from .indexer import TranscriptIndexer
 from . import incidents as incidents_mod
+from .internal_routes import router as internal_router
 from .logging import get_logger, setup
 from .privacy import PrivacyEraseConsumer
 from .quality import CallQualityEnricher
@@ -31,6 +33,7 @@ from .outbox import OutboxRelay
 from .retention import RetentionSweeper
 from .routes import router
 from .sinks import KafkaSink, TranscriptSink, build_sink
+from .tenant_lifecycle import TenantLifecycleConsumer
 from .tenants import TenantResolver
 
 
@@ -47,6 +50,8 @@ class State:
     capture_extractor: CaptureExtractor | None
     privacy: PrivacyEraseConsumer | None
     retention: RetentionSweeper | None
+    helpdesk: HelpdeskAutomation | None
+    tenant_lifecycle: TenantLifecycleConsumer | None
     log: object
 
 
@@ -195,6 +200,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         retention = RetentionSweeper(cfg, db)
         retention.start()
 
+    # SPEC-W45 UC helpdesk automation: human-escalation turns open a real
+    # booking helpdesk ticket (X-Internal-Token, tenant-bound).
+    helpdesk_auto: HelpdeskAutomation | None = None
+    if cfg.helpdesk_enabled:
+        helpdesk_auto = HelpdeskAutomation(cfg, dapr, agent_store)
+        if not cfg.booking_internal_token:
+            log.error(
+                "CONVERSATION_BOOKING_INTERNAL_TOKEN unset: helpdesk ticket "
+                "creation will be skipped with an error log per escalation"
+            )
+
+    # SPEC-W45 K9: TenantDeleted cascade — purge tenant sessions/history.
+    tenant_lifecycle = TenantLifecycleConsumer(cfg, db)
+    tenant_lifecycle.start()
+
     app.state.cfg = cfg
     app.state.db = db
     app.state.agent_store = agent_store
@@ -203,6 +223,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sink = sink
     app.state.intel_sink = intel_sink
     app.state.quality_sink = quality_sink
+    app.state.helpdesk = helpdesk_auto
+    app.state.tenant_lifecycle = tenant_lifecycle
     app.state.log = log
     log.info("conversation-service started", port=cfg.port, sink=cfg.transcript_sink,
              intel_llm=cfg.intel_llm, quality_enrich=cfg.quality_enrich_enabled,
@@ -233,6 +255,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if incident_retry is not None:
             with contextlib.suppress(Exception):
                 await incident_retry.stop()
+        if tenant_lifecycle is not None:
+            with contextlib.suppress(Exception):
+                await tenant_lifecycle.stop()
         with contextlib.suppress(Exception):
             await sink.close()
         with contextlib.suppress(Exception):
@@ -256,6 +281,8 @@ class _NullSink:
 app = FastAPI(title="OpenDesk conversation-service", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
 app.include_router(agent_router)
+# SPEC-W45 K19: internauth-gated service-to-service routes (/internal/gdpr/*).
+app.include_router(internal_router)
 
 
 @app.get("/healthz")

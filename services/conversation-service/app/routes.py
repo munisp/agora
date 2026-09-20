@@ -413,6 +413,30 @@ async def _persist_turn(
             tasks.add(task)
             task.add_done_callback(tasks.discard)
 
+    # 5) SPEC-W45 UC helpdesk automation: a human-escalation USER turn opens
+    #    a real helpdesk ticket on booking-service (POST /v1/helpdesk/tickets
+    #    with X-Internal-Token, tenant-bound). Non-blocking background task
+    #    like the incident IDP; Idempotency-Key replays returned above, so
+    #    this fires exactly once per persisted turn (and at most once per
+    #    conversation per process — HelpdeskAutomation dedupes).
+    if turn.role == "user":
+        helpdesk_auto = getattr(st, "helpdesk", None)
+        if helpdesk_auto is not None:
+            tasks = getattr(st, "background_tasks", None)
+            if tasks is None:
+                tasks = set()
+                st.background_tasks = tasks
+            helpdesk_auto.maybe_escalate(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                turn_id=turn.id,
+                text=turn.text,
+                intent=turn.intent,
+                channel=conv_channel,
+                contact_phone=contact_phone,
+                background_tasks=tasks,
+            )
+
     return turn, True
 
 

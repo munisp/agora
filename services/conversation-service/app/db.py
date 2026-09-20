@@ -554,6 +554,77 @@ class Database:
             )
             return (len(ids), int(deleted or 0))
 
+    async def export_contact_conversations(
+        self, tenant_id: uuid.UUID, contact: str
+    ) -> list[dict[str, Any]]:
+        """GDPR export (SPEC-W45 K19): every conversation carrying the
+        contact marker, each with its full turn list. Powers the internal
+        /internal/gdpr/conversations collector."""
+        async with self._tenant_tx(tenant_id) as conn:
+            convs = await conn.fetch(
+                """
+                SELECT id, tenant_id, site_slug, channel, contact_phone,
+                       started_at, ended_at
+                FROM conversations
+                WHERE contact_phone = $1
+                ORDER BY started_at
+                """,
+                contact,
+            )
+            out: list[dict[str, Any]] = []
+            for c in convs:
+                turns = await conn.fetch(
+                    """
+                    SELECT id, seq, role, text, ts
+                    FROM turns WHERE conversation_id = $1
+                    ORDER BY seq
+                    """,
+                    c["id"],
+                )
+                out.append(
+                    {
+                        "id": str(c["id"]),
+                        "tenant_id": str(c["tenant_id"]),
+                        "site_slug": c["site_slug"],
+                        "channel": c["channel"],
+                        "contact_phone": c["contact_phone"],
+                        "started_at": c["started_at"].isoformat()
+                        if c["started_at"]
+                        else None,
+                        "ended_at": c["ended_at"].isoformat()
+                        if c["ended_at"]
+                        else None,
+                        "turns": [
+                            {
+                                "id": str(t["id"]),
+                                "seq": t["seq"],
+                                "role": t["role"],
+                                "text": t["text"],
+                                "ts": t["ts"].isoformat() if t["ts"] else None,
+                            }
+                            for t in turns
+                        ],
+                    }
+                )
+            return out
+
+    async def purge_tenant_data(self, tenant_id: uuid.UUID) -> tuple[int, int]:
+        """K9 TenantDeleted cascade (SPEC-W45): hard-delete the tenant's
+        sessions and history — all turns of all tenant conversations, then
+        the conversation rows themselves. Idempotent: a second run deletes
+        zero rows. Returns (conversations_deleted, turns_deleted)."""
+        async with self._tenant_tx(tenant_id) as conn:
+            turns = await conn.fetchval(
+                "WITH d AS (DELETE FROM turns WHERE conversation_id IN "
+                "(SELECT id FROM conversations) RETURNING 1) "
+                "SELECT count(*) FROM d"
+            )
+            convs = await conn.fetchval(
+                "WITH d AS (DELETE FROM conversations RETURNING 1) "
+                "SELECT count(*) FROM d"
+            )
+            return (int(convs or 0), int(turns or 0))
+
     # ------------------------------------------------------------------
     # Data retention (NDPA 2023 storage limitation — docs/compliance/ndpa.md)
     # ------------------------------------------------------------------
