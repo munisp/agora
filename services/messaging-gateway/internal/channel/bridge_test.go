@@ -376,16 +376,77 @@ func TestParseSiteMap(t *testing.T) {
 	}
 }
 
+// SPEC-W45 ORPH O2 base-resolution matrix: override > Dapr sidecar invoke
+// (REGISTERED app-ids conversation/voice) > direct-base defaults.
 func TestResolveBases(t *testing.T) {
-	conv, voice := ResolveBases("", "", 3500)
-	if conv != "http://127.0.0.1:3500/v1.0/invoke/conversation-service/method" {
-		t.Fatalf("bad dapr conv base %q", conv)
+	cases := []struct {
+		name      string
+		convOver  string
+		voiceOver string
+		port      int
+		sidecar   bool
+		wantConv  string
+		wantVoice string
+	}{
+		{
+			name: "sidecar uses registered app-ids",
+			port: 3500, sidecar: true,
+			wantConv:  "http://127.0.0.1:3500/v1.0/invoke/conversation/method",
+			wantVoice: "http://127.0.0.1:3500/v1.0/invoke/voice/method",
+		},
+		{
+			name: "sidecar on custom port",
+			port: 3501, sidecar: true,
+			wantConv:  "http://127.0.0.1:3501/v1.0/invoke/conversation/method",
+			wantVoice: "http://127.0.0.1:3501/v1.0/invoke/voice/method",
+		},
+		{
+			name: "no sidecar falls back to direct defaults",
+			port: 3500, sidecar: false,
+			wantConv:  DefaultConversationURL,
+			wantVoice: DefaultVoiceURL,
+		},
+		{
+			name:     "overrides win with sidecar",
+			port:     3500,
+			sidecar:  true,
+			convOver: "http://conversation:7007", voiceOver: "http://voice:7006",
+			wantConv: "http://conversation:7007", wantVoice: "http://voice:7006",
+		},
+		{
+			name:     "overrides win without sidecar",
+			port:     3500,
+			sidecar:  false,
+			convOver: "http://conv.internal:9000", voiceOver: "http://voice.internal:9001",
+			wantConv: "http://conv.internal:9000", wantVoice: "http://voice.internal:9001",
+		},
+		{
+			name:     "partial override: conv only, voice direct default",
+			port:     3500,
+			sidecar:  false,
+			convOver: "http://conv.internal:9000",
+			wantConv: "http://conv.internal:9000", wantVoice: DefaultVoiceURL,
+		},
+		{
+			name:      "partial override: voice only, conv dapr",
+			port:      3500,
+			sidecar:   true,
+			voiceOver: "http://voice.internal:9001",
+			wantConv:  "http://127.0.0.1:3500/v1.0/invoke/conversation/method",
+			wantVoice: "http://voice.internal:9001",
+		},
 	}
-	if voice != "http://127.0.0.1:3500/v1.0/invoke/voice-agent-runtime/method" {
-		t.Fatalf("bad dapr voice base %q", voice)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conv, voice := ResolveBases(tc.convOver, tc.voiceOver, tc.port, tc.sidecar)
+			if conv != tc.wantConv || voice != tc.wantVoice {
+				t.Fatalf("ResolveBases(%q, %q, %d, %v) = (%q, %q), want (%q, %q)",
+					tc.convOver, tc.voiceOver, tc.port, tc.sidecar, conv, voice, tc.wantConv, tc.wantVoice)
+			}
+		})
 	}
-	conv, voice = ResolveBases("http://conversation:7007", "http://voice:7006", 3500)
-	if conv != "http://conversation:7007" || voice != "http://voice:7006" {
-		t.Fatalf("direct overrides must win: %q %q", conv, voice)
+	// The compose-posture defaults must be the real service URLs.
+	if DefaultConversationURL != "http://conversation:7007" || DefaultVoiceURL != "http://voice:7006" {
+		t.Fatalf("direct defaults drifted: %q %q", DefaultConversationURL, DefaultVoiceURL)
 	}
 }

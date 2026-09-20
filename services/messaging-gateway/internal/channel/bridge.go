@@ -111,18 +111,40 @@ func NewBridge(sites map[string]Site, convURL, voiceURL string, wa *provider.Wha
 	}
 }
 
-// ResolveBases maps the CONVERSATION_URL / VOICE_RUNTIME_URL overrides and
-// the DAPR_HTTP_PORT onto the two base URLs the bridge calls. Direct-base
-// overrides win; otherwise the Dapr sidecar invoke URL is used.
-func ResolveBases(convOverride, voiceOverride string, daprHTTPPort int) (conv, voice string) {
+// Direct-base defaults for sidecar-less deployments (SPEC-W45 ORPH O2):
+// the compose service names/ports. messaging-gateway runs WITHOUT a daprd
+// sidecar in compose, so these are the primary path; the Dapr invoke form
+// is used only when a sidecar is actually injected (DAPR_HTTP_PORT/DAPR_HOST
+// present).
+const (
+	DefaultConversationURL = "http://conversation:7007"
+	DefaultVoiceURL        = "http://voice:7006"
+)
+
+// ResolveBases maps the CONVERSATION_URL / VOICE_RUNTIME_URL overrides onto
+// the two base URLs the bridge calls (SPEC-W45 ORPH O2). Precedence:
+// explicit override wins; with a Dapr sidecar (sidecar=true) the invoke API
+// is used with the REGISTERED app-ids `conversation` / `voice` (see
+// docker-compose DAPR_APP_ID — the previous `conversation-service` /
+// `voice-agent-runtime` app-ids matched no sidecar and made the bridge a
+// permanent 500); without a sidecar the direct-base defaults above.
+func ResolveBases(convOverride, voiceOverride string, daprHTTPPort int, sidecar bool) (conv, voice string) {
 	dapr := fmt.Sprintf("http://127.0.0.1:%d/v1.0/invoke", daprHTTPPort)
 	conv = convOverride
 	if conv == "" {
-		conv = dapr + "/conversation-service/method"
+		if sidecar {
+			conv = dapr + "/conversation/method"
+		} else {
+			conv = DefaultConversationURL
+		}
 	}
 	voice = voiceOverride
 	if voice == "" {
-		voice = dapr + "/voice-agent-runtime/method"
+		if sidecar {
+			voice = dapr + "/voice/method"
+		} else {
+			voice = DefaultVoiceURL
+		}
 	}
 	return conv, voice
 }
