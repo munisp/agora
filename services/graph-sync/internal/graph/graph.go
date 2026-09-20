@@ -116,6 +116,13 @@ type Client interface {
 	// (the BOOKED edge is removed with the Person). Returns found=false
 	// when no such person existed (erasure is idempotent).
 	ErasePerson(ctx context.Context, tenantID, personID string) (found bool, err error)
+
+	// DeleteTenantSubgraph DETACH DELETEs every node carrying the tenant id
+	// (SPEC-W45 K9 TenantDeleted cascade): the Tenant anchor, Persons,
+	// Contacts, Consents, Bookings, Offerings, Cases, Locations and the
+	// tenant's processed-markers. Edges die with their nodes. Idempotent:
+	// returns found=false when the tenant had no subgraph.
+	DeleteTenantSubgraph(ctx context.Context, tenantID string) (found bool, err error)
 }
 
 // ErrTenantRequired is returned when a graph write carries no tenant_id
@@ -243,11 +250,6 @@ func Cosine(a, b []float32) float64 {
 	}
 	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
-
-// UTC normalizes a timestamp for storage: every graph timestamp is UTC
-// RFC3339Nano (dual-TZ safety — offsets in incoming events never leak into
-// the graph).
-func UTC(t time.Time) time.Time { return t.UTC() }
 
 // FormatTime renders a stored timestamp (UTC RFC3339Nano).
 func FormatTime(t time.Time) string {

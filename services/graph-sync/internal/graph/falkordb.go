@@ -28,17 +28,13 @@ type FalkorDB struct {
 }
 
 // NewFalkorDB dials FalkorDB at addr (host:port) and selects the graph.
-func NewFalkorDB(addr, graphName string) *FalkorDB {
+// password is the Redis AUTH credential (compose graph-db runs with
+// --requirepass FALKORDB_PASSWORD); empty = no AUTH (local dev).
+func NewFalkorDB(addr, graphName, password string) *FalkorDB {
 	return &FalkorDB{
-		rdb:   redis.NewClient(&redis.Options{Addr: addr}),
+		rdb:   redis.NewClient(&redis.Options{Addr: addr, Password: password}),
 		graph: graphName,
 	}
-}
-
-// NewFalkorDBWith builds a client over an arbitrary commander (tests can
-// inject a scripted fake).
-func NewFalkorDBWith(rdb commander, graphName string) *FalkorDB {
-	return &FalkorDB{rdb: rdb, graph: graphName}
 }
 
 // Ping checks store liveness.
@@ -390,6 +386,31 @@ func (f *FalkorDB) ErasePerson(ctx context.Context, tenantID, personID string) (
 		return false, nil
 	}
 	if err := f.exec(ctx, erasePersonQuery(tenantID, personID)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DeleteTenantSubgraph implements Client (SPEC-W45 K9; idempotent via the
+// pre-check, same posture as ErasePerson).
+func (f *FalkorDB) DeleteTenantSubgraph(ctx context.Context, tenantID string) (bool, error) {
+	if tenantID == "" {
+		return false, ErrTenantRequired
+	}
+	rows, err := f.query(ctx, tenantNodeCountQuery(tenantID))
+	if err != nil {
+		return false, err
+	}
+	found := false
+	for _, row := range rows {
+		if toInt64(row["n"]) > 0 {
+			found = true
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	if err := f.exec(ctx, deleteTenantSubgraphQuery(tenantID)); err != nil {
 		return false, err
 	}
 	return true, nil

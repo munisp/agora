@@ -420,6 +420,28 @@ DETACH DELETE p, c, s`,
 	}
 }
 
+// tenantNodeCountQuery counts nodes carrying the tenant id (pre-check so
+// DeleteTenantSubgraph can report found without relying on delete
+// statistics).
+func tenantNodeCountQuery(tenantID string) q {
+	return q{
+		text:   `MATCH (n {tenant_id: $tenant_id}) RETURN count(n) AS n`,
+		params: map[string]any{"tenant_id": tenantID},
+	}
+}
+
+// deleteTenantSubgraphQuery DETACH DELETEs every node of the tenant — the
+// Tenant anchor plus Person/Contact/Consent/Booking/Offering/Case/Location
+// and every processed-marker for the tenant. Edges die with their nodes.
+// Idempotent by construction: a second run matches nothing.
+func deleteTenantSubgraphQuery(tenantID string) q {
+	return q{
+		text: `MATCH (n {tenant_id: $tenant_id})
+DETACH DELETE n`,
+		params: map[string]any{"tenant_id": tenantID},
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Cypher literal encoding for the GRAPH.QUERY `CYPHER k=v ...` parameter
 // prefix (values are embedded as Cypher literals — strings single-quoted and
