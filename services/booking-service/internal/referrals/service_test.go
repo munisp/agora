@@ -41,13 +41,38 @@ func newServiceTestStore(t *testing.T) *store.Store {
 	}
 	defer conn.Close(ctx) //nolint:errcheck
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS outbox (
-	    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-	    aggregate_id UUID NOT NULL,
-	    topic TEXT NOT NULL,
-	    payload JSONB NOT NULL,
-	    sent_at TIMESTAMPTZ
-	)`); err != nil {
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_id UUID NOT NULL,
+    topic TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    sent_at TIMESTAMPTZ
+)`); err != nil {
 		t.Fatalf("outbox ddl: %v", err)
+	}
+	// SPEC-W45 STK O18 mirror tables: production gets contacts/team_members
+	// from 01-booking-schema.sql, but this harness boots a bare database —
+	// referrer validation (Service.Create → GetContact/GetTeamMember) and
+	// the referrer fixtures below resolve against them, so minimal mirrors
+	// (production column set) are created here.
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS contacts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    phone TEXT,
+    email TEXT,
+    notes TEXT NOT NULL DEFAULT ''
+)`); err != nil {
+		t.Fatalf("contacts mirror ddl: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS team_members (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    email TEXT,
+    role TEXT NOT NULL DEFAULT 'staff',
+    active BOOLEAN NOT NULL DEFAULT TRUE
+)`); err != nil {
+		t.Fatalf("team_members mirror ddl: %v", err)
 	}
 	st, err := store.New(ctx, dsn, 0)
 	if err != nil {
@@ -65,6 +90,50 @@ func newService(st *store.Store) *Service {
 		CACEventsTopic: "cac.events",
 		Log:            zap.NewNop(),
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W45 STK O18 fixtures: Service.Create rejects unresolvable
+// referrer_ids, so every referral fixture registers its referrer first.
+// ---------------------------------------------------------------------------
+
+// mkContactReferrer registers a contacts row and returns its id string.
+func mkContactReferrer(t *testing.T, st *store.Store, tenantID uuid.UUID) string {
+	t.Helper()
+	c := store.Contact{TenantID: tenantID, Name: "Referrer", Phone: "+234" + uuid.NewString()[:12]}
+	if err := st.CreateContact(context.Background(), &c); err != nil {
+		t.Fatalf("create referrer contact: %v", err)
+	}
+	return c.ID.String()
+}
+
+// mkStaffReferrer registers a team_members row and returns its id string.
+func mkStaffReferrer(t *testing.T, st *store.Store, tenantID uuid.UUID) string {
+	t.Helper()
+	m := store.TeamMember{TenantID: tenantID, Name: "Staff Referrer", Email: "staff-" + uuid.NewString() + "@example.com", Role: "staff", Active: true}
+	if err := st.CreateTeamMember(context.Background(), &m); err != nil {
+		t.Fatalf("create referrer staff: %v", err)
+	}
+	return m.ID.String()
+}
+
+// mkPayableAgent registers an APPROVED, beneficiary-linked agent (STK O10)
+// and returns its id string.
+func mkPayableAgent(t *testing.T, svc *Service, tenantID uuid.UUID) string {
+	t.Helper()
+	agent, err := svc.CreateAgent(context.Background(), tenantID, CreateAgentInput{
+		Name: "Field Agent", Phone: "+2347" + uuid.NewString()[:9],
+	})
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	beneficiaryID := uuid.New()
+	status := AgentApproved
+	agent, err = svc.UpdateAgent(context.Background(), tenantID, agent.ID, UpdateAgentInput{Status: &status, BeneficiaryID: &beneficiaryID})
+	if err != nil {
+		t.Fatalf("approve agent: %v", err)
+	}
+	return agent.ID.String()
 }
 
 // funnelEvents drains the outbox and decodes every cac.events CloudEvent
@@ -125,8 +194,9 @@ func TestVerifyFiresRulesPostsAndIsIdempotent(t *testing.T) {
 	mkSvcRule(t, svc, tenantID, "agent-only", TriggerSignupVerified, BeneficiaryAgent, AmountFlat, 77000, 0, nil, true, 3)
 	mkSvcRule(t, svc, tenantID, "other-trigger", TriggerSale, BeneficiaryReferrer, AmountFlat, 88000, 0, nil, true, 1)
 
+	referrerID := mkContactReferrer(t, st, tenantID) // STK O18: resolvable referrer
 	ref, created, err := svc.Create(ctx, CreateInput{
-		TenantID: tenantID, ReferrerType: ReferrerContact, ReferrerID: "contact-1", RefereePhone: "+2348099990001",
+		TenantID: tenantID, ReferrerType: ReferrerContact, ReferrerID: referrerID, RefereePhone: "+2348099990001",
 	})
 	if err != nil || !created {
 		t.Fatalf("create referral: created=%v err=%v", created, err)
@@ -179,12 +249,12 @@ func TestVerifyFiresRulesPostsAndIsIdempotent(t *testing.T) {
 	if debit.DebitNGN != 50000 || debit.CreditNGN != 0 || debit.BeneficiaryID != "" {
 		t.Fatalf("expense side: %+v", debit)
 	}
-	if credit.CreditNGN != 50000 || credit.DebitNGN != 0 || credit.BeneficiaryID != "contact-1" {
+	if credit.CreditNGN != 50000 || credit.DebitNGN != 0 || credit.BeneficiaryID != referrerID {
 		t.Fatalf("payable side: %+v", credit)
 	}
 
-	// Balance known vector: contact-1 payable = 50,000 kobo.
-	bal, err := svc.CommissionBalance(ctx, tenantID, "contact-1")
+	// Balance known vector: the referrer's payable = 50,000 kobo.
+	bal, err := svc.CommissionBalance(ctx, tenantID, referrerID)
 	if err != nil || bal != 50000 {
 		t.Fatalf("balance = %d, %v; want 50000", bal, err)
 	}
@@ -228,8 +298,9 @@ func TestVerifyRevenueTriggerConvertedFirstTxn(t *testing.T) {
 
 	mkSvcRule(t, svc, tenantID, "txn5pct-cap60k", TriggerFirstTxn, BeneficiaryReferrer, AmountPercent, 0, 500, i64(60000), true, 1)
 
+	agentID := mkPayableAgent(t, svc, tenantID) // STK O10: approved + beneficiary-linked
 	ref, _, err := svc.Create(ctx, CreateInput{
-		TenantID: tenantID, ReferrerType: ReferrerAgent, ReferrerID: "agent-7", RefereePhone: "+2348099990002",
+		TenantID: tenantID, ReferrerType: ReferrerAgent, ReferrerID: agentID, RefereePhone: "+2348099990002",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -242,10 +313,10 @@ func TestVerifyRevenueTriggerConvertedFirstTxn(t *testing.T) {
 		t.Fatalf("status = %q, want converted", res.Referral.Status)
 	}
 	// 5% of 2,000,000 = 100,000 → capped to 60,000 kobo.
-	if len(res.Awards) != 1 || res.Awards[0].AmountKobo != 60000 || res.Awards[0].BeneficiaryID != "agent-7" {
+	if len(res.Awards) != 1 || res.Awards[0].AmountKobo != 60000 || res.Awards[0].BeneficiaryID != agentID {
 		t.Fatalf("awards: %+v", res.Awards)
 	}
-	bal, _ := svc.CommissionBalance(ctx, tenantID, "agent-7")
+	bal, _ := svc.CommissionBalance(ctx, tenantID, agentID)
 	if bal != 60000 {
 		t.Fatalf("balance = %d, want 60000", bal)
 	}
@@ -277,7 +348,7 @@ func TestVerifyConvertsRefereeLead(t *testing.T) {
 	}
 
 	ref, _, err := svc.Create(ctx, CreateInput{
-		TenantID: tenantID, ReferrerType: ReferrerContact, ReferrerID: "contact-9", RefereePhone: phone,
+		TenantID: tenantID, ReferrerType: ReferrerContact, ReferrerID: mkContactReferrer(t, st, tenantID), RefereePhone: phone,
 	})
 	if err != nil {
 		t.Fatalf("create referral: %v", err)
@@ -334,7 +405,7 @@ func TestRejectFlow(t *testing.T) {
 	tenantID := uuid.New()
 
 	ref, _, err := svc.Create(ctx, CreateInput{
-		TenantID: tenantID, ReferrerType: ReferrerStaff, ReferrerID: "staff-1", RefereePhone: "+2348099990004",
+		TenantID: tenantID, ReferrerType: ReferrerStaff, ReferrerID: mkStaffReferrer(t, st, tenantID), RefereePhone: "+2348099990004",
 	})
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -362,18 +433,19 @@ func TestCreateDedupeOpenOnly(t *testing.T) {
 	ctx := context.Background()
 	tenantID := uuid.New()
 
-	in := CreateInput{TenantID: tenantID, ReferrerType: ReferrerContact, ReferrerID: "c-1", RefereePhone: "+2348099990005"}
+	referrerID := mkContactReferrer(t, st, tenantID)
+	in := CreateInput{TenantID: tenantID, ReferrerType: ReferrerContact, ReferrerID: referrerID, RefereePhone: "+2348099990005"}
 	r1, created1, err := svc.Create(ctx, in)
 	if err != nil || !created1 {
 		t.Fatalf("first create: created=%v err=%v", created1, err)
 	}
 	r2, created2, err := svc.Create(ctx, CreateInput{
-		TenantID: tenantID, ReferrerType: ReferrerAgent, ReferrerID: "a-2", RefereePhone: in.RefereePhone,
+		TenantID: tenantID, ReferrerType: ReferrerAgent, ReferrerID: mkPayableAgent(t, svc, tenantID), RefereePhone: in.RefereePhone,
 	})
 	if err != nil || created2 {
 		t.Fatalf("dedupe create: created=%v err=%v", created2, err)
 	}
-	if r2.ID != r1.ID || r2.ReferrerID != "c-1" {
+	if r2.ID != r1.ID || r2.ReferrerID != referrerID {
 		t.Fatalf("dedupe returned wrong row: %+v", r2)
 	}
 	if _, err := svc.Reject(ctx, tenantID, r1.ID); err != nil {
