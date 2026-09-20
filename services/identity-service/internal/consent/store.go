@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS consents (
     captured_ts      TIMESTAMPTZ NOT NULL DEFAULT now(),
     captured_channel TEXT NOT NULL DEFAULT '',
     captured_locale  TEXT NOT NULL DEFAULT '',
+    -- SPEC-W45 STK O13: capture provenance (see Record.CapturedBy).
+    captured_by      TEXT NOT NULL DEFAULT '',
     erasure_ts       TIMESTAMPTZ,
     UNIQUE (tenant_id, data_subject_id, purpose)
 );
@@ -139,6 +141,11 @@ CREATE POLICY tenant_isolation ON consents
 		// topic) + PrivacyEraseRequested (opendesk.privacy.events) from it
 		// and marks sent_at. Relay reads are cross-tenant => internal-role
 		// escape in the policy.
+		// SPEC-W45 STK O13: capture provenance column. Separate idempotent
+		// ALTER so installs whose consents table pre-dates the column get it
+		// (CREATE TABLE IF NOT EXISTS above would no-op).
+		{"add consents.captured_by",
+			`ALTER TABLE consents ADD COLUMN IF NOT EXISTS captured_by TEXT NOT NULL DEFAULT ''`},
 		{"ensure consent_events_outbox", `
 CREATE TABLE IF NOT EXISTS consent_events_outbox (
     id              BIGSERIAL PRIMARY KEY,
@@ -203,12 +210,12 @@ func (s *Store) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(tx p
 	return tx.Commit(ctx)
 }
 
-const recordCols = `consent_id, tenant_id, data_subject_id, purpose, captured_ts, captured_channel, captured_locale, erasure_ts`
+const recordCols = `consent_id, tenant_id, data_subject_id, purpose, captured_ts, captured_channel, captured_locale, captured_by, erasure_ts`
 
 func scanRecord(row pgx.Row) (Record, error) {
 	var r Record
 	err := row.Scan(&r.ConsentID, &r.TenantID, &r.DataSubjectID, &r.Purpose,
-		&r.CapturedTS, &r.CapturedChannel, &r.CapturedLocale, &r.ErasureTS)
+		&r.CapturedTS, &r.CapturedChannel, &r.CapturedLocale, &r.CapturedBy, &r.ErasureTS)
 	return r, err
 }
 
@@ -218,19 +225,20 @@ func (s *Store) Capture(ctx context.Context, rec *Record) error {
 		rec.ConsentID = uuid.New()
 	}
 	// ON CONFLICT: idempotent replay keeps the original captured_ts (first
-	// capture wins); channel/locale refresh; a re-capture after an erasure
-	// tombstone clears erasure_ts (explicit re-consent).
-	const q = `INSERT INTO consents (` + recordCols + `)
-	           VALUES ($1,$2,$3,$4,now(),$5,$6,NULL)
-	           ON CONFLICT (tenant_id, data_subject_id, purpose) DO UPDATE
-	           SET captured_channel = EXCLUDED.captured_channel,
-	               captured_locale  = EXCLUDED.captured_locale,
-	               erasure_ts       = NULL
-	           RETURNING ` + recordCols
+	// capture wins); channel/locale/provenance refresh; a re-capture after an
+	// erasure tombstone clears erasure_ts (explicit re-consent).
+	const q = `INSERT INTO consents (consent_id, tenant_id, data_subject_id, purpose, captured_ts, captured_channel, captured_locale, captured_by, erasure_ts)
+           VALUES ($1,$2,$3,$4,now(),$5,$6,$7,NULL)
+           ON CONFLICT (tenant_id, data_subject_id, purpose) DO UPDATE
+           SET captured_channel = EXCLUDED.captured_channel,
+               captured_locale  = EXCLUDED.captured_locale,
+               captured_by      = EXCLUDED.captured_by,
+               erasure_ts       = NULL
+           RETURNING ` + recordCols
 	return s.withTenant(ctx, rec.TenantID, func(tx pgx.Tx) error {
 		out, err := scanRecord(tx.QueryRow(ctx, q,
 			rec.ConsentID, rec.TenantID, rec.DataSubjectID, rec.Purpose,
-			rec.CapturedChannel, rec.CapturedLocale))
+			rec.CapturedChannel, rec.CapturedLocale, rec.CapturedBy))
 		if err != nil {
 			return fmt.Errorf("capture consent: %w", err)
 		}
@@ -242,8 +250,8 @@ func (s *Store) Capture(ctx context.Context, rec *Record) error {
 // List implements Repository.
 func (s *Store) List(ctx context.Context, tenantID uuid.UUID, subject string) ([]Record, error) {
 	const q = `SELECT ` + recordCols + ` FROM consents
-	           WHERE tenant_id = $1 AND data_subject_id = $2
-	           ORDER BY captured_ts DESC`
+           WHERE tenant_id = $1 AND data_subject_id = $2
+           ORDER BY captured_ts DESC`
 	var out []Record
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID, subject)
@@ -266,7 +274,7 @@ func (s *Store) List(ctx context.Context, tenantID uuid.UUID, subject string) ([
 // Active implements Repository.
 func (s *Store) Active(ctx context.Context, tenantID uuid.UUID, subject, purpose string) (Record, error) {
 	const q = `SELECT ` + recordCols + ` FROM consents
-	           WHERE tenant_id = $1 AND data_subject_id = $2 AND purpose = $3 AND erasure_ts IS NULL`
+           WHERE tenant_id = $1 AND data_subject_id = $2 AND purpose = $3 AND erasure_ts IS NULL`
 	var r Record
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
@@ -327,7 +335,7 @@ func (s *Store) FetchUnsentOutbox(ctx context.Context, limit int) ([]OutboxEvent
 		limit = 100
 	}
 	const q = `SELECT id, tenant_id, data_subject_id, purpose, erased_records, synthetic, created_at
-	           FROM consent_events_outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1`
+           FROM consent_events_outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1`
 	rows, err := s.internal.Query(ctx, q, limit)
 	if err != nil {
 		return nil, fmt.Errorf("fetch unsent outbox: %w", err)

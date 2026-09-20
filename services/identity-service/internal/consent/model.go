@@ -35,12 +35,17 @@ const (
 // contact uuid (free-form text by design: the registry must not need to
 // resolve subjects to store their consent).
 type Record struct {
-	ConsentID       uuid.UUID  `json:"consent_id"`
-	TenantID        uuid.UUID  `json:"tenant_id"`
-	DataSubjectID   string     `json:"data_subject_id"`
-	Purpose         string     `json:"purpose"`
-	CapturedTS      time.Time  `json:"captured_ts"`
-	CapturedChannel string     `json:"captured_channel"`
-	CapturedLocale  string     `json:"captured_locale"`
-	ErasureTS       *time.Time `json:"erasure_ts"`
+	ConsentID       uuid.UUID `json:"consent_id"`
+	TenantID        uuid.UUID `json:"tenant_id"`
+	DataSubjectID   string    `json:"data_subject_id"`
+	Purpose         string    `json:"purpose"`
+	CapturedTS      time.Time `json:"captured_ts"`
+	CapturedChannel string    `json:"captured_channel"`
+	CapturedLocale  string    `json:"captured_locale"`
+	// CapturedBy is the capture provenance (SPEC-W45 STK O13): "public", a
+	// channel descriptor, "portal:<contact_id>", "user:<sub>" or
+	// "service:internal". Provenance, not authz — capture is public by
+	// design (see handlers.capture).
+	CapturedBy string     `json:"captured_by"`
+	ErasureTS  *time.Time `json:"erasure_ts"`
 }
