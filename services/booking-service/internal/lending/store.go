@@ -467,8 +467,10 @@ func (s *Store) Disburse(ctx context.Context, tenantID, applicationID uuid.UUID,
 
 		// Balanced ledger journal: DEBIT 501 (house cash out) /
 		// CREDIT 500 (borrower principal). ref_id = application id.
+		// SPEC-W45 ORPH O4: validate through the Ledger seam's invariants
+		// (validateJournal) before the rows hit the database.
 		journalID := DisburseJournalID(applicationID)
-		if err := postJournalTx(ctx, tx, journalID, []LedgerEntry{
+		entries := []LedgerEntry{
 			{
 				TenantID: tenantID, JournalID: journalID, AccountCode: AccountRepaymentReceived,
 				BeneficiaryID: "", RefType: RefTypeDisbursement, RefID: applicationID.String(),
@@ -479,7 +481,11 @@ func (s *Store) Disburse(ctx context.Context, tenantID, applicationID uuid.UUID,
 				BeneficiaryID: app.ContactID.String(), RefType: RefTypeDisbursement, RefID: applicationID.String(),
 				CreditKobo: app.PrincipalKobo,
 			},
-		}); err != nil {
+		}
+		if err := validateJournal(tenantID, journalID, entries); err != nil {
+			return err
+		}
+		if err := postJournalTx(ctx, tx, journalID, entries); err != nil {
 			return err
 		}
 
@@ -631,9 +637,11 @@ func (s *Store) Repay(ctx context.Context, tenantID, loanID uuid.UUID, amountKob
 
 		// Balanced ledger journal: DEBIT 500 (borrower principal reduced) /
 		// CREDIT 501 (house cash in). ref_id = caller repayment ref_id.
+		// SPEC-W45 ORPH O4: validate through the Ledger seam's invariants
+		// (validateJournal) before the rows hit the database.
 		journalID := uuid.NewSHA1(uuid.NameSpaceOID,
 			[]byte("opendesk:"+RefTypeRepayment+":"+loanID.String()+":"+refID))
-		if err := postJournalTx(ctx, tx, journalID, []LedgerEntry{
+		entries := []LedgerEntry{
 			{
 				TenantID: tenantID, JournalID: journalID, AccountCode: AccountPrincipalDisbursed,
 				BeneficiaryID: loan.ContactID.String(), RefType: RefTypeRepayment, RefID: refID,
@@ -644,7 +652,11 @@ func (s *Store) Repay(ctx context.Context, tenantID, loanID uuid.UUID, amountKob
 				BeneficiaryID: "", RefType: RefTypeRepayment, RefID: refID,
 				CreditKobo: applied,
 			},
-		}); err != nil {
+		}
+		if err := validateJournal(tenantID, journalID, entries); err != nil {
+			return err
+		}
+		if err := postJournalTx(ctx, tx, journalID, entries); err != nil {
 			return err
 		}
 
