@@ -40,15 +40,30 @@ func (f *fakeAuditStore) InsertAudit(_ context.Context, a *store.Audit) error {
 	return nil
 }
 
+// IDHashOwner implements the SPEC-W45 K22 binding lookup over the recorded
+// rows: the subject_phone of the FIRST resolution of (id_type, id_hash).
+func (f *fakeAuditStore) IDHashOwner(_ context.Context, tenantID uuid.UUID, idType, idValueHash string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, a := range f.rows {
+		if a.TenantID == tenantID && a.IDType == idType && a.IDValueHash == idValueHash {
+			return a.SubjectPhone, nil
+		}
+	}
+	return "", nil
+}
+
 func (f *fakeAuditStore) Ping(context.Context) error { return nil }
 
 type fakeConsent struct {
 	tenantID uuid.UUID
 	err      error
-	gotHdr   map[string]string // captured tenant header(s) via client, n/a for fake
+	// captured last call (K22 binding context forwarded to the gate).
+	gotSubject, gotIDType, gotIDHash string
 }
 
-func (f fakeConsent) CheckConsent(_ context.Context, tenantRef, subject, purpose string) (uuid.UUID, error) {
+func (f *fakeConsent) CheckConsent(_ context.Context, tenantRef, subject, purpose, idType, idHash string) (uuid.UUID, error) {
+	f.gotSubject, f.gotIDType, f.gotIDHash = subject, idType, idHash
 	return f.tenantID, f.err
 }
 
@@ -70,34 +85,54 @@ func (f *fakePublisher) PublishEvent(_ context.Context, _, topic string, data an
 	return f.err
 }
 
+// testInternalToken is the harness X-Internal-Token (SPEC-W45 K22 gate).
+const testInternalToken = "test-kyc-internal-token"
+
+// testHashSecret is the harness HMAC key for id_value_hash.
+const testHashSecret = "test-kyc-hash-secret"
+
 type harness struct {
-	audits *fakeAuditStore
-	pub    *fakePublisher
-	tid    uuid.UUID
-	http   http.Handler
+	audits  *fakeAuditStore
+	pub     *fakePublisher
+	consent *fakeConsent
+	tid     uuid.UUID
+	http    http.Handler
 }
 
 func newHarness(consentErr error) *harness {
 	audits := &fakeAuditStore{}
 	pub := &fakePublisher{}
-	tid := uuid.New()
+	consent := &fakeConsent{tenantID: uuid.New()}
+	consent.err = consentErr
+	tid := consent.tenantID
 	d := Deps{
-		Store:       audits,
-		Consent:     fakeConsent{tenantID: tid, err: consentErr},
-		Resolver:    MockResolver{},
-		Events:      pub,
-		PubSub:      "pubsub-kafka",
-		EventsTopic: "opendesk.kyc.resolved.v1",
-		Logger:      zap.NewNop(),
+		Store:         audits,
+		Consent:       consent,
+		Resolver:      MockResolver{},
+		Events:        pub,
+		PubSub:        "pubsub-kafka",
+		EventsTopic:   "opendesk.kyc.resolved.v1",
+		InternalToken: testInternalToken,
+		HashSecret:    testHashSecret,
+		Logger:        zap.NewNop(),
 	}
 	r := chi.NewRouter()
 	r.Mount("/", NewRouter(d))
-	return &harness{audits: audits, pub: pub, tid: tid, http: r}
+	return &harness{audits: audits, pub: pub, consent: consent, tid: tid, http: r}
 }
 
+// resolve posts with the valid internal token (the K22 happy path).
 func (h *harness) resolve(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return h.resolveWithToken(t, body, testInternalToken)
+}
+
+func (h *harness) resolveWithToken(t *testing.T, body, token string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/kyc/resolve", strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("X-Internal-Token", token)
+	}
 	rec := httptest.NewRecorder()
 	h.http.ServeHTTP(rec, req)
 	return rec
@@ -253,7 +288,7 @@ func TestConsentClientAgainstIdentityStub(t *testing.T) {
 
 	c := NewConsentClient(nil, "", stub.URL, "")
 	// uuid tenant ref -> X-Tenant-ID header.
-	got, err := c.CheckConsent(context.Background(), tid.String(), "+2348", "kyc")
+	got, err := c.CheckConsent(context.Background(), tid.String(), "+2348", "kyc", "bvn", "abc123hash")
 	if err != nil || got != tid {
 		t.Errorf("uuid path: got %v err %v", got, err)
 	}
@@ -263,15 +298,19 @@ func TestConsentClientAgainstIdentityStub(t *testing.T) {
 	if !strings.Contains(gotQuery, "purpose=kyc") {
 		t.Errorf("query: %q", gotQuery)
 	}
+	// SPEC-W45 K22: the binding context (id_type + id_hash) is forwarded.
+	if !strings.Contains(gotQuery, "id_type=bvn") || !strings.Contains(gotQuery, "id_hash=abc123hash") {
+		t.Errorf("K22 binding context missing from query: %q", gotQuery)
+	}
 	// slug tenant ref -> X-Tenant-Slug header.
-	if _, err := c.CheckConsent(context.Background(), "acme", "+2348", "kyc"); err != nil {
+	if _, err := c.CheckConsent(context.Background(), "acme", "+2348", "kyc", "bvn", "abc123hash"); err != nil {
 		t.Errorf("slug path: %v", err)
 	}
 	if gotSlug != "acme" {
 		t.Errorf("slug header = %q", gotSlug)
 	}
 	// 403 -> ErrConsentDenied.
-	if _, err := c.CheckConsent(context.Background(), tid.String(), "denied", "kyc"); !errors.Is(err, ErrConsentDenied) {
+	if _, err := c.CheckConsent(context.Background(), tid.String(), "denied", "kyc", "bvn", "abc123hash"); !errors.Is(err, ErrConsentDenied) {
 		t.Errorf("denied: %v, want ErrConsentDenied", err)
 	}
 }
@@ -317,5 +356,140 @@ func TestResolvePublishFailureStill200(t *testing.T) {
 	}
 	if len(h.audits.rows) != 1 {
 		t.Errorf("audit row must still exist: rows = %d", len(h.audits.rows))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W45 K22 (OOS-07): X-Internal-Token gate on /v1/kyc/*
+// ---------------------------------------------------------------------------
+
+func TestResolveInternalTokenMatrix(t *testing.T) {
+	body := func(tid uuid.UUID) string {
+		return `{"tenant_id":"` + tid.String() + `","subject_phone":"+2348012345678","id_type":"bvn","id_value":"22223333444"}`
+	}
+	t.Run("missing token -> 401", func(t *testing.T) {
+		h := newHarness(nil)
+		if rec := h.resolveWithToken(t, body(h.tid), ""); rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", rec.Code)
+		}
+	})
+	t.Run("wrong token -> 401", func(t *testing.T) {
+		h := newHarness(nil)
+		if rec := h.resolveWithToken(t, body(h.tid), "nope"); rec.Code != http.StatusUnauthorized {
+			t.Errorf("status = %d, want 401", rec.Code)
+		}
+	})
+	t.Run("correct token -> 200", func(t *testing.T) {
+		h := newHarness(nil)
+		if rec := h.resolve(t, body(h.tid)); rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want 200 (body %s)", rec.Code, rec.Body)
+		}
+	})
+	t.Run("token unset on server -> 503 fail-closed", func(t *testing.T) {
+		h := newHarness(nil)
+		d := Deps{
+			Store: h.audits, Consent: h.consent, Resolver: MockResolver{},
+			Events: h.pub, PubSub: "pubsub-kafka", EventsTopic: "t",
+			InternalToken: "", HashSecret: testHashSecret, Logger: zap.NewNop(),
+		}
+		r := chi.NewRouter()
+		r.Mount("/", NewRouter(d))
+		req := httptest.NewRequest(http.MethodPost, "/v1/kyc/resolve", strings.NewReader(body(h.tid)))
+		req.Header.Set("X-Internal-Token", testInternalToken)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503 (fail-closed unset)", rec.Code)
+		}
+	})
+	t.Run("unauthenticated request resolves nothing", func(t *testing.T) {
+		h := newHarness(nil)
+		rec := h.resolveWithToken(t, body(h.tid), "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if len(h.audits.rows) != 0 || len(h.pub.events) != 0 {
+			t.Errorf("rejected requests must not audit/publish: audits=%d events=%d",
+				len(h.audits.rows), len(h.pub.events))
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W45 K22 (OOS-17): consent<->ID binding rule
+// ---------------------------------------------------------------------------
+
+// An ID resolved once under a phone is bound to that phone (first consented
+// resolution wins); resolving the same ID under a DIFFERENT phone -> 403.
+func TestResolveIDBindingRule(t *testing.T) {
+	h := newHarness(nil)
+	resolve := func(phone, idValue string) *httptest.ResponseRecorder {
+		return h.resolve(t, `{"tenant_id":"`+h.tid.String()+`","subject_phone":"`+phone+
+			`","id_type":"bvn","id_value":"`+idValue+`"}`)
+	}
+	// First resolution binds 22223333444 -> phone A.
+	if rec := resolve("+2348011111111", "22223333444"); rec.Code != http.StatusOK {
+		t.Fatalf("first resolution: status = %d, body %s", rec.Code, rec.Body)
+	}
+	// Same ID + same phone -> allowed (idempotent re-resolution).
+	if rec := resolve("+2348011111111", "22223333444"); rec.Code != http.StatusOK {
+		t.Errorf("same phone re-resolution: status = %d, want 200", rec.Code)
+	}
+	// Same ID under a DIFFERENT phone -> 403 id_binding_violation.
+	rec := resolve("+2348099999999", "22223333444")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-phone resolution: status = %d, want 403", rec.Code)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out["error"] != "id_binding_violation" {
+		t.Errorf("error = %v, want id_binding_violation", out)
+	}
+	// The violation must not resolve/audit (no provider call, no audit row).
+	if len(h.audits.rows) != 2 {
+		t.Errorf("audit rows = %d, want 2 (the two allowed resolutions)", len(h.audits.rows))
+	}
+	// A different ID under the second phone is fine (phone consented, ID unbound).
+	if rec := resolve("+2348099999999", "55556666777"); rec.Code != http.StatusOK {
+		t.Errorf("new id under other phone: status = %d, want 200", rec.Code)
+	}
+}
+
+// The consent check must carry the binding context: the request's
+// subject_phone (consented subject) plus id_type + id_hash.
+func TestResolveConsentCheckCarriesBindingContext(t *testing.T) {
+	h := newHarness(nil)
+	rec := h.resolve(t, `{"tenant_id":"`+h.tid.String()+`","subject_phone":"+2348012345678","id_type":"nin","id_value":"22223333444"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if h.consent.gotSubject != "+2348012345678" {
+		t.Errorf("consent subject = %q, want the request phone", h.consent.gotSubject)
+	}
+	if h.consent.gotIDType != "nin" {
+		t.Errorf("consent id_type = %q", h.consent.gotIDType)
+	}
+	if h.consent.gotIDHash != hashIDValue(testHashSecret, "22223333444") {
+		t.Errorf("consent id_hash = %q, want HMAC digest", h.consent.gotIDHash)
+	}
+}
+
+// HMAC key separation: the stored digest must differ from the bare SHA-256
+// of the raw value and from a digest keyed with another secret.
+func TestResolveHashIsKeyedHMAC(t *testing.T) {
+	h := newHarness(nil)
+	rec := h.resolve(t, `{"tenant_id":"`+h.tid.String()+`","subject_phone":"+2348012345678","id_type":"bvn","id_value":"22223333444"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	got := h.audits.rows[0].IDValueHash
+	if got == hashIDValue("", "22223333444") {
+		t.Errorf("digest must depend on the configured key (empty-key HMAC must differ)")
+	}
+	if got == hashIDValue("other-secret", "22223333444") {
+		t.Errorf("digest must depend on the configured secret")
+	}
+	if got != hashIDValue(testHashSecret, "22223333444") {
+		t.Errorf("digest = %q, want HMAC-SHA256(testHashSecret, id)", got)
 	}
 }

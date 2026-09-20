@@ -8,6 +8,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -36,6 +37,10 @@ type Audit struct {
 // *Store is the Postgres implementation; tests substitute an in-memory fake.
 type Repository interface {
 	InsertAudit(ctx context.Context, a *Audit) error
+	// IDHashOwner returns the subject_phone an (id_type, id_value_hash) pair
+	// was FIRST resolved under for this tenant ("" when never resolved) —
+	// the consent↔ID binding lookup (SPEC-W45 K22).
+	IDHashOwner(ctx context.Context, tenantID uuid.UUID, idType, idValueHash string) (string, error)
 	Ping(ctx context.Context) error
 }
 
@@ -147,6 +152,30 @@ func (s *Store) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(tx p
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// IDHashOwner implements the consent↔ID binding lookup (SPEC-W45 K22,
+// OOS-17): the subject_phone of the EARLIEST audit row for
+// (tenant, id_type, id_value_hash). "" + nil when the ID was never resolved
+// for this tenant — the first resolution establishes the binding. Runs
+// inside withTenant so RLS scopes the read.
+func (s *Store) IDHashOwner(ctx context.Context, tenantID uuid.UUID, idType, idValueHash string) (string, error) {
+	var owner string
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		err := tx.QueryRow(ctx, `SELECT subject_phone FROM kyc_audit
+		                         WHERE tenant_id = $1 AND id_type = $2 AND id_value_hash = $3
+		                         ORDER BY created_at ASC, audit_id ASC LIMIT 1`,
+			tenantID, idType, idValueHash).Scan(&owner)
+		if errors.Is(err, pgx.ErrNoRows) {
+			owner = ""
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("lookup id hash owner: %w", err)
+		}
+		return nil
+	})
+	return owner, err
 }
 
 // InsertAudit records one resolution attempt. Every /v1/kyc/resolve call
