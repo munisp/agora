@@ -194,7 +194,8 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 func (s *Syncer) HandleIdentity(ctx context.Context, evt events.CloudEvent) error {
 	switch evt.Type {
 	case events.TypeTenantProvisioned, events.TypeContactCaptured,
-		events.TypeConsentGranted, events.TypeConsentRevoked:
+		events.TypeConsentGranted, events.TypeConsentRevoked,
+		events.TypeTenantDeleted:
 	default:
 		return nil
 	}
@@ -208,6 +209,8 @@ func (s *Syncer) HandleIdentity(ctx context.Context, evt events.CloudEvent) erro
 		return nil
 	}
 	switch evt.Type {
+	case events.TypeTenantDeleted:
+		return s.tenantDeleted(ctx, evt, tenantID)
 	case events.TypeTenantProvisioned:
 		var d struct {
 			Slug string `json:"slug"`
@@ -219,6 +222,33 @@ func (s *Syncer) HandleIdentity(ctx context.Context, evt events.CloudEvent) erro
 	default: // consent granted / revoked
 		return s.consentChanged(ctx, evt, tenantID)
 	}
+}
+
+// tenantDeleted handles the SPEC-W45 K9 cascade: DETACH DELETE the whole
+// tenant subgraph. The graph client pre-check makes this idempotent; the
+// deletion is logged with the actor for auditability (never silent).
+func (s *Syncer) tenantDeleted(ctx context.Context, evt events.CloudEvent, tenantID string) error {
+	found, err := s.Graph.DeleteTenantSubgraph(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	actor, _ := evt.Data["actor"].(string)
+	s.metrics().Inc("tenant_subgraphs_deleted")
+	s.log().Info("tenant subgraph deleted (K9 TenantDeleted cascade)",
+		zap.String("tenant_id", tenantID),
+		zap.String("tenant_slug", firstNonEmpty(stringField(evt.Data, "tenant_slug"), evt.Subject)),
+		zap.String("actor", actor),
+		zap.Bool("found", found),
+		zap.String("event_id", evt.ID))
+	return nil
+}
+
+// stringField reads a string field from a raw event data map.
+func stringField(data map[string]any, key string) string {
+	if v, ok := data[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 // contactCaptured handles ContactCaptured (identity topic) and LeadCreated

@@ -73,13 +73,16 @@ func run() error {
 	if cfg.PhoneHashSalt == "" {
 		logger.Warn("PHONE_HASH_SALT is empty; phone hashes are unsalted (dev posture only)")
 	}
+	if cfg.FalkorDBPassword == "" {
+		logger.Warn("FALKORDB_PASSWORD is empty; connecting without AUTH (fails against compose graph-db --requirepass)")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// FalkorDB graph client (Redis-protocol Cypher; the Client seam is
 	// faked in tests).
-	gc := graph.NewFalkorDB(cfg.FalkorDBAddr, cfg.FalkorDBGraph)
+	gc := graph.NewFalkorDB(cfg.FalkorDBAddr, cfg.FalkorDBGraph, cfg.FalkorDBPassword)
 	defer gc.Close() //nolint:errcheck
 
 	reg := metrics.New()

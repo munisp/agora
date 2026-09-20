@@ -52,6 +52,25 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// SPEC-W45 ORPH O13: `FLUVIO_ENDPOINT` is the canonical env. `FLUVIO_ADDR`
+/// is kept as a DEPRECATED alias for one wave (older compose/k3s manifests
+/// still set it); when only the alias is present a startup warning is
+/// logged. The alias is ignored when the canonical var is set.
+fn fluvio_endpoint() -> String {
+    if let Ok(v) = std::env::var("FLUVIO_ENDPOINT") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(v) = std::env::var("FLUVIO_ADDR") {
+        if !v.is_empty() {
+            tracing::warn!("FLUVIO_ADDR is deprecated; rename it to FLUVIO_ENDPOINT");
+            return v;
+        }
+    }
+    "fluvio:9003".to_string()
+}
+
 impl Config {
     pub fn from_env() -> Self {
         Self {
@@ -70,7 +89,7 @@ impl Config {
             dev_mode: env_flag("OPENDESK_DEV"),
             jwks_cache_ttl_secs: env_parse("JWKS_CACHE_TTL_SECS", 300),
             ws_channel_capacity: env_parse("WS_CHANNEL_CAPACITY", 256),
-            fluvio_endpoint: env_or("FLUVIO_ENDPOINT", "fluvio:9003"),
+            fluvio_endpoint: fluvio_endpoint(),
             fluvio_transcripts_topic: env_or(
                 "FLUVIO_TRANSCRIPTS_TOPIC",
                 "opendesk.transcripts-raw",
@@ -123,6 +142,27 @@ mod tests {
 
         std::env::remove_var("ENRICHED_TOPIC");
         std::env::remove_var("GATEWAY_EDGE_ALLOW_SIM");
+    }
+
+    /// ORPH O13: FLUVIO_ENDPOINT canonical, FLUVIO_ADDR deprecated alias.
+    #[test]
+    fn fluvio_endpoint_canonical_and_deprecated_alias() {
+        for k in ["FLUVIO_ENDPOINT", "FLUVIO_ADDR"] {
+            std::env::remove_var(k);
+        }
+        assert_eq!(Config::from_env().fluvio_endpoint, "fluvio:9003");
+
+        // Alias alone is honoured (with a deprecation warning at boot).
+        std::env::set_var("FLUVIO_ADDR", "fluvio-legacy:9003");
+        assert_eq!(Config::from_env().fluvio_endpoint, "fluvio-legacy:9003");
+
+        // Canonical wins over the alias.
+        std::env::set_var("FLUVIO_ENDPOINT", "fluvio-canonical:9003");
+        assert_eq!(Config::from_env().fluvio_endpoint, "fluvio-canonical:9003");
+
+        for k in ["FLUVIO_ENDPOINT", "FLUVIO_ADDR"] {
+            std::env::remove_var(k);
+        }
     }
 
     /// SEC#12: audience is mandatory outside explicit dev posture.

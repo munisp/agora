@@ -45,6 +45,10 @@ type Config struct {
 	// (FALKORDB_GRAPH, default opendesk).
 	FalkorDBAddr  string
 	FalkorDBGraph string
+	// FalkorDBPassword is the Redis-protocol AUTH password (FALKORDB_PASSWORD).
+	// The compose graph-db requires --requirepass; empty means no AUTH (local
+	// dev without compose) and is logged loudly at boot.
+	FalkorDBPassword string
 	// PhoneHashSalt is the SHA-256 salt for phone_hash (PHONE_HASH_SALT) —
 	// the same salted-hash posture as the leads dedupe scheme (SPEC-W28 §3).
 	// Empty is allowed for dev but logged loudly (mirrors crm-sync's
@@ -82,6 +86,7 @@ func Load() Config {
 		ErasureDoneTopic: envStr("GRAPH_ERASURE_DONE_TOPIC", "opendesk.graph.erasure.done.v1"),
 		FalkorDBAddr:     envStr("FALKORDB_ADDR", "graph-db:6379"),
 		FalkorDBGraph:    envStr("FALKORDB_GRAPH", "opendesk"),
+		FalkorDBPassword: os.Getenv("FALKORDB_PASSWORD"),
 		PhoneHashSalt:    os.Getenv("PHONE_HASH_SALT"),
 		OllamaBaseURL:    envStr("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
 		OllamaEmbedModel: envStr("OLLAMA_EMBED_MODEL", "nomic-embed-text"),

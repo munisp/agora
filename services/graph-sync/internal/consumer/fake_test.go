@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -387,6 +388,74 @@ func (f *fakeGraph) ErasePerson(_ context.Context, tenantID, personID string) (b
 	}
 	f.mergeCandidates = kept
 	return true, nil
+}
+
+// DeleteTenantSubgraph implements the SPEC-W45 K9 cascade on the fake:
+// drop every record whose key carries the tenant prefix; reports found when
+// anything was removed (tenant anchor, person, contact, consent, booking,
+// case or processed marker).
+func (f *fakeGraph) DeleteTenantSubgraph(_ context.Context, tenantID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	found := false
+	prefix := tenantID + "|"
+	if _, ok := f.tenants[tenantID]; ok {
+		delete(f.tenants, tenantID)
+		found = true
+	}
+	for id, p := range f.persons {
+		if strings.HasPrefix(id, prefix) || p.TenantID == tenantID {
+			delete(f.persons, id)
+			delete(f.hasContact, id)
+			delete(f.consented, id)
+			delete(f.booked, id)
+			delete(f.reported, id)
+			delete(f.embeddings, id)
+			delete(f.enrichment, id)
+			found = true
+		}
+	}
+	for id := range f.contacts {
+		if strings.HasPrefix(id, prefix) {
+			delete(f.contacts, id)
+			found = true
+		}
+	}
+	for id := range f.consents {
+		if strings.HasPrefix(id, prefix) {
+			delete(f.consents, id)
+			found = true
+		}
+	}
+	for id := range f.bookings {
+		if strings.HasPrefix(id, prefix) {
+			delete(f.bookings, id)
+			found = true
+		}
+	}
+	for id := range f.cases {
+		if strings.HasPrefix(id, prefix) {
+			delete(f.cases, id)
+			delete(f.caseExtra, id)
+			delete(f.caseAt, id)
+			delete(f.caseMerged, id)
+			found = true
+		}
+	}
+	for eventID, t := range f.processed {
+		if t == tenantID {
+			delete(f.processed, eventID)
+			found = true
+		}
+	}
+	kept := f.mergeCandidates[:0]
+	for _, mc := range f.mergeCandidates {
+		if mc.TenantID != tenantID {
+			kept = append(kept, mc)
+		}
+	}
+	f.mergeCandidates = kept
+	return found, nil
 }
 
 func link(m map[string]map[string]bool, from, to string) {
