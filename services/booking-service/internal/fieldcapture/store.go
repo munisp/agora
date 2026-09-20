@@ -84,8 +84,12 @@ CREATE TABLE IF NOT EXISTS field_captures (
                 CHECK (status IN ('processing','applied','error')),
     result      JSONB,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- SPEC-W45 OOS-21: the server-side receipt timestamp stored alongside
+    -- the client-claimed captured_at (clock-skew detection).
+    server_received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, client_id)
 );
+ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS server_received_at TIMESTAMPTZ NOT NULL DEFAULT now();
 -- SPEC-W32 WS-A: the kind enum gains 'civic_report'. CREATE TABLE IF NOT
 -- EXISTS never updates an existing CHECK constraint, so it is rebuilt
 -- idempotently (drop + re-add with the full enum).
@@ -114,8 +118,11 @@ CREATE TABLE IF NOT EXISTS field_checkins (
     note        TEXT NOT NULL DEFAULT '',
     payload     JSONB NOT NULL DEFAULT '{}',
     captured_at TIMESTAMPTZ,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- SPEC-W45 OOS-21: server receipt time next to client captured_at.
+    server_received_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE field_checkins ADD COLUMN IF NOT EXISTS server_received_at TIMESTAMPTZ NOT NULL DEFAULT now();
 CREATE INDEX IF NOT EXISTS idx_field_checkins_contact ON field_checkins (tenant_id, contact_id, captured_at);
 ALTER TABLE field_checkins ENABLE ROW LEVEL SECURITY;
 ALTER TABLE field_checkins FORCE ROW LEVEL SECURITY;
@@ -213,9 +220,13 @@ func (s *Store) Resolve(ctx context.Context, tenantID uuid.UUID, clientID, statu
 	})
 }
 
-const checkinCols = `id, tenant_id, contact_id, lat, lng, accuracy_m, note, payload, captured_at, created_at`
+// checkinReadCols is the SELECT column list (SPEC-W45 OOS-21: includes the
+// server receipt timestamp next to the client-claimed captured_at).
+const checkinReadCols = `id, tenant_id, contact_id, lat, lng, accuracy_m, note, payload, captured_at, created_at, server_received_at`
 
-// InsertCheckin appends one geo check-in event.
+// InsertCheckin appends one geo check-in event. server_received_at is
+// stamped by the database at insert time (OOS-21: the server clock is the
+// trusted reference against the client-claimed captured_at).
 func (s *Store) InsertCheckin(ctx context.Context, c *Checkin) error {
 	if c.ID == uuid.Nil {
 		c.ID = uuid.New()
@@ -223,20 +234,27 @@ func (s *Store) InsertCheckin(ctx context.Context, c *Checkin) error {
 	if len(c.Payload) == 0 {
 		c.Payload = json.RawMessage(`{}`)
 	}
-	const q = `INSERT INTO field_checkins (` + checkinCols + `)
+	const q = `INSERT INTO field_checkins (id, tenant_id, contact_id, lat, lng, accuracy_m, note, payload, captured_at, created_at)
 		           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
-		           RETURNING created_at`
-	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		           RETURNING created_at, server_received_at`
+	err := s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, q, c.ID, c.TenantID, c.ContactID, c.Lat, c.Lng,
-			c.AccuracyM, c.Note, c.Payload, c.CapturedAt).Scan(&c.CreatedAt)
+			c.AccuracyM, c.Note, c.Payload, c.CapturedAt).Scan(&c.CreatedAt, &c.ServerReceivedAt)
 	})
+	if err == nil {
+		c.ComputeClockSkew()
+	}
+	return err
 }
 
 // ListCheckins returns the tenant's check-in history (newest captured
 // first), optionally narrowed to one contact. Backs future admin reads;
-// exercised by the store tests today.
+// exercised by the store tests today. SPEC-W45 OOS-21: each row carries
+// server_received_at and a clock_skew flag (|captured_at −
+// server_received_at| > 5min) so readers can honestly distrust a captured
+// timestamp from a device with a badly skewed clock.
 func (s *Store) ListCheckins(ctx context.Context, tenantID uuid.UUID, contactID *uuid.UUID) ([]Checkin, error) {
-	q := `SELECT ` + checkinCols + ` FROM field_checkins WHERE tenant_id=$1`
+	q := `SELECT ` + checkinReadCols + ` FROM field_checkins WHERE tenant_id=$1`
 	args := []any{tenantID}
 	if contactID != nil {
 		q += ` AND contact_id=$2`
@@ -253,9 +271,10 @@ func (s *Store) ListCheckins(ctx context.Context, tenantID uuid.UUID, contactID 
 		for rows.Next() {
 			var c Checkin
 			if err := rows.Scan(&c.ID, &c.TenantID, &c.ContactID, &c.Lat, &c.Lng,
-				&c.AccuracyM, &c.Note, &c.Payload, &c.CapturedAt, &c.CreatedAt); err != nil {
+				&c.AccuracyM, &c.Note, &c.Payload, &c.CapturedAt, &c.CreatedAt, &c.ServerReceivedAt); err != nil {
 				return err
 			}
+			c.ComputeClockSkew()
 			out = append(out, c)
 		}
 		return rows.Err()

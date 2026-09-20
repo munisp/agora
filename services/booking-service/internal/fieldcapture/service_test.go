@@ -161,6 +161,57 @@ func TestCheckinApplyAndDedupe(t *testing.T) {
 	}
 }
 
+// SPEC-W45 OOS-21: server_received_at is stored alongside the
+// client-claimed captured_at and the read API flags clock skew
+// (|diff| > 5min) so consumers can honestly distrust skewed device clocks.
+func TestCheckinClockSkewFlag(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	contactID := uuid.New()
+
+	skewedAt := time.Now().UTC().Add(-30 * time.Minute) // device clock 30m behind
+	skewed := Checkin{TenantID: rig.tenant.ID, ContactID: &contactID, Note: "old device clock", CapturedAt: &skewedAt}
+	if err := rig.fstore.InsertCheckin(ctx, &skewed); err != nil {
+		t.Fatalf("insert skewed: %v", err)
+	}
+	freshAt := time.Now().UTC()
+	fresh := Checkin{TenantID: rig.tenant.ID, ContactID: &contactID, Note: "synced clock", CapturedAt: &freshAt}
+	if err := rig.fstore.InsertCheckin(ctx, &fresh); err != nil {
+		t.Fatalf("insert fresh: %v", err)
+	}
+	noTS := Checkin{TenantID: rig.tenant.ID, ContactID: &contactID, Note: "no client timestamp"}
+	if err := rig.fstore.InsertCheckin(ctx, &noTS); err != nil {
+		t.Fatalf("insert no-ts: %v", err)
+	}
+
+	if skewed.ServerReceivedAt.IsZero() || !skewed.ClockSkew {
+		t.Fatalf("skewed checkin: %+v", skewed)
+	}
+	if fresh.ClockSkew {
+		t.Fatalf("fresh checkin must not flag skew: %+v", fresh)
+	}
+	if noTS.ClockSkew {
+		t.Fatalf("missing captured_at must not flag skew: %+v", noTS)
+	}
+
+	// The read API (ListCheckins) surfaces the same server timestamp + flag.
+	rows, err := rig.fstore.ListCheckins(ctx, rig.tenant.ID, &contactID)
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("list: %+v, %v", rows, err)
+	}
+	byID := map[uuid.UUID]Checkin{}
+	for _, c := range rows {
+		if c.ServerReceivedAt.IsZero() {
+			t.Fatalf("server_received_at missing in read API: %+v", c)
+		}
+		byID[c.ID] = c
+	}
+	if !byID[skewed.ID].ClockSkew || byID[fresh.ID].ClockSkew || byID[noTS.ID].ClockSkew {
+		t.Fatalf("read API skew flags: skewed=%v fresh=%v noTS=%v",
+			byID[skewed.ID].ClockSkew, byID[fresh.ID].ClockSkew, byID[noTS.ID].ClockSkew)
+	}
+}
+
 // Deterministic validation failures: invalid kind is rejected WITHOUT an
 // anchor (a replay fails identically); a schema-valid but semantically
 // invalid lead_capture (no phone) is anchored as error — its replay

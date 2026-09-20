@@ -21,6 +21,10 @@ const EventTypeTicket = "com.opendesk.helpdesk.TicketEvent"
 const (
 	EventNameTicketCreated  = "ticket_created"
 	EventNameTicketResolved = "ticket_resolved"
+	// EventNameSLAPolicyDetached is the SPEC-W45 K24 audit event emitted
+	// when an admin detaches the SLA policy from a ticket (data carries the
+	// actor + detached_policy_id).
+	EventNameSLAPolicyDetached = "sla_policy_detached"
 )
 
 // ticketEventData builds the data payload for one lifecycle event.
@@ -53,13 +57,19 @@ func ticketEventData(t Ticket, eventName string) map[string]any {
 // emit publishes one TicketEvent CloudEvent to the helpdesk events topic via
 // the outbox. Best-effort (same posture as the leads funnel emission): the
 // ticket row is durable; an enqueue failure is logged loudly for
-// reconciliation.
-func (h *Handlers) emit(ctx context.Context, t Ticket, eventName, tenantSlug string) {
+// reconciliation. extra is merged into the data payload (nil for none) —
+// e.g. the K24 CSAT token on ticket_resolved, the actor + detached policy
+// id on the sla_policy_detached audit event.
+func (h *Handlers) emit(ctx context.Context, t Ticket, eventName, tenantSlug string, extra map[string]any) {
 	if h.EventsTopic == "" {
 		return
 	}
+	data := ticketEventData(t, eventName)
+	for k, v := range extra {
+		data[k] = v
+	}
 	payload, err := json.Marshal(events.New("booking-service", EventTypeTicket, tenantSlug,
-		t.TenantID.String(), ticketEventData(t, eventName)))
+		t.TenantID.String(), data))
 	if err != nil {
 		h.log().Warn("helpdesk event marshal failed; skipping emission", zap.Error(err))
 		return
