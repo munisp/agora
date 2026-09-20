@@ -43,6 +43,8 @@ const (
 	TypeContactCaptured   = "com.opendesk.identity.ContactCaptured"
 	TypeConsentGranted    = "com.opendesk.identity.ConsentGranted"
 	TypeConsentRevoked    = "com.opendesk.identity.ConsentRevoked"
+	// SPEC-W45 K9: tenant teardown cascade (delete the tenant subgraph).
+	TypeTenantDeleted = "com.opendesk.identity.TenantDeleted"
 
 	// booking events (opendesk.booking.events)
 	TypeBookingCreated     = "com.opendesk.booking.BookingCreated"

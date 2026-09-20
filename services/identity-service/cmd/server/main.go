@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/opendesk/identity-service/internal/apps"
+	"github.com/opendesk/identity-service/internal/billing"
 	"github.com/opendesk/identity-service/internal/config"
 	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
@@ -96,7 +97,10 @@ func run() error {
 		// K2 service token or K1 tenant-bound subject (dev escape logged).
 		InternalToken:      cfg.InternalToken,
 		TrustDirectTenancy: cfg.TrustDirectTenancy,
-		Logger:             logger,
+		// SPEC-W45 STK O13: data subjects may ALSO self-serve with a booking
+		// portal JWT (contact+tenant bound); unset secret = path unavailable.
+		PortalSecret: cfg.PortalSecret,
+		Logger:       logger,
 	}
 
 	// SPEC-W18 §1/§3: app platform registry. The embedded catalog.yaml is
@@ -129,9 +133,48 @@ func run() error {
 		Logger: logger,
 	}
 
+	kcClient := keycloak.New(cfg.KeycloakURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret)
+
+	// SPEC-W45 K10: realm SMTP bootstrap — PATCH the realm smtpServer map from
+	// KC_REALM_SMTP_* so Keycloak's own credentials e-mails (K8
+	// execute-actions-email) fire. Fail-soft: the MemberInvited →
+	// notification-worker rail (dapr SMTP binding) works regardless.
+	if cfg.RealmSMTPHost != "" {
+		smtpCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := kcClient.ApplyRealmSMTP(smtpCtx, keycloak.RealmSMTPConfig{
+			Host:     cfg.RealmSMTPHost,
+			Port:     cfg.RealmSMTPPort,
+			From:     cfg.RealmSMTPFrom,
+			User:     cfg.RealmSMTPUser,
+			Password: cfg.RealmSMTPPassword,
+		})
+		cancel()
+		if err != nil {
+			logger.Warn("realm SMTP bootstrap failed (invite e-mail via notification-worker unaffected)",
+				zap.String("host", cfg.RealmSMTPHost), zap.Error(err))
+		} else {
+			logger.Info("realm SMTP configured", zap.String("host", cfg.RealmSMTPHost), zap.String("from", cfg.RealmSMTPFrom))
+		}
+	} else {
+		logger.Info("KC_REALM_SMTP_HOST unset — realm SMTP bootstrap skipped (invite e-mail via notification-worker rail)")
+	}
+
+	// SPEC-W45 K contract note: best-effort billing plan push. Disabled when
+	// BILLING_URL is unset (dev default); token-less push fails closed at
+	// the peer (logged loudly here, ERROR per failed push at request time).
+	var billingClient *billing.Client
+	if cfg.BillingURL != "" {
+		billingClient = billing.New(cfg.BillingURL, cfg.BillingInternalToken)
+		if cfg.BillingInternalToken == "" {
+			logger.Warn("BILLING_URL set but BILLING_INTERNAL_TOKEN empty: billing plan push will fail closed (peer 503/401)")
+		}
+	} else {
+		logger.Info("BILLING_URL unset — billing plan push disabled (TenantPlanChanged event remains the sync path)")
+	}
+
 	deps := httpapi.Deps{
 		Store:             st,
-		Keycloak:          keycloak.New(cfg.KeycloakURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret),
+		Keycloak:          kcClient,
 		Permify:           permify.NewHTTPClient(cfg.PermifyURL),
 		Dapr:              daprClient,
 		PubSub:            cfg.PubSubName,
@@ -143,6 +186,7 @@ func run() error {
 		Apps:              appsHandler,
 		InternalToken:     cfg.InternalToken,
 		PlatformAdmins:    cfg.PlatformAdmins,
+		Billing:           billingClient,
 	}
 
 	srv := &http.Server{
