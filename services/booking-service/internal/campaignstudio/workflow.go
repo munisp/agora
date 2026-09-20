@@ -62,6 +62,10 @@ const (
 	// (registered on booking-service's worker by RegisterWorker).
 	ActivityStudioRecordSend = "StudioRecordSendOutcome"
 
+	// ActivityStudioAssignVariant resolves one experiment send's arm via
+	// the model-registry (SPEC-W45 U6; registered by RegisterWorker).
+	ActivityStudioAssignVariant = "StudioAssignVariant"
+
 	// ActivityNotifyPaced mirrors notification-worker's paced wrapper
 	// activity name (service boundary: duplicated, not shared).
 	ActivityNotifyPaced = "NotifyPaced"
@@ -169,6 +173,24 @@ type RecordSendRequest struct {
 	StepIdx      int    `json:"step_idx"`
 	Status       string `json:"status"` // sent | suppressed_dnd | failed
 	Reason       string `json:"reason,omitempty"`
+	// Variant/ExperimentID (SPEC-W45 U6) carry the resolved experiment arm
+	// onto the outcome record; empty for non-experiment sends.
+	Variant      string `json:"variant,omitempty"`
+	ExperimentID string `json:"experiment_id,omitempty"`
+}
+
+// AssignVariantRequest is the ActivityStudioAssignVariant input.
+type AssignVariantRequest struct {
+	TenantID     string `json:"tenant_id"`
+	ExperimentID string `json:"experiment_id"`
+	// PersonID is the stable per-recipient assignment key (the enrollment
+	// id — re-sends to the same enrollment resolve the same arm).
+	PersonID string `json:"person_id"`
+}
+
+// AssignVariantResult is the ActivityStudioAssignVariant output.
+type AssignVariantResult struct {
+	Variant string `json:"variant"` // champion | challenger
 }
 
 // buildPacedRequest renders one queued send to the NotifyPaced payload.
@@ -298,6 +320,30 @@ func StudioSendWorkflow(ctx workflow.Context, in StudioSendBatchInput) error {
 				"enrollment_id", send.EnrollmentID.String(), "error", err)
 			continue
 		}
+		// SPEC-W45 U6: experiment-tagged sends resolve the recipient's arm
+		// BEFORE dispatch (the outcome record carries it; the activity
+		// fails open to the control arm when the registry is unset/down).
+		variant, experimentID := "", ""
+		if send.ExperimentID != nil && *send.ExperimentID != uuid.Nil {
+			var assign AssignVariantResult
+			if err := workflow.ExecuteActivity(ctx, ActivityStudioAssignVariant, AssignVariantRequest{
+				TenantID:     in.TenantID,
+				ExperimentID: send.ExperimentID.String(),
+				PersonID:     send.EnrollmentID.String(),
+			}).Get(ctx, &assign); err != nil {
+				// The activity itself never errors on registry trouble
+				// (fail-open inside); an error here is Temporal-level —
+				// stay fail-open so the send still goes out.
+				logger.Error("variant assignment activity failed; failing open to control arm",
+					"experiment_id", send.ExperimentID.String(),
+					"enrollment_id", send.EnrollmentID.String(), "error", err)
+				assign.Variant = ControlArm
+			}
+			if assign.Variant == "" {
+				assign.Variant = ControlArm
+			}
+			variant, experimentID = assign.Variant, send.ExperimentID.String()
+		}
 		res, err := guardedPacedSend(ctx, req, quiet)
 		status := PacedSendStatusSent
 		reason := ""
@@ -321,6 +367,8 @@ func StudioSendWorkflow(ctx workflow.Context, in StudioSendBatchInput) error {
 			StepIdx:      send.StepIdx,
 			Status:       status,
 			Reason:       reason,
+			Variant:      variant,
+			ExperimentID: experimentID,
 		}).Get(ctx, nil); err != nil {
 			logger.Error("studio send outcome recording failed",
 				"enrollment_id", send.EnrollmentID.String(), "status", status, "error", err)
@@ -342,6 +390,10 @@ func StudioSendWorkflow(ctx workflow.Context, in StudioSendBatchInput) error {
 type SendActivities struct {
 	Store  *Store
 	Logger *zap.Logger
+	// Registry (SPEC-W45 U6) is the model-registry experiments client
+	// (integrator: RegistryFromEnv). nil → assignment fails open to the
+	// control arm.
+	Registry *RegistryClient
 }
 
 func (a *SendActivities) log() *zap.Logger {
@@ -380,7 +432,29 @@ func (a *SendActivities) RecordSendOutcome(ctx context.Context, req RecordSendRe
 	default:
 		return fmt.Errorf("record send outcome: unknown status %q", req.Status)
 	}
-	return a.Store.RecordSendOutcome(ctx, tenantID, journeyID, enrollmentID, req.StepIdx, kind, req.Reason)
+	return a.Store.RecordSendOutcome(ctx, tenantID, journeyID, enrollmentID, req.StepIdx, kind, req.Reason, req.Variant, req.ExperimentID)
+}
+
+// AssignVariant (SPEC-W45 U6) resolves one experiment send's arm via the
+// model-registry. FAIL-OPEN end to end: a nil client, registry outage or
+// bad answer all resolve to the control arm (the client logs WARN) — the
+// activity itself only errors on malformed request ids, which the workflow
+// also absorbs fail-open.
+func (a *SendActivities) AssignVariant(ctx context.Context, req AssignVariantRequest) (AssignVariantResult, error) {
+	experimentID, err := uuid.Parse(req.ExperimentID)
+	if err != nil {
+		return AssignVariantResult{}, fmt.Errorf("assign variant: bad experiment id: %w", err)
+	}
+	tenantID, err := uuid.Parse(req.TenantID)
+	if err != nil {
+		return AssignVariantResult{}, fmt.Errorf("assign variant: bad tenant id: %w", err)
+	}
+	if a.Registry == nil {
+		a.log().Warn("experiment assignment requested but no registry client is wired; failing open to control arm",
+			zap.String("experiment_id", experimentID.String()))
+		return AssignVariantResult{Variant: ControlArm}, nil
+	}
+	return AssignVariantResult{Variant: a.Registry.AssignVariant(ctx, experimentID, tenantID, req.PersonID)}, nil
 }
 
 // RegisterWorker registers the StudioSendWorkflow + its outcome activity
@@ -393,6 +467,7 @@ func (a *SendActivities) RecordSendOutcome(ctx context.Context, req RecordSendRe
 func RegisterWorker(w worker.Worker, acts *SendActivities) {
 	w.RegisterWorkflowWithOptions(StudioSendWorkflow, workflow.RegisterOptions{Name: WorkflowTypeStudioSend})
 	w.RegisterActivityWithOptions(acts.RecordSendOutcome, activity.RegisterOptions{Name: ActivityStudioRecordSend})
+	w.RegisterActivityWithOptions(acts.AssignVariant, activity.RegisterOptions{Name: ActivityStudioAssignVariant})
 }
 
 // ---------------------------------------------------------------------------

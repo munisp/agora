@@ -256,6 +256,13 @@ type JourneyStep struct {
 	WaitHours int                `json:"wait_hours,omitempty"` // wait only; >= 0
 	Condition *SegmentDefinition `json:"condition,omitempty"`  // branch only
 	AbVariant string             `json:"ab_variant,omitempty"` // optional A|B tag
+	// ExperimentID (send only, SPEC-W45 U6): when set, the send workflow
+	// resolves the recipient's arm against the model-registry experiment
+	// (fail-open to the control arm when the registry is down/unset) and
+	// records the variant on the send outcome; conversions reported via
+	// POST /v1/studio/journeys/{id}/conversions feed the registry's
+	// outcome rail (fail-closed).
+	ExperimentID *uuid.UUID `json:"experiment_id,omitempty"`
 	// TemplateName is the Meta-approved WhatsApp template name (kind
 	// whatsapp only, REQUIRED there — SPEC-W21).
 	TemplateName string `json:"template_name,omitempty"`
@@ -312,7 +319,8 @@ func ValidateSteps(steps Steps) error {
 		switch st.Type {
 		case StepWait:
 			if st.Kind != "" || st.Template != "" || st.Condition != nil ||
-				st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 {
+				st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 ||
+				st.ExperimentID != nil {
 				return fmt.Errorf("%w: steps[%d] wait takes only wait_hours", ErrInvalidInput, i)
 			}
 		case StepSend:
@@ -350,7 +358,8 @@ func ValidateSteps(steps Steps) error {
 			}
 		case StepBranch:
 			if st.Kind != "" || st.Template != "" || st.WaitHours != 0 ||
-				st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 {
+				st.TemplateName != "" || st.Language != "" || len(st.Params) > 0 ||
+				st.ExperimentID != nil {
 				return fmt.Errorf("%w: steps[%d] branch takes only condition", ErrInvalidInput, i)
 			}
 			if err := ValidateSegmentDefinition(st.Condition); err != nil {
@@ -439,4 +448,8 @@ const (
 	EventSendSkipped    = "send_skipped" // ussd (no outbound binding) / missing channel address
 	EventCompleted      = "completed"
 	EventExited         = "exited"
+	// EventConversionReported (SPEC-W45 U6): a conversion was reported for
+	// an experiment-tagged send via POST /journeys/{id}/conversions; the
+	// payload carries experiment_id, variant and the converted flag.
+	EventConversionReported = "conversion_reported"
 )
