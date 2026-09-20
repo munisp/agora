@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/opendesk/booking-service/internal/apikey"
 	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
@@ -118,6 +119,11 @@ type Deps struct {
 	// closed with 503; a missing/wrong X-Internal-Token header answers 401
 	// (constant-time compare).
 	InternalToken string
+	// ExtKeys validates X-Api-Key on the SPEC-W45 K17 external bookings
+	// surface (/v1/ext/bookings — the APISIX api-ext-booking upstream).
+	// Nil → NewRouter substitutes an UNCONFIGURED validator that fails
+	// closed with 503, so the routes always exist and never silently open.
+	ExtKeys *apikey.Validator
 
 	// SPEC-W19 integrator (additive): the four enterprise app packages.
 	// Each Deps bundle is built in cmd/server/main.go (store + topics); the
@@ -186,7 +192,7 @@ func NewRouter(d Deps) http.Handler {
 	if d.TenantBySlug == nil && d.Resolver != nil {
 		d.TenantBySlug = d.Resolver.BySlug
 	}
-	s := &server{d: d, portalLimiter: newPortalRateLimiter(), promoLimiter: newPortalRateLimiter()}
+	s := &server{d: d, portalLimiter: newPortalRateLimiter(), promoLimiter: newPortalRateLimiter(), qrLimiter: newPortalRateLimiter(), waitlistLimiter: newPortalRateLimiter()}
 
 	// SPEC-W18 Agent D (additive): the entitlement gate prefers the tenant
 	// resolved by tenantMiddleware (covers the JWT-claim path where no
@@ -258,6 +264,10 @@ func NewRouter(d Deps) http.Handler {
 			r.Get("/{id}", s.getBooking)
 			r.With(s.require("manage_bookings")).Post("/{id}/reschedule", s.rescheduleBooking)
 			r.With(s.require("manage_bookings")).Post("/{id}/cancel", s.cancelBooking)
+			// SPEC-W45 K11/K12: booking completion (deposit capture +
+			// BookingCompleted + loyalty hook) and the refund rail.
+			r.With(s.require("manage_bookings")).Post("/{id}/complete", s.completeBooking)
+			r.With(s.require("manage_bookings")).Post("/{id}/refund", s.refundBooking)
 		})
 		r.Route("/waitlist", func(r chi.Router) {
 			r.With(s.require("manage_bookings")).Post("/", s.createWaitlistEntry)
@@ -341,7 +351,17 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("view_analytics")).Get("/{id}", s.getReferral)
 			r.With(s.require("manage_bookings")).Post("/{id}/verify", s.verifyReferral)
 			r.With(s.require("manage_bookings")).Post("/{id}/reject", s.rejectReferral)
+			// SPEC-W45 STK O10: the referral agent registry. POST = staff
+			// registration (pending), GET = staff read, PATCH = ADMIN-ONLY
+			// approval/suspension + beneficiary link (role checked in the
+			// handler — no finer Permify permission exists).
+			r.With(s.require("manage_bookings")).Post("/agents", s.createReferralAgent)
+			r.With(s.require("view_analytics")).Get("/agents", s.listReferralAgents)
+			r.With(s.require("manage_bookings")).Patch("/agents/{id}", s.updateReferralAgent)
 		})
+		// SPEC-W45 item 9: QR scan analytics read path (the public ingest
+		// half lives OUTSIDE this group — see below).
+		r.With(s.require("view_analytics")).Get("/qr/scans", s.listQRScans)
 		r.Route("/commissions", func(r chi.Router) {
 			r.With(s.require("view_analytics")).Get("/rules", s.listCommissionRules)
 			r.With(s.require("manage_bookings")).Post("/rules", s.createCommissionRule)
@@ -392,8 +412,9 @@ func NewRouter(d Deps) http.Handler {
 			return t, t.ID != uuid.Nil
 		}
 		s.d.Helpdesk.UserFromContext = userFrom
+		s.d.Helpdesk.RolesFromContext = rolesFrom // SPEC-W45 K24: admin-only SLA-policy detach
 		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
-			s.appGateChain("helpdesk", s.requireReadWrite())...)
+			s.appGateChain("helpdesk", s.helpdeskPerms())...)
 		helpdesk.RegisterRoutes(r, s.d.Helpdesk, mw...)
 	}
 	if s.d.Workorders != nil {
@@ -470,6 +491,15 @@ func NewRouter(d Deps) http.Handler {
 		mw := append([]func(http.Handler) http.Handler{s.tenantMiddleware},
 			s.appGateChain("social-publisher", s.requireReadWrite())...)
 		socialpub.RegisterRoutes(r, s.d.Social, mw...)
+		// SPEC-W45 CODER-H (route-registration exception granted — this ONE
+		// route lives in server.go): GET /v1/social/settings surfaces the
+		// per-provider config_status (configured|not_configured) so the
+		// settings UI can render an honest "connect provider" state.
+		// Registered OUTSIDE the package's RegisterRoutes per the work
+		// order; the chain mirrors the group (tenant → appgate → read perm).
+		r.With(append([]func(http.Handler) http.Handler{s.tenantMiddleware},
+			s.appGateChain("social-publisher", s.require("view_analytics"))...)...).
+			Get("/v1/social/settings", socialpub.SettingsHandler(s.d.Social))
 	}
 	// SPEC-W21 integrator — END
 
@@ -478,11 +508,43 @@ func NewRouter(d Deps) http.Handler {
 	// owning tenant server-side (public site-slug resolution pattern).
 	r.Post("/v1/promo/redeem", s.redeemPromo)
 
+	// Public QR scan ingest (SPEC-W45 item 9): rate-limited, tenant-slug
+	// bound via the published-site registry (same public site-slug
+	// resolution pattern as /v1/promo/redeem).
+	r.Post("/v1/qr/scan", s.ingestQRScan)
+
+	// Public waitlist claim (SPEC-W45 CODER-M, K13 completion): the public
+	// claim page (CODER-I's /p/{slug}/claim?token=...) reads the claim
+	// preview and performs the claim with the unguessable claim_token as
+	// the capability — no tenant middleware (the token resolves the tenant
+	// server-side), IP+token rate-limited like the other public routes.
+	// The legacy tenant-scoped POST /v1/waitlist/{id}/claim stays for
+	// compatibility.
+	r.Get("/v1/waitlist/claim-info", s.waitlistClaimInfo)
+	r.Post("/v1/waitlist/claim", s.claimWaitlistByToken)
+
 	// IoT/webhook incident ingest (SPEC-W11 Part B §6): invoked
 	// service-to-service via Dapr by the messaging-gateway, which already
 	// authenticated the caller (per-tenant shared secret) — hence no tenant
 	// middleware here; the body carries tenant_id / tenant_slug.
 	r.Post("/v1/incidents/ingest", s.ingestIncident)
+
+	// SPEC-W45 K17 (booking half): the external read-only bookings surface
+	// behind the APISIX api-ext-booking route (/api/ext/booking/* →
+	// /v1/ext/bookings/*). Registered OUTSIDE the /v1 JWT/tenant/Permify
+	// group by design — auth is the apikey middleware ONLY (X-Api-Key →
+	// identity /internal/api-keys/validate, scope bookings:read, per-key
+	// rate limit, ≤60s positive cache); the tenant binding comes FROM the
+	// key. A nil ExtKeys is replaced by an unconfigured validator that
+	// fails closed with 503 — the routes always exist, never silently open.
+	if s.d.ExtKeys == nil {
+		s.d.ExtKeys = apikey.New("", "", d.Logger)
+	}
+	r.Route("/v1/ext/bookings", func(r chi.Router) {
+		r.Use(s.d.ExtKeys.Middleware(apikey.ScopeBookingsRead))
+		r.Get("/", s.extListBookings)
+		r.Get("/{id}", s.extGetBooking)
+	})
 
 	// Public civic reporting endpoints (SPEC-W32 WS-A): registered WITHOUT
 	// the tenant middleware — citizens have no accounts (§0.2); the APISIX
@@ -589,6 +651,10 @@ type server struct {
 	d             Deps
 	portalLimiter *portalRateLimiter
 	promoLimiter  *portalRateLimiter // SPEC-W13 §6: public promo redeem guard
+	qrLimiter     *portalRateLimiter // SPEC-W45 item 9: public QR scan ingest guard
+	// waitlistLimiter guards the PUBLIC waitlist claim-info/claim token
+	// endpoints (SPEC-W45 CODER-M, K13 completion).
+	waitlistLimiter *portalRateLimiter
 }
 
 func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -643,7 +709,14 @@ func (s *server) tenantMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxTenant, tenant)
-		ctx = context.WithValue(ctx, ctxUser, claims.Sub)
+		// Caller identity: the JWT sub wins; the X-User-Id header (trusted
+		// internal callers / tests) is the fallback — same posture as the
+		// X-User-Roles fallback below. require() 401s when neither resolves.
+		user := claims.Sub
+		if user == "" {
+			user = strings.TrimSpace(r.Header.Get("X-User-Id"))
+		}
+		ctx = context.WithValue(ctx, ctxUser, user)
 		// SPEC-W32 WS-A: realm roles for role-based reporter masking. JWT
 		// realm_access.roles wins; the X-User-Roles header (comma-separated,
 		// injected by trusted internal callers / tests) is the fallback.
@@ -739,6 +812,65 @@ func (s *server) requireReadWrite() func(http.Handler) http.Handler {
 	}
 }
 
+// helpdeskPerms (SPEC-W45 CODER-H exception, per CODER-E contract note):
+// POST /v1/helpdesk/tickets additionally accepts service-to-service
+// callers presenting X-Internal-Token == BOOKING_INTERNAL_TOKEN (K2
+// pattern) so conversation-service escalation automation can open
+// tickets; every other helpdesk route keeps the plain read/write Permify
+// posture unchanged.
+func (s *server) helpdeskPerms() func(http.Handler) http.Handler {
+	rw := s.requireReadWrite()
+	createAlt := s.requireOrInternalToken("manage_bookings")
+	return func(next http.Handler) http.Handler {
+		rwH := rw(next)
+		createH := createAlt(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/v1/helpdesk/tickets" {
+				createH.ServeHTTP(w, r)
+				return
+			}
+			rwH.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requireOrInternalToken enforces the Permify permission for human
+// callers; a request CARRYING an X-Internal-Token header takes the K2
+// service path instead — constant-time comparison against
+// Deps.InternalToken (fail-closed 503 when unset, 401 on mismatch,
+// identical semantics to internAuth). A valid token stamps a synthetic
+// service actor ("service:<X-Service-Name>", default "service:internal")
+// into the context — the helpdesk package records it as the
+// ticket_events actor — and skips the Permify check (the token IS the
+// authorization). Humans send no header and are untouched.
+func (s *server) requireOrInternalToken(permission string) func(http.Handler) http.Handler {
+	perm := s.require(permission)
+	return func(next http.Handler) http.Handler {
+		permH := perm(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("X-Internal-Token") == "" {
+				permH.ServeHTTP(w, r) // human path: Permify (unchanged)
+				return
+			}
+			if s.d.InternalToken == "" {
+				s.d.Logger.Error("internal-token helpdesk ticket create hit but BOOKING_INTERNAL_TOKEN is unset (fail closed)")
+				writeError(w, http.StatusServiceUnavailable, "internal token not configured")
+				return
+			}
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Token")), []byte(s.d.InternalToken)) != 1 {
+				writeError(w, http.StatusUnauthorized, "invalid internal token")
+				return
+			}
+			actor := "service:" + strings.TrimSpace(r.Header.Get("X-Service-Name"))
+			if actor == "service:" {
+				actor = "service:internal"
+			}
+			ctx := context.WithValue(r.Context(), ctxUser, actor)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
 // appGateChain (SPEC-W19 integrator) returns the appgate entitlement
 // middleware for appID followed by any extra middleware — an empty slice
 // prefix when the gate is not configured (nil Deps.AppGate keeps behavior
@@ -827,6 +959,7 @@ func (s *server) internal(w http.ResponseWriter, err error) {
 
 // mapOpError converts bookingops/store sentinel errors to HTTP statuses.
 func (s *server) mapOpError(w http.ResponseWriter, err error) {
+	var paymentsRailErr *bookingops.PaymentsError
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
@@ -834,10 +967,18 @@ func (s *server) mapOpError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, bookingops.ErrPhoneRequired):
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
-	case errors.Is(err, bookingops.ErrSlotUnavailable):
+	case errors.Is(err, bookingops.ErrSlotUnavailable), errors.Is(err, bookingops.ErrInvalidTransition):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, bookingops.ErrClaimExpired):
+		writeError(w, http.StatusGone, err.Error())
 	case errors.Is(err, bookingops.ErrInvalidInput):
 		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, bookingops.ErrPaymentsNotConfigured):
+		// SPEC-W45 K11/K12: fail-closed money posture — the config signal
+		// travels in the body (PAYMENTS_URL unset).
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+	case errors.As(err, &paymentsRailErr):
+		writeError(w, http.StatusBadGateway, paymentsRailErr.Error())
 	default:
 		s.internal(w, err)
 	}
