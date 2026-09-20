@@ -9,15 +9,28 @@
 // is synchronous request/reply — the aggregator shows our response body to
 // the subscriber. Processing is bounded by the shared 25s webhook context;
 // internal failures are logged and surfaced as a generic END line (never a
-// 5xx the aggregator would retry mid-session). The only 4xx is 400 for a
-// garbage form (missing sessionId/serviceCode/phoneNumber).
+// 5xx the aggregator would retry mid-session). The 4xx/5xx set is exactly:
+// 503 (callback auth not configured), 401 (wrong path secret), 429 (per-phone
+// rate limit), 400 (garbage form — missing sessionId/serviceCode/phoneNumber).
+//
+// Authentication (SPEC-W45 K14/OOS-06): the route is
+// POST /ussd/callback/{secret} — the shared secret lives in the path (the
+// Africa's Talking dashboard only lets you configure a callback URL, no
+// custom headers). AT_CALLBACK_SECRET unset fails CLOSED (503); a wrong
+// secret gets 401 via a constant-time compare. The phoneNumber form field
+// is UNVERIFIED aggregator-asserted input: it keys only best-effort abuse
+// control (the per-phone rate limit) and session continuity — never trust
+// it for identity/authorization decisions.
 package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
+	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/opendesk/messaging-gateway/internal/channel"
 	"go.uber.org/zap"
 )
@@ -29,6 +42,18 @@ type USSDConfig struct {
 	Menus        channel.USSDMenuFetcher  // nil: pass-through text mode for every tenant
 	Conversation channel.USSDConversation // nil: every session ends with the fallback line
 	SessionTTL   time.Duration            // default channel.USSDSessionTTL (180s)
+
+	// CallbackSecret (AT_CALLBACK_SECRET) authenticates the callback path
+	// (K14). Empty = fail-closed: every callback answers 503.
+	CallbackSecret string
+	// RatePerMinute bounds callbacks per phoneNumber (default 30, sliding
+	// window). RateLimiter may be injected (tests); nil lazily builds the
+	// default in-memory limiter (see ratelimit.go for the per-replica
+	// residual note).
+	RatePerMinute int
+	RateLimiter   *PhoneRateLimiter
+
+	rlMu sync.Mutex
 }
 
 // ussdFallbackLine is shown when conversation-service is unreachable —
@@ -36,21 +61,65 @@ type USSDConfig struct {
 // subscriber is not stuck in a broken session.
 const ussdFallbackLine = "Service unavailable. Please try again later."
 
-// handleUSSDCallback implements SPEC-W12 §1.
+// ussdDefaultRatePerMinute is the K14 per-phone sliding-window default.
+const ussdDefaultRatePerMinute = 30
+
+// limiter returns the per-phone rate limiter, lazily building the default.
+func (c *USSDConfig) limiter() *PhoneRateLimiter {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	if c.RateLimiter == nil {
+		limit := c.RatePerMinute
+		if limit <= 0 {
+			limit = ussdDefaultRatePerMinute
+		}
+		c.RateLimiter = NewPhoneRateLimiter(limit, time.Minute)
+	}
+	return c.RateLimiter
+}
+
+// handleUSSDCallback implements SPEC-W12 §1 + the K14/OOS-06 auth contract:
+// the shared secret rides in the path (/ussd/callback/{secret}) and is
+// checked BEFORE any body parsing or logging; then the per-phone rate
+// limit; then the session state machine.
 func (s *Server) handleUSSDCallback(w http.ResponseWriter, r *http.Request) {
+	if s.USSD == nil || s.USSD.CallbackSecret == "" {
+		// Fail-closed (K14): an unauthenticated USSD callback endpoint is a
+		// free conversation-service amplifier. 503, not a silent END line.
+		s.Log.Warn("ussd callback rejected: AT_CALLBACK_SECRET not configured")
+		writeError(w, http.StatusServiceUnavailable, "ussd callback not configured (AT_CALLBACK_SECRET)")
+		return
+	}
+	provided := chi.URLParam(r, "secret")
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(s.USSD.CallbackSecret)) != 1 {
+		// Never log the presented secret (it may be a near-miss of the real
+		// one); the request id correlates abuse investigations.
+		s.Log.Warn("ussd callback rejected: bad path secret")
+		writeError(w, http.StatusUnauthorized, "invalid callback secret")
+		return
+	}
+
 	if err := r.ParseForm(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid form body")
 		return
 	}
 	sessionID := r.PostForm.Get("sessionId")
 	serviceCode := r.PostForm.Get("serviceCode")
+	// phoneNumber is UNVERIFIED aggregator-asserted input — it keys the
+	// rate limiter and session record only; never an auth/identity decision.
 	phone := r.PostForm.Get("phoneNumber")
 	text := r.PostForm.Get("text")
 	if sessionID == "" || serviceCode == "" || phone == "" {
 		writeError(w, http.StatusBadRequest, "sessionId, serviceCode and phoneNumber are required")
 		return
 	}
-	if s.USSD == nil || s.USSD.Store == nil {
+	if !s.USSD.limiter().Allow(phone) {
+		s.Log.Warn("ussd callback rate limited",
+			zap.String("service_code", serviceCode), zap.String("session_id", sessionID))
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+	if s.USSD.Store == nil {
 		s.Log.Warn("ussd callback: not configured, ending session",
 			zap.String("service_code", serviceCode))
 		writeUSSD(w, "END", ussdFallbackLine)

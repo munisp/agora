@@ -4,8 +4,12 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -38,8 +42,15 @@ type Server struct {
 	IncidentSecrets map[string]string // INCIDENT_WEBHOOK_SECRETS parsed (tenant slug|id → secret)
 	IncidentIngest  IncidentIngester  // nil: forward disabled, posts drop + 200
 
-	// USSD inbound (SPEC-W12 Agent A): POST /webhooks/ussd.
-	USSD *USSDConfig // nil: USSD disabled, callbacks get the fallback END line
+	// USSD inbound (SPEC-W12 Agent A + SPEC-W45 K14): POST
+	// /ussd/callback/{secret}.
+	USSD *USSDConfig // nil/empty secret: USSD disabled, callbacks fail-closed 503
+
+	// Upstreams are the resolved internal bases (conversation / voice /
+	// booking) probed by /healthz (SPEC-W45 ORPH O2): reachability is
+	// REPORTED (warn-level) but never changes the 200 — the gateway itself
+	// is healthy and serving provider webhooks regardless.
+	Upstreams []UpstreamCheck
 
 	// NG SMS aggregator failover chain (SPEC-W12 Agent A): POST /v1/sms/send.
 	SMSChain *provider.Failover // nil: chain endpoint disabled (503)
@@ -54,11 +65,7 @@ func (s *Server) Router() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`)) //nolint:errcheck
-	})
+	r.Get("/healthz", s.handleHealthz)
 	r.Get("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		s.Metrics.Render(w)
@@ -87,12 +94,41 @@ func (s *Server) Router() http.Handler {
 		// APISIX /webhooks/* route, authenticated by the per-tenant shared
 		// secret in the body.
 		r.Post("/incidents", s.handleIncidentWebhook)
-		// USSD session callback (SPEC-W12 Agent A §1): Africa's Talking
-		// posts the session form here; the answer is the text/plain
-		// CON/END line shown to the subscriber. See docs/channels-ussd.md.
-		r.Post("/ussd", s.handleUSSDCallback)
 	})
+
+	// USSD session callback (SPEC-W12 Agent A §1 + SPEC-W45 K14/OOS-06):
+	// Africa's Talking posts the session form here; the answer is the
+	// text/plain CON/END line shown to the subscriber. The shared secret
+	// lives in the path (the AT dashboard configures a bare callback URL —
+	// no custom headers); AT_CALLBACK_SECRET unset fails closed (503), a
+	// wrong secret gets 401 (constant-time compare). See
+	// docs/channels-ussd.md.
+	r.Post("/ussd/callback/{secret}", s.handleUSSDCallback)
 	return r
+}
+
+// UpstreamCheck is one resolved internal base reported by /healthz.
+type UpstreamCheck struct {
+	Name string // "conversation" | "voice" | "booking"
+	Base string // fully resolved base (direct or Dapr invoke)
+}
+
+// handleHealthz reports liveness plus the reachability of the resolved
+// internal bases (SPEC-W45 ORPH O2). An unreachable base is a WARN-level
+// signal in the body + logs — never a non-200 (the gateway still serves
+// provider webhooks; the inbound bridge degrades per-message instead).
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	status := map[string]string{}
+	for _, u := range s.Upstreams {
+		if err := ProbeBase(r.Context(), u.Base); err != nil {
+			s.Log.Warn("healthz: upstream base unreachable",
+				zap.String("upstream", u.Name), zap.String("base", u.Base), zap.Error(err))
+			status[u.Name] = "unreachable"
+		} else {
+			status[u.Name] = "ok"
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "upstreams": status})
 }
 
 type smsRequest struct {
@@ -234,6 +270,30 @@ func requireToMessage(w http.ResponseWriter, to, message string) bool {
 
 func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+// probeTimeout bounds one upstream reachability probe (health endpoint and
+// the boot-time warn probe share it).
+const probeTimeout = 2 * time.Second
+
+// ProbeBase reports whether a resolved internal base answers HTTP at all
+// (GET {base}/healthz; for Dapr invoke bases this invokes the target app's
+// /healthz through the sidecar). ANY HTTP response — even a 4xx/5xx — means
+// reachable; only a transport failure counts as unreachable.
+func ProbeBase(ctx context.Context, base string) error {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: probeTimeout}).Do(req)
+	if err != nil {
+		return fmt.Errorf("probe %s: %w", base, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
