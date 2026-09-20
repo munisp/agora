@@ -315,13 +315,22 @@ func NewIncidentIngester(base string) IncidentIngester {
 	return &httpIncidentIngester{base: base, hc: &http.Client{Timeout: 10 * time.Second}}
 }
 
-// ResolveIncidentBase maps the BOOKING_URL override / DAPR_HTTP_PORT onto
-// the booking-service base URL (same convention as channel.ResolveBases).
-func ResolveIncidentBase(bookingOverride string, daprHTTPPort int) string {
+// DefaultBookingURL is the direct booking-service base for sidecar-less
+// deployments (SPEC-W45 ORPH O2, compose service name/port).
+const DefaultBookingURL = "http://booking:7002"
+
+// ResolveIncidentBase maps the BOOKING_URL override onto the
+// booking-service base URL (same convention as channel.ResolveBases):
+// override wins; with a Dapr sidecar the invoke API (registered app-id
+// `booking`); without a sidecar the direct-base default.
+func ResolveIncidentBase(bookingOverride string, daprHTTPPort int, sidecar bool) string {
 	if bookingOverride != "" {
 		return bookingOverride
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d/v1.0/invoke/booking/method", daprHTTPPort)
+	if sidecar {
+		return fmt.Sprintf("http://127.0.0.1:%d/v1.0/invoke/booking/method", daprHTTPPort)
+	}
+	return DefaultBookingURL
 }
 
 func (c *httpIncidentIngester) Ingest(ctx context.Context, body []byte) error {
