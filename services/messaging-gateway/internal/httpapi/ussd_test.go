@@ -60,24 +60,35 @@ var testMenu = []channel.USSDMenuItem{
 	{Key: "2", Label: "Talk to an agent", Action: "handoff"},
 }
 
+// ussdTestSecret is the K14 path secret used across the USSD tests.
+const ussdTestSecret = "test-callback-secret"
+
 func newUSSDServer(store channel.USSDSessionStore, menus channel.USSDMenuFetcher, conv channel.USSDConversation) *Server {
 	return &Server{
 		USSD: &USSDConfig{
 			Sites: map[string]channel.Site{
 				"ussd:*384*123#": {SiteSlug: "acme-ng", TenantID: "9f1c2a4e-0000-4000-8000-000000000001"},
 			},
-			Store:        store,
-			Menus:        menus,
-			Conversation: conv,
-			SessionTTL:   channel.USSDSessionTTL,
+			Store:          store,
+			Menus:          menus,
+			Conversation:   conv,
+			SessionTTL:     channel.USSDSessionTTL,
+			CallbackSecret: ussdTestSecret,
 		},
 		Metrics: metrics.New(),
 		Log:     zap.NewNop(),
 	}
 }
 
-// ussdPost issues one aggregator callback (form fields per SPEC-W12 §1).
+// ussdPost issues one aggregator callback (form fields per SPEC-W12 §1) on
+// the authenticated K14 path.
 func ussdPost(t *testing.T, h http.Handler, sessionID, serviceCode, phone, text string) *httptest.ResponseRecorder {
+	t.Helper()
+	return ussdPostSecret(t, h, ussdTestSecret, sessionID, serviceCode, phone, text)
+}
+
+// ussdPostSecret issues one callback with an explicit path secret.
+func ussdPostSecret(t *testing.T, h http.Handler, secret, sessionID, serviceCode, phone, text string) *httptest.ResponseRecorder {
 	t.Helper()
 	form := url.Values{}
 	if sessionID != "" {
@@ -92,7 +103,7 @@ func ussdPost(t *testing.T, h http.Handler, sessionID, serviceCode, phone, text 
 	if text != "" {
 		form.Set("text", text)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/webhooks/ussd", strings.NewReader(form.Encode()))
+	req := httptest.NewRequest(http.MethodPost, "/ussd/callback/"+secret, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -307,7 +318,7 @@ func TestUSSDGarbageForm400(t *testing.T) {
 		t.Fatalf("missing serviceCode must be 400, got %d", rec.Code)
 	}
 	// Not a form at all.
-	req := httptest.NewRequest(http.MethodPost, "/webhooks/ussd", strings.NewReader("\xff\xfe garbage"))
+	req := httptest.NewRequest(http.MethodPost, "/ussd/callback/"+ussdTestSecret, strings.NewReader("\xff\xfe garbage"))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec = httptest.NewRecorder()
 	s.Router().ServeHTTP(rec, req)
@@ -353,10 +364,53 @@ func TestUSSDEmptyReplyEndsSession(t *testing.T) {
 }
 
 func TestUSSDNotConfigured(t *testing.T) {
+	// K14 fail-closed: no USSD config at all → 503 (not a silent END line).
 	s := &Server{Metrics: metrics.New(), Log: zap.NewNop()} // no USSD config
 	rec := ussdPost(t, s.Router(), "sess-9", "*384*123#", "+2348012345678", "")
-	if body := mustPlain(t, rec); !strings.HasPrefix(body, "END ") {
-		t.Fatalf("unconfigured USSD must answer END, got %q", body)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured USSD must fail closed 503, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// K14 fail-closed: config present but AT_CALLBACK_SECRET unset → 503 even
+// with the "right" path segment.
+func TestUSSDCallbackSecretUnset503(t *testing.T) {
+	s := newUSSDServer(channel.NewMemoryUSSDStore(), &fakeMenus{menu: testMenu}, &fakeConversation{})
+	s.USSD.CallbackSecret = ""
+	rec := ussdPostSecret(t, s.Router(), "anything", "sess-9b", "*384*123#", "+2348012345678", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unset AT_CALLBACK_SECRET must be 503, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// K14 auth matrix: wrong/empty secret → 401 (constant-time compare); the
+// right secret passes through to the session flow.
+func TestUSSDCallbackSecretAuthMatrix(t *testing.T) {
+	conv := &fakeConversation{resp: channel.USSDTurnResponse{Reply: "hi", Continue: true}}
+	s := newUSSDServer(channel.NewMemoryUSSDStore(), &fakeMenus{menu: testMenu}, conv)
+
+	for _, bad := range []string{"wrong-secret", "test-callback-secre", "test-callback-secretx"} {
+		rec := ussdPostSecret(t, s.Router(), bad, "sess-9c", "*384*123#", "+2348012345678", "")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("secret %q must be 401, got %d (%s)", bad, rec.Code, rec.Body.String())
+		}
+	}
+	// An empty path segment does not even match the route → 404 (also a
+	// rejection, just outside the handler).
+	req := httptest.NewRequest(http.MethodPost, "/ussd/callback/", strings.NewReader("sessionId=s&serviceCode=c&phoneNumber=p"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("empty secret must not reach the handler, got 200")
+	}
+	if n := len(conv.captured()); n != 0 {
+		t.Fatalf("rejected callbacks must not reach conversation-service, got %d calls", n)
+	}
+
+	rec = ussdPostSecret(t, s.Router(), ussdTestSecret, "sess-9c", "*384*123#", "+2348012345678", "")
+	if body := mustPlain(t, rec); body != "CON hi" {
+		t.Fatalf("right secret must reach the session flow, got %q", body)
 	}
 }
 
