@@ -188,15 +188,42 @@ func (m *MockRail) Transfers() []string {
 // ledger; transfer IDs are idempotent there.
 // ---------------------------------------------------------------------------
 
+// EnvPaymentsInternalToken (PAYMENTS_INTERNAL_TOKEN) is the K2
+// service-auth token payments accepts in lieu of a gateway money role on
+// the money-mutation routes (require_money_mutation covers /v1/transfers).
+// Already present on booking's compose env; when unset the HTTPRail sends
+// NO X-Internal-Token header and payments answers 401 — the intent then
+// dead-letters (fail-closed: never a simulated success), which is the
+// documented posture for an unwired token.
+const EnvPaymentsInternalToken = "PAYMENTS_INTERNAL_TOKEN"
+
 // HTTPRail posts transfers to the payments-service bridge endpoint.
 type HTTPRail struct {
 	BaseURL string
-	hc      *http.Client
+	// InternalToken rides as X-Internal-Token (K2 service auth). Empty =
+	// the header is omitted and payments' require_money_mutation answers
+	// 401 (documented fail posture — see EnvPaymentsInternalToken).
+	InternalToken string
+	hc            *http.Client
+}
+
+// HTTPRailOption customizes NewHTTPRail.
+type HTTPRailOption func(*HTTPRail)
+
+// WithInternalToken sets the K2 service-auth token sent as X-Internal-Token
+// (V2-7: payments /v1/transfers 401s without it under
+// require_money_mutation).
+func WithInternalToken(token string) HTTPRailOption {
+	return func(r *HTTPRail) { r.InternalToken = token }
 }
 
 // NewHTTPRail builds the live rail against baseURL (trailing slash trimmed).
-func NewHTTPRail(baseURL string) *HTTPRail {
-	return &HTTPRail{BaseURL: strings.TrimRight(baseURL, "/"), hc: &http.Client{Timeout: 20 * time.Second}}
+func NewHTTPRail(baseURL string, opts ...HTTPRailOption) *HTTPRail {
+	r := &HTTPRail{BaseURL: strings.TrimRight(baseURL, "/"), hc: &http.Client{Timeout: 20 * time.Second}}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // Name implements DisbursementRail.
@@ -214,6 +241,11 @@ func (r *HTTPRail) CreateTransfer(ctx context.Context, in RailTransfer) (string,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Idempotency-Key", in.TransferID)
+	// V2-7: K2 service auth — payments' require_money_mutation accepts
+	// X-Internal-Token for service callers; without it /v1/transfers 401s.
+	if r.InternalToken != "" {
+		req.Header.Set("X-Internal-Token", r.InternalToken)
+	}
 	resp, err := r.hc.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("rail transfer %s: %w", in.TransferID, err)
@@ -242,9 +274,12 @@ func (failClosedRail) CreateTransfer(context.Context, RailTransfer) (string, err
 // LENDING_TB_BRIDGE_URL non-empty → HTTPRail (live); else
 // ALLOW_MOCK_RAILS=1 → MockRail (dev simulation); else FAIL CLOSED with
 // ErrRailNotConfigured (W39 SIM-001 — the mock posture is opt-in only).
+// The HTTPRail carries PAYMENTS_INTERNAL_TOKEN as X-Internal-Token (V2-7);
+// an unset token means NO header and 401s from payments — fail-closed by
+// dead-letter, never simulated success.
 func RailFromEnv(log *zap.Logger) (DisbursementRail, error) {
 	if base := os.Getenv(EnvLendingTBBridgeURL); base != "" {
-		return NewHTTPRail(base), nil
+		return NewHTTPRail(base, WithInternalToken(os.Getenv(EnvPaymentsInternalToken))), nil
 	}
 	if lending.MockRailsAllowed() {
 		return NewMockRail(log), nil

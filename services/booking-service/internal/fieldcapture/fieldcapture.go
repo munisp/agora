@@ -168,6 +168,12 @@ type ItemResult struct {
 	Error     string     `json:"error,omitempty"`
 }
 
+// ClockSkewThreshold (SPEC-W45 OOS-21): when the client-claimed captured_at
+// and the server's receipt timestamp differ by more than this, the read API
+// flags the row (the device clock is untrustworthy — e.g. an offline PWA
+// queued for hours, or a mis-set handset).
+const ClockSkewThreshold = 5 * time.Minute
+
 // Checkin mirrors booking.field_checkins: one geo check-in event (the W8
 // contact_locations store has no history, so the history lives here).
 type Checkin struct {
@@ -181,4 +187,23 @@ type Checkin struct {
 	Payload    json.RawMessage `json:"payload"`
 	CapturedAt *time.Time      `json:"captured_at"`
 	CreatedAt  time.Time       `json:"created_at"`
+	// SPEC-W45 OOS-21: server-side receipt timestamp stored alongside the
+	// client-claimed captured_at, plus the derived skew flag surfaced in
+	// the read API.
+	ServerReceivedAt time.Time `json:"server_received_at"`
+	ClockSkew        bool      `json:"clock_skew"`
+}
+
+// ComputeClockSkew sets ClockSkew from captured_at vs server_received_at
+// (false when the client sent no captured_at — nothing to distrust).
+func (c *Checkin) ComputeClockSkew() {
+	c.ClockSkew = false
+	if c.CapturedAt == nil || c.ServerReceivedAt.IsZero() {
+		return
+	}
+	diff := c.ServerReceivedAt.Sub(*c.CapturedAt)
+	if diff < 0 {
+		diff = -diff
+	}
+	c.ClockSkew = diff > ClockSkewThreshold
 }

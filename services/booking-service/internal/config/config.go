@@ -4,7 +4,6 @@ package config
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -266,26 +265,6 @@ func Load() (Config, error) {
 			DevPortalSecretDefault, EnvDevInsecure)
 	}
 	return cfg, nil
-}
-
-// databaseURL resolves the booking DB DSN. DATABASE_URL wins; otherwise the
-// DSN is constructed from PG_DSN (base) + PG_DATABASE with an optional
-// PG_USER/PG_PASS credential override (per-service DB roles, SPEC-W3 §2).
-// The default credentials stay opendesk/opendesk for local dev.
-func databaseURL() string {
-	if v := os.Getenv("DATABASE_URL"); v != "" {
-		return v
-	}
-	base := envStr("PG_DSN", "postgres://opendesk:opendesk@postgres:5432")
-	u, err := url.Parse(base)
-	if err != nil {
-		return ""
-	}
-	if user := os.Getenv("PG_USER"); user != "" {
-		u.User = url.UserPassword(user, os.Getenv("PG_PASS"))
-	}
-	u.Path = "/" + strings.TrimPrefix(envStr("PG_DATABASE", "booking"), "/")
-	return u.String()
 }
 
 func envStr(key, def string) string {

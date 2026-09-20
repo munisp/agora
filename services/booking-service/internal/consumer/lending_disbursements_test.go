@@ -252,3 +252,41 @@ func TestHTTPRailPostsTransfer(t *testing.T) {
 	require.Equal(t, "ldisb_abc", gotKey)
 	require.Equal(t, "/transfers", gotPath)
 }
+
+// V2-7 regression: payments' require_money_mutation gates /v1/transfers —
+// the rail MUST send X-Internal-Token when PAYMENTS_INTERNAL_TOKEN is
+// configured, and MUST NOT invent one when it is not (documented fail
+// posture: no header → payments 401s → the intent dead-letters, never a
+// simulated success).
+func TestHTTPRailInternalTokenHeader(t *testing.T) {
+	var gotToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotToken = r.Header.Get("X-Internal-Token")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	tr := RailTransfer{TransferID: "ldisb_tok", AmountKobo: 100}
+
+	// Configured → header present.
+	rail := NewHTTPRail(srv.URL, WithInternalToken("pay-tok-1"))
+	_, err := rail.CreateTransfer(context.Background(), tr)
+	require.NoError(t, err)
+	require.Equal(t, "pay-tok-1", gotToken, "configured token must ride as X-Internal-Token")
+
+	// Unconfigured → header ABSENT (fail posture documented on
+	// EnvPaymentsInternalToken: payments answers 401, the intent
+	// dead-letters — never a forged/empty-token call).
+	rail = NewHTTPRail(srv.URL)
+	_, err = rail.CreateTransfer(context.Background(), tr)
+	require.NoError(t, err)
+	require.Empty(t, gotToken, "unset token must omit the header, not send an empty/forged one")
+
+	// RailFromEnv picks PAYMENTS_INTERNAL_TOKEN up from the environment.
+	t.Setenv(EnvLendingTBBridgeURL, srv.URL)
+	t.Setenv(EnvPaymentsInternalToken, "env-tok-9")
+	fromEnv, err := RailFromEnv(zap.NewNop())
+	require.NoError(t, err)
+	httpRail, ok := fromEnv.(*HTTPRail)
+	require.True(t, ok, "bridge URL must select the HTTPRail")
+	require.Equal(t, "env-tok-9", httpRail.InternalToken)
+}

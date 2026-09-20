@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -193,18 +192,6 @@ func (s *Store) List(ctx context.Context, tenantID uuid.UUID, platform, app stri
 	}
 	q += ` ORDER BY last_seen_at DESC LIMIT 500`
 	return s.list(ctx, tenantID, q, args...)
-}
-
-// Touch refreshes last_seen_at for one token (app heartbeat). Not exposed
-// as an endpoint in W16; kept for the notification-worker failure-sweep
-// (token pruning decisions use last_seen_at).
-func (s *Store) Touch(ctx context.Context, tenantID uuid.UUID, token string, at time.Time) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx,
-			`UPDATE device_tokens SET last_seen_at=$3 WHERE tenant_id=$1 AND token=$2`,
-			tenantID, token, at.UTC())
-		return err
-	})
 }
 
 func (s *Store) list(ctx context.Context, tenantID uuid.UUID, q string, args ...any) ([]DeviceToken, error) {
