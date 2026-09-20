@@ -175,7 +175,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(include_str!("../migrations/0005_hardening.sql"))
         .execute(&pool)
         .await?;
-    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox, 0005 hardening)");
+    // SPEC-W45 K18-billing-side: tenant_plans (billing's plan source),
+    // tax_bps on rate_cards/plan_presets (VAT-ready), invoices.billing_email.
+    sqlx::raw_sql(include_str!("../migrations/0006_plan_presets.sql"))
+        .execute(&pool)
+        .await?;
+    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox, 0005 hardening, 0006 plan presets)");
 
     let internal_pool = match &cfg.internal_database_url {
         Some(dsn) => {

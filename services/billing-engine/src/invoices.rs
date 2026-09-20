@@ -87,6 +87,9 @@ pub fn rate_line(
         billable,
         unit_price_cents,
         amount_cents: billable.saturating_mul(unit_price_cents),
+        // tax_bps is stamped from the rate card by the caller (generation);
+        // the pure rating helper only owns the money math.
+        tax_bps: 0,
     }
 }
 
@@ -104,14 +107,90 @@ struct RateCardRow {
     unit_price_cents: i64,
     included_quota: i64,
     currency: String,
+    tax_bps: i64,
+}
+
+async fn fetch_rate_cards(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+) -> Result<Vec<RateCardRow>, BillingError> {
+    let card_rows = sqlx::query(
+        "SELECT metric, unit_price_cents, included_quota, currency, tax_bps \
+         FROM rate_cards WHERE tenant_id = $1 ORDER BY metric",
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    card_rows
+        .iter()
+        .map(|r| {
+            // tax_bps is INTEGER (INT4) in the schema; widen to i64 here.
+            let tax_bps: i32 = r.try_get("tax_bps")?;
+            Ok(RateCardRow {
+                metric: r.try_get("metric")?,
+                unit_price_cents: r.try_get("unit_price_cents")?,
+                included_quota: r.try_get("included_quota")?,
+                currency: r.try_get("currency")?,
+                tax_bps: i64::from(tax_bps),
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(BillingError::from)
+}
+
+/// SPEC-W45 K18-billing-side (ORPH O5): a tenant with ZERO rate cards gets
+/// the presets for its plan copied into rate_cards on first invoice
+/// generation. The plan is read from tenant_plans (default 'free'); an
+/// unknown plan falls back to the zero-priced 'free' presets with a WARN.
+/// The copy runs INSIDE the generation transaction (transactional: a failed
+/// generate leaves no half-copied cards) with ON CONFLICT DO NOTHING
+/// (idempotent: a concurrent/repeated generate copies at most once).
+async fn copy_plan_presets_if_unrated(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Uuid,
+) -> Result<(), BillingError> {
+    let plan: String = sqlx::query_scalar("SELECT plan FROM tenant_plans WHERE tenant_id = $1")
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or_else(|| "free".to_string());
+    let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM plan_presets WHERE plan = $1)")
+        .bind(&plan)
+        .fetch_one(&mut **tx)
+        .await?;
+    let effective_plan = if known {
+        plan
+    } else {
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            plan = %plan,
+            "unknown plan in tenant_plans; falling back to zero-priced 'free' presets"
+        );
+        "free".to_string()
+    };
+    sqlx::query(
+        "INSERT INTO rate_cards (tenant_id, metric, unit_price_cents, included_quota, currency, tax_bps) \
+         SELECT $1, metric, unit_price_cents, included_quota, currency, tax_bps \
+         FROM plan_presets WHERE plan = $2 \
+         ON CONFLICT (tenant_id, metric) DO NOTHING",
+    )
+    .bind(tenant_id)
+    .bind(&effective_plan)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Aggregate a tenant's usage for the period, rate it against the tenant's
-/// rate cards, and create (or replace a draft) invoice.
+/// rate cards, and create (or replace a draft) invoice. `billing_email`,
+/// when supplied, becomes the invoice's billing contact; on a draft
+/// regenerate a supplied address REPLACES the stored one while `None`
+/// COALESCE-keeps it (SPEC-W45).
 pub async fn generate_invoice(
     tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     period: &str,
+    billing_email: Option<&str>,
 ) -> Result<Invoice, BillingError> {
     let (start, end) = parse_period(period)?;
 
@@ -151,24 +230,13 @@ pub async fn generate_invoice(
     .fetch_all(&mut **tx)
     .await?;
 
-    let card_rows = sqlx::query(
-        "SELECT metric, unit_price_cents, included_quota, currency \
-         FROM rate_cards WHERE tenant_id = $1 ORDER BY metric",
-    )
-    .bind(tenant_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let cards: Vec<RateCardRow> = card_rows
-        .iter()
-        .map(|r| {
-            Ok(RateCardRow {
-                metric: r.try_get("metric")?,
-                unit_price_cents: r.try_get("unit_price_cents")?,
-                included_quota: r.try_get("included_quota")?,
-                currency: r.try_get("currency")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    let mut cards = fetch_rate_cards(tx, tenant_id).await?;
+    if cards.is_empty() {
+        // ORPH O5: first-ever generation for a tenant with no rate cards —
+        // copy its plan presets (transactional + idempotent), then re-read.
+        copy_plan_presets_if_unrated(tx, tenant_id).await?;
+        cards = fetch_rate_cards(tx, tenant_id).await?;
+    }
 
     // Only metrics with a rate card are billed (others stay metered but free).
     let mut line_items: Vec<LineItem> = Vec::new();
@@ -201,12 +269,16 @@ pub async fn generate_invoice(
             } else {
                 currency = Some(card.currency.clone());
             }
-            line_items.push(rate_line(
+            let mut item = rate_line(
                 &metric,
                 total,
                 card.unit_price_cents,
                 card.included_quota,
-            ));
+            );
+            // VAT-ready foundation: stamp the rate card's tax_bps onto the
+            // line (amounts unchanged — no tax is added to the subtotal).
+            item.tax_bps = card.tax_bps;
+            line_items.push(item);
         }
     }
     let currency = currency.unwrap_or_else(|| "USD".to_string());
@@ -217,30 +289,35 @@ pub async fn generate_invoice(
         .map_err(|e| BillingError::Db(format!("line items serialize: {e}")))?;
 
     let id = match existing_id {
-        // Regenerate = replace the draft in place (keep the invoice id stable).
+        // Regenerate = replace the draft in place (keep the invoice id
+        // stable). A supplied billing_email replaces the stored contact;
+        // None COALESCE-keeps it.
         Some(id) => {
             sqlx::query(
-                "UPDATE invoices SET line_items = $1, subtotal_cents = $2, currency = $3 \
+                "UPDATE invoices SET line_items = $1, subtotal_cents = $2, currency = $3, \
+                        billing_email = COALESCE($5, billing_email) \
                  WHERE id = $4 AND status = 'draft'",
             )
             .bind(&line_items_json)
             .bind(subtotal)
             .bind(&currency)
             .bind(id)
+            .bind(billing_email)
             .execute(&mut **tx)
             .await?;
             id
         }
         None => {
             sqlx::query(
-                "INSERT INTO invoices (tenant_id, period, status, subtotal_cents, currency, line_items) \
-                 VALUES ($1, $2, 'draft', $3, $4, $5) RETURNING id",
+                "INSERT INTO invoices (tenant_id, period, status, subtotal_cents, currency, line_items, billing_email) \
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6) RETURNING id",
             )
             .bind(tenant_id)
             .bind(period)
             .bind(subtotal)
             .bind(&currency)
             .bind(&line_items_json)
+            .bind(billing_email)
             .fetch_one(&mut **tx)
             .await?
             .try_get("id")?
@@ -259,7 +336,7 @@ pub async fn get_invoice(
 ) -> Result<Option<Invoice>, BillingError> {
     let row = sqlx::query(
         "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
-                payment_ref, created_at, issued_at, paid_at \
+                billing_email, payment_ref, created_at, issued_at, paid_at \
          FROM invoices WHERE id = $1",
     )
     .bind(id)
@@ -278,7 +355,7 @@ pub async fn list_invoices(
         Some(st) => {
             sqlx::query(
                 "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
-                        payment_ref, created_at, issued_at, paid_at \
+                        billing_email, payment_ref, created_at, issued_at, paid_at \
                  FROM invoices WHERE tenant_id = $1 AND status = $2 \
                  ORDER BY created_at DESC",
             )
@@ -290,7 +367,7 @@ pub async fn list_invoices(
         None => {
             sqlx::query(
                 "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
-                        payment_ref, created_at, issued_at, paid_at \
+                        billing_email, payment_ref, created_at, issued_at, paid_at \
                  FROM invoices WHERE tenant_id = $1 \
                  ORDER BY created_at DESC",
             )
@@ -317,6 +394,7 @@ fn invoice_from_row(row: &sqlx::postgres::PgRow) -> Result<Invoice, BillingError
         subtotal_cents: row.try_get("subtotal_cents")?,
         currency: row.try_get("currency")?,
         line_items,
+        billing_email: row.try_get("billing_email")?,
         payment_ref: row.try_get("payment_ref")?,
         created_at: row.try_get("created_at")?,
         issued_at: row.try_get("issued_at")?,

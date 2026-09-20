@@ -128,6 +128,11 @@ pub struct LineItem {
     pub unit_price_cents: i64,
     /// billable * unit_price_cents.
     pub amount_cents: i64,
+    /// VAT-ready tax basis points (0..=10000), stamped from the rate card at
+    /// generation (SPEC-W45 K18). Serde default 0 so legacy stored line-item
+    /// JSON (pre-0006) keeps decoding.
+    #[serde(default)]
+    pub tax_bps: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +144,10 @@ pub struct Invoice {
     pub subtotal_cents: i64,
     pub currency: String,
     pub line_items: Vec<LineItem>,
+    /// Tenant billing contact (SPEC-W45 K12-side billing field); set at
+    /// generate time / via PATCH, carried into paid/voided event payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_ref: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -155,6 +164,8 @@ pub struct RateCard {
     pub unit_price_cents: i64,
     pub included_quota: i64,
     pub currency: String,
+    /// VAT-ready tax basis points (0..=10000, default 0).
+    pub tax_bps: i64,
 }
 
 #[cfg(test)]
@@ -195,6 +206,28 @@ mod tests {
         for s in [Draft, Issued, Paid, Void, PastDue] {
             assert!(!s.can_transition_to(s));
         }
+    }
+
+    #[test]
+    fn line_item_tax_bps_defaults_to_zero_for_legacy_stored_json() {
+        // Legacy (pre-0006) line-item JSON has no tax_bps key; it must keep
+        // decoding with the 0 default (SPEC-W45 K18 VAT-ready foundation).
+        let legacy = serde_json::json!({
+            "metric": "booking",
+            "quantity": 1200,
+            "included_quota": 1000,
+            "billable": 200,
+            "unit_price_cents": 50,
+            "amount_cents": 10_000,
+        });
+        let li: LineItem = serde_json::from_value(legacy).expect("legacy line item decodes");
+        assert_eq!(li.tax_bps, 0);
+        assert_eq!(li.amount_cents, 10_000);
+        // A stamped tax survives the round trip.
+        let stamped = LineItem { tax_bps: 750, ..li };
+        let round: LineItem =
+            serde_json::from_value(serde_json::to_value(&stamped).unwrap()).unwrap();
+        assert_eq!(round.tax_bps, 750);
     }
 
     #[test]
