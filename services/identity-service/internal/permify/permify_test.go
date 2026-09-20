@@ -125,6 +125,67 @@ func TestCreateTenantSchemaWriteFailureFailsClosed(t *testing.T) {
 	}
 }
 
+// TestDeleteRelationshipAndTenant (SPEC-W45 K16/K9): tuple delete posts the
+// same tuple shape as write to relationships/delete; tenant delete issues
+// DELETE /v1/tenants/{id} and tolerates 404 (idempotent cascade).
+func TestDeleteRelationshipAndTenant(t *testing.T) {
+	var mu sync.Mutex
+	var delTuples []string
+	var delTenants []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/data/relationships/delete"):
+			var body struct {
+				Tuple struct {
+					Entity   map[string]string `json:"entity"`
+					Relation string            `json:"relation"`
+					Subject  map[string]string `json:"subject"`
+				} `json:"tuple"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			delTuples = append(delTuples,
+				body.Tuple.Entity["type"]+":"+body.Tuple.Entity["id"]+"#"+body.Tuple.Relation+"@"+body.Tuple.Subject["type"]+":"+body.Tuple.Subject["id"])
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/tenants/"):
+			mu.Lock()
+			delTenants = append(delTenants, strings.TrimPrefix(r.URL.Path, "/v1/tenants/"))
+			mu.Unlock()
+			if strings.HasSuffix(r.URL.Path, "ghost") {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL)
+	ctx := context.Background()
+	if err := c.DeleteRelationship(ctx, "t1", "organization:o1", "member", "user:u1"); err != nil {
+		t.Fatalf("DeleteRelationship: %v", err)
+	}
+	if err := c.DeleteTenant(ctx, "t1"); err != nil {
+		t.Fatalf("DeleteTenant: %v", err)
+	}
+	if err := c.DeleteTenant(ctx, "ghost"); err != nil {
+		t.Errorf("DeleteTenant(404) must be idempotent success: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delTuples) != 1 || delTuples[0] != "organization:o1#member@user:u1" {
+		t.Errorf("delete tuples = %v", delTuples)
+	}
+	if len(delTenants) != 2 || delTenants[0] != "t1" {
+		t.Errorf("delete tenants = %v", delTenants)
+	}
+}
+
 // TestEmbeddedSchemaMatchesCanonical guards against drift between the
 // embedded copy (this package) and the canonical infra/permify/schema.perm
 // (also used by infra/permify/load-schema.sh for the bootstrap tenant).
