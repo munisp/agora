@@ -332,3 +332,39 @@ func TestCivicSLABreachInternalToken(t *testing.T) {
 	require.Equal(t, "book-tok", call.headers.Get("X-Internal-Token"))
 	require.Equal(t, "acme", call.headers.Get("X-Tenant-Slug"))
 }
+
+// SPEC-W45 INT (K21): crm-sync gates /v1/tasks + /v1/people/lookup behind
+// X-Internal-Token = CRM_SYNC_INTERNAL_TOKEN; notification-worker must
+// forward it on every crm-sync call (and the identity token on the
+// internauth-gated pack-terminology call).
+func TestCRMSyncInternalTokenForwarded(t *testing.T) {
+	fake := newFakePeerDapr(t, map[string]peerResponse{
+		"/v1.0/invoke/crm-sync/method/v1/people/lookup": {200, `{"person":null}`},
+	})
+	a := newPeerActivities(fake.client(t))
+	a.Industry = IndustryDeps{CRMSyncAppID: "crm-sync"}
+	a.CRMSyncInternalToken = "crm-tok"
+	ctx := context.Background()
+
+	// /v1/tasks (industry pack staff-alert / follow-up helpers).
+	require.NoError(t, a.createCRMTask(ctx, "acme", "uuid-1", map[string]any{"kind": "follow_up"}))
+	call := fake.last(t)
+	require.Equal(t, http.MethodPost, call.method)
+	require.Equal(t, "/v1.0/invoke/crm-sync/method/v1/tasks", call.path)
+	require.Equal(t, "crm-tok", call.headers.Get("X-Internal-Token"), "K21: CRM_SYNC_INTERNAL_TOKEN forwarded")
+
+	// /v1/people/lookup (GDPR collect).
+	out, err := a.GdprCollectCrmPerson(ctx, workflows.GdprInput{Email: "s@x.io"})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"person":null}`, string(out))
+	call = fake.last(t)
+	require.Equal(t, http.MethodGet, call.method)
+	require.Equal(t, "/v1.0/invoke/crm-sync/method/v1/people/lookup", call.path)
+	require.Equal(t, "crm-tok", call.headers.Get("X-Internal-Token"), "K21: CRM_SYNC_INTERNAL_TOKEN forwarded")
+
+	// Empty token → no header (fail-soft; the peer fails closed and the
+	// error surfaces, never a silent retry).
+	a.CRMSyncInternalToken = ""
+	require.NoError(t, a.createCRMTask(ctx, "acme", "uuid-1", map[string]any{"kind": "staff_alert"}))
+	require.Empty(t, fake.last(t).headers.Get("X-Internal-Token"))
+}
