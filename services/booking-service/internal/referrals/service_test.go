@@ -41,12 +41,12 @@ func newServiceTestStore(t *testing.T) *store.Store {
 	}
 	defer conn.Close(ctx) //nolint:errcheck
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS outbox (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_id UUID NOT NULL,
-    topic TEXT NOT NULL,
-    payload JSONB NOT NULL,
-    sent_at TIMESTAMPTZ
-)`); err != nil {
+	    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	    aggregate_id UUID NOT NULL,
+	    topic TEXT NOT NULL,
+	    payload JSONB NOT NULL,
+	    sent_at TIMESTAMPTZ
+	)`); err != nil {
 		t.Fatalf("outbox ddl: %v", err)
 	}
 	// SPEC-W45 STK O18 mirror tables: production gets contacts/team_members
@@ -55,23 +55,23 @@ func newServiceTestStore(t *testing.T) *store.Store {
 	// the referrer fixtures below resolve against them, so minimal mirrors
 	// (production column set) are created here.
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS contacts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL,
-    name TEXT NOT NULL,
-    phone TEXT,
-    email TEXT,
-    notes TEXT NOT NULL DEFAULT ''
-)`); err != nil {
+	    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	    tenant_id UUID NOT NULL,
+	    name TEXT NOT NULL,
+	    phone TEXT,
+	    email TEXT,
+	    notes TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
 		t.Fatalf("contacts mirror ddl: %v", err)
 	}
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS team_members (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL,
-    name TEXT NOT NULL,
-    email TEXT,
-    role TEXT NOT NULL DEFAULT 'staff',
-    active BOOLEAN NOT NULL DEFAULT TRUE
-)`); err != nil {
+	    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	    tenant_id UUID NOT NULL,
+	    name TEXT NOT NULL,
+	    email TEXT,
+	    role TEXT NOT NULL DEFAULT 'staff',
+	    active BOOLEAN NOT NULL DEFAULT TRUE
+	)`); err != nil {
 		t.Fatalf("team_members mirror ddl: %v", err)
 	}
 	st, err := store.New(ctx, dsn, 0)
