@@ -88,12 +88,16 @@ type Activities struct {
 	PaymentsInternalToken string // PAYMENTS_INTERNAL_TOKEN
 	BookingInternalToken  string // BOOKING_INTERNAL_TOKEN
 	IdentityInternalToken string // IDENTITY_INTERNAL_TOKEN
+	// CRMSyncInternalToken (CRM_SYNC_INTERNAL_TOKEN, SPEC-W45 K21): forwarded
+	// on every crm-sync /v1/* call (tasks + people/lookup); empty → warn at
+	// boot, peer fails closed (401/503) and the error surfaces.
+	CRMSyncInternalToken string // CRM_SYNC_INTERNAL_TOKEN
 	// PaymentsURL (PAYMENTS_URL) is the direct-HTTP fallback base for the
 	// payments /activities/* calls (no Dapr sidecar); empty → Dapr invoke
 	// with header passthrough (default, W44 decision: daprc forwards
 	// headers, verified).
 	PaymentsURL string
-	Log *zap.Logger
+	Log         *zap.Logger
 
 	hc *http.Client
 }
