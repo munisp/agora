@@ -29,6 +29,10 @@
 #   SEED_KAFKA     off            (on = publish CloudEvents to Kafka)
 #   SEED_SALT      passthrough for scripts/seeds/_lib.py deterministic ids
 #   SEED_PYTHON    python3
+#   SEED_ALLOW_PROD  unset  (OOS-23 prod guard: REQUIRED =1 when DATABASE_URL
+#                    host is not localhost/127.0.0.1/::1 or a compose service
+#                    name: postgres, db, analytics-db, postgres-db,
+#                    opendesk-postgres, host.docker.internal)
 #   POSTGRES_CONTAINER  postgres  (docker-exec fallback when psql is absent)
 #   TRINO_CONTAINER     opendesk-trino
 #   SPARK_MASTER_CONTAINER opendesk-spark-master
@@ -221,6 +225,35 @@ step_snapshot() {
     fi
     if [ "$DRY" = 1 ]; then bash "$snap" --dry-run; else bash "$snap"; fi
 }
+
+# --- OOS-23 prod guard (SPEC-W45) --------------------------------------------
+# Refuse to run against a non-local DATABASE_URL unless the operator
+# explicitly sets SEED_ALLOW_PROD=1. "Local" = loopback plus the compose
+# Postgres service names (container_name `postgres` in
+# infra/docker-compose.core.yml; db/analytics-db/postgres-db are common local
+# aliases). The python half of this guard lives in scripts/seeds/_lib.py
+# (assert_seed_allowed, called by get_conn) so direct seed-script invocations
+# are covered too.
+seed_host_guard() {
+    local host
+    host="$(printf '%s' "$DATABASE_URL" | sed -n 's|^[a-zA-Z][a-zA-Z0-9+.-]*://[^@/]*@\([^/:]*\).*|\1|p')"
+    if [ -z "$host" ]; then # keyword DSN form: "host=... port=..." (start or after a space)
+        host="$(printf '%s' "$DATABASE_URL" | sed -n 's|^host=\([^ ]*\).*|\1|p; s|.* host=\([^ ]*\).*|\1|p' | head -1)"
+    fi
+    case "$host" in
+        localhost|127.0.0.1|::1|postgres|db|analytics-db|postgres-db|opendesk-postgres|host.docker.internal)
+            return 0 ;;
+    esac
+    if [ "${SEED_ALLOW_PROD:-0}" = "1" ]; then
+        log "SEED_ALLOW_PROD=1 — proceeding against NON-LOCAL database host '${host:-<unparsed>}' (OOS-23 override)"
+        return 0
+    fi
+    fail "DATABASE_URL host '${host:-<unparsed>}' is not localhost/127.0.0.1/a compose service name — refusing to seed (OOS-23). Set SEED_ALLOW_PROD=1 to override deliberately."
+}
+
+if [ "$DRY" = 0 ]; then
+    seed_host_guard
+fi
 
 log "SEED_SCALE=$SEED_SCALE SEED_KAFKA=$SEED_KAFKA DRY_RUN=$DRY DATABASE_URL=$DATABASE_URL"
 step "postgres DDL (sql/postgres/ddl)"          step_pg_ddl

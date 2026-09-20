@@ -57,18 +57,34 @@ services:
     container_name: opendesk-graph-db
     # Persist + snapshot every 60s when >=1 write (RDB snapshot = the backup
     # primitive documented in docs/graph.md).
-    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    # OOS-14 (SPEC-W45): requirepass is ON (dev-only default below; prod MUST
+    # set FALKORDB_PASSWORD via the secrets store). graph-service / graph-ml /
+    # fraud-engine authenticate via their FALKORDB_PASSWORD env. NOTE:
+    # graph-sync's go-redis client (internal/graph/falkordb.go) does NOT yet
+    # read a password — tracked as a W45 CODER-E follow-up; until it lands
+    # graph-sync cannot talk to a password-protected graph-db.
+    environment:
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-dev-only}
+    command:
+      - /bin/sh
+      - -c
+      - 'exec redis-server --appendonly yes --save 60 1 --requirepass "$${FALKORDB_PASSWORD}"'
     ports:
       # Host 6380 (NOT 6379 — that is the platform redis in
       # infra/docker-compose.core.yml). In-cluster address: graph-db:6379.
-      - "6380:6379/tcp"
+      # OOS-14 (SPEC-W45): LOOPBACK ONLY — the graph store holds per-tenant
+      # PII-derived nodes; binding it on all interfaces exposed an
+      # unauthenticated Cypher/Redis port to the LAN. Use
+      # `docker compose exec` or an SSH tunnel for debugging.
+      - "127.0.0.1:6380:6379/tcp"
     volumes:
       - falkordb-data:/data
     networks:
       - opendesk
     healthcheck:
       # FalkorDB speaks the Redis protocol; PING is the liveness probe.
-      test: ["CMD", "redis-cli", "ping"]
+      # OOS-14: -a authenticates against the requirepass above.
+      test: ["CMD-SHELL", "redis-cli -a \"$${FALKORDB_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -157,14 +173,29 @@ services:
       - path: .env
         required: false
     environment:
-      KAFKA_BROKERS: kafka:9092
+      # ORPH O3 (SPEC-W45): the keys below are the names graph-sync's config
+      # ACTUALLY reads (services/graph-sync/internal/config/config.go). The
+      # previous GRAPH_SYNC_KAFKA_BROKERS / GRAPH_SYNC_GROUP_ID /
+      # GRAPH_SYNC_FALKORDB_ADDR / GRAPH_SYNC_GRAPH_NAME / GRAPH_SYNC_OLLAMA_*
+      # keys were NEVER read — the consumer silently ran on code defaults,
+      # writing the `opendesk` graph nobody queries, with an empty phone
+      # salt and localhost Ollama. Do not reintroduce the old names.
       PORT: "7015"
-      GRAPH_SYNC_KAFKA_BROKERS: kafka:9092
-      GRAPH_SYNC_GROUP_ID: ${GRAPH_SYNC_GROUP_ID:-graph-sync}
-      GRAPH_SYNC_FALKORDB_ADDR: graph-db:6379
-      GRAPH_SYNC_GRAPH_NAME: ${GRAPH_SYNC_GRAPH_NAME:-agora_tenants}
-      GRAPH_SYNC_OLLAMA_BASE_URL: ${GRAPH_SYNC_OLLAMA_BASE_URL:-http://ollama-graph:11434}
-      GRAPH_SYNC_OLLAMA_EMBED_MODEL: ${GRAPH_SYNC_OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      GRAPH_SYNC_GROUP: ${GRAPH_SYNC_GROUP:-graph-sync}
+      FALKORDB_ADDR: ${FALKORDB_ADDR:-graph-db:6379}
+      # Must be the graph graph-service/graph-ml/fraud-engine query
+      # (agora_tenants) — the code default "opendesk" was the split-brain.
+      FALKORDB_GRAPH: ${FALKORDB_GRAPH:-agora_tenants}
+      # OOS-14: graph-db now requires auth. graph-sync's client does not read
+      # a password yet (W45 CODER-E follow-up — see graph-db comment above);
+      # the var is wired here so the code change is a one-line read.
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-dev-only}
+      # graph-sync's embed client POSTs {OLLAMA_BASE_URL}/embeddings
+      # (OpenAI-compatible, internal/embed/ollama.go), so the base MUST carry
+      # the /v1 suffix; ollama-graph hosts the bootstrapped nomic-embed-text.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama-graph:11434/v1}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       # Topic names: env-configured with the SPEC-W28 §2 documented defaults.
       GRAPH_SYNC_BOOKING_TOPIC: ${GRAPH_SYNC_BOOKING_TOPIC:-opendesk.booking.events}
       # Default matches infra/kafka/create-topics.sh exactly ("cac.events",
@@ -178,9 +209,12 @@ services:
       GRAPH_ERASURE_DONE_TOPIC: ${GRAPH_ERASURE_DONE_TOPIC:-opendesk.graph.erasure.done.v1}
       GRAPH_SYNC_DLQ_TOPIC: ${GRAPH_SYNC_DLQ_TOPIC:-opendesk.dlq}
       # Phone hashing: same SHA-256+salt scheme as leads dedupe (SPEC-W28 §3).
-      # DEV ONLY default salt — rotate per environment via .env/secrets store
-      # (docs/runbooks/secrets.md); a known salt weakens the PII hash.
-      GRAPH_SYNC_PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
+      # ORPH O3 (SPEC-W45): the code reads PHONE_HASH_SALT (never the old
+      # GRAPH_SYNC_PHONE_HASH_SALT) and treats empty as UNSALTED — this
+      # non-empty DEV ONLY default closes that. Rotate per environment via
+      # .env/secrets store (docs/runbooks/secrets.md); a known salt weakens
+      # the PII hash.
+      PHONE_HASH_SALT: ${PHONE_HASH_SALT:-opendesk-dev-phone-salt}
     ports:
       - "7015:7015/tcp"
     networks:
@@ -207,7 +241,12 @@ services:
       FALKORDB_PORT: "6379"
       FALKORDB_ADDR: graph-db:6379
       FALKORDB_GRAPH: ${FALKORDB_GRAPH:-agora_tenants}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama-graph:11434}
+      # OOS-14 (SPEC-W45): graph-db requirepass (see graph-db block).
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-dev-only}
+      # W45: /v1 suffix REQUIRED — app/ask.py builds AsyncOpenAI(base_url=...)
+      # which appends /chat/completions|/embeddings to the base; without /v1
+      # the calls 404 against Ollama's OpenAI-compatible endpoint.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama-graph:11434/v1}
       OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-qwen2.5:7b-instruct}
       OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       KEYCLOAK_URL: http://keycloak:8080
@@ -278,6 +317,8 @@ services:
       FALKORDB_HOST: graph-db
       FALKORDB_PORT: "6379"
       FALKORDB_DB: ${FALKORDB_GRAPH:-agora_tenants}
+      # OOS-14 (SPEC-W45): graph-db requirepass (see graph-db block).
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-dev-only}
       GRAPH_SERVICE_URL: http://graph-service:7014
       # REQUIRED (SPEC-W44 S1-F6-01) — must equal graph-service's INTERNAL_TOKEN;
       # both read the same ${INTERNAL_TOKEN} (dev value in .env.example).
@@ -317,6 +358,8 @@ services:
       FALKORDB_HOST: graph-db
       FALKORDB_PORT: "6379"
       FALKORDB_DB: ${FALKORDB_GRAPH:-agora_tenants}
+      # OOS-14 (SPEC-W45): graph-db requirepass (see graph-db block).
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-dev-only}
       GRAPH_SERVICE_URL: http://graph-service:7014
       # REQUIRED (SPEC-W44 S1-F6-01) — must equal graph-service's INTERNAL_TOKEN;
       # both read the same ${INTERNAL_TOKEN} (dev value in .env.example).
@@ -354,11 +397,21 @@ services:
       FALKORDB_HOST: graph-db
       FALKORDB_PORT: "6379"
       FALKORDB_GRAPH: ${FALKORDB_GRAPH:-agora_tenants}
+      # OOS-14 (SPEC-W45): graph-db requirepass (see graph-db block).
+      FALKORDB_PASSWORD: ${FALKORDB_PASSWORD:-dev-only}
+      # K23 (SPEC-W45): /v1/detect/* requires X-Internal-Token matching this
+      # value (constant-time; fail-closed unset). DEV ONLY default; prod MUST
+      # set via the secrets store (docs/runbooks/secrets.md).
+      FRAUD_INTERNAL_TOKEN: ${FRAUD_INTERNAL_TOKEN:-opendesk-dev-fraud-internal-token-change-in-prod}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BROKERS:-kafka:9092}
       KAFKA_ENABLED: ${FRAUD_KAFKA_ENABLED:-true}
       FRAUD_ALERTS_TOPIC: ${FRAUD_ALERTS_TOPIC:-opendesk.fraud.alerts.v1}
       FRAUD_SWEEP_MINUTES: ${FRAUD_SWEEP_MINUTES:-15}
-      FRAUD_KAFKA_TOPICS: ${FRAUD_KAFKA_TOPICS:-opendesk.booking.events,opendesk.identity.events}
+      # ORPH O11 (SPEC-W45): matches the code default
+      # (fraud_engine/config.py) — `cac.events` is the UNPREFIXED funnel
+      # topic booking-service leads actually publish (`opendesk.cac.events`
+      # was dead — no producer writes it); plus the live civic stream.
+      FRAUD_KAFKA_TOPICS: ${FRAUD_KAFKA_TOPICS:-cac.events,opendesk.booking.events,opendesk.identity.events,opendesk.civic.events.v1}
       CAPTURE_VELOCITY_MAX: ${CAPTURE_VELOCITY_MAX:-30}
       SYBIL_WINDOW_MIN: ${SYBIL_WINDOW_MIN:-60}
       SYBIL_SIM_THRESHOLD: ${SYBIL_SIM_THRESHOLD:-0.98}

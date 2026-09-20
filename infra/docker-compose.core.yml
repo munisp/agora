@@ -357,6 +357,13 @@ services:
       TRAIN_ENABLED: ${MODEL_REGISTRY_TRAIN_ENABLED:-false}
       TRAIN_CRON_HOUR: ${TRAIN_CRON_HOUR:-2}
       GIT_SHA: ${GIT_SHA:-unknown}
+      # K23 (SPEC-W45): register/promote/rollback/experiments routes require
+      # X-Internal-Token matching this value (constant-time; fail-closed when
+      # unset). In-cluster callers (booking campaignstudio A/B, graph-ml /
+      # fraud-engine / credit-bureau registry clients) must carry the SAME
+      # value. DEV ONLY default; prod MUST set via the secrets store
+      # (docs/runbooks/secrets.md).
+      MODEL_REGISTRY_INTERNAL_TOKEN: ${MODEL_REGISTRY_INTERNAL_TOKEN:-opendesk-dev-model-registry-internal-token-change-in-prod}
       # GF1 wiring (SPEC-W34): internal/batch role DSN used by store.py for
       # internal transactions (RLS policies gate on the app_model_registry_internal
       # role, not the GUC). Dev-only password - override in real environments.

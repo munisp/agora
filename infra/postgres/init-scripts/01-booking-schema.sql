@@ -20,13 +20,19 @@ CREATE TABLE offerings (
 CREATE INDEX idx_offerings_tenant ON offerings (tenant_id) WHERE bookable;
 
 -- Team members who can take bookings.
+-- SPEC-W45 CODER-M (STK O14 completion, single-column exception): nullable
+-- user_id soft-links a member to an identity-service user. No FK —
+-- identity owns users and booking does not existence-check the link.
+-- EXISTING DATABASES are migrated by the booking-service bootstrap DDL
+-- (ensureTeamMemberUserIDColumn, ALTER ... ADD COLUMN IF NOT EXISTS).
 CREATE TABLE team_members (
     id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
     name      TEXT NOT NULL,
     email     TEXT,
     role      TEXT NOT NULL DEFAULT 'staff',
-    active    BOOLEAN NOT NULL DEFAULT TRUE
+    active    BOOLEAN NOT NULL DEFAULT TRUE,
+    user_id   UUID
 );
 CREATE INDEX idx_team_members_tenant ON team_members (tenant_id) WHERE active;
 
@@ -54,7 +60,14 @@ CREATE TABLE contacts (
     email     TEXT,
     notes     TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX idx_contacts_tenant_phone ON contacts (tenant_id, phone);
+-- SPEC-W45 CODER-A item 5: one contact per (tenant, phone) — the booking
+-- write path matches-or-creates on this key instead of duplicating people
+-- across channels. Partial: phone-less rows are exempt (NULL/'' handled by
+-- the store). EXISTING DATABASES: this init script runs only on fresh
+-- installs; existing deployments are migrated idempotently by the
+-- store.ensureContactDedupe bootstrap (folds duplicate rows, re-points
+-- bookings/loan references, then creates this same index).
+CREATE UNIQUE INDEX uq_contacts_tenant_phone ON contacts (tenant_id, phone) WHERE phone IS NOT NULL AND phone <> '';
 
 -- Bookings. idempotency_key makes command retries safe.
 CREATE TABLE bookings (

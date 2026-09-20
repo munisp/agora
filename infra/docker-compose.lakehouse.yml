@@ -10,8 +10,14 @@ services:
     container_name: opendesk-minio
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      # OOS-18 (SPEC-W45): single source of truth — every MinIO/S3 client in
+      # the stack (iceberg-rest, analytics-pipeline, notification-worker S3_*)
+      # reads the SAME ${MINIO_ROOT_USER/PASSWORD}; the previous hardcoded
+      # `minioadmin` copies drifted from any .env override (clients kept the
+      # old creds while the server used the new ones). DEV ONLY defaults;
+      # prod sets both via the secrets store (docs/runbooks/secrets.md).
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_DOMAIN: minio
     ports:
     - 9000:9000/tcp
@@ -55,8 +61,9 @@ services:
 
       '
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      # OOS-18 (SPEC-W45): same indirection as the minio block above.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     networks:
     - opendesk
     depends_on:
@@ -86,15 +93,17 @@ services:
     image: apache/iceberg-rest-fixture:latest
     container_name: opendesk-iceberg-rest
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      # OOS-18 (SPEC-W45): MinIO credentials via the shared indirection —
+      # must match the minio block's MINIO_ROOT_USER/PASSWORD.
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       AWS_REGION: us-east-1
       CATALOG_WAREHOUSE: s3://lake/warehouse
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: 'true'
-      CATALOG_S3_ACCESS__KEY__ID: minioadmin
-      CATALOG_S3_SECRET__ACCESS__KEY: minioadmin
+      CATALOG_S3_ACCESS__KEY__ID: ${MINIO_ROOT_USER:-minioadmin}
+      CATALOG_S3_SECRET__ACCESS__KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
       CATALOG_URI: jdbc:postgresql://postgres:5432/iceberg
       CATALOG_JDBC_USER: ${POSTGRES_USER:-opendesk}

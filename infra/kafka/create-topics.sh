@@ -29,7 +29,7 @@ TOPICS=(
   opendesk.dlq                     # dead letters
   # SPEC-W18 (additive): app lifecycle events (identity-service emits;
   # portal/app-catalog consumers) — was missing from the declarations.
-  opendesk.apps.lifecycle.v1       # AppProvisioned/Enabled/Disabled/Suspended (SPEC-W18)
+  opendesk.apps.lifecycle.v1       # AppProvisioned/AppStatusChanged (SPEC-W18; identity-service internal/apps/model.go)
   # SPEC-W19 (additive): enterprise app lifecycle event streams
   # (booking-service emits via the transactional outbox).
   opendesk.helpdesk.events.v1      # helpdesk TicketEvent: ticket_created/ticket_resolved (SPEC-W19 Agent A)

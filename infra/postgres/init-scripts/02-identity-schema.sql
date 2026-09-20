@@ -35,6 +35,26 @@ CREATE TABLE memberships (
 );
 CREATE INDEX idx_memberships_user ON memberships (user_id);
 
+-- SPEC-W45 K17: tenant API keys for programmatic access (validated via
+-- identity-service /internal/api-keys/validate). Only the SHA-256 hash of
+-- the full key ("<prefix>.<secret>") is stored; the secret is returned once
+-- at creation. Revocation is a soft delete (revoked_at) so usage stays
+-- auditable. Existing installs get this table via the identity-service
+-- bootstrap CREATE IF NOT EXISTS.
+CREATE TABLE tenant_api_keys (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id  UUID NOT NULL REFERENCES tenants (id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    prefix     TEXT NOT NULL,
+    key_hash   TEXT NOT NULL UNIQUE,
+    scopes     TEXT[] NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
+CREATE INDEX idx_tenant_api_keys_tenant ON tenant_api_keys (tenant_id);
+CREATE INDEX idx_tenant_api_keys_hash ON tenant_api_keys (key_hash) WHERE revoked_at IS NULL;
+
 -- ---------------- Row Level Security (SPEC §7) ----------------
 -- tenants IS the tenant table: its tenant_id is its own id.
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
@@ -45,4 +65,9 @@ CREATE POLICY tenant_isolation ON tenants
 ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON memberships
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+
+ALTER TABLE tenant_api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_api_keys FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tenant_api_keys
     USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);

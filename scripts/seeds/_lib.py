@@ -44,6 +44,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 from datetime import datetime, timezone
@@ -222,6 +223,63 @@ def emit_seed_report(table: str, rowcount: int, runner: str, sha: str) -> dict[s
 
 
 # ---------------------------------------------------------------------------
+# OOS-23 prod guard (SPEC-W45) — refuse to seed non-local databases by default
+# ---------------------------------------------------------------------------
+# Hosts considered local/dev-safe: loopback plus the compose Postgres service
+# names (container_name `postgres` in infra/docker-compose.core.yml;
+# db/analytics-db/postgres-db are common local aliases). Anything else — or a
+# DSN whose host cannot be parsed (fail-closed) — requires SEED_ALLOW_PROD=1.
+SEED_LOCAL_DB_HOSTS = frozenset({
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "postgres",
+    "db",
+    "analytics-db",
+    "postgres-db",
+    "opendesk-postgres",
+    "host.docker.internal",
+})
+
+_DSN_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^@/]*@(\[[0-9a-fA-F:]+\]|[^/:]+)")
+_DSN_KV_RE = re.compile(r"(?:^|\s)host=([^\s]+)")
+
+
+def dsn_host(dsn: str) -> str | None:
+    """Extract the host from a URL-form or keyword-form Postgres DSN."""
+    m = _DSN_URL_RE.match(dsn.strip())
+    if m:
+        host = m.group(1)
+        return host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    m = _DSN_KV_RE.search(dsn)
+    if m:
+        return m.group(1).strip("'\"")
+    return None
+
+
+def assert_seed_allowed(dsn: str | None = None, environ: Mapping[str, str] | None = None) -> None:
+    """Raise RuntimeError unless the DSN targets a local host or
+    SEED_ALLOW_PROD=1 is set (OOS-23). Mirrored by the bash guard in
+    scripts/seeds/bootstrap.sh (seed_host_guard)."""
+    env: Mapping[str, str] = os.environ if environ is None else environ
+    dsn = dsn if dsn is not None else env.get("DATABASE_URL", "")
+    host = dsn_host(dsn) if dsn else None
+    if host is not None and host.lower() in SEED_LOCAL_DB_HOSTS:
+        return
+    if env.get("SEED_ALLOW_PROD") == "1":
+        log.warning(
+            "SEED_ALLOW_PROD=1 — seeding against NON-LOCAL database host %r (OOS-23 override)",
+            host or "<unparsed>",
+        )
+        return
+    raise RuntimeError(
+        f"DATABASE_URL host {host or '<unparsed>'!r} is not "
+        "localhost/127.0.0.1/a compose service name — refusing to seed "
+        "(OOS-23 prod guard). Set SEED_ALLOW_PROD=1 to override deliberately."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Database access — ALL DB traffic goes through these helpers (test-fakeable)
 # ---------------------------------------------------------------------------
 def get_conn() -> Any:
@@ -229,6 +287,7 @@ def get_conn() -> Any:
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         raise RuntimeError("DATABASE_URL is not set (needed for non-dry-run seeding)")
+    assert_seed_allowed(dsn)
     try:
         import psycopg  # type: ignore  # psycopg v3
 

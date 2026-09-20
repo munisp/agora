@@ -129,7 +129,12 @@ services:
         soft: 65536
         hard: 65536
     ports:
-    - 9200:9200/tcp
+    # OOS-13 (SPEC-W45): LOOPBACK ONLY. The security plugin is DISABLED above
+    # (dev posture), so an unauthenticated REST API with the full log/trace
+    # corpus was reachable from any LAN host on :9200. In-cluster services
+    # use http://opensearch:9200 on the opendesk network and are unaffected;
+    # host-side debugging goes via localhost or an SSH tunnel.
+    - 127.0.0.1:9200:9200/tcp
     volumes:
     - opensearch-data:/usr/share/opensearch/data
     networks:
@@ -150,7 +155,11 @@ services:
       OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
       DISABLE_SECURITY_DASHBOARDS_PLUGIN: 'true'
     ports:
-    - 5601:5601/tcp
+    # OOS-13 (SPEC-W45): LOOPBACK ONLY — Dashboards ships with the security
+    # plugin disabled above (no login screen), so a LAN-wide :5601 bind was
+    # an unauthenticated window into every index. Reach it via
+    # http://localhost:5601 or an SSH tunnel.
+    - 127.0.0.1:5601:5601/tcp
     networks:
     - opendesk
     depends_on:
