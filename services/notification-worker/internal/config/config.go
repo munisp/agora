@@ -56,11 +56,20 @@ type Config struct {
 	// GDPR (SPEC-W3 §2 innovation 13)
 	ConversationAppID  string // Dapr app-id of conversation-service (export collector)
 	PrivacyEventsTopic string // opendesk.privacy.events (erase tombstones)
-	S3Endpoint         string // MinIO endpoint for GDPR exports (http://minio:9000)
-	S3Region           string // SigV4 region (us-east-1)
-	S3AccessKey        string // MinIO access key (S3_ACCESS_KEY)
-	S3SecretKey        string // MinIO secret key (S3_SECRET_KEY)
-	S3ExportsBucket    string // exports
+	// SPEC-W45 K19: X-Internal-Token for conversation /internal/gdpr/*.
+	ConversationInternalToken string
+	// SPEC-W45 K8/STK O16 + ORPH O8: lifecycle + billing event consumers.
+	IdentityEventsTopic string // opendesk.identity.events ("off" disables)
+	IdentityEventsGroup string // consumer group of the identity consumer
+	BillingEventsTopic  string // opendesk.billing.events ("off" disables)
+	BillingEventsGroup  string // consumer group of the billing consumer
+	AppBaseURL          string // APP_BASE_URL for invite/welcome email links (falls back to PUBLIC_BASE_URL)
+	DLQTopic            string // dead-letter topic for the event consumers (opendesk.dlq)
+	S3Endpoint          string // MinIO endpoint for GDPR exports (http://minio:9000)
+	S3Region            string // SigV4 region (us-east-1)
+	S3AccessKey         string // MinIO access key (S3_ACCESS_KEY)
+	S3SecretKey         string // MinIO secret key (S3_SECRET_KEY)
+	S3ExportsBucket     string // exports
 	// Outbound CPS pacing + sender rotation (VOICE-SCALING §4 telephony)
 	OutboundCPS         float64  // OUTBOUND_CPS: outbound starts/sec (1.0)
 	OutboundBurst       int      // OUTBOUND_BURST: token bucket capacity (3)
@@ -82,18 +91,19 @@ type Config struct {
 	APNSKeyP8          string // APNS_KEY_P8 (stub)
 	APNSTopic          string // APNS_TOPIC (stub)
 	// SPEC-W44 security wave (K1/K2/K3/K5, N-01..N-09).
-	InternalToken         string   // NOTIFICATION_INTERNAL_TOKEN: X-Internal-Token for /v1/signals (K2)
-	PaymentsInternalToken string   // PAYMENTS_INTERNAL_TOKEN: forwarded on payments /activities/* calls
-	BookingInternalToken  string   // BOOKING_INTERNAL_TOKEN: forwarded on booking /activities/* + civic sla-breach
-	IdentityInternalToken string   // IDENTITY_INTERNAL_TOKEN: forwarded on identity /internal/* calls
-	PaymentsURL           string   // PAYMENTS_URL: direct-HTTP fallback for payments calls (empty = Dapr invoke)
-	InternalDatabaseURL   string   // INTERNAL_DATABASE_URL: app_notifications_internal pool for RLS escape (N-08)
-	DNDAdminRoles         []string // DND_ADMIN_ROLES csv (default "platform-admin")
+	InternalToken          string   // NOTIFICATION_INTERNAL_TOKEN: X-Internal-Token for /v1/signals (K2)
+	PaymentsInternalToken  string   // PAYMENTS_INTERNAL_TOKEN: forwarded on payments /activities/* calls
+	BookingInternalToken   string   // BOOKING_INTERNAL_TOKEN: forwarded on booking /activities/* + civic sla-breach
+	IdentityInternalToken  string   // IDENTITY_INTERNAL_TOKEN: forwarded on identity /internal/* calls
+	CRMSyncInternalToken   string   // CRM_SYNC_INTERNAL_TOKEN (SPEC-W45 K21): forwarded on crm-sync /v1/* calls (tasks + people/lookup)
+	PaymentsURL            string   // PAYMENTS_URL: direct-HTTP fallback for payments calls (empty = Dapr invoke)
+	InternalDatabaseURL    string   // INTERNAL_DATABASE_URL: app_notifications_internal pool for RLS escape (N-08)
+	DNDAdminRoles          []string // DND_ADMIN_ROLES csv (default "platform-admin")
 	SignalWorkflowPrefixes []string // SIGNAL_WORKFLOW_PREFIXES csv (S1-F7-04 allowlist; "{tenant}" expands)
-	DevEndpoints          bool     // OPENDESK_DEV_ENDPOINTS=1: compile in /dev/* (N-01) + relax webhook URL guard (N-02 dev)
-	TrustDirectTenant     bool     // OPENDESK_TRUST_DIRECT_TENANT=1: gateway-less dev escape for K1 bindings
-	OpsAlertsGroup        string   // OPS_ALERTS_GROUP: consumer group of the ops-alerts consumer
-	ShutdownTimeout    time.Duration
+	DevEndpoints           bool     // OPENDESK_DEV_ENDPOINTS=1: compile in /dev/* (N-01) + relax webhook URL guard (N-02 dev)
+	TrustDirectTenant      bool     // OPENDESK_TRUST_DIRECT_TENANT=1: gateway-less dev escape for K1 bindings
+	OpsAlertsGroup         string   // OPS_ALERTS_GROUP: consumer group of the ops-alerts consumer
+	ShutdownTimeout        time.Duration
 }
 
 // Load reads configuration from the environment.
@@ -137,19 +147,27 @@ func Load() Config {
 		WebhookSigningRequired:   envStr("WEBHOOK_SIGNING_REQUIRED", "false") == "true",
 		ConversationAppID:        envStr("CONVERSATION_APP_ID", "conversation"),
 		PrivacyEventsTopic:       envStr("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
-		S3Endpoint:               envStr("S3_ENDPOINT", "http://minio:9000"),
-		S3Region:                 envStr("S3_REGION", "us-east-1"),
-		S3AccessKey:              envStr("S3_ACCESS_KEY", "minioadmin"),
-		S3SecretKey:              envStr("S3_SECRET_KEY", "minioadmin"),
-		S3ExportsBucket:          envStr("S3_EXPORTS_BUCKET", "exports"),
-		OutboundCPS:              envFloat("OUTBOUND_CPS", 1.0),
-		OutboundBurst:            envInt("OUTBOUND_BURST", 3),
-		PacerBackend:             envStr("PACER_BACKEND", "redis"),
-		OutboundFromNumbers:      envList("OUTBOUND_FROM_NUMBERS"),
-		RedisAddr:                envStr("REDIS_ADDR", "redis:6379"),
-		DNDEnforcement:           envStr("DND_ENFORCEMENT", "true") == "true",
-		QuietHoursDefault:        envStr("QUIET_HOURS_DEFAULT", "20:00-08:00"),
-		QuietHoursOverrides:      os.Getenv("QUIET_HOURS_OVERRIDES"),
+		// SPEC-W45 (K8/K19, STK O16, ORPH O8).
+		ConversationInternalToken: os.Getenv("CONVERSATION_INTERNAL_TOKEN"),
+		IdentityEventsTopic:       envStr("IDENTITY_EVENTS_TOPIC", "opendesk.identity.events"),
+		IdentityEventsGroup:       envStr("IDENTITY_EVENTS_GROUP", "notification-identity-events"),
+		BillingEventsTopic:        envStr("BILLING_EVENTS_TOPIC", "opendesk.billing.events"),
+		BillingEventsGroup:        envStr("BILLING_EVENTS_GROUP", "notification-billing-events"),
+		AppBaseURL:                envStr("APP_BASE_URL", envStr("PUBLIC_BASE_URL", "http://localhost:9080")),
+		DLQTopic:                  envStr("DLQ_TOPIC", "opendesk.dlq"),
+		S3Endpoint:                envStr("S3_ENDPOINT", "http://minio:9000"),
+		S3Region:                  envStr("S3_REGION", "us-east-1"),
+		S3AccessKey:               envStr("S3_ACCESS_KEY", "minioadmin"),
+		S3SecretKey:               envStr("S3_SECRET_KEY", "minioadmin"),
+		S3ExportsBucket:           envStr("S3_EXPORTS_BUCKET", "exports"),
+		OutboundCPS:               envFloat("OUTBOUND_CPS", 1.0),
+		OutboundBurst:             envInt("OUTBOUND_BURST", 3),
+		PacerBackend:              envStr("PACER_BACKEND", "redis"),
+		OutboundFromNumbers:       envList("OUTBOUND_FROM_NUMBERS"),
+		RedisAddr:                 envStr("REDIS_ADDR", "redis:6379"),
+		DNDEnforcement:            envStr("DND_ENFORCEMENT", "true") == "true",
+		QuietHoursDefault:         envStr("QUIET_HOURS_DEFAULT", "20:00-08:00"),
+		QuietHoursOverrides:       os.Getenv("QUIET_HOURS_OVERRIDES"),
 		// Push providers (SPEC-W16 §1): FCM_MOCK defaults OFF (SIM-010) —
 		// the deterministic mock is an explicit dev/test opt-in (KYC_MOCK /
 		// PAYOUT_MOCK env idiom). With the mock off and no FCM credentials
@@ -168,6 +186,7 @@ func Load() Config {
 		PaymentsInternalToken:  os.Getenv("PAYMENTS_INTERNAL_TOKEN"),
 		BookingInternalToken:   os.Getenv("BOOKING_INTERNAL_TOKEN"),
 		IdentityInternalToken:  os.Getenv("IDENTITY_INTERNAL_TOKEN"),
+		CRMSyncInternalToken:   os.Getenv("CRM_SYNC_INTERNAL_TOKEN"),
 		PaymentsURL:            os.Getenv("PAYMENTS_URL"),
 		InternalDatabaseURL:    os.Getenv("INTERNAL_DATABASE_URL"),
 		DNDAdminRoles:          envListDefault("DND_ADMIN_ROLES", "platform-admin"),
@@ -175,7 +194,7 @@ func Load() Config {
 		DevEndpoints:           envBool("OPENDESK_DEV_ENDPOINTS", false),
 		TrustDirectTenant:      envBool("OPENDESK_TRUST_DIRECT_TENANT", false),
 		OpsAlertsGroup:         envStr("OPS_ALERTS_GROUP", "notification-ops-alerts"),
-		ShutdownTimeout:    time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
+		ShutdownTimeout:        time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 	}
 }
 
