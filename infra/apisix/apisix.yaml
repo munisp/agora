@@ -1488,6 +1488,106 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- Ops alerts (ORPH O15 / SPEC-W45): GET /api/notifications/v1/ops-alerts ----
+  # Dedicated exact-URI route (priority 10 wins over the /api/notifications/*
+  # wildcard) so the operational alert feed gets an explicit gateway-level
+  # ADMIN role gate in addition to notification-worker's own DND_ADMIN_ROLES
+  # check on X-User-Roles. Rewrites to the service-native GET /v1/ops-alerts.
+  - id: api-notifications-ops-alerts
+    uri: /api/notifications/v1/ops-alerts
+    methods: [GET, OPTIONS]
+    priority: 10
+    upstream_id: notification
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/notifications/v1/ops-alerts/?$"
+          - "/v1/ops-alerts"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W44 K1 injection (identical to the api-notifications
+            -- route): X-Tenant-Slugs / X-User-Id / X-User-Roles from the JWT.
+            -- openid-connect verifies the signature in the access phase
+            -- AFTER this runs, so a forged token 401s before upstream.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
+          - |
+            -- ORPH O15 (SPEC-W45): ops-alerts is platform-operations data —
+            -- require an admin realm role (admin or platform-admin). Runs
+            -- after the K1 injection above; a missing/roleless token falls
+            -- through to the 403 here (or the OIDC 401 when absent/forged).
+            return function()
+              local roles = "," .. (ngx.req.get_headers()["X-User-Roles"] or "") .. ","
+              if roles:find(",admin,", 1, true) or roles:find(",platform-admin,", 1, true) then
+                return
+              end
+              ngx.exit(403)
+            end
+      limit-count:
+        count: 300
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
   # ---- Tenant knowledge graph (SPEC-W28): /api/graph/* -> graph-service:7014 ----
   # Same jwt + rewrite pattern as /api/notifications. Serves the admin-web
   # Segment Builder / Ask box / Person 360 (tenant filter enforced
@@ -1726,6 +1826,77 @@ routes:
   # see the WAF note at the top of this file. No proxy-rewrite: the gateway
   # serves /webhooks/* natively. Handlers always answer 200 fast (providers
   # retry-storm on non-200), so limit-count stays generous.
+  # ---- USSD callback (K14 / SPEC-W45): /ussd/callback/{secret} -> messaging-gateway ----
+  # Africa's Talking (and other aggregators) POST session callbacks here.
+  # PUBLIC path by design (the aggregator cannot present Keycloak tokens) —
+  # the SECRET IS THE FINAL PATH SEGMENT: messaging-gateway constant-time
+  # compares it against AT_CALLBACK_SECRET (503 fail-closed when unset, 401
+  # on mismatch, per-phone rate limit service-side). The wildcard must allow
+  # the secret segment, hence /ussd/callback/* (the bare prefix without a
+  # segment is NOT routed). The legacy /webhooks/ussd path is retired
+  # service-side by K14. The gateway adds a per-IP throttle on top (the
+  # secret is a bearer credential in the URL — keep it out of logs: APISIX
+  # access logs record the URI, so treat gateway logs as sensitive).
+  - id: ussd-callback
+    uris:
+      - /ussd/callback/*
+    methods: [POST, OPTIONS]
+    upstream_id: messaging-gateway
+    plugins:
+      limit-count:
+        count: 300
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  # ---- Tenant API keys (K17 / SPEC-W45): /api/ext/booking/* -> booking /v1/ext/bookings/* ----
+  # External tenant-automation surface (read-only bookings scope). NOTE:
+  # openid-connect is deliberately NOT applied here — callers authenticate
+  # with an X-Api-Key header that BOOKING-SERVICE validates itself against
+  # identity's /internal/api-keys/validate (fail-closed, per-key rate limit).
+  # The gateway must stay auth-agnostic on this route: it neither verifies
+  # nor strips X-Api-Key (global rule 1 strips only internal identity
+  # headers, not API keys).
+  - id: api-ext-booking
+    uris:
+      - /api/ext/booking/*
+    methods: [GET, OPTIONS]
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/ext/booking/?(.*)"
+          - "/v1/ext/bookings/$1"
+      limit-count:
+        count: 300
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "GET,OPTIONS"
+        allow_headers: "Content-Type,X-Api-Key"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
   - id: webhooks-messaging
     uris:
       - /webhooks/*
@@ -1829,6 +2000,10 @@ routes:
         allow_credential: false
 
   # ---- Twenty CRM (SPEC-CRM §A): /crm/* -> twenty-api, bearer_only OIDC ----
+  # K21 (SPEC-W45): tenant CRM data is staff tooling — the route now ALSO
+  # enforces an admin|staff realm-role claim (403 otherwise); bearer_only
+  # alone let ANY authenticated realm user (e.g. a customer-portal account)
+  # browse every workspace.
   - id: crm-twenty
     uris:
       - /crm/*
@@ -1846,6 +2021,36 @@ routes:
         realm: opendesk
         client_id: admin-web
         use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- K21 (SPEC-W45): realm-role gate — admin, staff or
+            -- platform-admin only. Decodes the (not-yet-verified) payload
+            -- for the claim; openid-connect bearer_only still verifies the
+            -- signature in the access phase AFTER this runs, so a forged
+            -- token 401s before it ever reaches upstream.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
+              local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
+              for _, r in ipairs({"admin", "staff", "platform-admin"}) do
+                if roles:find('"' .. r .. '"', 1, true) then return end
+              end
+              ngx.exit(403)
+            end
       limit-count:
         count: 600
         time_window: 60
@@ -1941,11 +2146,142 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- Voice admin (K15d / SPEC-W45): /api/voice-admin/* -> voice /voice-admin/* ----
+  # Voice enrollment is biometric onboarding (NDPA-sensitive) — it moved OFF
+  # the public /voice/* prefix. This route carries openid-connect bearer_only
+  # + a staff|admin realm-role gate; the voice runtime additionally checks
+  # X-Internal-Token (VOICE_ADMIN_INTERNAL_TOKEN) server-side — but note the
+  # gateway STRIPS client-supplied x-internal-token (global rule 1), so
+  # gateway-admins authenticate via JWT + role claim here and the service
+  # treats the gateway route as the admin path (in-cluster callers use the
+  # token). Rewrites /api/voice-admin/* -> /voice-admin/*.
+  - id: api-voice-admin
+    uris:
+      - /api/voice-admin/*
+      - /api/voice-admin
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    upstream_id: voice
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/voice-admin/?(.*)"
+          - "/voice-admin/$1"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W44 K1 injection (identical to api-notifications-ops-alerts):
+            -- X-User-Id / X-User-Roles from the JWT so the service-side
+            -- _require_admin_access guard (W45 FX2) can trust the gateway role
+            -- header. openid-connect verifies the signature in the access phase
+            -- AFTER this runs, so a forged token 401s before upstream.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
+          - |
+            -- K15d (SPEC-W45): staff tooling gate — staff, admin or
+            -- platform-admin realm role (403 otherwise). The payload decode
+            -- is safe pre-verification: openid-connect verifies the JWT
+            -- signature in the access phase AFTER this runs, so a forged
+            -- token 401s before upstream.
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+              local rem = #b64 % 4
+              if rem == 2 then b64 = b64 .. "=="
+              elseif rem == 3 then b64 = b64 .. "="
+              elseif rem == 1 then return end
+              local json = ngx.decode_base64(b64)
+              if not json then return end
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
+              local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
+              for _, r in ipairs({"staff", "admin", "platform-admin"}) do
+                if roles:find('"' .. r .. '"', 1, true) then return end
+              end
+              ngx.exit(403)
+            end
+      limit-count:
+        count: 120
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  # ---- K15d (SPEC-W45): legacy public enrollment path CLOSED --------------
+  # POST /voice/voices/enroll was reachable anonymously via the public
+  # /voice/* wildcard (biometric write with no auth). The endpoint now lives
+  # behind /api/voice-admin/* above; the legacy public path 404s (priority 10
+  # wins over the /voice/* wildcard; no surface disclosure).
+  - id: block-voice-enrollment-public
+    uris:
+      - /voice/voices/enroll
+      - /voice/voices/enroll/
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
   # ---- Voice runtime ingress (public chat/session + LiveKit webhooks) ----
-  # SECURITY (SPEC-W3 §2): /voice/chat + /voice/session stay PUBLIC because
-  # anonymous website visitors use them (no Keycloak account), so they cannot
-  # get openid-connect bearer_only like /api/*. Instead they get a STRICTER
-  # limit-count (30 req/min per IP vs 120 before) keyed on remote_addr.
+  # SECURITY (SPEC-W3 §2): /voice/chat + /voice/session + /voice/tts-preview
+  # stay PUBLIC because anonymous website visitors use them (no Keycloak
+  # account), so they cannot get openid-connect bearer_only like /api/*.
+  # Instead they get a STRICTER limit-count (30 req/min per IP vs 120 before)
+  # keyed on remote_addr. K15d (SPEC-W45): enrollment NO LONGER rides this
+  # wildcard — /voice/voices/enroll 404s here (block route above) and lives
+  # behind /api/voice-admin/* (jwt + staff role).
   # TODO(prod): add a bot-gate (Cloudflare Turnstile token verified by the
   # voice runtime) in front of /voice/chat — rate limiting alone does not
   # stop credential-free LLM cost abuse. LiveKit webhook/SIP paths under
