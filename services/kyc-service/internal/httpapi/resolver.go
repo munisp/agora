@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -114,11 +115,17 @@ func (l *LiveResolver) Resolve(ctx context.Context, idType, idValue string) (str
 	}
 }
 
-// hashIDValue returns the SHA-256 hex digest of a raw BVN/NIN. Only the
-// digest is ever stored (kyc_audit.id_value_hash) — NDPA data minimization.
-func hashIDValue(v string) string {
-	sum := sha256.Sum256([]byte(v))
-	return hex.EncodeToString(sum[:])
+// hashIDValue returns the HMAC-SHA256 hex digest of a raw BVN/NIN keyed
+// with KYC_HASH_SECRET (SPEC-W45 K22, OOS-17). Only the digest is ever
+// stored (kyc_audit.id_value_hash) — NDPA data minimization. Keyed (not
+// bare SHA-256) because the BVN/NIN space is small enough to dictionary-
+// attack: a leaked audit table must not reveal who was resolved. Config
+// fails closed at startup when the secret is unset outside an explicit dev
+// opt-in, so secret is never empty here.
+func hashIDValue(secret, v string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(v))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // referenceFor derives the deterministic resolution reference (uuid5 of

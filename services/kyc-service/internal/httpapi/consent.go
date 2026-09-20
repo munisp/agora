@@ -24,7 +24,14 @@ type ConsentChecker interface {
 	// CheckConsent returns the canonical tenant uuid when an active consent
 	// exists, ErrConsentDenied on a 403, or a wrapped error on transport
 	// failure (mapped to 502 — the gate itself is down).
-	CheckConsent(ctx context.Context, tenantRef, subject, purpose string) (uuid.UUID, error)
+	//
+	// SPEC-W45 K22: the check is on (tenant, subject_phone, purpose,
+	// id_type, id_hash) — idType/idHash identify the ID being resolved so
+	// the gate can scope consent to specific IDs; identity versions that
+	// predate the binding ignore the extra query parameters and the
+	// phone-level consent + kyc-side audit binding (server.go resolve)
+	// remain the enforcement floor.
+	CheckConsent(ctx context.Context, tenantRef, subject, purpose, idType, idHash string) (uuid.UUID, error)
 }
 
 // ConsentClient calls identity-service, either directly (IdentityBaseURL
@@ -55,8 +62,15 @@ func NewConsentClient(d *daprc.Client, appID, baseURL, internalToken string) *Co
 // CheckConsent implements ConsentChecker. The tenant reference is forwarded
 // as X-Tenant-ID (uuid) or X-Tenant-Slug header, matching identity's
 // /internal/consents/check contract.
-func (c *ConsentClient) CheckConsent(ctx context.Context, tenantRef, subject, purpose string) (uuid.UUID, error) {
+func (c *ConsentClient) CheckConsent(ctx context.Context, tenantRef, subject, purpose, idType, idHash string) (uuid.UUID, error) {
 	q := url.Values{"subject": {subject}, "purpose": {purpose}}
+	// SPEC-W45 K22 binding context (ignored by pre-K22 identity versions).
+	if idType != "" {
+		q.Set("id_type", idType)
+	}
+	if idHash != "" {
+		q.Set("id_hash", idHash)
+	}
 	headers := map[string]string{}
 	if _, err := uuid.Parse(tenantRef); err == nil {
 		headers["X-Tenant-ID"] = tenantRef

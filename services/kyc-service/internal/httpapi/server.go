@@ -4,6 +4,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -35,7 +36,15 @@ type Deps struct {
 	Events      EventPublisher
 	PubSub      string
 	EventsTopic string
-	Logger      *zap.Logger
+	// InternalToken (KYC_INTERNAL_TOKEN, SPEC-W45 K22): X-Internal-Token
+	// gate on /v1/kyc/* — 503 fail-closed when unset, 401 missing/wrong
+	// (identity-service K2 pattern).
+	InternalToken string
+	// HashSecret (KYC_HASH_SECRET, SPEC-W45 K22): HMAC-SHA256 key for
+	// id_value_hash. Config fails closed when unset outside dev, so this
+	// is never empty in a wired deployment.
+	HashSecret string
+	Logger     *zap.Logger
 }
 
 // NewRouter builds the chi router with all routes (booking-service shape).
@@ -50,9 +59,31 @@ func NewRouter(d Deps) http.Handler {
 
 	r.Get("/healthz", s.healthz)
 	r.Route("/v1/kyc", func(r chi.Router) {
+		r.Use(s.internauth)
 		r.Post("/resolve", s.resolve)
 	})
 	return r
+}
+
+// internauth gates /v1/kyc/* (SPEC-W45 K22, OOS-07): X-Internal-Token must
+// match KYC_INTERNAL_TOKEN via constant-time compare. Fail-closed: 503 when
+// the env token is unset, 401 on missing/wrong — the identity-service K2
+// pattern (identity-service/internal/httpapi/auth.go internauth).
+func (s *server) internauth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.d.InternalToken == "" {
+			s.d.Logger.Error("KYC_INTERNAL_TOKEN unset — refusing request (fail-closed, K22)",
+				zap.String("path", r.URL.Path))
+			writeError(w, http.StatusServiceUnavailable, "internal token not configured")
+			return
+		}
+		got := r.Header.Get("X-Internal-Token")
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.d.InternalToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid internal token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type server struct{ d Deps }
@@ -81,14 +112,16 @@ type resolveResponse struct {
 }
 
 // resolve (POST /v1/kyc/resolve) is the consent-gated KYC resolution
-// endpoint (SPEC-W12 §5):
+// endpoint (SPEC-W12 §5), gated by X-Internal-Token (SPEC-W45 K22):
 //  1. validate the request;
 //  2. consent gate — identity GET /internal/consents/check?purpose=kyc;
 //     no consent → 403; gate unreachable → 502;
-//  3. resolve via the mock (deterministic) or live provider;
-//  4. write exactly one kyc_audit row (who/what/when/result — raw id_value
-//     is hashed, never stored);
-//  5. publish com.opendesk.kyc.Resolved (best-effort outbox, identity-service
+//  3. consent↔ID binding (SPEC-W45 K22) — the ID must be unbound or bound
+//     to this subject_phone, else 403;
+//  4. resolve via the mock (deterministic) or live provider;
+//  5. write exactly one kyc_audit row (who/what/when/result — raw id_value
+//     is HMAC-hashed, never stored);
+//  6. publish com.opendesk.kyc.Resolved (best-effort outbox, identity-service
 //     pattern; the audit row is the durable record for reconciliation).
 func (s *server) resolve(w http.ResponseWriter, r *http.Request) {
 	var req resolveRequest
@@ -109,8 +142,18 @@ func (s *server) resolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Consent gate (contract §5: no consent → 403).
-	tenantID, err := s.d.Consent.CheckConsent(r.Context(), req.TenantID, req.SubjectPhone, "kyc")
+	// SPEC-W45 K22: the id_value hash is computed once, up front — the
+	// consent check, the binding rule, the audit row and the event all use
+	// the SAME keyed digest (HMAC-SHA256 with KYC_HASH_SECRET).
+	idHash := hashIDValue(s.d.HashSecret, req.IDValue)
+
+	// Consent gate (contract §5: no consent → 403). SPEC-W45 K22 binding
+	// rule, part 1: the consent record must match the PHONE — the check
+	// runs on (tenant, subject_phone, purpose=kyc) and the id_type/id_hash
+	// being resolved are forwarded so the gate can enforce ID-level consent
+	// scoping; the request MUST carry subject_phone (validated above) and
+	// that phone — not any other identifier — is the consented subject.
+	tenantID, err := s.d.Consent.CheckConsent(r.Context(), req.TenantID, req.SubjectPhone, "kyc", req.IDType, idHash)
 	if errors.Is(err, ErrConsentDenied) {
 		writeJSON(w, http.StatusForbidden, map[string]any{
 			"error":  "consent_required",
@@ -121,6 +164,26 @@ func (s *server) resolve(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.d.Logger.Error("consent gate failure", zap.Error(err))
 		writeError(w, http.StatusBadGateway, "consent gate unavailable")
+		return
+	}
+
+	// SPEC-W45 K22 binding rule, part 2 (OOS-17): an ID is bound to the
+	// phone of its FIRST consented resolution in this tenant (recorded in
+	// the append-only audit trail). Resolving the same (id_type, id_hash)
+	// under a DIFFERENT subject_phone means the ID is not associated with
+	// the consented phone → 403, before any provider call or audit write.
+	owner, err := s.d.Store.IDHashOwner(r.Context(), tenantID, req.IDType, idHash)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if owner != "" && owner != req.SubjectPhone {
+		s.d.Logger.Warn("kyc id binding violation",
+			zap.String("tenant_id", tenantID.String()), zap.String("id_type", req.IDType))
+		writeJSON(w, http.StatusForbidden, map[string]any{
+			"error":  "id_binding_violation",
+			"detail": "this id is not associated with the consented subject_phone",
+		})
 		return
 	}
 
@@ -135,7 +198,6 @@ func (s *server) resolve(w http.ResponseWriter, r *http.Request) {
 			status = StatusPending
 		}
 	}
-	idHash := hashIDValue(req.IDValue)
 	reference := referenceFor(tenantID, req.SubjectPhone, req.IDType, idHash)
 
 	// Audit (who/what/when/result). The actor header is optional metadata —

@@ -78,12 +78,17 @@ func TestLiveResolverContractShapes(t *testing.T) {
 }
 
 func TestHashAndReferenceStable(t *testing.T) {
-	h1 := hashIDValue("22223333444")
-	if len(h1) != 64 || h1 != hashIDValue("22223333444") {
-		t.Errorf("sha256 hex expected, got %q", h1)
+	h1 := hashIDValue("k", "22223333444")
+	if len(h1) != 64 || h1 != hashIDValue("k", "22223333444") {
+		t.Errorf("HMAC-SHA256 hex expected, got %q", h1)
 	}
-	if h1 == hashIDValue("22223333445") {
+	if h1 == hashIDValue("k", "22223333445") {
 		t.Errorf("hash collision on adjacent values")
+	}
+	// SPEC-W45 K22: the digest is KEYED — a different secret yields a
+	// different digest for the same id_value (dictionary-attack resistance).
+	if h1 == hashIDValue("other", "22223333444") {
+		t.Errorf("digest must change with the HMAC secret")
 	}
 	tid := uuid.New()
 	r1 := referenceFor(tid, "+2348", "bvn", h1)
