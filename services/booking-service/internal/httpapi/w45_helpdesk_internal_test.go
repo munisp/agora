@@ -56,7 +56,7 @@ func TestRequireOrInternalToken(t *testing.T) {
 		rec, req := newReq(map[string]string{"X-Internal-Token": "nope"})
 		s.requireOrInternalToken("manage_bookings")(next).ServeHTTP(rec, req)
 		if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("wrong token = %d, want 401", rec.Code)
+			t.Fatalf("wrong token = %d, want 401", rec.Code)
 		}
 	})
 
