@@ -31,17 +31,20 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 git clone <this repo> && cd opendesk
 make config        # validate compose
 make up            # build & start everything (~15 images, first build takes a while)
-make seed          # demo tenant "acme" with catalog + knowledge
+make seed          # demo tenant "acme" with catalog + knowledge (through the gateway
+                   # with a Keycloak JWT — set SEED_USER/SEED_PASSWORD + KC_BOOTSTRAP_ADMIN_PASSWORD;
+                   # see docs/runbooks/local-dev.md §1/§3)
 ./scripts/seed-industries.sh   # 4 demo tenants, one per industry pack (acme-salon, acme-clinic, acme-consult, acme-support)
 make smoke         # end-to-end checks through the gateway
 ```
 
-Then open:
+Then open (everything via the gateway — the web app and service ports are
+not host-published; W34 GF4):
 
 | UI | URL |
 |---|---|
-| Public booking page | http://localhost:9080/p/acme (or http://localhost:3001/p/acme) |
-| Tenant dashboard | http://localhost:3001/app/acme (Keycloak login: `admin` / `admin123`) |
+| Public booking page | http://localhost:9080/p/acme |
+| Tenant dashboard | http://localhost:9080/app/acme (Keycloak login — no seeded user; create a dev realm user per docs/runbooks/local-dev.md §3. The old `admin`/`admin123` was removed in W34 GF5) |
 | CRM UI (Twenty) | http://localhost:3100 |
 | Grafana (observability profile) | http://localhost:3002 |
 | Keycloak admin | http://localhost:8080 |

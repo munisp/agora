@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import { RefreshCw } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { useBookingEvents } from "@/lib/ws";
@@ -51,6 +52,7 @@ export function BookingsClient({
   token?: string;
 }) {
   const { toast } = useToast();
+  const router = useRouter();
   const [range, setRange] = React.useState<Range>("upcoming");
   const [bookings, setBookings] = React.useState<Booking[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -102,22 +104,45 @@ export function BookingsClient({
     void load(range);
   }, [load, range]);
 
+  // SPEC-W45 K15(e): the staff LiveKit join token is no longer published on
+  // the events topic. When an operator picks up the escalation we mint a
+  // token on demand via the staff-gated voice-admin endpoint, then navigate
+  // to the call page with it.
+  const joinEscalation = React.useCallback(
+    async (conversationId: string) => {
+      try {
+        const res = await api.post<{ room: string; token: string }>(
+          `/api/voice-admin/escalations/${encodeURIComponent(conversationId)}/staff-token`,
+          {},
+        );
+        const params = new URLSearchParams({ room: res.room, token: res.token });
+        router.push(`/app/${orgSlug}/call?${params.toString()}`);
+      } catch (e) {
+        toast({
+          title: "Could not join the escalation",
+          description:
+            e instanceof ApiError
+              ? e.message
+              : "The voice runtime did not issue a staff token.",
+          variant: "destructive",
+        });
+      }
+    },
+    [orgSlug, router, toast],
+  );
+
   // Live updates from gateway-edge: toast + silent refresh. Also listens for
   // warm-handoff escalations from the voice runtime (innovation 1) and offers
-  // the staff member a link to join the LiveKit escalation room.
+  // the staff member a join action for the LiveKit escalation room.
   const { connected } = useBookingEvents(orgSlug, token, (event: WsEvent) => {
     if (event.type === "EscalationRequested") {
       const data = (event as EscalationRequestedEvent).data;
-      const params = new URLSearchParams({
-        room: data.room,
-        token: data.join_token_staff,
-      });
       toast({
         title: "Human handoff requested",
         description: `The receptionist asked a human to take over (room ${data.room}).`,
         variant: "warning",
-        href: `/app/${orgSlug}/call?${params.toString()}`,
-        hrefLabel: "Join the call",
+        actionLabel: "Join the call",
+        onAction: () => void joinEscalation(data.conversation_id),
       });
       return;
     }

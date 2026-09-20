@@ -68,6 +68,48 @@ import { StatsTiles } from "@/components/apps/social-publisher/stats-tiles";
 const ROLLOUT_NOTE =
   "Social Publisher is not available yet — the booking-service social API may still be rolling out.";
 
+/**
+ * SPEC-W45 (UC social-status): per-provider configuration posture from the
+ * socialpub settings read API (GET /v1/social/settings; field
+ * config_status: "configured" | "not_configured"). Decoded defensively —
+ * the response may be a provider-keyed map or a list; a missing endpoint
+ * (404) simply hides the section.
+ */
+type ConfigStatus = "configured" | "not_configured";
+
+const SOCIAL_PROVIDERS = [
+  { id: "meta", label: "Meta" },
+  { id: "tiktok", label: "TikTok" },
+  { id: "x", label: "X" },
+] as const;
+
+function parseConfigStatuses(data: unknown): Record<string, ConfigStatus> {
+  const out: Record<string, ConfigStatus> = {};
+  const mark = (provider: unknown, value: unknown) => {
+    if (typeof provider !== "string") return;
+    const status =
+      typeof value === "string"
+        ? value
+        : typeof value === "object" && value !== null
+          ? (value as { config_status?: unknown }).config_status
+          : undefined;
+    out[provider] = status === "configured" ? "configured" : "not_configured";
+  };
+  if (typeof data !== "object" || data === null) return out;
+  const providers = (data as { providers?: unknown }).providers ?? data;
+  if (Array.isArray(providers)) {
+    for (const p of providers) {
+      if (typeof p === "object" && p !== null) {
+        const rec = p as Record<string, unknown>;
+        mark(rec.provider ?? rec.id ?? rec.name, rec.config_status ?? rec.status);
+      }
+    }
+  } else if (typeof providers === "object" && providers !== null) {
+    for (const [k, v] of Object.entries(providers)) mark(k, v);
+  }
+  return out;
+}
+
 function errMsg(e: unknown): string {
   // ApiError's message already surfaces the backend's {error} body (the
   // gate messages: 422 political gate, 409 account/transition).
@@ -113,6 +155,30 @@ export function SocialPublisherClient({
 
   const [busy, setBusy] = React.useState(false);
   const [busyId, setBusyId] = React.useState<string | null>(null);
+
+  // Provider configuration posture (SPEC-W45 UC social-status). null = the
+  // settings read API is unavailable (older build) → section hidden.
+  const [configStatus, setConfigStatus] = React.useState<Record<
+    string,
+    ConfigStatus
+  > | null>(null);
+
+  React.useEffect(() => {
+    const c = new AbortController();
+    (async () => {
+      try {
+        const data = await api.get<unknown>(
+          "/api/bookings/v1/social/settings",
+          { tenant: orgSlug },
+        );
+        if (c.signal.aborted) return;
+        setConfigStatus(parseConfigStatuses(data));
+      } catch {
+        if (!c.signal.aborted) setConfigStatus(null);
+      }
+    })();
+    return () => c.abort();
+  }, [orgSlug]);
 
   // ---------------------------------------------------------------------
   // Loads
@@ -504,6 +570,39 @@ export function SocialPublisherClient({
           </Button>
         }
       />
+
+      {configStatus ? (
+        <div className="rounded-lg border border-border bg-card p-4">
+          <p className="mb-2 text-sm font-medium">Provider configuration</p>
+          <ul className="flex flex-wrap gap-x-6 gap-y-2">
+            {SOCIAL_PROVIDERS.map((p) => {
+              const status = configStatus[p.id] ?? "not_configured";
+              return (
+                <li key={p.id} className="flex items-center gap-2 text-sm">
+                  <span
+                    className={
+                      status === "configured"
+                        ? "inline-block h-2 w-2 rounded-full bg-success"
+                        : "inline-block h-2 w-2 rounded-full bg-muted-foreground/40"
+                    }
+                    aria-hidden
+                  />
+                  <span>{p.label}</span>
+                  {status === "configured" ? (
+                    <span className="text-xs text-muted-foreground">
+                      Configured
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">
+                      Not configured — see docs/social-publishing.md
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
 
       <Tabs defaultValue="accounts">
         <TabsList>
