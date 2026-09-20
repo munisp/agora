@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/opendesk/identity-service/internal/daprc"
@@ -27,6 +28,7 @@ type fakeStore struct {
 	mu      sync.Mutex
 	tenants map[string]store.Tenant
 	members map[uuid.UUID][]store.Membership
+	apiKeys []store.APIKey
 	deleted []string
 }
 
@@ -97,14 +99,114 @@ func (f *fakeStore) ListMembers(_ context.Context, tenantID uuid.UUID) ([]store.
 func (f *fakeStore) AddMember(_ context.Context, m store.Membership) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for i, ex := range f.members[m.TenantID] {
+		if ex.UserID == m.UserID {
+			f.members[m.TenantID][i].Role = m.Role
+			return nil
+		}
+	}
 	f.members[m.TenantID] = append(f.members[m.TenantID], m)
 	return nil
 }
 
+func (f *fakeStore) GetMember(_ context.Context, tenantID uuid.UUID, userID string) (store.Membership, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, m := range f.members[tenantID] {
+		if m.UserID == userID {
+			return m, nil
+		}
+	}
+	return store.Membership{}, store.ErrNotFound
+}
+
+func (f *fakeStore) RemoveMember(_ context.Context, tenantID uuid.UUID, userID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ms := f.members[tenantID]
+	for i, m := range ms {
+		if m.UserID == userID {
+			f.members[tenantID] = append(ms[:i], ms[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (f *fakeStore) CountMembers(_ context.Context, tenantID uuid.UUID) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.members[tenantID]), nil
+}
+
+func (f *fakeStore) SetTenantPlan(_ context.Context, slug, plan string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.tenants[slug]
+	if !ok {
+		return store.ErrNotFound
+	}
+	t.Plan = plan
+	f.tenants[slug] = t
+	return nil
+}
+
+func (f *fakeStore) CreateAPIKey(_ context.Context, k *store.APIKey) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if k.ID == uuid.Nil {
+		k.ID = uuid.New()
+	}
+	f.apiKeys = append(f.apiKeys, *k)
+	return nil
+}
+
+func (f *fakeStore) ListAPIKeys(_ context.Context, tenantID uuid.UUID) ([]store.APIKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.APIKey
+	for _, k := range f.apiKeys {
+		if k.TenantID == tenantID {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RevokeAPIKey(_ context.Context, tenantID, keyID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, k := range f.apiKeys {
+		if k.TenantID == tenantID && k.ID == keyID && k.RevokedAt == nil {
+			now := time.Now().UTC()
+			f.apiKeys[i].RevokedAt = &now
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (f *fakeStore) GetAPIKeyByHash(_ context.Context, keyHash string) (store.APIKey, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, k := range f.apiKeys {
+		if k.KeyHash == keyHash && k.RevokedAt == nil {
+			for _, t := range f.tenants {
+				if t.ID == k.TenantID {
+					return k, t.Slug, nil
+				}
+			}
+		}
+	}
+	return store.APIKey{}, "", store.ErrNotFound
+}
+
 // fakePermify answers Check from a key set "permission|subject|resource".
 type fakePermify struct {
-	allowed map[string]bool
-	err     error
+	allowed    map[string]bool
+	err        error
+	relDeleted []string
+	tenantDel  []string
 }
 
 func (f *fakePermify) Check(_ context.Context, tenantID, subject, permission, resource string) (bool, error) {
@@ -120,15 +222,67 @@ func (f *fakePermify) WriteRelationship(context.Context, string, string, string,
 	return nil
 }
 
-type fakeKeycloak struct{ nextUser int }
+func (f *fakePermify) DeleteRelationship(_ context.Context, tenantID, entity, relation, subject string) error {
+	f.relDeleted = append(f.relDeleted, entity+"#"+relation+"@"+subject)
+	return nil
+}
+
+func (f *fakePermify) DeleteTenant(_ context.Context, tenantID string) error {
+	f.tenantDel = append(f.tenantDel, tenantID)
+	return nil
+}
+
+type fakeKeycloak struct {
+	nextUser     int
+	userExists   bool // simulate re-invite of an already-registered e-mail
+	disabled     []string
+	loggedOut    []string
+	assigned     []string
+	removedRoles []string
+	groupsDel    []string
+	actionsEmail []string
+}
 
 func (f *fakeKeycloak) CreateTenantGroup(context.Context, string) (string, error) {
 	return uuid.NewString(), nil
 }
 
-func (f *fakeKeycloak) CreateUser(_ context.Context, _ string, _ keycloak.CreateUserInput) (string, error) {
+func (f *fakeKeycloak) CreateUser(_ context.Context, _ string, in keycloak.CreateUserInput) (string, error) {
+	if f.userExists {
+		return "", keycloak.ErrUserExists
+	}
 	f.nextUser++
 	return fmt.Sprintf("user-%d", f.nextUser), nil
+}
+
+func (f *fakeKeycloak) SendExecuteActionsEmail(_ context.Context, userID string, actions []string) error {
+	f.actionsEmail = append(f.actionsEmail, userID+":"+strings.Join(actions, ","))
+	return nil
+}
+
+func (f *fakeKeycloak) DisableUser(_ context.Context, userID string) error {
+	f.disabled = append(f.disabled, userID)
+	return nil
+}
+
+func (f *fakeKeycloak) LogoutUserSessions(_ context.Context, userID string) error {
+	f.loggedOut = append(f.loggedOut, userID)
+	return nil
+}
+
+func (f *fakeKeycloak) AssignRealmRole(_ context.Context, userID, role string) error {
+	f.assigned = append(f.assigned, userID+":"+role)
+	return nil
+}
+
+func (f *fakeKeycloak) RemoveRealmRole(_ context.Context, userID, role string) error {
+	f.removedRoles = append(f.removedRoles, userID+":"+role)
+	return nil
+}
+
+func (f *fakeKeycloak) DeleteTenantGroup(_ context.Context, slug string) error {
+	f.groupsDel = append(f.groupsDel, slug)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +292,7 @@ func (f *fakeKeycloak) CreateUser(_ context.Context, _ string, _ keycloak.Create
 type harness struct {
 	st      *fakeStore
 	perm    *fakePermify
+	kc      *fakeKeycloak
 	http    http.Handler
 	token   string
 	tenID   uuid.UUID
@@ -158,7 +313,7 @@ func newHarness(token string) *harness {
 	perm := &fakePermify{allowed: map[string]bool{}}
 	tid := uuid.New()
 	st.addTenant(store.Tenant{ID: tid, Slug: "acme", Name: "Acme"})
-	h := &harness{st: st, perm: perm, token: token, tenID: tid, tenSlug: "acme"}
+	h := &harness{st: st, perm: perm, kc: &fakeKeycloak{}, token: token, tenID: tid, tenSlug: "acme"}
 	h.http = NewRouter(h.deps())
 	return h
 }
@@ -168,7 +323,7 @@ func newHarness(token string) *harness {
 func (h *harness) deps() Deps {
 	return Deps{
 		Store:         h.st,
-		Keycloak:      &fakeKeycloak{},
+		Keycloak:      h.kc,
 		Permify:       h.perm,
 		Dapr:          daprc.New("127.0.0.1", 1),
 		Logger:        zap.NewNop(),
@@ -221,10 +376,19 @@ func TestInternalDeleteTenantAuthMatrix(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("delete: status = %d, body %s", rec.Code, rec.Body)
 	}
-	var out map[string]string
+	// W45 K9: the response may additively carry a warnings array (best-effort
+	// cascade surfacing), so decode into a generic map.
+	var out map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	if out["deleted"] != "acme" {
 		t.Errorf("body = %v", out)
+	}
+	// K9 cascade: Keycloak group + Permify tenant deletion ran best-effort.
+	if len(h.kc.groupsDel) != 1 || h.kc.groupsDel[0] != "acme" {
+		t.Errorf("keycloak group deletions = %v", h.kc.groupsDel)
+	}
+	if len(h.perm.tenantDel) != 1 || h.perm.tenantDel[0] != h.tenID.String() {
+		t.Errorf("permify tenant deletions = %v", h.perm.tenantDel)
 	}
 	if len(h.st.deleted) != 1 || h.st.deleted[0] != "acme" {
 		t.Errorf("store deletions = %v", h.st.deleted)
