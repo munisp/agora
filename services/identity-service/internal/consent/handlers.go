@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/opendesk/identity-service/internal/authn"
 	"github.com/opendesk/identity-service/internal/store"
 	"go.uber.org/zap"
 )
@@ -49,7 +50,12 @@ type Handler struct {
 	// gateway-less runs. See authorizeDataAccess (SPEC-W44 F4 / V2-D3).
 	InternalToken      string
 	TrustDirectTenancy bool
-	Logger             *zap.Logger
+	// PortalSecret (PORTAL_SECRET, shared with booking-service) enables data
+	// subjects to self-serve the gated data-access/erasure surfaces with a
+	// booking portal JWT (SPEC-W45 STK O13 — see portal.go). Unset = portal
+	// path unavailable (fail-closed).
+	PortalSecret string
+	Logger       *zap.Logger
 }
 
 // RegisterRoutes adds the consent routes to the router (called additively
@@ -104,12 +110,27 @@ type captureRequest struct {
 	Purpose         string `json:"purpose"`
 	CapturedChannel string `json:"captured_channel"`
 	CapturedLocale  string `json:"captured_locale"`
+	// CapturedBy (SPEC-W45 STK O13) is the provenance of the capture — who/
+	// what recorded the consent (e.g. "booking-widget", "ussd", a staff
+	// subject). When empty the server DERIVES it from the caller context:
+	// "portal:<contact_id>" for a booking-portal JWT, "service:internal" for
+	// the K2 token, "user:<sub>" for an authenticated subject, else "public".
+	CapturedBy string `json:"captured_by"`
 }
 
 // capture (POST /v1/consents) records consent. Idempotent on
 // (tenant, subject, purpose): a replay returns the existing record with its
 // original captured_ts; a replay after erasure re-consents (clears the
 // tombstone).
+//
+// PUBLIC BY DESIGN: consent is captured at PUBLIC surfaces (booking widget,
+// public site, QR pages, USSD) at the exact moment the data subject acts —
+// BEFORE they hold any credential (their portal session comes later, via
+// OTP). Gating capture on authentication would make lawful consent recording
+// impossible precisely where it must happen. Instead of a gate, the record
+// carries captured_by PROVENANCE (SPEC-W45 STK O13) so audits can
+// distinguish self-declared captures from operator/service-recorded ones;
+// the destructive/read surfaces (erasure, list) ARE gated (authorizeDataAccess).
 func (h *Handler) capture(w http.ResponseWriter, r *http.Request) {
 	var req captureRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -138,12 +159,33 @@ func (h *Handler) capture(w http.ResponseWriter, r *http.Request) {
 		Purpose:         req.Purpose,
 		CapturedChannel: req.CapturedChannel,
 		CapturedLocale:  req.CapturedLocale,
+		CapturedBy:      h.deriveCapturedBy(r, req.CapturedBy, tenant.Slug),
 	}
 	if err := h.Repo.Capture(r.Context(), &rec); err != nil {
 		h.internal(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, rec)
+}
+
+// deriveCapturedBy resolves the capture provenance (STK O13). An explicit
+// caller-provided value wins (channel descriptors like "booking-widget" are
+// meaningful provenance, not an authz claim — the endpoint is public by
+// design, see capture); otherwise it is derived from the caller context.
+func (h *Handler) deriveCapturedBy(r *http.Request, explicit, tenantSlug string) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	if claims, ok := parsePortalJWT(h.PortalSecret, r.Header.Get("Authorization")); ok && claims.TenantSlug == tenantSlug {
+		return "portal:" + claims.Sub
+	}
+	if authn.ValidInternalToken(h.InternalToken, r) {
+		return "service:internal"
+	}
+	if c, err := authn.Resolve(r); err == nil && c.Subject != "" {
+		return "user:" + c.Subject
+	}
+	return "public"
 }
 
 // list (GET /v1/consents?subject=) returns every consent record of a data
@@ -166,7 +208,7 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		h.tenantError(w, err)
 		return
 	}
-	if !h.authorizeDataAccess(w, r, tenant.Slug) {
+	if !h.authorizeDataAccess(w, r, tenant.Slug, subject) {
 		return
 	}
 	recs, err := h.Repo.List(r.Context(), tenant.ID, subject)
@@ -239,9 +281,10 @@ type erasureRequest struct {
 //
 // GATED (SPEC-W44 F4 / V2-D3): K4's PrivacyEraseRequested fanout to
 // opendesk.privacy.events makes this endpoint DESTRUCTIVE cross-service, so
-// it requires an X-Internal-Token service caller or a tenant-bound
-// authenticated subject (authorizeDataAccess). Public data-principal
-// self-service erasure is out of scope pending a verification flow.
+// it requires an X-Internal-Token service caller, a tenant-bound
+// authenticated subject, OR (SPEC-W45 STK O13) the DATA SUBJECT themselves
+// presenting a booking portal JWT whose contact+tenant claims match the
+// erasure target — self-service erasure is live via the portal OTP session.
 func (h *Handler) erasure(w http.ResponseWriter, r *http.Request) {
 	var req erasureRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -265,8 +308,9 @@ func (h *Handler) erasure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// V2-D3 gate BEFORE any tombstone/outbox work: unauthorized callers must
-	// not move a single record (or fan out the privacy event).
-	if !h.authorizeDataAccess(w, r, tenant.Slug) {
+	// not move a single record (or fan out the privacy event). STK O13: a
+	// portal-JWT data subject passes here for their OWN subject only.
+	if !h.authorizeDataAccess(w, r, tenant.Slug, req.Subject) {
 		return
 	}
 	// Erasure eligibility (SPEC-W17 §8.8 / Agent D — additive): a data subject

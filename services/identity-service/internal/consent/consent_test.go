@@ -44,6 +44,7 @@ func (f *fakeRepo) Capture(_ context.Context, rec *Record) error {
 		// Idempotent replay: keep consent_id + captured_ts; clear tombstone.
 		existing.CapturedChannel = rec.CapturedChannel
 		existing.CapturedLocale = rec.CapturedLocale
+		existing.CapturedBy = rec.CapturedBy
 		existing.ErasureTS = nil
 		f.recs[k] = existing
 		*rec = existing
