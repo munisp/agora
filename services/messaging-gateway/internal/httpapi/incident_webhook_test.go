@@ -193,12 +193,19 @@ func TestParseIncidentSecrets(t *testing.T) {
 	}
 }
 
-// Dapr invoke base resolution: override wins, else the sidecar URL.
+// Base resolution (SPEC-W45 ORPH O2): override wins; sidecar → Dapr invoke
+// (registered app-id booking); no sidecar → the direct default.
 func TestResolveIncidentBase(t *testing.T) {
-	if got := ResolveIncidentBase("http://booking:7002", 3500); got != "http://booking:7002" {
+	if got := ResolveIncidentBase("http://booking:7002", 3500, true); got != "http://booking:7002" {
 		t.Fatalf("override = %q", got)
 	}
-	if got := ResolveIncidentBase("", 3501); got != "http://127.0.0.1:3501/v1.0/invoke/booking/method" {
+	if got := ResolveIncidentBase("http://booking:7002", 3500, false); got != "http://booking:7002" {
+		t.Fatalf("override (no sidecar) = %q", got)
+	}
+	if got := ResolveIncidentBase("", 3501, true); got != "http://127.0.0.1:3501/v1.0/invoke/booking/method" {
 		t.Fatalf("dapr base = %q", got)
+	}
+	if got := ResolveIncidentBase("", 3501, false); got != DefaultBookingURL {
+		t.Fatalf("no-sidecar default = %q, want %q", got, DefaultBookingURL)
 	}
 }

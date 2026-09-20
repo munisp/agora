@@ -282,13 +282,18 @@ func (s *DaprUSSDStore) Delete(ctx context.Context, id string) error {
 // Upstream clients
 // ---------------------------------------------------------------------------
 
-// ResolveInvokeBase maps a direct-base override onto the Dapr sidecar
-// invoke base for an app-id (same convention as ResolveBases).
-func ResolveInvokeBase(override, appID string, daprHTTPPort int) string {
+// ResolveInvokeBase maps a direct-base override onto the upstream base for
+// an app-id (same convention as ResolveBases, SPEC-W45 ORPH O2): override
+// wins; with a Dapr sidecar the invoke API; without one the direct-base
+// default (compose service name/port).
+func ResolveInvokeBase(override, appID, defaultDirect string, daprHTTPPort int, sidecar bool) string {
 	if override != "" {
 		return override
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d/v1.0/invoke/%s/method", daprHTTPPort, appID)
+	if sidecar {
+		return fmt.Sprintf("http://127.0.0.1:%d/v1.0/invoke/%s/method", daprHTTPPort, appID)
+	}
+	return defaultDirect
 }
 
 // USSDMenuFetcher loads the tenant pack's ussd.menu (nil = pass-through
