@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/opendesk/booking-service/internal/apikey" // SPEC-W45 K17 (additive import)
 	"github.com/opendesk/booking-service/internal/appgate"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/cache"
@@ -52,6 +54,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)
 	}
+}
+
+// tenantDataDeleterBySlug bridges CODER-E's consumer.TenantDataDeleter
+// interface (DeleteTenantData(ctx, slug string)) to CODER-A's store
+// surface (DeleteTenantDataBySlug — the idempotent K9 cascade helper).
+type tenantDataDeleterBySlug struct {
+	st *store.Store
+}
+
+func (a tenantDataDeleterBySlug) DeleteTenantData(ctx context.Context, slug string) error {
+	_, err := a.st.DeleteTenantDataBySlug(ctx, slug)
+	return err
 }
 
 func run() error {
@@ -107,6 +121,12 @@ func run() error {
 		defer ss.Close()
 		studioStore = ss
 	}
+	// SPEC-W45 U6 (CODER-H2): the model-registry experiments client, hoisted
+	// with the studio store (shared by the worker activities and the
+	// conversion webhook Deps). Nil when MODEL_REGISTRY_URL is unset —
+	// assignment fails open to the control arm; conversion outcome reports
+	// are skipped (RegistryFromEnv logs the posture).
+	studioRegistry := campaignstudio.RegistryFromEnv(logger)
 	// SPEC-W19 integrator — END (hoisted half; the remaining three app
 	// stores are dialed next to the W16 stores below)
 
@@ -253,7 +273,7 @@ func run() error {
 		// step endpoint works via the Starter even without this; the
 		// registration is required for queued sends to actually dispatch).
 		if studioStore != nil {
-			campaignstudio.RegisterWorker(w, &campaignstudio.SendActivities{Store: studioStore, Logger: logger})
+			campaignstudio.RegisterWorker(w, &campaignstudio.SendActivities{Store: studioStore, Logger: logger, Registry: studioRegistry})
 		}
 		// SPEC-W19 integrator — END
 		if err := w.Start(); err != nil {
@@ -281,6 +301,19 @@ func run() error {
 		logger.Info("availability cache enabled", zap.String("redis_addr", cfg.RedisAddr), zap.Duration("ttl", cfg.CacheTTL))
 	}
 
+	// SPEC-W45 K11/K12: the payments rail for the booking money loop
+	// (deposit capture on complete, refunds). Fail-CLOSED: PAYMENTS_URL
+	// unset → no client → money-moving booking endpoints answer 503 with
+	// the config signal. PAYMENTS_INTERNAL_TOKEN is the K2 service-auth
+	// token payments accepts in lieu of gateway money roles.
+	paymentsURL := strings.TrimRight(os.Getenv("PAYMENTS_URL"), "/")
+	var paymentsClient *bookingops.PaymentsClient
+	if paymentsURL == "" {
+		logger.Warn("PAYMENTS_URL unset — booking complete-with-capture, refund and the lending disbursement bridge fail closed (503)")
+	} else {
+		paymentsClient = bookingops.NewPaymentsClient(paymentsURL, os.Getenv("PAYMENTS_INTERNAL_TOKEN"), logger)
+	}
+
 	ops := &bookingops.Service{
 		Store:       st,
 		Saga:        saga,
@@ -288,6 +321,7 @@ func run() error {
 		UsageTopic:  cfg.UsageEventsTopic,
 		Logger:      logger,
 		Cache:       availCache,
+		Payments:    paymentsClient,
 	}
 
 	// Incidents service (SPEC-W11 Part B): ingest (Kafka consumer + webhook
@@ -393,6 +427,18 @@ func run() error {
 			EventsTopic: cfg.LoyaltyEventsTopic,
 			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W19 Agent C: metering rides USAGE_EVENTS_TOPIC
 		}
+		// SPEC-W45 K11 + CONTRACT NOTE (CODER-H, work order H-7): loyalty
+		// exposes AccrueOnBookingCompleted(tenantID, bookingID). The hook is
+		// detected by interface assertion — while H's method does not exist
+		// yet the assertion fails and completion skips accrual (build stays
+		// green either way); once H lands it the hook activates with no
+		// further change here.
+		if hook, ok := any(loyaltyDeps).(bookingops.BookingCompletedAccruer); ok {
+			ops.Loyalty = hook
+			logger.Info("loyalty accrual hook wired: BookingCompleted → AccrueOnBookingCompleted")
+		} else {
+			logger.Warn("loyalty package does not expose AccrueOnBookingCompleted yet (CODER-H contract pending) — booking completion skips loyalty accrual")
+		}
 	}
 	var studioDeps *campaignstudio.Deps
 	if studioStore != nil {
@@ -403,6 +449,7 @@ func run() error {
 			UsageTopic:    cfg.UsageEventsTopic,
 			EventsTopic:   cfg.StudioEventsTopic,
 			StepBatchSize: cfg.StudioStepBatch,
+			Registry:      studioRegistry, // SPEC-W45 U6: conversion outcome reports (fail-closed); nil when MODEL_REGISTRY_URL unset
 		}
 	}
 	// SPEC-W19 integrator — END
@@ -463,12 +510,21 @@ func run() error {
 			EventsTopic: cfg.LendingEventsTopic,
 			UsageTopic:  cfg.UsageEventsTopic, // SPEC-W20 Agent C: metering rides USAGE_EVENTS_TOPIC
 			KYCURL:      cfg.LendingKYCURL,    // empty = override-only approval mode (documented in docs/apps/lending.md)
+			// SPEC-W45 K22: the kyc resolve call is internal-token gated;
+			// KYC_INTERNAL_TOKEN holds the shared value (CODER-G enforces it
+			// on kyc-service; CODER-F wires compose).
+			KYCInternalToken: os.Getenv("KYC_INTERNAL_TOKEN"),
+			// SPEC-W45 ORPH O4: the mirrored Postgres ledger — the
+			// disburse/repay journal confirmation rides this seam.
+			Ledger: lending.NewPostgresLedger(ls),
 			// SPEC-W44 W-B/S1-F7-07: kyc_override approve role gate.
 			KYCOverrideRoles: cfg.LendingKYCOverrideRoles,
-			// W39 SIM-001: the live rail is "configured" only when the TB
-			// bridge URL is set; otherwise Disburse fails closed unless
-			// ALLOW_MOCK_RAILS=1 opts into the simulation.
-			RealRailConfigured: os.Getenv(consumer.EnvLendingTBBridgeURL) != "",
+			// W39 SIM-001: the live rail is "configured" when the TB bridge
+			// URL is set; SPEC-W45 item 3 adds the payments /v1/transfers
+			// bridge (PAYMENTS_URL) as a live rail too. Otherwise Disburse
+			// fails closed unless ALLOW_MOCK_RAILS=1 opts into the
+			// simulation.
+			RealRailConfigured: os.Getenv(consumer.EnvLendingTBBridgeURL) != "" || paymentsURL != "",
 		}
 	}
 	var workforceDeps *workforce.Deps
@@ -603,6 +659,31 @@ func run() error {
 		}()
 		defer privacyConsumer.Close() //nolint:errcheck
 
+		// SPEC-W45 K9 (CODER-E consumer, CODER-H2 wiring): TenantDeleted
+		// cascade — consumes identity lifecycle events and applies
+		// booking's tenant teardown. CODER-E's TenantDataDeleter interface
+		// is slug-keyed; CODER-A's store exposes DeleteTenantData(ctx,
+		// tenantID) + DeleteTenantDataBySlug(ctx, slug) — the tiny adapter
+		// below bridges the two (idempotent either way).
+		identityTopic := os.Getenv("IDENTITY_EVENTS_TOPIC")
+		if identityTopic == "" {
+			identityTopic = "opendesk.identity.events"
+		}
+		identityGroup := os.Getenv("IDENTITY_EVENTS_GROUP")
+		if identityGroup == "" {
+			identityGroup = "booking-service-identity"
+		}
+		tenantDeletedConsumer := consumer.NewTenantDeleted(cfg.KafkaBrokers, identityTopic, identityGroup, cfg.DLQTopic,
+			tenantDataDeleterBySlug{st: st}, logger)
+		tenantDeletedHealth := consumerHealth.Register("tenant-deleted")
+		go func() {
+			if err := tenantDeletedConsumer.Run(ctx); err != nil && ctx.Err() == nil {
+				tenantDeletedHealth.Store(false)
+				logger.Error("tenant-deleted consumer exited; liveness flag cleared", zap.Error(err))
+			}
+		}()
+		defer tenantDeletedConsumer.Close() //nolint:errcheck
+
 		// SPEC-W11 Part B §2: IDP consumer (group booking-incidents) on
 		// opendesk.incidents → idempotent persist + auto-dispatch/outreach.
 		incidentsConsumer := incidents.NewConsumer(cfg.KafkaBrokers, cfg.IncidentsTopic, cfg.IncidentsGroup, cfg.DLQTopic, incidentSvc, logger)
@@ -632,6 +713,19 @@ func run() error {
 				lendingGroup = consumer.DefaultLendingDisbursementsGroup
 			}
 			lendingRail, railErr := consumer.RailFromEnv(logger)
+			if errors.Is(railErr, consumer.ErrRailNotConfigured) && paymentsURL != "" {
+				// SPEC-W45 item 3: PAYMENTS_URL is the live-rail fallback
+				// when LENDING_TB_BRIDGE_URL is unset — the HTTPRail posts
+				// {base}/transfers, so the base is the payments API root
+				// (POST /v1/transfers is CODER-K's disbursement bridge
+				// target; idempotency rides the deterministic transfer ID).
+				// V2-7: PAYMENTS_INTERNAL_TOKEN rides as X-Internal-Token —
+				// payments' require_money_mutation 401s /v1/transfers without it.
+				lendingRail = consumer.NewHTTPRail(paymentsURL+"/v1",
+					consumer.WithInternalToken(os.Getenv("PAYMENTS_INTERNAL_TOKEN")))
+				railErr = nil
+				logger.Info("lending disbursement rail: payments /v1/transfers bridge (PAYMENTS_URL fallback)")
+			}
 			if railErr != nil {
 				logger.Error("lending disbursement rail not configured; consumer NOT started (fail closed)",
 					zap.Error(railErr), zap.String("topic", cfg.LendingEventsTopic))
@@ -691,6 +785,14 @@ func run() error {
 		Social:        socialDeps,           // SPEC-W21 integrator (additive): /v1/social gated behind app "social-publisher" (opt-in)
 		Civic:         civicSvc,             // SPEC-W32 WS-A (additive): /v1/civic public intake + operator console
 		Health:        consumerHealth,       // SPEC-W43 K-09: consumer liveness flags read by /healthz
+		// SPEC-W45 K17 (booking half): X-Api-Key validation for the ext
+		// bookings surface. Reuses the W44 identity config
+		// (IDENTITY_BASE_URL + IDENTITY_INTERNAL_TOKEN); either empty → the
+		// validator fails closed with 503 per request (never silently open).
+		ExtKeys: apikey.New(cfg.IdentityBaseURL, cfg.IdentityInternalToken, logger),
+	}
+	if cfg.IdentityBaseURL == "" || cfg.IdentityInternalToken == "" {
+		logger.Warn("IDENTITY_BASE_URL/IDENTITY_INTERNAL_TOKEN unset — /v1/ext/bookings api-key validation fails closed (503)")
 	}
 
 	srv := &http.Server{

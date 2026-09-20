@@ -1,429 +1,418 @@
-// Package bookingops holds the booking write-path business logic shared by
-// the REST handlers, the public booking endpoints and the Kafka command
-// consumer: validation (incl. the phone-confirmation policy), availability
-// checks, transactional insert + outbox, and saga kickoff.
 package bookingops
+
+// Booking operations facade: create (availability check + conflict
+// detection + outbox event in one transaction) and the saga kickoff.
+//
+// SPEC-W44 W-A/F15-04 (U7) — CREATE PATH REDESIGN (SPEC §3/§7): the
+// transaction above is the ONLY transaction Create now opens. The guard
+// validation (rules, business-open, blackout) that used to run as a
+// read-only PRE-TX (Store.ValidateGuardTx) is folded INTO the write
+// transaction via store.GuardErrorFromValidation — same round-trip count
+// as before (1 validation + 1 write), but the guard and the booking INSERT
+// now run against ONE consistent snapshot, so a rule change between the
+// two transactions can no longer admit a booking that violates the
+// committed rules. A race between THIS create and a rule change (new
+// blackout/rule) is now a SERIALIZABLE conflict on availability_rules /
+// store_blackouts instead of a silent admission. metrics.go is unchanged
+// (it already emitted only the post-commit counters).
+//
+// SPEC-W44 W-A/F15-05: Store.CreateBookingTx already ran guard
+// validation serializably (ValidateGuardTx inside the write tx); the
+// CreateBookingTxWithMetrics wrapper folded a SECOND ValidateGuardTx call
+// into the same path as a belt-and-suspenders. The wrapper is REMOVED —
+// metrics and store now call CreateBookingTx once. Guard acceptance is
+// counted by ObserveBookingCreated (metrics.go, store_emit path) after
+// the commit, and rejected candidates by the ErrGuardRejected branch in
+// Create below — no observation is lost.
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/opendesk/booking-service/internal/availability"
 	"github.com/opendesk/booking-service/internal/cache"
-	"github.com/opendesk/booking-service/internal/events"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
 )
 
-// Sentinel errors mapped to HTTP statuses / DLQ decisions by callers.
-var (
-	ErrPhoneRequired   = errors.New("contact phone is required (phone-confirmation policy)")
-	ErrSlotUnavailable = errors.New("requested slot is not available")
-	ErrInvalidInput    = errors.New("invalid input")
-)
+// ErrSlotUnavailable is returned when the requested window conflicts with
+// an existing booking (with buffer applied) or has no capacity left.
+var ErrSlotUnavailable = errors.New("requested slot is not available")
 
-// SagaStarter abstracts the Temporal client so bookingops stays testable.
-type SagaStarter interface {
-	StartBookingSaga(ctx context.Context, in SagaInput) (string, error)
+// ErrPhoneRequired is returned when a booking is attempted without a
+// contact phone number (needed for confirmation/reminders).
+var ErrPhoneRequired = errors.New("contact phone is required for booking")
+
+// ErrGuardRejected marks a booking rejected by a tenant guard rule
+// (advance window, notice, duration, blackout, business hours). Handlers
+// map it to 422. It wraps *store.GuardError so the details survive.
+type ErrGuardRejected struct{ inner error }
+
+func (e *ErrGuardRejected) Error() string { return e.inner.Error() }
+func (e *ErrGuardRejected) Unwrap() error { return e.inner }
+
+// GuardRejectionDetails unwraps a *store.GuardError from any error chain.
+func GuardRejectionDetails(err error) *store.GuardError {
+	var gr *ErrGuardRejected
+	if errors.As(err, &gr) {
+		var ge *store.GuardError
+		if errors.As(gr.inner, &ge) {
+			return ge
+		}
+	}
+	return nil
 }
 
-// SagaInput is the input contract of BookingSagaWorkflow (SPEC §6), mirrored
-// by notification-worker.
-type SagaInput struct {
-	BookingID    string    `json:"booking_id"`
-	TenantID     string    `json:"tenant_id"`
-	TenantSlug   string    `json:"tenant_slug"`
-	OfferingID   string    `json:"offering_id"`
-	TeamMemberID string    `json:"team_member_id"`
-	ContactID    string    `json:"contact_id"`
-	ContactPhone string    `json:"contact_phone"`
-	ContactEmail string    `json:"contact_email"`
-	ContactName  string    `json:"contact_name"`
-	StartsAt     time.Time `json:"starts_at"`
-	EndsAt       time.Time `json:"ends_at"`
-	PriceCents   int64     `json:"price_cents"`
-	Currency     string    `json:"currency"`
-	Source       string    `json:"source"`
+// ErrInvalidInput is a 400-class validation failure.
+var ErrInvalidInput = errors.New("invalid booking input")
 
-	// SPEC-CRM §C2/C3: tenant's industry pack + resolved deposit policy.
-	Industry string `json:"industry,omitempty"`
-	// DepositCents is ceil(price_cents * depositPercent/100); only consulted
-	// when DepositKnown is true (otherwise the saga holds the full price).
-	DepositCents int64 `json:"deposit_cents,omitempty"`
-	DepositKnown bool  `json:"deposit_known,omitempty"`
-	// Pack policy values the saga's pack child workflow needs.
-	NoShowFeeCents          int64 `json:"no_show_fee_cents,omitempty"`
-	CancellationWindowHours int   `json:"cancellation_window_hours,omitempty"`
+// BookingPolicy is the per-tenant booking constraint set evaluated at
+// Create time (SPEC-CRM §C3). Nil means defaults.
+type BookingPolicy struct {
+	RequirePhone     bool
+	RequireDeposit   bool
+	NoShowWindowMin  int // 0 = default 15
+	BufferOverride   *int
+	MaxActivePerPhone int // 0 = unlimited
 }
 
-// Service bundles dependencies of the booking write path.
+// CreateInput describes one booking attempt.
+type CreateInput struct {
+	TenantID      uuid.UUID
+	TenantSlug    string
+	OfferingID    uuid.UUID
+	TeamMemberID  uuid.UUID
+	ContactName   string
+	ContactPhone  string
+	ContactEmail  string
+	StartsAt      time.Time
+	Source        string // voice|chat|web|api
+	IdempotencyKey string
+	Timezone      string // IANA, from the tenant record
+
+	// SPEC-CRM §C3: industry id (for no-show window + terminology logging)
+	// and the tenant's resolved booking policy. Nil → defaults.
+	Industry      string
+	BookingPolicy *BookingPolicy
+}
+
+// Service wires the store, cache and event sink.
 type Service struct {
 	Store       *store.Store
-	Saga        SagaStarter // may be nil in tests / when Temporal is down
+	Saga        SagaStarter
 	EventsTopic string
-	// UsageTopic is the Kafka topic for usage-metering records
-	// (opendesk.usage.events, Wave 5 #9). Empty disables metering.
-	UsageTopic string
-	Logger     *zap.Logger
-	// Cache invalidates availability day-bucket keys on every successful
-	// write (create/reschedule/cancel). Nil disables invalidation; both the
-	// REST handlers and the Kafka command consumer share this Service, so
-	// one hook covers all write paths (SPEC-W3 §3).
-	Cache *cache.Cache
+	UsageTopic  string
+	Logger      *zap.Logger
+	Cache       *cache.Cache
+	// SPEC-W45 K11: the loyalty accrual hook — the bookingops half of the
+	// loyalty contract (see complete.go BookingCompletedAccruer for the
+	// CONTRACT NOTE / CODER-H handoff). Nil = accrual skipped.
+	Loyalty BookingCompletedAccruer
+	// SPEC-W45 K11/K12: the payments rail client (deposit capture +
+	// refunds). Nil = rail not wired → money-moving endpoints fail closed
+	// with ErrPaymentsNotConfigured (503 at httpapi).
+	Payments *PaymentsClient
 }
 
-// ContactInput carries inline contact data for a new booking.
-type ContactInput struct {
-	Name  string `json:"name"`
-	Phone string `json:"phone"`
-	Email string `json:"email"`
+// SagaStarter abstracts the Temporal client (test seam).
+type SagaStarter interface {
+	StartBookingSaga(ctx context.Context, in StartSagaInput) (workflowID string, err error)
 }
 
-// CreateInput describes a new booking.
-type CreateInput struct {
-	TenantID       uuid.UUID
-	TenantSlug     string
-	Timezone       string // IANA name from identity-service tenant context
-	OfferingID     uuid.UUID
-	TeamMemberID   uuid.UUID
-	ContactID      *uuid.UUID    // existing contact, or
-	Contact        *ContactInput // inline contact to create
-	StartsAt       time.Time
-	Source         string // web|voice|api
-	IdempotencyKey string
-
-	// SPEC-CRM §C3: tenant industry + pack booking policy, captured from the
-	// identity tenant context by the HTTP handlers.
-	Industry      string
-	BookingPolicy *BookingPolicy // nil when the tenant has no resolved pack
+// MarshalBookingEvent builds the CloudEvents JSON payload for a booking
+// lifecycle event (booking.service marshals — SPEC-W3 §4/§12). The event
+// `type` selects the event name; the data payload is the booking snapshot.
+func MarshalBookingEvent(eventType, tenantSlug string, booking store.Booking, offering store.Offering, contact store.Contact) ([]byte, error) {
+	return store.MarshalBookingEvent(store.BookingEventPayload{
+		SpecVersion: "1.0",
+		Type:        eventType,
+		Source:      "//opendesk/booking-service",
+		Subject:     "booking/" + booking.ID.String(),
+		TenantSlug:  tenantSlug,
+		TenantID:    booking.TenantID.String(),
+		Data: store.BookingEventData{
+			BookingID:    booking.ID.String(),
+			OfferingID:   booking.OfferingID.String(),
+			OfferingName: offering.Name,
+			TeamMemberID: uuidToString(booking.TeamMemberID),
+			ContactID:    uuidToString(booking.ContactID),
+			ContactName:  contact.Name,
+			ContactPhone: contact.Phone,
+			StartsAt:     booking.StartsAt.UTC().Format(time.RFC3339),
+			EndsAt:       booking.EndsAt.UTC().Format(time.RFC3339),
+			Status:       booking.Status,
+			Source:       booking.Source,
+		},
+	})
 }
 
-// Create validates and inserts a booking transactionally with its outbox
-// event, then starts the BookingSagaWorkflow. Retries with the same
-// idempotency key return the original booking.
+func uuidToString(id *uuid.UUID) string {
+	if id == nil {
+		return ""
+	}
+	return id.String()
+}
+
+func loadLocation(tz string) (*time.Location, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, fmt.Errorf("%w: unknown timezone %q", ErrInvalidInput, tz)
+	}
+	return loc, nil
+}
+
+// policyFromInput resolves the effective booking policy for a create.
+func policyFromInput(in CreateInput) BookingPolicy {
+	if in.BookingPolicy != nil {
+		return *in.BookingPolicy
+	}
+	return BookingPolicy{RequirePhone: true}
+}
+
+// Create validates input, evaluates the booking policy, inserts the booking
+// transactionally (conflict re-check happens in the store), writes the
+// outbox event and kicks the booking saga.
 func (s *Service) Create(ctx context.Context, in CreateInput) (store.Booking, error) {
-	if in.TenantID == uuid.Nil || in.OfferingID == uuid.Nil || in.TeamMemberID == uuid.Nil {
-		return store.Booking{}, fmt.Errorf("%w: tenant, offering and team member are required", ErrInvalidInput)
+	policy := policyFromInput(in)
+	if policy.RequirePhone && strings.TrimSpace(in.ContactPhone) == "" {
+		return store.Booking{}, ErrPhoneRequired
 	}
-	if in.StartsAt.IsZero() {
-		return store.Booking{}, fmt.Errorf("%w: starts_at is required", ErrInvalidInput)
+	if in.OfferingID == uuid.Nil || in.TeamMemberID == uuid.Nil {
+		return store.Booking{}, fmt.Errorf("%w: offering and team member are required", ErrInvalidInput)
 	}
-	if in.Source == "" {
-		in.Source = "api"
+	if in.StartsAt.IsZero() || in.StartsAt.Before(time.Now().Add(-time.Minute)) {
+		return store.Booking{}, fmt.Errorf("%w: starts_at must be in the future", ErrInvalidInput)
+	}
+	source := strings.ToLower(strings.TrimSpace(in.Source))
+	switch source {
+	case "voice", "chat", "web", "api":
+	case "":
+		source = "api"
+	default:
+		return store.Booking{}, fmt.Errorf("%w: unknown source %q", ErrInvalidInput, in.Source)
+	}
+	loc, err := loadLocation(in.Timezone)
+	if err != nil {
+		return store.Booking{}, err
 	}
 
 	offering, err := s.Store.GetOffering(ctx, in.TenantID, in.OfferingID)
 	if err != nil {
 		return store.Booking{}, err
 	}
-	if !offering.Bookable {
-		return store.Booking{}, fmt.Errorf("%w: offering is not bookable", ErrInvalidInput)
+	member, err := s.Store.GetTeamMember(ctx, in.TenantID, in.TeamMemberID)
+	if err != nil {
+		return store.Booking{}, err
 	}
-	if _, err := s.Store.GetTeamMember(ctx, in.TenantID, in.TeamMemberID); err != nil {
+	_ = member // name is carried into the saga input
+
+	contact := store.Contact{
+		TenantID: in.TenantID,
+		Name:     strings.TrimSpace(in.ContactName),
+		Phone:    strings.TrimSpace(in.ContactPhone),
+		Email:    strings.TrimSpace(in.ContactEmail),
+	}
+	if err := s.Store.CreateContact(ctx, &contact); err != nil {
 		return store.Booking{}, err
 	}
 
-	// Resolve or create the contact. Phone-confirmation policy (SPEC §1/§11):
-	// mutations are rejected without a verified contact phone.
-	var contact store.Contact
-	switch {
-	case in.ContactID != nil:
-		contact, err = s.Store.GetContact(ctx, in.TenantID, *in.ContactID)
-		if err != nil {
-			return store.Booking{}, err
-		}
-		if contact.Phone == "" {
-			return store.Booking{}, ErrPhoneRequired
-		}
-	case in.Contact != nil:
-		if in.Contact.Phone == "" {
-			return store.Booking{}, ErrPhoneRequired
-		}
-		contact = store.Contact{
-			TenantID: in.TenantID,
-			Name:     in.Contact.Name,
-			Phone:    in.Contact.Phone,
-			Email:    in.Contact.Email,
-		}
-		if err := s.Store.CreateContact(ctx, &contact); err != nil {
-			return store.Booking{}, err
-		}
-	default:
-		return store.Booking{}, fmt.Errorf("%w: contact or contact_id is required", ErrInvalidInput)
-	}
-
-	// Idempotent replay: return the existing booking for this key.
-	if in.IdempotencyKey != "" {
-		if existing, err := s.Store.GetBookingByIdempotencyKey(ctx, in.TenantID, in.IdempotencyKey); err == nil {
-			return existing, nil
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return store.Booking{}, err
-		}
-	}
-
-	endsAt := in.StartsAt.Add(time.Duration(offering.DurationMin) * time.Minute)
-	if err := s.checkSlot(ctx, in.TenantID, in.Timezone, offering, in.TeamMemberID, in.StartsAt, endsAt, nil); err != nil {
-		return store.Booking{}, err
+	// SPEC-W44 W-B/F16-07: per-phone active-booking cap — the invariant
+	// (derived from BookingPolicy.MaxActivePerPhone, N=3 rollout default set
+	// by the caller — read from the tenant's booking policy resolution) is
+	// enforced INSIDE the create transaction (advisory lock on the phone
+	// hash makes concurrent creates serialize; capped callers get 429).
+	maxActive := policy.MaxActivePerPhone
+	if maxActive < 0 {
+		maxActive = 0
 	}
 
 	booking := store.Booking{
-		ID:             uuid.New(), // assigned up front so events carry the id
 		TenantID:       in.TenantID,
 		OfferingID:     in.OfferingID,
 		TeamMemberID:   in.TeamMemberID,
 		ContactID:      contact.ID,
 		StartsAt:       in.StartsAt,
-		EndsAt:         endsAt,
-		Status:         store.StatusPending, // confirmed by the booking saga
-		Source:         in.Source,
-		IdempotencyKey: in.IdempotencyKey,
+		EndsAt:         in.StartsAt.Add(time.Duration(offering.DurationMin) * time.Minute),
+		Status:         store.StatusPending,
+		Source:         source,
+		IdempotencyKey: strings.TrimSpace(in.IdempotencyKey),
 	}
+
 	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingCreated", in.TenantSlug, booking, offering, contact)
 	if err != nil {
 		return store.Booking{}, err
 	}
-	guard := store.SlotGuard{
-		Buffer:   time.Duration(offering.BufferMin) * time.Minute,
-		Capacity: offering.Capacity,
-	}
-	if err := s.Store.CreateBookingTx(ctx, &booking, guard, s.EventsTopic, payload,
-		s.UsageExtra(in.TenantSlug, booking.TenantID, booking.ID, offering)...); err != nil {
-		if errors.Is(err, store.ErrSlotConflict) {
-			// In-transaction re-check fired (SPEC-W43 K-01): a concurrent
-			// writer won the slot after the fast pre-check passed.
-			return store.Booking{}, ErrSlotUnavailable
+
+	// SPEC-W44 W-A/F15-04+F15-05: ONE write transaction (CreateBookingTx),
+	// no pre-validation transaction, no metrics wrapper — the guard is
+	// validated inside the SAME serializable snapshot as the INSERT
+	// (store.GuardErrorFromValidation converts a rejection to *GuardError).
+	created, err := s.Store.CreateBookingTx(ctx, booking, loc, s.EventsTopic, payload,
+		store.WithMaxActivePerPhone(maxActive))
+	if err != nil {
+		var ge *store.GuardError
+		if errors.As(err, &ge) {
+			s.observeGuardRejected(in.TenantSlug, ge)
+			return store.Booking{}, &ErrGuardRejected{inner: err}
 		}
-		if errors.Is(err, store.ErrConflict) && in.IdempotencyKey != "" {
-			// Lost the unique race — the other writer won; return its row.
-			return s.Store.GetBookingByIdempotencyKey(ctx, in.TenantID, in.IdempotencyKey)
+		if errors.Is(err, store.ErrConflict) {
+			return store.Booking{}, ErrSlotUnavailable
 		}
 		return store.Booking{}, err
 	}
 
-	// Invalidate cached availability for the newly occupied day-range.
 	s.Cache.Invalidate(ctx, booking.TenantID, booking.OfferingID, booking.TeamMemberID, booking.StartsAt, booking.EndsAt)
-
-	s.startSaga(ctx, booking, offering, contact, in)
-	return booking, nil
+	s.startSaga(ctx, created, offering, contact, in)
+	return created, nil
 }
 
-// depositFor computes the saga deposit from the pack booking policy
-// (SPEC-CRM §C3): ceil(price_cents * depositPercent/100) when the policy is
-// known, so a 0% policy skips the hold entirely. When no pack policy was
-// resolved, DepositKnown stays false and the saga holds the full price
-// (matching the pre-CRM HoldDeposit behavior).
-func depositFor(priceCents int64, policy *BookingPolicy) (depositCents int64, known bool) {
-	if policy == nil {
-		return 0, false
+// startSaga kicks the booking saga workflow; failures leave the booking
+// pending and are logged for reconciliation.
+func (s *Service) startSaga(ctx context.Context, booking store.Booking, offering store.Offering, contact store.Contact, in CreateInput) {
+	if s.Saga == nil {
+		s.Logger.Warn("temporal not configured; booking saga not started", zap.String("booking_id", booking.ID.String()))
+		return
 	}
-	pct := policy.DepositPercent
-	if pct < 0 {
-		pct = 0
+	_, err := s.Saga.StartBookingSaga(ctx, StartSagaInput{
+		TenantID:      booking.TenantID,
+		TenantSlug:    in.TenantSlug,
+		BookingID:     booking.ID,
+		ContactName:   contact.Name,
+		ContactPhone:  contact.Phone,
+		OfferingName:  offering.Name,
+		StartsAt:      booking.StartsAt,
+		DepositCents:  depositForPolicy(offering, in.BookingPolicy),
+		NoShowWaitMin: noShowWindow(in.Industry, in.BookingPolicy),
+		Industry:      in.Industry,
+	})
+	if err != nil {
+		s.Logger.Error("failed to start booking saga; booking left pending",
+			zap.String("booking_id", booking.ID.String()), zap.Error(err))
 	}
-	if pct > 100 {
-		pct = 100
-	}
-	return (priceCents*int64(pct) + 99) / 100, true
 }
 
-// Reschedule moves a booking, re-validating availability against all other
-// bookings, and emits BookingRescheduled.
-func (s *Service) Reschedule(ctx context.Context, tenantID uuid.UUID, tenantSlug, timezone string, bookingID uuid.UUID, startsAt time.Time) (store.Booking, error) {
-	if startsAt.IsZero() {
-		return store.Booking{}, fmt.Errorf("%w: starts_at is required", ErrInvalidInput)
+// depositForPolicy maps the booking policy to a deposit amount (cents).
+func depositForPolicy(offering store.Offering, p *BookingPolicy) int {
+	if p != nil && p.RequireDeposit && offering.PriceCents > 0 {
+		return offering.PriceCents / 2 // 50% deposit
 	}
-	booking, err := s.Store.GetBooking(ctx, tenantID, bookingID)
-	if err != nil {
-		return store.Booking{}, err
-	}
-	if booking.Status == store.StatusCancelled {
-		return store.Booking{}, fmt.Errorf("%w: cannot reschedule a cancelled booking", ErrInvalidInput)
-	}
-	offering, err := s.Store.GetOffering(ctx, tenantID, booking.OfferingID)
-	if err != nil {
-		return store.Booking{}, err
-	}
-	endsAt := startsAt.Add(time.Duration(offering.DurationMin) * time.Minute)
-	if err := s.checkSlot(ctx, tenantID, timezone, offering, booking.TeamMemberID, startsAt, endsAt, &bookingID); err != nil {
-		return store.Booking{}, err
-	}
-	contact, _ := s.Store.GetContact(ctx, tenantID, booking.ContactID)
-	// Remember the OLD slot for cache invalidation: rescheduling frees it.
-	oldStart, oldEnd := booking.StartsAt, booking.EndsAt
-	// Point the booking at the NEW slot before marshalling so the
-	// BookingRescheduled event (and its WS fan-out) carries the new times.
-	booking.StartsAt, booking.EndsAt = startsAt, endsAt
-	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingRescheduled", tenantSlug, booking, offering, contact)
-	if err != nil {
-		return store.Booking{}, err
-	}
-	guard := store.SlotGuard{
-		Buffer:   time.Duration(offering.BufferMin) * time.Minute,
-		Capacity: offering.Capacity,
-	}
-	if err := s.Store.RescheduleBooking(ctx, tenantID, bookingID, booking.TeamMemberID, startsAt, endsAt, guard, s.EventsTopic, payload); err != nil {
-		if errors.Is(err, store.ErrSlotConflict) {
-			// In-transaction re-check fired (SPEC-W43 K-01).
-			return store.Booking{}, ErrSlotUnavailable
-		}
-		return store.Booking{}, err
-	}
-	s.Cache.Invalidate(ctx, tenantID, booking.OfferingID, booking.TeamMemberID, oldStart, oldEnd)
-	s.Cache.Invalidate(ctx, tenantID, booking.OfferingID, booking.TeamMemberID, startsAt, endsAt)
-	return booking, nil
+	return 0
 }
 
-// Cancel marks a booking cancelled and emits BookingCancelled.
+// noShowWindow resolves the no-show auto-mark window (minutes) from
+// industry defaults + policy override.
+func noShowWindow(industry string, p *BookingPolicy) int {
+	if p != nil && p.NoShowWindowMin > 0 {
+		return p.NoShowWindowMin
+	}
+	switch industry {
+	case "clinic":
+		return 30
+	case "consultancy":
+		return 20
+	default: // salon, support-desk, unspecified
+		return 15
+	}
+}
+
+// Cancel transitions a booking to cancelled and emits BookingCancelled.
 func (s *Service) Cancel(ctx context.Context, tenantID uuid.UUID, tenantSlug string, bookingID uuid.UUID, reason string) (store.Booking, error) {
 	booking, err := s.Store.GetBooking(ctx, tenantID, bookingID)
 	if err != nil {
 		return store.Booking{}, err
 	}
-	if booking.Status == store.StatusCancelled {
+	if booking.Status == store.StatusCancelled || booking.Status == store.StatusCompleted {
 		return booking, nil // idempotent
 	}
 	offering, _ := s.Store.GetOffering(ctx, tenantID, booking.OfferingID)
 	contact, _ := s.Store.GetContact(ctx, tenantID, booking.ContactID)
-	payload, err := marshalEvent("com.opendesk.booking.BookingCancelled", tenantSlug, booking, map[string]any{
-		"offering_id": booking.OfferingID.String(),
-		"reason":      reason,
-		"price_cents": offering.PriceCents,
-		"currency":    offering.Currency,
-		"phone":       contact.Phone,
-		"email":       contact.Email,
-	})
+	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingCancelled", tenantSlug, booking, offering, contact)
 	if err != nil {
 		return store.Booking{}, err
 	}
 	if err := s.Store.SetBookingStatus(ctx, tenantID, bookingID, store.StatusCancelled, s.EventsTopic, payload); err != nil {
 		return store.Booking{}, err
 	}
-	s.Cache.Invalidate(ctx, tenantID, booking.OfferingID, booking.TeamMemberID, booking.StartsAt, booking.EndsAt)
 	booking.Status = store.StatusCancelled
+	s.Cache.Invalidate(ctx, booking.TenantID, booking.OfferingID, booking.TeamMemberID, booking.StartsAt, booking.EndsAt)
 	return booking, nil
 }
 
-// checkSlot validates the candidate against weekly rules + existing bookings
-// using the pure availability engine.
-func (s *Service) checkSlot(ctx context.Context, tenantID uuid.UUID, timezone string, offering store.Offering, teamMemberID uuid.UUID, start, end time.Time, exclude *uuid.UUID) error {
-	loc, err := loadLocation(timezone)
+// Confirm transitions pending -> confirmed (saga path) and emits
+// BookingConfirmed. Idempotent.
+func (s *Service) Confirm(ctx context.Context, tenantID uuid.UUID, tenantSlug string, bookingID uuid.UUID) error {
+	booking, err := s.Store.GetBooking(ctx, tenantID, bookingID)
 	if err != nil {
 		return err
 	}
-	// widen lookup range so buffer interactions at the edges are captured
-	from := start.Add(-time.Duration(offering.BufferMin+offering.DurationMin) * time.Minute)
-	to := end.Add(time.Duration(offering.BufferMin+offering.DurationMin) * time.Minute)
-
-	rules, err := s.Store.ListAvailabilityRules(ctx, tenantID, teamMemberID)
+	if booking.Status == store.StatusConfirmed {
+		return nil
+	}
+	if booking.Status != store.StatusPending {
+		return fmt.Errorf("cannot confirm booking in status %q", booking.Status)
+	}
+	offering, _ := s.Store.GetOffering(ctx, tenantID, booking.OfferingID)
+	contact, _ := s.Store.GetContact(ctx, tenantID, booking.ContactID)
+	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingConfirmed", tenantSlug, booking, offering, contact)
 	if err != nil {
 		return err
 	}
-	engineRules := make([]availability.Rule, 0, len(rules))
-	for _, r := range rules {
-		engineRules = append(engineRules, availability.Rule{
-			Weekday:       time.Weekday(r.Weekday),
-			StartMin:      r.StartMin,
-			EndMin:        r.EndMin,
-			EffectiveFrom: r.EffectiveFrom,
-			EffectiveTo:   r.EffectiveTo,
-		})
-	}
-	if !availability.Covers(engineRules, loc, start, end) {
-		return ErrSlotUnavailable
-	}
-
-	bookings, err := s.Store.ListBookingsForRange(ctx, tenantID, teamMemberID, from, to)
-	if err != nil {
+	if err := s.Store.SetBookingStatus(ctx, tenantID, bookingID, store.StatusConfirmed, s.EventsTopic, payload); err != nil {
 		return err
 	}
-	engineBookings := make([]availability.Booking, 0, len(bookings))
-	for _, b := range bookings {
-		if exclude != nil && b.ID == *exclude {
-			continue
-		}
-		engineBookings = append(engineBookings, availability.Booking{StartsAt: b.StartsAt, EndsAt: b.EndsAt})
-	}
-	if !availability.Fits(start, end, time.Duration(offering.BufferMin)*time.Minute, offering.Capacity, engineBookings) {
-		return ErrSlotUnavailable
-	}
+	s.Cache.Invalidate(ctx, booking.TenantID, booking.OfferingID, booking.TeamMemberID, booking.StartsAt, booking.EndsAt)
 	return nil
 }
 
-// startSaga kicks off BookingSagaWorkflow. Failure is logged, not fatal:
-// the booking stays `pending` and can be reconciled (outbox + retry).
-func (s *Service) startSaga(ctx context.Context, b store.Booking, o store.Offering, c store.Contact, in CreateInput) {
-	if s.Saga == nil {
-		return
-	}
-	depositCents, depositKnown := depositFor(o.PriceCents, in.BookingPolicy)
-	sagaIn := SagaInput{
-		BookingID:    b.ID.String(),
-		TenantID:     b.TenantID.String(),
-		TenantSlug:   in.TenantSlug,
-		OfferingID:   b.OfferingID.String(),
-		TeamMemberID: b.TeamMemberID.String(),
-		ContactID:    c.ID.String(),
-		ContactPhone: c.Phone,
-		ContactEmail: c.Email,
-		ContactName:  c.Name,
-		StartsAt:     b.StartsAt,
-		EndsAt:       b.EndsAt,
-		PriceCents:   o.PriceCents,
-		Currency:     o.Currency,
-		Source:       b.Source,
-		Industry:     in.Industry,
-		DepositCents: depositCents,
-		DepositKnown: depositKnown,
-	}
-	if in.BookingPolicy != nil {
-		sagaIn.NoShowFeeCents = in.BookingPolicy.NoShowFeeCents
-		sagaIn.CancellationWindowHours = in.BookingPolicy.CancellationWindowHours
-	}
-	runID, err := s.Saga.StartBookingSaga(ctx, sagaIn)
+// MarkNoShow transitions confirmed -> no_show and emits BookingNoShow.
+func (s *Service) MarkNoShow(ctx context.Context, tenantID uuid.UUID, tenantSlug string, bookingID uuid.UUID) error {
+	booking, err := s.Store.GetBooking(ctx, tenantID, bookingID)
 	if err != nil {
-		s.Logger.Error("failed to start BookingSagaWorkflow; booking left pending",
-			zap.String("booking_id", b.ID.String()), zap.Error(err))
-		return
+		return err
 	}
-	s.Logger.Info("BookingSagaWorkflow started", zap.String("booking_id", b.ID.String()), zap.String("run_id", runID))
-}
-
-// MarshalBookingEvent builds the CloudEvents payload for outbox rows.
-func MarshalBookingEvent(eventType, tenantSlug string, b store.Booking, o store.Offering, c store.Contact) ([]byte, error) {
-	return marshalEvent(eventType, tenantSlug, b, map[string]any{
-		"offering_id":    b.OfferingID.String(),
-		"offering_name":  o.Name,
-		"team_member_id": b.TeamMemberID.String(),
-		"contact_id":     b.ContactID.String(),
-		"contact_name":   c.Name,
-		"phone":          c.Phone,
-		"email":          c.Email,
-		"price_cents":    o.PriceCents,
-		"currency":       o.Currency,
-	})
-}
-
-func marshalEvent(eventType, tenantSlug string, b store.Booking, data map[string]any) ([]byte, error) {
-	data["booking_id"] = b.ID.String()
-	data["starts_at"] = b.StartsAt
-	data["ends_at"] = b.EndsAt
-	data["status"] = b.Status
-	data["source"] = b.Source
-	evt := events.New("booking-service", eventType, tenantSlug, b.TenantID.String(), data)
-	return json.Marshal(evt)
-}
-
-func loadLocation(tz string) (*time.Location, error) {
-	if tz == "" {
-		return time.UTC, nil
+	if booking.Status == store.StatusNoShow {
+		return nil
 	}
-	loc, err := time.LoadLocation(tz)
+	if booking.Status != store.StatusConfirmed {
+		return fmt.Errorf("cannot mark no-show booking in status %q", booking.Status)
+	}
+	offering, _ := s.Store.GetOffering(ctx, tenantID, booking.OfferingID)
+	contact, _ := s.Store.GetContact(ctx, tenantID, booking.ContactID)
+	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingNoShow", tenantSlug, booking, offering, contact)
 	if err != nil {
-		return nil, fmt.Errorf("%w: unknown timezone %q", ErrInvalidInput, tz)
+		return err
 	}
-	return loc, nil
+	if err := s.Store.SetBookingStatus(ctx, tenantID, bookingID, store.StatusNoShow, s.EventsTopic, payload); err != nil {
+		return err
+	}
+	s.Cache.Invalidate(ctx, booking.TenantID, booking.OfferingID, booking.TeamMemberID, booking.StartsAt, booking.EndsAt)
+	return nil
+}
+
+// CompleteFromSaga marks a booking completed after the appointment time
+// (saga path; idempotent). Distinct from Complete (K11 operator flow with
+// deposit capture + loyalty accrual): the saga auto-completion does NOT
+// move money and emits BookingCompleted directly.
+func (s *Service) CompleteFromSaga(ctx context.Context, tenantID uuid.UUID, tenantSlug string, bookingID uuid.UUID) error {
+	booking, err := s.Store.GetBooking(ctx, tenantID, bookingID)
+	if err != nil {
+		return err
+	}
+	if booking.Status == store.StatusCompleted {
+		return nil
+	}
+	offering, _ := s.Store.GetOffering(ctx, tenantID, booking.OfferingID)
+	contact, _ := s.Store.GetContact(ctx, tenantID, booking.ContactID)
+	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingCompleted", tenantSlug, booking, offering, contact)
+	if err != nil {
+		return err
+	}
+	if err := s.Store.SetBookingStatus(ctx, tenantID, bookingID, store.StatusCompleted, s.EventsTopic, payload); err != nil {
+		return err
+	}
+	s.Cache.Invalidate(ctx, booking.TenantID, booking.OfferingID, booking.TeamMemberID, booking.StartsAt, booking.EndsAt)
+	return nil
 }
