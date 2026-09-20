@@ -76,11 +76,18 @@ def store(app_dsn, internal_dsn) -> RegistryStore:
     return RegistryStore(app_dsn, internal_dsn=internal_dsn)
 
 
+# SPEC-W45 K23: the mutating + experiments routes are gated by
+# X-Internal-Token; the shared fixtures configure one and the default
+# client sends it (auth-matrix tests live in test_internal_token.py).
+TEST_INTERNAL_TOKEN = "test-model-registry-internal-token"
+
+
 @pytest.fixture()
 def settings(app_dsn, internal_dsn) -> Settings:
     return Settings(pg_dsn=app_dsn, pg_internal_dsn=internal_dsn,
                     kafka_enabled=False,
-                    drift_manifest_dir=str(Path(__file__).parent / "fixtures"))
+                    drift_manifest_dir=str(Path(__file__).parent / "fixtures"),
+                    internal_token=TEST_INTERNAL_TOKEN)
 
 
 @pytest.fixture()
@@ -88,5 +95,6 @@ def client(settings, store):
     from fastapi.testclient import TestClient
     from model_registry.main import create_app
     app = create_app(settings=settings, store=store, enable_scheduler=False)
-    with TestClient(app) as c:
+    with TestClient(app,
+                    headers={"X-Internal-Token": TEST_INTERNAL_TOKEN}) as c:
         yield c

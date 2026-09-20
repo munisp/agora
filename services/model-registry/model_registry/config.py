@@ -39,6 +39,10 @@ class Settings:
     train_aucpr_tolerance: float = 0.02
     # I2 provenance: git sha of the running service build, where knowable.
     git_sha: str = "unknown"
+    # SPEC-W45 K23 (OOS-08): X-Internal-Token gate on the mutating +
+    # experiments routes. None = fail-closed 503 (the K2 pattern: a service
+    # that cannot authenticate callers must refuse, not run open).
+    internal_token: str | None = None
 
 
 def _bool(name: str, default: bool) -> bool:
@@ -66,4 +70,5 @@ def load_settings() -> Settings:
         train_brier_max=float(os.getenv("TRAIN_BRIER_MAX", "0.20")),
         train_aucpr_tolerance=float(os.getenv("TRAIN_AUCPR_TOLERANCE", "0.02")),
         git_sha=os.getenv("GIT_SHA", "unknown"),
+        internal_token=os.getenv("MODEL_REGISTRY_INTERNAL_TOKEN") or None,
     )
