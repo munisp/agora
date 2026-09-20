@@ -136,13 +136,14 @@ fn connect_options(url: &str) -> sqlx::postgres::PgConnectOptions {
     PgConnectOptions::from_str(url).expect("parse BILLING_TEST_DATABASE_URL")
 }
 
-/// All migrations (0001..0005, the boot path incl. B-07), in order.
-pub const MIGRATIONS: [&str; 5] = [
+/// All migrations (0001..0006, the boot path incl. B-07 + K18), in order.
+pub const MIGRATIONS: [&str; 6] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_rls.sql"),
     include_str!("../migrations/0003_ledger.sql"),
     include_str!("../migrations/0004_outbox.sql"),
     include_str!("../migrations/0005_hardening.sql"),
+    include_str!("../migrations/0006_plan_presets.sql"),
 ];
 
 /// Migrations are applied exactly once per test process (concurrent
