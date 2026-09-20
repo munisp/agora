@@ -278,6 +278,16 @@ class AgentStore:
                 slug,
             )
 
+    async def tenant_slug_for(self, tenant_id: uuid.UUID | str) -> str | None:
+        """Reverse lookup of the tenant_slugs projection (None when the
+        mapping was never remembered). J-14 exempt: tenant_slugs is a
+        cross-tenant mapping table by design (see remember_tenant_slug)."""
+        async with self._db._pool_acquire() as conn:
+            return await conn.fetchval(
+                "SELECT slug FROM tenant_slugs WHERE tenant_id = $1",
+                uuid.UUID(str(tenant_id)),
+            )
+
     async def create_agent(
         self,
         tenant_id: uuid.UUID,

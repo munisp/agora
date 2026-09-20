@@ -37,6 +37,20 @@ class Config:
     identity_internal_token: str = ""
     tenant_cache_ttl_seconds: float = 300.0
 
+    # SPEC-W45 K19: X-Internal-Token gating the /internal/gdpr/* routes
+    # (K2 pattern; unset → those routes 503 fail-closed).
+    internal_token: str = ""
+
+    # SPEC-W45 K9: TenantDeleted cascade — identity lifecycle events.
+    identity_events_topic: str = "opendesk.identity.events"
+    tenant_events_group: str = "conversation-tenant-lifecycle"
+
+    # SPEC-W45 UC helpdesk automation: human-escalation turns open a real
+    # ticket via booking POST /v1/helpdesk/tickets (X-Internal-Token).
+    helpdesk_enabled: bool = True
+    booking_app_id: str = "booking"
+    booking_internal_token: str = ""
+
     # Raw transcript sink (SPEC §5). "kafka" (aiokafka fallback) or "fluvio".
     transcript_sink: str = "kafka"
     fluvio_topic: str = "opendesk.transcripts-raw"
@@ -154,6 +168,13 @@ def load() -> Config:
         identity_app_id=_env("IDENTITY_APP_ID", "identity"),
         identity_internal_token=_env("IDENTITY_INTERNAL_TOKEN", ""),
         tenant_cache_ttl_seconds=float(_env("TENANT_CACHE_TTL_SECONDS", "300")),
+        internal_token=_env("CONVERSATION_INTERNAL_TOKEN", ""),
+        identity_events_topic=_env("IDENTITY_EVENTS_TOPIC", "opendesk.identity.events"),
+        tenant_events_group=_env("TENANT_EVENTS_GROUP", "conversation-tenant-lifecycle"),
+        helpdesk_enabled=_env("HELPDESK_AUTOMATION_ENABLED", "true").lower()
+        in ("1", "on", "true", "yes"),
+        booking_app_id=_env("BOOKING_APP_ID", "booking"),
+        booking_internal_token=_env("CONVERSATION_BOOKING_INTERNAL_TOKEN", ""),
         transcripts_topic=_env("TRANSCRIPTS_TOPIC", "opendesk.conversation.transcripts"),
         transcript_sink=_env("TRANSCRIPT_SINK", "kafka").lower(),
         fluvio_topic=_env("FLUVIO_TOPIC", "opendesk.transcripts-raw"),
