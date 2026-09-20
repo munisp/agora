@@ -22,6 +22,7 @@ import (
 	"github.com/opendesk/notification-worker/internal/civicoutbox"
 	"github.com/opendesk/notification-worker/internal/config"
 	"github.com/opendesk/notification-worker/internal/daprc"
+	"github.com/opendesk/notification-worker/internal/eventmail"
 	"github.com/opendesk/notification-worker/internal/httpapi"
 	"github.com/opendesk/notification-worker/internal/notifyoutbox"
 	"github.com/opendesk/notification-worker/internal/opsalerts"
@@ -118,6 +119,8 @@ func run() error {
 		S3AccessKey:       cfg.S3AccessKey,
 		S3SecretKey:       cfg.S3SecretKey,
 		S3ExportsBucket:   cfg.S3ExportsBucket,
+		// SPEC-W45 K19: internauth token for conversation /internal/gdpr/*.
+		ConversationInternalToken: cfg.ConversationInternalToken,
 	}
 
 	w := worker.New(tc, cfg.TemporalTaskQueue, worker.Options{})
@@ -140,6 +143,12 @@ func run() error {
 	w.RegisterWorkflowWithOptions(workflows.CivicStatusNotifyWorkflow, workflow.RegisterOptions{Name: workflows.WorkflowTypeCivicStatusNotify})
 	// SPEC-W3 §3 innovation 12: digital-twin 24h cleanup.
 	w.RegisterWorkflowWithOptions(workflows.TwinCleanupWorkflow, workflow.RegisterOptions{Name: "TwinCleanupWorkflow"})
+
+	// SPEC-W3 §2 innovation 13 / SPEC-W45 K19 (ORPH O1): GDPR data-subject
+	// workflows. Until this registration the booking POST /v1/privacy/*
+	// endpoints 202'd into a Temporal void — no worker hosted these workflow
+	// types, so every export/erase request queued forever.
+	registerGdpr(w, acts)
 
 	// Industry pack workflows (SPEC-CRM §C2)
 	w.RegisterWorkflowWithOptions(workflows.ClinicIntakeWorkflow, workflow.RegisterOptions{Name: "ClinicIntakeWorkflow"})
@@ -209,6 +218,7 @@ func run() error {
 	acts.PaymentsInternalToken = cfg.PaymentsInternalToken
 	acts.BookingInternalToken = cfg.BookingInternalToken
 	acts.IdentityInternalToken = cfg.IdentityInternalToken
+	acts.CRMSyncInternalToken = cfg.CRMSyncInternalToken
 	acts.PaymentsURL = cfg.PaymentsURL
 	if cfg.PaymentsInternalToken == "" {
 		logger.Warn("PAYMENTS_INTERNAL_TOKEN unset: payments /activities/* calls will fail closed (peer 503/401)")
@@ -218,6 +228,11 @@ func run() error {
 	}
 	if cfg.IdentityInternalToken == "" {
 		logger.Warn("IDENTITY_INTERNAL_TOKEN unset: identity /internal/* calls will fail closed (peer 503/401)")
+	}
+	// SPEC-W45 K21: fail-soft — dev without the secret still boots, but the
+	// crm-sync peer fails closed (401/503) so the miss is loud.
+	if cfg.CRMSyncInternalToken == "" {
+		logger.Warn("CRM_SYNC_INTERNAL_TOKEN unset: crm-sync /v1/tasks + /v1/people/lookup calls will fail closed (peer 503/401)")
 	}
 
 	// Outbound webhook platform (Wave 5 #10): Postgres-backed subscriptions +
@@ -479,6 +494,50 @@ func run() error {
 				errCh <- fmt.Errorf("webhook dispatcher: %w", err)
 			}
 		}()
+	}
+
+	// SPEC-W45 K8/STK O16 + ORPH O8: lifecycle + billing event → email
+	// consumers (existing dapr SMTP binding via BindingSender; idempotent by
+	// event id, DLQ after 3 attempts). Topic "off" disables each consumer.
+	if brokers := strings.Split(cfg.KafkaBrokers, ","); len(brokers) > 0 && brokers[0] != "" {
+		bindingSender := notifyoutbox.BindingSender{
+			Dapr: daprClient, SMTPBinding: cfg.SMTPBinding, TwilioBinding: cfg.TwilioBinding,
+			SMTPFrom: cfg.SMTPFrom, TwilioFrom: cfg.TwilioFrom,
+		}
+		if topic := eventmail.TopicEnabled(cfg.IdentityEventsTopic); topic != "" {
+			identityConsumer := eventmail.New(brokers, topic, cfg.IdentityEventsGroup, cfg.DLQTopic,
+				eventmail.IdentityDeps{Sender: bindingSender, AppBaseURL: cfg.AppBaseURL, Log: logger}.HandleIdentity, logger)
+			defer identityConsumer.Close() //nolint:errcheck
+			go func() {
+				if err := identityConsumer.Run(ctx); err != nil {
+					errCh <- fmt.Errorf("identity events consumer: %w", err)
+				}
+			}()
+			logger.Info("identity events consumer enabled", zap.String("topic", topic),
+				zap.String("group", cfg.IdentityEventsGroup))
+		} else {
+			logger.Info("identity events consumer disabled (IDENTITY_EVENTS_TOPIC off)")
+		}
+		if topic := eventmail.TopicEnabled(cfg.BillingEventsTopic); topic != "" {
+			billingConsumer := eventmail.New(brokers, topic, cfg.BillingEventsGroup, cfg.DLQTopic,
+				eventmail.BillingDeps{
+					Sender:   bindingSender,
+					Resolver: &eventmail.DaprContactResolver{Dapr: daprClient, AppID: cfg.IdentityAppID, Token: cfg.IdentityInternalToken},
+					Log:      logger,
+				}.HandleBilling, logger)
+			defer billingConsumer.Close() //nolint:errcheck
+			go func() {
+				if err := billingConsumer.Run(ctx); err != nil {
+					errCh <- fmt.Errorf("billing events consumer: %w", err)
+				}
+			}()
+			logger.Info("billing events consumer enabled", zap.String("topic", topic),
+				zap.String("group", cfg.BillingEventsGroup))
+		} else {
+			logger.Info("billing events consumer disabled (BILLING_EVENTS_TOPIC off)")
+		}
+	} else {
+		logger.Warn("identity/billing event consumers disabled: no Kafka brokers")
 	}
 
 	// Ops-alerts consumer (SPEC-W44 K3/F15-04): persists opendesk.ops.alerts
