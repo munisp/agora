@@ -263,7 +263,7 @@ func (s *Store) exitEnrollment(ctx context.Context, tx pgx.Tx, tenantID, journey
 }
 
 // completeEnrollment completes an enrollment already past the last step.
-func (s *Store) completeEnrollment(ctx context.Context, tx pgx.Tx, tenantID, journeyID uuid.UUID, e Enrollment) error {
+func (s *Store) completeEnrollment(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, e Enrollment) error {
 	if _, err := tx.Exec(ctx,
 		`UPDATE studio_enrollments SET state='completed', last_step_at=now()
 		  WHERE tenant_id=$1 AND id=$2`,
