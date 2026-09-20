@@ -16,6 +16,7 @@ never touch FalkorDB/Kafka.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import threading
@@ -23,7 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from .config import Settings, load_settings
@@ -156,6 +157,22 @@ def create_app(
     app = FastAPI(title="fraud-engine", version="0.1.0", lifespan=lifespan)
     app.state.fraud = state
 
+    # ------------------------------------------------ K23 internal-token gate
+    # SPEC-W45 K23 (OOS-20): /v1/detect/* is service-to-service only —
+    # X-Internal-Token must match FRAUD_INTERNAL_TOKEN via constant-time
+    # compare. Fail-closed (identity-service K2 pattern): 503 when the env
+    # token is unset, 401 on missing/wrong. /healthz stays open (probes).
+    def require_internal_token(request: Request) -> None:
+        configured = settings.internal_token
+        if not configured:
+            log.error("FRAUD_INTERNAL_TOKEN unset — refusing request "
+                      "(fail-closed, K23): %s", request.url.path)
+            raise HTTPException(status_code=503,
+                                detail="internal token not configured")
+        presented = request.headers.get("x-internal-token", "")
+        if not presented or not hmac.compare_digest(presented, configured):
+            raise HTTPException(status_code=401, detail="invalid internal token")
+
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
         graph_ok = False
@@ -170,7 +187,7 @@ def create_app(
             "time": datetime.now(UTC).isoformat(),
         }
 
-    @app.post("/v1/detect/run")
+    @app.post("/v1/detect/run", dependencies=[Depends(require_internal_token)])
     def detect_run(req: RunRequest) -> dict[str, Any]:
         try:
             report = run_and_record(tenant_id=req.tenant_id, detector=req.detector)
@@ -181,32 +198,19 @@ def create_app(
             ) from exc
         return report.as_dict()
 
-    @app.get("/v1/detect/status")
+    @app.get("/v1/detect/status", dependencies=[Depends(require_internal_token)])
     def detect_status() -> dict[str, Any]:
+        # SPEC-W45 K23 (OOS-20): health + counts only. The evasion
+        # thresholds (velocity caps, similarity cutoffs, ...) are NO LONGER
+        # exposed — a caller reading them could tune fraud just under the
+        # tripwires.
         return {
             "service": "fraud-engine",
-            "sweep_minutes": settings.sweep_minutes,
             "sweep_enabled": settings.sweep_enabled,
             "kafka_enabled": settings.kafka_enabled,
             "alerts_topic": settings.alerts_topic,
+            "detector_count": len(ALL_DETECTORS),
             "detectors": [d.name for d in ALL_DETECTORS],
-            "thresholds": {
-                "SYBIL_WINDOW_MIN": settings.sybil_window_min,
-                "SYBIL_SIM_THRESHOLD": settings.sybil_sim_threshold,
-                "SYBIL_HIGH_SIZE": settings.sybil_high_size,
-                "CAPTURE_VELOCITY_MAX": settings.capture_velocity_max,
-                "CAPTURE_WINDOW_MIN": settings.capture_window_min,
-                "CAPTURE_SUSTAINED_WINDOWS": settings.capture_sustained_windows,
-                "MAX_TRAVEL_KMH": settings.max_travel_kmh,
-                "GHOST_MIN": settings.ghost_min,
-                "GHOST_WINDOW_MIN": settings.ghost_window_min,
-                "ANOMALY_ALERT_THRESHOLD": settings.anomaly_alert_threshold,
-                "CIVIC_REPORT_MAX_PER_DAY": settings.civic_report_max_per_day,
-                "CIVIC_COORD_CASE_THRESHOLD": settings.civic_coord_case_threshold,
-                "CIVIC_COORD_RADIUS_M": settings.civic_coord_radius_m,
-                "CIVIC_COORD_WINDOW_HOURS": settings.civic_coord_window_hours,
-                "FRAUD_SWEEP_MINUTES": settings.sweep_minutes,
-            },
             "last_run": state["last_run"],
         }
 

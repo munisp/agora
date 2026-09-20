@@ -31,6 +31,11 @@ const ddl = `CREATE TABLE IF NOT EXISTS sync_map (
 	UNIQUE (kind, opendesk_id, tenant_id)
 );
 ALTER TABLE sync_map ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
+-- SPEC-W45 K21/K9: TenantDeleted tombstone. Rows of a deleted tenant are
+-- DISABLED (never deleted — the mapping is a forensic record): Get /
+-- GetByTwentyID ignore them, so no forward or reverse sync touches a dead
+-- tenant's Twenty records.
+ALTER TABLE sync_map ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS sync_map_twenty_idx ON sync_map (kind, twenty_id);
 CREATE TABLE IF NOT EXISTS webhook_events_seen (
 	event_id TEXT PRIMARY KEY,
@@ -68,6 +73,14 @@ const KindBookingContact = "booking_contact"
 // note path when the Twenty people lookup by phone misses (e.g. the person
 // record's phone formatting differs from the confirmed number).
 const KindContactPhone = "contact_phone"
+
+// KindContactIdentity maps a tenant-scoped natural person key
+// ("email:<lower(email)>" / "phone:<trimmed phone>") to the Twenty person id
+// (SPEC-W45 K21, OOS-09/OOS-25): the person upsert is keyed
+// (tenant_id, email|phone) through this mapping — a contact existing under
+// tenant A is NEVER merged into tenant B's person record by a global
+// email/phone find.
+const KindContactIdentity = "contact_identity"
 
 // normTenant maps nil to uuid.Nil (stored as a regular value, never NULL).
 func normTenant(t *uuid.UUID) uuid.UUID {
@@ -111,10 +124,13 @@ func (s *Store) scanMapping(row pgx.Row) (Mapping, error) {
 // Get looks up a mapping by (kind, opendesk_id, tenant_id). A nil tenantID
 // is normalized to uuid.Nil so the UNIQUE constraint dedupes correctly
 // (Postgres treats NULLs as distinct, which would break ON CONFLICT).
+// Rows disabled by a TenantDeleted tombstone (SPEC-W45 K9/K21) are
+// invisible here — they behave as unmapped.
 func (s *Store) Get(ctx context.Context, kind, opendeskID string, tenantID *uuid.UUID) (Mapping, error) {
 	m, err := s.scanMapping(s.pool.QueryRow(ctx,
 		`SELECT `+mappingCols+` FROM sync_map
-		     WHERE kind = $1 AND opendesk_id = $2 AND tenant_id = $3`,
+		     WHERE kind = $1 AND opendesk_id = $2 AND tenant_id = $3
+		       AND disabled_at IS NULL`,
 		kind, opendeskID, normTenant(tenantID)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
@@ -133,6 +149,7 @@ func (s *Store) GetByTwentyID(ctx context.Context, kind, twentyID string) (Mappi
 	m, err := s.scanMapping(s.pool.QueryRow(ctx,
 		`SELECT `+mappingCols+` FROM sync_map
 		     WHERE kind = $1 AND twenty_id = $2
+		       AND disabled_at IS NULL
 		     ORDER BY updated_at DESC LIMIT 1`, kind, twentyID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
@@ -150,6 +167,22 @@ func (s *Store) DeleteByTwentyID(ctx context.Context, twentyID string) (int64, e
 	tag, err := s.pool.Exec(ctx, `DELETE FROM sync_map WHERE twenty_id = $1`, twentyID)
 	if err != nil {
 		return 0, fmt.Errorf("sync_map delete by twenty_id: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DisableTenant tombstones every sync_map row of a tenant (SPEC-W45 K9
+// TenantDeleted cascade / K21): the rows stay (forensic record) but become
+// invisible to Get/GetByTwentyID, so neither the forward syncer nor the
+// reverse worker touches the dead tenant's Twenty records. Idempotent:
+// already-disabled rows are matched by the same predicate and simply not
+// re-stamped; re-running yields 0 newly-disabled rows and no error.
+func (s *Store) DisableTenant(ctx context.Context, tenantID uuid.UUID) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE sync_map SET disabled_at = now()
+		 WHERE tenant_id = $1 AND disabled_at IS NULL`, tenantID)
+	if err != nil {
+		return 0, fmt.Errorf("sync_map disable tenant: %w", err)
 	}
 	return tag.RowsAffected(), nil
 }

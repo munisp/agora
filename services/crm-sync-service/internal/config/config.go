@@ -36,7 +36,8 @@ type Config struct {
 	EchoWindow          time.Duration // reverse echo suppression window (default 10s)
 	DLQTopic            string // opendesk.dlq
 	ShutdownTimeout     time.Duration
-	ConsumerEnabled     bool // run Kafka consumers (default true)
+	ConsumerEnabled     bool   // run Kafka consumers (default true)
+	InternalToken       string // CRM_SYNC_INTERNAL_TOKEN (SPEC-W45 K21): X-Internal-Token gate on /v1/tasks + /v1/people/lookup — 503 fail-closed when unset, 401 missing/wrong
 }
 
 // Load reads configuration from the environment.
@@ -67,6 +68,8 @@ func Load() (Config, error) {
 		DLQTopic:            envStr("DLQ_TOPIC", "opendesk.dlq"),
 		ShutdownTimeout:     time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 		ConsumerEnabled:     envStr("CONSUMER_ENABLED", "true") == "true",
+		// SPEC-W45 K21 (OOS-09): service-to-service gate for the /v1 surface.
+		InternalToken: os.Getenv("CRM_SYNC_INTERNAL_TOKEN"),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

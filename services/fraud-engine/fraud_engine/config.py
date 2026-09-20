@@ -53,11 +53,19 @@ class Settings:
     kafka_enabled: bool = field(default_factory=lambda: _bool("KAFKA_ENABLED", False))
     kafka_group_id: str = field(default_factory=lambda: os.getenv("FRAUD_KAFKA_GROUP", "fraud-engine"))
     # Event-driven triggers (D3 on capture events, D5 on consent/messaging
-    # events) consume the same topics as graph-sync.
+    # events, D8 on civic events) consume the same topics as graph-sync.
+    # SPEC-W45 ORPH O11: the defaults now match the topics producers
+    # ACTUALLY write (verified by grep): booking-service leads/referrals
+    # publish the funnel events on `cac.events` (UNPREFIXED — see
+    # infra/kafka/create-topics.sh and GRAPH_SYNC_CAC_TOPIC; the old
+    # `opendesk.cac.events` default was dead — no producer writes it),
+    # booking events on opendesk.booking.events, identity events on
+    # opendesk.identity.events, civic case events on
+    # opendesk.civic.events.v1 (booking-service civic.go TopicCivicEvents).
     kafka_trigger_topics: str = field(
         default_factory=lambda: os.getenv(
             "FRAUD_KAFKA_TOPICS",
-            "opendesk.cac.events,opendesk.identity.events,opendesk.civic.events.v1",
+            "cac.events,opendesk.booking.events,opendesk.identity.events,opendesk.civic.events.v1",
         )
     )
     alerts_topic: str = field(
@@ -141,6 +149,13 @@ class Settings:
     )
     ml_score_threshold: float = field(
         default_factory=lambda: _float("FRAUD_ML_SCORE_THRESHOLD", 0.9)
+    )
+
+    # SPEC-W45 K23 (OOS-20): X-Internal-Token gate on /v1/detect/*. Empty =
+    # fail-closed 503 (K2 pattern: refuse, never run an open service-to-
+    # service mutation surface).
+    internal_token: str = field(
+        default_factory=lambda: os.getenv("FRAUD_INTERNAL_TOKEN", "")
     )
 
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))

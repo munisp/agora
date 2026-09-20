@@ -86,6 +86,9 @@ func (tr *twentyRecorder) called(sub string) bool {
 	return false
 }
 
+// testInternalToken is the harness X-Internal-Token (SPEC-W45 K21 gate).
+const testInternalToken = "test-crm-sync-internal-token"
+
 func newTestServer(t *testing.T) (*Server, *fakeMap, *twentyRecorder) {
 	t.Helper()
 	rec := &twentyRecorder{}
@@ -93,16 +96,18 @@ func newTestServer(t *testing.T) (*Server, *fakeMap, *twentyRecorder) {
 	t.Cleanup(srv.Close)
 	fm := &fakeMap{rows: map[string]string{}}
 	return &Server{
-		Twenty:  twentyc.New(srv.URL, "k", 0),
-		Map:     fm,
-		Metrics: metrics.New(),
-		Log:     zap.NewNop(),
+		Twenty:        twentyc.New(srv.URL, "k", 0),
+		Map:           fm,
+		Metrics:       metrics.New(),
+		InternalToken: testInternalToken,
+		Log:           zap.NewNop(),
 	}, fm, rec
 }
 
 func postTasks(t *testing.T, s *Server, body string) (int, map[string]any) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(body))
+	req.Header.Set("X-Internal-Token", testInternalToken)
 	rec := httptest.NewRecorder()
 	s.Router().ServeHTTP(rec, req)
 	var out map[string]any
@@ -211,5 +216,70 @@ func TestResolveDueAt(t *testing.T) {
 	}
 	if _, err := resolveDueAt("", "tomorrow"); err == nil {
 		t.Fatal("expected error for non-RFC3339 due_at")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W45 K21 (OOS-09): X-Internal-Token gate on /v1/tasks + /v1/people/lookup
+// ---------------------------------------------------------------------------
+
+func TestInternalTokenMatrix(t *testing.T) {
+	s, _, rec := newTestServer(t)
+	rec.people = []map[string]any{{"id": "person-1"}}
+	router := s.Router()
+	do := func(method, path, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(`{"title":"x"}`))
+		if token != "" {
+			req.Header.Set("X-Internal-Token", token)
+		}
+		r := httptest.NewRecorder()
+		router.ServeHTTP(r, req)
+		return r
+	}
+	for _, path := range []string{"/v1/tasks", "/v1/people/lookup?email=jane@example.com"} {
+		method := http.MethodPost
+		if strings.HasPrefix(path, "/v1/people") {
+			method = http.MethodGet
+		}
+		if r := do(method, path, ""); r.Code != http.StatusUnauthorized {
+			t.Errorf("%s missing token: code = %d, want 401", path, r.Code)
+		}
+		if r := do(method, path, "wrong"); r.Code != http.StatusUnauthorized {
+			t.Errorf("%s wrong token: code = %d, want 401", path, r.Code)
+		}
+		if r := do(method, path, testInternalToken); r.Code == http.StatusUnauthorized || r.Code == http.StatusServiceUnavailable {
+			t.Errorf("%s correct token must pass: code = %d", path, r.Code)
+		}
+	}
+}
+
+func TestInternalTokenUnsetFailClosed503(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	s.InternalToken = "" // misconfigured deployment
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(`{"title":"x"}`))
+	req.Header.Set("X-Internal-Token", testInternalToken)
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("unset server token: code = %d, want 503 (fail-closed)", rec.Code)
+	}
+}
+
+// The webhook intake and probes are NOT behind the internal token (Twenty
+// calls the webhook path; it has its own HMAC gate).
+func TestGatedSurfaceDoesNotSwallowWebhookRoute(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/twenty", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	// 401 from the HMAC verifier (no signature), NOT the internal-token gate.
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("webhook without signature: code = %d, want 401 (HMAC)", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec = httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("healthz: code = %d, want 200", rec.Code)
 	}
 }
