@@ -662,21 +662,6 @@ func (s *Store) ListLeave(ctx context.Context, tenantID uuid.UUID, f LeaveFilter
 	return out, err
 }
 
-// GetLeave loads one leave request scoped to the tenant.
-func (s *Store) GetLeave(ctx context.Context, tenantID, id uuid.UUID) (LeaveRequest, error) {
-	var l LeaveRequest
-	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `SELECT `+leaveCols+` FROM leave_requests WHERE tenant_id=$1 AND id=$2`, tenantID, id)
-		var err error
-		l, err = scanLeave(row)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	})
-	return l, err
-}
-
 // DecideLeave records an approve|decline decision on a PENDING request
 // (SPEC-W20: decided_by is the JWT sub, decided_at is now). Atomic on the
 // pending guard: ErrNotFound when the row is missing, ErrInvalidTransition

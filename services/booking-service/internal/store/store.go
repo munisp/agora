@@ -80,6 +80,13 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W45 CODER-M (STK O14 completion): nullable team_members.user_id
+	// soft link to identity-service users (fresh installs get it from
+	// 01-booking-schema.sql directly).
+	if err := s.ensureTeamMemberUserIDColumn(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	if err := s.ensureCRMColumns(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -116,6 +123,23 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 	// composite (infra init scripts own fresh installs; this bootstrap
 	// migrates existing dev DBs idempotently).
 	if err := s.ensureIdempotencyIndex(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W45 CODER-A item 5: contacts dedupe — fold duplicate
+	// (tenant_id, phone) rows and create the UNIQUE index (fresh installs
+	// get it from 01-booking-schema.sql directly).
+	if err := s.ensureContactDedupe(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W45 CODER-A item 9: qr_scans (public scan ingest, RLS-enabled).
+	if err := s.ensureQRScansTable(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W45 CODER-A item 7: referral_agents registry (STK O10).
+	if err := s.ensureReferralAgentTables(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -318,7 +342,7 @@ func (s *Store) UpdateOffering(ctx context.Context, o *Offering) error {
 
 // DeleteOffering removes an offering.
 func (s *Store) DeleteOffering(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, o.TenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM offerings WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		if err != nil {
 			return err
@@ -342,6 +366,34 @@ type TeamMember struct {
 	Email    string    `json:"email"`
 	Role     string    `json:"role"`
 	Active   bool      `json:"active"`
+	// UserID optionally links the team member to an identity-service user
+	// (SPEC-W45 CODER-M, STK O14 completion). Nullable; booking-service does
+	// NOT existence-check it — identity-service owns users, this is a soft
+	// reference recorded for the team UI.
+	UserID *uuid.UUID `json:"user_id,omitempty"`
+}
+
+// teamMemberCols is the shared team_members projection (user_id added in
+// SPEC-W45; ensureTeamMemberUserIDColumn bootstraps it on existing DBs).
+const teamMemberCols = `id, tenant_id, name, email, role, active, user_id`
+
+// ensureTeamMemberUserIDColumn adds the nullable team_members.user_id
+// column on existing databases (fresh installs get it from
+// 01-booking-schema.sql directly). Idempotent.
+//
+// NOTE (RLS): superuser bootstrap path, intentionally outside withTenant.
+func (s *Store) ensureTeamMemberUserIDColumn(ctx context.Context) error {
+	const ddl = `
+DO $$
+BEGIN
+    IF to_regclass('public.team_members') IS NOT NULL THEN
+        ALTER TABLE team_members ADD COLUMN IF NOT EXISTS user_id UUID;
+    END IF;
+END $$;`
+	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("ensure team_members.user_id: %w", err)
+	}
+	return nil
 }
 
 // AvailabilityRule mirrors booking.availability_rules.
@@ -361,9 +413,9 @@ func (s *Store) CreateTeamMember(ctx context.Context, m *TeamMember) error {
 	if m.ID == uuid.Nil {
 		m.ID = uuid.New()
 	}
-	const q = `INSERT INTO team_members (id, tenant_id, name, email, role, active) VALUES ($1,$2,$3,$4,$5,$6)`
+	const q = `INSERT INTO team_members (` + teamMemberCols + `) VALUES ($1,$2,$3,$4,$5,$6,$7)`
 	return s.withTenant(ctx, m.TenantID, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, q, m.ID, m.TenantID, m.Name, m.Email, m.Role, m.Active); err != nil {
+		if _, err := tx.Exec(ctx, q, m.ID, m.TenantID, m.Name, m.Email, m.Role, m.Active, m.UserID); err != nil {
 			return fmt.Errorf("insert team member: %w", err)
 		}
 		return nil
@@ -375,14 +427,14 @@ func (s *Store) ListTeamMembers(ctx context.Context, tenantID uuid.UUID) ([]Team
 	var out []TeamMember
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
-			`SELECT id, tenant_id, name, email, role, active FROM team_members WHERE tenant_id=$1 ORDER BY name`, tenantID)
+			`SELECT `+teamMemberCols+` FROM team_members WHERE tenant_id=$1 ORDER BY name`, tenantID)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var m TeamMember
-			if err := rows.Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active); err != nil {
+			if err := rows.Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active, &m.UserID); err != nil {
 				return err
 			}
 			out = append(out, m)
@@ -399,9 +451,9 @@ func (s *Store) GetTeamMemberByEmail(ctx context.Context, tenantID uuid.UUID, em
 	var m TeamMember
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT id, tenant_id, name, email, role, active FROM team_members
+			`SELECT `+teamMemberCols+` FROM team_members
 			 WHERE tenant_id=$1 AND lower(email)=lower($2) ORDER BY name LIMIT 1`,
-			tenantID, email).Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active)
+			tenantID, email).Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active, &m.UserID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
@@ -414,8 +466,8 @@ func (s *Store) GetTeamMember(ctx context.Context, tenantID, id uuid.UUID) (Team
 	var m TeamMember
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT id, tenant_id, name, email, role, active FROM team_members WHERE tenant_id=$1 AND id=$2`,
-			tenantID, id).Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active)
+			`SELECT `+teamMemberCols+` FROM team_members WHERE tenant_id=$1 AND id=$2`,
+			tenantID, id).Scan(&m.ID, &m.TenantID, &m.Name, &m.Email, &m.Role, &m.Active, &m.UserID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
@@ -441,7 +493,7 @@ func (s *Store) UpdateTeamMember(ctx context.Context, m *TeamMember) error {
 
 // DeleteTeamMember removes a team member.
 func (s *Store) DeleteTeamMember(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, m.TenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM team_members WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		if err != nil {
 			return err
@@ -586,7 +638,7 @@ func (s *Store) UpdateContact(ctx context.Context, c *Contact) error {
 
 // DeleteContact removes a contact.
 func (s *Store) DeleteContact(ctx context.Context, tenantID, id uuid.UUID) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+	return s.withTenant(ctx, m.TenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `DELETE FROM contacts WHERE tenant_id=$1 AND id=$2`, tenantID, id)
 		if err != nil {
 			return err
