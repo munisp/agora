@@ -228,13 +228,13 @@ func (s *Store) Capture(ctx context.Context, rec *Record) error {
 	// capture wins); channel/locale/provenance refresh; a re-capture after an
 	// erasure tombstone clears erasure_ts (explicit re-consent).
 	const q = `INSERT INTO consents (consent_id, tenant_id, data_subject_id, purpose, captured_ts, captured_channel, captured_locale, captured_by, erasure_ts)
-           VALUES ($1,$2,$3,$4,now(),$5,$6,$7,NULL)
-           ON CONFLICT (tenant_id, data_subject_id, purpose) DO UPDATE
-           SET captured_channel = EXCLUDED.captured_channel,
-               captured_locale  = EXCLUDED.captured_locale,
-               captured_by      = EXCLUDED.captured_by,
-               erasure_ts       = NULL
-           RETURNING ` + recordCols
+	           VALUES ($1,$2,$3,$4,now(),$5,$6,$7,NULL)
+	           ON CONFLICT (tenant_id, data_subject_id, purpose) DO UPDATE
+	           SET captured_channel = EXCLUDED.captured_channel,
+	               captured_locale  = EXCLUDED.captured_locale,
+	               captured_by      = EXCLUDED.captured_by,
+	               erasure_ts       = NULL
+	           RETURNING ` + recordCols
 	return s.withTenant(ctx, rec.TenantID, func(tx pgx.Tx) error {
 		out, err := scanRecord(tx.QueryRow(ctx, q,
 			rec.ConsentID, rec.TenantID, rec.DataSubjectID, rec.Purpose,
@@ -250,8 +250,8 @@ func (s *Store) Capture(ctx context.Context, rec *Record) error {
 // List implements Repository.
 func (s *Store) List(ctx context.Context, tenantID uuid.UUID, subject string) ([]Record, error) {
 	const q = `SELECT ` + recordCols + ` FROM consents
-           WHERE tenant_id = $1 AND data_subject_id = $2
-           ORDER BY captured_ts DESC`
+	           WHERE tenant_id = $1 AND data_subject_id = $2
+	           ORDER BY captured_ts DESC`
 	var out []Record
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID, subject)
@@ -274,7 +274,7 @@ func (s *Store) List(ctx context.Context, tenantID uuid.UUID, subject string) ([
 // Active implements Repository.
 func (s *Store) Active(ctx context.Context, tenantID uuid.UUID, subject, purpose string) (Record, error) {
 	const q = `SELECT ` + recordCols + ` FROM consents
-           WHERE tenant_id = $1 AND data_subject_id = $2 AND purpose = $3 AND erasure_ts IS NULL`
+	           WHERE tenant_id = $1 AND data_subject_id = $2 AND purpose = $3 AND erasure_ts IS NULL`
 	var r Record
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
@@ -335,7 +335,7 @@ func (s *Store) FetchUnsentOutbox(ctx context.Context, limit int) ([]OutboxEvent
 		limit = 100
 	}
 	const q = `SELECT id, tenant_id, data_subject_id, purpose, erased_records, synthetic, created_at
-           FROM consent_events_outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1`
+	           FROM consent_events_outbox WHERE sent_at IS NULL ORDER BY id LIMIT $1`
 	rows, err := s.internal.Query(ctx, q, limit)
 	if err != nil {
 		return nil, fmt.Errorf("fetch unsent outbox: %w", err)
