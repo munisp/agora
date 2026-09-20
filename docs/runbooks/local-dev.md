@@ -15,9 +15,15 @@ make config     # validate the merged compose config (root docker-compose.yml
 make up         # docker compose up -d --build — middleware + services + web
 
 make seed       # scripts/seed-demo.sh — creates demo tenant "acme"
-                # (Europe/London, GBP, pro), two offerings and a knowledge doc.
-                # Hits services DIRECTLY on :7001/:7002/:7008 — gateway /api/*
-                # routes require a JWT (see §3).
+                # (Europe/London, GBP, plan free — the plan is server-forced
+                # for non-platform-admins), two offerings and a knowledge doc.
+                # Everything goes THROUGH the gateway (:9080) with a Keycloak
+                # JWT (§3): export SEED_USER/SEED_PASSWORD (or TOKEN) and
+                # KC_BOOTSTRAP_ADMIN_PASSWORD first — the script also joins
+                # the user to the /tenants/acme group so tokens carry the
+                # tenant_slugs claim. Direct :7001/:7002/:7008 access is gone
+                # (ports not host-published, W34 GF4; AUTHZ_DISABLED removed,
+                # W34 GF12).
 
 make smoke      # scripts/smoke-test.sh — health of all 9 services, public
                 # context + availability through the gateway, voice text turn,

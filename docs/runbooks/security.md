@@ -143,3 +143,92 @@ positive list is maintained.
   `opendesk.privacy.events`; booking (anonymizes contacts), conversation
   (deletes turns) and crm-sync (deletes the Twenty person + sync_map rows)
   consume it. Tombstones are idempotent; replays are safe.
+
+---
+
+## 6. First platform admin bootstrap (STK O15)
+
+"Platform admin" is a **cross-tenant operator** — the only principal that may
+set a non-`free` plan (`POST /v1/tenants` plan field, `PATCH
+/v1/tenants/{slug}/plan`) and perform other platform-level actions
+(assigning the `analyst`/`billing` realm roles, lending KYC overrides).
+identity-service recognizes a caller as platform admin when EITHER
+(`internal/httpapi/auth.go` `isPlatformAdmin`, SPEC-W43 I-01):
+
+1. the JWT carries the **`platform-admin` realm role** (realm_access.roles), or
+2. the JWT `sub` is in the **`OPENDESK_PLATFORM_ADMINS`** allowlist (CSV env
+   on identity-service).
+
+The shipped realm (`infra/keycloak/realm-opendesk.json`) deliberately has
+**no** `platform-admin` role and no users — bootstrap is a conscious operator
+act, not a default.
+
+### 6.1 Create the role + first platform admin (kcadm)
+
+```sh
+# 0. Authenticate kcadm (master-realm bootstrap admin — see
+#    infra/keycloak/README.md; password was exported before `make up`).
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh config credentials \
+  --server http://localhost:8080 --realm master \
+  --user admin --password "$KC_BOOTSTRAP_ADMIN_PASSWORD"
+
+# 1. Create the realm role ONCE (add-roles fails for a role that doesn't exist).
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh create roles -r opendesk \
+  -s name=platform-admin \
+  -s description='Platform operator — cross-tenant plan/admin actions'
+
+# 2. Create the user and set a real password.
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh create users -r opendesk \
+  -s username=platform-admin -s enabled=true
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh set-password -r opendesk \
+  --username platform-admin --new-password '<real-password>'
+
+# 3. Grant the role.
+docker compose exec keycloak /opt/keycloak/bin/kcadm.sh add-roles -r opendesk \
+  --uusername platform-admin --rolename platform-admin
+```
+
+Do **not** add this user to any `/tenants/*` group: platform admin is a
+platform capability, not a tenant membership.
+
+### 6.2 Alternative/complement: the subject allowlist
+
+`OPENDESK_PLATFORM_ADMINS` is a CSV of Keycloak user **ids** (the JWT `sub`),
+read by identity-service at boot (`internal/config/config.go`). Useful for
+break-glass or when the realm is managed externally:
+
+```sh
+SUB=$(docker compose exec keycloak /opt/keycloak/bin/kcadm.sh get users \
+  -r opendesk -q username=platform-admin --fields id --format csv --noquotes)
+# .env:  OPENDESK_PLATFORM_ADMINS=<uuid>[,<uuid>...]
+docker compose up -d identity   # pick up the env change
+```
+
+Prefer the realm role for humans (revocable in one place, visible in the
+admin console); use the allowlist sparingly and audit it — both paths are
+logged by identity-service when a plan override is applied.
+
+### 6.3 Dev invite emails: capture with Mailpit
+
+Two invite-mail paths exist (SPEC-W45 K8/K10): notification-worker sends the
+MemberInvited email through the Dapr SMTP output binding
+(`infra/dapr/components/bindings.smtp.yaml`, env `SMTP_HOST`/`SMTP_PORT`/
+`SMTP_USER`/`SMTP_FROM`/`SMTP_PASSWORD`), and identity-service's bootstrap
+PATCHes the Keycloak realm `smtpServer` from `KC_REALM_SMTP_HOST`/`_PORT`/
+`_FROM`/`_USER`/`_PASSWORD` so Keycloak's own execute-actions email
+(UPDATE_PASSWORD, VERIFY_EMAIL) fires. Neither sends anything real in dev —
+there is no SMTP server in the default compose. To see the emails locally,
+run Mailpit and point both var sets at it:
+
+```sh
+docker run -d --name mailpit --network opendesk_opendesk \
+  -p 1025:1025 -p 8025:8025 axllent/mailpit
+# .env:  SMTP_HOST=mailpit  SMTP_PORT=1025  SMTP_FROM="OpenDesk <no-reply@opendesk.local>"
+#        KC_REALM_SMTP_HOST=mailpit  KC_REALM_SMTP_PORT=1025  KC_REALM_SMTP_FROM=no-reply@opendesk.local
+docker compose up -d notification identity
+# inbox UI: http://localhost:8025
+```
+
+(If the compose project network differs, `docker network ls` and adjust; both
+SMTP configs fail soft — invites are still created, only the email is dropped,
+and the failure is logged.)

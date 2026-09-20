@@ -66,12 +66,12 @@ PATCH  /v1/social/creatives/{id}
 GET    /v1/social/posts?status=&account_id=
 POST   /v1/social/posts                     # {account_id, creative_id, status draft|queued (default queued)}
 GET    /v1/social/posts/{id}
-POST   /v1/social/posts/{id}/publish        # provider publish (mock default)
+POST   /v1/social/posts/{id}/publish        # provider publish (mock in dev; stub error unconfigured)
 GET    /v1/social/ads?status=&account_id=
 POST   /v1/social/ads                       # budget/age gates at input (400)
 PATCH  /v1/social/ads/{id}                  # field edits (draft|review|rejected) + status machine
 POST   /v1/social/ads/{id}/launch           # the gated launch
-GET    /v1/social/ads/{id}/stats            # provider stats (mock default)
+GET    /v1/social/ads/{id}/stats            # provider stats (mock in dev; stub error unconfigured)
 ```
 
 ### curl walkthrough
@@ -104,7 +104,7 @@ AD_ID=$(curl -s $H -X POST $B/v1/social/ads -d '{
 curl -s $H -X POST $B/v1/social/ads/$AD_ID/launch
 # → {"ad":{"status":"review","provider_ad_id":"mock-ad-meta-…"}, "rejected":false}
 
-# 5. Stats (deterministic while the mock is the default).
+# 5. Stats (deterministic while the mock serves — the dev default).
 curl -s $H $B/v1/social/ads/$AD_ID/stats
 ```
 
@@ -119,14 +119,19 @@ curl -s $H $B/v1/social/ads/$AD_ID/stats
 | `budget_kobo ≤ 0`, `daily_budget_kobo ≤ 0` or `daily > total` | **400** | Checked at create AND update. |
 | `targeting.age_min/age_max` outside `18..100` or `min > max` | **400** | 18+ floor matches the providers' political-ads policies. |
 
-## Provider seam + mock defaults
+## Provider seam + mock switches
 
 `internal/socialpub/provider` — one `Publisher` interface
-(`PublishPost`, `LaunchAd`, `AdStats`), three providers. **The mock is the
-zero-config default** (same posture as W16 `FCM_MOCK=1`): no network,
-deterministic sandbox ids (`mock-post-<provider>-<sha[:16]>`,
-`mock-ad-<provider>-<sha[:16]>`) and plausible, deterministic stats
-(impressions/reach/clicks/spend_kobo derived from the ad id hash).
+(`PublishPost`, `LaunchAd`, `AdStats`), three providers. Since W39 SIM-005
+the mock is an **explicit opt-in, never the silent code default** — with
+all mock switches unset every provider is the honest real-API stub and
+fails closed with "not configured" (see the operator guide
+`docs/social-publishing.md`). In dev, compose/`.env.example` opts every
+provider into mock mode (`SOCIAL_MOCK=0` + `META_MOCK=1`/`TIKTOK_MOCK=1`/
+`X_MOCK=1`). The mock is deterministic: no network, sandbox ids
+(`mock-post-<provider>-<sha[:16]>`, `mock-ad-<provider>-<sha[:16]>`) and
+plausible, deterministic stats (impressions/reach/clicks/spend_kobo derived
+from the ad id hash).
 
 Documented mock test hooks:
 
@@ -136,21 +141,23 @@ Documented mock test hooks:
   (ad lands in `rejected`, `AdRejected` event, 200 with
   `{"rejected":true,"reason":…}`).
 
-Mock switches (integrator wires; defaults in parentheses):
+Mock switches (code defaults in parentheses — W39 SIM-005: all OFF;
+dev `.env.example` opts each provider in individually):
 
-| Env | Default | Meaning |
+| Env | Code default | Meaning |
 |---|---|---|
-| `SOCIAL_MOCK` | `1` | Master mock switch. |
-| `META_MOCK` / `TIKTOK_MOCK` / `X_MOCK` | `1` | Per-provider mock. A provider leaves mock mode only when BOTH `SOCIAL_MOCK=0` AND its own switch are `0`. |
+| `SOCIAL_MOCK` | `0` | Master mock switch — truthy mocks ALL providers. |
+| `META_MOCK` / `TIKTOK_MOCK` / `X_MOCK` | `0` (dev env: `1`) | Per-provider mock. A provider is mocked when the master OR its own switch is truthy. |
 | `SOCIAL_EVENTS_TOPIC` | `opendesk.social.events.v1` | Lifecycle CloudEvents topic (empty disables). |
 | `USAGE_EVENTS_TOPIC` | `opendesk.usage.events` | `social_ad_launched` metering (empty disables). |
 | `DATABASE_URL` | — | `DialStore` fallback pool. |
 
-With `*_MOCK=0` the provider seam currently answers an **honest
-"not configured" stub** (same posture as the W16 APNs stub — the seam is
-real, the credential wiring is a follow-up; no fake success claims). The
-UI stats endpoint discloses `{"mock": true}` and renders a "mock data"
-badge while the mock serves.
+With mocks off the provider seam answers an **honest "not configured"
+stub** (same posture as the W16 APNs stub — the seam is real, the
+credential wiring is a follow-up; no fake success claims). The settings
+read API exposes `config_status` (`notConfigured` until a real rail is
+wired) and the UI stats endpoint discloses `{"mock": true}` with a "mock
+data" badge while the mock serves.
 
 ## Meta political-ads authorization runbook (EXTERNAL — plan for WEEKS)
 

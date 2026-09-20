@@ -135,3 +135,12 @@ TTS_PROVIDER_CHAIN=azure,mms,piper
 TTS_VOICE_MAP={"en-NG": "azure:en-NG-EzinneNeural", "en": "azure:en-NG-EzinneNeural", "pcm": "mms:pcm"}
 AZURE_SPEECH_KEY=... AZURE_SPEECH_REGION=westeurope
 ```
+
+## Outbound voice — ROADMAP ONLY (U4)
+
+The voice agent is **inbound and text-chat only**. There is no outbound
+dialer, campaign calling, or answer-machine detection anywhere in the
+codebase, and no env var enables one. Outbound voice campaigns are a
+tracked roadmap item with an implementation sketch in
+`docs/roadmap/W45-deferred.md` §7 — any external material claiming outbound
+campaigns exist today is inaccurate.

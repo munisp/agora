@@ -16,11 +16,17 @@ eBulksSMS). Implemented in `services/messaging-gateway`
 Africa's Talking invokes the gateway once per subscriber interaction:
 
 ```
-POST /webhooks/ussd
+POST /ussd/callback/{secret}
 Content-Type: application/x-www-form-urlencoded
 
 sessionId=…&serviceCode=*384*123%23&phoneNumber=%2B2348012345678&text=1*2
 ```
+
+**Callback authentication (SPEC-W45 K14).** The `{secret}` path segment must
+equal the `AT_CALLBACK_SECRET` env var (constant-time compare). The route
+fails closed: `503` when `AT_CALLBACK_SECRET` is unset, `401` on a wrong
+secret, and each subscriber phone number is rate-limited. The old
+unauthenticated `POST /webhooks/ussd` route is retired.
 
 | Field | Meaning |
 |---|---|
@@ -151,6 +157,7 @@ chain from `SMS_PROVIDER_CHAIN` (default `africastalking,termii,ebulksms`):
 | `USSD_SESSION_BACKEND` | `memory` | `memory` \| `dapr` |
 | `USSD_STATE_STORE` | `statestore` | Dapr component (backend=dapr) |
 | `USSD_SESSION_TTL_SECONDS` | `180` | Contract §1 TTL |
+| `AT_CALLBACK_SECRET` | — (required for USSD) | Shared secret in the callback path `/ussd/callback/{secret}` (K14); route is 503 fail-closed when unset |
 
 Tenant routing reuses `CHANNEL_SITE_MAP` with the route key
 `ussd:<serviceCode>`:
@@ -161,11 +168,15 @@ Tenant routing reuses `CHANNEL_SITE_MAP` with the route key
 
 ## Ops notes
 
-- Register the callback URL `https://<gateway>/webhooks/ussd` on the AT
-  USSD channel (shared shortcode) or via the aggregator's callback
-  configuration. It sits behind the same public APISIX `/webhooks/*`
-  route as the WhatsApp/Telegram webhooks; AT callbacks carry no shared
-  secret, so tenancy is established by the `serviceCode` site-map entry.
+- Register the callback URL
+  `https://<gateway>/ussd/callback/<AT_CALLBACK_SECRET>` on the AT USSD
+  channel (shared shortcode) or via the aggregator's callback configuration
+  (SPEC-W45 K14: the shared secret is carried in the path — the route is
+  fail-closed: `503` when `AT_CALLBACK_SECRET` is unset, `401` on mismatch,
+  compared in constant time, plus a per-phone rate limit). Set
+  `AT_CALLBACK_SECRET` in compose/k3s (see `.env.example`) and keep it out
+  of logs. Tenancy is still established by the `serviceCode` site-map entry;
+  the secret only authenticates that the caller is the aggregator.
 - Aggregator callbacks time out in a few seconds: the handler is bounded by
   the shared 25s webhook context but conversation-service should answer in
   ~1–2s; on slow paths the subscriber sees the fallback END line.
