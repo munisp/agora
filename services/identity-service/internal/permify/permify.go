@@ -95,6 +95,47 @@ func (c *HTTPClient) WriteRelationship(ctx context.Context, tenantID, entity, re
 	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/relationships/write", body, nil)
 }
 
+// DeleteRelationship removes one relationship tuple via
+// POST /v1/tenants/{t}/data/relationships/delete (SPEC-W45 K16 member
+// removal/role change). A missing tuple is a Permify no-op, so the call is
+// idempotent by construction.
+func (c *HTTPClient) DeleteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error {
+	et, ei := splitRef(entity)
+	st, si := splitRef(subject)
+	body := map[string]any{
+		"metadata": map[string]any{"schema_version": ""},
+		"tuple": map[string]any{
+			"entity":   map[string]string{"type": et, "id": ei},
+			"relation": relation,
+			"subject":  map[string]string{"type": st, "id": si},
+		},
+	}
+	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/relationships/delete", body, nil)
+}
+
+// DeleteTenant removes the Permify tenant and every relationship it holds
+// (DELETE /v1/tenants/{id} — SPEC-W45 K9 tenant-deletion cascade).
+// Idempotent: 404 (already gone) is treated as success.
+func (c *HTTPClient) DeleteTenant(ctx context.Context, tenantID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/v1/tenants/"+tenantID, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("permify delete tenant %s: %w", tenantID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode >= 300 {
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("permify delete tenant %s: status %d: %s", tenantID, resp.StatusCode, string(rb))
+	}
+	return nil
+}
+
 // CreateTenant provisions a Permify tenant for relationship isolation and
 // writes the OpenDesk ReBAC schema to it (SPEC-W34 GF15 — a tenant without
 // the schema fail-closes every booking-service permission check with 502).
