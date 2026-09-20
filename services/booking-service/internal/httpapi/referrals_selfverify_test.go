@@ -74,9 +74,20 @@ func TestReferralSelfVerifyGuard(t *testing.T) {
 	}
 
 	tenant := bookingops.TenantInfo{ID: uuid.New(), Slug: "acme-ng", Name: "Acme NG"}
+	// SPEC-W45 STK O18/O10: agent referrers must be registered, approved
+	// and beneficiary-linked before a referral can attribute (or verify).
+	agent, err := svc.CreateAgent(ctx, tenant.ID, referrals.CreateAgentInput{Name: "Agent One", Phone: "+2347000000001"})
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	approved := referrals.AgentApproved
+	beneficiaryID := uuid.New()
+	if _, err := svc.UpdateAgent(ctx, tenant.ID, agent.ID, referrals.UpdateAgentInput{Status: &approved, BeneficiaryID: &beneficiaryID}); err != nil {
+		t.Fatalf("approve agent: %v", err)
+	}
 	ref, created, err := svc.Create(ctx, referrals.CreateInput{
 		TenantID: tenant.ID, ReferrerType: referrals.ReferrerAgent,
-		ReferrerID: "agent-1", RefereePhone: "+2348099990001",
+		ReferrerID: agent.ID.String(), RefereePhone: "+2348099990001",
 	})
 	if err != nil || !created {
 		t.Fatalf("create referral: created=%v err=%v", created, err)
@@ -115,8 +126,10 @@ func TestReferralSelfVerifyGuard(t *testing.T) {
 	}
 
 	// Referrer == verifier (X-User-Id path) → 409, and the referral must
-	// stay pending (no verify side-effects).
-	if rec := verify("agent-1"); rec.Code != http.StatusConflict {
+	// stay pending (no verify side-effects). Since STK O18 the referrer_id
+	// IS the registered agent's uuid, so the self-verify caller carries that
+	// same id (a bare "agent-1" string can no longer BE the referrer).
+	if rec := verify(agent.ID.String()); rec.Code != http.StatusConflict {
 		t.Fatalf("self-verify = %d (%s), want 409", rec.Code, rec.Body.String())
 	}
 	got, err := svc.Store.GetReferral(ctx, tenant.ID, ref.ID)

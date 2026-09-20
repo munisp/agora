@@ -39,9 +39,12 @@ func (s *server) mapReferralError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, referrals.ErrUnknownReferrer):
+		// SPEC-W45 STK O18: unresolvable referrer_id → 422.
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, referrals.ErrInvalidInput):
 		writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, referrals.ErrInvalidTransition):
+	case errors.Is(err, referrals.ErrInvalidTransition), errors.Is(err, referrals.ErrAgentNotPayable):
 		writeError(w, http.StatusConflict, err.Error())
 	default:
 		s.internal(w, err)
@@ -367,4 +370,110 @@ func (s *server) commissionBalance(w http.ResponseWriter, r *http.Request) {
 		"account_code":   referrals.AccountCommissionPayable,
 		"balance_ngn":    bal, // kobo (credits − debits)
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Referral agent registry (SPEC-W45 STK O10)
+// ---------------------------------------------------------------------------
+
+// createAgentRequest is the POST /v1/referrals/agents body.
+type createAgentRequest struct {
+	Name          string     `json:"name"`
+	Phone         string     `json:"phone"`
+	BeneficiaryID *uuid.UUID `json:"beneficiary_id,omitempty"`
+}
+
+// createReferralAgent handles POST /v1/referrals/agents (manage_bookings):
+// staff registration — the agent starts pending; approval is the admin-only
+// PATCH.
+func (s *server) createReferralAgent(w http.ResponseWriter, r *http.Request) {
+	svc := s.referralsSvc(w)
+	if svc == nil {
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	var req createAgentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	agent, err := svc.CreateAgent(r.Context(), tenant.ID, referrals.CreateAgentInput{
+		Name:          req.Name,
+		Phone:         req.Phone,
+		BeneficiaryID: req.BeneficiaryID,
+	})
+	if err != nil {
+		s.mapReferralError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"agent": agent})
+}
+
+// listReferralAgents handles GET /v1/referrals/agents?status=
+// (view_analytics).
+func (s *server) listReferralAgents(w http.ResponseWriter, r *http.Request) {
+	svc := s.referralsSvc(w)
+	if svc == nil {
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	agents, err := svc.ListAgents(r.Context(), tenant.ID, r.URL.Query().Get("status"))
+	if err != nil {
+		s.mapReferralError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
+}
+
+// updateAgentRequest is the PATCH /v1/referrals/agents/{id} body.
+type updateAgentRequest struct {
+	Status           *string    `json:"status,omitempty"`
+	BeneficiaryID    *uuid.UUID `json:"beneficiary_id,omitempty"`
+	ClearBeneficiary bool       `json:"clear_beneficiary,omitempty"`
+}
+
+// hasAdminRole reports whether the resolved realm roles include "admin"
+// (JWT realm_access.roles, X-User-Roles fallback — resolved by the tenant
+// middleware).
+func hasAdminRole(r *http.Request) bool {
+	for _, role := range rolesFrom(r.Context()) {
+		if role == "admin" {
+			return true
+		}
+	}
+	return false
+}
+
+// updateReferralAgent handles PATCH /v1/referrals/agents/{id} — ADMIN-ONLY
+// (SPEC-W45 STK O10: approval/suspension and the beneficiary link change
+// who money flows to; manage_bookings is necessary but not sufficient).
+func (s *server) updateReferralAgent(w http.ResponseWriter, r *http.Request) {
+	svc := s.referralsSvc(w)
+	if svc == nil {
+		return
+	}
+	if !hasAdminRole(r) {
+		s.d.Logger.Warn("referral agent PATCH rejected: caller lacks the admin role",
+			zap.String("caller", callerIdentity(r)))
+		writeError(w, http.StatusForbidden, "referral agent approval requires the admin role")
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req updateAgentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	agent, err := svc.UpdateAgent(r.Context(), tenant.ID, id, referrals.UpdateAgentInput{
+		Status:           req.Status,
+		BeneficiaryID:    req.BeneficiaryID,
+		ClearBeneficiary: req.ClearBeneficiary,
+	})
+	if err != nil {
+		s.mapReferralError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent": agent})
 }
