@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/opendesk/identity-service/internal/apps"
+	"github.com/opendesk/identity-service/internal/billing"
 	"github.com/opendesk/identity-service/internal/consent"
 	"github.com/opendesk/identity-service/internal/daprc"
 	"github.com/opendesk/identity-service/internal/events"
@@ -36,6 +37,17 @@ type TenantStore interface {
 	MergeTerminology(ctx context.Context, slug string, patch json.RawMessage) (json.RawMessage, error)
 	ListMembers(ctx context.Context, tenantID uuid.UUID) ([]store.Membership, error)
 	AddMember(ctx context.Context, m store.Membership) error
+	// SPEC-W45 K16 member lifecycle.
+	GetMember(ctx context.Context, tenantID uuid.UUID, userID string) (store.Membership, error)
+	RemoveMember(ctx context.Context, tenantID uuid.UUID, userID string) error
+	// SPEC-W45 K18 plan gate + plan update.
+	CountMembers(ctx context.Context, tenantID uuid.UUID) (int, error)
+	SetTenantPlan(ctx context.Context, slug, plan string) error
+	// SPEC-W45 K17 tenant API keys.
+	CreateAPIKey(ctx context.Context, k *store.APIKey) error
+	ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]store.APIKey, error)
+	RevokeAPIKey(ctx context.Context, tenantID, keyID uuid.UUID) error
+	GetAPIKeyByHash(ctx context.Context, keyHash string) (store.APIKey, string, error)
 }
 
 // PermifyClient is the authorization/relationship contract
@@ -44,6 +56,9 @@ type PermifyClient interface {
 	Check(ctx context.Context, tenantID, subject, permission, resource string) (bool, error)
 	CreateTenant(ctx context.Context, tenantID, name string) error
 	WriteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error
+	// SPEC-W45 K16/K9: relationship unlink + tenant deletion cascade.
+	DeleteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error
+	DeleteTenant(ctx context.Context, tenantID string) error
 }
 
 // KeycloakClient is the identity-provider contract (*keycloak.Client
@@ -51,6 +66,15 @@ type PermifyClient interface {
 type KeycloakClient interface {
 	CreateTenantGroup(ctx context.Context, slug string) (string, error)
 	CreateUser(ctx context.Context, slug string, in keycloak.CreateUserInput) (string, error)
+	// SPEC-W45 K8: execute-actions e-mail after invite (fail-soft).
+	SendExecuteActionsEmail(ctx context.Context, userID string, actions []string) error
+	// SPEC-W45 K16 member lifecycle.
+	DisableUser(ctx context.Context, userID string) error
+	LogoutUserSessions(ctx context.Context, userID string) error
+	AssignRealmRole(ctx context.Context, userID, roleName string) error
+	RemoveRealmRole(ctx context.Context, userID, roleName string) error
+	// SPEC-W45 K9: tenant-deletion cascade.
+	DeleteTenantGroup(ctx context.Context, slug string) error
 }
 
 // Deps bundles server dependencies.
@@ -76,6 +100,9 @@ type Deps struct {
 	// Apps is the app platform registry handler (SPEC-W18 §1); nil disables
 	// the apps routes (tests).
 	Apps *apps.Handler
+	// Billing pushes plan changes to billing-engine (SPEC-W45 K contract
+	// note, best-effort); nil disables the push (BILLING_URL unset).
+	Billing *billing.Client
 }
 
 // NewRouter builds the chi router with all routes.
@@ -105,7 +132,21 @@ func NewRouter(d Deps) http.Handler {
 		r.Delete("/tenants/{slug}", s.deleteTenant)
 		r.Get("/tenants/{slug}/members", s.listMembers)
 		r.Post("/tenants/{slug}/members", s.inviteMember)
+		// SPEC-W45 K16 member lifecycle (admin-gated; owner-only for the
+		// owner role — see members.go).
+		r.Delete("/tenants/{slug}/members/{user_id}", s.removeMember)
+		r.Patch("/tenants/{slug}/members/{user_id}", s.updateMemberRole)
+		// SPEC-W45 K17 tenant API keys (owner/admin; secret shown once).
+		r.Post("/tenants/{slug}/api-keys", s.createAPIKey)
+		r.Get("/tenants/{slug}/api-keys", s.listAPIKeys)
+		r.Delete("/tenants/{slug}/api-keys/{key_id}", s.revokeAPIKey)
+		// SPEC-W45 K18 plan change (owner or platform-admin).
+		r.Patch("/tenants/{slug}/plan", s.updatePlan)
 	})
+	// SPEC-W45 K17: service-to-service API-key validation (internauth-gated
+	// by the /internal prefix, K2). Consumed by booking-service's
+	// X-Api-Key middleware for the /v1/ext/* route group.
+	r.Post("/internal/api-keys/validate", s.validateAPIKey)
 	// Idempotent internal endpoints used by the TenantOnboardingWorkflow
 	// (SPEC §6) via Dapr service invocation.
 	r.Route("/internal/tenants/{slug}", func(r chi.Router) {
@@ -468,9 +509,23 @@ type inviteMemberRequest struct {
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
 	Role      string `json:"role"`
+	// RealmRoles optionally grants FUNCTIONAL Keycloak realm roles layered on
+	// top of the base membership role (SPEC-W45 K16/STK O4): "analyst" and
+	// "billing" exist as realm roles but are grantable by platform-admins
+	// only — tenant admins must not mint billing/analyst capabilities.
+	RealmRoles []string `json:"realm_roles"`
 }
 
 var memberRoles = map[string]bool{"owner": true, "admin": true, "staff": true, "viewer": true}
+
+// realmAssignableRoles are the member roles mirrored to same-named Keycloak
+// realm roles via role-mappings (SPEC-W45 K16/STK O4). "owner" is
+// deliberately absent: ownership lives in Permify only.
+var realmAssignableRoles = map[string]bool{"admin": true, "staff": true, "viewer": true}
+
+// functionalRealmRoles are realm roles outside the membership model,
+// grantable at invite time by platform-admins only (STK O4).
+var functionalRealmRoles = map[string]bool{"analyst": true, "billing": true}
 
 // inviteMember creates the Keycloak user, a membership row and the Permify
 // relationship, then publishes MemberInvited.
@@ -504,6 +559,23 @@ func (s *server) inviteMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "role must be owner|admin|staff|viewer")
 		return
 	}
+	// STK O4: functional realm roles are platform-admin-only.
+	for _, rr := range req.RealmRoles {
+		if !functionalRealmRoles[rr] {
+			writeError(w, http.StatusBadRequest, "realm_roles entries must be analyst|billing")
+			return
+		}
+		if !s.isPlatformAdmin(c) {
+			writeError(w, http.StatusForbidden, "realm roles "+rr+" are assignable by platform-admin only")
+			return
+		}
+	}
+	// SPEC-W45 K18: plan member-limit gate (free ≤ 3, pro ≤ 20,
+	// scale/enterprise/twin unlimited) — enforced BEFORE the Keycloak user is
+	// created so a rejected invite leaves no orphaned IdP account.
+	if err := s.enforceMemberLimit(w, r, t); err != nil {
+		return
+	}
 	if req.Role == "owner" {
 		// Owner-role invites require an owner caller (Permify relation check;
 		// the organization schema has no owner-only permission, and the
@@ -527,9 +599,27 @@ func (s *server) inviteMember(w http.ResponseWriter, r *http.Request) {
 		LastName:  req.LastName,
 	})
 	if err != nil {
+		// SPEC-W45 K16/STK O3: re-inviting an already-registered e-mail is a
+		// client-level conflict with resend semantics, NOT an IdP outage —
+		// the UI offers "resend invite" on this response.
+		if errors.Is(err, keycloak.ErrUserExists) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":  "already_invited_or_member",
+				"resend": true,
+			})
+			return
+		}
 		s.d.Logger.Error("keycloak create user", zap.Error(err))
 		writeError(w, http.StatusBadGateway, "identity provider error")
 		return
+	}
+	// SPEC-W45 K8: Keycloak's own credentials e-mail (UPDATE_PASSWORD +
+	// VERIFY_EMAIL) fires when realm SMTP is live (K10). Fail-soft: the
+	// MemberInvited → notification-worker invite e-mail is the primary rail.
+	if err := s.d.Keycloak.SendExecuteActionsEmail(r.Context(), userID,
+		[]string{"UPDATE_PASSWORD", "VERIFY_EMAIL"}); err != nil {
+		s.d.Logger.Warn("execute-actions-email deferred (realm SMTP not live?)",
+			zap.String("user_id", userID), zap.Error(err))
 	}
 	if err := s.d.Store.AddMember(r.Context(), store.Membership{
 		TenantID: t.ID, UserID: userID, Role: req.Role,
@@ -546,18 +636,45 @@ func (s *server) inviteMember(w http.ResponseWriter, r *http.Request) {
 		"organization:"+t.ID.String(), relation, "user:"+userID); err != nil {
 		s.d.Logger.Warn("permify member relationship deferred", zap.Error(err))
 	}
+	// SPEC-W45 K16/STK O4: mirror the membership role to the same-named
+	// Keycloak realm role (admin/staff/viewer) + grant any requested
+	// functional realm roles. Fail-soft: Permify is the authorization source
+	// of truth; a realm without these roles logs a warn, not a failed invite.
+	for _, roleName := range append(realmRoleNames(req.Role), req.RealmRoles...) {
+		if err := s.d.Keycloak.AssignRealmRole(r.Context(), userID, roleName); err != nil {
+			s.d.Logger.Warn("realm role assignment deferred",
+				zap.String("user_id", userID), zap.String("role", roleName), zap.Error(err))
+		}
+	}
 
+	// SPEC-W45 K8: the notification-worker invite e-mail consumes this event;
+	// the payload carries everything the template needs (app URL is added by
+	// the consumer).
 	evt := events.New("identity-service", "com.opendesk.identity.MemberInvited", t.Slug, t.ID.String(), map[string]any{
-		"tenant_id": t.ID.String(),
-		"user_id":   userID,
-		"email":     req.Email,
-		"role":      req.Role,
+		"tenant_slug":  t.Slug,
+		"tenant_id":    t.ID.String(),
+		"user_id":      userID,
+		"email":        req.Email,
+		"display_name": strings.TrimSpace(req.FirstName + " " + req.LastName),
+		"role":         req.Role,
+		"invited_by":   c.Subject,
+		"invite_ts":    time.Now().UTC().Format(time.RFC3339),
 	})
 	if err := s.d.Dapr.PublishEvent(r.Context(), s.d.PubSub, s.d.Topic, evt); err != nil {
 		s.d.Logger.Error("failed to publish MemberInvited", zap.Error(err))
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{"user_id": userID, "role": req.Role})
+}
+
+// realmRoleNames maps a membership role to the Keycloak realm roles mirrored
+// for it (STK O4): admin/staff/viewer map to the same-named realm role;
+// owner has no realm-role mirror (ownership is Permify-only).
+func realmRoleNames(memberRole string) []string {
+	if realmAssignableRoles[memberRole] {
+		return []string{memberRole}
+	}
+	return nil
 }
 
 // ensureGroup (POST /internal/tenants/{slug}/ensure-group) idempotently
