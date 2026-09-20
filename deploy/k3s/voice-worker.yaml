@@ -108,12 +108,21 @@ spec:
               value: ollama
             - name: WHISPER_MODEL
               value: base
-            - name: PIPER_URL
+            # ORPH O14 (SPEC-W45): the code reads PIPER_HTTP_URL
+            # (app/config.py); PIPER_URL was never read.
+            - name: PIPER_HTTP_URL
               value: http://piper:5500
             - name: KAFKA_BROKERS
               value: kafka:9092
             - name: AGENT_BACKEND
               value: livekit
+            # K15c (SPEC-W45): the verified-session OTP client
+            # (app/verification.py) POSTs {BOOKING_URL}/public/sites/{slug}/
+            # portal/request + /portal/verify and is FAIL-CLOSED when
+            # BOOKING_URL is unset (verification_unavailable on every
+            # mutating tool). In-cluster booking Service address.
+            - name: BOOKING_URL
+              value: http://booking:7002
             # Dapr sidecars are not injected on the appliance yet; point at
             # the voice service directly until the Dapr dataplane lands
             # (same caveat as deploy/k3s/README.md "Is not (yet)").
