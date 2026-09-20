@@ -133,11 +133,11 @@ func checkSlotOverlapTx(ctx context.Context, tx pgx.Tx, tenantID, teamMemberID, 
 	}
 	var overlapping, withinBuffer int64
 	err := tx.QueryRow(ctx, `SELECT
-    count(*) FILTER (WHERE starts_at < $4 AND ends_at > $3),
-    count(*) FILTER (WHERE starts_at < $6 AND ends_at > $5
-                     AND NOT (starts_at < $4 AND ends_at > $3))
-  FROM bookings
-  WHERE tenant_id=$1 AND team_member_id=$2 AND status <> 'cancelled' AND id <> $7`,
+	    count(*) FILTER (WHERE starts_at < $4 AND ends_at > $3),
+	    count(*) FILTER (WHERE starts_at < $6 AND ends_at > $5
+	                     AND NOT (starts_at < $4 AND ends_at > $3))
+	  FROM bookings
+	  WHERE tenant_id=$1 AND team_member_id=$2 AND status <> 'cancelled' AND id <> $7`,
 		tenantID, teamMemberID, start, end, from, to, excludeID).Scan(&overlapping, &withinBuffer)
 	if err != nil {
 		return fmt.Errorf("slot overlap re-check: %w", err)
