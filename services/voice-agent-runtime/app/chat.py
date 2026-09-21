@@ -79,13 +79,20 @@ class ChatService:
         site_slug: str,
         message: str,
         conversation_id: str | None,
+        session_secret: str | None = None,
         persona_override: str | None = None,
     ) -> tuple[SessionState, ToolLayer, list[dict[str, Any]]]:
         """Shared turn setup for the buffered and SSE streaming chat paths
         (SPEC-W3 §3): session, tenant context, multi-agent routing, tool
         layer and the re-rendered system prompt + user message in history.
+
+        K15(b): resume requires the session_secret issued at creation; a
+        conversation_id alone NEVER recovers confirmed/verified phone,
+        history or escalation state (SessionStore starts fresh instead).
         """
-        session = self._sessions.get_or_create(conversation_id, site_slug)
+        session = self._sessions.get_or_create(
+            conversation_id, site_slug, session_secret=session_secret
+        )
         ctx = await fetch_tenant_context(self._dapr, self._settings, site_slug)
 
         # Wave 5 #8 A/B prompt testing: swap the tenant persona for the
@@ -183,18 +190,34 @@ class ChatService:
         site_slug: str,
         message: str,
         conversation_id: str | None,
+        session_secret: str | None = None,
         persona_override: str | None = None,
         channel: str = "web",
+        pin_verified_identity: str | None = None,
     ) -> dict[str, Any]:
         session, tool_layer, history = await self._prepare_turn(
             site_slug=site_slug,
             message=message,
             conversation_id=conversation_id,
+            session_secret=session_secret,
             persona_override=persona_override,
         )
         # SPEC-W6 Part A: omnichannel inbound — remember which channel the
         # message arrived on (session metadata + turn logging only).
         session.channel = channel
+        # SPEC-W45 K15(c): channel-verified identity pinning (e.g. WhatsApp
+        # wa_id). The HTTP layer (control_plane) passes this ONLY when the
+        # request was authorized with the internal token AND the channel's
+        # provider supplies a verified identity — a public web caller can
+        # never set it. Pinned identity satisfies the OTP gate.
+        if pin_verified_identity:
+            pinned = session.mark_verified(pin_verified_identity)
+            session.claimed_phone = session.claimed_phone or pinned
+            log.info(
+                "channel-verified identity pinned",
+                conversation_id=session.conversation_id,
+                channel=channel,
+            )
 
         reply, trace = await run_tool_loop(
             self._llm,
@@ -216,9 +239,13 @@ class ChatService:
         )
         return {
             "conversation_id": session.conversation_id,
+            # K15(b): the resume credential — the client MUST present it
+            # together with conversation_id to continue this session.
+            "session_secret": session.session_secret,
             "reply": reply,
             "tool_calls": trace,
             "phone_confirmed": session.confirmed_phone is not None,
+            "phone_verified": session.verified_phone is not None,
             "active_agent": session.active_agent,
             "escalated": session.escalation_room is not None,
             # SPEC-W9 Part B (additive): validated UI actions the LLM invoked
@@ -232,6 +259,7 @@ class ChatService:
         site_slug: str,
         message: str,
         conversation_id: str | None,
+        session_secret: str | None = None,
         persona_override: str | None = None,
     ):
         """SSE streaming chat (SPEC-W3 §3): async generator of event dicts.
@@ -239,7 +267,8 @@ class ChatService:
         Yields {"delta": "..."} for every LLM content chunk and
         {"tool_call": {...}} when a tool is executed — the SAME tool layer
         as the buffered path. The terminal event is
-        {"done": true, "conversation_id": ...}. History and whisper-copilot
+        {"done": true, "conversation_id": ..., "session_secret": ...}
+        (K15(b): both are required to resume). History and whisper-copilot
         bookkeeping happen after the final answer, exactly as in
         handle_message.
         """
@@ -247,6 +276,7 @@ class ChatService:
             site_slug=site_slug,
             message=message,
             conversation_id=conversation_id,
+            session_secret=session_secret,
             persona_override=persona_override,
         )
 
@@ -294,4 +324,8 @@ class ChatService:
         # `data: {"ui_action": {...}}` frames ahead of the terminal done frame.
         for action in tool_layer.collected_ui_actions:
             yield {"ui_action": action}
-        yield {"done": True, "conversation_id": session.conversation_id}
+        yield {
+            "done": True,
+            "conversation_id": session.conversation_id,
+            "session_secret": session.session_secret,
+        }
