@@ -40,6 +40,10 @@ pub enum AttemptState {
     ResolvedCommitted,
     /// Reconciler: the rail confirmed the transfer never happened / aborted.
     ResolvedFailed,
+    /// SPEC-W45 K20: amount is strictly above PAYOUT_APPROVAL_THRESHOLD_KOBO
+    /// (threshold > 0) — the funds are reserved (pending hold) and the rail
+    /// is NOT called until POST /v1/payouts/{id}/approve (owner role).
+    PendingApproval,
 }
 
 impl AttemptState {
@@ -50,6 +54,7 @@ impl AttemptState {
             Self::Committed => "committed",
             Self::ResolvedCommitted => "resolved_committed",
             Self::ResolvedFailed => "resolved_failed",
+            Self::PendingApproval => "pending_approval",
         }
     }
 
@@ -60,6 +65,7 @@ impl AttemptState {
             "committed" => Some(Self::Committed),
             "resolved_committed" => Some(Self::ResolvedCommitted),
             "resolved_failed" => Some(Self::ResolvedFailed),
+            "pending_approval" => Some(Self::PendingApproval),
             _ => None,
         }
     }
@@ -109,12 +115,19 @@ CREATE TABLE IF NOT EXISTS payout_attempts (
     currency     TEXT NOT NULL,
     payee        JSONB NOT NULL,
     state        TEXT NOT NULL CHECK (state IN
-        ('unknown','failed','committed','resolved_committed','resolved_failed')),
+        ('unknown','failed','committed','resolved_committed','resolved_failed','pending_approval')),
     detail       TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS payout_attempts_state_idx ON payout_attempts (state);
+-- SPEC-W45 K20: existing deployments created the CHECK without
+-- 'pending_approval'. CREATE TABLE IF NOT EXISTS does not migrate them, so
+-- re-add the constraint with the widened state set (idempotent: DROP+ADD).
+ALTER TABLE payout_attempts DROP CONSTRAINT IF EXISTS payout_attempts_state_check;
+ALTER TABLE payout_attempts ADD CONSTRAINT payout_attempts_state_check
+    CHECK (state IN
+        ('unknown','failed','committed','resolved_committed','resolved_failed','pending_approval'));
 "#;
 
 pub struct PgPayoutAttemptStore {
@@ -535,6 +548,7 @@ mod tests {
             database_url: None,
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
+            payout_approval_threshold_cents: 0,
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -554,6 +568,7 @@ mod tests {
             ),
             payout_attempts: Arc::new(MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
+            transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),

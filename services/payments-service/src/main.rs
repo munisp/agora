@@ -14,6 +14,7 @@ mod mojaloop;
 mod payouts;
 mod registry;
 mod routes;
+mod transfers;
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +61,10 @@ pub struct AppState {
     /// provenance. Postgres when a DSN is configured; in-memory dev fallback
     /// otherwise (same lifecycle as `payout_attempts`).
     pub registry: Arc<dyn registry::Registry>,
+    /// SPEC-W45: durable rail-attempt records for /v1/transfers and the K12
+    /// refund rail (replay returns the ORIGINAL outcome). Same DSN posture
+    /// as `payout_attempts`.
+    pub transfer_attempts: Arc<dyn transfers::TransferAttemptStore>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
     /// GF11 error metric: commands dead-lettered after bounded retries.
@@ -209,6 +214,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(registry::MemRegistry::default())
         }
     };
+    // SPEC-W45: rail_attempts store for /v1/transfers + the K12 refund rail
+    // (same DSN posture as payout_attempts: fail-closed when configured,
+    // in-memory dev fallback otherwise).
+    let transfer_attempts: Arc<dyn transfers::TransferAttemptStore> = match &cfg.database_url {
+        Some(dsn) => Arc::new(transfers::PgTransferAttemptStore::connect_with_retry(dsn).await?),
+        None => {
+            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: rail_attempts store is                    in-memory (dev only — transfer/refund replay records are lost on restart)");
+            Arc::new(transfers::MemTransferAttemptStore::default())
+        }
+    };
+    if cfg.payout_approval_threshold_cents > 0 {
+        info!(
+            threshold_kobo = cfg.payout_approval_threshold_cents,
+            "K20: payouts above the threshold require POST /v1/payouts/:id/approve (owner role)"
+        );
+    }
     if cfg.internal_token.is_none() && !cfg.trust_direct_tenant {
         warn!("PAYMENTS_INTERNAL_TOKEN unset and OPENDESK_TRUST_DIRECT_TENANT off: money routes                fail closed (503) unless the gateway injects X-Tenant-Slugs (C1)");
     }
@@ -226,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         payout_attempts,
         registry,
+        transfer_attempts,
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
         commands_dead_lettered: Arc::new(AtomicU64::new(0)),
