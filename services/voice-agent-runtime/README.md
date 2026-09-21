@@ -31,12 +31,27 @@ The agent exposes exactly six tools: `get_business_info`, `get_availability`,
   (types `com.opendesk.booking.command.{BookAppointment,RescheduleAppointment,CancelAppointment}`,
   `subject` = tenant slug, `tenantid` ext = tenant UUID, the CloudEvent id is
   reused as `data.idempotency_key`).
-- **Phone-confirmation policy**: book/lookup/reschedule/cancel refuse without
+- **Phone-confirmation policy**: book_appointment refuses without
   a confirmed phone in session state. Server-enforced two-step: the first
   call with a new number returns `confirmation_required`; the model reads the
   number back, the caller confirms, and the repeated call with the same
   number proceeds. booking-service re-enforces the policy server-side
   (`ErrPhoneRequired`).
+- **Verified-session policy (SPEC-W45 K15(c))**: lookup/reschedule/cancel
+  additionally require a VERIFIED phone — read-back confirmation is not
+  enough. Verification is OTP via the booking customer portal
+  (`request_verification_code` → booking `POST /public/sites/{slug}/portal/request`
+  sends an SMS/email code → `verify_caller_code` → `.../portal/verify`), or a
+  channel-verified identity pinned by the messaging-gateway (WhatsApp wa_id,
+  internal-token-authorized). Fail-closed (`verification_unavailable`) when
+  `BOOKING_URL`/`VOICE_BOOKING_INTERNAL_TOKEN` are unset. The SIP
+  carrier-asserted pre-confirmation bypass is REMOVED (OOS-03): the caller ID
+  is a claimed/unverified hint only.
+- **Session resume (SPEC-W45 K15(b))**: each session is issued a
+  `session_secret` (uuid4) at creation, returned in every `/voice/chat`
+  response. Resuming a conversation requires `conversation_id` +
+  `session_secret`; a `conversation_id` alone always starts a FRESH session
+  (no confirmed/verified phone, history or escalation state leaks).
 - Conversation lifecycle events (`SessionStarted`, `SessionEnded`,
   `ToolInvoked`) are published to `opendesk.conversation.events` via Dapr.
 - Tenant context (terminology/timezone/currency/locale + catalog + knowledge
@@ -50,9 +65,39 @@ The agent exposes exactly six tools: `get_business_info`, `get_availability`,
 | Method | Path | Body | Description |
 |---|---|---|---|
 | GET | `/healthz` | — | liveness |
-| POST | `/voice/session` | `{site_slug, participant_name?}` | LiveKit access token (room `site-{slug}`) or ElevenLabs signed URL |
-| POST | `/voice/chat` | `{site_slug, message, conversation_id?}` | text-in/text-out through the same tool layer |
+| POST | `/voice/session` | `{site_slug, participant_name?}` | LiveKit access token (PER-SESSION unique room `site-{slug}-{uuid4hex}`, grant scoped to that room — K15(a)) or ElevenLabs signed URL |
+| POST | `/voice/chat` | `{site_slug, message, conversation_id?, session_secret?, channel?, channel_identity?}` | text-in/text-out through the same tool layer; resume requires `session_secret` (K15(b)); `channel_identity` (wa_id) honored only with a valid `X-Internal-Token` (K15(c)) |
 | POST | `/voice/elevenlabs/tools` | ElevenLabs tool webhook payload | only when `AGENT_BACKEND=elevenlabs` |
+| POST | `/voice-admin/voices/enroll` | `{name, sample_base64, tenant}` | XTTS brand-voice enrollment (K15(d): moved off `/voice/*`); guarded by `_require_admin_access` — see the **Admin-access guard (F-2)** note below |
+| POST | `/voice-admin/escalations/{conversation_id}/staff-token` | — | K15(e): on-demand staff join token for the escalation room (replaces publishing it on the events topic); same `_require_admin_access` guard |
+
+**Admin-access guard (SPEC-W45 K15(d)/(e), verifier F-2).** Both
+`/voice-admin/*` endpoints accept EITHER of two credentials (`401` when
+neither applies):
+
+1. **`X-Internal-Token` == `VOICE_ADMIN_INTERNAL_TOKEN`** — the
+   service-to-service path (e.g. messaging-gateway), compared in constant
+   time. Fail-closed `503` when the env is unset and no other auth applies.
+   The APISIX gateway strips client-supplied `x-internal-token` (global
+   rule 1), so only in-cluster callers can ever present it — this remains
+   the **strong path**.
+2. **`X-User-Roles` containing `staff`, `admin` or `platform-admin`** — the
+   human path via the APISIX `api-voice-admin` route
+   (`/api/voice-admin/*` → `/voice-admin/*`): OIDC `bearer_only` + a
+   staff-role gate + SPEC-W44 K1 injection of `X-User-Roles` from the
+   verified JWT. admin-web (`voices-client.tsx`, `bookings-client.tsx`)
+   calls these endpoints through the gateway; the gateway strips client
+   `X-Internal-Token` and injects nothing in its place, so a token-only
+   guard 401'd every staff call (defect F-2).
+
+> **TRUST-BOUNDARY WARNING (R1-adjacent residual):** path 2 trusts the
+> APISIX header boundary — global rule 1 strips any client-supplied
+> `x-user-roles` and the route re-injects the claim-derived value after
+> OIDC verification, so external clients cannot spoof it. An **in-cluster
+> caller that bypasses the gateway** (direct ClusterIP call) could still
+> spoof `X-User-Roles` absent a networkPolicy pinning this service's
+> ingress to APISIX. That residual is accepted for the human path; the
+> token path remains the strong path for anything sensitive.
 
 ## Backends
 
@@ -88,6 +133,10 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_AGENT_ID` | _(unset)_ | elevenlabs backend |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |
 | `PHONE_CONFIRMATION_REQUIRED` | `true` | phone-confirmation policy toggle |
+| `BOOKING_URL` | _(unset)_ | K15(c): booking-service base URL for the portal OTP endpoints (`/public/sites/{slug}/portal/request|verify`). Unset = verification unavailable, mutating tools fail closed |
+| `VOICE_BOOKING_INTERNAL_TOKEN` | _(unset)_ | K15(c): `X-Internal-Token` sent on the booking portal OTP calls (K2 pattern; must match booking-side internal token) |
+| `VOICE_ADMIN_INTERNAL_TOKEN` | _(unset)_ | K15(d)/(e) + F-2: `X-Internal-Token` half of the `/voice-admin/*` admin-access guard (enrollment, escalation staff-token mint; the other half is the gateway-injected staff-grade `X-User-Roles` — see the guard note above) and for channel-identity pinning on `/voice/chat`. Unset = 503 fail-closed on the token path when no other auth applies |
+| `PHONE_HASH_SALT` | _(unset)_ | K15(f): HMAC-SHA256 key for caller-phone hashes in ToolInvoked/capture_location events (W28 scheme: tenant-bound, digits-normalized). Unset = phone omitted from events entirely (never plaintext) |
 | `COPILOT_MODE` | `true` | whisper-copilot: post suggested replies to the escalation room data channel after `request_human` |
 | `PLUGIN_ALLOWED_HOSTS` | `booking,knowledge,identity` | SSRF allowlist for pack `customTools` |
 | `VOICEPRINTS` | `off` | consent gate for the voice-biometrics scaffold |
@@ -208,11 +257,20 @@ everything out of the box.
 ## Warm handoff & whisper-copilot (innovation 1)
 
 Tool `request_human(reason?)`: creates LiveKit room
-`escalation-{conversation_id}` via livekit-api, mints a staff join token and
-publishes `com.opendesk.conversation.EscalationRequested`
-(`{conversation_id, tenant_id, site_slug, room, join_token_staff, reason}`)
+`escalation-{conversation_id}` via livekit-api and publishes
+`com.opendesk.conversation.EscalationRequested`
+(`{conversation_id, tenant_id, site_slug, room, reason, staff_token_endpoint}`)
 to `opendesk.conversation.events` via Dapr — the dashboard listens for the
-banner. The caller hears a spoken confirmation. When LiveKit is unreachable
+banner. **SPEC-W45 K15(e): the staff join token is NO LONGER on the event**
+(the topic is fan-out — any consumer could hijack the room and listen to the
+caller). Staff mint a token on demand via the internal
+`POST /voice-admin/escalations/{conversation_id}/staff-token` endpoint
+(`X-Internal-Token`, or the gateway-injected staff-grade `X-User-Roles` —
+the admin-web bookings-client calls it via `/api/voice-admin/*`, F-2), or
+receive it in-room via a targeted LiveKit data
+message (`LiveKitEscalation.deliver_staff_token`,
+`destination_identities=[staff]`) — staff participant only. The caller hears
+a spoken confirmation. When LiveKit is unreachable
 the event still goes out and the caller flow is unaffected. Afterwards,
 whisper-copilot mode (`COPILOT_MODE=true`) keeps the agent engaged: every
 reply is also posted as a `copilot_suggestion` to the escalation room's
@@ -264,8 +322,11 @@ number (`call-{number}`). `app/sip.py` detects `call-*` rooms / SIP
 participants, resolves the tenant from the dialed number
 (`TENANT_PHONE_MAP`, dev-mode static JSON; production = `phone_numbers`
 table), and attaches the carrier-asserted caller ID as the session's
-confirmed phone — the two-step read-back confirmation is bypassed for SIP
-calls only (policy documented in `app/sip.py`). Provisioning:
+CLAIMED (unverified) phone — a prompt hint and the emergency
+location-capture contact key. **SPEC-W45 K15(c): the carrier-asserted
+pre-confirmation bypass is REMOVED (OOS-03)** — caller ID is spoofable, so
+SIP callers face the same OTP verification gate as every other channel
+before any booking lookup/change. Provisioning:
 `deploy/livekit-sip/setup.sh` + docs/telephony.md.
 
 ## Agents registry & agent definitions (SPEC-W38)

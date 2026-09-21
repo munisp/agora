@@ -122,6 +122,39 @@ class Settings:
     # Phone-confirmation policy
     phone_confirmation_required: bool = True
 
+    # SPEC-W45 K15(c) caller verification (OTP): mutating tools
+    # (lookup/reschedule/cancel) require a VERIFIED session. Verification
+    # goes through the booking customer-portal magic-code endpoints
+    # (POST {BOOKING_URL}/public/sites/{slug}/portal/request + /portal/verify)
+    # with X-Internal-Token (VOICE_BOOKING_INTERNAL_TOKEN, K2 pattern).
+    # FAIL-CLOSED: when either is unset the verification tools answer
+    # "verification_unavailable" (honest 503-equivalent on the tool path)
+    # and the mutating tools refuse — no fallback to self-asserted numbers.
+    booking_url: str = ""
+    voice_booking_internal_token: str = ""
+
+    # SPEC-W45 K15(d) + verifier F-2: /voice-admin/* staff paths
+    # (brand-voice enrollment, escalation staff-token mint) are guarded by
+    # _require_admin_access — EITHER X-Internal-Token matching
+    # VOICE_ADMIN_INTERNAL_TOKEN (constant-time; 503 fail-closed when unset
+    # and no other auth applies, 401 on mismatch) OR the gateway-injected
+    # X-User-Roles carrying staff|admin|platform-admin (APISIX
+    # api-voice-admin route: OIDC + role gate + K1 header injection; the
+    # gateway strips client-supplied x-internal-token AND x-user-roles, so
+    # only in-cluster callers can present the token and only the gateway
+    # can mint the role header — see control_plane for the trust-boundary
+    # caveat). The same token also authorizes channel-identity pinning on
+    # /voice/chat (K15(c): the messaging-gateway asserts provider-verified
+    # identities such as the WhatsApp wa_id).
+    voice_admin_internal_token: str = ""
+
+    # SPEC-W45 K15(f): HMAC-SHA256 key for hashing caller phone numbers in
+    # ToolInvoked / capture_location events (W28 scheme: tenant-bound,
+    # digits-normalized; graph-sync graph.PhoneHash family). Empty = the
+    # phone is OMITTED from events entirely (never emitted in plaintext,
+    # warning logged).
+    phone_hash_salt: str = ""
+
     # Warm handoff / whisper-copilot (SPEC-W3 §4, innovation 1): after an
     # escalation the agent keeps drafting suggested replies into the
     # escalation room data channel.
@@ -249,6 +282,10 @@ def load_settings() -> Settings:
         tool_ack_grace_ms=_env_int("TOOL_ACK_GRACE_MS", 400),
         phone_confirmation_required=_env("PHONE_CONFIRMATION_REQUIRED", "true").lower()
         not in ("0", "false", "no"),
+        booking_url=_env("BOOKING_URL", ""),
+        voice_booking_internal_token=_env("VOICE_BOOKING_INTERNAL_TOKEN", ""),
+        voice_admin_internal_token=_env("VOICE_ADMIN_INTERNAL_TOKEN", ""),
+        phone_hash_salt=_env("PHONE_HASH_SALT", ""),
         copilot_mode=_env("COPILOT_MODE", "true").lower() not in ("0", "false", "no"),
         plugin_allowed_hosts=_env(
             "PLUGIN_ALLOWED_HOSTS", "booking,knowledge,identity"
