@@ -54,6 +54,13 @@ pub struct Config {
     /// (`MONEY_ROLES`, comma-separated, default "owner,admin"). Compared
     /// case-insensitively against the gateway-injected `X-User-Roles`.
     pub money_roles: Vec<String>,
+    /// SPEC-W45 K20: payout approval threshold in minor units (kobo for NGN;
+    /// env `PAYOUT_APPROVAL_THRESHOLD_KOBO`). DEFAULT 0 = DISABLED (every
+    /// payout dispatches to the rail immediately, the pre-K20 behavior). When
+    /// > 0, a payout whose amount is STRICTLY ABOVE the threshold is reserved
+    /// ledger-first and parked in `pending_approval` until an
+    /// owner-role caller approves it via POST /v1/payouts/{id}/approve.
+    pub payout_approval_threshold_cents: u64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -159,6 +166,7 @@ impl Config {
                 .find_map(|k| std::env::var(k).ok().filter(|s| !s.trim().is_empty())),
             payout_reconciler_interval_secs: env_parse("PAYOUT_RECONCILER_INTERVAL_SECS", 30),
             money_roles: parse_roles(&env_or("MONEY_ROLES", "owner,admin")),
+            payout_approval_threshold_cents: env_parse("PAYOUT_APPROVAL_THRESHOLD_KOBO", 0),
         })
     }
 
@@ -286,6 +294,26 @@ mod tests {
             "error should name the variable and value: {err}"
         );
         std::env::remove_var("PLATFORM_FEE_BPS");
+        clear_posture_env();
+    }
+
+    // ------------------------------------------------------------------
+    // K20: PAYOUT_APPROVAL_THRESHOLD_KOBO — default 0 (disabled).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn payout_approval_threshold_defaults_to_disabled() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::set_var("LEDGER_IMPL", "sim");
+        std::env::set_var("MOJALOOP_ALLOW_SIM", "true");
+        std::env::remove_var("PAYOUT_APPROVAL_THRESHOLD_KOBO");
+        let cfg = Config::from_env().expect("loads");
+        assert_eq!(cfg.payout_approval_threshold_cents, 0, "default = disabled");
+        std::env::set_var("PAYOUT_APPROVAL_THRESHOLD_KOBO", "500000");
+        let cfg = Config::from_env().expect("loads");
+        assert_eq!(cfg.payout_approval_threshold_cents, 500_000);
+        std::env::remove_var("PAYOUT_APPROVAL_THRESHOLD_KOBO");
         clear_posture_env();
     }
 
