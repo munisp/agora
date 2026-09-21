@@ -457,6 +457,7 @@ mod tests {
             database_url: None,
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
+            payout_approval_threshold_cents: 0,
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -476,6 +477,7 @@ mod tests {
             ),
             payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
+            transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),
