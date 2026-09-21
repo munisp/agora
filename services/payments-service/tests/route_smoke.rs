@@ -458,7 +458,7 @@ async fn money_endpoints_require_idempotency_key() {
     // empty string key is also rejected
     let r = http
         .post(format!("{base}/v1/deposits"))
-        .json(&serde_json::json!({"tenant_id": "t-k", "amount_cents": 100, "currency": "NGN", "idempotency_key": "  "))
+        .json(&serde_json::json!({"tenant_id": "t-k", "amount_cents": 100, "currency": "NGN", "idempotency_key": "  "}))
         .send().await.unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "blank key");
 }
