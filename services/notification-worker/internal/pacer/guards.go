@@ -378,6 +378,3 @@ func (g *Guards) SuppressedStats() map[string]uint64 {
 	}
 	return out
 }
-
-// Config returns the guard configuration (boot logging).
-func (g *Guards) Config() GuardConfig { return g.cfg }
