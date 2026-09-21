@@ -629,13 +629,30 @@ async def test_tts_preview_errors(monkeypatch):
     assert resp.status_code == 422
 
 
+# ---------------------------------------------------------------------------
+# SPEC-W45 K15(d) + verifier F-2: enrollment lives behind /voice-admin/*,
+# guarded by _require_admin_access (X-Internal-Token OR gateway-injected
+# staff-grade X-User-Roles).
+# ---------------------------------------------------------------------------
+ENROLL_PATH = "/voice-admin/voices/enroll"
+ENROLL_SETTINGS = Settings(voice_admin_internal_token="adm-tok")
+ENROLL_HEADERS = {"X-Internal-Token": "adm-tok"}
+
+
+async def _post_enroll(app, payload: dict, headers: dict | None = None) -> httpx.Response:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        return await client.post(ENROLL_PATH, json=payload, headers=headers or {})
+
+
 async def test_enroll_requires_xtts(monkeypatch):
     chain = _FakeChain({"piper": FakeProvider("piper")})
-    app = _app(monkeypatch, chain)
-    resp = await _post(
+    app = _app(monkeypatch, chain, ENROLL_SETTINGS)
+    resp = await _post_enroll(
         app,
-        "/voice/voices/enroll",
         {"name": "Acme", "sample_base64": "QUJD", "tenant": "acme"},
+        ENROLL_HEADERS,
     )
     assert resp.status_code == 400
     assert "xtts" in resp.json()["detail"]
@@ -653,23 +670,84 @@ async def test_enroll_happy_path_and_base64_guard(monkeypatch):
 
     xtts = FakeXtts()
     chain = _FakeChain({"xtts": xtts, "piper": FakeProvider("piper")})
-    app = _app(monkeypatch, chain)
+    app = _app(monkeypatch, chain, ENROLL_SETTINGS)
 
-    resp = await _post(
+    resp = await _post_enroll(
         app,
-        "/voice/voices/enroll",
         {"name": "Acme", "sample_base64": "not base64!!", "tenant": "acme"},
+        ENROLL_HEADERS,
     )
     assert resp.status_code == 400
 
-    resp = await _post(
+    resp = await _post_enroll(
         app,
-        "/voice/voices/enroll",
         {"name": "Acme", "sample_base64": "QUJD", "tenant": "acme"},
+        ENROLL_HEADERS,
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"voice_id": "voice-42"}
     assert xtts.enrolled == [("Acme", "QUJD")]
+
+
+async def test_enroll_auth_matrix(monkeypatch):
+    """K15(d) guard: 503 fail-closed when VOICE_ADMIN_INTERNAL_TOKEN is
+    unset, 401 when missing/wrong, and the old public path is gone (404)."""
+    chain = _FakeChain({"piper": FakeProvider("piper")})
+    payload = {"name": "Acme", "sample_base64": "QUJD", "tenant": "acme"}
+
+    # Unset token -> fail closed 503 (even with a header present).
+    app = _app(monkeypatch, chain, Settings())
+    resp = await _post_enroll(app, payload, {"X-Internal-Token": "whatever"})
+    assert resp.status_code == 503
+
+    # Configured: missing token -> 401; wrong token -> 401.
+    app = _app(monkeypatch, chain, ENROLL_SETTINGS)
+    resp = await _post_enroll(app, payload)
+    assert resp.status_code == 401
+    resp = await _post_enroll(app, payload, {"X-Internal-Token": "wrong"})
+    assert resp.status_code == 401
+
+    # The legacy public path no longer exists.
+    resp = await _post(app, "/voice/voices/enroll", payload)
+    assert resp.status_code == 404
+
+
+async def test_enroll_gateway_role_path(monkeypatch):
+    """Verifier F-2: the APISIX api-voice-admin route authenticates staff
+    via OIDC + a staff|admin|platform-admin role gate and injects
+    X-User-Roles from the verified JWT (SPEC-W44 K1). The gateway strips
+    client X-Internal-Token, so the service MUST accept the role header —
+    otherwise every human (admin-web voices-client) call 401s."""
+
+    class FakeXtts(FakeProvider):
+        async def enroll_voice(self, name, sample_base64):
+            return "voice-gw"
+
+    chain = _FakeChain({"xtts": FakeXtts("xtts")})
+    payload = {"name": "Acme", "sample_base64": "QUJD", "tenant": "acme"}
+
+    # staff / admin / platform-admin gateway roles -> 200.
+    app = _app(monkeypatch, chain, ENROLL_SETTINGS)
+    for role in ("staff", "admin", "platform-admin"):
+        resp = await _post_enroll(app, payload, {"X-User-Roles": role})
+        assert resp.status_code == 200, (role, resp.text)
+        assert resp.json() == {"voice_id": "voice-gw"}
+
+    # CSV roles tolerate whitespace/case and non-qualifying noise.
+    resp = await _post_enroll(app, payload, {"X-User-Roles": "viewer, Admin"})
+    assert resp.status_code == 200
+
+    # viewer-only role -> 401 (not a staff-grade role).
+    resp = await _post_enroll(app, payload, {"X-User-Roles": "viewer"})
+    assert resp.status_code == 401
+
+    # The human path must NOT depend on the token being configured…
+    app_unset = _app(monkeypatch, chain, Settings())
+    resp = await _post_enroll(app_unset, payload, {"X-User-Roles": "staff"})
+    assert resp.status_code == 200
+    # …but unset token + no authorizing header still fails closed 503.
+    resp = await _post_enroll(app_unset, payload)
+    assert resp.status_code == 503
 
 
 def test_metrics_series_registered():
