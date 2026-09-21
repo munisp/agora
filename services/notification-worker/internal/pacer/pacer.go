@@ -149,9 +149,6 @@ func NewWithClient(cfg Config, rdb RedisClient, log *zap.Logger) *Pacer {
 	return p
 }
 
-// Numbers reports the configured sender rotation pool.
-func (p *Pacer) Numbers() []string { return p.cfg.FromNumbers }
-
 // Wait blocks until the token bucket grants one outbound start or ctx is
 // cancelled. With the redis backend it acquires from the fleet-wide bucket;
 // on any redis error it logs once and falls back to the local limiter
