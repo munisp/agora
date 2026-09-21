@@ -18,20 +18,17 @@ flow:
 2. Caller identity: the SIP caller ID is extracted from the LiveKit SIP
    participant (attributes ``sip.phoneNumber`` / identity ``sip_<from>``,
    falling back to the room name) and attached to session state as the
-   *confirmed* phone.
+   *claimed* (unverified) phone — a prompt hint and the emergency
+   location-capture contact key.
 
-POLICY — caller-ID confirmation bypass: the phone-confirmation policy
-(session_state.require_confirmed_phone) exists because in web chat the
-caller types their own number and a mis-heard number must be read back.
-On the PSTN the calling number is asserted by the carrier in the SIP
-``From``/``P-Asserted-Identity`` headers and delivered by LiveKit as the
-participant's authenticated phone attribute — reading it back adds a turn
-without adding assurance. SIP sessions therefore start with
-``confirmed_phone`` already set (carrier-asserted). The bypass is scoped to
-SIP-originated sessions only; the web/chat path keeps the two-step
-confirmation. Disable with ``PHONE_CONFIRMATION_REQUIRED=false`` semantics
-unchanged — a missing/anonymous caller ID simply means no pre-confirmed
-phone and the normal two-step flow applies.
+POLICY — SPEC-W45 K15(c) / OOS-03: the carrier-asserted pre-confirmation
+bypass is REMOVED. Caller ID is spoofable and is NOT proof of possession,
+so SIP sessions no longer start with ``confirmed_phone`` set: the caller
+ID lands in ``session.claimed_phone`` (unverified) and the mutating tools
+(lookup/reschedule/cancel) require the same OTP verification
+(app/verification.py) as every other channel. ``book_appointment`` keeps
+the two-step read-back confirmation; ``capture_location`` may key on the
+claimed number (safety write, not a data read).
 
 This module is deliberately free of livekit imports (duck-typed
 participants) so it stays unit-testable without the server SDK.
@@ -252,15 +249,17 @@ async def resolve_agent_for_dialed(
 
 
 def attach_caller_id(session: SessionState, caller_phone: str) -> bool:
-    """POLICY (see module docstring): the SIP caller ID is carrier-asserted,
-    so it enters the session as the *confirmed* phone, bypassing the two-step
-    read-back. Returns True when a phone was attached. Anonymous/withheld
-    caller IDs leave the session untouched (normal confirmation applies)."""
+    """Attach the SIP caller ID as the session's CLAIMED (unverified) phone.
+
+    POLICY (see module docstring): SPEC-W45 K15(c) removed the
+    carrier-asserted pre-confirmation bypass — the caller ID is a prompt
+    hint / emergency location-capture key ONLY and never authorizes the
+    mutating tools. Returns True when a phone was attached.
+    Anonymous/withheld caller IDs leave the session untouched."""
     phone = normalize_phone(caller_phone)
     if not phone:
         return False
-    session.confirmed_phone = phone
-    session.pending_phone = None
+    session.claimed_phone = phone
     session.touch()
     return True
 
@@ -290,8 +289,8 @@ def bootstrap_inbound_call(
     if session is not None:
         attached = attach_caller_id(session, ctx.caller_phone)
         log.info(
-            "sip caller id attached",
-            confirmed=attached,
+            "sip caller id attached (claimed, unverified)",
+            attached=attached,
             caller=ctx.caller_phone or "<anonymous>",
         )
     log.info(
@@ -316,7 +315,8 @@ async def bootstrap_inbound_call_async(
     resolution via resolve_agent_for_dialed (agents registry, fail-open to
     the legacy TENANT_PHONE_MAP/SIP_DEFAULT_SITE path). The resolved agent
     record (when any) rides on ``ctx.agent_record`` for the worker to merge
-    its definition; caller-ID handling is unchanged."""
+    its definition; caller-ID handling is identical (claimed, unverified —
+    K15(c))."""
     caller, dialed, attrs = extract_call_info(room_name, participants)
     site_slug, source, record = await resolve_agent_for_dialed(
         settings, dialed, registry=registry
@@ -332,8 +332,8 @@ async def bootstrap_inbound_call_async(
     if session is not None:
         attached = attach_caller_id(session, ctx.caller_phone)
         log.info(
-            "sip caller id attached",
-            confirmed=attached,
+            "sip caller id attached (claimed, unverified)",
+            attached=attached,
             caller=ctx.caller_phone or "<anonymous>",
         )
     log.info(
