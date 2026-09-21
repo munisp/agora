@@ -9,8 +9,18 @@ lookup_appointment, reschedule_appointment, cancel_appointment.
 - Mutating tools publish CloudEvents commands to Kafka topic
   `opendesk.booking.commands` via Dapr pubsub component `pubsub-kafka`;
   the CloudEvent id is reused as the idempotency key (`data.idempotency_key`).
-- Phone-confirmation policy (SPEC §1/§11): book/lookup/reschedule/cancel
-  refuse without a confirmed phone in session state (see session_state.py).
+- Phone-confirmation policy (SPEC §1/§11): book_appointment refuses without
+  a confirmed phone in session state (see session_state.py).
+- SPEC-W45 K15(c): lookup/reschedule/cancel additionally require a VERIFIED
+  session — OTP via the booking customer portal (request_verification_code
+  -> verify_caller_code) or a channel-pinned identity (WhatsApp wa_id).
+  Fail-closed (verification_unavailable) when BOOKING_URL /
+  VOICE_BOOKING_INTERNAL_TOKEN are unset; the SIP carrier-asserted bypass
+  is removed (OOS-03).
+- SPEC-W45 K15(e): the escalation staff LiveKit token never rides the
+  events topic (internal mint endpoint / targeted in-room delivery).
+- SPEC-W45 K15(f): caller phones in ToolInvoked/capture_location events
+  are HMAC-hashed (PHONE_HASH_SALT, W28 scheme) or omitted.
 """
 
 from __future__ import annotations
@@ -19,7 +29,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from . import metrics, ui_actions
+from . import metrics, sip, ui_actions
 from .config import Settings
 from .dapr_client import DaprClient
 from .escalation import LiveKitEscalation, escalation_room_name
@@ -28,6 +38,7 @@ from .logging import get_logger
 from .plugin_tools import PluginTool
 from .session_state import PhoneConfirmationRequired, SessionState
 from .tenant_context import TenantContext
+from .verification import BookingPortalVerifier, hash_phone
 
 log = get_logger("tools")
 
@@ -127,6 +138,49 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "reason": {"type": "string"},
                 },
                 "required": ["booking_id", "phone"],
+            },
+        },
+    },
+    # SPEC-W45 K15(c): caller verification (OTP). The agent sends a
+    # one-time code to the caller's phone via the booking customer portal,
+    # then verifies the code the caller reads back. Only a session verified
+    # this way (or via a channel-pinned identity) may run the mutating
+    # tools (lookup/reschedule/cancel).
+    {
+        "type": "function",
+        "function": {
+            "name": "request_verification_code",
+            "description": (
+                "Send a one-time verification code to the caller's phone "
+                "number (SMS/email via the booking portal). REQUIRED before "
+                "looking up, rescheduling or cancelling an existing booking. "
+                "After calling this, ask the caller to read you the code and "
+                "submit it with verify_caller_code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone": {"type": "string", "description": "Caller phone number"},
+                },
+                "required": ["phone"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_caller_code",
+            "description": (
+                "Verify the one-time code the caller read back. On success "
+                "the session is verified and lookup/reschedule/cancel may run."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone": {"type": "string", "description": "Caller phone number"},
+                    "code": {"type": "string", "description": "One-time code read back by the caller"},
+                },
+                "required": ["phone", "code"],
             },
         },
     },
@@ -262,6 +316,37 @@ def _confirmation_payload(pending_phone: str) -> dict[str, Any]:
     }
 
 
+def _verification_required_payload() -> dict[str, Any]:
+    """K15(c): mutating tools refuse unverified sessions — the agent must
+    drive the OTP flow (request_verification_code -> verify_caller_code)."""
+    return {
+        "status": "verification_required",
+        "message": (
+            "For the caller's security, this phone number must be verified "
+            "before bookings can be looked up or changed. Call "
+            "request_verification_code with the caller's number to send a "
+            "one-time code, ask the caller to read it back, then submit it "
+            "with verify_caller_code."
+        ),
+    }
+
+
+def _verification_unavailable_payload() -> dict[str, Any]:
+    """Honest degrade (503-equivalent on the tool path): verification is
+    not configured (BOOKING_URL / VOICE_BOOKING_INTERNAL_TOKEN unset), so
+    NO session can be verified and mutating tools must refuse rather than
+    fall back to self-asserted numbers."""
+    return {
+        "status": "error",
+        "error": "verification_unavailable",
+        "message": (
+            "Phone verification is temporarily unavailable, so I can't look "
+            "up or change existing bookings right now. Please try again "
+            "later or contact the business directly."
+        ),
+    }
+
+
 class ToolLayer:
     """Implements the six tools against Dapr. One instance per session."""
 
@@ -275,6 +360,7 @@ class ToolLayer:
         escalation: LiveKitEscalation | None = None,
         plugin_tools: list[PluginTool] | None = None,
         ui_action_sink: list[dict[str, Any]] | None = None,
+        verifier_factory: "Any | None" = None,
     ) -> None:
         self._dapr = dapr
         self._settings = settings
@@ -282,6 +368,10 @@ class ToolLayer:
         self._session = session
         self._escalation = escalation or LiveKitEscalation(settings)
         self._plugin_tools = {t.name: t for t in (plugin_tools or [])}
+        # Injectable BookingPortalVerifier factory (tests; same pattern as
+        # the injectable agents-registry client in app/sip.py). None = the
+        # real client built from settings on every OTP call.
+        self._verifier_factory = verifier_factory
         # SPEC-W9 Part B: per-turn collector for validated UI actions. The
         # chat path injects a fresh list per turn; other callers (voice
         # worker, ElevenLabs) get a private one that is simply never read —
@@ -344,6 +434,79 @@ class ToolLayer:
         if not self._settings.phone_confirmation_required:
             return (phone or self._session.confirmed_phone or "").strip()
         return self._session.require_confirmed_phone(phone)
+
+    # ------------------------------------------------------ K15(c) OTP gate
+    def _verifier(self) -> BookingPortalVerifier:
+        if self._verifier_factory is not None:
+            return self._verifier_factory()
+        return BookingPortalVerifier(
+            base_url=self._settings.booking_url,
+            internal_token=self._settings.voice_booking_internal_token,
+            site_slug=self._ctx.site_slug,
+            timeout_s=self._settings.http_timeout_s,
+        )
+
+    def _require_verified(self, phone: str | None) -> str | dict[str, Any]:
+        """K15(c): mutating tools (lookup/reschedule/cancel) require a
+        VERIFIED session (OTP or channel-pinned identity).
+
+        Returns the verified phone to use for the operation, or the refusal
+        payload to hand back to the model. The verified number ALWAYS wins
+        over a model-supplied one; a mismatch is rejected (no silent
+        re-targeting at another customer's bookings)."""
+        verified = self._session.verified_phone
+        if not verified:
+            if not (
+                self._settings.booking_url
+                and self._settings.voice_booking_internal_token
+            ):
+                log.error(
+                    "mutating tool refused: caller verification not "
+                    "configured (BOOKING_URL / VOICE_BOOKING_INTERNAL_TOKEN "
+                    "unset) — failing closed"
+                )
+                return _verification_unavailable_payload()
+            return _verification_required_payload()
+        supplied = sip.normalize_phone(phone)
+        if supplied and supplied != verified:
+            return {
+                "status": "error",
+                "error": "phone_mismatch",
+                "message": (
+                    "That number does not match the verified caller number "
+                    "for this session. Use the verified number, or verify "
+                    "the new number first."
+                ),
+            }
+        return verified
+
+    async def _refuse_gate(self, tool: str, gate: dict[str, Any]) -> dict[str, Any]:
+        """Emit the ToolInvoked event for a verification-gate refusal and
+        return the refusal payload to the model."""
+        if gate.get("error") == "verification_unavailable":
+            status = "verification_unavailable"
+        elif gate.get("error") == "phone_mismatch":
+            status = "phone_mismatch"
+        else:
+            status = "verification_required"
+        await self._emit_tool_event(tool, status, {})
+        return gate
+
+    def _event_phone_detail(self, phone: str) -> dict[str, Any]:
+        """K15(f): phone detail for ToolInvoked/capture_location events —
+        HMAC-hashed (W28 scheme) when PHONE_HASH_SALT is set, OMITTED
+        entirely otherwise (never plaintext)."""
+        if not self._settings.phone_hash_salt:
+            log.warning(
+                "PHONE_HASH_SALT unset — omitting caller phone from event "
+                "payload (fail closed, no plaintext)"
+            )
+            return {}
+        return {
+            "phone_hash": hash_phone(
+                self._settings.phone_hash_salt, self._ctx.tenant_id, phone
+            )
+        }
 
     async def _publish_command(self, type_: str, data: dict[str, Any]) -> str:
         """Publish a booking command; returns the CloudEvent id (idempotency key)."""
@@ -455,12 +618,114 @@ class ToolLayer:
             "starts_at": starts_at,
         }
 
-    async def lookup_appointment(self, phone: str) -> dict[str, Any]:
+    # ------------------------------------------- K15(c) verification tools
+    async def request_verification_code(self, phone: str) -> dict[str, Any]:
+        """Send a one-time verification code to the claimed caller phone."""
+        phone = sip.normalize_phone(phone)
+        if not phone:
+            return {
+                "status": "error",
+                "message": "request_verification_code needs the caller's phone number.",
+            }
+        verifier = self._verifier()
         try:
-            confirmed = self._require_phone(phone)
-        except PhoneConfirmationRequired as pcr:
-            await self._emit_tool_event("lookup_appointment", "confirmation_required", {})
-            return _confirmation_payload(pcr.pending_phone)
+            result = await verifier.request_code(phone)
+        finally:
+            await verifier.aclose()
+        await self._emit_tool_event(
+            "request_verification_code",
+            result.status,
+            self._event_phone_detail(phone),
+        )
+        if result.ok:
+            return {
+                "status": "code_sent",
+                "message": (
+                    "I've sent a one-time verification code to the number "
+                    f"ending in {phone[-4:]}. Ask the caller to read it back "
+                    "and submit it with verify_caller_code."
+                ),
+            }
+        if result.status == "unavailable":
+            return _verification_unavailable_payload()
+        if result.status == "rate_limited":
+            return {
+                "status": "error",
+                "error": "rate_limited",
+                "message": (
+                    "Too many verification codes were requested for this "
+                    "number. Ask the caller to wait a moment and try again."
+                ),
+            }
+        return {
+            "status": "error",
+            "message": (
+                "The verification code could not be sent just now; please "
+                "try again in a moment."
+            ),
+        }
+
+    async def verify_caller_code(self, phone: str, code: str) -> dict[str, Any]:
+        """Verify the caller-read-back code; success marks the session
+        verified (K15(c)) so lookup/reschedule/cancel may run."""
+        phone = sip.normalize_phone(phone)
+        if not phone:
+            return {
+                "status": "error",
+                "message": "verify_caller_code needs the caller's phone number.",
+            }
+        verifier = self._verifier()
+        try:
+            result = await verifier.verify_code(phone, code)
+        finally:
+            await verifier.aclose()
+        if result.ok:
+            self._session.mark_verified(phone)
+            await self._emit_tool_event(
+                "verify_caller_code", "verified", self._event_phone_detail(phone)
+            )
+            log.info(
+                "caller phone verified",
+                conversation_id=self._session.conversation_id,
+                channel=self._session.channel,
+            )
+            return {
+                "status": "verified",
+                "message": (
+                    "Thank you — the number is verified. You may now look "
+                    "up, reschedule or cancel the caller's bookings."
+                ),
+            }
+        await self._emit_tool_event("verify_caller_code", result.status, {})
+        if result.status == "unavailable":
+            return _verification_unavailable_payload()
+        if result.status == "rate_limited":
+            return {
+                "status": "error",
+                "error": "rate_limited",
+                "message": (
+                    "Too many failed attempts. Ask the caller to request a "
+                    "new code with request_verification_code."
+                ),
+            }
+        if result.status == "invalid_code":
+            return {
+                "status": "invalid_code",
+                "message": (
+                    "That code didn't match. Ask the caller to double-check "
+                    "the code and try again, or send a new one."
+                ),
+            }
+        return {
+            "status": "error",
+            "message": "The code could not be verified just now; please try again.",
+        }
+
+    async def lookup_appointment(self, phone: str) -> dict[str, Any]:
+        gate = self._require_verified(phone)
+        if isinstance(gate, dict):
+            return await self._refuse_gate("lookup_appointment", gate)
+        confirmed = gate
 
         now = datetime.now(timezone.utc)
         resp = await self._dapr.invoke_get(
@@ -486,11 +751,10 @@ class ToolLayer:
     async def reschedule_appointment(
         self, booking_id: str, starts_at: str, phone: str
     ) -> dict[str, Any]:
-        try:
-            confirmed = self._require_phone(phone)
-        except PhoneConfirmationRequired as pcr:
-            await self._emit_tool_event("reschedule_appointment", "confirmation_required", {})
-            return _confirmation_payload(pcr.pending_phone)
+        gate = self._require_verified(phone)
+        if isinstance(gate, dict):
+            return await self._refuse_gate("reschedule_appointment", gate)
+        confirmed = gate
 
         event_id = await self._publish_command(
             RESCHEDULE,
@@ -516,11 +780,10 @@ class ToolLayer:
     async def cancel_appointment(
         self, booking_id: str, phone: str, reason: str | None = None
     ) -> dict[str, Any]:
-        try:
-            confirmed = self._require_phone(phone)
-        except PhoneConfirmationRequired as pcr:
-            await self._emit_tool_event("cancel_appointment", "confirmation_required", {})
-            return _confirmation_payload(pcr.pending_phone)
+        gate = self._require_verified(phone)
+        if isinstance(gate, dict):
+            return await self._refuse_gate("cancel_appointment", gate)
+        confirmed = gate
 
         event_id = await self._publish_command(
             CANCEL,
@@ -551,13 +814,17 @@ class ToolLayer:
     ) -> dict[str, Any]:
         """Save the caller's location on their contact record (SPEC-W11 C §4).
 
-        Contact resolution follows the SIP caller-ID pattern: the session's
-        confirmed phone (carrier-asserted for PSTN calls, app/sip.py) selects
-        the contact via booking-service ``GET /internal/contacts?phone=``;
-        the location is then upserted through the Wave-8 contract
-        ``PUT /v1/contacts/{id}/location`` with ``{lat, lng}`` when
-        coordinates were given, else ``{address: address_text}`` (server-side
-        geocoding per GEOCODE_ENABLED).
+        Contact resolution: the session's confirmed phone (read-back
+        confirmed or OTP/channel verified) selects the contact via
+        booking-service ``GET /internal/contacts?phone=``; when no phone is
+        confirmed the channel-ASSERTED (unverified) claimed phone is used —
+        location capture is a safety-critical WRITE for the emergency lane,
+        never a data read, and K15(c) removed the carrier-asserted bypass
+        only for the mutating tools. The location is then upserted through
+        the Wave-8 contract ``PUT /v1/contacts/{id}/location`` with
+        ``{lat, lng}`` when coordinates were given, else
+        ``{address: address_text}`` (server-side geocoding per
+        GEOCODE_ENABLED).
 
         NEVER raises: every failure resolves to an error payload the model
         can speak (the emergency flow must not break the call).
@@ -581,12 +848,14 @@ class ToolLayer:
                     ),
                 }
 
-            phone = (self._session.confirmed_phone or "").strip()
+            phone = (
+                self._session.confirmed_phone or self._session.claimed_phone or ""
+            ).strip()
             if not phone:
                 return {
                     "status": "error",
                     "message": (
-                        "No caller phone number is confirmed for this "
+                        "No caller phone number is known for this "
                         "session, so the location cannot be attached to a "
                         "contact. Ask the caller for their number first."
                     ),
@@ -601,8 +870,9 @@ class ToolLayer:
             )
             contact_id = str((contact or {}).get("id") or "").strip()
             if not contact_id:
+                # K15(f): hashed (or omitted) — never the plaintext number.
                 await self._emit_tool_event(
-                    "capture_location", "no_contact", {"phone": phone}
+                    "capture_location", "no_contact", self._event_phone_detail(phone)
                 )
                 return {
                     "status": "error",
@@ -652,15 +922,24 @@ class ToolLayer:
     async def request_human(self, reason: str | None = None) -> dict[str, Any]:
         """Escalate to a human operator (SPEC-W3 §4, innovation 1).
 
-        Creates LiveKit room ``escalation-{conversation_id}``, mints a staff
-        join token and publishes an EscalationRequested CloudEvent to
-        ``opendesk.conversation.events``. Degrades gracefully when LiveKit
-        is unreachable: the event still goes out (staff see the banner) and
-        the caller still gets a spoken confirmation.
+        Creates LiveKit room ``escalation-{conversation_id}`` and publishes
+        an EscalationRequested CloudEvent to ``opendesk.conversation.events``.
+
+        SPEC-W45 K15(e): the staff LiveKit join token is NO LONGER on the
+        event (the events topic is fan-out — any consumer could hijack the
+        escalation room and listen to the caller). The event carries the
+        room name only; the staff token is delivered to the staff
+        participant only, either minted on demand via the internal
+        ``POST /voice-admin/escalations/{conversation_id}/staff-token``
+        endpoint (X-Internal-Token, app/control_plane.py) or pushed in-room
+        via targeted LiveKit data (LiveKitEscalation.deliver_staff_token).
+
+        Degrades gracefully when LiveKit is unreachable: the event still
+        goes out (staff see the banner) and the caller still gets a spoken
+        confirmation.
         """
         room = escalation_room_name(self._session.conversation_id)
         room_created = await self._escalation.create_room(room)
-        join_token_staff = self._escalation.staff_join_token(room)
 
         self._session.escalation_room = room
         self._session.touch()
@@ -674,8 +953,12 @@ class ToolLayer:
                 "tenant_id": self._ctx.tenant_id,
                 "site_slug": self._ctx.site_slug,
                 "room": room,
-                "join_token_staff": join_token_staff,
                 "reason": reason or "caller_requested",
+                # K15(e): staff join via the internal staff-token endpoint.
+                "staff_token_endpoint": (
+                    f"/voice-admin/escalations/{self._session.conversation_id}"
+                    "/staff-token"
+                ),
             },
         )
         await self._dapr.publish(
@@ -805,6 +1088,13 @@ class ToolLayer:
             ),
             "lookup_appointment": lambda: self.lookup_appointment(
                 phone=str(arguments.get("phone", ""))
+            ),
+            "request_verification_code": lambda: self.request_verification_code(
+                phone=str(arguments.get("phone", ""))
+            ),
+            "verify_caller_code": lambda: self.verify_caller_code(
+                phone=str(arguments.get("phone", "")),
+                code=str(arguments.get("code", "")),
             ),
             "reschedule_appointment": lambda: self.reschedule_appointment(
                 booking_id=str(arguments.get("booking_id", "")),
