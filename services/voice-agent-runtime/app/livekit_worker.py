@@ -29,6 +29,7 @@ app/pipeline/ are version-agnostic.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from typing import Any, AsyncIterable, Optional
 
@@ -533,8 +534,18 @@ async def _publish_lifecycle(
     )
 
 
+# SPEC-W45 K15(a): web session rooms are PER-SESSION unique —
+# ``site-{slug}-{uuid4hex}`` (control_plane.py) — so no two callers ever
+# share a "party line" room (OOS-01). The trailing 32-hex session suffix is
+# stripped to recover the tenant slug; legacy ``site-{slug}`` rooms (and
+# any non-conforming name) pass through unchanged.
+_SESSION_ROOM_RE = re.compile(r"^(?P<slug>.+)-[0-9a-f]{32}$")
+
+
 def site_slug_from_room(room_name: str) -> str:
-    return room_name[len(ROOM_PREFIX):] if room_name.startswith(ROOM_PREFIX) else room_name
+    base = room_name[len(ROOM_PREFIX):] if room_name.startswith(ROOM_PREFIX) else room_name
+    m = _SESSION_ROOM_RE.match(base)
+    return m.group("slug") if m else base
 
 
 async def build_voice_agent(
@@ -547,8 +558,10 @@ async def build_voice_agent(
     """Bootstrap tenant context and assemble the VoicePipelineAgent.
 
     Wave 5 #1: ``sip_call`` (from app/sip.bootstrap_inbound_call) attaches
-    the carrier-asserted caller ID as the session's confirmed phone before
-    the prompt is rendered, so the receptionist skips the read-back step.
+    the carrier-asserted caller ID as the session's CLAIMED (unverified)
+    phone before the prompt is rendered, so the receptionist can greet with
+    the number on file — but the K15(c) OTP gate still applies before any
+    booking lookup/change (the carrier-asserted bypass was removed).
     """
     ctx = await fetch_tenant_context(dapr, settings, site_slug)
     # SPEC-W38 F1/F2: when the SIP bootstrap resolved an agent record via
@@ -566,8 +579,9 @@ async def build_voice_agent(
         session.resolved_agent_id = (getattr(agent_record, "id", "") or "").strip() or None
     caller_phone = ""
     if sip_call is not None:
+        # K15(c): claimed (unverified) hint only — never confirmed.
         sip.attach_caller_id(session, sip_call.caller_phone)
-        caller_phone = session.confirmed_phone or ""
+        caller_phone = session.claimed_phone or ""
     tool_layer = ToolLayer(dapr=dapr, settings=settings, ctx=ctx, session=session)
     system_prompt = build_system_prompt(
         ctx, conversation_id=conversation_id, caller_phone=caller_phone or None
@@ -636,7 +650,7 @@ async def build_voice_agent(
             ctx,
             conversation_id=conversation_id,
             language=ml_state.active_language,
-            caller_phone=session.confirmed_phone,
+            caller_phone=session.confirmed_phone or session.claimed_phone,
         )
         try:
             msgs = agent.chat_ctx.messages
