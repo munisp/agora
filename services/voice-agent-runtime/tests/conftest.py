@@ -18,11 +18,19 @@ class _CreateRoomRequest:
 
 
 class _SendDataRequest:
-    def __init__(self, room: str, data: bytes, kind=None, topic: str = "") -> None:
+    def __init__(
+        self,
+        room: str,
+        data: bytes,
+        kind=None,
+        topic: str = "",
+        destination_identities: list | None = None,
+    ) -> None:
         self.room = room
         self.data = data
         self.kind = kind
         self.topic = topic
+        self.destination_identities = list(destination_identities or [])
 
 
 class _Kind:
@@ -36,9 +44,19 @@ class _DataPacket:
 
 
 class _VideoGrants:
-    def __init__(self, room_join: bool = False, room: str = "") -> None:
+    def __init__(
+        self,
+        room_join: bool = False,
+        room: str = "",
+        can_publish: bool = True,
+        can_subscribe: bool = True,
+        **extra,
+    ) -> None:
         self.room_join = room_join
         self.room = room
+        self.can_publish = can_publish
+        self.can_subscribe = can_subscribe
+        self.extra = extra
 
 
 class _AccessToken:

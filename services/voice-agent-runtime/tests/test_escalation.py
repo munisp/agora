@@ -61,7 +61,13 @@ async def test_request_human_publishes_event(livekit_stub):
     assert data["tenant_id"] == "t-uuid"
     assert data["site_slug"] == "demo"
     assert data["room"] == "escalation-conv-1"
-    assert data["join_token_staff"].startswith("stub-jwt:")
+    # SPEC-W45 K15(e): the staff join token must NOT ride the events topic —
+    # staff mint it on demand via the internal endpoint instead.
+    assert "join_token_staff" not in data
+    assert "token" not in data
+    assert data["staff_token_endpoint"] == (
+        "/voice-admin/escalations/conv-1/staff-token"
+    )
     assert data["reason"] == "caller asked for a manager"
 
 
@@ -94,6 +100,28 @@ async def test_staff_join_token_offline(livekit_stub):
     esc = LiveKitEscalation(Settings())
     token = esc.staff_join_token("escalation-x")
     assert token == "stub-jwt:staff-escalation-x"
+
+
+async def test_deliver_staff_token_targeted(livekit_stub):
+    """K15(e): the staff token goes into the room addressed to the staff
+    participant ONLY (destination_identities) — never broadcast."""
+    esc = LiveKitEscalation(Settings())
+    ok = await esc.deliver_staff_token("escalation-c9", "staff-escalation-c9")
+    assert ok is True
+    assert len(livekit_stub.send_data_calls) == 1
+    req = livekit_stub.send_data_calls[0]
+    assert req.room == "escalation-c9"
+    assert req.destination_identities == ["staff-escalation-c9"]
+    assert req.topic == "staff-credentials"
+    assert b"staff_join_token" in req.data
+    assert b"stub-jwt:" in req.data
+
+
+async def test_deliver_staff_token_graceful_when_down(livekit_stub):
+    livekit_stub.fail = True
+    esc = LiveKitEscalation(Settings())
+    ok = await esc.deliver_staff_token("escalation-c9", "staff-escalation-c9")
+    assert ok is False  # degraded, no exception
 
 
 async def test_copilot_suggestion_posted(livekit_stub):

@@ -65,17 +65,24 @@ def main() -> int:
     with httpx.Client(timeout=60.0) as client:
         for sc in load_scenarios():
             conv_id = str(uuid.uuid4())
+            # K15(b): resume requires the session_secret issued on the first
+            # turn; round-trip it for the rest of the scenario.
+            secret: str | None = None
             record = {"scenario": sc["id"], "site_slug": sc["site_slug"],
                       "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "turns": []}
             for turn in sc["turns"]:
                 tools_called, reply, error = [], "", None
                 try:
-                    r = client.post(f"{args.base_url}/voice/chat", json={
+                    payload = {
                         "site_slug": sc["site_slug"], "message": turn["say"],
-                        "conversation_id": conv_id})
+                        "conversation_id": conv_id}
+                    if secret:
+                        payload["session_secret"] = secret
+                    r = client.post(f"{args.base_url}/voice/chat", json=payload)
                     r.raise_for_status()
                     body = r.json()
                     reply = body.get("reply", "")
+                    secret = body.get("session_secret") or secret
                     tools_called = [t.get("tool") for t in body.get("tool_calls", [])]
                 except Exception as exc:
                     error = str(exc)

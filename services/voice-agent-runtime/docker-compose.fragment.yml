@@ -90,6 +90,13 @@ services:
       LLM_FALLBACK_BASE_URL: ${LLM_FALLBACK_BASE_URL:-}
       LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-}
       LLM_FALLBACK_API_KEY: ${LLM_FALLBACK_API_KEY:-}
+      # SPEC-W45 K15: caller verification (OTP via booking portal), admin
+      # guard, event phone hashing. Empty token/salt = FAIL CLOSED (mutating
+      # tools refuse; /voice-admin/* 503; phones omitted from events).
+      BOOKING_URL: ${BOOKING_URL:-http://booking:7002}
+      VOICE_BOOKING_INTERNAL_TOKEN: ${VOICE_BOOKING_INTERNAL_TOKEN:-}
+      VOICE_ADMIN_INTERNAL_TOKEN: ${VOICE_ADMIN_INTERNAL_TOKEN:-}
+      PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
     depends_on:
       - daprd-voice
       - piper
@@ -120,6 +127,11 @@ services:
       AGENT_IDLE_PROCESSES: ${AGENT_IDLE_PROCESSES:-2}
       LOAD_THRESHOLD: ${LOAD_THRESHOLD:-0.7}
       TOOL_TIMEOUT_SECONDS: ${TOOL_TIMEOUT_SECONDS:-4}
+      # SPEC-W45 K15: SIP sessions run the same OTP gate for mutating tools
+      # (the carrier-asserted bypass was removed); fail closed when unset.
+      BOOKING_URL: ${BOOKING_URL:-http://booking:7002}
+      VOICE_BOOKING_INTERNAL_TOKEN: ${VOICE_BOOKING_INTERNAL_TOKEN:-}
+      PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
     command: ["python", "-m", "app.livekit_worker", "start"]
     depends_on:
       - daprd-voice
