@@ -55,6 +55,8 @@ mod payouts;
 mod registry;
 #[path = "../src/routes.rs"]
 mod routes;
+#[path = "../src/transfers.rs"]
+mod transfers;
 
 // Trait in scope for the MemRegistry handle assertions (K7 provenance test).
 use registry::Registry as _;
@@ -81,6 +83,7 @@ pub struct AppState {
     pub auth: auth::AuthConfig,
     pub payout_attempts: Arc<dyn payouts::PayoutAttemptStore>,
     pub registry: Arc<dyn registry::Registry>,
+    pub transfer_attempts: Arc<dyn transfers::TransferAttemptStore>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
     pub commands_dead_lettered: Arc<AtomicU64>,
@@ -149,6 +152,7 @@ fn test_config() -> config::Config {
         database_url: None,
         payout_reconciler_interval_secs: 30,
         money_roles: vec!["owner".to_string(), "admin".to_string()],
+            payout_approval_threshold_cents: 0,
     }
 }
 
@@ -217,6 +221,7 @@ async fn spawn_with_app(
         ),
         payout_attempts: Arc::new(payouts::MemPayoutAttemptStore::default()),
         registry: registry.clone(),
+        transfer_attempts: Arc::new(transfers::MemTransferAttemptStore::default()),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
         commands_dead_lettered: dead.clone(),
@@ -453,7 +458,7 @@ async fn money_endpoints_require_idempotency_key() {
     // empty string key is also rejected
     let r = http
         .post(format!("{base}/v1/deposits"))
-        .json(&serde_json::json!({"tenant_id": "t-k", "amount_cents": 100, "currency": "NGN", "idempotency_key": "  "}))
+        .json(&serde_json::json!({"tenant_id": "t-k", "amount_cents": 100, "currency": "NGN", "idempotency_key": "  "))
         .send().await.unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "blank key");
 }
@@ -1062,4 +1067,640 @@ async fn f15_healthz_degrades_on_dead_letters_and_metrics_expose_counters() {
     assert!(text.contains("payments_commands_dead_lettered 1"), "{text}");
     assert!(text.contains("payments_commands_processed_total"), "{text}");
     assert!(text.contains("payments_payout_attempts_total{outcome=\"committed\"}"), "{text}");
+}
+
+// ===========================================================================
+// SPEC-W45 tests: K12 refund rail fallback matrix, /v1/transfers (auth /
+// idempotency / ledger-order), K20 payout approval threshold matrix.
+// ===========================================================================
+
+/// W45 spawn variant: full control over the Mojaloop rail URL, the
+/// Flutterwave adapter (K12 refund rail) and the K20 approval threshold.
+async fn spawn_w45(
+    rail_url: &str,
+    fw: Option<(&str, &str)>, // (base_url, secret_key)
+    approval_threshold: u64,
+) -> ServerHandles {
+    let registry = Arc::new(registry::MemRegistry::default());
+    let dead = Arc::new(AtomicU64::new(0));
+    let mut cfg = test_config();
+    cfg.payout_approval_threshold_cents = approval_threshold;
+    let fw_adapter = match fw {
+        Some((base, key)) => {
+            flutterwave::FlutterwaveAdapter::with_credentials(base, key, None, None)
+        }
+        // Explicitly UNCONFIGURED (never env-leaky): configured() == false.
+        None => flutterwave::FlutterwaveAdapter::with_credentials(
+            "http://127.0.0.1:1",
+            "",
+            None,
+            None,
+        ),
+    };
+    let state = AppState {
+        ledger: Arc::new(ledger::sim::SimLedgerClient::new(0)),
+        outbox: dapr::DaprOutbox::new(
+            "http://127.0.0.1:1".to_string(),
+            "pubsub".to_string(),
+            "opendesk.payments.events".to_string(),
+        ),
+        mojaloop: mojaloop::MojaloopAdapter::new(rail_url.to_string()),
+        flutterwave: fw_adapter,
+        config: Arc::new(cfg),
+        dlq: Arc::new(consumer::UnavailableDlqSink),
+        auth: auth::AuthConfig::new(None, true, vec!["owner".to_string(), "admin".to_string()]),
+        payout_attempts: Arc::new(payouts::MemPayoutAttemptStore::default()),
+        registry: registry.clone(),
+        transfer_attempts: Arc::new(transfers::MemTransferAttemptStore::default()),
+        events_published: Arc::new(AtomicU64::new(0)),
+        events_failed: Arc::new(AtomicU64::new(0)),
+        commands_dead_lettered: dead.clone(),
+        commands_processed: Arc::new(AtomicU64::new(0)),
+        payouts_attempted: Arc::new(AtomicU64::new(0)),
+        payouts_committed: Arc::new(AtomicU64::new(0)),
+        payouts_failed: Arc::new(AtomicU64::new(0)),
+        payouts_unknown: Arc::new(AtomicU64::new(0)),
+    };
+    let app = routes::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve router");
+    });
+    ServerHandles {
+        base: format!("http://{addr}"),
+        registry,
+        commands_dead_lettered: dead,
+    }
+}
+
+/// Committed Mojaloop stub (quote + transfer COMMITTED); returns its URL.
+async fn spawn_committed_rail_stub() -> String {
+    async fn quotes() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({}))
+    }
+    async fn transfers() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "transferState": "COMMITTED",
+            "completedTimestamp": "2026-08-22T00:00:00Z"
+        }))
+    }
+    let app = axum::Router::new()
+        .route("/quotes", axum::routing::post(quotes))
+        .route("/transfers", axum::routing::post(transfers));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    format!("http://{addr}")
+}
+
+/// Flutterwave refund stub: tx 1 succeeds, every other tx is rejected.
+async fn spawn_fw_refund_stub() -> String {
+    async fn handler(
+        axum::extract::Path(id): axum::extract::Path<u64>,
+    ) -> (reqwest::StatusCode, axum::Json<serde_json::Value>) {
+        if id == 1 {
+            (
+                reqwest::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "status": "success", "message": "refund queued",
+                    "data": {"id": 1, "tx_ref": "fw-x", "status": "processed"}
+                })),
+            )
+        } else {
+            (
+                reqwest::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "status": "error", "message": "transaction not refundable", "data": null
+                })),
+            )
+        }
+    }
+    let app = axum::Router::new().route("/transactions/:id/refund", axum::routing::post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    format!("http://{addr}")
+}
+
+/// Hold + capture through the real API (earns tenant revenue).
+async fn earn_revenue(http: &reqwest::Client, base: &str, tenant: &str, key: &str, cents: u64) {
+    let deposit_id = hold_via_api(http, base, tenant, key, cents).await;
+    let r = http
+        .post(format!("{base}/v1/deposits/{deposit_id}/capture"))
+        .json(&serde_json::json!({"tenant_id": tenant}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK, "capture earns revenue");
+}
+
+/// K12 refund rail fallback matrix (unconfigured rail):
+/// 1. refund of a PENDING hold voids it — "refunded", no provider involved;
+/// 2. refund of a CAPTURED deposit without a configured rail / tx id is the
+///    honest "queued_manual" (the ledger refund committed; the response says
+///    the provider refund is manual), and a replay returns the ORIGINAL
+///    status without re-attempting anything.
+#[tokio::test]
+async fn k12_refund_rail_fallback_matrix_unconfigured() {
+    let handles = spawn_w45("http://127.0.0.1:1", None, 0).await;
+    let base = &handles.base;
+    let http = client();
+
+    // 1. Pending-hold void: refunded, rail "none".
+    let deposit_id = hold_via_api(&http, base, "t-k12", "k12-void-hold", 1_000).await;
+    let r = http
+        .post(format!("{base}/v1/refunds"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-k12", "deposit_id": deposit_id, "amount_cents": 1_000,
+            "idempotency_key": "k12-void",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "refunded", "pending-hold void is refunded");
+    assert_eq!(json["rail"], "none");
+    assert!(json["id"].as_str().unwrap().len() == 32, "id is the hex string");
+    assert_eq!(json["amount"], 1_000);
+
+    // 2. Captured refund, unconfigured rail: queued_manual + stable replay.
+    earn_revenue(&http, base, "t-k12", "k12-cap-hold", 2_000).await;
+    let body = serde_json::json!({
+        "tenant_id": "t-k12", "amount_cents": 2_000, "idempotency_key": "k12-cap",
+        "reason": "guest cancelled",
+    });
+    let r = http
+        .post(format!("{base}/v1/refunds"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "queued_manual", "no rail => honest queued_manual");
+    assert_eq!(json["rail"], "none");
+    assert!(json["rail_detail"]
+        .as_str()
+        .unwrap()
+        .contains("manual provider refund required"));
+    let refund_id = json["id"].as_str().unwrap().to_string();
+
+    // Replay: ORIGINAL status + same refund id (durable record; no re-attempt).
+    let r = http
+        .post(format!("{base}/v1/refunds"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "queued_manual");
+    assert_eq!(json["id"], refund_id, "replay returns the original refund");
+
+    // 3. No provider tx id even when the rail IS configured: queued_manual.
+    //    (Covered at the unit level in flutterwave.rs; here the rail is
+    //    unconfigured, which short-circuits first.)
+}
+
+/// K12: with FLUTTERWAVE configured + a provider tx id, the refund rail is
+/// attempted — provider success marks "refunded"; provider failure degrades
+/// honestly to "queued_manual" (never a claimed refund).
+#[tokio::test]
+async fn k12_refund_rail_provider_attempt_success_and_failure() {
+    let fw_stub = spawn_fw_refund_stub().await;
+    let handles = spawn_w45("http://127.0.0.1:1", Some((&fw_stub, "sk_test")), 0).await;
+    let base = &handles.base;
+    let http = client();
+
+    // Success path (stub tx id 1).
+    earn_revenue(&http, base, "t-fw", "k12-fw-hold", 3_000).await;
+    let r = http
+        .post(format!("{base}/v1/refunds"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-fw", "amount_cents": 1_500,
+            "idempotency_key": "k12-fw-ok", "flutterwave_transaction_id": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "refunded", "provider accepted: {json}");
+    assert_eq!(json["rail"], "flutterwave");
+
+    // Provider failure path (stub rejects every tx != 1): queued_manual.
+    earn_revenue(&http, base, "t-fw", "k12-fw-hold2", 3_000).await;
+    let r = http
+        .post(format!("{base}/v1/refunds"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-fw", "amount_cents": 1_000,
+            "idempotency_key": "k12-fw-fail", "flutterwave_transaction_id": 2,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "queued_manual", "provider failure is honest");
+    assert_eq!(json["rail"], "none");
+    assert!(json["rail_detail"]
+        .as_str()
+        .unwrap()
+        .contains("flutterwave refund attempt failed"));
+}
+
+/// /v1/transfers: auth matrix (K6 money-role gate + X-Internal-Token service
+/// caller), NGN guard, and ledger-first ordering (over-limit rejected before
+/// any rail side effect).
+#[tokio::test]
+async fn w45_transfers_auth_and_ledger_first() {
+    let handles = spawn_server_with_auth(Some("s3cret"), false).await;
+    let base = &handles.base;
+    let http = client();
+    let body = serde_json::json!({
+        "tenant_id": "t-l", "amount_kobo": 500, "currency": "NGN",
+        "transfer_id": "tr-auth", "loan_id": "loan-1",
+    });
+
+    // No identity at all: 401 (fail-closed tenant binding).
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Tenant member WITHOUT a money role: 403.
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("x-tenant-slugs", "t-l")
+        .header("x-user-roles", "member")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // A wrong internal token is 401 even with roles present.
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("x-internal-token", "wrong")
+        .header("x-tenant-slugs", "t-l")
+        .header("x-user-roles", "owner")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // NGN guard (consistent with the other money routes): 400.
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("x-internal-token", "s3cret")
+        .json(&serde_json::json!({
+            "tenant_id": "t-l", "amount_kobo": 500, "currency": "USD",
+            "transfer_id": "tr-usd",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "NGN guard");
+
+    // Ledger-first: the tenant has NO revenue — the transfer is rejected
+    // (422) BEFORE any rail call, and nothing is recorded/reserved.
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("x-internal-token", "s3cret")
+        .json(&serde_json::json!({
+            "tenant_id": "t-l", "amount_kobo": 10_000, "currency": "NGN",
+            "transfer_id": "tr-over", "loan_id": "loan-2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "over-limit transfer rejected ledger-first"
+    );
+}
+
+/// Rail stub where the quote stage succeeds but the transfer stage answers
+/// an undecodable body => the adapter classifies the outcome UNKNOWN.
+async fn spawn_ambiguous_rail_stub() -> String {
+    async fn quotes() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({}))
+    }
+    async fn transfers() -> &'static str {
+        "this is not a transfer response"
+    }
+    let app = axum::Router::new()
+        .route("/quotes", axum::routing::post(quotes))
+        .route("/transfers", axum::routing::post(transfers));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    format!("http://{addr}")
+}
+
+/// /v1/transfers: an unreachable rail fails the QUOTE stage (nothing reached
+/// the rail) — per the payout rail pattern this is an explicit failure: the
+/// hold is voided (funds released) and the status is honestly "failed".
+#[tokio::test]
+async fn w45_transfers_unreachable_rail_fails_and_releases_funds() {
+    let handles = spawn_w45("http://127.0.0.1:1", None, 0).await;
+    let base = &handles.base;
+    let http = client();
+    earn_revenue(&http, base, "t-f", "tr-f-hold", 5_000).await;
+
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-f", "amount_kobo": 2_000, "currency": "NGN",
+            "transfer_id": "tr-f",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "failed", "quote-stage failure is explicit");
+
+    // Funds released: the full revenue is transferable again (5_001 is 422).
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-f", "amount_kobo": 5_001, "currency": "NGN",
+            "transfer_id": "tr-f2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// /v1/transfers: Idempotency-Key header honored — an AMBIGUOUS rail outcome
+/// (transfer stage undecodable) leaves the funds RESERVED and records the
+/// honest queued_manual status; the replay returns the ORIGINAL recorded
+/// outcome without re-executing anything.
+#[tokio::test]
+async fn w45_transfers_idempotent_replay_queued_manual() {
+    let rail = spawn_ambiguous_rail_stub().await;
+    let handles = spawn_w45(&rail, None, 0).await;
+    let base = &handles.base;
+    let http = client();
+    earn_revenue(&http, base, "t-q", "tr-q-hold", 5_000).await;
+
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("idempotency-key", "idem-tr-1")
+        .json(&serde_json::json!({
+            "tenant_id": "t-q", "amount_kobo": 2_000, "currency": "NGN",
+            "transfer_id": "tr-q", "loan_id": "loan-9",
+        }))
+        .send()
+        .await
+        .unwrap();
+    // Ambiguous rail: 502 with the honest queued_manual status in the JSON
+    // (a 2xx here would let the caller's rail client treat an UNDELIVERED
+    // disbursement as delivered).
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "queued_manual");
+    assert!(json["rail_detail"]
+        .as_str()
+        .unwrap()
+        .contains("VERIFY"));
+    let transfer_id = json["transfer_id"].as_str().unwrap().to_string();
+
+    // Replay with the SAME key (header only): original outcome, same id.
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("idempotency-key", "idem-tr-1")
+        .json(&serde_json::json!({
+            "tenant_id": "t-q", "amount_kobo": 2_000, "currency": "NGN",
+            "transfer_id": "tr-q", "loan_id": "loan-9",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "queued_manual");
+    assert_eq!(json["transfer_id"], transfer_id, "replay returns the original");
+
+    // The funds are still RESERVED (pending hold): the revenue account shows
+    // the -2_000 pending reservation and one kobo more than the remainder is
+    // 422.
+    let r = http
+        .get(format!("{base}/v1/accounts/t-q/balance"))
+        .send()
+        .await
+        .unwrap();
+    let bal: serde_json::Value = r.json().await.unwrap();
+    let revenue = bal["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["account"].as_str().unwrap().contains("revenue"))
+        .expect("revenue account present");
+    assert_eq!(revenue["pending_net"], -2_000, "funds stay reserved");
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-q", "amount_kobo": 3_001, "currency": "NGN",
+            "transfer_id": "tr-q2",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// /v1/transfers: committed path against the stub rail — ledger-first hold,
+/// rail COMMITTED, hold posted, replay returns the original committed record.
+#[tokio::test]
+async fn w45_transfers_committed_against_stub_rail() {
+    let rail = spawn_committed_rail_stub().await;
+    let handles = spawn_w45(&rail, None, 0).await;
+    let base = &handles.base;
+    let http = client();
+    earn_revenue(&http, base, "t-c9", "tr-c-hold", 4_000).await;
+
+    let body = serde_json::json!({
+        "tenant_id": "t-c9", "amount_kobo": 1_500, "currency": "NGN",
+        "transfer_id": "tr-commit", "loan_id": "loan-3",
+        "debit_account_code": 501, "credit_account_code": 500,
+    });
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("idempotency-key", "idem-tr-commit")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "committed");
+    assert!(json["ledger_transfer"].is_object());
+    let transfer_id = json["transfer_id"].as_str().unwrap().to_string();
+
+    // Replay: original committed outcome (no second rail call / ledger leg).
+    let r = http
+        .post(format!("{base}/v1/transfers"))
+        .header("idempotency-key", "idem-tr-commit")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED);
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "committed");
+    assert_eq!(json["transfer_id"], transfer_id);
+}
+
+/// K20 payout approval threshold matrix (threshold = 1_000 kobo):
+/// - amount strictly above the threshold parks in pending_approval (202,
+///   funds reserved, NO rail call) and the replay returns the same 202;
+/// - approving with a mere admin role is 403 (owner required above the
+///   threshold); approving as owner dispatches (201 COMMITTED); the approve
+///   replay returns the recorded outcome;
+/// - amounts at/below the threshold dispatch immediately (pre-K20 behavior);
+/// - approving an unknown payout id is 404.
+#[tokio::test]
+async fn k20_payout_approval_threshold_matrix() {
+    let rail = spawn_committed_rail_stub().await;
+    let handles = spawn_w45(&rail, None, 1_000).await;
+    let base = &handles.base;
+    let http = client();
+    earn_revenue(&http, base, "t-k20", "k20-hold", 10_000).await;
+    let beneficiary_id = create_beneficiary_via_api(&http, base, "t-k20", "k20-payee").await;
+
+    // Above the threshold: 202 pending_approval, no rail outcome yet.
+    let r = http
+        .post(format!("{base}/v1/payouts"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-k20", "amount_cents": 1_500, "currency": "NGN",
+            "beneficiary_id": beneficiary_id, "idempotency_key": "k20-above",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::ACCEPTED, "above threshold parks");
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "pending_approval");
+    assert!(json.get("mojaloop").is_none(), "no rail call before approval");
+    let payout_id = json["payout_id"].as_str().unwrap().to_string();
+
+    // Replay of the parked payout: same 202 (no duplicate hold, no rail).
+    let r = http
+        .post(format!("{base}/v1/payouts"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-k20", "amount_cents": 1_500, "currency": "NGN",
+            "beneficiary_id": beneficiary_id, "idempotency_key": "k20-above",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::ACCEPTED, "parked replay");
+
+    // Admin (a money role but NOT owner) cannot approve above the threshold.
+    let r = http
+        .post(format!("{base}/v1/payouts/{payout_id}/approve"))
+        .header("x-user-roles", "admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN, "owner required");
+
+    // The parked hold is still reserved after the failed approval: the
+    // tenant revenue account shows a -1_500 pending (debit) reservation.
+    let r = http
+        .get(format!("{base}/v1/accounts/t-k20/balance"))
+        .send()
+        .await
+        .unwrap();
+    let bal: serde_json::Value = r.json().await.unwrap();
+    let revenue = bal["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["account"].as_str().unwrap().contains("revenue"))
+        .expect("revenue account present");
+    assert_eq!(revenue["pending_net"], -1_500, "funds stay reserved");
+
+    // Owner approves: rail dispatches and commits.
+    let r = http
+        .post(format!("{base}/v1/payouts/{payout_id}/approve"))
+        .header("x-user-roles", "owner")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED, "owner approval dispatches");
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["mojaloop"]["state"], "COMMITTED");
+
+    // Approve replay: the recorded outcome, no second rail call.
+    let r = http
+        .post(format!("{base}/v1/payouts/{payout_id}/approve"))
+        .header("x-user-roles", "owner")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK, "approve replay");
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["status"], "approved_replay");
+
+    // At/below the threshold: immediate dispatch (pre-K20 behavior).
+    let r = http
+        .post(format!("{base}/v1/payouts"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-k20", "amount_cents": 1_000, "currency": "NGN",
+            "beneficiary_id": beneficiary_id, "idempotency_key": "k20-at",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED, "at threshold dispatches");
+
+    // Unknown payout id: 404.
+    let r = http
+        .post(format!(
+            "{base}/v1/payouts/{}/approve",
+            uuid::Uuid::new_v4()
+        ))
+        .header("x-user-roles", "owner")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// K20: the default threshold (0) is DISABLED — even very large payouts
+/// dispatch immediately without an approval step.
+#[tokio::test]
+async fn k20_threshold_disabled_by_default() {
+    let rail = spawn_committed_rail_stub().await;
+    let handles = spawn_w45(&rail, None, 0).await;
+    let base = &handles.base;
+    let http = client();
+    earn_revenue(&http, base, "t-d0", "k20-d0-hold", 9_000).await;
+    let beneficiary_id = create_beneficiary_via_api(&http, base, "t-d0", "k20-d0-payee").await;
+    let r = http
+        .post(format!("{base}/v1/payouts"))
+        .json(&serde_json::json!({
+            "tenant_id": "t-d0", "amount_cents": 9_000, "currency": "NGN",
+            "beneficiary_id": beneficiary_id, "idempotency_key": "k20-d0",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::CREATED, "0 = disabled");
+    let json: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(json["mojaloop"]["state"], "COMMITTED");
 }
