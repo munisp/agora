@@ -11,6 +11,19 @@
    suggested replies, posted to the escalation room data channel so the
    operator sees live drafts while talking to the caller.
 
+SPEC-W45 K15(e): the staff join token is NEVER published on the events
+topic (fan-out = any consumer could join the escalation room and listen to
+the caller). Delivery is staff-participant-only:
+
+1. On-demand mint via the internal control-plane endpoint
+   ``POST /voice-admin/escalations/{conversation_id}/staff-token``
+   (X-Internal-Token, app/control_plane.py) — the staff dashboard calls it
+   when an operator picks up the escalation banner; or
+2. ``deliver_staff_token`` — a targeted LiveKit data message
+   (``destination_identities=[staff_identity]``) pushed into the escalation
+   room once the staff participant has joined; other participants
+   (including the caller) never receive it.
+
 Everything degrades gracefully: when the LiveKit server is unreachable the
 event is still published (the dashboard banner + room name are valid) and
 copilot posts are skipped with a warning — the caller never hears an error.
@@ -78,7 +91,11 @@ class LiveKitEscalation:
             return False
 
     def staff_join_token(self, room: str, *, staff_name: str = "Staff") -> str:
-        """Mint a staff join token for the escalation room (offline JWT)."""
+        """Mint a staff join token for the escalation room (offline JWT).
+
+        K15(e): call sites must deliver the returned token to the staff
+        participant ONLY (internal mint endpoint or targeted in-room data) —
+        never publish it on an event topic."""
         from livekit import api as lk_api
 
         return (
@@ -91,6 +108,60 @@ class LiveKitEscalation:
             .with_ttl(timedelta(hours=2))
             .to_jwt()
         )
+
+    async def deliver_staff_token(
+        self,
+        room: str,
+        staff_identity: str,
+        *,
+        token: str | None = None,
+        staff_name: str = "Staff",
+    ) -> bool:
+        """K15(e): push the staff join token INTO the escalation room,
+        addressed to the staff participant only
+        (``SendDataRequest.destination_identities``) — the caller and any
+        other room participants never receive it.
+
+        Used when the staff participant has already joined (e.g. they
+        entered via the dashboard-minted token and need a refresh, or a
+        supervisor joins the whisper-copilot session). Returns False
+        (graceful) when LiveKit is unreachable or the identity is absent.
+        """
+        import json
+
+        from livekit import api as lk_api
+        from livekit.protocol import room as lk_room
+
+        token = token or self.staff_join_token(room, staff_name=staff_name)
+        try:
+            api = self._api()
+            try:
+                await api.room.send_data(
+                    lk_api.SendDataRequest(
+                        room=room,
+                        data=json.dumps(
+                            {
+                                "type": "staff_join_token",
+                                "room": room,
+                                "token": token,
+                            }
+                        ).encode(),
+                        kind=lk_room.DataPacket.Kind.Value("RELIABLE"),
+                        topic="staff-credentials",
+                        destination_identities=[staff_identity],
+                    )
+                )
+            finally:
+                await api.aclose()
+            log.info(
+                "staff token delivered in-room", room=room, identity=staff_identity
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            log.warning(
+                "staff token delivery failed", room=room, error=str(exc)[:200]
+            )
+            return False
 
     async def post_suggestion(self, room: str, suggestion: dict[str, Any]) -> bool:
         """Publish a copilot suggested reply to the room data channel.

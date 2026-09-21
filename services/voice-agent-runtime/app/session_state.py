@@ -11,12 +11,26 @@ server-enforced (never delegated to the model):
    re-issues the call after the caller said "yes"); the phone becomes
    `confirmed_phone` and the call proceeds.
 
+SPEC-W45 K15 — two hardening layers on top of that:
+
+- K15(b) session resume: every session is issued a ``session_secret`` (uuid4)
+  at creation, returned to the caller once. Resuming a session (recovering
+  confirmed_phone / history / escalation state) requires BOTH the
+  conversation_id AND the matching secret; a client-supplied conversation_id
+  alone NEVER resumes state — the store starts a fresh session instead.
+- K15(c) verified sessions: lookup/reschedule/cancel additionally require a
+  VERIFIED phone — OTP via the booking customer portal
+  (app/verification.py) or a channel-verified identity pinned by the
+  messaging-gateway (e.g. WhatsApp wa_id). ``confirmed_phone`` (read-back)
+  is NOT sufficient for those tools anymore.
+
 State is in-memory (dev-grade; swap `SessionStore` for the Dapr state store
 `statestore.redis` in production — the interface is tiny).
 """
 
 from __future__ import annotations
 
+import hmac
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -34,8 +48,22 @@ class PhoneConfirmationRequired(RuntimeError):
 class SessionState:
     conversation_id: str
     site_slug: str
+    # K15(b): resume credential, minted once at creation (uuid4) and
+    # returned to the caller; required to resume this session's state.
+    session_secret: str = field(default_factory=lambda: str(uuid.uuid4()))
     pending_phone: str | None = None
     confirmed_phone: str | None = None
+    # K15(c): OTP/channel-verified caller phone — required by the mutating
+    # tools (lookup/reschedule/cancel). Set ONLY by verify_caller_code
+    # (booking-portal OTP) or by an internal-token-authorized channel
+    # identity pin (WhatsApp wa_id); never by the model or the SIP carrier.
+    verified_phone: str | None = None
+    # K15(c): a phone the channel ASSERTED but which is not verified (SIP
+    # caller ID, web self-claim). Usable as a prompt hint and for the
+    # emergency location-capture contact lookup; NEVER authorizes a
+    # mutation. Replaces the removed SIP carrier-asserted pre-confirmation
+    # bypass (OOS-03).
+    claimed_phone: str | None = None
     caller_name: str | None = None
     last_booking_ids: list[str] = field(default_factory=list)
     # Multi-agent crews (SPEC-W3 §4, innovation 6): id of the specialist
@@ -91,6 +119,24 @@ class SessionState:
         self.touch()
         raise PhoneConfirmationRequired(phone)
 
+    def mark_verified(self, phone: str) -> str:
+        """K15(c): pin an OTP/channel-verified caller phone.
+
+        A verified number also satisfies the (weaker) read-back
+        confirmation, so book_appointment does not re-ask for it. Returns
+        the stored (already normalized by the caller) phone."""
+        self.verified_phone = phone
+        self.confirmed_phone = phone
+        self.pending_phone = None
+        self.touch()
+        return phone
+
+    def check_secret(self, session_secret: str | None) -> bool:
+        """Constant-time resume-credential check (K15(b))."""
+        if not session_secret:
+            return False
+        return hmac.compare_digest(session_secret, self.session_secret)
+
 
 @dataclass
 class SessionStore:
@@ -99,13 +145,30 @@ class SessionStore:
     ttl_s: int = 3600
     _sessions: dict[str, SessionState] = field(default_factory=dict)
 
-    def get_or_create(self, conversation_id: str | None, site_slug: str) -> SessionState:
+    def get_or_create(
+        self,
+        conversation_id: str | None,
+        site_slug: str,
+        session_secret: str | None = None,
+    ) -> SessionState:
+        """Resume an existing session or start a fresh one.
+
+        K15(b): resuming requires the session_secret issued at creation. A
+        conversation_id presented WITHOUT the matching secret NEVER resumes
+        confirmed_phone/history/escalation state — a brand-new session (new
+        conversation_id) is created instead, leaving the targeted session
+        untouched."""
         self._gc()
         if conversation_id and conversation_id in self._sessions:
             session = self._sessions[conversation_id]
-            session.touch()
-            return session
+            if session.check_secret(session_secret):
+                session.touch()
+                return session
+            # Secret missing/wrong: fall through to a fresh session below.
         cid = conversation_id or str(uuid.uuid4())
+        if cid in self._sessions:
+            # Existing session, wrong/absent secret: never adopt its id.
+            cid = str(uuid.uuid4())
         session = SessionState(conversation_id=cid, site_slug=site_slug)
         self._sessions[cid] = session
         return session

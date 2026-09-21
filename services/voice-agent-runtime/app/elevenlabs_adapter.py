@@ -60,18 +60,31 @@ class ElevenLabsBackend:
 
         Expected payload (ElevenLabs server-tool webhook):
         {"tool_name": str, "parameters": {...}, "conversation_id": str,
-         "site_slug": str}
+         "site_slug": str, "session_secret": str?}
+
+        K15(b): resuming session state across webhook calls requires the
+        session_secret — the response always carries the current
+        conversation_id + session_secret so the ElevenLabs agent can round
+        -trip them (dynamic variables / client tools). A conversation_id
+        alone NEVER resumes confirmed/verified phone, history or escalation
+        state; without the secret each call runs on a fresh session.
         """
         tool_name = payload.get("tool_name") or payload.get("name") or ""
         parameters = payload.get("parameters") or payload.get("args") or {}
         site_slug = payload.get("site_slug") or ""
         conversation_id = payload.get("conversation_id")
+        session_secret = payload.get("session_secret")
 
-        session = self._sessions.get_or_create(conversation_id, site_slug)
+        session = self._sessions.get_or_create(
+            conversation_id, site_slug, session_secret=session_secret
+        )
         ctx = await fetch_tenant_context(self._dapr, self._settings, site_slug)
         tool_layer = ToolLayer(
             dapr=self._dapr, settings=self._settings, ctx=ctx, session=session
         )
         result = await tool_layer.dispatch(tool_name, parameters)
+        # Round-trip the resume credentials (K15(b)) — additive keys.
+        result.setdefault("conversation_id", session.conversation_id)
+        result.setdefault("session_secret", session.session_secret)
         log.info("elevenlabs tool dispatched", tool=tool_name, status=result.get("status"))
         return result

@@ -35,7 +35,8 @@ KNOWLEDGE
 TOOLS
 You have exactly these tools: get_business_info, get_availability,
 book_appointment, lookup_appointment, reschedule_appointment,
-cancel_appointment, request_human{extra_tool_names}.
+cancel_appointment, request_verification_code, verify_caller_code,
+request_human{extra_tool_names}.
 - Use get_availability before offering times; quote times in {timezone}.
 - book_appointment requires: offering_id, team_member_id, starts_at (RFC3339),
   and the caller's phone number.
@@ -43,13 +44,24 @@ cancel_appointment, request_human{extra_tool_names}.
   distressed, or you cannot resolve their request after two attempts.
 
 PHONE-CONFIRMATION POLICY (hard rule, enforced server-side)
-- Before ANY booking, lookup, reschedule or cancellation you MUST collect the
+- Before ANY new booking you MUST collect the
   caller's phone number, read it back digit by digit, and get an explicit
   "yes".
 - If a tool answers "confirmation_required", read the phone number back and
   ask the caller to confirm; when they confirm, call the tool again with the
   same number.
 - Never claim a booking exists until the tool confirms it was accepted.
+
+CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
+- Looking up, rescheduling or cancelling an EXISTING booking requires a
+  verified phone number. If a tool answers "verification_required", call
+  request_verification_code with the caller's number, tell the caller a
+  one-time code is on its way to their phone, ask them to read it back, and
+  submit it with verify_caller_code. Only then retry the original tool.
+- If verify_caller_code answers "invalid_code", ask the caller to
+  double-check and try again; after two failures offer request_human.
+- If a tool answers "verification_unavailable", apologize and explain that
+  booking changes are temporarily unavailable; do NOT keep retrying.
 
 CALLER CONTEXT
 - conversation_id: {conversation_id}
@@ -156,8 +168,9 @@ def build_system_prompt(
     registered alongside the built-ins. Wave 5 #3: ``language`` (whisper
     auto-detected, normalized ISO code) appends a per-turn locale instruction
     when the caller speaks a language other than the tenant default. Wave 5
-    #1: ``caller_phone`` (SIP carrier-asserted caller ID, already confirmed)
-    tells the model to skip the read-back confirmation for that number.
+    #1/K15(c): ``caller_phone`` (SIP carrier-asserted caller ID, CLAIMED but
+    unverified) lets the model greet with the number on file; the OTP
+    verification gate still applies before any booking lookup/change.
     """
     terminology = (
         json.dumps(ctx.terminology, ensure_ascii=False, indent=2)
@@ -219,15 +232,19 @@ def build_system_prompt(
 
         if language != default_language_from_locale(ctx.locale):
             prompt += locale_instruction(language)
-    # Wave 5 #1: SIP caller ID is carrier-asserted and server-confirmed at
-    # session bootstrap (app/sip.py policy); the read-back step would only
-    # add friction, so the prompt records the number as already confirmed.
+    # Wave 5 #1 / SPEC-W45 K15(c): the SIP caller ID is carrier-asserted but
+    # NOT proof of possession (spoofable) — it is recorded as the CLAIMED
+    # number (prompt hint + emergency location capture); the OTP gate still
+    # applies to lookup/reschedule/cancel and the read-back policy to new
+    # bookings.
     if caller_phone:
         prompt += (
-            f"\nCALLER ID (SIP, carrier-verified)\n- The caller is phoning "
-            f"from {caller_phone}; this number is ALREADY CONFIRMED — use it "
-            "directly for booking, lookup, reschedule and cancel tools and "
-            "do NOT ask the caller to read it back or confirm it.\n"
+            f"\nCALLER ID (SIP, unverified)\n- The caller appears to be "
+            f"phoning from {caller_phone}. You may use this number when the "
+            "caller confirms it is theirs, but it is NOT verified: booking "
+            "lookups/changes still require the one-time-code verification "
+            "flow, and new bookings still require the read-back "
+            "confirmation.\n"
         )
     if active_agent is not None:
         persona = str(active_agent.get("persona") or "").strip()
