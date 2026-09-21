@@ -1,336 +1,288 @@
-"""SIP telephony inbound tests (Wave 5 #1): tenant resolution from the dialed
-number, carrier caller-ID confirmation bypass, and the LiveKit SIP deploy
-YAML schemas (safe_load)."""
+"""Tests for the SIP inbound bootstrap (Wave 5 #1, app/sip.py)."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
 
-from app import sip
-from app.session_state import PhoneConfirmationRequired, SessionState
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SIP_DIR = REPO_ROOT / "deploy" / "livekit-sip"
+from app import metrics, sip
+from app.config import load_settings
+from app.session_state import SessionState
 
 
-def _settings(phone_map=None, default_site=""):
-    return SimpleNamespace(
-        tenant_phone_map=phone_map or {}, sip_default_site=default_site
+# --------------------------------------------------------------------------
+# normalize_phone / parse_tenant_phone_map
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("+1 (555) 123-4567", "+15551234567"),
+        ("  +44 20 7946 0958 ", "+442079460958"),
+        ("+15551234567", "+15551234567"),
+        ("", ""),
+        (None, ""),
+        ("anonymous", "anonymous"),
+    ],
+)
+def test_normalize_phone(raw, expected):
+    assert sip.normalize_phone(raw) == expected
+
+
+def test_parse_tenant_phone_map_happy():
+    m = sip.parse_tenant_phone_map('{"+15551234567": "acme", "+442079460958": "globex"}')
+    assert m == {"+15551234567": "acme", "+442079460958": "globex"}
+
+
+def test_parse_tenant_phone_map_normalizes_keys():
+    m = sip.parse_tenant_phone_map('{"+1 (555) 123-4567": "acme"}')
+    assert m == {"+15551234567": "acme"}
+
+
+def test_parse_tenant_phone_map_tolerant():
+    assert sip.parse_tenant_phone_map("not json") == {}
+    assert sip.parse_tenant_phone_map('["+15551234567"]') == {}
+    assert sip.parse_tenant_phone_map('{"bad-number": "acme"}') == {}
+    assert sip.parse_tenant_phone_map('{"+15551234567": ""}') == {}
+    assert sip.parse_tenant_phone_map("") == {}
+    assert sip.parse_tenant_phone_map(None) == {}
+
+
+# --------------------------------------------------------------------------
+# SIP detection
+# --------------------------------------------------------------------------
+
+def test_is_sip_room():
+    assert sip.is_sip_room("call-+15551234567")
+    assert not sip.is_sip_room("site-acme")
+    assert not sip.is_sip_room("")
+
+
+def _participant(kind=None, identity="", attributes=None):
+    return SimpleNamespace(kind=kind, identity=identity, attributes=attributes or {})
+
+
+def test_is_sip_participant_by_kind():
+    assert sip.is_sip_participant(_participant(kind=SimpleNamespace(name="SIP")))
+    assert sip.is_sip_participant(_participant(kind="sip"))
+
+
+def test_is_sip_participant_by_identity_and_attrs():
+    assert sip.is_sip_participant(_participant(identity="sip_+15551234567_x"))
+    assert sip.is_sip_participant(_participant(attributes={"sip.phoneNumber": "+1"}))
+    assert not sip.is_sip_participant(_participant(identity="web-abc"))
+    assert not sip.is_sip_participant(None)
+
+
+# --------------------------------------------------------------------------
+# Call info extraction
+# --------------------------------------------------------------------------
+
+def test_extract_call_info_from_attributes():
+    p = _participant(
+        kind=SimpleNamespace(name="SIP"),
+        identity="sip_+15559876543_ab12",
+        attributes={
+            "sip.phoneNumber": "+1 (555) 987-6543",
+            "sip.trunkPhoneNumber": "+15551234567",
+        },
     )
+    caller, dialed, attrs = sip.extract_call_info("call-+15551234567", [p])
+    assert caller == "+15559876543"
+    assert dialed == "+15551234567"
+    assert attrs["sip.phoneNumber"].startswith("+1")
+
+
+def test_extract_call_info_falls_back_to_identity_then_room():
+    p = _participant(identity="sip_+15559876543_ab12")
+    caller, dialed, _ = sip.extract_call_info("call-+15551234567", [p])
+    assert caller == "+15559876543"
+    assert dialed == "+15551234567"  # room name = dialed number (callee dispatch)
+
+
+def test_extract_call_info_room_only():
+    caller, dialed, _ = sip.extract_call_info("call-+15551234567", [])
+    assert caller == ""
+    assert dialed == "+15551234567"
 
 
 # --------------------------------------------------------------------------
-# TENANT_PHONE_MAP parsing + tenant resolution
+# Tenant resolution
 # --------------------------------------------------------------------------
-class TestTenantPhoneMap:
-    def test_parses_valid_json(self):
-        m = sip.parse_tenant_phone_map('{"+15551234567": "acme", "+15557654321": "glow"}')
-        assert m == {"+15551234567": "acme", "+15557654321": "glow"}
 
-    def test_normalizes_keys(self):
-        m = sip.parse_tenant_phone_map('{"+1 (555) 123-4567": "acme"}')
-        assert m == {"+15551234567": "acme"}
-
-    def test_invalid_json_yields_empty_map(self):
-        assert sip.parse_tenant_phone_map("{not json") == {}
-
-    def test_non_object_yields_empty_map(self):
-        assert sip.parse_tenant_phone_map('["+15551234567"]') == {}
-
-    def test_drops_non_e164_keys_and_empty_slugs(self):
-        m = sip.parse_tenant_phone_map(
-            '{"abc": "acme", "+15551234567": "", "+15557654321": "glow", "5551234": "x"}'
-        )
-        assert m == {"+15557654321": "glow"}
-
-    def test_empty_input(self):
-        assert sip.parse_tenant_phone_map("") == {}
-        assert sip.parse_tenant_phone_map(None) == {}
+def test_resolve_tenant_map_hit():
+    slug, src = sip.resolve_tenant("+1 555 123-4567", {"+15551234567": "acme"})
+    assert (slug, src) == ("acme", "map")
 
 
-class TestResolveTenant:
-    MAP = {"+15551234567": "acme", "+15557654321": "glow"}
+def test_resolve_tenant_default_fallback():
+    slug, src = sip.resolve_tenant("+19999999999", {"+15551234567": "acme"}, "frontdesk")
+    assert (slug, src) == ("frontdesk", "default")
 
-    def test_map_hit(self):
-        slug, source = sip.resolve_tenant("+1 555-123-4567", self.MAP)
-        assert (slug, source) == ("acme", "map")
 
-    def test_default_site_fallback(self):
-        slug, source = sip.resolve_tenant("+49999", self.MAP, default_site="front-desk")
-        assert (slug, source) == ("front-desk", "default")
-
-    def test_unmapped_without_default_raises(self):
-        with pytest.raises(sip.SipTenantResolutionError):
-            sip.resolve_tenant("+49999", self.MAP)
+def test_resolve_tenant_unmapped_rejected():
+    with pytest.raises(sip.SipTenantResolutionError):
+        sip.resolve_tenant("+19999999999", {})
 
 
 # --------------------------------------------------------------------------
-# SIP participant / room detection + call info extraction
+# Caller ID attachment — SPEC-W45 K15(c): CLAIMED, never confirmed
 # --------------------------------------------------------------------------
-class TestDetection:
-    def test_is_sip_room(self):
-        assert sip.is_sip_room("call-+15551234567")
-        assert not sip.is_sip_room("site-acme")
-        assert not sip.is_sip_room("")
 
-    def test_is_sip_participant_by_kind(self):
-        p = SimpleNamespace(kind=SimpleNamespace(name="SIP"), identity="abc", attributes={})
-        assert sip.is_sip_participant(p)
-
-    def test_is_sip_participant_by_identity(self):
-        p = SimpleNamespace(kind=None, identity="sip_+15551234567_xyz", attributes={})
-        assert sip.is_sip_participant(p)
-
-    def test_is_sip_participant_by_attributes(self):
-        p = SimpleNamespace(kind=None, identity="web-1", attributes={"sip.callID": "42"})
-        assert sip.is_sip_participant(p)
-
-    def test_web_participant_is_not_sip(self):
-        p = SimpleNamespace(kind=None, identity="web-1", attributes={})
-        assert not sip.is_sip_participant(p)
-        assert not sip.is_sip_participant(None)
+def test_attach_caller_id_marks_claimed_not_confirmed():
+    s = SessionState(conversation_id="c1", site_slug="acme")
+    assert sip.attach_caller_id(s, "+1 (555) 987-6543") is True
+    assert s.claimed_phone == "+15559876543"
+    # K15(c) / OOS-03: the carrier-asserted bypass is REMOVED — caller ID is
+    # not proof of possession, so no confirmed/verified phone is set.
+    assert s.confirmed_phone is None
+    assert s.verified_phone is None
+    assert s.pending_phone is None
 
 
-class TestExtractCallInfo:
-    def test_attributes_take_precedence(self):
-        p = SimpleNamespace(
-            kind=None,
-            identity="sip_+15551110000_x",
-            attributes={
-                "sip.phoneNumber": "+1 555-222-3333",
-                "sip.trunkPhoneNumber": "+15551234567",
-            },
-        )
-        caller, dialed, attrs = sip.extract_call_info("call-+15551234567", [p])
-        assert caller == "+15552223333"
-        assert dialed == "+15551234567"
-        assert attrs["sip.phoneNumber"].startswith("+1")
+def test_attach_caller_id_anonymous_noop():
+    s = SessionState(conversation_id="c1", site_slug="acme")
+    assert sip.attach_caller_id(s, "") is False
+    assert s.claimed_phone is None
 
-    def test_identity_fallback_for_caller(self):
-        p = SimpleNamespace(kind=None, identity="sip_+15552223333_ab12", attributes={})
-        caller, dialed, _ = sip.extract_call_info("call-+15551234567", [p])
-        assert caller == "+15552223333"
-        assert dialed == "+15551234567"  # from the room name
 
-    def test_room_name_only(self):
-        caller, dialed, _ = sip.extract_call_info("call-+15557654321", [])
-        assert caller == ""
-        assert dialed == "+15557654321"
+def test_attach_caller_id_does_not_clobber_confirmed():
+    s = SessionState(conversation_id="c1", site_slug="acme")
+    s.confirmed_phone = "+11111111111"
+    sip.attach_caller_id(s, "+12222222222")
+    assert s.confirmed_phone == "+11111111111"
+    assert s.claimed_phone == "+12222222222"
 
 
 # --------------------------------------------------------------------------
-# Caller-ID confirmation bypass (SIP caller ID IS the confirmation)
+# Full bootstrap
 # --------------------------------------------------------------------------
-class TestCallerIdBypass:
-    def test_attach_sets_confirmed_phone(self):
-        session = SessionState(conversation_id="c1", site_slug="acme")
-        assert sip.attach_caller_id(session, "+1 (555) 222-3333")
-        assert session.confirmed_phone == "+15552223333"
-        assert session.pending_phone is None
 
-    def test_bypass_skips_two_step_confirmation(self):
-        """A SIP session with an attached caller ID runs mutating tools
-        immediately — no confirmation_required round-trip."""
-        session = SessionState(conversation_id="c1", site_slug="acme")
-        sip.attach_caller_id(session, "+15552223333")
-        # No phone argument needed at all: the confirmed phone applies.
-        assert session.require_confirmed_phone(None) == "+15552223333"
-        # Same number re-issued by the model also passes straight through.
-        assert session.require_confirmed_phone("+15552223333") == "+15552223333"
-
-    def test_anonymous_caller_keeps_normal_policy(self):
-        session = SessionState(conversation_id="c1", site_slug="acme")
-        assert not sip.attach_caller_id(session, "")
-        with pytest.raises(PhoneConfirmationRequired):
-            session.require_confirmed_phone("+15559990000")
-
-    def test_bypass_scoped_to_sip_sessions(self):
-        """Without the SIP bootstrap (web path), the two-step policy holds."""
-        session = SessionState(conversation_id="c1", site_slug="acme")
-        with pytest.raises(PhoneConfirmationRequired):
-            session.require_confirmed_phone("+15552223333")
+def _settings(monkeypatch, phone_map="", default_site=""):
+    monkeypatch.setenv("TENANT_PHONE_MAP", phone_map)
+    monkeypatch.setenv("SIP_DEFAULT_SITE", default_site)
+    return load_settings()
 
 
-class TestBootstrap:
-    def test_full_inbound_bootstrap(self):
-        settings = _settings(phone_map={"+15551234567": "acme"})
-        p = SimpleNamespace(
-            kind=None,
-            identity="sip_+15552223333_x",
-            attributes={"sip.trunkPhoneNumber": "+15551234567"},
-        )
-        session = SessionState(conversation_id="c1", site_slug="")
-        ctx = sip.bootstrap_inbound_call(settings, "call-+15551234567", [p], session)
-        assert ctx.site_slug == "acme"
-        assert ctx.tenant_source == "map"
-        assert ctx.dialed_number == "+15551234567"
-        assert ctx.caller_phone == "+15552223333"
-        assert session.confirmed_phone == "+15552223333"
+def test_bootstrap_inbound_call_maps_tenant_and_claims_caller(monkeypatch):
+    settings = _settings(monkeypatch, '{"+15551234567": "acme"}')
+    p = _participant(
+        kind=SimpleNamespace(name="SIP"),
+        identity="sip_+15559876543_ab",
+        attributes={"sip.phoneNumber": "+15559876543"},
+    )
+    session = SessionState(conversation_id="c1", site_slug="")
+    ctx = sip.bootstrap_inbound_call(settings, "call-+15551234567", [p], session)
+    assert ctx.site_slug == "acme"
+    assert ctx.tenant_source == "map"
+    assert ctx.dialed_number == "+15551234567"
+    # K15(c): claimed (unverified) only.
+    assert session.claimed_phone == "+15559876543"
+    assert session.confirmed_phone is None
 
-    def test_unmapped_number_raises(self):
-        settings = _settings()
-        with pytest.raises(sip.SipTenantResolutionError):
-            sip.bootstrap_inbound_call(settings, "call-+49999000", [])
 
-    def test_default_site_used_when_unmapped(self):
-        settings = _settings(default_site="front-desk")
-        ctx = sip.bootstrap_inbound_call(settings, "call-+49999000", [])
-        assert ctx.site_slug == "front-desk"
-        assert ctx.tenant_source == "default"
+def test_bootstrap_inbound_call_unmapped_raises(monkeypatch):
+    settings = _settings(monkeypatch)
+    with pytest.raises(sip.SipTenantResolutionError):
+        sip.bootstrap_inbound_call(settings, "call-+19999999999", [])
+
+
+def test_bootstrap_inbound_call_default_site(monkeypatch):
+    settings = _settings(monkeypatch, default_site="frontdesk")
+    ctx = sip.bootstrap_inbound_call(settings, "call-+19999999999", [])
+    assert ctx.site_slug == "frontdesk"
+    assert ctx.tenant_source == "default"
 
 
 # --------------------------------------------------------------------------
-# SPEC-W38 F1: agents-registry-first resolution, fail-open to the legacy map
+# SPEC-W38 F1: registry-first resolution (resolve_agent_for_dialed)
 # --------------------------------------------------------------------------
-class _FakeRegistry:
-    """Scriptable stand-in for AgentsRegistryClient."""
 
-    def __init__(self, record=None):
-        self.record = record
-        self.calls: list[str] = []
+class _StubRegistry:
+    """Scriptable agents-registry client stand-in."""
 
-    async def resolve_agent_by_phone(self, phone: str):
+    def __init__(self, record=None, calls=None):
+        self._record = record
+        self.calls = calls if calls is not None else []
+
+    async def resolve_agent_by_phone(self, phone):
         self.calls.append(phone)
-        return self.record
+        return self._record
 
 
-def _record(tenant_slug="acme"):
-    from app.agents_registry import AgentRecord
-
-    return AgentRecord(
+def _agent_record(tenant_slug="acme"):
+    return SimpleNamespace(
         id="agent-1",
-        tenant_id="t-uuid",
         tenant_slug=tenant_slug,
-        name="Front Desk",
-        phone_number="+15551234567",
-        status="active",
+        tenant_id="t-uuid",
+        definition=None,
     )
 
 
-class TestRegistryResolution:
-    async def test_registry_hit_wins_over_env_map(self):
-        settings = _settings(phone_map={"+15551234567": "legacy-tenant"})
-        registry = _FakeRegistry(_record())
+async def test_registry_resolution_wins_over_map(monkeypatch):
+    settings = _settings(monkeypatch, '{"+15551234567": "map-tenant"}')
+    registry = _StubRegistry(_agent_record(tenant_slug="acme"))
+    slug, source, record = await sip.resolve_agent_for_dialed(
+        settings, "+15551234567", registry=registry
+    )
+    assert (slug, source) == ("acme", "registry")
+    assert record is not None and record.id == "agent-1"
+    assert registry.calls == ["+15551234567"]
+    assert metrics.get_registry().agent_resolution._series["registry"] == 1
+
+
+async def test_registry_miss_falls_back_to_map(monkeypatch):
+    settings = _settings(monkeypatch, '{"+15551234567": "acme"}')
+    registry = _StubRegistry(None)
+    slug, source, record = await sip.resolve_agent_for_dialed(
+        settings, "+15551234567", registry=registry
+    )
+    assert (slug, source) == ("acme", "map")
+    assert record is None
+    assert registry.calls == ["+15551234567"]  # consulted, failed open
+
+
+async def test_registry_down_falls_back_and_metrics_count(monkeypatch):
+    settings = _settings(monkeypatch, default_site="frontdesk")
+    slug, source, record = await sip.resolve_agent_for_dialed(
+        settings, "+19999999999", registry=_StubRegistry(None)
+    )
+    assert (slug, source) == ("frontdesk", "default")
+    assert record is None
+    assert metrics.get_registry().agent_resolution._series["default"] == 1
+
+
+async def test_no_registry_url_keeps_legacy_path(monkeypatch):
+    """Shared-client path: with AGENTS_REGISTRY_URL unset the legacy map is
+    used and no registry call happens (dev-mode compat)."""
+    from app import agents_registry
+
+    monkeypatch.setenv("TENANT_PHONE_MAP", '{"+15551234567": "acme"}')
+    monkeypatch.setenv("AGENTS_REGISTRY_URL", "")
+    agents_registry.set_registry_client(None)
+    settings = load_settings()
+    try:
         slug, source, record = await sip.resolve_agent_for_dialed(
-            settings, "+1 555-123-4567", registry=registry
+            settings, "+15551234567"
         )
-        assert (slug, source) == ("acme", "registry")
-        assert record is not None and record.id == "agent-1"
-        assert registry.calls == ["+15551234567"]
-
-    async def test_registry_miss_falls_back_to_env_map(self):
-        settings = _settings(phone_map={"+15551234567": "acme"})
-        registry = _FakeRegistry(None)  # 404 / network / timeout all land here
-        slug, source, record = await sip.resolve_agent_for_dialed(
-            settings, "+15551234567", registry=registry
-        )
-        assert (slug, source) == ("acme", "map")
-        assert record is None
-        assert registry.calls == ["+15551234567"]
-
-    async def test_registry_miss_falls_back_to_default_site(self):
-        settings = _settings(default_site="front-desk")
-        slug, source, record = await sip.resolve_agent_for_dialed(
-            settings, "+49999000", registry=_FakeRegistry(None)
-        )
-        assert (slug, source) == ("front-desk", "default")
-        assert record is None
-
-    async def test_no_registry_uses_legacy_path(self):
-        settings = _settings(phone_map={"+15551234567": "acme"})
-        slug, source, record = await sip.resolve_agent_for_dialed(
-            settings, "+15551234567", registry=None
-        )
-        assert (slug, source) == ("acme", "map")
-        assert record is None
-
-    async def test_registry_hit_without_slug_falls_back_for_slug(self):
-        """Registry resolved the agent but carried no tenant slug: the legacy
-        map/default still provides the slug, the record still rides along."""
-        settings = _settings(phone_map={"+15551234567": "acme"})
-        registry = _FakeRegistry(_record(tenant_slug=""))
-        slug, source, record = await sip.resolve_agent_for_dialed(
-            settings, "+15551234567", registry=registry
-        )
-        assert (slug, source) == ("acme", "registry")
-        assert record is not None
-
-    async def test_unmapped_everywhere_still_raises(self):
-        settings = _settings()
-        with pytest.raises(sip.SipTenantResolutionError):
-            await sip.resolve_agent_for_dialed(
-                settings, "+49999000", registry=_FakeRegistry(None)
-            )
-
-    async def test_bootstrap_async_attaches_record_and_caller(self):
-        settings = _settings()
-        registry = _FakeRegistry(_record())
-        p = SimpleNamespace(
-            kind=None,
-            identity="sip_+15552223333_x",
-            attributes={"sip.trunkPhoneNumber": "+15551234567"},
-        )
-        session = SessionState(conversation_id="c1", site_slug="")
-        ctx = await sip.bootstrap_inbound_call_async(
-            settings, "call-+15551234567", [p], session, registry=registry
-        )
-        assert ctx.site_slug == "acme"
-        assert ctx.tenant_source == "registry"
-        assert ctx.agent_record is not None
-        assert ctx.agent_record.id == "agent-1"
-        assert session.confirmed_phone == "+15552223333"
-
-    async def test_bootstrap_async_legacy_fallback_unchanged(self):
-        settings = _settings(phone_map={"+15551234567": "acme"})
-        ctx = await sip.bootstrap_inbound_call_async(
-            settings, "call-+15551234567", [], registry=_FakeRegistry(None)
-        )
-        assert ctx.site_slug == "acme"
-        assert ctx.tenant_source == "map"
-        assert ctx.agent_record is None
-
-    async def test_resolution_metric_recorded(self):
-        from app import metrics
-
-        registry = metrics.reset_registry()
-        settings = _settings(phone_map={"+15551234567": "acme"})
-        await sip.resolve_agent_for_dialed(
-            settings, "+15551234567", registry=_FakeRegistry(_record())
-        )
-        await sip.resolve_agent_for_dialed(
-            settings, "+15551234567", registry=_FakeRegistry(None)
-        )
-        rendered = registry.render()
-        assert 'voice_agent_resolution_total{source="registry"} 1' in rendered
-        assert 'voice_agent_resolution_total{source="env_map"} 1' in rendered
-        metrics.reset_registry()
+    finally:
+        agents_registry.set_registry_client(None)
+    assert (slug, source) == ("acme", "map")
+    assert record is None
 
 
-# --------------------------------------------------------------------------
-# Deploy YAML schemas (safe_load)
-# --------------------------------------------------------------------------
-class TestDeployYaml:
-    def test_dispatch_rule_schema(self):
-        doc = yaml.safe_load((SIP_DIR / "dispatch-rule.yaml").read_text())
-        assert doc["name"]
-        rule = doc["rule"]["dispatchRuleCallee"]
-        assert rule["roomPrefix"] == "call-"
-        assert rule["randomize"] is False
-        assert isinstance(doc.get("trunk_ids"), list)
-
-    def test_trunk_config_schema(self):
-        doc = yaml.safe_load((SIP_DIR / "trunk-config.example.yaml").read_text())
-        assert doc["name"]
-        numbers = doc["numbers"]
-        assert isinstance(numbers, list) and numbers
-        assert all(n.startswith("+") for n in numbers)
-
-    def test_setup_script_exists_and_uses_lk(self):
-        script = (SIP_DIR / "setup.sh").read_text()
-        assert "sip inbound create" in script
-        assert "sip dispatch create" in script
-        assert "LK_URL" in script and "LK_KEY" in script and "LK_SECRET" in script
+async def test_bootstrap_async_carries_agent_record(monkeypatch):
+    settings = _settings(monkeypatch)
+    record = _agent_record(tenant_slug="acme")
+    p = _participant(
+        kind=SimpleNamespace(name="SIP"),
+        attributes={"sip.phoneNumber": "+15559876543"},
+    )
+    ctx = await sip.bootstrap_inbound_call_async(
+        settings, "call-+15551234567", [p], registry=_StubRegistry(record)
+    )
+    assert ctx.site_slug == "acme"
+    assert ctx.tenant_source == "registry"
+    assert ctx.agent_record is record
+    assert ctx.caller_phone == "+15559876543"

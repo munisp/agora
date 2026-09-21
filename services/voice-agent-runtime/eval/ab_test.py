@@ -1,267 +1,171 @@
-"""A/B prompt testing (Wave 5 #8, STRATEGY §3).
+"""A/B prompt testing harness (Wave 5 #8).
 
-Runs two persona variants across ALL eval scenarios against the live
-`POST /voice/chat` endpoint and lets the LLM judge pick a winner:
+Pairs two persona variants (A = control, B = candidate) against the eval
+scenario set via POST /voice/chat `persona_override`, scores every turn with
+the LLM judge and prints a per-scenario/per-turn comparison table plus the
+mean judge score per variant (accuracy proxy: 5.0 = fully meets the turn
+criterion, matching the eval harness scale).
 
-- **A** = the tenant's current persona (resolved server-side from the
-  industry pack, exactly as production serves it).
-- **B** = a candidate persona from `eval/personas/*.md`, injected per request
-  via the `persona_override` chat field. The runtime only honors that field
-  when started with `EVAL_PERSONA_OVERRIDE=true` (default off — it is a
-  prompt-injection surface on a public endpoint).
-
-Scoring: every turn of every scenario is scored 1-5 by the same LLM judge
-as eval.py. Summary = mean score per variant + per-scenario win rate
-(a scenario is "won" by the variant with the higher mean; ties count ½).
-`--promote` writes the winner to `eval/promoted/{tenant}.md` (drop-in
-replacement for the pack persona) and prints the recommendation.
+Requires the runtime started with EVAL_PERSONA_OVERRIDE=true (off by
+default — the override is an eval-only backdoor).
 
 Usage:
-    EVAL_PERSONA_OVERRIDE=true on the voice runtime, then:
-    python3 eval/ab_test.py --tenant acme --persona-b eval/personas/salon_warm_concise.md
-    python3 eval/ab_test.py --tenant acme --persona-b ... --promote
-    make ab-test AB_ARGS="--tenant acme --persona-b eval/personas/salon_warm_concise.md"
+    python eval/ab_test.py --base-url http://localhost:7006 \
+        --control prompts/persona_default.txt --variant prompts/persona_v2.txt
 
-Env: VOICE_BASE_URL, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY (same family as eval.py).
+Env: VOICE_BASE_URL, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY (same family as
+     eval/eval.py — Ollama qwen3:8b works out of the box).
 """
 from __future__ import annotations
 
-import argparse, json, os, sys, time, uuid
+import argparse
+import json
+import os
+import sys
+import time
+import uuid
 from pathlib import Path
 
+import httpx
+import yaml
+
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+JUDGE_PROMPT = """You are judging an AI receptionist turn. Score 1-5 (5 = fully meets the criterion).
+Criterion: {criteria}
 
-import eval as base_eval  # noqa: E402  (scenarios + judge shared with eval.py)
+Caller said: {user}
+Agent replied: {reply}
 
-MIN_SCORE_GAP = 0.25  # minimum mean-score advantage for a promote recommendation
+Answer with ONLY JSON: {{"score": <1-5>, "rationale": "<one sentence>"}}"""
 
 
-def run_variant(
-    scenarios: list[dict],
-    *,
-    variant: str,
-    persona: str | None,
-    chat_fn,
-    judge_fn=None,
-) -> list[dict]:
-    """Replay every scenario turn for one persona variant.
+def load_scenarios() -> list[dict]:
+    return [yaml.safe_load(f.read_text())
+            for f in sorted((HERE / "scenarios").glob("*.yaml"))]
 
-    ``chat_fn(site_slug, message, conversation_id, persona_override)`` ->
-    (reply, tools_called). ``judge_fn(turn, reply, tools_called)`` ->
-    {"score": 1..5|None, "rationale": str}. Returns one record per turn."""
-    results = []
+
+def load_persona(ref: str) -> str:
+    """Persona text from a file path or a raw inline string."""
+    p = Path(ref)
+    if p.is_file():
+        return p.read_text().strip()
+    return ref
+
+
+def judge(client, base_url, model, api_key, criteria, user, reply) -> dict:
+    try:
+        r = client.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers={"authorization": f"Bearer {api_key}"},
+            json={"model": model, "temperature": 0.0, "messages": [{
+                "role": "user",
+                "content": JUDGE_PROMPT.format(criteria=criteria, user=user, reply=reply)}]},
+            timeout=30.0)
+        content = r.json()["choices"][0]["message"]["content"]
+        start, end = content.find("{"), content.rfind("}")
+        parsed = json.loads(content[start:end + 1])
+        return {"score": max(1, min(5, int(parsed.get("score", 1)))),
+                "rationale": str(parsed.get("rationale", ""))}
+    except Exception as exc:
+        return {"score": None, "rationale": f"judge unavailable: {exc}"}
+
+
+def run_variant(client, base_url, scenarios, persona, judge_args, label) -> dict:
+    """Replay the scenario set with a persona override; return turn results."""
+    out = {"label": label, "persona_chars": len(persona), "scenarios": {}}
     for sc in scenarios:
         conv_id = str(uuid.uuid4())
+        secret = None  # K15(b): round-trip the resume credential.
+        turns = []
         for turn in sc["turns"]:
-            error = None
+            reply, error = "", None
             try:
-                reply, tools = chat_fn(
-                    sc["site_slug"], turn["say"], conv_id, persona
-                )
-            except Exception as exc:  # noqa: BLE001 - record and continue
-                reply, tools, error = "", [], str(exc)
-            verdict = (
-                judge_fn(turn, reply, tools)
-                if judge_fn is not None and error is None
-                else {"score": None, "rationale": "judge off" if judge_fn is None else error}
-            )
-            results.append(
-                {
-                    "variant": variant,
-                    "scenario": sc["id"],
-                    "say": turn["say"],
-                    "reply": reply,
-                    "tools_called": tools,
-                    "score": verdict.get("score"),
-                    "rationale": verdict.get("rationale", ""),
-                    "error": error,
+                payload = {
+                    "site_slug": sc["site_slug"],
+                    "message": turn["say"],
+                    "conversation_id": conv_id,
+                    "persona_override": persona,
                 }
-            )
-    return results
+                if secret:
+                    payload["session_secret"] = secret
+                r = client.post(f"{base_url}/voice/chat", json=payload)
+                r.raise_for_status()
+                body = r.json()
+                reply = body.get("reply", "")
+                secret = body.get("session_secret") or secret
+            except Exception as exc:
+                error = str(exc)
+            verdict = None
+            if error is None:
+                verdict = judge(client, *judge_args, turn.get("judge", ""),
+                                turn["say"], reply)
+            turns.append({"say": turn["say"], "reply": reply, "error": error,
+                          "judge": verdict})
+        out["scenarios"][sc["id"]] = turns
+    return out
 
 
-def _mean(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
-
-
-def aggregate(results: list[dict]) -> dict:
-    """Statistical summary: mean score per variant (overall + per scenario),
-    per-scenario winners and win rates. Turns without a judge score are
-    excluded from the means (counted separately)."""
-    variants = sorted({r["variant"] for r in results})
-    summary: dict = {"variants": {}, "scenarios": {}}
-    for v in variants:
-        vrs = [r for r in results if r["variant"] == v]
-        scored = [r["score"] for r in vrs if isinstance(r["score"], (int, float))]
-        errors = sum(1 for r in vrs if r["error"])
-        summary["variants"][v] = {
-            "turns": len(vrs),
-            "scored_turns": len(scored),
-            "errors": errors,
-            "mean": round(_mean(scored), 3),
-        }
-    for sid in sorted({r["scenario"] for r in results}):
-        per_v = {}
-        for v in variants:
-            scored = [
-                r["score"]
-                for r in results
-                if r["scenario"] == sid
-                and r["variant"] == v
-                and isinstance(r["score"], (int, float))
-            ]
-            per_v[v] = _mean(scored) if scored else None
-        ranked = [m for m in per_v.values() if m is not None]
-        if not ranked:
-            winner = None
-        else:
-            best = max(ranked)
-            leaders = [v for v, m in per_v.items() if m == best]
-            winner = leaders[0] if len(leaders) == 1 else "tie"
-        summary["scenarios"][sid] = {"means": per_v, "winner": winner}
-    # Win rate: scenarios won per variant; a tie awards ½ to each leader.
-    n_sc = len(summary["scenarios"])
-    for v in variants:
-        wins = 0.0
-        for sc in summary["scenarios"].values():
-            w = sc["winner"]
-            if w == v:
-                wins += 1.0
-            elif w == "tie":
-                wins += 0.5
-        summary["variants"][v]["scenarios_won"] = wins
-        summary["variants"][v]["win_rate"] = round(wins / n_sc, 3) if n_sc else 0.0
-    return summary
-
-
-def recommend(summary: dict, *, a: str = "A", b: str = "B") -> dict:
-    """Promotion decision: B is recommended when its overall mean beats A's
-    by at least MIN_SCORE_GAP AND it wins strictly more scenarios than A.
-    Anything else keeps the incumbent (conservative default)."""
-    va, vb = summary["variants"].get(a, {}), summary["variants"].get(b, {})
-    gap = round(vb.get("mean", 0.0) - va.get("mean", 0.0), 3)
-    won_more = vb.get("scenarios_won", 0.0) > va.get("scenarios_won", 0.0)
-    promote = gap >= MIN_SCORE_GAP and won_more
-    rationale = (
-        f"B mean {vb.get('mean', 0):.2f} vs A mean {va.get('mean', 0):.2f} "
-        f"(gap {gap:+.2f}, need ≥ +{MIN_SCORE_GAP}); scenarios "
-        f"{vb.get('scenarios_won', 0):.1f} vs {va.get('scenarios_won', 0):.1f}"
-    )
-    return {
-        "promote": promote,
-        "winner": b if promote else a,
-        "gap": gap,
-        "rationale": rationale,
-    }
-
-
-def promote_persona(tenant: str, persona: str, out_dir: Path | None = None) -> Path:
-    """Write the winning persona to eval/promoted/{tenant}.md — the drop-in
-    replacement for the tenant pack's agentPersona."""
-    out = (out_dir or HERE / "promoted")
-    out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{tenant}.md"
-    header = (
-        f"# Promoted persona — tenant `{tenant}`\n"
-        f"<!-- generated by eval/ab_test.py "
-        f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}; "
-        "copy the body into the industry pack `agentPersona` to apply -->\n\n"
-    )
-    path.write_text(header + persona.strip() + "\n")
-    return path
+def mean_score(result: dict) -> float | None:
+    scores = [t["judge"]["score"] for turns in result["scenarios"].values()
+              for t in turns if t["judge"] and t["judge"]["score"] is not None]
+    return round(sum(scores) / len(scores), 2) if scores else None
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--tenant", required=True, help="tenant slug (names the promoted file)")
-    ap.add_argument("--persona-b", required=True, help="candidate persona markdown (eval/personas/*.md)")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default=os.environ.get("VOICE_BASE_URL", "http://localhost:7006"))
+    ap.add_argument("--control", required=True, help="persona A (file path or text)")
+    ap.add_argument("--variant", required=True, help="persona B (file path or text)")
     ap.add_argument("--no-judge", action="store_true")
-    ap.add_argument("--promote", action="store_true", help="write the winner to eval/promoted/{tenant}.md")
     args = ap.parse_args()
 
-    persona_b_path = Path(args.persona_b)
-    persona_b = persona_b_path.read_text().strip()
-    scenarios = base_eval.load_scenarios()
+    judge_args = (os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
+                  os.environ.get("LLM_MODEL", "qwen3:8b"),
+                  os.environ.get("LLM_API_KEY", "ollama"))
+    persona_a, persona_b = load_persona(args.control), load_persona(args.variant)
+    scenarios = load_scenarios()
     if not scenarios:
-        print("[ab] no scenarios found", file=sys.stderr)
-        return 2
-
-    import httpx
-
-    llm_base = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
-    llm_model = os.environ.get("LLM_MODEL", "qwen3:8b")
-    llm_key = os.environ.get("LLM_API_KEY", "ollama")
+        print("[ab] no scenarios found under eval/scenarios/", file=sys.stderr)
+        return 1
 
     with httpx.Client(timeout=60.0) as client:
-        def chat_fn(site_slug, message, conversation_id, persona_override):
-            body = {
-                "site_slug": site_slug,
-                "message": message,
-                "conversation_id": conversation_id,
-            }
-            if persona_override:
-                body["persona_override"] = persona_override
-            r = client.post(f"{args.base_url.rstrip('/')}/voice/chat", json=body)
-            r.raise_for_status()
-            payload = r.json()
-            return payload.get("reply", ""), [
-                t.get("tool") for t in payload.get("tool_calls", [])
-            ]
+        res_a = run_variant(client, args.base_url, scenarios, persona_a,
+                            judge_args, "A(control)")
+        res_b = run_variant(client, args.base_url, scenarios, persona_b,
+                            judge_args, "B(variant)")
 
-        judge_fn = None
-        if not args.no_judge:
-            def judge_fn(turn, reply, tools):  # noqa: F811
-                return base_eval.judge(
-                    client, llm_base, llm_model, llm_key,
-                    turn.get("judge", ""), turn["say"], reply, tools,
-                )
+    # Comparison table.
+    print(f"\n# A/B prompt comparison — {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}")
+    print(f"base: {args.base_url}  judge: {'off' if args.no_judge else judge_args[1]}\n")
+    print(f"{'scenario':<28} {'turn':<38} {'A':>3} {'B':>3}  winner")
+    print("-" * 84)
+    for sid in res_a["scenarios"]:
+        for i, (ta, tb) in enumerate(zip(res_a["scenarios"][sid],
+                                         res_b["scenarios"][sid])):
+            sa = ta["judge"]["score"] if ta["judge"] else None
+            sb = tb["judge"]["score"] if tb["judge"] else None
+            if sa is None or sb is None:
+                winner = "?"
+            elif sb > sa:
+                winner = "B"
+            elif sa > sb:
+                winner = "A"
+            else:
+                winner = "="
+            say = ta["say"][:36]
+            print(f"{sid:<28} {say:<38} {str(sa):>3} {str(sb):>3}  {winner}")
+    ma, mb = mean_score(res_a), mean_score(res_b)
+    print("-" * 84)
+    print(f"mean judge score:  A = {ma}   B = {mb}   "
+          + ("B wins" if (mb or 0) > (ma or 0)
+             else "A wins" if (ma or 0) > (mb or 0) else "tie"))
 
-        results = run_variant(
-            scenarios, variant="A", persona=None, chat_fn=chat_fn, judge_fn=judge_fn
-        ) + run_variant(
-            scenarios, variant="B", persona=persona_b, chat_fn=chat_fn, judge_fn=judge_fn
-        )
-
-    summary = aggregate(results)
-    decision = recommend(summary)
-
-    lines = [
-        "# A/B persona eval report", "",
-        f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
-        f"Tenant: {args.tenant} | B candidate: {persona_b_path.name} | "
-        f"Judge: {'off' if args.no_judge else llm_model}", "",
-        f"| Variant | Mean | Scenarios won | Win rate | Errors |",
-        f"|---|---|---|---|---|",
-    ]
-    for v, stats in summary["variants"].items():
-        lines.append(
-            f"| {v} | {stats['mean']:.2f} | {stats['scenarios_won']:.1f} | "
-            f"{stats['win_rate']:.0%} | {stats['errors']} |"
-        )
-    lines += ["", "## Per-scenario means", ""]
-    for sid, sc in summary["scenarios"].items():
-        means = ", ".join(
-            f"{v}={m:.2f}" if m is not None else f"{v}=n/a"
-            for v, m in sc["means"].items()
-        )
-        lines.append(f"- **{sid}**: {means} → winner: {sc['winner']}")
-    lines += ["", f"**Recommendation: {'PROMOTE B' if decision['promote'] else 'KEEP A'}** "
-              f"({decision['rationale']})", ""]
-    (HERE / "ab_report.md").write_text("\n".join(lines))
-    print(f"[ab] wrote {HERE / 'ab_report.md'}")
-    print(f"[ab] recommendation: {'PROMOTE B' if decision['promote'] else 'KEEP A'} — {decision['rationale']}")
-
-    if args.promote:
-        winner_persona = persona_b if decision["promote"] else ""
-        if not winner_persona:
-            print("[ab] not promoting: A keeps the incumbent persona; "
-                  "eval/promoted not written", file=sys.stderr)
-            return 1
-        path = promote_persona(args.tenant, winner_persona)
-        print(f"[ab] promoted B persona -> {path}")
-    return 0 if decision["promote"] or not args.promote else 1
+    report = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "mean": {"A": ma, "B": mb}, "A": res_a, "B": res_b}
+    out_path = HERE / "ab_report.json"
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    print(f"[ab] wrote {out_path}")
+    return 0
 
 
 if __name__ == "__main__":
