@@ -228,6 +228,30 @@ impl AuthConfig {
         }
         Err(AuthRejection::RoleForbidden)
     }
+
+    /// SPEC-W45 K20: approving an above-threshold payout requires the
+    /// `owner` role specifically (admin alone is not enough for the largest
+    /// movements). Same posture as `require_money_role`: a valid internal
+    /// token fully authenticates (service caller), a wrong one is 401, the
+    /// headerless dev escape allows, everything else is 403.
+    pub fn require_owner_role(&self, headers: &HeaderMap) -> Result<(), AuthRejection> {
+        if let Some(presented) = self.presented_token(headers) {
+            if self.internal_token.is_some() {
+                if self.token_matches(presented) {
+                    return Ok(());
+                }
+                return Err(AuthRejection::Unauthorized);
+            }
+        }
+        if self.user_roles(headers).iter().any(|r| r == "owner") {
+            return Ok(());
+        }
+        let roles_header_present = headers.contains_key(USER_ROLES_HEADER);
+        if self.trust_direct_tenant && !roles_header_present {
+            return Ok(());
+        }
+        Err(AuthRejection::RoleForbidden)
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +473,37 @@ mod tests {
         let h = headers_with(&[("x-user-roles", "member")]);
         assert_eq!(
             a.require_money_role(&h),
+            Err(AuthRejection::RoleForbidden)
+        );
+    }
+
+    // ---------------- require_owner_role matrix (SPEC-W45 K20) ----------------
+
+    #[test]
+    fn owner_role_required_for_above_threshold_approval() {
+        let a = auth(Some("s3cret"), false);
+        // owner passes; admin (a money role but not owner) does not.
+        let h = headers_with(&[("x-user-roles", "owner")]);
+        assert_eq!(a.require_owner_role(&h), Ok(()));
+        let h = headers_with(&[("x-user-roles", "admin")]);
+        assert_eq!(
+            a.require_owner_role(&h),
+            Err(AuthRejection::RoleForbidden)
+        );
+        // Valid internal token exempt (service caller); wrong token is 401.
+        let h = headers_with(&[("x-internal-token", "s3cret")]);
+        assert_eq!(a.require_owner_role(&h), Ok(()));
+        let h = headers_with(&[("x-internal-token", "wrong"), ("x-user-roles", "owner")]);
+        assert_eq!(
+            a.require_owner_role(&h),
+            Err(AuthRejection::Unauthorized)
+        );
+        // Headerless dev escape allows; a present-but-insufficient header 403s.
+        let a = auth(None, true);
+        assert_eq!(a.require_owner_role(&HeaderMap::new()), Ok(()));
+        let h = headers_with(&[("x-user-roles", "admin")]);
+        assert_eq!(
+            a.require_owner_role(&h),
             Err(AuthRejection::RoleForbidden)
         );
     }
