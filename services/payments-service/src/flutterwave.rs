@@ -132,6 +132,72 @@ impl FlutterwaveAdapter {
         self.secret_hash.as_deref()
     }
 
+    /// SPEC-W45 K12: whether the rail is configured (a non-empty
+    /// FLUTTERWAVE_SECRET_KEY). When false, refund callers must take the
+    /// honest `queued_manual` path instead of attempting the provider.
+    pub fn configured(&self) -> bool {
+        !self.secret_key.is_empty()
+    }
+
+    /// SPEC-W45 K12: refund a charge server-side
+    /// (`POST /transactions/{id}/refund`). `amount_cents = None` refunds the
+    /// full charge; a partial amount is sent as an exact major-unit decimal
+    /// string (integer minor-unit math, never floats). Retry-safety: the
+    /// caller's idempotency key makes the ledger side replay-safe, and the
+    /// durable `rail_attempts` record (transfers.rs) short-circuits replays
+    /// BEFORE this is called again, so the provider sees one attempt per
+    /// logical refund. A non-success envelope or HTTP status is a
+    /// [`FlutterwaveError::Rejected`] — the caller records `queued_manual`
+    /// with the detail rather than claiming a refund.
+    pub async fn refund_transaction(
+        &self,
+        id: u64,
+        amount_cents: Option<u64>,
+    ) -> Result<FwRefundData, FlutterwaveError> {
+        if self.secret_key.is_empty() {
+            return Err(FlutterwaveError::Rejected(
+                "FLUTTERWAVE_SECRET_KEY is not configured".to_string(),
+            ));
+        }
+        let url = format!("{}/transactions/{}/refund", self.base_url, id);
+        // ASSUMPTION (no live keys in this wave): the v3 refund endpoint
+        // accepts an optional {"amount": "<major units>"} body and answers
+        // {status:"success", data:{id, tx_ref, amount_refunded?, currency,
+        // status}}. Marked per the ASSUMPTION convention above.
+        let body = match amount_cents {
+            Some(cents) => serde_json::json!({ "amount": minor_to_decimal(cents) }),
+            None => serde_json::json!({}),
+        };
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(&self.secret_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(FlutterwaveError::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(FlutterwaveError::Rejected(format!(
+                "refund transaction {id} failed: {status}: {body}"
+            )));
+        }
+        let parsed: FwRefundResponse = resp.json().await.map_err(FlutterwaveError::Http)?;
+        if parsed.status != "success" {
+            return Err(FlutterwaveError::Rejected(format!(
+                "refund transaction {id}: status={} {}",
+                parsed.status,
+                parsed.message.unwrap_or_default()
+            )));
+        }
+        Ok(parsed.data.unwrap_or(FwRefundData {
+            id: Some(id),
+            tx_ref: None,
+            status: None,
+        }))
+    }
+
     /// P-04 (contract C4): verify a charge server-side
     /// (`GET /transactions/{id}/verify`) before capturing. Only the VERIFIED
     /// charged amount may capture a hold; the webhook never trusts the
@@ -254,6 +320,28 @@ struct FwVerifyResponse {
     #[serde(default)]
     message: Option<String>,
     data: FwVerifiedTransaction,
+}
+
+/// ASSUMPTION: v3 refund envelope (SPEC-W45 K12).
+#[derive(Debug, Deserialize)]
+struct FwRefundResponse {
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    data: Option<FwRefundData>,
+}
+
+/// Server-side refund facts returned by the provider (K12). All fields are
+/// optional: the success envelope is the authoritative signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FwRefundData {
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub tx_ref: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Server-side verified charge facts (P-04).
@@ -776,6 +864,7 @@ mod tests {
             database_url: None,
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
+            payout_approval_threshold_cents: 0,
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -800,6 +889,7 @@ mod tests {
             ),
             payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
+            transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),
@@ -1013,5 +1103,82 @@ mod tests {
             .map(|a| a.posted_net)
             .unwrap_or(0);
         assert_eq!(revenue, 0, "unverifiable charge must not move money");
+    }
+
+    // ------------------------------------------------------------------
+    // SPEC-W45 K12: refund_transaction against a stub v3 rail (the existing
+    // mock-HTTP seam — same axum-stub idiom as spawn_verify_stub).
+    // ------------------------------------------------------------------
+
+    /// Stub POST /transactions/:id/refund with a fixed envelope.
+    async fn spawn_refund_stub(status: &'static str, http_ok: bool) -> String {
+        async fn ok_handler(
+            axum::extract::State(s): axum::extract::State<&'static str>,
+            axum::extract::Path(_id): axum::extract::Path<u64>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "status": s,
+                "message": "refund queued",
+                "data": {"id": 123, "tx_ref": "fw-x", "status": "processed"}
+            }))
+        }
+        async fn err_handler() -> (StatusCode, Json<serde_json::Value>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"status":"error","message":"transaction already refunded","data":null})),
+            )
+        }
+        let app = if http_ok {
+            Router::new()
+                .route("/transactions/:id/refund", axum::routing::post(ok_handler))
+                .with_state(status)
+        } else {
+            Router::new().route("/transactions/:id/refund", axum::routing::post(err_handler))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn refund_transaction_success_envelope() {
+        let base = spawn_refund_stub("success", true).await;
+        let ad = FlutterwaveAdapter::with_credentials(&base, "sk_test", None, None);
+        let data = ad.refund_transaction(123, Some(1_200)).await.unwrap();
+        assert_eq!(data.id, Some(123));
+    }
+
+    #[tokio::test]
+    async fn refund_transaction_provider_rejection_is_error_not_success() {
+        // Envelope status != "success" => Rejected (the caller records
+        // queued_manual; it must NEVER mark refunded on a provider failure).
+        let base = spawn_refund_stub("error", true).await;
+        let ad = FlutterwaveAdapter::with_credentials(&base, "sk_test", None, None);
+        assert!(matches!(
+            ad.refund_transaction(123, None).await,
+            Err(FlutterwaveError::Rejected(_))
+        ));
+        // HTTP-level failure is also a Rejected, not a silent success.
+        let base = spawn_refund_stub("success", false).await;
+        let ad = FlutterwaveAdapter::with_credentials(&base, "sk_test", None, None);
+        assert!(matches!(
+            ad.refund_transaction(123, Some(100)).await,
+            Err(FlutterwaveError::Rejected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn refund_transaction_unconfigured_key_fails_closed() {
+        let ad = FlutterwaveAdapter::with_credentials("http://127.0.0.1:1", "", None, None);
+        assert!(!ad.configured());
+        assert!(matches!(
+            ad.refund_transaction(123, None).await,
+            Err(FlutterwaveError::Rejected(_))
+        ));
+        let ad = FlutterwaveAdapter::with_credentials("http://127.0.0.1:1", "sk", None, None);
+        assert!(ad.configured());
     }
 }
