@@ -230,23 +230,23 @@ fn require_money_role(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError
 /// K2: internal token), and the request transaction runs with the RLS GUC
 /// pinned to that tenant — a cross-tenant id is a 403 after a successful
 /// lookup, never a leak.
+///
+/// SPEC-W46 R8: ONE transaction, ONE query roundtrip — the combined
+/// `set_config + SELECT` (invoices::get_invoice_pin_tenant) replaces the old
+/// lookup-tx + commit + bind + second-tx + re-read chain (6-8 RTTs, two
+/// BEGIN/COMMIT pairs per request). Write paths then use
+/// UPDATE...RETURNING (transition_invoice / mark_paid_idempotent), so the
+/// row fetched here is never re-read on the hot path either.
 async fn begin_scoped_invoice_tx(
     st: &AppState,
     headers: &HeaderMap,
     id: Uuid,
 ) -> Result<(Transaction<'static, Postgres>, Invoice), ApiError> {
-    let mut lookup_tx = tenant::begin_internal_tx(&st.internal_pool).await?;
-    let looked_up = invoices::get_invoice(&mut lookup_tx, id).await?;
-    lookup_tx.commit().await?;
-    let inv = looked_up
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("invoice not found: {id}")))?;
-    bind_tenant(st, headers, inv.tenant_id).await?;
-    let mut tx = tenant::begin_tenant_tx(&st.pool, inv.tenant_id).await?;
-    // Re-read inside the tenant-scoped transaction (the row visible under
-    // RLS is authoritative for the mutation).
-    let inv = invoices::get_invoice(&mut tx, id)
+    let mut tx = tenant::begin_internal_tx(&st.internal_pool).await?;
+    let inv = invoices::get_invoice_pin_tenant(&mut tx, id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("invoice not found: {id}")))?;
+    bind_tenant(st, headers, inv.tenant_id).await?;
     Ok((tx, inv))
 }
 
@@ -297,7 +297,17 @@ pub struct BillingEmailBody {
 pub struct ListParams {
     pub tenant_id: Uuid,
     pub status: Option<String>,
+    /// SPEC-W46 R10: page size (default 50, max 200) and keyset cursor from
+    /// the previous page's last item (`{unix_micros}:{uuid}`, see
+    /// invoices::InvoiceCursor). Both optional — old clients get the same
+    /// response shape, just bounded.
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
 }
+
+/// R10 list bounds: unbounded invoice lists grew linearly with tenant age.
+pub const LIST_INVOICES_DEFAULT_LIMIT: i64 = 50;
+pub const LIST_INVOICES_MAX_LIMIT: i64 = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct PaymentLinkBody {
@@ -377,6 +387,10 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             require_internal_token,
         ))
+        // SPEC-W46 R19: gzip/br response compression (negotiated via
+        // Accept-Encoding). Outermost layer so it sees the final response;
+        // large list_invoices pages are the main win.
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }
 
@@ -663,8 +677,24 @@ async fn list_invoices(
         ),
         None => None,
     };
+    let limit = match params.limit {
+        None => LIST_INVOICES_DEFAULT_LIMIT,
+        Some(n) if n >= 1 && n <= LIST_INVOICES_MAX_LIMIT => n,
+        Some(n) => {
+            return Err(ApiError::bad_request(format!(
+                "limit must be in 1..={LIST_INVOICES_MAX_LIMIT} (got {n})"
+            )))
+        }
+    };
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            invoices::InvoiceCursor::decode(raw)
+                .ok_or_else(|| ApiError::bad_request("malformed cursor (expected {unix_micros}:{uuid})"))?,
+        ),
+    };
     let mut tx = tenant::begin_tenant_tx(&st.pool, params.tenant_id).await?;
-    let inv = invoices::list_invoices(&mut tx, params.tenant_id, status).await?;
+    let inv = invoices::list_invoices(&mut tx, params.tenant_id, status, limit, cursor).await?;
     tx.commit().await?;
     Ok(Json(inv))
 }
@@ -686,10 +716,7 @@ async fn issue_invoice(
 ) -> Result<Json<Invoice>, ApiError> {
     let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
     require_money_role(&st, &headers)?;
-    invoices::transition_invoice(&mut tx, id, InvoiceStatus::Issued).await?;
-    let updated = invoices::get_invoice(&mut tx, id)
-        .await?
-        .ok_or_else(|| ApiError::internal("invoice vanished after issue"))?;
+    let (_prev, updated) = invoices::transition_invoice(&mut tx, id, InvoiceStatus::Issued).await?;
     // Ledger: invoice issued -> DR AR-control / CR revenue (code 200).
     // Zero-amount invoices skip the posting (the ledger rejects 0).
     // SPEC-W43 B-03: the postgres ledger posts INSIDE this transaction, so
@@ -732,7 +759,7 @@ async fn void_invoice(
 ) -> Result<Json<Invoice>, ApiError> {
     let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
     require_money_role(&st, &headers)?;
-    let prev = invoices::transition_invoice(&mut tx, id, InvoiceStatus::Void).await?;
+    let (prev, updated) = invoices::transition_invoice(&mut tx, id, InvoiceStatus::Void).await?;
     // SPEC-W43 B-02: voiding an ISSUED/PAST_DUE invoice must unwind its
     // receivable — reversing entry DR revenue / CR AR (deterministic
     // transfer id `billing-void:{invoice_id}`, so retries replay) plus an
@@ -785,9 +812,6 @@ async fn void_invoice(
             post_after_commit = enlisted.is_none();
         }
     }
-    let updated = invoices::get_invoice(&mut tx, id)
-        .await?
-        .ok_or_else(|| ApiError::internal("invoice vanished after void"))?;
     tx.commit().await?;
     if post_after_commit {
         // Dev-only sim backend could not enlist in the transaction.
@@ -959,11 +983,13 @@ async fn paystack_webhook(
     // Idempotent paid transition: already-paid is a 200 replay (B3).
     // GF6: the webhook has no tenant header — it authenticates via the
     // Paystack HMAC signature instead. The invoice lookup therefore runs on
-    // the internal pool (role-gated cross-tenant access); once the row is
-    // found, `app.tenant_id` is pinned to the invoice's own tenant for the
-    // transition, so the write path stays tenant-scoped even here.
+    // the internal pool (role-gated cross-tenant access); the lookup pins
+    // `app.tenant_id` to the invoice's own tenant in the same statement, so
+    // the write path stays tenant-scoped even here.
     let mut tx = tenant::begin_internal_tx(&st.internal_pool).await?;
-    let looked_up = match invoices::get_invoice(&mut tx, invoice_id).await {
+    // R8: the lookup pins `app.tenant_id` to the invoice's own tenant in the
+    // SAME statement (set_config + SELECT, one roundtrip).
+    let looked_up = match invoices::get_invoice_pin_tenant(&mut tx, invoice_id).await {
         Ok(inv) => inv,
         Err(e) => {
             let _ = tx.rollback().await;
@@ -976,7 +1002,6 @@ async fn paystack_webhook(
         tracing::warn!(invoice_id = %invoice_id, "paystack webhook: invoice not found");
         return Ok((StatusCode::OK, Json(serde_json::json!({ "status": "ignored" }))));
     };
-    tenant::set_tenant_guc(&mut tx, inv.tenant_id).await?;
 
     // SPEC-W43 B-01: a charge against a VOID invoice can never settle it
     // (void is terminal; attempting the transition 409'd and Paystack kept
@@ -1088,10 +1113,9 @@ async fn paystack_webhook(
             tx.commit().await?;
             Ok((StatusCode::OK, Json(serde_json::json!({ "status": "already_paid" }))))
         }
-        Ok(Some(_prev)) => {
-            let inv = invoices::get_invoice(&mut tx, invoice_id)
-                .await?
-                .ok_or_else(|| ApiError::internal("invoice vanished after payment"))?;
+        Ok(Some((_prev, inv))) => {
+            // R12: the updated row came back with the UPDATE...RETURNING —
+            // no post-transition re-read.
             // RS-001: the InvoicePaid CloudEvent is written to the durable
             // outbox INSIDE the same transaction as the paid transition, so
             // the event can never be silently lost (topic unprovisioned,
