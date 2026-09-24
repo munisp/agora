@@ -16,11 +16,13 @@ tenant; unset = dev mode, the ``X-Tenant-Id`` header supplies the tenant.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -54,14 +56,39 @@ def _b64url_decode(segment: str) -> bytes:
         raise AuthError("malformed JWT") from exc
 
 
-def _verify_rs256_es256(algorithm: str, signing_input: bytes, signature: bytes, key_pem: str) -> bool:
+def _load_pem_public_key(key_pem: str) -> Any:
+    """Parse a PEM public key once (W46-F P7). Returns the key object or
+    None on parse failure (fail-closed: requests then 401 exactly as the
+    previous per-request parse failure did)."""
+    try:
+        from cryptography.hazmat.primitives import serialization
+    except ImportError:
+        return None  # per-request path raises the precise AuthError
+    try:
+        return serialization.load_pem_public_key(key_pem.encode())
+    except Exception:  # noqa: BLE001
+        log.error("JWT public key PEM failed to parse at startup; "
+                  "asymmetric verification will fail closed")
+        return None
+
+
+def _verify_rs256_es256(
+    algorithm: str,
+    signing_input: bytes,
+    signature: bytes,
+    key_pem: str,
+    parsed_key: Any = None,
+) -> bool:
     try:
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import ec, padding
     except ImportError as exc:
         raise AuthError(f"JWT_ALGORITHM {algorithm} requires the cryptography package") from exc
     try:
-        key = serialization.load_pem_public_key(key_pem.encode())
+        # W46-F P7: the PEM is parsed ONCE at startup (parsed_key) instead of
+        # per request; fall back to the legacy per-request parse only when no
+        # parsed key was supplied (direct decode_and_verify callers/tests).
+        key = parsed_key if parsed_key is not None else serialization.load_pem_public_key(key_pem.encode())
         if algorithm == "RS256":
             key.verify(signature, signing_input, padding.PKCS1v15(), hashes.SHA256())
         else:
@@ -71,7 +98,9 @@ def _verify_rs256_es256(algorithm: str, signing_input: bytes, signature: bytes, 
         return False
 
 
-def decode_and_verify(token: str, key: str, algorithm: str) -> dict[str, Any]:
+def decode_and_verify(
+    token: str, key: str, algorithm: str, parsed_key: Any = None
+) -> dict[str, Any]:
     algorithm = algorithm.upper()
     if algorithm not in ("HS256", "RS256", "ES256"):
         raise AuthError(f"unsupported JWT_ALGORITHM {algorithm!r}")
@@ -91,7 +120,7 @@ def decode_and_verify(token: str, key: str, algorithm: str) -> dict[str, Any]:
         expected = hmac.new(key.encode(), signing_input, hashlib.sha256).digest()
         ok = hmac.compare_digest(expected, signature)
     else:
-        ok = _verify_rs256_es256(algorithm, signing_input, signature, key)
+        ok = _verify_rs256_es256(algorithm, signing_input, signature, key, parsed_key)
     if not ok:
         raise AuthError("JWT signature verification failed")
     exp = claims.get("exp")
@@ -100,14 +129,21 @@ def decode_and_verify(token: str, key: str, algorithm: str) -> dict[str, Any]:
     return claims
 
 
-def tenant_from_request(settings: Settings, authorization: str | None, x_tenant_id: str | None) -> str:
+def tenant_from_request(
+    settings: Settings,
+    authorization: str | None,
+    x_tenant_id: str | None,
+    parsed_key: Any = None,
+) -> str:
     if authorization:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
             raise AuthError("Authorization must be 'Bearer <token>'")
         if not settings.jwt_public_key:
             raise AuthError("Bearer auth not configured on this deployment")
-        claims = decode_and_verify(token, settings.jwt_public_key, settings.jwt_algorithm)
+        claims = decode_and_verify(
+            token, settings.jwt_public_key, settings.jwt_algorithm, parsed_key
+        )
         sub = claims.get("sub")
         if not sub or not isinstance(sub, str):
             raise AuthError("JWT missing sub claim")
@@ -125,7 +161,12 @@ async def current_tenant(
     x_tenant_id: str | None = Header(default=None),
 ) -> str:
     settings: Settings = request.app.state.settings
-    return tenant_from_request(settings, authorization, x_tenant_id)
+    return tenant_from_request(
+        settings,
+        authorization,
+        x_tenant_id,
+        getattr(request.app.state, "jwt_verification_key", None),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,19 +206,66 @@ class ScoreResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _registry_tenant_dirs(registry_dir: str) -> list[str]:
+    """Tenant scopes present in the filesystem bootstrap registry (direct
+    subdirectories, e.g. per-tenant dirs + the `global` fallback scope)."""
+    try:
+        return sorted(
+            entry
+            for entry in os.listdir(registry_dir)
+            if os.path.isdir(os.path.join(registry_dir, entry))
+        )
+    except OSError:
+        return []
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     app = FastAPI(title="credit-bureau", version="1.0.0")
     app.state.settings = settings
     app.state.scorer_cache = {}
+    # W46-F P7: parse the JWT verification PEM ONCE at startup instead of
+    # per request (RS256/ES256 only; HS256 needs no parse). None when the
+    # parse fails → fail-closed 401s, same as the legacy per-request path.
+    app.state.jwt_verification_key = (
+        _load_pem_public_key(settings.jwt_public_key)
+        if settings.jwt_public_key
+        and settings.jwt_algorithm.upper() in ("RS256", "ES256")
+        else None
+    )
 
-    def scorer_for(tenant_id: str) -> LearnedScorer | None:
+    async def scorer_for(tenant_id: str) -> LearnedScorer | None:
         cache = app.state.scorer_cache
         if tenant_id not in cache:
-            cache[tenant_id] = LearnedScorer.load(settings.ml_registry_dir, tenant_id)
+            # W46-F P7: artifact resolution (urllib GET to model-registry +
+            # torch.load + load_state_dict) is BLOCKING — run it off the
+            # event loop so a cold-miss never stalls concurrent requests.
+            cache[tenant_id] = await asyncio.to_thread(
+                LearnedScorer.load, settings.ml_registry_dir, tenant_id
+            )
             if cache[tenant_id] is None:
                 log.info("no credit-ml artifact for tenant %s — rules-only (heuristic-v1)", tenant_id)
         return cache[tenant_id]
+
+    @app.on_event("startup")
+    async def _warm_scorers() -> None:
+        """W46-F P7: best-effort scorer warm at boot for the tenant scopes
+        the filesystem bootstrap registry lists (per-tenant dirs + global).
+        Failures are logged and skipped — LearnedScorer.load already
+        degrades to None (I1), and the first request re-tries lazily."""
+        if not settings.ml_registry_dir:
+            return
+        for tenant_id in await asyncio.to_thread(
+            _registry_tenant_dirs, settings.ml_registry_dir
+        ):
+            try:
+                scorer = await scorer_for(tenant_id)
+                if scorer is not None:
+                    log.info("warmed credit-ml scorer for tenant scope %s (%s)",
+                             tenant_id, scorer.model_version)
+            except Exception as exc:  # noqa: BLE001 — best-effort warm
+                log.warning("scorer warm failed for tenant scope %s: %s",
+                            tenant_id, exc)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -198,7 +286,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         naive, reasons = rule_score(sig)
         rule_bureau = naive_to_bureau(naive)
 
-        scorer = scorer_for(tenant_id)
+        scorer = await scorer_for(tenant_id)
         if scorer is None:
             # I1 honest degradation: pure rule output, byte-stable.
             return ScoreResponse(
@@ -213,7 +301,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 tenant_id=tenant_id,
             )
 
-        ml_score, p_default = scorer.score(payload.features)
+        # W46-F P7: torch inference is CPU-bound — off the event loop.
+        ml_score, p_default = await asyncio.to_thread(scorer.score, payload.features)
         blended = settings.blend_ml_weight * ml_score + (1.0 - settings.blend_ml_weight) * rule_bureau
         blended_int = int(round(blended))
         blended_int = max(BUREAU_MIN, min(BUREAU_MAX, blended_int))

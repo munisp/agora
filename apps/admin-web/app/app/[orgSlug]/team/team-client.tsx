@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import { Plus, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
@@ -42,34 +43,43 @@ export interface IdentityMember {
   role: string;
 }
 
-export function TeamClient({ orgSlug }: { orgSlug: string }) {
+/**
+ * SPEC-W46 AW-4: the team-members endpoint has no limit/cursor param
+ * (contract frozen), so rendering is bounded client-side at 100 rows/page.
+ */
+const PAGE_SIZE = 100;
+
+export function TeamClient({
+  orgSlug,
+  initialMembers,
+  initialError,
+}: {
+  orgSlug: string;
+  /** SPEC-W46 AW-2: fetched server-side in page.tsx. */
+  initialMembers: TeamMember[];
+  initialError: string | null;
+}) {
   const { toast } = useToast();
-  const [members, setMembers] = React.useState<TeamMember[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const router = useRouter();
+  const [members, setMembers] = React.useState<TeamMember[]>(initialMembers);
+  const [error, setError] = React.useState<string | null>(initialError);
   const [adding, setAdding] = React.useState(false);
   const [removing, setRemoving] = React.useState<TeamMember | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [page, setPage] = React.useState(0);
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.get<TeamMember[] | { items: TeamMember[] }>(
-        "/api/bookings/v1/team-members",
-        { tenant: orgSlug },
-      );
-      setMembers(Array.isArray(data) ? data : (data.items ?? []));
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load team.");
-    } finally {
-      setLoading(false);
-    }
-  }, [orgSlug]);
-
+  // Sync when the server props change (router.refresh() after mutations).
   React.useEffect(() => {
-    void load();
-  }, [load]);
+    setMembers(initialMembers);
+    setError(initialError);
+  }, [initialMembers, initialError]);
+
+  const pageCount = Math.max(1, Math.ceil(members.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedMembers = members.slice(
+    safePage * PAGE_SIZE,
+    (safePage + 1) * PAGE_SIZE,
+  );
 
   const add = async (form: {
     name: string;
@@ -88,7 +98,7 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
       await api.post("/api/bookings/v1/team-members", body, { tenant: orgSlug });
       toast({ title: "Team member added", variant: "success" });
       setAdding(false);
-      await load();
+      router.refresh();
     } catch (e) {
       toast({
         title: "Could not add member",
@@ -128,7 +138,7 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
       });
       toast({ title: "Member removed", variant: "success" });
       setRemoving(null);
-      await load();
+      router.refresh();
     } catch (e) {
       toast({
         title: "Remove failed",
@@ -165,12 +175,10 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {members.length === 0 ? (
-              <TableEmpty colSpan={5}>
-                {loading ? "Loading…" : "No team members yet."}
-              </TableEmpty>
+            {pagedMembers.length === 0 ? (
+              <TableEmpty colSpan={5}>No team members yet.</TableEmpty>
             ) : (
-              members.map((m) => (
+              pagedMembers.map((m) => (
                 <TableRow key={m.id}>
                   <TableCell className="pl-5 font-medium">{m.name}</TableCell>
                   <TableCell>{m.email}</TableCell>
@@ -205,6 +213,32 @@ export function TeamClient({ orgSlug }: { orgSlug: string }) {
           </TableBody>
         </Table>
       </Card>
+
+      {pageCount > 1 ? (
+        <div className="mt-3 flex items-center justify-between">
+          <p className="text-xs text-muted-foreground">
+            Page {safePage + 1} of {pageCount} · {members.length} members
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage(safePage - 1)}
+              disabled={safePage === 0}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage(safePage + 1)}
+              disabled={safePage >= pageCount - 1}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       <AddMemberDialog
         open={adding}

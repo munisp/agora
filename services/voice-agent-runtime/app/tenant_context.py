@@ -14,6 +14,10 @@ the model — SPEC §1):
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -111,7 +115,98 @@ def _apply_pack(ctx: TenantContext, tenant_payload: dict[str, Any]) -> None:
             ctx.languages = validate_pack_languages(pack.get("languages"))
 
 
+# ------------------------------------------------------- TTL cache (W46 P1/P2)
+# Per-process tenant-context cache keyed by site_slug, shared by every
+# fetch_tenant_context caller (chat turns, ElevenLabs tool webhooks, voice
+# session bootstrap). Fresh entries are served for `tenant_ctx_ttl_s`; on a
+# refresh failure a stale entry is served for up to `tenant_ctx_stale_s`
+# (stale-while-error). Callers receive a DEEP COPY so per-session
+# mutations (persona_override, merge_definition, list edits) never leak
+# into the cache or across sessions. Bounded: oldest entries are evicted
+# past the cap.
+
+
+@dataclass
+class _CtxCacheEntry:
+    ctx: TenantContext
+    expires_at: float  # monotonic deadline for the fresh window
+    stale_until: float  # monotonic deadline for the stale-while-error window
+
+
+_CTX_CACHE_MAX = 512
+_ctx_cache: "OrderedDict[str, _CtxCacheEntry]" = OrderedDict()
+_ctx_locks: dict[str, asyncio.Lock] = {}
+
+
+def _ctx_lock(site_slug: str) -> asyncio.Lock:
+    lock = _ctx_locks.get(site_slug)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ctx_locks[site_slug] = lock
+        if len(_ctx_locks) > _CTX_CACHE_MAX:
+            # Bound the lock map alongside the cache.
+            for key in list(_ctx_locks)[: len(_ctx_locks) - _CTX_CACHE_MAX]:
+                _ctx_locks.pop(key, None)
+    return lock
+
+
+def clear_tenant_context_cache() -> None:
+    """Test/admin hook: drop every cached tenant context."""
+    _ctx_cache.clear()
+
+
+def _cache_store(site_slug: str, ctx: TenantContext, ttl_s: float, stale_s: float) -> None:
+    now = time.monotonic()
+    _ctx_cache[site_slug] = _CtxCacheEntry(
+        ctx=ctx,
+        expires_at=now + max(ttl_s, 0.0),
+        stale_until=now + max(ttl_s, 0.0) + max(stale_s, 0.0),
+    )
+    _ctx_cache.move_to_end(site_slug)
+    while len(_ctx_cache) > _CTX_CACHE_MAX:
+        _ctx_cache.popitem(last=False)
+
+
 async def fetch_tenant_context(
+    dapr: DaprClient, settings: Settings, site_slug: str
+) -> TenantContext:
+    """Resolve the tenant context for `site_slug`, cached per slug.
+
+    Fresh-cache hits skip the 3-invoke bootstrap entirely (P1/P2: it used
+    to run on every chat turn and every ElevenLabs tool call). A refresh
+    failure falls back to the stale entry when one is still inside the
+    stale window; with no usable entry the error propagates exactly as the
+    pre-cache code did (fail-closed bootstrap preserved).
+    """
+    now = time.monotonic()
+    entry = _ctx_cache.get(site_slug)
+    if entry is not None and entry.expires_at > now:
+        return copy.deepcopy(entry.ctx)
+
+    async with _ctx_lock(site_slug):
+        # Recheck under the lock: a concurrent turn may have refreshed.
+        now = time.monotonic()
+        entry = _ctx_cache.get(site_slug)
+        if entry is not None and entry.expires_at > now:
+            return copy.deepcopy(entry.ctx)
+        try:
+            ctx = await _fetch_tenant_context_uncached(dapr, settings, site_slug)
+        except Exception as exc:
+            if entry is not None and entry.stale_until > now:
+                log.warning(
+                    "tenant context refresh failed; serving stale entry",
+                    site_slug=site_slug,
+                    error=str(exc)[:200],
+                )
+                return copy.deepcopy(entry.ctx)
+            raise
+        _cache_store(
+            site_slug, ctx, settings.tenant_ctx_ttl_s, settings.tenant_ctx_stale_s
+        )
+        return copy.deepcopy(ctx)
+
+
+async def _fetch_tenant_context_uncached(
     dapr: DaprClient, settings: Settings, site_slug: str
 ) -> TenantContext:
     """Bootstrap the per-session tenant context. Raises DaprError when the
@@ -143,49 +238,56 @@ async def fetch_tenant_context(
     # payload — pick up the industry pack persona when present.
     _apply_pack(ctx, tenant)
 
-    # 2. Canonical tenant record from identity (best-effort enrichment).
-    # SPEC-W44 K2: identity gates tenant-scoped reads for service callers
-    # behind X-Internal-Token; the enrichment stays soft-fail when unset.
-    try:
-        headers = (
-            {"X-Internal-Token": settings.identity_internal_token}
-            if settings.identity_internal_token
-            else None
-        )
-        identity_tenant = await dapr.invoke_get(
-            settings.identity_app_id, f"v1/tenants/{tenant_slug}", headers=headers
-        )
-        if isinstance(identity_tenant, dict):
-            ctx.timezone = identity_tenant.get("timezone") or ctx.timezone
-            ctx.currency = identity_tenant.get("currency") or ctx.currency
-            ctx.locale = identity_tenant.get("locale") or ctx.locale
-            ctx.terminology = identity_tenant.get("terminology") or ctx.terminology
-            ctx.tenant_id = str(identity_tenant.get("id") or ctx.tenant_id)
-            _apply_pack(ctx, identity_tenant)
-    except Exception as exc:  # noqa: BLE001 - enrichment only
-        log.warning("identity tenant fetch failed", slug=tenant_slug, error=str(exc))
+    # 2+3 (W46 P1): identity enrichment and knowledge grounding are
+    # independent best-effort legs — fetch them concurrently instead of
+    # sequentially (one RTT window instead of two).
+    async def _identity_leg() -> None:
+        # 2. Canonical tenant record from identity (best-effort enrichment).
+        # SPEC-W44 K2: identity gates tenant-scoped reads for service callers
+        # behind X-Internal-Token; the enrichment stays soft-fail when unset.
+        try:
+            headers = (
+                {"X-Internal-Token": settings.identity_internal_token}
+                if settings.identity_internal_token
+                else None
+            )
+            identity_tenant = await dapr.invoke_get(
+                settings.identity_app_id, f"v1/tenants/{tenant_slug}", headers=headers
+            )
+            if isinstance(identity_tenant, dict):
+                ctx.timezone = identity_tenant.get("timezone") or ctx.timezone
+                ctx.currency = identity_tenant.get("currency") or ctx.currency
+                ctx.locale = identity_tenant.get("locale") or ctx.locale
+                ctx.terminology = identity_tenant.get("terminology") or ctx.terminology
+                ctx.tenant_id = str(identity_tenant.get("id") or ctx.tenant_id)
+                _apply_pack(ctx, identity_tenant)
+        except Exception as exc:  # noqa: BLE001 - enrichment only
+            log.warning("identity tenant fetch failed", slug=tenant_slug, error=str(exc))
 
-    # 3. Knowledge snippets for grounding (best-effort).
-    try:
-        kb = await dapr.invoke_get(
-            settings.knowledge_app_id,
-            "v1/context",
-            params={"tenant": tenant_slug, "q": settings.knowledge_query},
-        )
-        items = []
-        if isinstance(kb, dict):
-            items = kb.get("snippets") or kb.get("results") or []
-        elif isinstance(kb, list):
-            items = kb
-        for item in items[: settings.knowledge_snippet_count]:
-            if isinstance(item, dict):
-                text = item.get("content") or item.get("text") or item.get("title")
-            else:
-                text = str(item)
-            if text:
-                ctx.knowledge_snippets.append(str(text))
-    except Exception as exc:  # noqa: BLE001 - grounding is optional
-        log.warning("knowledge context fetch failed", slug=tenant_slug, error=str(exc))
+    async def _knowledge_leg() -> None:
+        # 3. Knowledge snippets for grounding (best-effort).
+        try:
+            kb = await dapr.invoke_get(
+                settings.knowledge_app_id,
+                "v1/context",
+                params={"tenant": tenant_slug, "q": settings.knowledge_query},
+            )
+            items = []
+            if isinstance(kb, dict):
+                items = kb.get("snippets") or kb.get("results") or []
+            elif isinstance(kb, list):
+                items = kb
+            for item in items[: settings.knowledge_snippet_count]:
+                if isinstance(item, dict):
+                    text = item.get("content") or item.get("text") or item.get("title")
+                else:
+                    text = str(item)
+                if text:
+                    ctx.knowledge_snippets.append(str(text))
+        except Exception as exc:  # noqa: BLE001 - grounding is optional
+            log.warning("knowledge context fetch failed", slug=tenant_slug, error=str(exc))
+
+    await asyncio.gather(_identity_leg(), _knowledge_leg())
 
     log.info(
         "tenant context bootstrapped",
