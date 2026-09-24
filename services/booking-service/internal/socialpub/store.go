@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // ErrNotFound is returned when a row does not exist (mirrors
@@ -44,7 +45,7 @@ func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -265,7 +266,7 @@ func (s *Store) ListAccounts(ctx context.Context, tenantID uuid.UUID, provider, 
 		rows, err := tx.Query(ctx,
 			`SELECT `+accountCols+` FROM social_accounts
 			 WHERE ($1='' OR provider=$1) AND ($2='' OR status=$2)
-			 ORDER BY created_at DESC`, provider, status)
+			 ORDER BY created_at DESC LIMIT 500`, provider, status)
 		if err != nil {
 			return err
 		}
@@ -355,7 +356,7 @@ func (s *Store) ListCreatives(ctx context.Context, tenantID uuid.UUID, kind stri
 		rows, err := tx.Query(ctx,
 			`SELECT `+creativeCols+` FROM social_creatives
 			 WHERE ($1='' OR kind=$1)
-			 ORDER BY created_at DESC`, kind)
+			 ORDER BY created_at DESC LIMIT 500`, kind)
 		if err != nil {
 			return err
 		}
@@ -447,7 +448,7 @@ func (s *Store) ListPosts(ctx context.Context, tenantID uuid.UUID, status string
 		rows, err := tx.Query(ctx,
 			`SELECT `+postCols+` FROM social_posts
 			 WHERE ($1='' OR status=$1) AND ($2::uuid IS NULL OR account_id=$2)
-			 ORDER BY created_at DESC`, status, nullableUUID(accountID))
+			 ORDER BY created_at DESC LIMIT 500`, status, nullableUUID(accountID))
 		if err != nil {
 			return err
 		}
@@ -562,7 +563,7 @@ func (s *Store) ListAds(ctx context.Context, tenantID uuid.UUID, status string, 
 		rows, err := tx.Query(ctx,
 			`SELECT `+adCols+` FROM social_ads
 			 WHERE ($1='' OR status=$1) AND ($2::uuid IS NULL OR account_id=$2)
-			 ORDER BY created_at DESC`, status, nullableUUID(accountID))
+			 ORDER BY created_at DESC LIMIT 500`, status, nullableUUID(accountID))
 		if err != nil {
 			return err
 		}

@@ -136,7 +136,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
 
-    dapr = DaprClient(settings.dapr_base_url, settings.http_timeout_s)
+    # SPEC-W46 P-02: booking invokes go direct (compose service address,
+    # daprd fallback on transport failure) — one hop instead of two on
+    # every tenant-context fetch, availability check and booking lookup.
+    dapr = DaprClient(
+        settings.dapr_base_url,
+        settings.http_timeout_s,
+        direct_bases={settings.booking_app_id: settings.booking_base_url},
+    )
     sessions = SessionStore()
     # Primary LLM endpoint + optional circuit-broken fallback chain
     # (LLM_FALLBACK_* envs, VOICE-SCALING §3).
