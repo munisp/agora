@@ -66,6 +66,21 @@ class RecommendationWritePlan:
 
 
 @dataclass(frozen=True)
+class ScoreBatchWritePlan:
+    """W46-F P12: one batch of ScoreWritePlan items (single batched write
+    per request instead of N per-item writes)."""
+
+    items: tuple[ScoreWritePlan, ...]
+
+
+@dataclass(frozen=True)
+class RecommendationBatchWritePlan:
+    """W46-F P12: one batch of RecommendationWritePlan items."""
+
+    items: tuple[RecommendationWritePlan, ...]
+
+
+@dataclass(frozen=True)
 class AlertResolvePlan:
     """Resolve one Alert; on ``dismissed`` clear the flagged person's
     quarantine ONLY when no other open high-severity alert flags them."""
@@ -107,6 +122,28 @@ class FixtureSeedPlan:
 
 
 WritePlan = ScoreWritePlan | RecommendationWritePlan | AlertResolvePlan | FixtureSeedPlan
+
+
+@dataclass(frozen=True)
+class CompiledBatchWrite:
+    """W46-F P12: batched predictive write-back (single UNWIND round trip).
+
+    * ``check_cypher`` + ``check_params`` — ONE pre-MERGE tenant
+      verification over every referenced node id (any row under a different
+      tenant aborts the batch with CrossTenantWriteError → HTTP 422,
+      identical to the per-item path).
+    * ``statements`` — grouped UNWIND writes (items are grouped by their
+      score-field set, so a homogeneous batch is exactly one statement);
+      each RETURNS the matched ids so the caller diffs input vs returned to
+      recover the per-item skip semantics (unknown nodes are skipped +
+      counted, never stub-created — verification gate WARN #4).
+    * ``plan`` — the structured semantics the in-memory backend applies.
+    """
+
+    check_cypher: str
+    check_params: dict[str, Any]
+    statements: tuple[tuple[str, dict[str, Any]], ...]
+    plan: ScoreBatchWritePlan | RecommendationBatchWritePlan
 
 
 @dataclass(frozen=True)
@@ -231,6 +268,106 @@ def compile_recommendation_write(
         check_cypher=check,
         check_params={"person_id": person_id, "offering_id": offering_id},
         require_rows=True,
+    )
+
+
+def compile_score_batch_write(items: list[ScoreWritePlan]) -> CompiledBatchWrite:
+    """W46-F P12: all score items in ONE check + one UNWIND write per
+    distinct score-field set (homogeneous batches = a single statement).
+
+    Per-item semantics are preserved via the RETURNING diff: the MATCH is
+    tenant-scoped, so unknown persons match nothing and the caller counts
+    them as skipped_unknown exactly like the per-item WriteTargetMissing
+    path; cross-tenant nodes are rejected by the pre-check before any SET.
+    """
+    if not items:
+        raise ValueError("score batch must not be empty")
+    person_ids = [item.person_id for item in items]
+    check = (
+        "UNWIND $person_ids AS pid\n"
+        "MATCH (p:Person {person_id: pid})\n"
+        "RETURN p.person_id AS person_id, p.tenant_id AS tenant_id"
+    )
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for item in items:
+        unknown = set(item.scores) - set(SCORE_WRITE_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown score fields: {sorted(unknown)}")
+        key = tuple(sorted(item.scores))
+        groups.setdefault(key, []).append(
+            {
+                "person_id": item.person_id,
+                **{name: float(value) for name, value in item.scores.items()},
+                "model_version": item.model_version,
+                "scored_at": item.scored_at,
+            }
+        )
+    statements: list[tuple[str, dict[str, Any]]] = []
+    for fields, rows in groups.items():
+        set_clauses = [f"p.{name} = row.{name}" for name in fields]
+        set_clauses.append("p.model_version = row.model_version")
+        set_clauses.append("p.scored_at = row.scored_at")
+        cypher = (
+            "UNWIND $rows AS row\n"
+            "MATCH (p:Person {tenant_id: $tenant_id, person_id: row.person_id})\n"
+            f"SET {', '.join(set_clauses)}\n"
+            "RETURN row.person_id AS person_id"
+        )
+        statements.append((cypher, {"rows": rows}))
+    return CompiledBatchWrite(
+        check_cypher=check,
+        check_params={"person_ids": person_ids},
+        statements=tuple(statements),
+        plan=ScoreBatchWritePlan(items=tuple(items)),
+    )
+
+
+def compile_recommendation_batch_write(
+    items: list[RecommendationWritePlan],
+) -> CompiledBatchWrite:
+    """W46-F P12: all recommendation items in ONE check + ONE UNWIND write.
+
+    RETURNING carries the matched (person_id, offering_id) pairs so the
+    caller diffs input vs returned for the per-item skip list (missing
+    endpoints are skipped, never created) — identical response semantics to
+    the per-item WriteTargetMissing path.
+    """
+    if not items:
+        raise ValueError("recommendation batch must not be empty")
+    ids = [item.person_id for item in items] + [item.offering_id for item in items]
+    check = (
+        "UNWIND $ids AS xid\n"
+        "MATCH (n)\n"
+        "WHERE (n:Person AND n.person_id = xid)\n"
+        "   OR (n:Offering AND n.offering_id = xid)\n"
+        "RETURN DISTINCT n.tenant_id AS tenant_id"
+    )
+    cypher = (
+        "UNWIND $rows AS row\n"
+        "MATCH (p:Person {tenant_id: $tenant_id, person_id: row.person_id})\n"
+        "MATCH (o:Offering {tenant_id: $tenant_id, offering_id: row.offering_id})\n"
+        "MERGE (p)-[r:RECOMMENDED_FOR]->(o)\n"
+        "SET r.score = row.score, r.rank = row.rank, r.reason = row.reason,\n"
+        "    r.model_version = row.model_version, r.scored_at = row.scored_at\n"
+        "RETURN row.person_id AS person_id, row.offering_id AS offering_id"
+    )
+    rows = [
+        {
+            "person_id": item.person_id,
+            "offering_id": item.offering_id,
+            "score": float(item.score),
+            "rank": int(item.rank),
+            "reason": item.reason,
+            "model_version": item.model_version,
+            "scored_at": item.scored_at,
+        }
+        for item in items
+    ]
+    return CompiledBatchWrite(
+        check_cypher=check,
+        check_params={"ids": ids},
+        statements=((cypher, {"rows": rows}),),
+        plan=RecommendationBatchWritePlan(items=tuple(items)),
     )
 
 

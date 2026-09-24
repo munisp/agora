@@ -129,7 +129,15 @@ impl PgTransferAttemptStore {
         let mut last_err = String::new();
         for attempt in 1..=10u32 {
             match sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
+                // SPEC-W46 R1: this pool sits on the /v1/transfers + K12
+                // refund hot path (2-3 sequential queries per request); a
+                // hardcoded 2 connections queued every 3rd concurrent
+                // request behind a full rail call. Sized via
+                // PAYMENTS_DB_POOL_MAX (default 8).
+                .max_connections(crate::payouts::db_pool_max())
+                // SPEC-W46 R2: fast-fail after 5s on exhaustion instead of
+                // the 30s sqlx default.
+                .acquire_timeout(crate::payouts::DB_ACQUIRE_TIMEOUT)
                 .connect_with(options.clone())
                 .await
             {

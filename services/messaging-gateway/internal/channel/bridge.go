@@ -14,6 +14,7 @@ package channel
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -80,15 +81,50 @@ type Bridge struct {
 	Log *zap.Logger
 
 	// done dedupes completed <channel>:<message_id> deliveries (N-05).
-	mu       sync.Mutex
-	done     map[string]time.Time
-	now      func() time.Time // injectable for tests
+	// doneExp is a min-heap of the same completions ordered by time:
+	// expiry/eviction pops the OLDEST entries (O(log n) amortized) instead
+	// of the previous O(n) sweep of every key on every inbound message
+	// (SPEC-W46 PERF-18), and the map stays bounded at
+	// bridgeDedupeMaxEntries.
+	mu        sync.Mutex
+	done      map[string]time.Time
+	doneExp   doneHeap
+	now       func() time.Time // injectable for tests
 	dedupeTTL time.Duration
+}
+
+// doneEntry is one heap element: a completed delivery key + completion time.
+type doneEntry struct {
+	key string
+	at  time.Time
+}
+
+// doneHeap is a min-heap of doneEntry ordered by completion time (oldest
+// first) — container/heap.Interface.
+type doneHeap []doneEntry
+
+func (h doneHeap) Len() int           { return len(h) }
+func (h doneHeap) Less(i, j int) bool { return h[i].at.Before(h[j].at) }
+func (h doneHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *doneHeap) Push(x any)        { *h = append(*h, x.(doneEntry)) }
+func (h *doneHeap) Pop() any {
+	old := *h
+	n := len(old)
+	e := old[n-1]
+	old[n-1] = doneEntry{}
+	*h = old[:n-1]
+	return e
 }
 
 // bridgeDedupeTTL bounds how long a completed message id is remembered
 // (provider redelivery storms are minutes, not days).
 const bridgeDedupeTTL = 24 * time.Hour
+
+// bridgeDedupeMaxEntries bounds the dedupe map (SPEC-W46 PERF-18: every
+// cache needs a bound). At capacity the OLDEST completions are evicted —
+// 100k ids ≈ a full day of traffic at >1 msg/s, so a capacity eviction
+// cannot open a realistic redelivery replay window.
+const bridgeDedupeMaxEntries = 100_000
 
 // SetClock injects the clock used by the dedupe window (tests).
 func (b *Bridge) SetClock(now func() time.Time) { b.now = now }
@@ -106,6 +142,7 @@ func NewBridge(sites map[string]Site, convURL, voiceURL string, wa *provider.Wha
 		HC:              &http.Client{Timeout: 10 * time.Second},
 		Log:             log,
 		done:            map[string]time.Time{},
+		doneExp:         doneHeap{},
 		now:             time.Now,
 		dedupeTTL:       bridgeDedupeTTL,
 	}
@@ -205,6 +242,37 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 	return nil
 }
 
+// sweepDoneLocked expires completions past the TTL by popping the heap's
+// OLDEST entries until the top is still inside the window (O(log n)
+// amortized per expired entry — no per-message O(n) map sweep, PERF-18).
+// A heap element whose timestamp no longer matches the map is a stale
+// duplicate of a re-completed key; it is dropped without touching the
+// newer map entry. Caller holds b.mu.
+func (b *Bridge) sweepDoneLocked(now time.Time) {
+	for len(b.doneExp) > 0 {
+		top := b.doneExp[0]
+		if now.Sub(top.at) <= b.dedupeTTL {
+			return // heap is ordered: nothing older remains
+		}
+		heap.Pop(&b.doneExp)
+		if at, ok := b.done[top.key]; ok && at.Equal(top.at) {
+			delete(b.done, top.key)
+		}
+	}
+}
+
+// evictOldestDoneLocked drops the oldest completion (capacity bound);
+// stale heap duplicates are skipped first. Caller holds b.mu.
+func (b *Bridge) evictOldestDoneLocked() {
+	for len(b.doneExp) > 0 {
+		e := heap.Pop(&b.doneExp).(doneEntry)
+		if at, ok := b.done[e.key]; ok && at.Equal(e.at) {
+			delete(b.done, e.key)
+			return
+		}
+	}
+}
+
 // alreadyDone reports whether the message was fully bridged within the
 // dedupe window. Messages without a provider id cannot dedupe (processed
 // every time).
@@ -215,13 +283,7 @@ func (b *Bridge) alreadyDone(msg InboundMessage) bool {
 	key := msg.Channel + ":" + msg.MessageID
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	now := b.now()
-	// Lazy expiry sweep.
-	for k, at := range b.done {
-		if now.Sub(at) > b.dedupeTTL {
-			delete(b.done, k)
-		}
-	}
+	b.sweepDoneLocked(b.now())
 	_, done := b.done[key]
 	return done
 }
@@ -233,7 +295,14 @@ func (b *Bridge) markDone(msg InboundMessage) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.done[msg.Channel+":"+msg.MessageID] = b.now()
+	now := b.now()
+	key := msg.Channel + ":" + msg.MessageID
+	b.sweepDoneLocked(now)
+	b.done[key] = now
+	heap.Push(&b.doneExp, doneEntry{key: key, at: now})
+	for len(b.done) > bridgeDedupeMaxEntries {
+		b.evictOldestDoneLocked()
+	}
 }
 
 // resolveConversation finds an existing conversation for the contact or

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/identity-service/internal/poolx"
 )
 
 // ErrNotFound is returned when no matching consent record exists.
@@ -76,7 +77,8 @@ type Store struct {
 // installs, same role as the identity store's bootstrap ALTERs). internalURL
 // is optional (see Store docs).
 func New(ctx context.Context, databaseURL string, internalURL ...string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	// SPEC-W46 PERF-08: budgeted pools (poolx); DATABASE_URL pool_* params win.
+	pool, err := poolx.New(ctx, databaseURL, poolx.MaxConns, poolx.MinConns)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -86,7 +88,7 @@ func New(ctx context.Context, databaseURL string, internalURL ...string) (*Store
 	}
 	s := &Store{pool: pool, internal: pool}
 	if len(internalURL) > 0 && internalURL[0] != "" && internalURL[0] != databaseURL {
-		ipool, err := pgxpool.New(ctx, internalURL[0])
+		ipool, err := poolx.New(ctx, internalURL[0], poolx.InternalMaxConns, poolx.InternalMinConns)
 		if err != nil {
 			pool.Close()
 			return nil, fmt.Errorf("connect internal postgres: %w", err)
