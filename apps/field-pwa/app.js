@@ -315,6 +315,99 @@ function checkin() {
 
 var flushing = false;
 
+/* FW-1 (SPEC-W46): bounded flush requests and per-batch failure handling.
+ * Previously the ENTIRE outbox went out as one POST with no timeout: one
+ * poison item (or one huge queue) failed/marked every item, and a dead
+ * network hung the flush until the OS gave up. Now: chunks of
+ * FLUSH_CHUNK items, each fetch bounded by FETCH_TIMEOUT_MS, and a failed
+ * chunk keeps ONLY its own items queued while the rest still sync. */
+var FLUSH_CHUNK = 50; // server batch cap is 100 — 50 stays well under body limits
+var FETCH_TIMEOUT_MS = 15000;
+
+/* fetch bounded by FETCH_TIMEOUT_MS; rejects with Error("timed out…"). */
+function fetchWithTimeout(url, opts) {
+  var ctrl = new AbortController();
+  var timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT_MS);
+  opts = opts || {};
+  opts.signal = ctrl.signal;
+  return fetch(url, opts).then(function (res) {
+    clearTimeout(timer);
+    return res;
+  }, function (err) {
+    clearTimeout(timer);
+    if (ctrl.signal.aborted) throw new Error("request timed out after " + (FETCH_TIMEOUT_MS / 1000) + "s");
+    throw err;
+  });
+}
+
+/* One chunk flush. Resolves {delivered, rejected, authFailed} — items are
+ * removed ONLY on a positive per-item (or whole-batch) acknowledgement;
+ * anything else stays queued with an honest "failed: …" status. On a
+ * network/timeout/5xx failure the chunk's items are marked failed and the
+ * error is rethrown so the caller can decide whether to continue. */
+function flushChunk(chunk, accessToken) {
+  var batchId = crypto.randomUUID();
+  return fetchWithTimeout(cfg().apiBase.replace(/\/+$/, "") + "/v1/field/capture", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer " + accessToken,
+      "x-tenant-slug": lsGet(LS.slug) || "",
+      "idempotency-key": "field_capture:" + batchId,
+    },
+    body: JSON.stringify({
+      batch_id: batchId,
+      items: chunk.map(function (i) {
+        return { client_id: i.id, kind: i.kind, payload: i.payload, captured_at: i.captured_at, gps: i.gps };
+      }),
+    }),
+  }).then(function (res) {
+    if (res.status === 401 || res.status === 403) {
+      var authErr = new Error("HTTP " + res.status);
+      authErr.authFailed = true;
+      authErr.status = res.status;
+      throw authErr;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json().catch(function () { return null; }).then(function (body) {
+      var results = body && body.results;
+      var delivered = 0, rejected = 0;
+      if (!Array.isArray(results)) {
+        // No per-item detail but the batch was accepted (HTTP 200): every
+        // item in this chunk was processed — remove just this chunk.
+        return Promise.all(chunk.map(function (i) { return outboxDel(i.id); }))
+          .then(function () { return { delivered: chunk.length, rejected: 0 }; });
+      }
+      // Per-item outcomes (fieldcapture.ItemResult): applied | deduped are
+      // exactly-once successes → remove; error is a deterministic server
+      // rejection → keep queued with the server's reason, never silently
+      // dropped.
+      var byId = {};
+      results.forEach(function (r) { byId[r.client_id] = r; });
+      return Promise.all(chunk.map(function (i) {
+        var r = byId[i.id];
+        if (r && (r.status === "applied" || r.status === "deduped")) {
+          delivered += 1;
+          return outboxDel(i.id);
+        }
+        rejected += 1;
+        i.status = "failed: " + (r && r.error ? r.error : (r ? r.status : "not acknowledged"));
+        return outboxPut(i);
+      })).then(function () { return { delivered: delivered, rejected: rejected }; });
+    });
+  }).then(null, function (err) {
+    // Network/timeout/HTTP/auth failure (thrown anywhere above): this
+    // chunk's items stay queued with an honest status; other chunks are
+    // unaffected. (Chained rejection handler — NOT the 2nd arg of the
+    // response .then — so HTTP errors raised while handling the response
+    // are caught here too.)
+    return Promise.all(chunk.map(function (i) {
+      i.status = "failed: " + err.message;
+      return outboxPut(i);
+    })).then(function () { throw err; });
+  });
+}
+
 function flush() {
   if (flushing) return Promise.resolve();
   if (!navigator.onLine) return Promise.resolve();
@@ -325,37 +418,43 @@ function flush() {
       if (!t) { setMode("demo"); authMsg("Session expired — signed out to demo mode."); render(); return; }
       flushing = true;
       renderOutbox("syncing");
-      var batchId = crypto.randomUUID();
-      return fetch(cfg().apiBase.replace(/\/+$/, "") + "/v1/field/capture", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: "Bearer " + t.access_token,
-          "x-tenant-slug": lsGet(LS.slug) || "",
-          "idempotency-key": "field_capture:" + batchId,
-        },
-        body: JSON.stringify({
-          batch_id: batchId,
-          items: items.map(function (i) {
-            return { client_id: i.id, kind: i.kind, payload: i.payload, captured_at: i.captured_at, gps: i.gps };
-          }),
-        }),
-      }).then(function (res) {
-        if (res.status === 401 || res.status === 403) {
-          saveTokens(null); setMode("demo");
-          authMsg("Session rejected (" + res.status + ") — signed out to demo mode.");
-          render();
-          return;
-        }
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        return Promise.all(items.map(function (i) { return outboxDel(i.id); })).then(function () {
-          toast("Synced " + items.length + " item" + (items.length > 1 ? "s" : "") + ".");
+      // Stable capture order; the server applies items in array order.
+      items.sort(function (a, b) { return a.captured_at < b.captured_at ? -1 : 1; });
+      var chunks = [];
+      for (var off = 0; off < items.length; off += FLUSH_CHUNK) {
+        chunks.push(items.slice(off, off + FLUSH_CHUNK));
+      }
+      var totals = { delivered: 0, rejected: 0, failed: 0 };
+      // Sequential chunks: a failed chunk marks only its own items and the
+      // flush CONTINUES with the next chunk (one poison batch can no
+      // longer block the whole outbox). An auth failure aborts the flush.
+      var chain = Promise.resolve();
+      chunks.forEach(function (chunk) {
+        chain = chain.then(function () {
+          return flushChunk(chunk, t.access_token).then(function (r) {
+            totals.delivered += r.delivered;
+            totals.rejected += r.rejected;
+          }, function (err) {
+            if (err && err.authFailed) throw err; // abort: session is dead
+            totals.failed += chunk.length;        // chunk stays queued
+          });
         });
-      }).catch(function (err) {
-        return Promise.all(items.map(function (i) {
-          i.status = "failed: " + err.message;
-          return outboxPut(i);
-        }));
+      });
+      return chain.then(function () {
+        if (totals.delivered > 0) {
+          var msg = "Synced " + totals.delivered + " item" + (totals.delivered > 1 ? "s" : "") + ".";
+          var left = totals.rejected + totals.failed;
+          if (left > 0) msg += " " + left + " still queued (not lost).";
+          toast(msg);
+        } else if (totals.failed > 0) {
+          toast("Sync failed — " + totals.failed + " item" + (totals.failed > 1 ? "s" : "") + " stay queued.");
+        }
+      }, function (err) {
+        if (err && err.authFailed) {
+          saveTokens(null); setMode("demo");
+          authMsg("Session rejected (" + err.status + ") — signed out to demo mode.");
+          render();
+        }
       }).then(function () {
         flushing = false;
         renderOutbox();

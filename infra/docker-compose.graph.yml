@@ -48,9 +48,33 @@ volumes:
   ollama-graph-data: null     # pulled model blobs (qwen2.5:7b-instruct, nomic-embed-text)
   graph-ml-models: null       # SPEC-W29 versioned model artifacts (graphsage-vN/)
 
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
   # ------------------------- FalkorDB graph store --------------------------
   graph-db:
+    logging: *default-logging
+    deploy: *default-limits
     # Official FalkorDB image (Redis-protocol compatible, Cypher via
     # GRAPH.QUERY). Pin an exact tag in production deploys.
     image: falkordb/falkordb:latest
@@ -93,6 +117,13 @@ services:
 
   # ------------------- Ollama (local LLM + embeddings) ---------------------
   ollama-graph:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
     # Pin an exact tag in production deploys. CPU profile: no GPU reservation.
     image: ollama/ollama:latest
     container_name: opendesk-ollama-graph
@@ -113,6 +144,7 @@ services:
     restart: unless-stopped
 
   ollama-graph-gpu:
+    logging: *default-logging
     # GPU profile twin of `ollama-graph` (SPEC-W28 §1: GPU profile documented).
     # Starts only under `--profile gpu`; shares the model volume so models
     # pulled by the CPU service are reused.
@@ -125,6 +157,10 @@ services:
       - ollama-graph-data:/root/.ollama
     deploy:
       resources:
+        # W46-I C-01: ollama sizing (see anchor comment) + GPU reservation.
+        limits:
+          cpus: "2.0"
+          memory: 4G
         reservations:
           devices:
             - driver: nvidia
@@ -141,6 +177,8 @@ services:
     restart: unless-stopped
 
   ollama-graph-models:
+    logging: *default-logging
+    deploy: *default-limits
     # One-shot, idempotent model bootstrap (SPEC-W28 WS-D): pulls the chat +
     # embedding models graph-service/graph-sync need. Re-runnable — the
     # script skips models that are already present.
@@ -164,6 +202,8 @@ services:
 
   # -------------- graph-sync (WS-A contract: Go consumer) ------------------
   graph-sync:
+    logging: *default-logging
+    deploy: *default-limits
     # Consumes the W28 §2 topic set (booking/cac/identity/transcripts/
     # consent-erasure) and upserts the per-tenant graph. Built by WS-A;
     # every knob is GRAPH_SYNC_* with the documented defaults — nothing
@@ -228,6 +268,8 @@ services:
 
   # ----------- graph-service (WS-B contract: FastAPI :7014) ----------------
   graph-service:
+    logging: *default-logging
+    deploy: *default-limits
     # Tenant-scoped Cypher API: segments, consent-gated audiences, NL->Cypher
     # GraphRAG via Ollama. Built by WS-B; every query injects the tenant
     # filter from the auth context (compliance gate 1).
@@ -304,6 +346,8 @@ services:
 
   # ----------- graph-ml (SPEC-W29: propensity + recommendations) -----------
   graph-ml:
+    logging: *default-logging
+    deploy: *default-limits
     # Batch scorer: reads each tenant's subgraph, writes propensity scores
     # and RECOMMENDED_FOR edges back through graph-service's internal API
     # (single write path). Heuristic mode has zero ML deps; the optional
@@ -340,6 +384,8 @@ services:
 
   # ----------- graph-ml-gpu (SPEC-W31: GraphSAGE GNN backend, opt-in) ------
   graph-ml-gpu:
+    logging: *default-logging
+    deploy: *default-limits
     # GNN variant of graph-ml: same service, built from Dockerfile.gnn
     # (base image + torch/torch-geometric overlay). Inactive unless the
     # `gnn` profile is enabled:
@@ -384,6 +430,8 @@ services:
 
   # ----------- fraud-engine (SPEC-W30: fraud & trust intelligence) ---------
   fraud-engine:
+    logging: *default-logging
+    deploy: *default-limits
     # Deterministic graph detectors (referral rings, sybil clusters, capture
     # velocity, geo-impossibility, consent backdating, ghost bookings) plus
     # the GNN-anomaly consumer. Writes Alert nodes + quarantine flags;
