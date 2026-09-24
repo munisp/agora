@@ -132,6 +132,10 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `AGENT_BACKEND` | `livekit` | `livekit` or `elevenlabs` |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_AGENT_ID` | _(unset)_ | elevenlabs backend |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |
+| `VOICE_TENANT_CTX_TTL_S` / `VOICE_TENANT_CTX_STALE_S` | `120` / `300` | W46 P1/P2: per-slug tenant-context cache fresh window / stale-while-error window (refresh failure serves the stale entry; no entry = error propagates as before) |
+| `BOOKING_BASE_URL` | `http://booking:7002` | W46 P-02: direct booking-service base for tool/tenant invokes (daprd invoke fallback on transport failure; empty = pure daprd). Distinct from `BOOKING_URL` (OTP verifier) |
+| `VOICE_TTS_CACHE_SIZE` | `256` | W46 P4: TTS LRU size keyed (voice, text, format); `0` disables |
+| `VOICE_TTS_CHUNKED` | `true` | W46 P4: sentence-level streaming TTS (first audio frame after the first chunk); `false` restores the full-buffer path |
 | `PHONE_CONFIRMATION_REQUIRED` | `true` | phone-confirmation policy toggle |
 | `BOOKING_URL` | _(unset)_ | K15(c): booking-service base URL for the portal OTP endpoints (`/public/sites/{slug}/portal/request|verify`). Unset = verification unavailable, mutating tools fail closed |
 | `VOICE_BOOKING_INTERNAL_TOKEN` | _(unset)_ | K15(c): `X-Internal-Token` sent on the booking portal OTP calls (K2 pattern; must match booking-side internal token) |
