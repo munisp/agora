@@ -227,7 +227,7 @@ declare module "expo-auth-session" {
   export interface AccessTokenRequestConfig {
     clientId: string;
     code: string;
-    redirectUri: string;
+    redirectUri?: string;
     scopes?: string[];
     extraParams?: Record<string, string>;
   }
