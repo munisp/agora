@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/daprc"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
@@ -70,9 +71,16 @@ func (d *Dispatcher) noteCycle(ok bool) {
 
 // Run loops until ctx is cancelled. Publish failures are retried next cycle
 // (at-least-once delivery; consumers must tolerate duplicates).
+//
+// SPEC-W46 (W46-A item 6, K-03): next to the poll ticker the loop selects on
+// the store's flush-on-commit signal (billing-engine pattern) — a write path
+// that just committed outbox rows triggers an immediate dispatch cycle
+// instead of waiting out the 2s poll. The ticker stays as the fallback
+// (missed/coalesced signals, publishes that failed mid-cycle).
 func (d *Dispatcher) Run(ctx context.Context) {
 	tick := time.NewTicker(d.interval)
 	defer tick.Stop()
+	flush := d.store.OutboxFlushSignal()
 	d.log.Info("outbox dispatcher started", zap.Duration("interval", d.interval))
 	for {
 		d.noteCycle(d.dispatchOnce(ctx))
@@ -81,6 +89,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 			d.log.Info("outbox dispatcher stopped")
 			return
 		case <-tick.C:
+		case <-flush:
 		}
 	}
 }
@@ -88,6 +97,11 @@ func (d *Dispatcher) Run(ctx context.Context) {
 // dispatchOnce runs one poll/publish cycle and reports whether it succeeded:
 // a failed fetch, any publish failure, or any failed mark-sent counts as a
 // failed cycle (an empty fetch with nothing to publish is a success).
+//
+// SPEC-W46 (W46-A item 6, PERF-07): successfully published (+ poisoned) rows
+// are marked sent in ONE batched UPDATE ... WHERE id = ANY($1) at the end of
+// the cycle instead of one UPDATE per row. On batch failure the per-row path
+// is retried so a single bad id cannot silently un-mark the whole batch.
 func (d *Dispatcher) dispatchOnce(ctx context.Context) bool {
 	rows, err := d.store.FetchUnsentOutbox(ctx, 100)
 	if err != nil {
@@ -97,6 +111,7 @@ func (d *Dispatcher) dispatchOnce(ctx context.Context) bool {
 		return false
 	}
 	ok := true
+	sent := make([]uuid.UUID, 0, len(rows))
 	for _, row := range rows {
 		// payload is already a serialized CloudEvents envelope
 		var evt map[string]any
@@ -105,7 +120,7 @@ func (d *Dispatcher) dispatchOnce(ctx context.Context) bool {
 			// preserved in the table for inspection
 			d.log.Error("undeliverable outbox payload, marking sent",
 				zap.String("outbox_id", row.ID.String()), zap.Error(err))
-			_ = d.store.MarkOutboxSent(ctx, row.ID)
+			sent = append(sent, row.ID)
 			continue
 		}
 		if err := d.dapr.PublishEvent(ctx, d.pubsub, row.Topic, evt); err != nil {
@@ -114,9 +129,17 @@ func (d *Dispatcher) dispatchOnce(ctx context.Context) bool {
 			ok = false
 			continue
 		}
-		if err := d.store.MarkOutboxSent(ctx, row.ID); err != nil {
-			d.log.Error("mark outbox sent", zap.String("outbox_id", row.ID.String()), zap.Error(err))
-			ok = false
+		sent = append(sent, row.ID)
+	}
+	if len(sent) > 0 {
+		if err := d.store.MarkOutboxSentBatch(ctx, sent); err != nil {
+			d.log.Error("batch mark outbox sent; falling back to per-row", zap.Error(err))
+			for _, id := range sent {
+				if err := d.store.MarkOutboxSent(ctx, id); err != nil {
+					d.log.Error("mark outbox sent", zap.String("outbox_id", id.String()), zap.Error(err))
+					ok = false
+				}
+			}
 		}
 	}
 	return ok

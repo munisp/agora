@@ -32,10 +32,34 @@ x-twenty-env: &twenty-env
   STORAGE_TYPE: local
   SIGN_IN_PREFILLED: "true"
 
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
 
   # ---------------- Twenty API (SPEC-CRM §A) ----------------
   twenty-api:
+    logging: *default-logging
+    deploy: *default-limits
     image: twentycrm/twenty:v1.3.2
     container_name: twenty-api
     restart: unless-stopped
@@ -59,6 +83,8 @@ services:
 
   # ---------------- Twenty worker (bull-mq jobs) ----------------
   twenty-worker:
+    logging: *default-logging
+    deploy: *default-limits
     image: twentycrm/twenty:v1.3.2
     container_name: twenty-worker
     restart: unless-stopped
@@ -81,6 +107,13 @@ services:
 
   # ---------------- Dedicated Redis for Twenty's bull-mq queue ----------------
   twenty-redis:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
     image: redis:7-alpine
     container_name: twenty-redis
     restart: unless-stopped

@@ -41,6 +41,11 @@ BEGIN
             USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
+-- W46-F (P-DATA DDL #8): the admin review queue filters by status and
+-- orders created_at DESC (list_suggestions) on a table that had zero
+-- indexes; tenant-leading matches the RLS predicate.
+CREATE INDEX IF NOT EXISTS idx_kb_suggestions_tenant_status
+    ON kb_suggestions (tenant_id, status, created_at DESC);
 """
 
 QUESTION_WORDS = frozenset(

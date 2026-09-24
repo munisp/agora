@@ -51,6 +51,15 @@ class Settings:
     flush_interval_seconds: float = field(
         default_factory=lambda: float(os.getenv("FLUSH_INTERVAL", "15"))
     )
+    # W46-F P14: broker-side fetch batching — getmany returns up to
+    # consume_max_records per partition or after consume_poll_ms, whichever
+    # first (replaces message-at-a-time iteration).
+    consume_max_records: int = field(
+        default_factory=lambda: _int("CONSUME_MAX_RECORDS", 500)
+    )
+    consume_poll_ms: int = field(
+        default_factory=lambda: _int("CONSUME_POLL_MS", 500)
+    )
 
     # Iceberg REST catalog + MinIO warehouse (SPEC §13)
     iceberg_rest_uri: str = field(

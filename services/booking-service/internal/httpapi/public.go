@@ -24,6 +24,38 @@ func (s *server) resolveSite(w http.ResponseWriter, r *http.Request) (store.Site
 	return site, true
 }
 
+// publicTenantContext resolves the tenant display context for the public
+// site endpoints. SPEC-W46 (W46-A item 5, P-DATA P-01): this used to be an
+// UNCACHED daprd service-invoke per page view (booking→daprd→identity→PG);
+// it now rides the TenantResolver — TTL-cached (TENANT_CACHE_TTL_SECONDS,
+// default 300s, stale-on-outage) and direct-HTTP when IDENTITY_BASE_URL is
+// set (the W45 pattern). The map mirrors identity's response shape
+// (id/slug/name/timezone/currency/locale/terminology/plan/industry/pack) so
+// the API contract is unchanged; on a hard resolution failure the same
+// fail-open fallback as before applies ({"slug": …}).
+func (s *server) publicTenantContext(r *http.Request, slug string) map[string]any {
+	info, err := s.d.Resolver.BySlug(r.Context(), slug)
+	if err != nil {
+		s.d.Logger.Warn("tenant context lookup failed for public site")
+		return map[string]any{"slug": slug}
+	}
+	m := map[string]any{
+		"id":          info.ID,
+		"slug":        info.Slug,
+		"name":        info.Name,
+		"timezone":    info.Timezone,
+		"currency":    info.Currency,
+		"locale":      info.Locale,
+		"terminology": info.Terminology,
+		"plan":        info.Plan,
+		"industry":    info.Industry,
+	}
+	if info.Pack != nil {
+		m["pack"] = info.Pack
+	}
+	return m
+}
+
 // publicContext serves GET /public/sites/{slug}/context — everything the
 // public booking page needs: site info, tenant display context, bookable
 // offerings and active team members.
@@ -33,11 +65,7 @@ func (s *server) publicContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// tenant display context (name/timezone/currency/locale/terminology)
-	var tenantCtx map[string]any
-	if err := s.d.Dapr.InvokeService(r.Context(), s.d.IdentityAppID, "v1/tenants/"+site.TenantSlug, nil, &tenantCtx); err != nil {
-		s.d.Logger.Warn("tenant context lookup failed for public site")
-		tenantCtx = map[string]any{"slug": site.TenantSlug}
-	}
+	tenantCtx := s.publicTenantContext(r, site.TenantSlug)
 	offerings, err := s.d.Store.ListOfferings(r.Context(), site.TenantID)
 	if err != nil {
 		s.internal(w, err)
@@ -77,11 +105,7 @@ func (s *server) publicSite(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var tenantCtx map[string]any
-	if err := s.d.Dapr.InvokeService(r.Context(), s.d.IdentityAppID, "v1/tenants/"+site.TenantSlug, nil, &tenantCtx); err != nil {
-		s.d.Logger.Warn("tenant context lookup failed for public site")
-		tenantCtx = map[string]any{}
-	}
+	tenantCtx := s.publicTenantContext(r, site.TenantSlug)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"site_slug":     site.Slug,
 		"business_name": site.DisplayName,
