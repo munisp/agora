@@ -158,7 +158,7 @@ func (s *Store) CreateBookingTx(ctx context.Context, b *Booking, guard SlotGuard
 	if b.ID == uuid.Nil {
 		b.ID = uuid.New()
 	}
-	return s.withTenant(ctx, b.TenantID, func(tx pgx.Tx) error {
+	err := s.withTenant(ctx, b.TenantID, func(tx pgx.Tx) error {
 		if err := lockTeamMemberTx(ctx, tx, b.TenantID, b.TeamMemberID); err != nil {
 			return err
 		}
@@ -184,6 +184,10 @@ func (s *Store) CreateBookingTx(ctx context.Context, b *Booking, guard SlotGuard
 		}
 		return insertExtraOutbox(ctx, tx, b.ID, extra)
 	})
+	if err == nil {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return err
 }
 
 // GetBooking fetches one booking scoped to a tenant.
@@ -341,7 +345,7 @@ func (s *Store) ListBookingsForRange(ctx context.Context, tenantID, teamMemberID
 // atomically. eventPayload may be nil to skip the outbox write. Optional
 // extra outbox rows (usage metering) join the same transaction.
 func (s *Store) SetBookingStatus(ctx context.Context, tenantID, id uuid.UUID, status, outboxTopic string, eventPayload []byte, extra ...ExtraOutbox) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx,
 			`UPDATE bookings SET status=$3, updated_at=now() WHERE tenant_id=$1 AND id=$2`,
 			tenantID, id, status)
@@ -360,13 +364,17 @@ func (s *Store) SetBookingStatus(ctx context.Context, tenantID, id uuid.UUID, st
 		}
 		return insertExtraOutbox(ctx, tx, id, extra)
 	})
+	if err == nil && (eventPayload != nil || len(extra) > 0) {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return err
 }
 
 // RescheduleBooking moves a booking to new times (+outbox event) atomically.
 // The target slot is re-validated inside the transaction under the
 // per-member advisory lock, excluding the booking itself (SPEC-W43 K-01).
 func (s *Store) RescheduleBooking(ctx context.Context, tenantID, id, teamMemberID uuid.UUID, startsAt, endsAt time.Time, guard SlotGuard, outboxTopic string, eventPayload []byte) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		if err := lockTeamMemberTx(ctx, tx, tenantID, teamMemberID); err != nil {
 			return err
 		}
@@ -390,6 +398,10 @@ func (s *Store) RescheduleBooking(ctx context.Context, tenantID, id, teamMemberI
 		}
 		return nil
 	})
+	if err == nil {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return err
 }
 
 // AnonymizeContacts applies the GDPR right-to-erasure tombstone to every
@@ -520,6 +532,19 @@ func (s *Store) ListStalePendingBookings(ctx context.Context, minAge time.Durati
 // NOTE (RLS): cross-tenant dispatcher path — see FetchUnsentOutbox.
 func (s *Store) MarkOutboxSent(ctx context.Context, id uuid.UUID) error {
 	_, err := s.pool.Exec(ctx, `UPDATE outbox SET sent_at=now() WHERE id=$1`, id)
+	return err
+}
+
+// MarkOutboxSentBatch marks many outbox rows dispatched in ONE round trip
+// (SPEC-W46 W46-A item 6, PERF-07: the dispatcher previously paid one UPDATE
+// per published row — 100 rows = 100 sequential RTTs).
+//
+// NOTE (RLS): cross-tenant dispatcher path — see FetchUnsentOutbox.
+func (s *Store) MarkOutboxSentBatch(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE outbox SET sent_at=now() WHERE id = ANY($1)`, ids)
 	return err
 }
 

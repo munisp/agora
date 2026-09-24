@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store persists Campaign Studio rows. Same packaging idiom as the W16
@@ -36,7 +37,7 @@ func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -496,22 +497,36 @@ func scanEnrollment(row pgx.Row) (Enrollment, error) {
 func (s *Store) Enroll(ctx context.Context, tenantID, journeyID uuid.UUID, contactIDs []uuid.UUID) (created []Enrollment, existing int, err error) {
 	created = []Enrollment{}
 	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		for _, cid := range contactIDs {
-			row, err := scanEnrollment(tx.QueryRow(ctx,
-				`INSERT INTO studio_enrollments (tenant_id, journey_id, contact_id)
-				 VALUES ($1,$2,$3)
-				 ON CONFLICT (tenant_id, journey_id, contact_id) DO NOTHING
-				 RETURNING `+enrollmentCols,
-				tenantID, journeyID, cid))
-			if errors.Is(err, pgx.ErrNoRows) {
-				existing++
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("enroll contact %s: %w", cid, err)
-			}
-			created = append(created, row)
+		if len(contactIDs) == 0 {
+			return nil
 		}
+		// SPEC-W46 (W46-A item 11, PERF-22): one batched INSERT via unnest
+		// (1 RTT) replaces the per-contact INSERT loop (N RTTs). The
+		// idempotency anchor is unchanged: ON CONFLICT DO NOTHING skips
+		// pre-existing (journey, contact) rows, RETURNING yields exactly
+		// the NEWLY created ones — created/existing accounting is identical
+		// to the old loop.
+		rows, err := tx.Query(ctx,
+			`INSERT INTO studio_enrollments (tenant_id, journey_id, contact_id)
+			 SELECT $1, $2, unnest($3::uuid[])
+			 ON CONFLICT (tenant_id, journey_id, contact_id) DO NOTHING
+			 RETURNING `+enrollmentCols,
+			tenantID, journeyID, contactIDs)
+		if err != nil {
+			return fmt.Errorf("enroll contacts: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			e, err := scanEnrollment(rows)
+			if err != nil {
+				return err
+			}
+			created = append(created, e)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("enroll contacts: %w", err)
+		}
+		existing = len(contactIDs) - len(created)
 		return nil
 	})
 	return created, existing, err
