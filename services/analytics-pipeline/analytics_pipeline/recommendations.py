@@ -2,9 +2,10 @@
 
 Reads the latest revenue-intelligence rows per offering from the Iceberg
 table `gold.reco_pricing` (written by infra/lakehouse/spark/jobs/
-revenue_intelligence.py) via a pyiceberg scan. The gold table is small (one
-row per tenant × offering per job run), so a full scan + in-Python "latest
-per offering" reduction is appropriate. When the table does not exist yet
+revenue_intelligence.py) via a pyiceberg scan. The scan pushes the tenant predicate down
+(row_filter) and projects only the needed fields (W46-F P6); the in-Python
+"latest per offering" reduction runs over the tenant's rows only. When the
+table does not exist yet
 (no Spark run so far) the endpoint returns an empty list.
 """
 
@@ -14,6 +15,7 @@ from typing import Any
 
 import structlog
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.expressions import EqualTo
 
 from .config import Settings
 from .iceberg_tables import load_rest_catalog
@@ -46,7 +48,18 @@ def fetch_recommendations(settings: Settings, tenant: str) -> list[dict[str, Any
         log.info("recommendations.table_absent", table=RECO_TABLE)
         return []
 
-    rows = table.scan(selected_fields=_RECO_FIELDS).to_arrow().to_pylist()
+    # W46-F P6: push the tenant predicate down to the scan (manifest/datafile
+    # pruning + projected fields) instead of a full gold-table scan with an
+    # in-Python tenant filter per request. The in-Python check stays as a
+    # defense-in-depth no-op when the filter is honored.
+    rows = (
+        table.scan(
+            row_filter=EqualTo("tenant_id", tenant),
+            selected_fields=_RECO_FIELDS,
+        )
+        .to_arrow()
+        .to_pylist()
+    )
 
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:

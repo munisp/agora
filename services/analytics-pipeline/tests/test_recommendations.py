@@ -25,10 +25,19 @@ class _FakeScan:
 
 
 class _FakeTable:
+    last_scan: dict | None = None
+
     def __init__(self, rows):
         self._rows = rows
 
-    def scan(self, selected_fields):
+    def scan(self, selected_fields, row_filter=None):
+        # W46-F P6: record the pushed-down predicate for assertion; the
+        # fake returns all rows so the in-Python reduction is still
+        # exercised (row_filter honored by real pyiceberg).
+        _FakeTable.last_scan = {
+            "selected_fields": selected_fields,
+            "row_filter": row_filter,
+        }
         return _FakeScan(self._rows)
 
 
@@ -80,6 +89,19 @@ def test_latest_per_offering_and_tenant_filter(monkeypatch, settings):
     assert a["suggested_peak_multiplier"] == 1.5
     assert a["suggested_deposit_pct"] == 30
     assert all(r["offering_id"] != "A" or r["bookings_30d"] == 12 for r in out)
+
+
+def test_scan_pushes_down_tenant_filter(monkeypatch, settings):
+    """W46-F P6: the Iceberg scan carries row_filter (tenant predicate) +
+    projected fields — no full-table scan per request."""
+    from pyiceberg.expressions import EqualTo
+
+    monkeypatch.setattr(recommendations, "load_rest_catalog", lambda s: _FakeCatalog(_rows()))
+    recommendations.fetch_recommendations(settings, T1)
+    scan = _FakeTable.last_scan
+    assert scan is not None
+    assert scan["selected_fields"] == recommendations._RECO_FIELDS
+    assert scan["row_filter"] == EqualTo("tenant_id", T1)
 
 
 def test_missing_table_returns_empty_list(monkeypatch, settings):

@@ -23,16 +23,28 @@ import type { ContactSearchResult } from "@/components/apps/crm-360/types";
 export function Crm360Client({
   orgSlug,
   canWork,
+  initialResults,
+  initialError,
 }: {
   orgSlug: string;
   /** owner/admin/staff — may write notes/tags on the profile page */
   canWork: boolean;
+  /** SPEC-W46 AW-2: unfiltered search fetched server-side in page.tsx. */
+  initialResults: ContactSearchResult[];
+  initialError: string | null;
 }) {
   const router = useRouter();
   const [filters, setFilters] = React.useState<SearchFilters>({ q: "", tag: "" });
-  const [results, setResults] = React.useState<ContactSearchResult[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const [results, setResults] =
+    React.useState<ContactSearchResult[]>(initialResults);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(initialError);
+
+  // Sync when the server props change (router.refresh()).
+  React.useEffect(() => {
+    setResults(initialResults);
+    setError(initialError);
+  }, [initialResults, initialError]);
 
   const load = React.useCallback(
     async (signal?: AbortSignal) => {
@@ -62,8 +74,14 @@ export function Crm360Client({
     [orgSlug, filters],
   );
 
-  // Debounce filter changes into one reload (same idiom as helpdesk).
+  // Debounce filter changes into one reload (same idiom as helpdesk). The
+  // initial (unfiltered) results arrive server-rendered — skip the first run.
+  const skipInitialLoad = React.useRef(true);
   React.useEffect(() => {
+    if (skipInitialLoad.current) {
+      skipInitialLoad.current = false;
+      return;
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => void load(controller.signal), 250);
     return () => {

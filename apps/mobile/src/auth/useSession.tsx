@@ -20,6 +20,7 @@ import {
   registerForPushNotifications,
   unregisterPushNotifications,
 } from "../push/register";
+import { setSessionExpiredHandler } from "../api/client";
 
 export interface SessionState {
   /** null while the stored session is being restored. */
@@ -43,9 +44,21 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
-      let stored = await loadSession();
-      // Proactive refresh: if the access token is expired (or close to it)
-      // and we hold a refresh token, refresh before first render.
+      // MB-4 (SPEC-W46): restore from SecureStore and unblock first paint
+      // IMMEDIATELY — never await a network round-trip here. A cold start
+      // with a near-expiry token used to stall on a Keycloak refresh RTT
+      // before any screen could render.
+      const stored = await loadSession();
+      if (cancelled) return;
+      setSession(stored);
+      setReady(true);
+
+      // Proactive refresh continues in the BACKGROUND. If the access token
+      // is expired (or close to it) and we hold a refresh token, refresh
+      // now so the first API calls don't pay the 401→refresh dance; any
+      // calls that do race ahead are covered by the client's single-flight
+      // 401→refresh→retry (MB-2). Auth semantics unchanged: a dead refresh
+      // grant still clears the session (→ /login via AuthGate).
       if (
         stored &&
         stored.expiresAt !== null &&
@@ -53,22 +66,28 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         stored.refreshToken
       ) {
         const refreshed = await refreshAccessToken(stored.refreshToken);
+        if (cancelled) return;
         if (refreshed) {
           await updateTokens(refreshed);
-          stored = await loadSession();
+          const next = await loadSession();
+          if (!cancelled) setSession(next);
         } else {
           await clearSession();
-          stored = null;
+          if (!cancelled) setSession(null);
         }
-      }
-      if (!cancelled) {
-        setSession(stored);
-        setReady(true);
       }
     })();
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // MB-2: when the API client's single-flight refresh fails (dead grant),
+  // it clears the stored session and invokes this hook so React state
+  // drops too — the root AuthGate then routes to /login (full logout).
+  React.useEffect(() => {
+    setSessionExpiredHandler(() => setSession(null));
+    return () => setSessionExpiredHandler(null);
   }, []);
 
   const signIn = React.useCallback(async (tenantSlug: string) => {

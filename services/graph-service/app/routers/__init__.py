@@ -56,6 +56,22 @@ async def run_write(deps: Any, kind: str, write: Any, tenant_id: str) -> dict[st
     return result
 
 
+async def run_batch_write(
+    deps: Any, kind: str, batch: Any, tenant_id: str
+) -> dict[str, Any]:
+    """W46-F P12: execute a CompiledBatchWrite with the same metrics/error
+    mapping as run_write."""
+    try:
+        with metrics.graph_query_latency.labels(kind=kind).time():
+            result = await deps.backend.execute_batch_write(batch, tenant_id)
+    except GraphError as exc:
+        metrics.graph_queries.labels(kind=kind, result="error").inc()
+        log.warning("graph.write_failed", kind=kind, error=str(exc))
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    metrics.graph_queries.labels(kind=kind, result="ok").inc()
+    return result
+
+
 async def require_internal_token(request: Request) -> None:
     """401 unless X-Internal-Token constant-time-matches INTERNAL_TOKEN.
 
