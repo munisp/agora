@@ -651,7 +651,7 @@ func (s *Store) SubmitResponse(ctx context.Context, token string, answers map[st
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE survey_invites SET status='answered', answered_at=now()
-			 WHERE tenant_id=$1 AND id=$2 AND status IN ('queued','sent')`,
+		 WHERE tenant_id=$1 AND id=$2 AND status IN ('queued','sent')`,
 		inv.TenantID, inv.ID)
 	if err != nil {
 		return out, err
