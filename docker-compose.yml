@@ -60,8 +60,32 @@ x-daprd:
   - ./infra/dapr/components:/components
   networks: &id003
   - opendesk
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
   identity:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/identity-service
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -142,6 +166,8 @@ services:
     - kafka
     - mailpit
   daprd-identity:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -150,6 +176,8 @@ services:
       DAPR_APP_ID: identity
       DAPR_APP_PORT: '7001'
   booking:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/booking-service
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -263,6 +291,8 @@ services:
     - temporal
     - permify
   daprd-booking:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -271,6 +301,8 @@ services:
       DAPR_APP_ID: booking
       DAPR_APP_PORT: '7002'
   notification:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/notification-worker
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -403,6 +435,8 @@ services:
     - kafka
     - redis
   messaging-gateway:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/messaging-gateway
     # Nigeria messaging channel (Termii / Africa's Talking / WhatsApp Cloud
     # API). Reached through the Dapr HTTP bindings bindings-termii /
@@ -471,6 +505,8 @@ services:
   # identity bootstraps (K10, KC_REALM_SMTP_* above). In-cluster address:
   # mailpit:1025. Prod replaces it via SMTP_HOST/KC_REALM_SMTP_HOST in .env.
   mailpit:
+    logging: *default-logging
+    deploy: *default-limits
     image: axllent/mailpit:v1.21
     restart: unless-stopped
     ports:
@@ -480,6 +516,8 @@ services:
     networks:
     - opendesk
   daprd-notification:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -497,6 +535,8 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-OpenDesk <no-reply@opendesk.local>}
   payments:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/payments-service
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -553,6 +593,8 @@ services:
     - tigerbeetle
     - kafka
   daprd-payments:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -561,6 +603,8 @@ services:
       DAPR_APP_ID: payments
       DAPR_APP_PORT: '7004'
   edge:
+    logging: *default-logging
+    deploy: *default-limits
     build:
       context: ./services/gateway-edge
       args:
@@ -604,6 +648,8 @@ services:
     - fluvio
     - keycloak
   voice:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/voice-agent-runtime
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -676,6 +722,8 @@ services:
     - booking
     - knowledge
   daprd-voice:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -684,6 +732,8 @@ services:
       DAPR_APP_ID: voice
       DAPR_APP_PORT: '7006'
   livekit:
+    logging: *default-logging
+    deploy: *default-limits
     image: livekit/livekit-server:v1.7
     # OOS-28 (SPEC-W45) STARTUP GUARD: `--dev` hardcodes the WELL-KNOWN
     # keypair devkey/secret and skips all config-file auth hardening — any
@@ -705,6 +755,8 @@ services:
     networks:
     - opendesk
   conversation:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/conversation-service
     environment:
       DAPR_HOST: daprd-conversation
@@ -762,6 +814,8 @@ services:
     - kafka
     - opensearch
   daprd-conversation:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -770,6 +824,8 @@ services:
       DAPR_APP_ID: conversation
       DAPR_APP_PORT: '7007'
   knowledge:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/knowledge-service
     environment:
       DAPR_HOST: daprd-knowledge
@@ -802,6 +858,8 @@ services:
     - postgres
     - opensearch
   daprd-knowledge:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -810,6 +868,8 @@ services:
       DAPR_APP_ID: knowledge
       DAPR_APP_PORT: '7008'
   analytics:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/analytics-pipeline
     environment:
       DAPR_HOST: ${DAPR_HOST:-}
@@ -848,6 +908,8 @@ services:
     - iceberg-rest
     - minio
   web:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./apps/admin-web
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -876,6 +938,13 @@ services:
     - apisix
     - keycloak
   ollama:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
     image: ollama/ollama:0.5.7
     profiles:
     - voice
@@ -888,6 +957,8 @@ services:
     # Publishing bypassed gateway authN entirely (any host process could call the
     # service directly and self-assign identity headers).
   ollama-init:
+    logging: *default-logging
+    deploy: *default-limits
     image: ollama/ollama:0.5.7
     profiles:
     - voice
@@ -897,6 +968,8 @@ services:
     - ollama
     entrypoint: /bin/sh -c "sleep 5 && OLLAMA_HOST=http://ollama:11434 ollama pull $${LLM_MODEL:-qwen3:8b}"
   piper:
+    logging: *default-logging
+    deploy: *default-limits
     build:
       context: ./services/voice-agent-runtime/sidecar
     profiles:
@@ -908,6 +981,8 @@ services:
     # Publishing bypassed gateway authN entirely (any host process could call the
     # service directly and self-assign identity headers).
   voice-worker:
+    logging: *default-logging
+    deploy: *default-limits
     build:
       context: ./services/voice-agent-runtime
     profiles:
@@ -966,6 +1041,8 @@ services:
     - voice
     - ollama
   crm-sync:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/crm-sync-service
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -1012,6 +1089,8 @@ services:
     - postgres
     - twenty-api
   daprd-crm-sync:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -1020,6 +1099,8 @@ services:
       DAPR_APP_ID: crm-sync
       DAPR_APP_PORT: '7010'
   billing-engine:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/billing-engine
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -1088,6 +1169,8 @@ services:
   # SPEC-W12 §5: KYC verification service (BVN/NIN, consent-gated). Dapr
   # app-id kyc; publishes opendesk.kyc.resolved.v1.
   kyc:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/kyc-service
     env_file:
     - path: .env
@@ -1140,6 +1223,8 @@ services:
     - kafka
     - identity
   daprd-kyc:
+    logging: *default-logging
+    deploy: *default-limits
     image: daprio/daprd:1.14.4
     command: *id001
     volumes: *id002
@@ -1154,6 +1239,8 @@ services:
   # debug). Start with: docker compose --profile experimental up -d credit-bureau
   # and uncomment the matching comment-gated route in infra/apisix/apisix.yaml.
   credit-bureau:
+    logging: *default-logging
+    deploy: *default-limits
     build: ./services/credit-bureau
     profiles:
     - experimental
