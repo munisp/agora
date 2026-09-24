@@ -20,16 +20,69 @@ volumes:
   fluvio-data:
   model-registry-manifests:
 
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
 
   # ---------------- Postgres 16 (SPEC §7) ----------------
   postgres:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
     # SPEC-W8 A1: postgis/postgis is a drop-in replacement for postgres:16
     # (same entrypoint, user/db env, data layout) adding the PostGIS
     # extension used by booking-service's geo tables.
     image: postgis/postgis:16-3.4
     container_name: postgres
     restart: unless-stopped
+    # W46-I (P-DATA I-01): tune the shared Postgres 16 instance — stock
+    # defaults (shared_buffers=128MB, work_mem=4MB, max_connections=100)
+    # thrash the buffer pool, disk-sort, and cap the fleet connection budget
+    # (booking alone needs ~68/replica; fleet ≈220+, see I-02). These are
+    # DEV-FRIENDLY values for a single docker host running the whole stack.
+    # PROD SIZING: shared_buffers ~25% of host RAM (e.g. 2GB on 8GB),
+    # effective_cache_size ~50-75%, work_mem ≈ RAM/(max_connections*2),
+    # random_page_cost 1.1 assumes SSD; front the fleet with PgBouncer
+    # (transaction mode, ADR-0008) if connections outgrow max_connections.
+    command:
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=16MB
+      - -c
+      - effective_cache_size=4GB
+      - -c
+      - max_connections=300
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - jit=off
+      - -c
+      - log_min_duration_statement=500
     environment:
       POSTGRES_USER: opendesk
       POSTGRES_PASSWORD: opendesk
@@ -48,10 +101,24 @@ services:
 
   # ---------------- Redis 7 ----------------
   redis:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
     image: redis:7-alpine
     container_name: redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"]
+    # W46-I (P-DATA I-03): this is an EPHEMERAL shared instance (availability
+    # cache, APISIX limit-count keys, outbound pacer, voice session state).
+    # maxmemory + allkeys-lru evict cold keys instead of OOMing the host;
+    # AOF is OFF to keep fsync latency off the hot path. Durable data MUST
+    # NOT move here — anything that cannot be rebuilt belongs in
+    # Postgres/Kafka. (twenty-redis in docker-compose.crm.yml keeps AOF: it
+    # backs Twenty's bull-mq job queue, not an ephemeral cache.)
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
       - "6379:6379"
     volumes:
@@ -65,6 +132,13 @@ services:
 
   # ---------------- Kafka (KRaft, bitnami, SPEC §4) ----------------
   kafka:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
     image: bitnami/kafka:3.7
     container_name: kafka
     restart: unless-stopped
@@ -92,6 +166,8 @@ services:
     networks: [opendesk]
 
   kafka-topics:
+    logging: *default-logging
+    deploy: *default-limits
     image: bitnami/kafka:3.7
     container_name: kafka-topics
     depends_on:
@@ -114,6 +190,8 @@ services:
   # Honest dev setup: SC + local SPU run inside one container via the fluvio
   # CLI; a CLI sidecar creates the topic against the SC. See fluvio/README.md.
   fluvio:
+    logging: *default-logging
+    deploy: *default-limits
     image: infinyon/fluvio:latest
     container_name: fluvio
     restart: unless-stopped
@@ -131,6 +209,8 @@ services:
     networks: [opendesk]
 
   fluvio-topics:
+    logging: *default-logging
+    deploy: *default-limits
     image: infinyon/fluvio:latest
     container_name: fluvio-topics
     depends_on:
@@ -151,6 +231,13 @@ services:
 
   # ---------------- Temporal (SPEC §6, namespace `opendesk`) ----------------
   temporal:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
     image: temporalio/auto-setup:1.24
     container_name: temporal
     restart: unless-stopped
@@ -181,6 +268,8 @@ services:
     networks: [opendesk]
 
   temporal-ui:
+    logging: *default-logging
+    deploy: *default-limits
     image: temporalio/ui:2.28.0
     container_name: temporal-ui
     restart: unless-stopped
@@ -202,6 +291,8 @@ services:
 
   # ---------------- TigerBeetle (SPEC §9, cluster 0, replica 3000) ----------------
   tigerbeetle:
+    logging: *default-logging
+    deploy: *default-limits
     # SPEC-W42 R1: the pinned Rust client (tigerbeetle-unofficial
     # 0.8.0+0.16.28, see services/payments-service/Cargo.toml) speaks the
     # TigerBeetle 0.16.28 wire protocol, and the server enforces client/server
@@ -234,6 +325,8 @@ services:
 
   # ---------------- Permify (SPEC §8) ----------------
   permify:
+    logging: *default-logging
+    deploy: *default-limits
     image: permify/permify:v1.2.7
     container_name: permify
     restart: unless-stopped
@@ -261,6 +354,8 @@ services:
     networks: [opendesk]
 
   permify-schema-loader:
+    logging: *default-logging
+    deploy: *default-limits
     image: curlimages/curl:8.8.0
     container_name: permify-schema-loader
     depends_on:
@@ -283,6 +378,13 @@ services:
 
   # ---------------- Keycloak (SPEC §8) ----------------
   keycloak:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
     image: quay.io/keycloak/keycloak:25.0
     container_name: keycloak
     restart: unless-stopped
@@ -315,6 +417,8 @@ services:
 
   # ---------------- Mojaloop simulator (SPEC §9) ----------------
   mojaloop:
+    logging: *default-logging
+    deploy: *default-limits
     image: mojaloop/simulator:latest
     container_name: mojaloop
     restart: unless-stopped
@@ -334,6 +438,8 @@ services:
 
   # ---------------- model-registry (SPEC-W33 §4 C1/C2/C3/C5) ----------------
   model-registry:
+    logging: *default-logging
+    deploy: *default-limits
     # Model version registry + drift sweep + A/B + nightly training scheduler
     # on the `platform` DB (init-scripts/30-model-registry.sql, FORCE RLS).
     # Slim image: no torch/sklearn/MLflow (I5); Kafka alerts degrade to

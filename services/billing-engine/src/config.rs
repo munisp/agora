@@ -77,6 +77,12 @@ pub struct Config {
     pub dunning_interval_s: u64,
     /// Issued invoices older than this many days become past_due.
     pub invoice_due_days: i64,
+    /// SPEC-W46 R9: per-pool max connections (`BILLING_DB_POOL_MAX`, default
+    /// 10). Applies to BOTH the app pool and the internal pool, so a pod
+    /// holds at most `2 * db_pool_max` connections to the billing database
+    /// (10+10=20 by default — compose max_connections=300 headroom shared
+    /// with the other services).
+    pub db_pool_max: u32,
 }
 
 /// K6: csv env -> lowercase trimmed role list; empty input falls back to the
@@ -242,6 +248,7 @@ impl Config {
             tenant_cache_ttl_s: env_parse("TENANT_CACHE_TTL_SECONDS", 60),
             dunning_interval_s: env_parse("DUNNING_INTERVAL_S", 3600),
             invoice_due_days: env_parse("INVOICE_DUE_DAYS", 14),
+            db_pool_max: env_parse("BILLING_DB_POOL_MAX", 10),
         })
     }
 

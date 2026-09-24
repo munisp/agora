@@ -224,10 +224,12 @@ export function GeoCampaignsClient({ orgSlug }: { orgSlug: string }) {
   }, [loadCampaigns]);
 
   // Poll while any campaign is still running.
+  // SPEC-W46 AW-6: 4s → 10s — progress moves at send-batch cadence, so the
+  // tighter interval only generated background traffic.
   const hasRunning = campaigns.some((c) => c.status === "running");
   React.useEffect(() => {
     if (!hasRunning) return;
-    const timer = setInterval(() => void loadCampaigns(true), 4000);
+    const timer = setInterval(() => void loadCampaigns(true), 10000);
     return () => clearInterval(timer);
   }, [hasRunning, loadCampaigns]);
 
