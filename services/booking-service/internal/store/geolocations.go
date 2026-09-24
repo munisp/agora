@@ -461,8 +461,8 @@ func (s *Store) CreateGeoCampaign(ctx context.Context, c *GeoCampaign, circle *C
 				circle.Lng, circle.Lat, circle.RadiusM, c.Status).Scan(&c.CreatedAt, &c.StartedAt)
 		}
 		const q = `INSERT INTO geo_campaigns (id, tenant_id, name, channel, message, target, status, created_at, started_at)
-			           VALUES ($1, $2, $3, $4, $5, ST_Multi(ST_GeomFromGeoJSON($6))::geography, $7, now(), now())
-			           RETURNING created_at, started_at`
+		           VALUES ($1, $2, $3, $4, $5, ST_Multi(ST_GeomFromGeoJSON($6))::geography, $7, now(), now())
+		           RETURNING created_at, started_at`
 		return tx.QueryRow(ctx, q, c.ID, c.TenantID, c.Name, c.Channel, c.Message, c.TargetGeoJSON, c.Status).
 			Scan(&c.CreatedAt, &c.StartedAt)
 	})
