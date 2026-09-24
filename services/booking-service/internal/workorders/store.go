@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store persists work orders. Same packaging idiom as the W16 devices
@@ -37,7 +38,7 @@ func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -102,6 +103,14 @@ BEGIN
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure work_orders table: %w", err)
+	}
+	// SPEC-W46 (W46-A item 1, P-DATA DDL #11): GIN trigram index backing the
+	// title/description ILIKE search. CONCURRENTLY requires its own
+	// single-statement Exec (no transaction block). Best-effort: without the
+	// pg_trgm contrib module the previous seq-scan search remains.
+	if _, err := s.pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err == nil {
+		_, _ = s.pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_workorders_title_trgm
+			ON work_orders USING gin (title gin_trgm_ops)`)
 	}
 	return nil
 }

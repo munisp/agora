@@ -94,13 +94,11 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
     const from = new Date(to.getTime() - days * 24 * 60 * 60 * 1000);
     const softNotes: string[] = [];
     try {
-      // 1) tenant (uuid + currency) — required for the conversation API.
-      const tenant = await api.get<Tenant>(
-        `/api/identity/v1/tenants/${orgSlug}`,
-      );
-
-      // 2) bookings in period + offerings (for per-booking revenue).
-      const [bookingsRaw, offeringsRaw] = await Promise.all([
+      // 1)+2) SPEC-W46 AW-1: the tenant fetch (uuid + currency, required for
+      // the conversation API) no longer gates the bookings/offerings leg —
+      // all three fire in parallel, removing one serial RTT.
+      const [tenant, bookingsRaw, offeringsRaw] = await Promise.all([
+        api.get<Tenant>(`/api/identity/v1/tenants/${orgSlug}`),
         api.get<Booking[] | { items: Booking[] }>(
           "/api/bookings/v1/bookings",
           {
@@ -184,22 +182,36 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
         }
         // Sentiment: average scored turns across a capped sample of the
         // most recent in-period conversations (detail fetch per conv).
+        // SPEC-W46 AW-1: the 8 detail fetches ran as a serial for-loop
+        // (up to 8 extra gateway RTTs); they now run through a worker pool
+        // capped at 6 concurrent requests. The average is order-insensitive,
+        // so unordered completion is safe.
         const sample = inPeriod.slice(0, 8);
         sentimentSamples = sample.length;
         const scores: number[] = [];
-        for (const c of sample) {
-          try {
-            const detail = await api.get<ConversationWithTurns>(
-              `/api/conversations/v1/conversations/${c.id}`,
-              { tenant_id: tenant.id },
-            );
-            for (const t of detail.turns ?? []) {
-              if (typeof t.sentiment === "number") scores.push(t.sentiment);
-            }
-          } catch {
-            // single conversation unreadable — skip it
-          }
-        }
+        let next = 0;
+        await Promise.all(
+          Array.from(
+            { length: Math.min(6, sample.length) },
+            async () => {
+              while (next < sample.length) {
+                const c = sample[next];
+                next += 1;
+                try {
+                  const detail = await api.get<ConversationWithTurns>(
+                    `/api/conversations/v1/conversations/${c.id}`,
+                    { tenant_id: tenant.id },
+                  );
+                  for (const t of detail.turns ?? []) {
+                    if (typeof t.sentiment === "number") scores.push(t.sentiment);
+                  }
+                } catch {
+                  // single conversation unreadable — skip it
+                }
+              }
+            },
+          ),
+        );
         if (scores.length > 0) {
           avgSentiment =
             scores.reduce((a, b) => a + b, 0) / scores.length;

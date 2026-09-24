@@ -13,6 +13,7 @@
  */
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowLeft, MailPlus, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
@@ -41,7 +42,7 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { titleCase } from "@/lib/utils";
 
-interface IdentityMember {
+export interface IdentityMember {
   tenant_id: string;
   user_id: string;
   role: string;
@@ -61,34 +62,44 @@ function warningsOf(body: unknown): string[] {
   return [];
 }
 
-export function MembersClient({ orgSlug }: { orgSlug: string }) {
+/**
+ * SPEC-W46 AW-4: the identity members endpoint has no limit/cursor param
+ * (contract frozen), so rendering is bounded client-side at 100 rows/page.
+ */
+const PAGE_SIZE = 100;
+
+export function MembersClient({
+  orgSlug,
+  initialMembers,
+  initialError,
+}: {
+  orgSlug: string;
+  /** SPEC-W46 AW-2: fetched server-side in page.tsx. */
+  initialMembers: IdentityMember[];
+  initialError: string | null;
+}) {
   const { toast } = useToast();
-  const [members, setMembers] = React.useState<IdentityMember[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const router = useRouter();
+  const [members, setMembers] = React.useState<IdentityMember[]>(initialMembers);
+  const [error, setError] = React.useState<string | null>(initialError);
   const [inviting, setInviting] = React.useState(false);
   const [removing, setRemoving] = React.useState<IdentityMember | null>(null);
   const [roleEdits, setRoleEdits] = React.useState<Record<string, string>>({});
   const [busy, setBusy] = React.useState(false);
+  const [page, setPage] = React.useState(0);
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.get<{ members?: IdentityMember[] }>(
-        `/api/identity/v1/tenants/${orgSlug}/members`,
-      );
-      setMembers(data.members ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load members.");
-    } finally {
-      setLoading(false);
-    }
-  }, [orgSlug]);
-
+  // Sync when the server props change (router.refresh() after mutations).
   React.useEffect(() => {
-    void load();
-  }, [load]);
+    setMembers(initialMembers);
+    setError(initialError);
+  }, [initialMembers, initialError]);
+
+  const pageCount = Math.max(1, Math.ceil(members.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedMembers = members.slice(
+    safePage * PAGE_SIZE,
+    (safePage + 1) * PAGE_SIZE,
+  );
 
   const changeRole = async (m: IdentityMember) => {
     const role = roleEdits[m.user_id];
@@ -105,7 +116,7 @@ export function MembersClient({ orgSlug }: { orgSlug: string }) {
         description: warnings.length ? warnings.join(" · ") : undefined,
         variant: warnings.length ? "warning" : "success",
       });
-      await load();
+      router.refresh();
     } catch (e) {
       toast({
         title: "Role change failed",
@@ -131,7 +142,7 @@ export function MembersClient({ orgSlug }: { orgSlug: string }) {
         variant: warnings.length ? "warning" : "success",
       });
       setRemoving(null);
-      await load();
+      router.refresh();
     } catch (e) {
       toast({
         title: "Remove failed",
@@ -174,12 +185,10 @@ export function MembersClient({ orgSlug }: { orgSlug: string }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {members.length === 0 ? (
-              <TableEmpty colSpan={4}>
-                {loading ? "Loading…" : "No members found."}
-              </TableEmpty>
+            {pagedMembers.length === 0 ? (
+              <TableEmpty colSpan={4}>No members found.</TableEmpty>
             ) : (
-              members.map((m) => (
+              pagedMembers.map((m) => (
                 <TableRow key={m.user_id}>
                   <TableCell className="pl-5 font-mono text-xs">
                     {m.user_id}
@@ -235,13 +244,39 @@ export function MembersClient({ orgSlug }: { orgSlug: string }) {
         </Table>
       </Card>
 
+      {pageCount > 1 ? (
+        <div className="mt-3 flex items-center justify-between">
+          <p className="text-xs text-muted-foreground">
+            Page {safePage + 1} of {pageCount} · {members.length} members
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage(safePage - 1)}
+              disabled={safePage === 0}
+            >
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage(safePage + 1)}
+              disabled={safePage >= pageCount - 1}
+            >
+              Next
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
       <InviteDialog
         orgSlug={orgSlug}
         open={inviting}
         busy={busy}
         setBusy={setBusy}
         onClose={() => setInviting(false)}
-        onInvited={() => void load()}
+        onInvited={() => router.refresh()}
       />
       <ConfirmDialog
         open={removing !== null}

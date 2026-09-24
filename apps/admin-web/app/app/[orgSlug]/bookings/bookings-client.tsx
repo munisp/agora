@@ -26,14 +26,18 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
 import { addDays, formatDateTime, minutesToTime, titleCase, toISODate } from "@/lib/utils";
-import {
-  DEFAULT_BOOKING_LABELS,
-  resolveBookingLabels,
-  type BookingLabels,
-} from "@/lib/terminology";
-import type { Booking, BookingEvent, EscalationRequestedEvent, Tenant, WsEvent } from "@/lib/types";
+import { type BookingLabels } from "@/lib/terminology";
+import type { Booking, BookingEvent, EscalationRequestedEvent, WsEvent } from "@/lib/types";
 
 type Range = "today" | "upcoming" | "past";
+
+/**
+ * SPEC-W46 AW-4: bounded list pages. booking-service honors limit up to 500
+ * (no cursor), so "load more" refetches with a larger limit. Must match the
+ * server-side fetch in page.tsx.
+ */
+const PAGE_SIZE = 100;
+const MAX_LIMIT = 500;
 
 function rangeQuery(range: Range): { from: string; to: string } {
   const now = new Date();
@@ -47,41 +51,46 @@ function rangeQuery(range: Range): { from: string; to: string } {
 export function BookingsClient({
   orgSlug,
   token,
+  initialBookings,
+  initialLabels,
+  initialError,
 }: {
   orgSlug: string;
   token?: string;
+  /** SPEC-W46 AW-2: default range ("upcoming") fetched server-side. */
+  initialBookings: Booking[];
+  initialLabels: BookingLabels;
+  initialError: string | null;
 }) {
   const { toast } = useToast();
   const router = useRouter();
   const [range, setRange] = React.useState<Range>("upcoming");
-  const [bookings, setBookings] = React.useState<Booking[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const [bookings, setBookings] = React.useState<Booking[]>(initialBookings);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(initialError);
+  const [limit, setLimit] = React.useState(PAGE_SIZE);
   const [rescheduleTarget, setRescheduleTarget] = React.useState<Booking | null>(null);
   const [cancelTarget, setCancelTarget] = React.useState<Booking | null>(null);
   const [busy, setBusy] = React.useState(false);
   // Pack/tenant-aware copy ("Bookings" -> "Reservations", "Guest" -> "Patient", …).
-  const [labels, setLabels] = React.useState<BookingLabels>(DEFAULT_BOOKING_LABELS);
+  const [labels, setLabels] = React.useState<BookingLabels>(initialLabels);
 
+  // Sync when the server props change (router.refresh()).
   React.useEffect(() => {
-    (async () => {
-      try {
-        const t = await api.get<Tenant>(`/api/identity/v1/tenants/${orgSlug}`);
-        setLabels(resolveBookingLabels(t));
-      } catch {
-        // Terminology is cosmetic — keep the defaults if identity is down.
-      }
-    })();
-  }, [orgSlug]);
+    setBookings(initialBookings);
+    setLabels(initialLabels);
+    setError(initialError);
+  }, [initialBookings, initialLabels, initialError]);
 
   const load = React.useCallback(
-    async (r: Range) => {
+    async (r: Range, effectiveLimit?: number) => {
+      const lim = effectiveLimit ?? limit;
       setLoading(true);
       setError(null);
       try {
         const data = await api.get<Booking[] | { items: Booking[] }>(
           "/api/bookings/v1/bookings",
-          { tenant: orgSlug, ...rangeQuery(r) },
+          { tenant: orgSlug, ...rangeQuery(r), limit: lim },
         );
         const items = Array.isArray(data) ? data : (data.items ?? []);
         setBookings(
@@ -97,12 +106,28 @@ export function BookingsClient({
         setLoading(false);
       }
     },
-    [orgSlug],
+    [orgSlug, limit],
   );
 
+  // The default range arrives server-rendered; refetch only on range switch.
+  const skipInitialLoad = React.useRef(true);
   React.useEffect(() => {
-    void load(range);
-  }, [load, range]);
+    if (skipInitialLoad.current) {
+      skipInitialLoad.current = false;
+      return;
+    }
+    setLimit(PAGE_SIZE);
+    void load(range, PAGE_SIZE);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [range]);
+
+  const loadMore = () => {
+    const next = Math.min(limit + PAGE_SIZE, MAX_LIMIT);
+    setLimit(next);
+    void load(range, next);
+  };
+  // A full page means the server may hold more rows in this range.
+  const canLoadMore = bookings.length >= limit && limit < MAX_LIMIT;
 
   // SPEC-W45 K15(e): the staff LiveKit join token is no longer published on
   // the events topic. When an operator picks up the escalation we mint a
@@ -307,6 +332,19 @@ export function BookingsClient({
           </TableBody>
         </Table>
       </Card>
+
+      {canLoadMore ? (
+        <div className="mt-3 flex justify-center">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={loadMore}
+            disabled={loading}
+          >
+            {loading ? "Loading…" : "Load more"}
+          </Button>
+        </div>
+      ) : null}
 
       <RescheduleDialog
         booking={rescheduleTarget}
