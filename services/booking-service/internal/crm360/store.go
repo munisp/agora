@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store persists crm_notes + crm_tags and serves the read-only 360
@@ -22,6 +24,13 @@ import (
 type Store struct {
 	pool    *pgxpool.Pool
 	ownPool bool // true when opened via DialStore
+
+	// SPEC-W46 (W46-A item 3, PERF-05): table-existence probes are memoized
+	// once per table name per process (the schema is static for the process
+	// lifetime) instead of one information_schema round-trip per 360
+	// section per request.
+	tablesMu sync.RWMutex
+	tables   map[string]bool
 }
 
 // NewStore wraps an existing pool and ensures the schema.
@@ -39,7 +48,7 @@ func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -141,13 +150,35 @@ var ErrNotFound = errors.New("not found")
 // 360 aggregation guards every OPTIONAL source with this so a partially
 // deployed booking DB (e.g. helpdesk not yet rolled out) degrades to an
 // empty section instead of a 500 (SPEC-W20 Agent A contract).
-func tableExists(ctx context.Context, tx pgx.Tx, name string) (bool, error) {
-	var ok bool
-	err := tx.QueryRow(ctx,
+//
+// SPEC-W46 (W46-A item 3, PERF-05): the probe is memoized process-wide
+// (both outcomes) — the information_schema catalog query no longer rides
+// every Profile-360 request. A probe error is NOT cached (the next
+// request retries, matching the previous fail-through behavior).
+func (s *Store) tableExists(ctx context.Context, name string) (bool, error) {
+	s.tablesMu.RLock()
+	ok, cached := s.tables[name]
+	s.tablesMu.RUnlock()
+	if cached {
+		return ok, nil
+	}
+	s.tablesMu.Lock()
+	defer s.tablesMu.Unlock()
+	if ok, cached := s.tables[name]; cached { // re-check under the write lock
+		return ok, nil
+	}
+	if s.tables == nil {
+		s.tables = map[string]bool{}
+	}
+	err := s.pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM information_schema.tables
 		                 WHERE table_schema = current_schema() AND table_name = $1)`,
 		name).Scan(&ok)
-	return ok, err
+	if err != nil {
+		return false, err
+	}
+	s.tables[name] = ok
+	return ok, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -450,24 +481,24 @@ func (s *Store) Profile360(ctx context.Context, tenantID, contactID uuid.UUID) (
 			return err
 		}
 
-		if err := loadTicketSection(ctx, tx, tenantID, contactID, &p); err != nil {
+		if err := loadTicketSection(ctx, s, tx, tenantID, contactID, &p); err != nil {
 			return err
 		}
-		if err := loadBookingSection(ctx, tx, tenantID, contactID, &p); err != nil {
+		if err := loadBookingSection(ctx, s, tx, tenantID, contactID, &p); err != nil {
 			return err
 		}
-		if err := loadWorkOrderSection(ctx, tx, tenantID, contactID, &p); err != nil {
+		if err := loadWorkOrderSection(ctx, s, tx, tenantID, contactID, &p); err != nil {
 			return err
 		}
-		return loadWalletSection(ctx, tx, tenantID, contactID, &p)
+		return loadWalletSection(ctx, s, tx, tenantID, contactID, &p)
 	})
 	return p, err
 }
 
 // loadTicketSection fills OpenTicketCount + the latest 5 tickets
 // (open = status open|pending, mirroring the helpdesk queue semantics).
-func loadTicketSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
-	ok, err := tableExists(ctx, tx, "tickets")
+func loadTicketSection(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
+	ok, err := s.tableExists(ctx, "tickets")
 	if err != nil || !ok {
 		return err
 	}
@@ -496,8 +527,8 @@ func loadTicketSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.
 }
 
 // loadBookingSection fills the latest 5 bookings (by scheduled start).
-func loadBookingSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
-	ok, err := tableExists(ctx, tx, "bookings")
+func loadBookingSection(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
+	ok, err := s.tableExists(ctx, "bookings")
 	if err != nil || !ok {
 		return err
 	}
@@ -523,8 +554,8 @@ func loadBookingSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid
 var activeWorkOrderStatuses = []string{"created", "assigned", "en_route", "on_site"}
 
 // loadWorkOrderSection fills the ACTIVE work orders for the contact.
-func loadWorkOrderSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
-	ok, err := tableExists(ctx, tx, "work_orders")
+func loadWorkOrderSection(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
+	ok, err := s.tableExists(ctx, "work_orders")
 	if err != nil || !ok {
 		return err
 	}
@@ -550,8 +581,8 @@ func loadWorkOrderSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uu
 // loadWalletSection fills Wallet when a loyalty_wallets row exists for
 // the contact (nil otherwise — SPEC: "loyalty wallet {balance, tier} if
 // any").
-func loadWalletSection(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
-	ok, err := tableExists(ctx, tx, "loyalty_wallets")
+func loadWalletSection(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, p *Profile360) error {
+	ok, err := s.tableExists(ctx, "loyalty_wallets")
 	if err != nil || !ok {
 		return err
 	}
@@ -616,16 +647,16 @@ func (s *Store) Timeline(ctx context.Context, tenantID, contactID uuid.UUID, lim
 			return err
 		}
 
-		if err := timelineBookings(ctx, tx, tenantID, contactID, limit, &items); err != nil {
+		if err := timelineBookings(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
 			return err
 		}
-		if err := timelineTicketEvents(ctx, tx, tenantID, contactID, limit, &items); err != nil {
+		if err := timelineTicketEvents(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
 			return err
 		}
-		if err := timelineWorkOrders(ctx, tx, tenantID, contactID, limit, &items); err != nil {
+		if err := timelineWorkOrders(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
 			return err
 		}
-		return timelineLoyalty(ctx, tx, tenantID, contactID, limit, &items)
+		return timelineLoyalty(ctx, s, tx, tenantID, contactID, limit, &items)
 	})
 	if err != nil {
 		return nil, err
@@ -638,8 +669,8 @@ func (s *Store) Timeline(ctx context.Context, tenantID, contactID uuid.UUID, lim
 }
 
 // timelineBookings contributes one item per booking (at creation time).
-func timelineBookings(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
-	ok, err := tableExists(ctx, tx, "bookings")
+func timelineBookings(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
+	ok, err := s.tableExists(ctx, "bookings")
 	if err != nil || !ok {
 		return err
 	}
@@ -671,12 +702,12 @@ func timelineBookings(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.U
 // timelineTicketEvents contributes helpdesk ticket_events for tickets
 // linked to the contact (created / assigned / status_changed / note /
 // first_response / resolved / reopened).
-func timelineTicketEvents(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
-	ok, err := tableExists(ctx, tx, "ticket_events")
+func timelineTicketEvents(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
+	ok, err := s.tableExists(ctx, "ticket_events")
 	if err != nil || !ok {
 		return err
 	}
-	ok, err = tableExists(ctx, tx, "tickets")
+	ok, err = s.tableExists(ctx, "tickets")
 	if err != nil || !ok {
 		return err
 	}
@@ -711,8 +742,8 @@ func timelineTicketEvents(ctx context.Context, tx pgx.Tx, tenantID, contactID uu
 // completion item when completed_at is set. Intermediate status changes
 // are not recorded in the booking DB (no work-order history table), so
 // they cannot appear here — documented in docs/apps/crm-360.md.
-func timelineWorkOrders(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
-	ok, err := tableExists(ctx, tx, "work_orders")
+func timelineWorkOrders(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
+	ok, err := s.tableExists(ctx, "work_orders")
 	if err != nil || !ok {
 		return err
 	}
@@ -753,8 +784,8 @@ func timelineWorkOrders(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid
 // timelineLoyalty contributes one item per loyalty_ledger entry for the
 // contact (beneficiary_id carries the contact id as text — see
 // internal/loyalty/ledger.go).
-func timelineLoyalty(ctx context.Context, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
-	ok, err := tableExists(ctx, tx, "loyalty_ledger")
+func timelineLoyalty(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
+	ok, err := s.tableExists(ctx, "loyalty_ledger")
 	if err != nil || !ok {
 		return err
 	}

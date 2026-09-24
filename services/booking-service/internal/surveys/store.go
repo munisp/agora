@@ -26,6 +26,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store wraps a pgx pool.
@@ -49,7 +50,7 @@ func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -433,9 +434,8 @@ func (s *Store) CreateInvites(ctx context.Context, tenantID, surveyID uuid.UUID,
 			return err
 		}
 
-		const ins = `INSERT INTO survey_invites (tenant_id, survey_id, contact_id, token)
-			             VALUES ($1,$2,$3,$4)
-			             RETURNING ` + inviteCols
+		// Filter to the invitable contacts first (order preserved).
+		eligible := make([]uuid.UUID, 0, len(contactIDs))
 		for _, cid := range contactIDs {
 			c, ok := found[cid]
 			if !ok {
@@ -446,29 +446,86 @@ func (s *Store) CreateInvites(ctx context.Context, tenantID, surveyID uuid.UUID,
 				res.Skipped = append(res.Skipped, SkippedContact{ContactID: cid, Reason: "no_phone"})
 				continue
 			}
-			// Token collision is cryptographically negligible; retry a few
-			// times anyway so a unique-violation can never 500 the send.
-			var inv Invite
-			inserted := false
-			for attempt := 0; attempt < 3 && !inserted; attempt++ {
+			eligible = append(eligible, cid)
+		}
+		if len(eligible) == 0 {
+			return nil
+		}
+
+		// SPEC-W46 (W46-A item 11, PERF-22): ONE batched INSERT via unnest
+		// (1 RTT) replaces the per-invite INSERT loop (N RTTs). Token
+		// collision discipline is preserved at batch scope: a unique
+		// violation retries the WHOLE batch with fresh tokens (the failed
+		// statement inserts nothing — the batch is atomic), so a collision
+		// can still never 500 the send.
+		const ins = `INSERT INTO survey_invites (tenant_id, survey_id, contact_id, token)
+			             SELECT $1, $2, c.cid, c.tok
+			               FROM unnest($3::uuid[], $4::text[]) AS c(cid, tok)
+			             RETURNING ` + inviteCols
+		var batch []Invite
+		var tokenSlot map[string]int
+		inserted := false
+		for attempt := 0; attempt < 3 && !inserted; attempt++ {
+			tokens := make([]string, len(eligible))
+			tokenSlot = make(map[string]int, len(eligible))
+			for i := range tokens {
 				token, err := NewToken()
 				if err != nil {
 					return err
 				}
-				inv, err = scanInvite(tx.QueryRow(ctx, ins, tenantID, surveyID, cid, token))
-				if err != nil {
-					if isUniqueViolation(err) {
-						continue
-					}
-					return fmt.Errorf("insert invite: %w", err)
+				tokens[i] = token
+				tokenSlot[token] = i
+			}
+			rows, err := tx.Query(ctx, ins, tenantID, surveyID, eligible, tokens)
+			if err != nil {
+				if isUniqueViolation(err) {
+					continue
 				}
-				inserted = true
+				return fmt.Errorf("insert invites: %w", err)
 			}
-			if !inserted {
-				return fmt.Errorf("insert invite: token collision after retries")
+			batch = batch[:0]
+			scanErr := func() error {
+				defer rows.Close()
+				for rows.Next() {
+					inv, err := scanInvite(rows)
+					if err != nil {
+						return err
+					}
+					batch = append(batch, inv)
+				}
+				return rows.Err()
+			}()
+			if scanErr != nil {
+				if isUniqueViolation(scanErr) {
+					continue
+				}
+				return fmt.Errorf("insert invites: %w", scanErr)
 			}
-			res.Invites = append(res.Invites, inv)
-			res.Contacts[cid] = c
+			inserted = true
+		}
+		if !inserted {
+			return fmt.Errorf("insert invites: token collision after retries")
+		}
+		// RETURNING order is unspecified — restore the request order so the
+		// response matches the old per-row loop exactly. Pairing rides the
+		// per-slot unique token (a contact may legitimately appear twice in
+		// one batch — dedupe is a handler concern), NOT the contact id.
+		ordered := make([]Invite, len(eligible))
+		seen := make([]bool, len(eligible))
+		for _, inv := range batch {
+			slot, ok := tokenSlot[inv.Token]
+			if !ok {
+				return fmt.Errorf("insert invites: returned row with unknown token")
+			}
+			ordered[slot] = inv
+			seen[slot] = true
+		}
+		for i, cid := range eligible {
+			if !seen[i] {
+				return fmt.Errorf("insert invites: missing returned row for contact %s", cid)
+			}
+			res.Invites = append(res.Invites, ordered[i])
+			res.Contacts[cid] = found[cid]
 		}
 		return nil
 	})
@@ -594,7 +651,7 @@ func (s *Store) SubmitResponse(ctx context.Context, token string, answers map[st
 
 	tag, err := tx.Exec(ctx,
 		`UPDATE survey_invites SET status='answered', answered_at=now()
-		 WHERE tenant_id=$1 AND id=$2 AND status IN ('queued','sent')`,
+			 WHERE tenant_id=$1 AND id=$2 AND status IN ('queued','sent')`,
 		inv.TenantID, inv.ID)
 	if err != nil {
 		return out, err
@@ -614,14 +671,30 @@ func (s *Store) SubmitResponse(ctx context.Context, token string, answers map[st
 // Responses (results + themes)
 // ---------------------------------------------------------------------------
 
-// maxResultResponses caps the responses scanned for results/themes
-// aggregation (the count itself stays exact via COUNT(*)).
-const maxResultResponses = 10000
+// Response page bounds for ListResponses (SPEC-W46 W46-A item 9, PERF-15):
+// the results endpoint used to scan up to 10,000 full JSONB rows into
+// memory per request; the fetch is now bounded (default page 1000, hard cap
+// 2000) and pageable via OFFSET so large surveys no longer allocate
+// unbounded result sets. The count itself stays exact via COUNT(*).
+const (
+	defaultResultPage = 1000
+	maxResultPage     = 2000
+)
 
-// ListResponses returns up to maxResultResponses responses of one survey
-// (oldest first) plus the EXACT total count; truncated is true when the
-// cap clipped the aggregation input.
-func (s *Store) ListResponses(ctx context.Context, tenantID, surveyID uuid.UUID) (responses []Response, total int, truncated bool, err error) {
+// ListResponses returns one PAGE of responses of one survey (oldest first)
+// plus the EXACT total count; truncated is true when the page did not cover
+// the total. limit <= 0 falls back to defaultResultPage; limit is clamped
+// to maxResultPage; offset < 0 is treated as 0.
+func (s *Store) ListResponses(ctx context.Context, tenantID, surveyID uuid.UUID, limit, offset int) (responses []Response, total int, truncated bool, err error) {
+	if limit <= 0 {
+		limit = defaultResultPage
+	}
+	if limit > maxResultPage {
+		limit = maxResultPage
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	responses = []Response{}
 	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx,
@@ -632,8 +705,8 @@ func (s *Store) ListResponses(ctx context.Context, tenantID, surveyID uuid.UUID)
 		rows, err := tx.Query(ctx,
 			`SELECT id, tenant_id, survey_id, invite_id, contact_id, answers, score, submitted_at
 			   FROM survey_responses WHERE tenant_id=$1 AND survey_id=$2
-			   ORDER BY submitted_at ASC LIMIT $3`,
-			tenantID, surveyID, maxResultResponses)
+			   ORDER BY submitted_at ASC LIMIT $3 OFFSET $4`,
+			tenantID, surveyID, limit, offset)
 		if err != nil {
 			return err
 		}
@@ -650,7 +723,7 @@ func (s *Store) ListResponses(ctx context.Context, tenantID, surveyID uuid.UUID)
 	if err != nil {
 		return nil, 0, false, err
 	}
-	return responses, total, total > len(responses), nil
+	return responses, total, total > offset+len(responses), nil
 }
 
 func scanResponse(row pgx.Row) (Response, error) {
