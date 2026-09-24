@@ -51,7 +51,12 @@ type Config struct {
 	ShutdownTimeout    time.Duration
 	AuthzDisabled      bool   // dev escape hatch: skip Permify checks (AUTHZ_DISABLED=true)
 	AuthzOutagePolicy  string // fail_closed (default) | fail_open — behavior when Permify itself errors
-	ConsumerEnabled    bool   // run the Kafka command consumer (default true)
+	// PermifyCacheTTL is the positive-decision cache TTL for Permify checks
+	// (PERMIFY_CACHE_TTL_SECONDS, default 45s — SPEC-W46 30–60s band).
+	// Only ALLOWED decisions are cached; denials + errors stay uncached
+	// (fail-closed preserved).
+	PermifyCacheTTL time.Duration
+	ConsumerEnabled bool // run the Kafka command consumer (default true)
 	// Pending-booking saga sweeper (SPEC-W43 K-08): re-drives
 	// StartBookingSaga for pending rows whose saga start failed at create.
 	BookingSweeperEnabled  bool          // BOOKING_SWEEPER_ENABLED (default true)
@@ -185,6 +190,7 @@ func Load() (Config, error) {
 		ShutdownTimeout:    time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 20)) * time.Second,
 		AuthzDisabled:      envStr("AUTHZ_DISABLED", "false") == "true",
 		AuthzOutagePolicy:  envStr("AUTHZ_OUTAGE_POLICY", "fail_closed"),
+		PermifyCacheTTL:    time.Duration(envInt("PERMIFY_CACHE_TTL_SECONDS", 45)) * time.Second,
 		ConsumerEnabled:    envStr("CONSUMER_ENABLED", "true") == "true",
 		// SPEC-W43 K-08: pending-booking saga sweeper — ON by default.
 		BookingSweeperEnabled:  envStr("BOOKING_SWEEPER_ENABLED", "true") == "true",
@@ -219,9 +225,12 @@ func Load() (Config, error) {
 		// SPEC-W19 integrator (additive): the four enterprise apps are
 		// functional with zero config — every default matches the package
 		// doc contracts; empty string disables the corresponding emission.
-		HelpdeskEventsTopic:          envStr("HELPDESK_EVENTS_TOPIC", "opendesk.helpdesk.events.v1"),
-		HelpdeskUsageTopic:           envStr("HELPDESK_USAGE_TOPIC", "opendesk.usage.events"),
-		HelpdeskDBMaxConns:           int32(envInt("HELPDESK_DB_MAX_CONNS", 4)),
+		HelpdeskEventsTopic: envStr("HELPDESK_EVENTS_TOPIC", "opendesk.helpdesk.events.v1"),
+		HelpdeskUsageTopic:  envStr("HELPDESK_USAGE_TOPIC", "opendesk.usage.events"),
+		// SPEC-W46 (W46-A item 7): helpdesk joins the shared satellite
+		// budget (SATELLITE_DB_MAX_CONNS, default 2); HELPDESK_DB_MAX_CONNS
+		// remains as the per-feature override.
+		HelpdeskDBMaxConns:           int32(envInt("HELPDESK_DB_MAX_CONNS", int(SatellitePoolMaxConns()))),
 		WorkordersNotificationsTopic: envStr("WORKORDERS_NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
 		WorkordersUsageTopic:         envStr("WORKORDERS_USAGE_TOPIC", "opendesk.usage.events"),
 		WorkordersFSMEventsTopic:     envStr("WORKORDERS_FSM_EVENTS_TOPIC", "opendesk.fsm.events.v1"),
@@ -281,4 +290,29 @@ func envInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// SatellitePoolMaxConns is the ONE shared pool budget for the twelve
+// satellite feature stores (devices, fieldcapture, helpdesk, workorders,
+// loyalty, campaign-studio, crm360, surveys, lending, workforce, socialpub,
+// commission payouts) — SPEC-W46 (W46-A item 7, PERF-11 / I-02 pool
+// consolidation). Each satellite previously hardcoded MaxConns=4, which
+// summed to 20 (main) + 12×4 = 68 potential conns per replica against a
+// max_connections=100 Postgres. SATELLITE_DB_MAX_CONNS overrides the
+// default of 2; values < 1 clamp to 1.
+//
+// Budget arithmetic (per replica, all features enabled):
+//
+//	main pool (PG_MAX_CONNS, default 20) + 12 satellites × 2 = 44 max
+//	conns — back under the ~40/replica target (was 68), and with the
+//	compose-level max_connections=300 (W46-I) three replicas peak at
+//	132, leaving headroom for identity/conversation/billing/payments/
+//	permify/temporal/keycloak. Satellites are operator-QPS surfaces; a
+//	2-conn pool still covers concurrent dashboard tabs, and RLS is
+//	per-transaction so conns are interchangeable across features.
+func SatellitePoolMaxConns() int32 {
+	if n := envInt("SATELLITE_DB_MAX_CONNS", 2); n >= 1 {
+		return int32(n)
+	}
+	return 1
 }

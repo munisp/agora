@@ -114,6 +114,9 @@ impl PgRegistry {
         for attempt in 1..=10u32 {
             match sqlx::postgres::PgPoolOptions::new()
                 .max_connections(4)
+                // SPEC-W46 R2: fast-fail after 5s on pool exhaustion instead
+                // of the 30s sqlx default.
+                .acquire_timeout(crate::payouts::DB_ACQUIRE_TIMEOUT)
                 .connect_with(options.clone())
                 .await
             {
