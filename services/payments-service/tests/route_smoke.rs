@@ -84,6 +84,7 @@ pub struct AppState {
     pub payout_attempts: Arc<dyn payouts::PayoutAttemptStore>,
     pub registry: Arc<dyn registry::Registry>,
     pub transfer_attempts: Arc<dyn transfers::TransferAttemptStore>,
+    pub ensured_tenants: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
     pub commands_dead_lettered: Arc<AtomicU64>,
@@ -96,10 +97,29 @@ pub struct AppState {
 
 /// Verbatim mirror of `src/main.rs::impl AppState` (called by the handlers).
 impl AppState {
-    /// Best-effort outbox (ADR-0007 note): ledger ops commit first; event
-    /// publication failures are logged + counted, not rolled back. A
-    /// reconciler can republish from the ledger.
-    pub async fn publish_event<T: Serialize>(
+    /// Mirror of `src/main.rs::ensure_accounts` (SPEC-W46 R3 per-process
+    /// account-ensure cache).
+    pub async fn ensure_accounts(&self, tenant_id: &str) -> Result<(), ledger::LedgerError> {
+        {
+            let ensured = self
+                .ensured_tenants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if ensured.contains(tenant_id) {
+                return Ok(());
+            }
+        }
+        self.ledger.create_accounts(tenant_id).await?;
+        self.ensured_tenants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(tenant_id.to_string());
+        Ok(())
+    }
+
+    /// Mirror of `src/main.rs::publish_event` (SPEC-W46 R5 fire-and-forget
+    /// spawn after the durable write; the event is fully built first).
+    pub async fn publish_event<T: Serialize + Send + Sync + 'static>(
         &self,
         type_name: &str,
         subject: &str,
@@ -113,19 +133,24 @@ impl AppState {
             tenant_id,
             data,
         );
-        match self.outbox.publish(&event).await {
-            Ok(()) => {
-                self.events_published.fetch_add(1, Ordering::Relaxed);
+        let outbox = self.outbox.clone();
+        let events_published = self.events_published.clone();
+        let events_failed = self.events_failed.clone();
+        tokio::spawn(async move {
+            match outbox.publish(&event).await {
+                Ok(()) => {
+                    events_published.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    events_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %e,
+                        type_ = %event.type_,
+                        "dapr pubsub publish failed (best-effort outbox)"
+                    );
+                }
             }
-            Err(e) => {
-                self.events_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    error = %e,
-                    type_ = %event.type_,
-                    "dapr pubsub publish failed (best-effort outbox)"
-                );
-            }
-        }
+        });
     }
 }
 
@@ -222,6 +247,7 @@ async fn spawn_with_app(
         payout_attempts: Arc::new(payouts::MemPayoutAttemptStore::default()),
         registry: registry.clone(),
         transfer_attempts: Arc::new(transfers::MemTransferAttemptStore::default()),
+        ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
         commands_dead_lettered: dead.clone(),
@@ -1112,6 +1138,7 @@ async fn spawn_w45(
         payout_attempts: Arc::new(payouts::MemPayoutAttemptStore::default()),
         registry: registry.clone(),
         transfer_attempts: Arc::new(transfers::MemTransferAttemptStore::default()),
+        ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
         commands_dead_lettered: dead.clone(),
