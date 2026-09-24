@@ -620,7 +620,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -804,7 +804,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -926,7 +926,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1066,7 +1066,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1188,7 +1188,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1310,7 +1310,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1436,7 +1436,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1579,7 +1579,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1703,7 +1703,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1818,7 +1818,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1955,7 +1955,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -2110,7 +2110,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -2393,7 +2393,7 @@ routes:
                 end
               end
               if not json then return end
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]') or ""
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
               local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
               for _, r in ipairs({"admin", "staff", "platform-admin"}) do
                 if roles:find('"' .. r .. '"', 1, true) then return end
@@ -2573,7 +2573,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -2631,7 +2631,7 @@ routes:
                 end
               end
               if not json then return end
-              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]') or ""
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
               local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
               for _, r in ipairs({"staff", "admin", "platform-admin"}) do
                 if roles:find('"' .. r .. '"', 1, true) then return end
