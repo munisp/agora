@@ -27,11 +27,12 @@ from .. import metrics
 from ..writes import (
     SCORE_WRITE_FIELDS,
     CrossTenantWriteError,
-    WriteTargetMissing,
-    compile_recommendation_write,
-    compile_score_write,
+    RecommendationWritePlan,
+    ScoreWritePlan,
+    compile_recommendation_batch_write,
+    compile_score_batch_write,
 )
-from . import InternalAuth, get_deps, run_write
+from . import InternalAuth, get_deps, run_batch_write
 
 log = structlog.get_logger("graph-service.internal_scores")
 
@@ -111,31 +112,38 @@ async def write_scores(
     payload: ScoresRequest,
     deps: Any = Depends(get_deps),
 ) -> dict[str, Any]:
-    written = 0
-    skipped_unknown: list[str] = []
+    # W46-F P12: the whole batch goes to the graph in ONE tenant pre-check +
+    # one UNWIND write per distinct score-field set (homogeneous batches = a
+    # single statement), replacing N×(check+write) sequential round trips.
+    # Per-item semantics are preserved via the RETURNING diff: unknown
+    # persons match nothing and are skipped + counted (never stub-created,
+    # verification gate WARN #4); a cross-tenant node still 422s the request
+    # before any write lands.
+    plans: list[ScoreWritePlan] = []
     for item in payload.scores:
         _check_item_tenant(payload.tenant_id, item)
-        write = compile_score_write(
-            person_id=item.person_id,
-            scores=item.scores(),
-            model_version=item.model_version,
-            scored_at=item.scored_at or _now_iso(),
-        )
-        try:
-            await run_write(deps, "internal_scores", write, payload.tenant_id)
-        except CrossTenantWriteError as exc:
-            log.warning(
-                "scores.cross_tenant_rejected",
-                tenant=payload.tenant_id,
+        plans.append(
+            ScoreWritePlan(
                 person_id=item.person_id,
+                scores=item.scores(),
+                model_version=item.model_version,
+                scored_at=item.scored_at or _now_iso(),
             )
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except WriteTargetMissing:
-            # MATCH-not-MERGE: unknown persons are skipped + counted, never
-            # created as bare stub nodes (verification gate WARN #4).
-            skipped_unknown.append(item.person_id)
-            continue
-        written += 1
+        )
+    batch = compile_score_batch_write(plans)
+    try:
+        result = await run_batch_write(deps, "internal_scores", batch, payload.tenant_id)
+    except CrossTenantWriteError as exc:
+        log.warning(
+            "scores.cross_tenant_rejected",
+            tenant=payload.tenant_id,
+        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    matched = {row["person_id"] for row in result["rows"]}
+    written = len(result["rows"])
+    skipped_unknown = [
+        plan.person_id for plan in plans if plan.person_id not in matched
+    ]
     metrics.scores_written.labels(tenant=payload.tenant_id).inc(written)
     return {
         "tenant_id": payload.tenant_id,
@@ -150,38 +158,45 @@ async def write_recommendations(
     payload: RecommendationsRequest,
     deps: Any = Depends(get_deps),
 ) -> dict[str, Any]:
-    written = 0
-    skipped: list[dict[str, str]] = []
+    # W46-F P12: single batched write (one pre-check + one UNWIND MERGE)
+    # with the RETURNING diff preserving the per-item skip list.
+    plans: list[RecommendationWritePlan] = []
     for item in payload.recommendations:
         _check_item_tenant(payload.tenant_id, item)
-        write = compile_recommendation_write(
-            person_id=item.person_id,
-            offering_id=item.offering_id,
-            score=item.score,
-            rank=item.rank,
-            reason=item.reason,
-            model_version=item.model_version,
-            scored_at=item.scored_at or _now_iso(),
-        )
-        try:
-            await run_write(deps, "internal_recommendations", write, payload.tenant_id)
-        except CrossTenantWriteError as exc:
-            log.warning(
-                "recommendations.cross_tenant_rejected",
-                tenant=payload.tenant_id,
+        plans.append(
+            RecommendationWritePlan(
                 person_id=item.person_id,
                 offering_id=item.offering_id,
+                score=item.score,
+                rank=item.rank,
+                reason=item.reason,
+                model_version=item.model_version,
+                scored_at=item.scored_at or _now_iso(),
             )
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except WriteTargetMissing:
-            # Both endpoints are verified same-tenant before MERGE; a missing
-            # endpoint cannot be verified, so the item is skipped (the MATCH
-            # in the Cypher path writes nothing either).
-            skipped.append(
-                {"person_id": item.person_id, "offering_id": item.offering_id}
-            )
-            continue
-        written += 1
+        )
+    batch = compile_recommendation_batch_write(plans)
+    try:
+        result = await run_batch_write(
+            deps, "internal_recommendations", batch, payload.tenant_id
+        )
+    except CrossTenantWriteError as exc:
+        log.warning(
+            "recommendations.cross_tenant_rejected",
+            tenant=payload.tenant_id,
+        )
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    matched = {
+        (row["person_id"], row["offering_id"]) for row in result["rows"]
+    }
+    written = len(result["rows"])
+    # Both endpoints are verified same-tenant before MERGE; a missing
+    # endpoint cannot be verified, so the item is skipped (the MATCH in the
+    # Cypher path writes nothing either).
+    skipped = [
+        {"person_id": plan.person_id, "offering_id": plan.offering_id}
+        for plan in plans
+        if (plan.person_id, plan.offering_id) not in matched
+    ]
     metrics.scores_written.labels(tenant=payload.tenant_id).inc(written)
     return {
         "tenant_id": payload.tenant_id,

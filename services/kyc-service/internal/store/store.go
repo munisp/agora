@@ -53,7 +53,8 @@ type Store struct {
 // kyc_audit table + RLS policy (idempotent; covers fresh and existing
 // installs — booking-service ensureSitesTable role).
 func New(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	// SPEC-W46 PERF-08: budgeted pool (see pool.go); URL pool_* params win.
+	pool, err := newPool(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -90,6 +91,14 @@ CREATE TABLE IF NOT EXISTS kyc_audit (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_kyc_audit_tenant ON kyc_audit (tenant_id, created_at DESC);
+-- SPEC-W46 PERF-09: IDHashOwner (consent↔ID binding, SPEC-W45 K22) filters
+-- (tenant_id, id_type, id_value_hash) on EVERY /v1/kyc/resolve; without a
+-- matching index that scans + sorts the tenant's ever-growing audit
+-- partition. The query orders created_at ASC — served by a backward scan
+-- of the DESC index (the audit_id tiebreak only matters for same-instant
+-- rows and is resolved inside the handful of matching rows).
+CREATE INDEX IF NOT EXISTS idx_kyc_audit_idhash
+    ON kyc_audit (tenant_id, id_type, id_value_hash, created_at DESC);
 ALTER TABLE kyc_audit ENABLE ROW LEVEL SECURITY;
 ALTER TABLE kyc_audit FORCE ROW LEVEL SECURITY;
 DO $$

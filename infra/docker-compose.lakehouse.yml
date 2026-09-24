@@ -4,8 +4,32 @@ networks:
 volumes:
   minio-data: null
   spark-ivy: null
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
   minio:
+    logging: *default-logging
+    deploy: *default-limits
     image: minio/minio:RELEASE.2024-07-16T23-46-41Z
     container_name: opendesk-minio
     command: server /data --console-address ":9001"
@@ -41,6 +65,8 @@ services:
   # GDPR data-subject export bundles written by notification-worker's
   # GdprExportWorkflow (plain S3 PUT, SPEC-W3 §2 innovation 13).
   createbucket:
+    logging: *default-logging
+    deploy: *default-limits
     image: minio/mc:RELEASE.2024-07-11T18-01-46Z
     container_name: opendesk-minio-createbucket
     entrypoint:
@@ -71,6 +97,8 @@ services:
         condition: service_healthy
     restart: 'no'
   iceberg-catalog-init:
+    logging: *default-logging
+    deploy: *default-limits
     image: postgres:16-alpine
     container_name: opendesk-iceberg-catalog-init
     entrypoint:
@@ -90,6 +118,8 @@ services:
     - opendesk
     restart: 'no'
   iceberg-rest:
+    logging: *default-logging
+    deploy: *default-limits
     image: apache/iceberg-rest-fixture:latest
     container_name: opendesk-iceberg-rest
     environment:
@@ -131,6 +161,13 @@ services:
       start_period: 15s
     restart: unless-stopped
   trino:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
     image: trinodb/trino:448
     container_name: opendesk-trino
     ports:
@@ -152,6 +189,13 @@ services:
       start_period: 20s
     restart: unless-stopped
   spark-master:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
     image: bitnami/spark:3.5
     container_name: opendesk-spark-master
     environment:
@@ -178,6 +222,13 @@ services:
       start_period: 10s
     restart: unless-stopped
   spark-worker:
+    logging: *default-logging
+    # W46-I C-01 override: sized above the 1G/1.0 default (see anchor comment).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
     image: bitnami/spark:3.5
     container_name: opendesk-spark-worker-1
     environment:

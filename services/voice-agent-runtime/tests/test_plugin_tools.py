@@ -6,6 +6,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app import plugin_tools
 from app.plugin_tools import (
     PluginTool,
     PluginToolError,
@@ -197,3 +198,37 @@ async def test_suffix_host_allowed():
     tool._client = _mock_client(handler)
     result = await tool.execute({})
     assert result["status"] == "ok"
+
+
+# ------------------------------------------- SPEC-W46 P11: shared client
+async def test_plugin_tools_share_process_client_when_not_injected(monkeypatch):
+    """Without an injected client, executions go through ONE shared
+    AsyncClient (no per-call connect/close)."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    shared = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(plugin_tools, "_shared_client", shared)
+    tool_a = PluginTool(
+        {"name": "tool_a", "method": "GET", "url": "http://booking:7002/a"},
+        allowed_hosts={"booking"},
+    )
+    tool_b = PluginTool(
+        {"name": "tool_b", "method": "GET", "url": "http://booking:7002/b"},
+        allowed_hosts={"booking"},
+    )
+    ra = await tool_a.execute({})
+    rb = await tool_b.execute({})
+    assert ra["status"] == rb["status"] == "ok"
+    assert requests == ["http://booking:7002/a", "http://booking:7002/b"]
+    # Neither tool owns a client; both rode the shared one.
+    assert tool_a._client is None and tool_b._client is None
+
+
+def test_shared_http_client_is_singleton():
+    from app.plugin_tools import _shared_http_client
+
+    assert _shared_http_client() is _shared_http_client()

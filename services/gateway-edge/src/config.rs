@@ -24,6 +24,14 @@ pub struct Config {
     /// Per-tenant broadcast channel capacity; slow consumers are dropped
     /// (drop-slow policy) and counted in metrics.
     pub ws_channel_capacity: usize,
+    /// SPEC-W46 R18: bound on the bus channel map (one entry per tenant
+    /// channel ever seen previously grew unbounded). At the bound, idle
+    /// zero-receiver channels are evicted first; all-active maps may
+    /// overflow (never drop live subscribers) with a warning.
+    pub bus_max_channels: usize,
+    /// R18: channels with no receivers and no activity for this long are
+    /// evicted by the periodic sweeper.
+    pub bus_idle_evict_s: u64,
     pub fluvio_endpoint: String,
     pub fluvio_transcripts_topic: String,
     pub fluvio_partitions: i32,
@@ -89,6 +97,8 @@ impl Config {
             dev_mode: env_flag("OPENDESK_DEV"),
             jwks_cache_ttl_secs: env_parse("JWKS_CACHE_TTL_SECS", 300),
             ws_channel_capacity: env_parse("WS_CHANNEL_CAPACITY", 256),
+            bus_max_channels: env_parse("GATEWAY_BUS_MAX_CHANNELS", 10_000),
+            bus_idle_evict_s: env_parse("GATEWAY_BUS_IDLE_EVICT_S", 600),
             fluvio_endpoint: fluvio_endpoint(),
             fluvio_transcripts_topic: env_or(
                 "FLUVIO_TRANSCRIPTS_TOPIC",

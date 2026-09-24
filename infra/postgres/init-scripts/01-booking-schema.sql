@@ -2,6 +2,11 @@
 \c booking
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- W46-I (P-DATA DDL #11): pg_trgm for leading-wildcard ILIKE search
+-- (contacts.name below; tickets.subject / workorders.title are
+-- service-bootstrap-owned tables — coder A adds those in the booking
+-- migration + ensureDDL, do NOT duplicate here).
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- Catalog of bookable offerings.
 CREATE TABLE offerings (
@@ -68,6 +73,12 @@ CREATE TABLE contacts (
 -- store.ensureContactDedupe bootstrap (folds duplicate rows, re-points
 -- bookings/loan references, then creates this same index).
 CREATE UNIQUE INDEX uq_contacts_tenant_phone ON contacts (tenant_id, phone) WHERE phone IS NOT NULL AND phone <> '';
+-- W46-I (P-DATA DDL #11, contacts part): GIN trgm index — crm360 contact
+-- search uses ILIKE '%...%' (crm360/store.go:348) which defeats B-trees.
+-- Plain CREATE INDEX (no CONCURRENTLY): init-db scripts must not use
+-- CONCURRENTLY. EXISTING deployments: converged by coder A's migration +
+-- ensureDDL mirror (W46-A), same pattern as uq_contacts_tenant_phone above.
+CREATE INDEX IF NOT EXISTS idx_contacts_name_trgm ON contacts USING gin (name gin_trgm_ops);
 
 -- Bookings. idempotency_key makes command retries safe.
 CREATE TABLE bookings (
@@ -94,6 +105,24 @@ CREATE INDEX idx_bookings_tenant_status ON bookings (tenant_id, status);
 -- keys are only unique within a tenant; the store inserts with
 -- NULLIF($key,'') so empty strings land as NULL and are never deduplicated).
 CREATE UNIQUE INDEX uq_bookings_idempotency_key ON bookings (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- W46-I (P-DATA DDL #1/#2/#3): hot-path booking indexes. The bookings
+-- CREATE TABLE lives HERE (init-scripts-owned), so fresh clusters get the
+-- indexes at bootstrap; coder A (W46-A) owns the migration + ensureDDL
+-- mirror that converges EXISTING deployments. Plain CREATE INDEX
+-- IF NOT EXISTS — CONCURRENTLY is not allowed in init-db transactions.
+--   #1 availability engine + slot-conflict recheck (bookings.go:140,316,
+--      waitlist.go:275): (tenant, member, starts), cancelled rows excluded.
+CREATE INDEX IF NOT EXISTS idx_bookings_tenant_member_starts
+    ON bookings (tenant_id, team_member_id, starts_at) WHERE status <> 'cancelled';
+--   #2 CRM-360 per-contact history + lending signals (crm360/store.go:505,
+--      :647; lending/store_queries.go:155,169): contact_id was an
+--      unindexed FK.
+CREATE INDEX IF NOT EXISTS idx_bookings_tenant_contact_starts
+    ON bookings (tenant_id, contact_id, starts_at DESC);
+--   #3 stale-pending sweeper is CROSS-TENANT (bookings.go:500), so the
+--      tenant-leading indexes above cannot serve it.
+CREATE INDEX IF NOT EXISTS idx_bookings_pending_created
+    ON bookings (created_at) WHERE status = 'pending';
 
 -- Transactional outbox (drained to Kafka opendesk.booking.events).
 CREATE TABLE outbox (

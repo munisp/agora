@@ -170,9 +170,13 @@ func run() error {
 		ussdStore = channel.NewMemoryUSSDStore()
 	}
 	srv.USSD = &httpapi.USSDConfig{
-		Sites:        siteMap,
-		Store:        ussdStore,
-		Menus:        channel.NewUSSDMenuFetcher(channel.ResolveInvokeBase(cfg.IdentityURL, "identity", defaultIdentityURL, cfg.DaprHTTPPort, cfg.DaprSidecar)),
+		Sites: siteMap,
+		Store: ussdStore,
+		// SPEC-W46 PERF-10: 60s TTL menu cache (stale-on-error) around the
+		// 5s-timeout identity fetcher — menus are near-static config.
+		Menus: channel.NewCachedUSSDMenuFetcher(
+			channel.NewUSSDMenuFetcher(channel.ResolveInvokeBase(cfg.IdentityURL, "identity", defaultIdentityURL, cfg.DaprHTTPPort, cfg.DaprSidecar)),
+			0),
 		Conversation: channel.NewUSSDConversation(convBase),
 		SessionTTL:   time.Duration(cfg.USSDSessionTTL) * time.Second,
 		// SPEC-W45 K14/OOS-06: shared-secret path auth (fail-closed unset)

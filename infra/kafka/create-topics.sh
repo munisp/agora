@@ -2,6 +2,27 @@
 # create-topics.sh — one-shot topic init for the OpenDesk Kafka broker (SPEC §4).
 # All topics: 6 partitions, replication-factor 1 (dev). Broker auto-create is OFF,
 # so every topic the platform uses must be declared here.
+#
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA K-01) — PROD RF=3 OVERLAY REQUIREMENT:
+# replication-factor 1 is DEV-ONLY. Any topic created RF=1 loses data on a
+# single-broker failure, and this includes money/audit streams
+# (opendesk.payments.*, opendesk.billing.events, opendesk.ledger-adjacent
+# usage/dlq topics). A production/staging deploy MUST run a 3-broker cluster
+# and provision topics with RF=3 + min.insync.replicas=2 instead of running
+# this script verbatim, e.g. via a prod overlay that replaces the create loop:
+#
+#   --replication-factor 3 \
+#   --config min.insync.replicas=2
+#
+# Also raise the broker-level internal topics in that overlay
+# (KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=3,
+#  KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=3,
+#  KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=2 in infra/docker-compose.core.yml
+#  — those env vars are single-broker dev values too).
+# Do NOT bump RF here: the dev stack runs ONE broker and RF>1 would fail
+# topic creation outright.
+# ---------------------------------------------------------------------------
 set -euo pipefail
 
 BOOTSTRAP="${BOOTSTRAP:-kafka:9092}"
@@ -84,6 +105,8 @@ until /opt/bitnami/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "${
 done
 
 for t in "${TOPICS[@]}"; do
+  # rf=1: single-broker DEV only — prod overlay must use RF=3 +
+  # min.insync.replicas=2 (see the K-01 block at the top of this script).
   echo "[kafka-topics] creating ${t} (partitions=6 rf=1)"
   "${KT}" --bootstrap-server "${BOOTSTRAP}" \
     --create --if-not-exists \

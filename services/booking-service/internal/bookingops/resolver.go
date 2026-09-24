@@ -24,6 +24,13 @@ type TenantInfo struct {
 	Currency string    `json:"currency"`
 	Locale   string    `json:"locale"`
 	Plan     string    `json:"plan"`
+	// Terminology carries the tenant's terminology overrides (identity's
+	// GET /v1/tenants/{slug} exposes them top-level). Raw passthrough —
+	// SPEC-W46 (W46-A item 5, P-01): the public site/context endpoints now
+	// serve their tenant block from the cached TenantInfo instead of an
+	// uncached per-request daprd invoke, and the public site page renders
+	// these overrides.
+	Terminology json.RawMessage `json:"terminology"`
 	// SPEC-CRM §C3: industry pack id + resolved pack summary (absent for
 	// tenants created before packs existed or when no pack is loaded).
 	Industry string       `json:"industry"`
