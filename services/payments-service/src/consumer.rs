@@ -31,7 +31,22 @@ use crate::AppState;
 /// Bounded retries before dead-lettering (mirrors booking-service's
 /// processWithRetry: transient ledger outages heal; poison commands don't).
 const MAX_ATTEMPTS: u32 = 3;
-const RETRY_BACKOFF_MS: u64 = 200;
+/// SPEC-W46 R6: exponential backoff between attempts (200ms, 400ms, …),
+/// non-blocking tokio sleep — replaces the fixed inline sleep.
+const RETRY_BACKOFF_BASE_MS: u64 = 200;
+const RETRY_BACKOFF_CAP_MS: u64 = 2_000;
+/// SPEC-W46 R6: buffered offset commits — at most one broker commit per 50
+/// processed messages or 1s, whichever comes first (was: one
+/// `commit_message` round trip per message).
+const COMMIT_EVERY_MESSAGES: u32 = 50;
+const COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// SPEC-W46 R6: exponential backoff, always a non-blocking
+/// `tokio::time::sleep` at the call site. `attempt` is 1-based.
+fn backoff(attempt: u32, base_ms: u64, cap_ms: u64) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(10);
+    std::time::Duration::from_millis((base_ms << shift).min(cap_ms))
+}
 
 // ---------------------------------------------------------------------------
 // DLQ sink (booking-service idiom: opendesk.dlq + dlq-* headers)
@@ -295,8 +310,12 @@ pub async fn process_payload(
                         );
                         last_err = Some(e);
                         if attempt < MAX_ATTEMPTS {
-                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS))
-                                .await;
+                            tokio::time::sleep(backoff(
+                                attempt,
+                                RETRY_BACKOFF_BASE_MS,
+                                RETRY_BACKOFF_CAP_MS,
+                            ))
+                            .await;
                         }
                     }
                 }
@@ -354,8 +373,23 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
         topic = %cfg.kafka_commands_topic,
         brokers = %cfg.kafka_brokers,
         dlq_topic = %cfg.dlq_topic,
+        commit_every_messages = COMMIT_EVERY_MESSAGES,
+        commit_interval_ms = COMMIT_INTERVAL.as_millis() as u64,
         "payments commands consumer started"
     );
+
+    // SPEC-W46 R6: buffered manual commits. `pending` holds the highest
+    // committable offset+1 per partition seen since the last flush; a flush
+    // happens every COMMIT_EVERY_MESSAGES processed messages or every
+    // COMMIT_INTERVAL, whichever comes first. AT-LEAST-ONCE is preserved:
+    // only messages whose outcome is Processed/DeadLettered enter the
+    // buffer; anything not yet flushed is redelivered on rebalance/restart.
+    let mut pending = rdkafka::TopicPartitionList::new();
+    let mut since_commit: u32 = 0;
+    let mut last_commit = tokio::time::Instant::now();
+    let mut commit_tick = tokio::time::interval(COMMIT_INTERVAL);
+    commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         tokio::select! {
@@ -363,11 +397,22 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
                 if changed.is_ok() {
                     info!("payments commands consumer shutting down");
                 }
+                // Flush buffered offsets before exiting; anything left
+                // unflushed is simply redelivered (at-least-once).
+                flush_commits(&consumer, &mut pending, &mut since_commit, &mut last_commit);
                 break;
+            }
+            _ = commit_tick.tick() => {
+                if last_commit.elapsed() >= COMMIT_INTERVAL {
+                    flush_commits(&consumer, &mut pending, &mut since_commit, &mut last_commit);
+                }
             }
             msg = consumer.recv() => {
                 match msg {
                     Ok(m) => {
+                        let topic = m.topic().to_string();
+                        let partition = m.partition();
+                        let offset = m.offset();
                         let payload = m.payload().unwrap_or_default();
                         let outcome =
                             process_payload(&state, m.key(), payload, &cfg.kafka_commands_topic)
@@ -376,18 +421,72 @@ pub async fn run(state: AppState, mut shutdown: watch::Receiver<bool>) {
                         // durable. `Failed` leaves the offset uncommitted so
                         // the command is redelivered (no silent money loss).
                         if outcome != ProcessOutcome::Failed {
-                            if let Err(e) = consumer.commit_message(&m, CommitMode::Async) {
-                                warn!(error = %e, "offset commit failed");
+                            consecutive_failures = 0;
+                            // Offset+1 = "next message to read" for this
+                            // partition (commit_message's semantics).
+                            if let Err(e) = pending.add_partition_offset(
+                                &topic,
+                                partition,
+                                rdkafka::Offset::Offset(offset + 1),
+                            ) {
+                                warn!(error = %e, "offset buffer update failed");
                             }
+                            since_commit += 1;
+                            if since_commit >= COMMIT_EVERY_MESSAGES {
+                                flush_commits(&consumer, &mut pending, &mut since_commit, &mut last_commit);
+                            }
+                        } else {
+                            // DLQ copy failed: flush everything buffered so
+                            // far (never commit past this message), then seek
+                            // the partition back to the failed offset so the
+                            // command is redelivered under buffered commits —
+                            // the explicit form of the old "offset left
+                            // uncommitted" semantics. Back off (tokio sleep)
+                            // so a DLQ outage does not hot-loop.
+                            flush_commits(&consumer, &mut pending, &mut since_commit, &mut last_commit);
+                            if let Err(e) = consumer.seek(
+                                &topic,
+                                partition,
+                                rdkafka::Offset::Offset(offset),
+                                std::time::Duration::from_secs(5),
+                            ) {
+                                warn!(error = %e,
+                                    "seek back to failed offset failed; redelivery relies on rebalance/restart");
+                            }
+                            consecutive_failures += 1;
+                            tokio::time::sleep(backoff(consecutive_failures, 500, 10_000)).await;
                         }
                     }
                     Err(e) => {
                         warn!(error = %e, "kafka receive error");
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        consecutive_failures += 1;
+                        tokio::time::sleep(backoff(consecutive_failures, 500, 10_000)).await;
                     }
                 }
             }
         }
+    }
+}
+
+/// SPEC-W46 R6: enqueue one buffered commit covering every offset recorded
+/// since the last flush. On an enqueue error the buffer is RETAINED so the
+/// next flush retries it (commit failures were already only warn-logged).
+fn flush_commits(
+    consumer: &StreamConsumer,
+    pending: &mut rdkafka::TopicPartitionList,
+    since_commit: &mut u32,
+    last_commit: &mut tokio::time::Instant,
+) {
+    if *since_commit == 0 {
+        return;
+    }
+    match consumer.commit(pending, CommitMode::Async) {
+        Ok(()) => {
+            *pending = rdkafka::TopicPartitionList::new();
+            *since_commit = 0;
+            *last_commit = tokio::time::Instant::now();
+        }
+        Err(e) => warn!(error = %e, "offset commit failed"),
     }
 }
 
@@ -478,6 +577,7 @@ mod tests {
             payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
             transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
+            ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),

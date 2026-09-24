@@ -345,37 +345,86 @@ pub async fn get_invoice(
     row.map(|r| invoice_from_row(&r)).transpose()
 }
 
+/// SPEC-W46 R8: single-roundtrip scoped fetch for invoice-ID-addressed
+/// routes. Runs on the internal pool's transaction (role-gated cross-tenant
+/// read) and pins `app.tenant_id` to the invoice's OWN tenant in the SAME
+/// statement (`set_config(..., true)` is transaction-local), replacing the
+/// old lookup-tx + re-read-in-tenant-tx pattern (6-8 RTTs per request). Zero
+/// rows => the GUC stays unset, so anything else in the transaction remains
+/// fail-closed.
+pub async fn get_invoice_pin_tenant(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+) -> Result<Option<Invoice>, BillingError> {
+    let row = sqlx::query(
+        "WITH inv AS ( \
+             SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
+                    billing_email, payment_ref, created_at, issued_at, paid_at \
+             FROM invoices WHERE id = $1 \
+         ) \
+         SELECT set_config('app.tenant_id', tenant_id::text, true) AS tenant_guc, \
+                id, tenant_id, period, status, subtotal_cents, currency, line_items, \
+                billing_email, payment_ref, created_at, issued_at, paid_at \
+         FROM inv",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|r| invoice_from_row(&r)).transpose()
+}
+
+/// Keyset cursor for list_invoices (SPEC-W46 R10): position in the
+/// `(created_at DESC, id DESC)` ordering. Encoded as
+/// `{unix_micros}:{uuid}` — opaque to clients, no new dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvoiceCursor {
+    pub created_at: DateTime<Utc>,
+    pub id: Uuid,
+}
+
+impl InvoiceCursor {
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.created_at.timestamp_micros(), self.id)
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (micros, id) = raw.split_once(':')?;
+        let micros: i64 = micros.trim().parse().ok()?;
+        let created_at = DateTime::from_timestamp_micros(micros)?;
+        let id = Uuid::parse_str(id.trim()).ok()?;
+        Some(Self { created_at, id })
+    }
+}
+
 /// List invoices, optionally filtered by status, always tenant-scoped.
+/// SPEC-W46 R10: bounded (caller-capped `limit`) keyset-paginated read —
+/// `cursor` continues strictly after `(created_at, id)` in the
+/// `(created_at DESC, id DESC)` ordering — backed by the
+/// `idx_invoices_tenant_created` index (migration 0007).
 pub async fn list_invoices(
     tx: &mut Transaction<'_, Postgres>,
     tenant_id: Uuid,
     status: Option<InvoiceStatus>,
+    limit: i64,
+    cursor: Option<InvoiceCursor>,
 ) -> Result<Vec<Invoice>, BillingError> {
-    let rows = match status {
-        Some(st) => {
-            sqlx::query(
-                "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
-                        billing_email, payment_ref, created_at, issued_at, paid_at \
-                 FROM invoices WHERE tenant_id = $1 AND status = $2 \
-                 ORDER BY created_at DESC",
-            )
-            .bind(tenant_id)
-            .bind(st.as_str())
-            .fetch_all(&mut **tx)
-            .await?
-        }
-        None => {
-            sqlx::query(
-                "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
-                        billing_email, payment_ref, created_at, issued_at, paid_at \
-                 FROM invoices WHERE tenant_id = $1 \
-                 ORDER BY created_at DESC",
-            )
-            .bind(tenant_id)
-            .fetch_all(&mut **tx)
-            .await?
-        }
-    };
+    let rows = sqlx::query(
+        "SELECT id, tenant_id, period, status, subtotal_cents, currency, line_items, \
+                billing_email, payment_ref, created_at, issued_at, paid_at \
+         FROM invoices \
+         WHERE tenant_id = $1 \
+           AND ($2::text IS NULL OR status = $2) \
+           AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4)) \
+         ORDER BY created_at DESC, id DESC \
+         LIMIT $5",
+    )
+    .bind(tenant_id)
+    .bind(status.map(|s| s.as_str()))
+    .bind(cursor.map(|c| c.created_at))
+    .bind(cursor.map(|c| c.id))
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await?;
     rows.iter().map(invoice_from_row).collect()
 }
 
@@ -402,72 +451,118 @@ fn invoice_from_row(row: &sqlx::postgres::PgRow) -> Result<Invoice, BillingError
     })
 }
 
-/// Apply a state-machine transition. Returns the previous status on success
-/// (callers use it for ledger/event side effects). `IllegalTransition` when
-/// the current state does not allow the move; `NotFound` when the id is
-/// unknown. The `expected_from` guard in SQL makes concurrent transitions
-/// safe: exactly one caller wins.
+/// Apply a state-machine transition. Returns the previous status and the
+/// updated row on success (callers use them for ledger/event side effects).
+/// `IllegalTransition` when the current state does not allow the move;
+/// `NotFound` when the id is unknown.
+///
+/// SPEC-W46 R12: single-roundtrip write — one `UPDATE ... WHERE id AND
+/// status = ANY(allowed_from) RETURNING *` (with a `prev` CTE capturing the
+/// pre-image) replaces the old fetch-then-update + re-read (3 SELECTs of the
+/// same row). The `status = ANY(...)` guard keeps concurrent transitions
+/// safe: exactly one caller wins; the loser sees zero rows and falls back to
+/// a diagnostic read (the cold path only).
 pub async fn transition_invoice(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
     to: InvoiceStatus,
-) -> Result<InvoiceStatus, BillingError> {
-    let current = match get_invoice(tx, id).await? {
-        Some(inv) => inv.status,
-        None => return Err(BillingError::NotFound(id.to_string())),
-    };
-    if !current.can_transition_to(to) {
-        return Err(BillingError::IllegalTransition {
-            from: current.as_str().to_string(),
-            to: to.as_str().to_string(),
-        });
-    }
+) -> Result<(InvoiceStatus, Invoice), BillingError> {
+    const ALL: [InvoiceStatus; 5] = [
+        InvoiceStatus::Draft,
+        InvoiceStatus::Issued,
+        InvoiceStatus::Paid,
+        InvoiceStatus::Void,
+        InvoiceStatus::PastDue,
+    ];
+    let allowed_from: Vec<&'static str> = ALL
+        .iter()
+        .filter(|s| s.can_transition_to(to))
+        .map(|s| s.as_str())
+        .collect();
     let now_clause = match to {
         InvoiceStatus::Issued => ", issued_at = now()",
         InvoiceStatus::Paid => ", paid_at = now()",
         _ => "",
     };
     let sql = format!(
-        "UPDATE invoices SET status = $1{now_clause} WHERE id = $2 AND status = $3"
+        "WITH prev AS (SELECT status FROM invoices WHERE id = $2), \
+         upd AS ( \
+             UPDATE invoices SET status = $1{now_clause} \
+             WHERE id = $2 AND status = ANY($3) \
+             RETURNING id, tenant_id, period, status, subtotal_cents, currency, line_items, \
+                       billing_email, payment_ref, created_at, issued_at, paid_at \
+         ) \
+         SELECT (SELECT status FROM prev) AS prev_status, * FROM upd"
     );
-    let res = sqlx::query(&sql)
+    let row = sqlx::query(&sql)
         .bind(to.as_str())
         .bind(id)
-        .bind(current.as_str())
-        .execute(&mut **tx)
+        .bind(&allowed_from)
+        .fetch_optional(&mut **tx)
         .await?;
-    if res.rows_affected() == 0 {
-        // Lost a race with a concurrent transition; re-read to report the
-        // state we actually saw.
-        let seen = get_invoice(tx, id)
-            .await?
-            .map(|inv| inv.status.as_str().to_string())
-            .unwrap_or_else(|| "missing".to_string());
-        return Err(BillingError::IllegalTransition {
-            from: seen,
-            to: to.as_str().to_string(),
-        });
+    if let Some(row) = row {
+        let prev_str: Option<String> = row.try_get("prev_status")?;
+        let prev_str =
+            prev_str.ok_or_else(|| BillingError::Db("transition lost prev status".to_string()))?;
+        let prev = InvoiceStatus::parse(&prev_str)
+            .ok_or_else(|| BillingError::Db(format!("unknown invoice status '{prev_str}'")))?;
+        return Ok((prev, invoice_from_row(&row)?));
     }
-    Ok(current)
+    // Zero rows: unknown id, or the current state does not allow the move
+    // (incl. a lost race). Diagnostic read on this cold path only.
+    match get_invoice(tx, id).await? {
+        None => Err(BillingError::NotFound(id.to_string())),
+        Some(inv) => Err(BillingError::IllegalTransition {
+            from: inv.status.as_str().to_string(),
+            to: to.as_str().to_string(),
+        }),
+    }
 }
 
 /// Mark an invoice paid idempotently (Paystack webhook path, B3): an
 /// already-paid invoice is a 200 replay, not an error. Returns
-/// Ok(Some(prev)) when this call performed the transition, Ok(None) when the
-/// invoice was already paid.
+/// Ok(Some((prev, updated))) when this call performed the transition,
+/// Ok(None) when the invoice was already paid.
+///
+/// SPEC-W46 R12: one `UPDATE ... WHERE id AND status <> 'paid' RETURNING *`
+/// (+ `prev` CTE) replaces the old get -> transition(get+update) -> get
+/// chain (3-4 SELECTs of the same row per webhook delivery). The
+/// `status <> 'paid'` guard makes duplicate deliveries no-ops; a delivery
+/// that loses the race sees zero rows and is still a 200 replay.
 pub async fn mark_paid_idempotent(
     tx: &mut Transaction<'_, Postgres>,
     id: Uuid,
-) -> Result<Option<InvoiceStatus>, BillingError> {
+) -> Result<Option<(InvoiceStatus, Invoice)>, BillingError> {
+    let row = sqlx::query(
+        "WITH prev AS (SELECT status FROM invoices WHERE id = $1), \
+         upd AS ( \
+             UPDATE invoices SET status = 'paid', paid_at = now() \
+             WHERE id = $1 AND status IN ('issued', 'past_due') \
+             RETURNING id, tenant_id, period, status, subtotal_cents, currency, line_items, \
+                       billing_email, payment_ref, created_at, issued_at, paid_at \
+         ) \
+         SELECT (SELECT status FROM prev) AS prev_status, * FROM upd",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = row {
+        let prev_str: Option<String> = row.try_get("prev_status")?;
+        let prev_str = prev_str
+            .ok_or_else(|| BillingError::Db("paid transition lost prev status".to_string()))?;
+        let prev = InvoiceStatus::parse(&prev_str)
+            .ok_or_else(|| BillingError::Db(format!("unknown invoice status '{prev_str}'")))?;
+        return Ok(Some((prev, invoice_from_row(&row)?)));
+    }
+    // Zero rows: already paid (replay/race), unknown id, or a state that can
+    // never settle (void — the webhook acks those before calling here).
     match get_invoice(tx, id).await? {
         None => Err(BillingError::NotFound(id.to_string())),
         Some(inv) if inv.status == InvoiceStatus::Paid => Ok(None),
-        Some(inv) => transition_invoice(tx, id, InvoiceStatus::Paid)
-            .await
-            .map(|prev| {
-                debug_assert_eq!(prev, inv.status);
-                Some(prev)
-            }),
+        Some(inv) => Err(BillingError::IllegalTransition {
+            from: inv.status.as_str().to_string(),
+            to: InvoiceStatus::Paid.as_str().to_string(),
+        }),
     }
 }
 
@@ -577,6 +672,19 @@ mod tests {
     fn parse_period_rejects_malformed_input() {
         for bad in ["2026-3", "26-03", "2026-13", "2026-00", "2026/03", "", "abcd-ef"] {
             assert!(parse_period(bad).is_err(), "expected '{bad}' to fail");
+        }
+    }
+
+    #[test]
+    fn invoice_cursor_roundtrips_and_rejects_garbage() {
+        let c = InvoiceCursor {
+            created_at: Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap(),
+            id: Uuid::new_v4(),
+        };
+        let encoded = c.encode();
+        assert_eq!(InvoiceCursor::decode(&encoded), Some(c));
+        for bad in ["", "nope", "123", "123:not-a-uuid", "abc:9b0b0d52-1c8b-4d3f-9e2a-6f6a2b7c1d20"] {
+            assert!(InvoiceCursor::decode(bad).is_none(), "expected {bad:?} to fail");
         }
     }
 }
