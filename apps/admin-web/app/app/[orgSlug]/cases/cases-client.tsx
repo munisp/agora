@@ -37,20 +37,46 @@ import {
   type CivicCategory,
 } from "@/components/cases/types";
 
+/**
+ * SPEC-W46 AW-4: the civic cases endpoint is hard-capped at 500 rows
+ * server-side with no limit/cursor param (contract frozen), so rendering is
+ * bounded client-side at 100 rows/page.
+ */
+const PAGE_SIZE = 100;
+
 export function CasesClient({
   orgSlug,
   canRevealReporter,
+  initialCases,
+  initialCategories,
+  initialUnavailable,
+  initialError,
 }: {
   orgSlug: string;
   /** owner/admin only — unmask anonymous reporters (SPEC §4 gate 4). */
   canRevealReporter: boolean;
+  /** SPEC-W46 AW-2: unfiltered queue + categories fetched server-side. */
+  initialCases: CivicCase[];
+  initialCategories: CivicCategory[];
+  initialUnavailable: boolean;
+  initialError: string | null;
 }) {
   const { toast } = useToast();
-  const [cases, setCases] = React.useState<CivicCase[]>([]);
-  const [categories, setCategories] = React.useState<CivicCategory[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
-  const [unavailable, setUnavailable] = React.useState(false);
+  const [cases, setCases] = React.useState<CivicCase[]>(initialCases);
+  const [categories, setCategories] =
+    React.useState<CivicCategory[]>(initialCategories);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(initialError);
+  const [unavailable, setUnavailable] = React.useState(initialUnavailable);
+  const [page, setPage] = React.useState(0);
+
+  // Sync when the server props change (router.refresh()).
+  React.useEffect(() => {
+    setCases(initialCases);
+    setCategories(initialCategories);
+    setUnavailable(initialUnavailable);
+    setError(initialError);
+  }, [initialCases, initialCategories, initialUnavailable, initialError]);
 
   const [status, setStatus] = React.useState("");
   const [category, setCategory] = React.useState("");
@@ -84,6 +110,7 @@ export function CasesClient({
         );
         if (signal?.aborted) return;
         setCases(unwrapList<unknown>(data).map(normalizeCase));
+        setPage(0);
         setUnavailable(false);
       } catch (e) {
         if (signal?.aborted) return;
@@ -120,17 +147,21 @@ export function CasesClient({
     [orgSlug],
   );
 
+  // The unfiltered queue + categories arrive server-rendered (AW-2);
+  // refetch only when the filters (and thus `load`) change.
+  const skipInitialCases = React.useRef(true);
   React.useEffect(() => {
+    if (skipInitialCases.current) {
+      skipInitialCases.current = false;
+      return;
+    }
     const controller = new AbortController();
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
 
-  React.useEffect(() => {
-    const controller = new AbortController();
-    void loadCategories(controller.signal);
-    return () => controller.abort();
-  }, [loadCategories]);
+  // Categories arrive server-rendered too; explicit reloads (Refresh button,
+  // CategoryConfig onCategoriesChanged) call loadCategories directly.
 
   // Ward suggestions for the free-text ward filter, from the loaded queue.
   const wardOptions = React.useMemo(() => {
@@ -138,6 +169,14 @@ export function CasesClient({
     for (const c of cases) if (c.ward) set.add(c.ward);
     return [...set].sort();
   }, [cases]);
+
+  // AW-4: bound the rendered rows; the queue itself is server-capped.
+  const pageCount = Math.max(1, Math.ceil(cases.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedCases = cases.slice(
+    safePage * PAGE_SIZE,
+    (safePage + 1) * PAGE_SIZE,
+  );
 
   const toggleSelect = (id: string, on: boolean) => {
     setSelectedIds((prev) => {
@@ -149,7 +188,8 @@ export function CasesClient({
   };
 
   const toggleSelectAll = (on: boolean) => {
-    setSelectedIds(on ? new Set(cases.map((c) => c.id)) : new Set());
+    // Scoped to the rendered page — matches what the header checkbox shows.
+    setSelectedIds(on ? new Set(pagedCases.map((c) => c.id)) : new Set());
   };
 
   const bulkAssign = async () => {
@@ -329,7 +369,7 @@ export function CasesClient({
             ) : null}
 
             <CasesTable
-              cases={cases}
+              cases={pagedCases}
               categories={categories}
               loading={loading}
               unavailable={unavailable}
@@ -342,6 +382,32 @@ export function CasesClient({
                 setDrawerOpen(true);
               }}
             />
+
+            {pageCount > 1 ? (
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-muted-foreground">
+                  Page {safePage + 1} of {pageCount} · {cases.length} cases
+                </p>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage(safePage - 1)}
+                    disabled={safePage === 0}
+                  >
+                    Previous
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage(safePage + 1)}
+                    disabled={safePage >= pageCount - 1}
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
+            ) : null}
           </div>
         </TabsContent>
 

@@ -267,7 +267,7 @@ func (s *Store) ListDispatchEndpoints(ctx context.Context, tenantID uuid.UUID, a
 	if activeOnly {
 		q += ` AND active`
 	}
-	q += ` ORDER BY created_at`
+	q += ` ORDER BY created_at LIMIT 500`
 	var out []DispatchEndpoint
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID)
@@ -341,7 +341,7 @@ func (s *Store) InsertIncidentDelivery(ctx context.Context, d *IncidentDelivery)
 
 // ListIncidentDeliveries returns the ledger rows of one incident.
 func (s *Store) ListIncidentDeliveries(ctx context.Context, tenantID, incidentID uuid.UUID) ([]IncidentDelivery, error) {
-	const q = `SELECT ` + deliveryCols + ` FROM incident_deliveries WHERE tenant_id=$1 AND incident_id=$2 ORDER BY created_at`
+	const q = `SELECT ` + deliveryCols + ` FROM incident_deliveries WHERE tenant_id=$1 AND incident_id=$2 ORDER BY created_at LIMIT 500`
 	var out []IncidentDelivery
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID, incidentID)
@@ -373,6 +373,7 @@ func (s *Store) EnqueueOutbox(ctx context.Context, aggregateID uuid.UUID, topic 
 		aggregateID, topic, payload); err != nil {
 		return fmt.Errorf("enqueue outbox: %w", err)
 	}
+	s.signalOutboxFlush() // W46-A item 6: flush-on-commit
 	return nil
 }
 

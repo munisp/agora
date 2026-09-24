@@ -65,6 +65,14 @@ pub struct AppState {
     /// refund rail (replay returns the ORIGINAL outcome). Same DSN posture
     /// as `payout_attempts`.
     pub transfer_attempts: Arc<dyn transfers::TransferAttemptStore>,
+    /// SPEC-W46 R3: per-process set of tenants whose ledger accounts have
+    /// already been ensured by THIS process. `create_accounts` is idempotent
+    /// (exists-ok) and ledger accounts are immutable once created, so after
+    /// the first successful ensure the per-request create_accounts round
+    /// trip (a full TB RTT on the live ledger) is pure waste. Entries are
+    /// only inserted AFTER a successful ensure, so a failure is retried on
+    /// the next request exactly as before.
+    pub ensured_tenants: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
     /// GF11 error metric: commands dead-lettered after bounded retries.
@@ -79,10 +87,47 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// SPEC-W46 R3: ensure the tenant's ledger accounts exist, running the
+    /// (idempotent, exists-ok) `create_accounts` round trip at most once per
+    /// tenant per process. Callers that need the returned account snapshots
+    /// (only POST /v1/accounts/provision) call `ledger.create_accounts`
+    /// directly. Semantics unchanged: the first call for a tenant still
+    /// awaits the ledger and propagates any error; nothing is cached on
+    /// failure.
+    pub async fn ensure_accounts(&self, tenant_id: &str) -> Result<(), ledger::LedgerError> {
+        {
+            let ensured = self
+                .ensured_tenants
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if ensured.contains(tenant_id) {
+                return Ok(());
+            }
+        }
+        self.ledger.create_accounts(tenant_id).await?;
+        self.ensured_tenants
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(tenant_id.to_string());
+        Ok(())
+    }
+
     /// Best-effort outbox (ADR-0007 note): ledger ops commit first; event
     /// publication failures are logged + counted, not rolled back. A
     /// reconciler can republish from the ledger.
-    pub async fn publish_event<T: Serialize>(
+    ///
+    /// SPEC-W46 R5: fire-and-forget. Every call site publishes ONLY after
+    /// the durable ledger/attempt-record write, and NO route derives any
+    /// part of its response from the publish result (failures were already
+    /// swallowed into a counter + warn log), so the request path no longer
+    /// awaits the daprd/broker RTT (up to the 30s reqwest timeout on sidecar
+    /// trouble). The publish itself — including the metric accounting and
+    /// error logging — runs in a spawned task; the event payload is fully
+    /// built synchronously BEFORE the spawn, so what is published is exactly
+    /// what the caller passed. `async` is kept on the signature purely so
+    /// the existing `.await` call sites are untouched; the future completes
+    /// immediately after the spawn.
+    pub async fn publish_event<T: Serialize + Send + Sync + 'static>(
         &self,
         type_name: &str,
         subject: &str,
@@ -96,19 +141,24 @@ impl AppState {
             tenant_id,
             data,
         );
-        match self.outbox.publish(&event).await {
-            Ok(()) => {
-                self.events_published.fetch_add(1, Ordering::Relaxed);
+        let outbox = self.outbox.clone();
+        let events_published = self.events_published.clone();
+        let events_failed = self.events_failed.clone();
+        tokio::spawn(async move {
+            match outbox.publish(&event).await {
+                Ok(()) => {
+                    events_published.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    events_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        error = %e,
+                        type_ = %event.type_,
+                        "dapr pubsub publish failed (best-effort outbox)"
+                    );
+                }
             }
-            Err(e) => {
-                self.events_failed.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    error = %e,
-                    type_ = %event.type_,
-                    "dapr pubsub publish failed (best-effort outbox)"
-                );
-            }
-        }
+        });
     }
 }
 
@@ -248,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         payout_attempts,
         registry,
         transfer_attempts,
+        ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),
         commands_dead_lettered: Arc::new(AtomicU64::new(0)),

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/identity-service/internal/poolx"
 )
 
 // ErrNotFound is returned when a tenant_apps row does not exist (app not
@@ -69,7 +70,8 @@ type Store struct {
 // platform_apps + tenant_apps tables and the tenant_isolation RLS policy
 // (idempotent; same bootstrap role as the consent store).
 func New(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	// SPEC-W46 PERF-08: budgeted pool (poolx); DATABASE_URL pool_* params win.
+	pool, err := poolx.New(ctx, databaseURL, poolx.MaxConns, poolx.MinConns)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
