@@ -28,5 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 futures-util = "0.3"
 thiserror = "1"
+# SPEC-W46 R19: response compression middleware (gzip + br).
+tower-http = { version = "0.5", features = ["compression-gzip", "compression-br"] }
 # Optional: real Fluvio consumer (feature `fluvio-live`).
 fluvio = { version = "0.21", optional = true }
