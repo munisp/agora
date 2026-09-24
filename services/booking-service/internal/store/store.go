@@ -33,6 +33,12 @@ var ErrConflict = errors.New("conflict")
 // Store wraps a pgx connection pool.
 type Store struct {
 	pool *pgxpool.Pool
+	// outboxFlush (SPEC-W46 W46-A item 6, K-03) is the flush-on-commit
+	// signal drained by the outbox dispatcher (billing-engine pattern): any
+	// write path that committed outbox rows nudges it so the dispatcher
+	// publishes immediately instead of waiting out the 2s poll. Buffered
+	// size 1 — a pending nudge coalesces; the poll remains the fallback.
+	outboxFlush chan struct{}
 	// geoEnabled reports whether the PostGIS geo tables (SPEC-W8) were
 	// bootstrapped; false when the server lacks the postgis extension
 	// (e.g. embedded-Postgres tests) — geo store methods then return
@@ -71,7 +77,7 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	s := &Store{pool: pool}
+	s := &Store{pool: pool, outboxFlush: make(chan struct{}, 1)}
 	if err := s.ensureSitesTable(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -140,6 +146,13 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 	}
 	// SPEC-W45 CODER-A item 7: referral_agents registry (STK O10).
 	if err := s.ensureReferralAgentTables(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W46 (W46-A item 1): performance index migration — CONCURRENTLY,
+	// per-statement, guarded (see perf_indexes.go). Runs after the lead /
+	// referral bootstraps so promo_codes + commission_* exist.
+	if err := s.ensurePerfIndexes(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -233,6 +246,23 @@ END $$;`
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
+// OutboxFlushSignal returns the flush-on-commit channel the outbox
+// dispatcher selects on next to its poll ticker (SPEC-W46 W46-A item 6).
+func (s *Store) OutboxFlushSignal() <-chan struct{} { return s.outboxFlush }
+
+// signalOutboxFlush nudges the dispatcher after a transaction that wrote
+// outbox rows committed. Non-blocking: an already-pending nudge covers the
+// rows (the next dispatch cycle drains everything unsent anyway).
+func (s *Store) signalOutboxFlush() {
+	if s.outboxFlush == nil {
+		return
+	}
+	select {
+	case s.outboxFlush <- struct{}{}:
+	default:
+	}
+}
+
 // Ping checks database liveness (used by /healthz).
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
@@ -287,7 +317,7 @@ func (s *Store) CreateOffering(ctx context.Context, o *Offering) error {
 
 // ListOfferings returns all offerings of a tenant.
 func (s *Store) ListOfferings(ctx context.Context, tenantID uuid.UUID) ([]Offering, error) {
-	const q = `SELECT ` + offeringCols + ` FROM offerings WHERE tenant_id = $1 ORDER BY created_at`
+	const q = `SELECT ` + offeringCols + ` FROM offerings WHERE tenant_id = $1 ORDER BY created_at LIMIT 1000`
 	var out []Offering
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID)
@@ -427,7 +457,7 @@ func (s *Store) ListTeamMembers(ctx context.Context, tenantID uuid.UUID) ([]Team
 	var out []TeamMember
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
-			`SELECT `+teamMemberCols+` FROM team_members WHERE tenant_id=$1 ORDER BY name`, tenantID)
+			`SELECT `+teamMemberCols+` FROM team_members WHERE tenant_id=$1 ORDER BY name LIMIT 1000`, tenantID)
 		if err != nil {
 			return err
 		}
@@ -589,7 +619,7 @@ func (s *Store) ListContacts(ctx context.Context, tenantID uuid.UUID) ([]Contact
 	var out []Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts WHERE tenant_id=$1 ORDER BY name`, tenantID)
+			`SELECT id, tenant_id, name, phone, email, notes FROM contacts WHERE tenant_id=$1 ORDER BY name LIMIT 1000`, tenantID)
 		if err != nil {
 			return err
 		}

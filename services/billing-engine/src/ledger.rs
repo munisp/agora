@@ -425,8 +425,69 @@ impl PgLedgerClient {
         }
         let amt = i64::try_from(amount).map_err(|_| LedgerError::InvalidAmount)?;
 
-        // Idempotent replay: same id + same parameters returns the recorded
-        // transfer; same id + different parameters is a conflict.
+        // SPEC-W46 R11: two roundtrips for a fresh posting (down from six).
+        // 1. Idempotent account ensure (the transfer FK needs the rows to
+        //    exist in this transaction's snapshot, so this stays a separate
+        //    statement — data-modifying CTEs cannot see each other's writes).
+        for name in [debit, credit] {
+            sqlx::query(
+                "INSERT INTO ledger_accounts (name, id, ledger, code) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(format!("{:032x}", account_id(name)))
+            .bind(self.ledger_id as i32)
+            .bind(i32::from(code_for_account(name)))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| pg_err("ensure account", e))?;
+        }
+        // 2. Idempotency check + insert + balance updates in ONE statement:
+        //    the transfer INSERT ... ON CONFLICT (id) DO NOTHING RETURNING
+        //    yields a row exactly when THIS call posts; the balance UPDATE is
+        //    gated on that row, so a replay never double-counts.
+        let created_at = Utc::now();
+        let inserted: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "WITH ins AS ( \
+                 INSERT INTO ledger_transfers \
+                     (id, debit_account, credit_account, amount, ledger, code, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (id) DO NOTHING \
+                 RETURNING created_at \
+             ), bump AS ( \
+                 UPDATE ledger_accounts a SET \
+                     debits_posted  = a.debits_posted  + CASE WHEN a.name = $2 THEN $4 ELSE 0 END, \
+                     credits_posted = a.credits_posted + CASE WHEN a.name = $3 THEN $4 ELSE 0 END \
+                 WHERE a.name IN ($2, $3) AND EXISTS (SELECT 1 FROM ins) \
+             ) \
+             SELECT created_at FROM ins",
+        )
+        .bind(transfer_id)
+        .bind(debit)
+        .bind(credit)
+        .bind(amt)
+        .bind(self.ledger_id as i32)
+        .bind(i32::from(code))
+        .bind(created_at)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| pg_err("post transfer", e))?;
+
+        if inserted.is_some() {
+            return Ok(Transfer {
+                id: transfer_id.as_u128(),
+                debit_account: debit.to_string(),
+                credit_account: credit.to_string(),
+                amount,
+                ledger: self.ledger_id,
+                code,
+                created_at,
+            });
+        }
+
+        // Replay path (cold): the id already existed, no balances moved.
+        // Same id + same parameters returns the recorded transfer; same id +
+        // different parameters is a conflict.
         let existing = sqlx::query(
             "SELECT debit_account, credit_account, amount, code, created_at \
              FROM ledger_transfers WHERE id = $1",
@@ -457,63 +518,10 @@ impl PgLedgerClient {
                     created_at: ex_created,
                 });
             }
-            return Err(LedgerError::ExistsWithDifferentParameters(
-                transfer_id.to_string(),
-            ));
         }
-
-        for name in [debit, credit] {
-            sqlx::query(
-                "INSERT INTO ledger_accounts (name, id, ledger, code) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
-            )
-            .bind(name)
-            .bind(format!("{:032x}", account_id(name)))
-            .bind(self.ledger_id as i32)
-            .bind(i32::from(code_for_account(name)))
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| pg_err("ensure account", e))?;
-        }
-        sqlx::query("UPDATE ledger_accounts SET debits_posted = debits_posted + $2 WHERE name = $1")
-            .bind(debit)
-            .bind(amt)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| pg_err("debit update", e))?;
-        sqlx::query("UPDATE ledger_accounts SET credits_posted = credits_posted + $2 WHERE name = $1")
-            .bind(credit)
-            .bind(amt)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| pg_err("credit update", e))?;
-
-        let created_at = Utc::now();
-        sqlx::query(
-            "INSERT INTO ledger_transfers \
-             (id, debit_account, credit_account, amount, ledger, code, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(transfer_id)
-        .bind(debit)
-        .bind(credit)
-        .bind(amt)
-        .bind(self.ledger_id as i32)
-        .bind(i32::from(code))
-        .bind(created_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| pg_err("insert transfer", e))?;
-
-        Ok(Transfer {
-            id: transfer_id.as_u128(),
-            debit_account: debit.to_string(),
-            credit_account: credit.to_string(),
-            amount,
-            ledger: self.ledger_id,
-            code,
-            created_at,
-        })
+        Err(LedgerError::ExistsWithDifferentParameters(
+            transfer_id.to_string(),
+        ))
     }
 }
 
