@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac as hmac_mod
 
@@ -32,6 +33,13 @@ from conftest import FakeDapr
 
 PHONE = "+234 803 555 0101"
 PHONE_NORM = "+2348035550101"
+
+
+async def _drain_events() -> None:
+    """SPEC-W46 P9: ToolInvoked publishes are fire-and-forget background
+    tasks — yield to the loop so scheduled publishes land in FakeDapr."""
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
 
 def _ctx() -> TenantContext:
@@ -479,6 +487,7 @@ class TestPhoneHashing:
         result = await layer.dispatch(
             "capture_location", {"address_text": "12 Allen Avenue"}
         )
+        await _drain_events()
         assert result["status"] == "error"  # no contact record
         # Find the capture_location ToolInvoked event.
         events = [
@@ -498,6 +507,7 @@ class TestPhoneHashing:
         )
         layer = _tool_layer(dapr, session, settings=_settings(phone_hash_salt=""))
         await layer.dispatch("capture_location", {"address_text": "12 Allen Avenue"})
+        await _drain_events()
         events = [
             e for (_p, _t, e) in dapr.best_effort
             if e["data"]["tool"] == "capture_location"
@@ -512,6 +522,7 @@ class TestPhoneHashing:
         session = SessionState(conversation_id="c1", site_slug="demo")
         layer = _tool_layer(dapr, session, verifier_factory=_verifier_factory(requests))
         await layer.dispatch("request_verification_code", {"phone": PHONE})
+        await _drain_events()
         events = [
             e for (_p, _t, e) in dapr.best_effort
             if e["data"]["tool"] == "request_verification_code"
