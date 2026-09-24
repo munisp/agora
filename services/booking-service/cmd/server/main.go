@@ -748,10 +748,13 @@ func run() error {
 	}
 
 	deps := httpapi.Deps{
-		Store:             st,
-		Ops:               ops,
-		Resolver:          resolver,
-		Authz:             permify.NewHTTPClient(cfg.PermifyURL),
+		Store:    st,
+		Ops:      ops,
+		Resolver: resolver,
+		// SPEC-W46 (W46-A item 4, X-01): positive-decision TTL cache (default
+		// 45s) in front of the per-request Permify check; denials + errors
+		// are never cached (fail-closed unchanged).
+		Authz:             permify.NewCachedAuthorizer(permify.NewHTTPClient(cfg.PermifyURL), cfg.PermifyCacheTTL),
 		AuthzDisabled:     cfg.AuthzDisabled,
 		AuthzOutagePolicy: cfg.AuthzOutagePolicy,
 		Dapr:              daprClient,

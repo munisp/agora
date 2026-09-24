@@ -480,7 +480,9 @@ async fn initialize(State(st): State<AppState>, headers: HeaderMap, Json(body): 
     //    idempotent ledger op. The rail commit IS the webhook, not the
     //    initialize call, so ledger-first applies here too. P-10: tenant
     //    accounts are auto-provisioned on first hold (idempotent, exists-ok).
-    if let Err(e) = st.ledger.create_accounts(&body.tenant_id).await {
+    //    SPEC-W46 R3: the ensure is cached per process (one ledger round
+    //    trip per tenant); a failure is NOT cached and retries as before.
+    if let Err(e) = st.ensure_accounts(&body.tenant_id).await {
         return map_ledger_error(e);
     }
     let hold = match st
@@ -890,6 +892,7 @@ mod tests {
             payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
             transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
+            ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),
