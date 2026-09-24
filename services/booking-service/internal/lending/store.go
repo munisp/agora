@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store persists loan products, applications, accounts, repayments and the
@@ -20,6 +22,21 @@ import (
 type Store struct {
 	pool    *pgxpool.Pool
 	ownPool bool // true when opened via DialStore
+
+	// SPEC-W46 (W46-A item 2, PERF-03): schema probes so ComputeScore can
+	// collapse its five sequential withTenant transactions into ONE tx +
+	// ONE statement. The scoring signals are defensive reads over tables
+	// lending does not own (contacts carries no created_at in the canonical
+	// schema; bookings may be absent in a lending-only harness) — probing
+	// replaces the previous try-and-ignore per-request error handling,
+	// which poisoned any shared transaction. PRESENT results are memoized
+	// forever (schema only ever gains tables/columns); ABSENT results are
+	// re-probed on the next scoring call, so a store dialed before the
+	// support schema lands (test harnesses, rolling deploys) picks it up
+	// without a restart.
+	probeMu            sync.Mutex
+	contactsHasCreated bool // contacts.created_at confirmed present
+	bookingsTable      bool // bookings confirmed present
 }
 
 // NewStore wraps an existing pool and ensures the schema.
@@ -31,13 +48,51 @@ func NewStore(ctx context.Context, pool *pgxpool.Pool) (*Store, error) {
 	return s, nil
 }
 
+// ensureSchemaProbes lazily confirms the two schema facts ComputeScore
+// needs. Confirmed facts are never re-probed (one probe per fact per
+// process in the steady state); unconfirmed ones retry next call. A probe
+// ERROR assumes "present" for that call without memoizing (same
+// attempt-then-tolerate posture as before — the scoring query stays
+// best-effort).
+func (s *Store) ensureSchemaProbes(ctx context.Context) (contactsHasCreated, bookingsTable bool) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	contactsHasCreated = s.contactsHasCreated
+	if !contactsHasCreated {
+		var col *string
+		err := s.pool.QueryRow(ctx,
+			`SELECT attname FROM pg_attribute
+			  WHERE attrelid = to_regclass('public.contacts') AND attname = 'created_at' AND NOT attisdropped`).Scan(&col)
+		switch {
+		case err == nil && col != nil:
+			contactsHasCreated = true
+			s.contactsHasCreated = true
+		case err != nil && !errors.Is(err, pgx.ErrNoRows):
+			contactsHasCreated = true // transient probe failure: attempt-then-tolerate
+		}
+	}
+	bookingsTable = s.bookingsTable
+	if !bookingsTable {
+		var reg *string
+		err := s.pool.QueryRow(ctx, `SELECT to_regclass('public.bookings')::text`).Scan(&reg)
+		switch {
+		case err == nil && reg != nil:
+			bookingsTable = true
+			s.bookingsTable = true
+		case err != nil:
+			bookingsTable = true // transient probe failure: attempt-then-tolerate
+		}
+	}
+	return contactsHasCreated, bookingsTable
+}
+
 // DialStore opens a small dedicated pool and ensures the schema.
 func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	poolCfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -692,17 +747,38 @@ func scanLedgerEntry(row pgx.Row) (LedgerEntry, error) {
 // postJournalTx inserts one journal's entries inside an EXISTING tenant tx
 // (idempotent: ON CONFLICT (tenant_id, ref_type, ref_id, account_code)
 // DO NOTHING — a replayed journal is a no-op).
+//
+// SPEC-W46 (W46-A item 11, PERF-22): one batched INSERT via unnest (1 RTT)
+// replaces the per-entry loop; the conflict anchor and DO NOTHING semantics
+// are identical, and unnest preserves the entry order within the journal.
 func postJournalTx(ctx context.Context, tx pgx.Tx, journalID uuid.UUID, entries []LedgerEntry) error {
-	for _, e := range entries {
-		e.JournalID = journalID
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO lending_ledger (tenant_id, journal_id, account_code, beneficiary_id, debit_kobo, credit_kobo, ref_type, ref_id)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-			 ON CONFLICT (tenant_id, ref_type, ref_id, account_code) DO NOTHING`,
-			e.TenantID, e.JournalID, e.AccountCode, e.BeneficiaryID,
-			e.DebitKobo, e.CreditKobo, e.RefType, e.RefID); err != nil {
-			return fmt.Errorf("post ledger entry: %w", err)
-		}
+	if len(entries) == 0 {
+		return nil
+	}
+	tenantIDs := make([]uuid.UUID, len(entries))
+	journalIDs := make([]uuid.UUID, len(entries))
+	accountCodes := make([]int32, len(entries))
+	beneficiaries := make([]string, len(entries))
+	debits := make([]int64, len(entries))
+	credits := make([]int64, len(entries))
+	refTypes := make([]string, len(entries))
+	refIDs := make([]string, len(entries))
+	for i, e := range entries {
+		tenantIDs[i] = e.TenantID
+		journalIDs[i] = journalID
+		accountCodes[i] = int32(e.AccountCode)
+		beneficiaries[i] = e.BeneficiaryID
+		debits[i] = e.DebitKobo
+		credits[i] = e.CreditKobo
+		refTypes[i] = e.RefType
+		refIDs[i] = e.RefID
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO lending_ledger (tenant_id, journal_id, account_code, beneficiary_id, debit_kobo, credit_kobo, ref_type, ref_id)
+		 SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::int[], $4::text[], $5::bigint[], $6::bigint[], $7::text[], $8::text[])
+		 ON CONFLICT (tenant_id, ref_type, ref_id, account_code) DO NOTHING`,
+		tenantIDs, journalIDs, accountCodes, beneficiaries, debits, credits, refTypes, refIDs); err != nil {
+		return fmt.Errorf("post ledger entries: %w", err)
 	}
 	return nil
 }
