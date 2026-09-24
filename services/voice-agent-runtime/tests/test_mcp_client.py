@@ -476,3 +476,68 @@ async def test_build_mcp_tools_sync_inside_running_loop(monkeypatch):
     )
     tools = build_plugin_tools([], allowed_hosts_raw="booking")
     assert [t.name for t in tools] == ["mcp__crm__lookup_order"]
+
+
+# ------------------------------------------- SPEC-W46 P3: persistent clients
+async def test_persistent_client_reused_across_calls():
+    """One handshake at first use; subsequent tools/call reuse the session."""
+    server = FakeStreamableServer()
+    spec = MCPServerSpec(name="n8n", url="https://mcp.example.com/mcp")
+    tool = MCPTool(
+        spec,
+        N8N_TOOLS[0],
+        runner=AsyncToolRunner(timeout_s=2.0),
+        persistent_client=MCPClient(
+            spec, timeout_s=2.0, client=_mock_client(server.handler)
+        ),
+    )
+    first = await tool.execute({"email": "a@example.com"})
+    second = await tool.execute({"email": "b@example.com"})
+    assert first["status"] == second["status"] == "ok"
+    methods = [m["method"] for m in server.messages]
+    assert methods.count("initialize") == 1  # handshake once, not per call
+    assert methods.count("tools/call") == 2
+    # The negotiated mcp-session-id is echoed on the reused session.
+    assert server.session_header_seen[-1] == "sess-1"
+    await tool.aclose()
+    assert tool._persistent_client is None
+
+
+async def test_persistent_client_reconnects_once_on_failure(monkeypatch):
+    """A broken persistent connection is dropped; ONE reconnect+retry runs
+    before the runner's apology path engages."""
+    server = FakeStreamableServer()
+    spec = MCPServerSpec(name="n8n", url="https://mcp.example.com/mcp")
+    state = {"calls": 0, "clients": 0}
+    real_handler = server.handler
+
+    def flaky_handler(request: httpx.Request) -> httpx.Response:
+        message = json.loads(request.content)
+        if message.get("method") == "tools/call":
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return httpx.Response(503, text="broken session")
+        return real_handler(request)
+
+    # Route lazy client creation through mock transports.
+    created: list[MCPClient] = []
+
+    real_client_cls = MCPClient
+
+    def factory(spec_arg, timeout_s=None, **kw):
+        client = real_client_cls(
+            spec_arg, timeout_s=timeout_s or 2.0,
+            client=_mock_client(flaky_handler),
+        )
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(mcp_client, "MCPClient", factory)
+    tool = MCPTool(spec, N8N_TOOLS[0], runner=AsyncToolRunner(timeout_s=2.0))
+    result = await tool.execute({"email": "a@example.com"})
+    assert result["status"] == "ok"  # retry on the fresh connection succeeded
+    assert state["calls"] == 2  # one failure + one retry
+    assert len(created) == 2  # exactly one reconnect
+    initializes = [m for m in server.messages if m["method"] == "initialize"]
+    assert len(initializes) == 2  # re-handshake on the new connection
+    await tool.aclose()

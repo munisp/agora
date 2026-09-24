@@ -26,6 +26,7 @@ from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,8 @@ def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class RegistryStore:
-    def __init__(self, dsn: str, *, internal_dsn: str | None = None) -> None:
+    def __init__(self, dsn: str, *, internal_dsn: str | None = None,
+                 pool_min_size: int = 1, pool_max_size: int = 8) -> None:
         self.dsn = dsn
         # SPEC-W34 GF1: internal (cross-tenant) transactions MUST connect as
         # the batch role. Production compose always sets
@@ -67,26 +69,60 @@ class RegistryStore:
                 "MODEL_REGISTRY_INTERNAL_DSN unset: internal transactions fall "
                 "back to the primary DSN (unit-test path only; cross-tenant "
                 "batch reads will return no rows under RLS)")
+        # W46-F P8: pooled connections replace connect-per-request (every
+        # registry read previously paid TCP+auth setup; /healthz churned
+        # connections). psycopg_pool is thread-safe, so the sync handlers'
+        # threadpool and the APScheduler batch jobs share the same pools.
+        # Tenant GUC discipline is unchanged: set_config(..., true) is
+        # transaction-local and auto-resets at commit/rollback, so a pooled
+        # connection can never carry tenant context into the next checkout.
+        # Budget: min 1 / max 8 per replica (internal batch pool max 4) —
+        # well inside the compose max_connections arithmetic (I-01/I-02).
+        self._pool = ConnectionPool(
+            self.dsn,
+            min_size=pool_min_size,
+            max_size=pool_max_size,
+            kwargs={"row_factory": dict_row},
+            open=True,
+        )
+        self._internal_pool = (
+            ConnectionPool(
+                self.internal_dsn,
+                min_size=1,
+                max_size=4,
+                kwargs={"row_factory": dict_row},
+                open=True,
+            )
+            if self.internal_dsn
+            else None
+        )
+
+    def close(self) -> None:
+        """Close both pools (app shutdown)."""
+        self._pool.close()
+        if self._internal_pool is not None:
+            self._internal_pool.close()
 
     @contextmanager
     def _tx(self, tenant_id: str | UUID | None = None, *,
             internal: bool = False) -> Iterator[Any]:
-        dsn = self.internal_dsn if (internal and self.internal_dsn) else self.dsn
-        conn = psycopg.connect(dsn, row_factory=dict_row)
-        try:
+        pool = (
+            self._internal_pool
+            if (internal and self._internal_pool is not None)
+            else self._pool
+        )
+        with pool.connection() as conn:
             with conn.transaction():
                 if tenant_id is not None:
                     conn.execute(
                         "SELECT set_config('app.tenant_id', %s, true)",
                         (str(tenant_id),))
                 yield conn
-        finally:
-            conn.close()
 
     # ------------------------------------------------------------------ health
     def health(self) -> bool:
         try:
-            with psycopg.connect(self.dsn) as conn:
+            with self._pool.connection() as conn:
                 conn.execute("SELECT 1")
             return True
         except Exception:  # noqa: BLE001 — honest health, never raise

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -26,6 +28,45 @@ from ..quarantine import apply_quarantine
 SEVERITIES = ("low", "medium", "high")
 
 log = logging.getLogger("fraud_engine.detectors")
+
+# W46-F P13: cache discipline for the per-tenant ML scorer + ML activity
+# caches (previously never-invalidated, unbounded dicts; the activity cache
+# was keyed by tenant ONLY, so a later run against a different person set
+# silently reused the first run's activity rows — a correctness bug).
+# Env-overridable (registry_client pattern); defaults per the standing
+# cache rule (TTL <= 300s on hot paths, explicit bound).
+_ML_CACHE_TTL_S = float(os.getenv("FRAUD_ML_CACHE_TTL_S", "300"))
+_ML_CACHE_MAXSIZE = int(os.getenv("FRAUD_ML_CACHE_MAXSIZE", "512"))
+
+
+class _BoundedTTLCache:
+    """Tiny bounded TTL cache (no new dependency): insertion-ordered dict,
+    per-entry monotonic expiry, oldest-first eviction at maxsize."""
+
+    def __init__(self, ttl_s: float, maxsize: int) -> None:
+        self._ttl_s = ttl_s
+        self._maxsize = maxsize
+        self._entries: dict[Any, tuple[float, Any]] = {}
+
+    def get(self, key: Any) -> tuple[bool, Any]:
+        entry = self._entries.get(key)
+        if entry is None:
+            return False, None
+        expires_at, value = entry
+        if expires_at <= time.monotonic():
+            self._entries.pop(key, None)
+            return False, None
+        return True, value
+
+    def set(self, key: Any, value: Any) -> None:
+        if key in self._entries:
+            del self._entries[key]
+        while len(self._entries) >= self._maxsize:
+            self._entries.pop(next(iter(self._entries)))
+        self._entries[key] = (time.monotonic() + self._ttl_s, value)
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 # ---------------------------------------------------------------------------
@@ -260,15 +301,25 @@ class DetectionRunner:
         # W33-B: explicit injection (tests) wins; otherwise lazy per-tenant
         # load from settings.ml_registry_dir. None/absent => pure rules (I1).
         self._ml_scorer = ml_scorer
-        self._ml_scorer_by_tenant: dict[str, Any] = {}
-        self._ml_activity_by_tenant: dict[str, dict[str, tuple[list[dict[str, Any]], int]]] = {}
+        # W46-F P13: bounded + TTL'd caches. The scorer entry is
+        # version-keyed: the cached tuple carries the artifact's
+        # model_version, and TTL expiry re-resolves LearnedScorer.load, so a
+        # newly promoted model version takes effect within one TTL window
+        # (previously a stale model was served forever).
+        self._ml_scorer_cache: _BoundedTTLCache = _BoundedTTLCache(
+            _ML_CACHE_TTL_S, _ML_CACHE_MAXSIZE
+        )
+        self._ml_activity_cache: _BoundedTTLCache = _BoundedTTLCache(
+            _ML_CACHE_TTL_S, _ML_CACHE_MAXSIZE
+        )
 
     # -- W33-B learned scorer (additive; inert when disabled) ---------------
     def _ml_scorer_for(self, tenant_id: str) -> Any | None:
         if self._ml_scorer is not None:
             return self._ml_scorer
-        if tenant_id in self._ml_scorer_by_tenant:
-            return self._ml_scorer_by_tenant[tenant_id]
+        hit, entry = self._ml_scorer_cache.get(tenant_id)
+        if hit:
+            return entry[0]
         scorer = None
         registry_dir = getattr(self.settings, "ml_registry_dir", "") or ""
         if registry_dir:
@@ -279,14 +330,21 @@ class DetectionRunner:
             except Exception:  # noqa: BLE001 - model failure -> rule fallback
                 log.exception("ml scorer load failed for %s; pure rules apply", tenant_id)
                 scorer = None
-        self._ml_scorer_by_tenant[tenant_id] = scorer
+        version = getattr(scorer, "model_version", None)
+        self._ml_scorer_cache.set(tenant_id, (scorer, version))
         return scorer
 
     def _ml_activity(
         self, tenant_id: str, person_ids: list[str]
     ) -> dict[str, tuple[list[dict[str, Any]], int]]:
-        if tenant_id in self._ml_activity_by_tenant:
-            return self._ml_activity_by_tenant[tenant_id]
+        # W46-F P13: keyed by (tenant, frozenset(person_ids)) — the query is
+        # parameterized by exactly those inputs, so this is the minimal
+        # correct key (the old tenant-only key could serve another person
+        # set's activity). TTL bounds staleness against graph updates.
+        key = (tenant_id, frozenset(person_ids))
+        hit, activity = self._ml_activity_cache.get(key)
+        if hit:
+            return activity
         params = {"tenant_id": tenant_id, "person_ids": person_ids}
         rows = self._run_ml_query(tenant_id, params)
         activity = {
@@ -294,7 +352,7 @@ class DetectionRunner:
             for row in rows
             if row.get("person_id")
         }
-        self._ml_activity_by_tenant[tenant_id] = activity
+        self._ml_activity_cache.set(key, activity)
         return activity
 
     def _run_ml_query(self, tenant_id: str, params: dict[str, Any]) -> list[dict[str, Any]]:
