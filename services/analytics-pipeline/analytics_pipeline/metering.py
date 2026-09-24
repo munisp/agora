@@ -10,8 +10,8 @@ Sparse data is the norm (v1 emits booking + call-minute metrics only, and
 payments/voice emission is deferred — see README): a missing table, a tenant
 without rows, or an empty range all return an empty list, never an error.
 
-The table is small (usage records, not events), so a full scan + in-Python
-reduction is appropriate — same pattern as recommendations.py.
+The scan pushes the tenant predicate down (row_filter) and projects only
+the needed fields (W46-F P6) — same pattern as recommendations.py.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any
 
 import structlog
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.expressions import EqualTo
 
 from .config import Settings
 from .iceberg_tables import load_rest_catalog
@@ -48,7 +49,17 @@ def fetch_usage(
         log.info("metering.table_absent", table=USAGE_TABLE)
         return []
 
-    rows = table.scan(selected_fields=_USAGE_FIELDS).to_arrow().to_pylist()
+    # W46-F P6: push the tenant predicate down to the scan (same fix as
+    # recommendations.py) — no more full bronze.usage_events scan per
+    # request; the in-Python check stays as defense-in-depth.
+    rows = (
+        table.scan(
+            row_filter=EqualTo("tenant_id", tenant),
+            selected_fields=_USAGE_FIELDS,
+        )
+        .to_arrow()
+        .to_pylist()
+    )
 
     totals: dict[tuple[date, str], float] = {}
     for row in rows:

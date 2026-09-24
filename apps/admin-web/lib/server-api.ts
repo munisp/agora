@@ -34,6 +34,13 @@ export async function serverApi<T>(
     body?: unknown;
     /** skip auth even if a session exists (public endpoints) */
     anonymous?: boolean;
+    /**
+     * ISR cache TTL in seconds (SPEC-W46 AW-3). Only for anonymous GETs of
+     * semi-static public data — the fetch becomes cacheable in the Next.js
+     * Data Cache instead of `no-store`. Never use on authed or per-user
+     * responses.
+     */
+    revalidate?: number;
   } = {},
 ): Promise<T> {
   const headers: Record<string, string> = { accept: "application/json" };
@@ -55,7 +62,10 @@ export async function serverApi<T>(
     method: opts.method ?? "GET",
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    cache: "no-store",
+    // AW-3: revalidate (public semi-static GETs) opts into the Data Cache;
+    // everything else keeps the existing no-store behavior.
+    cache: opts.revalidate ? undefined : "no-store",
+    next: opts.revalidate ? { revalidate: opts.revalidate } : undefined,
   });
 
   const text = await res.text();

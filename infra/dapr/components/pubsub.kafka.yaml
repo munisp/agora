@@ -21,6 +21,28 @@ spec:
       value: "true"
     - name: maxMessageBytes
       value: "1048576"
+    # ---------------------------------------------------------------------
+    # W46-I (P-DATA K-02) — producer tuning NOT configured here, ON PURPOSE.
+    # Verified against the dapr pubsub.kafka component spec (daprd 1.14.4,
+    # docs.dapr.io/reference/components-reference/supported-pubsub/
+    # setup-apache-kafka): the supported metadata keys are brokers,
+    # consumerGroup/consumerID, clientID, authType + SASL/TLS/OIDC keys,
+    # maxMessageBytes, consumeRetryInterval, heartbeatInterval,
+    # sessionTimeout, version, consumerFetchMin/Default, channelBufferSize,
+    # consumerGroupRebalanceStrategy, schemaRegistry*/useAvroJson,
+    # escapeHeaders, excludeMetaHeaderRegex, disableEntityManagement,
+    # allowAutoTopicCreation, initialOffset. There is NO compression /
+    # compressionType, NO linger.ms/batching and NO enable.idempotence key —
+    # the dapr sarama producer runs its defaults (no compression, linger 0).
+    # Guessing unsupported keys here would be silently ignored (or rejected
+    # at sidecar load), so the K-02 producer tuning must land where a real
+    # producer client exists:
+    #   * billing-engine (rdkafka producer, src/) — compression.type=lz4,
+    #     linger.ms=5-20, enable.idempotence=true  → coder C (W46-C)
+    #   * booking-service DLQ kafka writers (kafka-go) → coder A (W46-A)
+    # Re-check the component spec on any dapr upgrade; if producer-tuning
+    # keys appear, add them here.
+    # ---------------------------------------------------------------------
 scopes:
   - booking
   - conversation

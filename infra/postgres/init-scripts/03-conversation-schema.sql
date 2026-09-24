@@ -34,6 +34,13 @@ ALTER TABLE turns ADD COLUMN IF NOT EXISTS sentiment DOUBLE PRECISION;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS intent TEXT;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS entities JSONB;
 
+-- W46-I (P-DATA DDL #9): the retention sweep deletes by t.ts (db.py:664)
+-- with no ts index, and turns is the platform's fastest-growing table. The
+-- turns CREATE TABLE lives HERE (init-scripts-owned); coder F (W46-F) owns
+-- the service-boot migration for EXISTING deployments (db.py ensure
+-- pattern). Plain CREATE INDEX IF NOT EXISTS — no CONCURRENTLY in init-db.
+CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns (ts);
+
 -- ---------------- Row Level Security (SPEC §7) ----------------
 ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversations FORCE ROW LEVEL SECURITY;
