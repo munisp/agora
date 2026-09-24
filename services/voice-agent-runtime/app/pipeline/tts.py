@@ -16,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import re
 import tempfile
 import wave
-from typing import Protocol
+from collections import OrderedDict
+from typing import AsyncIterator, Protocol
 
 import httpx
 
@@ -26,6 +28,53 @@ from .. import metrics
 from ..logging import get_logger
 
 log = get_logger("tts")
+
+
+class TtsLruCache:
+    """Bounded per-process LRU for synthesized audio (SPEC-W46 P4).
+
+    Keyed ``(voice, text, format)`` by the callers; ``maxsize <= 0``
+    disables caching. Repeated utterances (greetings, read-backs, menu
+    lines) are served from memory instead of re-synthesized every turn.
+    """
+
+    def __init__(self, maxsize: int = 256) -> None:
+        self.maxsize = maxsize
+        self._items: "OrderedDict[tuple[str, str, str], bytes]" = OrderedDict()
+
+    def get(self, key: tuple[str, str, str]) -> bytes | None:
+        if self.maxsize <= 0:
+            return None
+        try:
+            value = self._items.pop(key)
+        except KeyError:
+            return None
+        self._items[key] = value  # most-recently-used
+        return value
+
+    def set(self, key: tuple[str, str, str], value: bytes) -> None:
+        if self.maxsize <= 0 or not value:
+            return
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self.maxsize:
+            self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
+# Sentence boundary for chunk-level streaming: a chunk ends at terminal
+# punctuation (or a newline); the final fragment without punctuation is
+# one chunk. Abbreviations are NOT special-cased — a false split only
+# costs an extra synthesis call, never wrong audio ordering.
+_SENTENCE_RE = re.compile(r"[^.!?…\n]+(?:[.!?…]+[\"')\]]*\s*|\n+|$)")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split `text` into speakable sentence-level chunks (order preserved)."""
+    chunks = [m.group(0).strip() for m in _SENTENCE_RE.finditer(text.strip())]
+    return [c for c in chunks if c]
 
 
 class TTSInterface(Protocol):
@@ -65,6 +114,7 @@ class PiperTTS:
         model_dir: str = "/voices",
         sample_rate: int = 22050,
         timeout_s: float = 30.0,
+        cache_size: int = 256,
     ) -> None:
         self.mode = mode
         self.http_url = http_url.rstrip("/")
@@ -74,6 +124,9 @@ class PiperTTS:
         self.sample_rate = sample_rate
         self._timeout = timeout_s
         self._client: httpx.AsyncClient | None = None
+        # SPEC-W46 P4: LRU keyed (voice, text, format) — repeated phrases
+        # (greetings, read-backs) skip synthesis entirely.
+        self._cache = TtsLruCache(cache_size)
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -89,6 +142,11 @@ class PiperTTS:
         text = text.strip()
         if not text:
             return b""
+        cache_key = (self.voice, text, "pcm")
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            metrics.session_tts()  # cache hit still counts as a served utterance
+            return cached
         try:
             with metrics.get_registry().tts_latency.time():
                 if self.mode == "subprocess":
@@ -103,7 +161,41 @@ class PiperTTS:
                 expected=self.sample_rate,
                 got=rate,
             )
+        self._cache.set(cache_key, pcm)
         return pcm
+
+    async def stream_pcm(self, text: str) -> AsyncIterator[bytes]:
+        """Sentence-level streaming synthesis (SPEC-W46 P4).
+
+        Full-utterance cache hits ship the whole buffer immediately;
+        otherwise each sentence chunk is synthesized (and cached) in turn,
+        so the first audio frame is available after the FIRST chunk's
+        synthesis instead of the full utterance. Chunk PCM is concatenated
+        into the full-utterance cache entry for the next repeat.
+        """
+        text = text.strip()
+        if not text:
+            return
+        cache_key = (self.voice, text, "pcm")
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            metrics.session_tts()
+            yield cached
+            return
+        chunks = split_sentences(text)
+        if len(chunks) <= 1:
+            pcm = await self.synthesize_pcm(text)
+            if pcm:
+                yield pcm
+            return
+        parts: list[bytes] = []
+        for chunk in chunks:
+            pcm = await self.synthesize_pcm(chunk)
+            if pcm:
+                parts.append(pcm)
+                yield pcm
+        if parts:
+            self._cache.set(cache_key, b"".join(parts))
 
     async def synthesize_wav(self, text: str, voice: str | None = None) -> bytes:
         """RIFF wav bytes for `text` (defaults to the configured voice).
@@ -115,9 +207,16 @@ class PiperTTS:
         if not text:
             return b""
         voice = (voice or "").strip() or self.voice
+        cache_key = (voice, text, "wav")
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
         if self.mode == "subprocess":
-            return await self._subprocess_wav(text, voice)
-        return await self._http_wav(text, voice)
+            wav = await self._subprocess_wav(text, voice)
+        else:
+            wav = await self._http_wav(text, voice)
+        self._cache.set(cache_key, wav)
+        return wav
 
     async def _synthesize_http(self, text: str) -> tuple[bytes, int]:
         return _wav_to_pcm(await self._http_wav(text, self.voice))

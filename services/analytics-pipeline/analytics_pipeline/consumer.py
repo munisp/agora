@@ -99,21 +99,30 @@ class BronzeConsumer:
         assert self._consumer is not None, "start() must be called first"
         flusher = asyncio.create_task(self._flush_ticker(stop_event))
         try:
-            async for msg in self._consumer:
-                if stop_event.is_set():
-                    break
-                value = _decode(msg.value)
-                if not value:
-                    continue
-                buffer = self._buffers[msg.topic]
-                if not buffer:
-                    self._buffer_since[msg.topic] = time.monotonic()
-                buffer.append(value)
-                metrics.MESSAGES_CONSUMED.labels(topic=msg.topic).inc()
-                metrics.BUFFER_SIZE.labels(topic=msg.topic).set(len(buffer))
-                await self._update_lag_metric(msg.topic, msg.partition)
-                if len(buffer) >= self._settings.batch_size:
-                    await self._flush(msg.topic)
+            # W46-F P14: batched broker fetches via getmany (max
+            # consume_max_records per call / consume_poll_ms wait) instead
+            # of message-at-a-time iteration; lag gauges moved to the
+            # flush ticker (no per-message highwater/position calls).
+            while not stop_event.is_set():
+                records = await self._consumer.getmany(
+                    timeout_ms=self._settings.consume_poll_ms,
+                    max_records=self._settings.consume_max_records,
+                )
+                for msgs in records.values():
+                    for msg in msgs:
+                        if stop_event.is_set():
+                            break
+                        value = _decode(msg.value)
+                        if not value:
+                            continue
+                        buffer = self._buffers[msg.topic]
+                        if not buffer:
+                            self._buffer_since[msg.topic] = time.monotonic()
+                        buffer.append(value)
+                        metrics.MESSAGES_CONSUMED.labels(topic=msg.topic).inc()
+                        metrics.BUFFER_SIZE.labels(topic=msg.topic).set(len(buffer))
+                        if len(buffer) >= self._settings.batch_size:
+                            await self._flush(msg.topic)
         finally:
             flusher.cancel()
             try:
@@ -132,6 +141,8 @@ class BronzeConsumer:
                 age = now - self._buffer_since.get(topic, now)
                 if age >= self._settings.flush_interval_seconds:
                     await self._flush(topic)
+            # W46-F P14: refresh lag gauges on the ticker, not per message.
+            self._update_lag_metrics()
 
     async def _flush_all(self) -> None:
         for topic in list(self._buffers):
@@ -166,6 +177,13 @@ class BronzeConsumer:
         log.info("sink.flushed", table=table, rows=written, seconds=round(elapsed, 3))
 
     # -- health ------------------------------------------------------------
+    def _update_lag_metrics(self) -> None:
+        """Refresh CONSUMER_LAG for every assigned partition (ticker path)."""
+        if self._consumer is None:
+            return
+        for tp in self._consumer.assignment():
+            self._update_lag_metric(tp.topic, tp.partition)
+
     def _update_lag_metric(self, topic: str, partition: int) -> None:
         if self._consumer is None:
             return

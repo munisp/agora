@@ -68,7 +68,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
     };
 
-    let bus = Arc::new(EventBus::new(cfg.ws_channel_capacity));
+    let bus = Arc::new(EventBus::with_limits(
+        cfg.ws_channel_capacity,
+        cfg.bus_max_channels,
+        Duration::from_secs(cfg.bus_idle_evict_s),
+    ));
     let state = AppState {
         bus: bus.clone(),
         auth: authenticator,
@@ -76,6 +80,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // R18: periodic idle-channel sweeper — zero-receiver channels idle past
+    // the TTL are evicted so the map cannot grow unboundedly with the number
+    // of tenants ever seen.
+    {
+        let sweep_bus = bus.clone();
+        let mut sweep_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let evicted = sweep_bus.evict_idle().await;
+                        if evicted > 0 {
+                            tracing::debug!(evicted, "bus idle-channel sweep");
+                        }
+                    }
+                    changed = sweep_shutdown.changed() => {
+                        if changed.is_ok() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Kafka primary consumer (booking events).
     let kafka_handle = tokio::spawn(kafka_consumer::run(
@@ -128,6 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ws", get(ws::ws_booking_events))
         .route("/ws/transcripts", get(ws::ws_transcripts))
         .route("/ws/intel", get(ws::ws_intel))
+        // SPEC-W46 R19: gzip/br response compression. WebSocket upgrade
+        // responses (101, no content-type body) pass through untouched.
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));

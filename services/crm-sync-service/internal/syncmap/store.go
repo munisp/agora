@@ -37,6 +37,10 @@ ALTER TABLE sync_map ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
 -- tenant's Twenty records.
 ALTER TABLE sync_map ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS sync_map_twenty_idx ON sync_map (kind, twenty_id);
+-- SPEC-W46 (P-DATA DDL #5): DeleteByTwentyID (GDPR erasure) filters
+-- twenty_id WITHOUT kind, which the (kind, twenty_id) index cannot serve —
+-- a plain twenty_id index keeps the erasure delete off a seq scan.
+CREATE INDEX IF NOT EXISTS idx_sync_map_twenty ON sync_map (twenty_id);
 CREATE TABLE IF NOT EXISTS webhook_events_seen (
 	event_id TEXT PRIMARY KEY,
 	seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -92,7 +96,8 @@ func normTenant(t *uuid.UUID) uuid.UUID {
 
 // New connects and bootstraps the schema (idempotent).
 func New(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	// SPEC-W46 PERF-08: budgeted pool (see pool.go); URL pool_* params win.
+	pool, err := newPool(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}

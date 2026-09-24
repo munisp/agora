@@ -41,6 +41,50 @@ function referralTone(status: string): "success" | "warning" | "info" | "seconda
   }
 }
 
+type BoardRow = import("../../src/api/growth").LeaderboardRow;
+
+/** SPEC-W46 MB-5: memo'd leaderboard row — skips re-render unless its
+ * row data or rank actually changes (form keystrokes in the create card
+ * used to re-render every row). */
+const LeaderboardRow = React.memo(function LeaderboardRow({
+  row,
+  rank,
+}: {
+  row: BoardRow;
+  rank: number;
+}) {
+  return (
+    <ListItem
+      title={`#${rank} · ${row.referrer_type} ${shortId(row.referrer_id)}`}
+      subtitle={`${row.verified} verified · ${row.converted} converted`}
+      right={
+        <Text style={styles.paidTotal}>
+          {row.paidTotalKobo === null ? "—" : formatNgn(row.paidTotalKobo)}
+        </Text>
+      }
+    />
+  );
+});
+
+/** MB-5: memo'd referral row (same reasoning). */
+const ReferralRow = React.memo(function ReferralRow({ referral }: { referral: Referral }) {
+  return (
+    <ListItem
+      title={referral.referee_phone}
+      subtitle={`${referral.referrer_type} ${shortId(referral.referrer_id)}`}
+      meta={
+        referral.created_at
+          ? new Date(referral.created_at).toLocaleString("en-NG")
+          : undefined
+      }
+      right={<Badge label={referral.status} tone={referralTone(referral.status)} />}
+    />
+  );
+});
+
+const MAX_BOARD_ROWS = 10;
+const MAX_RECENT_ROWS = 15;
+
 export default function GrowthScreen() {
   const [referrals, setReferrals] = React.useState<Referral[]>([]);
   const [payouts, setPayouts] = React.useState<Payout[] | null>(null);
@@ -78,11 +122,11 @@ export default function GrowthScreen() {
     }, [load]),
   );
 
-  const onRefresh = async () => {
+  const onRefresh = React.useCallback(async () => {
     setRefreshing(true);
     await load();
     setRefreshing(false);
-  };
+  }, [load]);
 
   const onCreate = async () => {
     if (!refId.trim() || !refPhone.trim()) {
@@ -116,11 +160,35 @@ export default function GrowthScreen() {
     }
   };
 
-  const board = buildLeaderboard(referrals, payouts);
-  const pending = referrals.filter((r) => r.status === "pending").length;
-  const converted = referrals.filter(
-    (r) => r.status === "converted" || r.status === "paid",
-  ).length;
+  // MB-5: memoized derivations + stable renderers — typing in the create
+  // form (refId/refPhone state) no longer re-sorts the leaderboard or
+  // re-renders every row.
+  const board = React.useMemo(
+    () => buildLeaderboard(referrals, payouts),
+    [referrals, payouts],
+  );
+  const pending = React.useMemo(
+    () => referrals.filter((r) => r.status === "pending").length,
+    [referrals],
+  );
+  const converted = React.useMemo(
+    () =>
+      referrals.filter((r) => r.status === "converted" || r.status === "paid").length,
+    [referrals],
+  );
+  const visibleBoard = React.useMemo(() => board.slice(0, MAX_BOARD_ROWS), [board]);
+  const visibleReferrals = React.useMemo(
+    () => referrals.slice(0, MAX_RECENT_ROWS),
+    [referrals],
+  );
+  const renderBoardRow = React.useCallback(
+    (row: BoardRow, i: number) => <LeaderboardRow key={row.key} row={row} rank={i + 1} />,
+    [],
+  );
+  const renderReferralRow = React.useCallback(
+    (r: Referral) => <ReferralRow key={r.referral_id} referral={r} />,
+    [],
+  );
 
   return (
     <Screen title="Growth" subtitle="Referrals, leaderboard and payouts">
@@ -149,18 +217,7 @@ export default function GrowthScreen() {
           {board.length === 0 ? (
             <EmptyState title="No verified referrals yet" />
           ) : (
-            board.slice(0, 10).map((row, i) => (
-              <ListItem
-                key={row.key}
-                title={`#${i + 1} · ${row.referrer_type} ${shortId(row.referrer_id)}`}
-                subtitle={`${row.verified} verified · ${row.converted} converted`}
-                right={
-                  <Text style={styles.paidTotal}>
-                    {row.paidTotalKobo === null ? "—" : formatNgn(row.paidTotalKobo)}
-                  </Text>
-                }
-              />
-            ))
+            visibleBoard.map(renderBoardRow)
           )}
         </Card>
 
@@ -196,15 +253,15 @@ export default function GrowthScreen() {
           {referrals.length === 0 ? (
             <EmptyState title="No referrals yet" />
           ) : (
-            referrals.slice(0, 15).map((r) => (
-              <ListItem
-                key={r.referral_id}
-                title={r.referee_phone}
-                subtitle={`${r.referrer_type} ${shortId(r.referrer_id)}`}
-                meta={r.created_at ? new Date(r.created_at).toLocaleString("en-NG") : undefined}
-                right={<Badge label={r.status} tone={referralTone(r.status)} />}
-              />
-            ))
+            <>
+              {visibleReferrals.map(renderReferralRow)}
+              {referrals.length > MAX_RECENT_ROWS ? (
+                <Text style={styles.moreText}>
+                  + {referrals.length - MAX_RECENT_ROWS} more (showing latest{" "}
+                  {MAX_RECENT_ROWS})
+                </Text>
+              ) : null}
+            </>
           )}
         </Card>
         <View style={{ height: spacing.xl }} />
@@ -224,5 +281,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: colors.mutedForeground,
     marginBottom: spacing.sm,
+  },
+  moreText: {
+    marginTop: spacing.xs,
+    fontSize: 12,
+    color: colors.mutedForeground,
   },
 });

@@ -12,6 +12,7 @@
  */
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, KeyRound, TriangleAlert } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
@@ -39,7 +40,7 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
 
-interface ApiKey {
+export interface ApiKey {
   id: string;
   tenant_id: string;
   name: string;
@@ -59,34 +60,30 @@ interface CreatedKey {
   created_at: string;
 }
 
-export function ApiKeysClient({ orgSlug }: { orgSlug: string }) {
+export function ApiKeysClient({
+  orgSlug,
+  initialKeys,
+  initialError,
+}: {
+  orgSlug: string;
+  /** SPEC-W46 AW-2: fetched server-side in page.tsx. */
+  initialKeys: ApiKey[];
+  initialError: string | null;
+}) {
   const { toast } = useToast();
-  const [keys, setKeys] = React.useState<ApiKey[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+  const router = useRouter();
+  const [keys, setKeys] = React.useState<ApiKey[]>(initialKeys);
+  const [error, setError] = React.useState<string | null>(initialError);
   const [creating, setCreating] = React.useState(false);
   const [created, setCreated] = React.useState<CreatedKey | null>(null);
   const [revoking, setRevoking] = React.useState<ApiKey | null>(null);
   const [busy, setBusy] = React.useState(false);
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.get<{ api_keys?: ApiKey[] }>(
-        `/api/identity/v1/tenants/${orgSlug}/api-keys`,
-      );
-      setKeys(data.api_keys ?? []);
-    } catch (e) {
-      setError(e instanceof ApiError ? e.message : "Failed to load API keys.");
-    } finally {
-      setLoading(false);
-    }
-  }, [orgSlug]);
-
+  // Sync when the server props change (router.refresh() after mutations).
   React.useEffect(() => {
-    void load();
-  }, [load]);
+    setKeys(initialKeys);
+    setError(initialError);
+  }, [initialKeys, initialError]);
 
   const create = async (name: string) => {
     setBusy(true);
@@ -97,7 +94,7 @@ export function ApiKeysClient({ orgSlug }: { orgSlug: string }) {
       );
       setCreating(false);
       setCreated(res);
-      await load();
+      router.refresh();
     } catch (e) {
       toast({
         title: "Could not create key",
@@ -118,7 +115,7 @@ export function ApiKeysClient({ orgSlug }: { orgSlug: string }) {
       );
       toast({ title: "Key revoked", variant: "success" });
       setRevoking(null);
-      await load();
+      router.refresh();
     } catch (e) {
       toast({
         title: "Revoke failed",
@@ -203,9 +200,7 @@ export function ApiKeysClient({ orgSlug }: { orgSlug: string }) {
           </TableHeader>
           <TableBody>
             {keys.length === 0 ? (
-              <TableEmpty colSpan={6}>
-                {loading ? "Loading…" : "No API keys yet."}
-              </TableEmpty>
+              <TableEmpty colSpan={6}>No API keys yet.</TableEmpty>
             ) : (
               keys.map((k) => (
                 <TableRow key={k.id}>

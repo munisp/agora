@@ -112,6 +112,12 @@ declare module "expo-secure-store" {
   export function deleteItemAsync(key: string): Promise<void>;
 }
 
+declare module "expo-crypto" {
+  /** Real SDK 51 API (Crypto.randomUUID, added SDK 47): RFC4122 v4 UUID
+   * from the platform CSPRNG. */
+  export function randomUUID(): string;
+}
+
 declare module "expo-notifications" {
   export type PermissionStatus = "granted" | "denied" | "undetermined";
   export interface NotificationPermissionsStatus {
@@ -180,13 +186,13 @@ declare module "expo-auth-session" {
   export function makeRedirectUri(options?: {
     scheme?: string;
     path?: string;
-    native?: string;
+    native?: boolean;
     isTripleSlashed?: boolean;
   }): string;
 
   export interface AuthRequestConfig {
     clientId: string;
-    redirectUri?: string;
+    redirectUri: string;
     scopes?: string[];
     responseType?: ResponseType;
     usePKCE?: boolean;
@@ -221,7 +227,7 @@ declare module "expo-auth-session" {
   export interface AccessTokenRequestConfig {
     clientId: string;
     code: string;
-    redirectUri?: string;
+    redirectUri: string;
     scopes?: string[];
     extraParams?: Record<string, string>;
   }

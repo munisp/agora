@@ -34,6 +34,21 @@ log = get_logger("plugin-tools")
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 
+# SPEC-W46 P11: one process-wide client shared by every plugin tool that
+# was not handed an injected client (tests) — TCP/TLS setup is paid once,
+# not per invocation, and keep-alive actually pools across calls.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+    return _shared_client
+
 
 class PluginToolError(ValueError):
     """Invalid plugin tool declaration or blocked execution."""
@@ -143,16 +158,14 @@ class PluginTool:
                     k: v for k, v in arguments.items()
                 }
 
-        owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_s))
+        client = self._client or _shared_http_client()
         try:
-            resp = await client.request(self.method, url, **request_kwargs)
+            resp = await client.request(
+                self.method, url, timeout=self._timeout_s, **request_kwargs
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the model
             log.warning("plugin tool request failed", tool=self.name, error=str(exc))
             return {"status": "error", "message": f"{self.name} request failed: {exc}"}
-        finally:
-            if owns_client:
-                await client.aclose()
 
         try:
             body: Any = resp.json()
