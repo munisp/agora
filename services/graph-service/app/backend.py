@@ -31,10 +31,13 @@ from .plans import (
 from .templates import TEMPLATES, GraphView, has_valid_consent
 from .writes import (
     AlertResolvePlan,
+    CompiledBatchWrite,
     CompiledWrite,
     CrossTenantWriteError,
     FixtureSeedPlan,
+    RecommendationBatchWritePlan,
     RecommendationWritePlan,
+    ScoreBatchWritePlan,
     ScoreWritePlan,
     WriteTargetMissing,
 )
@@ -146,6 +149,38 @@ class FalkorBackend:
         try:
             return await asyncio.to_thread(_run)
         except (CrossTenantWriteError, WriteTargetMissing):
+            raise
+        except Exception as exc:  # noqa: BLE001 — driver/redis outage
+            raise GraphError(f"falkordb write failed: {type(exc).__name__}: {exc}") from exc
+
+    async def execute_batch_write(
+        self, batch: CompiledBatchWrite, tenant_id: str
+    ) -> dict[str, Any]:
+        """W46-F P12: batched predictive write-back — ONE tenant pre-check
+        + one UNWIND statement per score-field group (typically a single
+        statement) instead of N×(check+write) sequential round trips."""
+
+        def _run() -> dict[str, Any]:
+            check_rows = self._query_rows(
+                batch.check_cypher, {**batch.check_params, "tenant_id": tenant_id}
+            )
+            for row in check_rows:
+                row_tenant = row.get("tenant_id")
+                if row_tenant is not None and row_tenant != tenant_id:
+                    raise CrossTenantWriteError(
+                        f"target node belongs to tenant {row_tenant!r}, "
+                        f"refusing write from {tenant_id!r}"
+                    )
+            rows: list[dict[str, Any]] = []
+            for cypher, params in batch.statements:
+                rows.extend(
+                    self._query_rows(cypher, {**params, "tenant_id": tenant_id})
+                )
+            return {"rows": rows}
+
+        try:
+            return await asyncio.to_thread(_run)
+        except CrossTenantWriteError:
             raise
         except Exception as exc:  # noqa: BLE001 — driver/redis outage
             raise GraphError(f"falkordb write failed: {type(exc).__name__}: {exc}") from exc
@@ -296,6 +331,35 @@ class InMemoryBackend:
         if isinstance(plan, FixtureSeedPlan):
             return self._apply_fixture_seed(plan, tenant_id)
         raise GraphError(f"unsupported write plan {type(plan).__name__}")
+
+    async def execute_batch_write(
+        self, batch: CompiledBatchWrite, tenant_id: str
+    ) -> dict[str, Any]:
+        """W46-F P12: apply the batch plan with the SAME per-item semantics
+        the UNWIND Cypher encodes — cross-tenant endpoints reject the whole
+        request (CrossTenantWriteError → 422); unknown targets are skipped
+        and omitted from the returned rows (the router diffs input vs
+        returned for the per-item skip list, matching the RETURNING diff on
+        the FalkorDB path)."""
+        plan = batch.plan
+        rows: list[dict[str, Any]] = []
+        if isinstance(plan, ScoreBatchWritePlan):
+            for item in plan.items:
+                try:
+                    rows.extend(self._apply_score_write(item, tenant_id)["rows"])
+                except WriteTargetMissing:
+                    continue
+            return {"rows": rows}
+        if isinstance(plan, RecommendationBatchWritePlan):
+            for item in plan.items:
+                try:
+                    rows.extend(
+                        self._apply_recommendation_write(item, tenant_id)["rows"]
+                    )
+                except WriteTargetMissing:
+                    continue
+            return {"rows": rows}
+        raise GraphError(f"unsupported batch write plan {type(plan).__name__}")
 
     # --- write plan semantics (mirror writes.py's Cypher) -------------------
     def _nodes_by_prop(self, label: str, prop: str, value: Any) -> list[GNode]:
