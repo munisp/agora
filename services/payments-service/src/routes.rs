@@ -574,7 +574,8 @@ async fn hold_deposit(
     let key = require_idempotency_key(&body.idempotency_key)?;
     // P-10: auto-provision the tenant accounts on first hold (idempotent,
     // exists-ok) so the live ledger never rejects a first-time tenant.
-    st.ledger.create_accounts(&body.tenant_id).await?;
+    // SPEC-W46 R3: cached per process — one ledger round trip per tenant.
+    st.ensure_accounts(&body.tenant_id).await?;
     let transfer_id = transfer_id_from_key(Some(&key));
     let t = st
         .ledger
@@ -987,8 +988,9 @@ async fn transfer(
     // C3 LEDGER-FIRST: the pending hold reserves the funds BEFORE the rail
     // is called (reuses the two-phase payout account flow: tenant revenue ->
     // platform:payouts, code 104; an over-limit transfer is rejected here
-    // with no rail side effect).
-    st.ledger.create_accounts(&body.tenant_id).await?;
+    // with no rail side effect). SPEC-W46 R3: account ensure is cached per
+    // process (one ledger round trip per tenant).
+    st.ensure_accounts(&body.tenant_id).await?;
     let hold = st
         .ledger
         .payout_hold(&body.tenant_id, tid, amount)
@@ -1452,8 +1454,8 @@ async fn payout(
 
     // C3 LEDGER-FIRST: 1. pending payout hold reserves the funds BEFORE the
     // rail is called (over-limit payouts are rejected here, with no rail side
-    // effect).
-    st.ledger.create_accounts(&body.tenant_id).await?;
+    // effect). SPEC-W46 R3: account ensure is cached per process.
+    st.ensure_accounts(&body.tenant_id).await?;
     let hold = st
         .ledger
         .payout_hold(&body.tenant_id, payout_id, body.amount_cents)
@@ -1860,7 +1862,8 @@ async fn activity_hold_deposit(
     // K5: tenant_slug preferred; uuid-only tenant_id accepted with a WARN.
     let tenant = resolve_activity_tenant(&body.tenant_slug, &body.tenant_id)?;
     // P-10: auto-provision on first hold (idempotent, exists-ok).
-    st.ledger.create_accounts(&tenant).await?;
+    // SPEC-W46 R3: cached per process — one ledger round trip per tenant.
+    st.ensure_accounts(&tenant).await?;
     // Deterministic per booking => saga retries are idempotent.
     let transfer_id = Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
