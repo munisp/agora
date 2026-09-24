@@ -662,23 +662,43 @@ impl LedgerClient for TigerBeetleClient {
         // amount/accounts/flags semantics stays a P-12 conflict (409),
         // never a silent success; `exists_with_different_*` handling in
         // submit()/classify_void_kinds() is otherwise unchanged.
-        match self.lookup_one(transfer_id).await {
-            Ok(stored) => {
-                if refund_replay_matches(&stored, self.ledger_id, tenant_id, hold_id, amount) {
-                    return Ok(self.wrap_stored(&stored, Some(tenant_id)));
-                }
-                return Err(LedgerError::ExistsWithDifferentParameters(
-                    transfer_id.to_string(),
-                ));
+        // SPEC-W46 R4: the replay lookup and the hold lookup below are
+        // batched into ONE lookup_transfers round trip (was 2 sequential
+        // RTTs). Lookup results are matched back by id; a missing id is the
+        // same TransferNotFound lookup_one() produced. With no hold_id only
+        // the replay id is looked up (one RTT, as before).
+        let ids: Vec<u128> = match hold_id {
+            Some(h) => vec![transfer_id.as_u128(), h.as_u128()],
+            None => vec![transfer_id.as_u128()],
+        };
+        let found = self
+            .client
+            .lookup_transfers(ids)
+            .await
+            .map_err(map_err)?;
+        let mut replay: Option<tb::Transfer> = None;
+        let mut hold_found: Option<tb::Transfer> = None;
+        for t in found {
+            if t.id() == transfer_id.as_u128() {
+                replay = Some(t);
+            } else if hold_id.map(|h| h.as_u128()) == Some(t.id()) {
+                hold_found = Some(t);
             }
-            // First call: the id is unknown to the ledger — proceed.
-            Err(LedgerError::TransferNotFound(_)) => {}
-            Err(e) => return Err(e),
         }
+        if let Some(stored) = replay {
+            if refund_replay_matches(&stored, self.ledger_id, tenant_id, hold_id, amount) {
+                return Ok(self.wrap_stored(&stored, Some(tenant_id)));
+            }
+            return Err(LedgerError::ExistsWithDifferentParameters(
+                transfer_id.to_string(),
+            ));
+        }
+        // First call: the id is unknown to the ledger — proceed.
         if let Some(h) = hold_id {
             // P-06: resolve the hold first — its credit account pins the
             // owning tenant (cross-tenant refund => TenantMismatch => 403).
-            let hold = self.lookup_one(h).await?;
+            let hold = hold_found
+                .ok_or_else(|| LedgerError::TransferNotFound(h.to_string()))?;
             let credit = deposits_account(tenant_id);
             if hold.credit_account_id() != account_id(&credit) {
                 return Err(LedgerError::TenantMismatch(format!(
@@ -884,8 +904,24 @@ impl LedgerClient for TigerBeetleClient {
         .with_pending_id(hold_id.as_u128())
         .with_flags(TbFlags::POST_PENDING_TRANSFER);
         self.submit(vec![t]).await?;
-        let stored = self.lookup_one(transfer_id).await?;
-        Ok(self.wrap_stored(&stored, Some(tenant_id)))
+        // SPEC-W46 R4: skip the read-back. Every field of the stored post
+        // leg is fully client-specified (id, accounts, amount == the hold
+        // amount resolved above, code, pending_id, POST_PENDING_TRANSFER
+        // flag), and a successful submit — including an idempotent replay,
+        // which a real server only accepts with IDENTICAL parameters
+        // (`exists_with_different_*` are 409-class errors here) — means the
+        // stored transfer IS this leg. Reconstructing it drops one TB round
+        // trip per payout post with no semantic change.
+        Ok(self.wrap(
+            transfer_id.as_u128(),
+            &debit,
+            PLATFORM_PAYOUTS_ACCOUNT,
+            amount,
+            CODE_PAYOUT,
+            TransferState::Posted,
+            TransferFlag::PostPending,
+            Some(hold_id.as_u128()),
+        ))
     }
 
     async fn payout_void(
