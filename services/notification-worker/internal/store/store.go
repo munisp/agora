@@ -57,7 +57,8 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 // set, the internal pool (N-08 role-gated RLS escape). Without it the
 // internal paths fall back to the main pool with a WARN.
 func NewWithInternal(ctx context.Context, databaseURL, internalDatabaseURL string, log *zap.Logger) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	// SPEC-W46 PERF-08: budgeted pools (see pool.go); URL pool_* params win.
+	pool, err := newPool(ctx, databaseURL, poolMaxConns, poolMinConns)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -67,7 +68,7 @@ func NewWithInternal(ctx context.Context, databaseURL, internalDatabaseURL strin
 	}
 	s := &Store{pool: pool}
 	if internalDatabaseURL != "" {
-		ip, err := pgxpool.New(ctx, internalDatabaseURL)
+		ip, err := newPool(ctx, internalDatabaseURL, poolInternalMaxConns, poolInternalMinConns)
 		if err != nil {
 			pool.Close()
 			return nil, fmt.Errorf("connect internal postgres: %w", err)

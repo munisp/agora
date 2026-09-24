@@ -323,6 +323,19 @@ def _wiring_app(cfg: Config | None = None):
     return app
 
 
+def _wait_for_turns(db, conv_id, n, timeout=5.0):
+    """W46-F P5: the agent-reply persist is a background task AFTER the
+    response — poll until the expected turn count lands (same pattern as
+    _wait_for_idps below)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        turns = db.turns.get(conv_id, [])
+        if len(turns) >= n:
+            return turns
+        time.sleep(0.05)
+    return db.turns.get(conv_id, [])
+
+
 def _post(client, **over):
     body = {
         "tenant_id": str(TENANT),
@@ -359,6 +372,11 @@ def test_ussd_menu_session_happy_path():
         assert body["mode"] == "menu"
         assert "1. Book appointment" in body["reply"]
 
+        # agent reply persists post-response in the background — wait for
+        # the user+agent pair before the next callback so seq order is
+        # deterministic (user < agent within each callback)
+        _wait_for_turns(app.state.db, conv_id, 2)
+
         # 2) selection "1" → confirmation, session ends (END)
         r = _post(c, text="1", menu=[m.model_dump() for m in MENU])
         assert r.status_code == 200, r.text
@@ -368,12 +386,13 @@ def test_ussd_menu_session_happy_path():
         assert "Book appointment" in body["reply"]
         assert body["action"] == "book"
 
-        # conversation + turns persisted with the ussd channel
+        # conversation + turns persisted with the ussd channel (agent
+        # replies persist in background tasks after each response — wait)
         db = app.state.db
         conv = db.convs[conv_id]
         assert conv["channel"] == "ussd"
         assert conv["contact_phone"] == PHONE
-        turns = db.turns[conv_id]
+        turns = _wait_for_turns(db, conv_id, 4)
         assert [t["role"] for t in turns] == ["user", "agent", "user", "agent"]
         assert turns[0]["text"] == "(ussd session started via *384*123#)"
         assert turns[2]["text"] == "Book appointment (ussd menu option 1)"
@@ -393,8 +412,10 @@ def test_ussd_callback_replay_is_idempotent():
         assert r2.status_code == 200, r2.text
         assert r2.json()["reply"] == r1.json()["reply"]
         conv_id = ussd.session_conversation_id(TENANT, SESSION)
-        # still exactly one user + one agent turn
-        assert len(app.state.db.turns[conv_id]) == 2
+        # still exactly one user + one agent turn (agent persist is a
+        # post-response background task — wait for both replays to settle)
+        turns = _wait_for_turns(app.state.db, conv_id, 2)
+        assert len(turns) == 2
 
 
 def test_ussd_text_mode_passthrough():

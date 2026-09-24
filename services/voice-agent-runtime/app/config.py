@@ -109,6 +109,25 @@ class Settings:
     knowledge_query: str = "opening hours services pricing"
     http_timeout_s: float = 15.0
 
+    # SPEC-W46 P1/P2: tenant-context TTL cache (VOICE_TENANT_CTX_TTL_S,
+    # default 120s) keyed by site_slug, shared by the chat path and the
+    # ElevenLabs tool webhook — the 3-invoke bootstrap no longer runs on
+    # every turn/tool call. On a refresh failure a stale entry is served
+    # for up to tenant_ctx_stale_s (stale-while-error, default 300s); when
+    # no usable entry exists the fetch error propagates exactly as before
+    # (fail-closed session bootstrap preserved).
+    tenant_ctx_ttl_s: int = 120
+    tenant_ctx_stale_s: int = 300
+
+    # SPEC-W46 P-02: direct booking-service base URL for the tool/tenant
+    # invoke paths (mirrors messaging-gateway ResolveInvokeBase): calls to
+    # app-id `booking` go straight to the compose service address instead
+    # of voice->daprd->booking; a transport failure falls back to the daprd
+    # invoke API. Empty disables the direct path (pure daprd). Default is
+    # the in-cluster compose address (service `booking`, port 7002 — same
+    # target as BOOKING_URL used by the K15(c) OTP verifier).
+    booking_base_url: str = "http://booking:7002"
+
     # Worker plane (VOICE-SCALING §2): prewarming + load gating.
     preload_models: bool = True  # eager whisper load + piper warmup at boot
     agent_idle_processes: int = 2  # num_idle_processes warm job processes
@@ -188,6 +207,14 @@ class Settings:
     # piper voice map (PIPER_VOICE_MAP JSON). Languages without an entry fall
     # back to `piper_voice`.
     piper_voice_map: dict = field(default_factory=dict)
+
+    # SPEC-W46 P4: TTS result cache + chunked streaming. tts_cache_size
+    # (VOICE_TTS_CACHE_SIZE, 0 disables) bounds the per-process LRU keyed
+    # (voice, text, format); tts_chunked (VOICE_TTS_CHUNKED=false restores
+    # the pre-W46 full-buffer behavior) streams sentence-level chunks so the
+    # first audio frame ships after the first chunk's synthesis.
+    tts_cache_size: int = 256
+    tts_chunked: bool = True
 
     # TTS provider chain (SPEC-W10 Part A, app/tts_providers/): ordered
     # comma-separated provider fallback chain (TTS_PROVIDER_CHAIN). Default
@@ -275,6 +302,9 @@ def load_settings() -> Settings:
         knowledge_snippet_count=_env_int("KNOWLEDGE_SNIPPET_COUNT", 3),
         knowledge_query=_env("KNOWLEDGE_QUERY", "opening hours services pricing"),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
+        tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),
+        tenant_ctx_stale_s=_env_int("VOICE_TENANT_CTX_STALE_S", 300),
+        booking_base_url=_env("BOOKING_BASE_URL", "http://booking:7002"),
         preload_models=_env("PRELOAD_MODELS", "true").lower() not in ("0", "false", "no"),
         agent_idle_processes=_env_int("AGENT_IDLE_PROCESSES", 2),
         load_threshold=float(os.environ.get("LOAD_THRESHOLD", "0.7")),
@@ -297,6 +327,9 @@ def load_settings() -> Settings:
         agents_registry_url=_env("AGENTS_REGISTRY_URL", "http://conversation:7007"),
         agents_cache_ttl_s=_env_int("AGENTS_CACHE_TTL_S", 30),
         piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
+        tts_cache_size=_env_int("VOICE_TTS_CACHE_SIZE", 256),
+        tts_chunked=_env("VOICE_TTS_CHUNKED", "true").lower()
+        not in ("0", "false", "no"),
         tts_provider_chain=_env("TTS_PROVIDER_CHAIN", "piper"),
         tts_voice_map=parse_tts_voice_map(_env("TTS_VOICE_MAP", "")),
         mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
