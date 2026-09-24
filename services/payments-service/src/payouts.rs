@@ -134,6 +134,24 @@ pub struct PgPayoutAttemptStore {
     pool: sqlx::PgPool,
 }
 
+/// SPEC-W46 R2: every payments Postgres pool fast-fails a connection
+/// acquisition after 5s instead of parking the request for sqlx's 30s
+/// default — pool exhaustion surfaces as a prompt 502, not a silent p95 tail.
+pub const DB_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// SPEC-W46 R1: pool size for the hot-path rail_attempts pool (and available
+/// to the other payments pools). `PAYMENTS_DB_POOL_MAX`, default 8. Budget
+/// arithmetic (vs the compose-level `max_connections=300`, SPEC-W46 I-01):
+/// rail_attempts 8 + payout_attempts 4 + registry 4 = at most 16
+/// connections per pod — ~5% of the server budget per replica.
+pub fn db_pool_max() -> u32 {
+    std::env::var("PAYMENTS_DB_POOL_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8)
+}
+
 /// Parse a Postgres DSN into connect options. Socket-only DSNs of the form
 /// `postgresql://user@/db?host=/path/to/socketdir` (e.g. pgserver-backed test
 /// databases) cannot be parsed by sqlx 0.7's URL parser ("empty host"), so
@@ -167,6 +185,9 @@ impl PgPayoutAttemptStore {
         for attempt in 1..=10u32 {
             match sqlx::postgres::PgPoolOptions::new()
                 .max_connections(4)
+                // SPEC-W46 R2: fast-fail on pool exhaustion (see
+                // DB_ACQUIRE_TIMEOUT).
+                .acquire_timeout(DB_ACQUIRE_TIMEOUT)
                 .connect_with(options.clone())
                 .await
             {
@@ -569,6 +590,7 @@ mod tests {
             payout_attempts: Arc::new(MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
             transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
+            ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
             commands_dead_lettered: Arc::new(AtomicU64::new(0)),
