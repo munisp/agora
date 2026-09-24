@@ -25,9 +25,10 @@ lookup_appointment, reschedule_appointment, cancel_appointment.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Coroutine, Optional
 
 from . import metrics, sip, ui_actions
 from .config import Settings
@@ -297,6 +298,34 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
+# SPEC-W46 P9: best-effort publishes (ToolInvoked events) are scheduled
+# fire-and-forget so the tool path never awaits a daprd RTT before the LLM
+# resumes. Tasks are strongly referenced until completion and failures are
+# logged from the done-callback (the publish helper itself never raises).
+_BACKGROUND_TASKS: "set[asyncio.Task[Any]]" = set()
+
+
+def _log_background_failure(task: "asyncio.Task[Any]") -> None:
+    _BACKGROUND_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("background publish task failed", error=str(exc)[:200])
+
+
+def _fire_and_forget(coro: Coroutine[Any, Any, Any]) -> None:
+    """Schedule `coro` on the running loop; exceptions are logged, never raised."""
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError as exc:  # no running loop — must not leak the coroutine
+        coro.close()
+        log.warning("background publish skipped: no running event loop", error=str(exc))
+        return
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_log_background_failure)
+
+
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
 
 # SPEC-W9 Part B: names of the agent-driven UI action tools (validated
@@ -409,6 +438,13 @@ class ToolLayer:
 
     # ------------------------------------------------------------------ util
     async def _emit_tool_event(self, tool: str, status: str, detail: dict[str, Any]) -> None:
+        """Record + publish the ToolInvoked event.
+
+        SPEC-W46 P9: the daprd publish is best-effort (publish_best_effort
+        already never raises) so it is scheduled fire-and-forget — the tool
+        path returns to the LLM immediately instead of awaiting a sidecar
+        RTT. The per-session quality accumulator stays synchronous.
+        """
         # Per-session quality accumulator (every tool invocation lands here,
         # on every path: LiveKit worker, chat tool loop, ElevenLabs webhook).
         metrics.session_tool_call(tool)
@@ -423,11 +459,13 @@ class ToolLayer:
                 "detail": detail,
             },
         )
-        await self._dapr.publish_best_effort(
-            self._settings.dapr_pubsub,
-            self._settings.conversation_events_topic,
-            event,
-            kind="ToolInvoked",
+        _fire_and_forget(
+            self._dapr.publish_best_effort(
+                self._settings.dapr_pubsub,
+                self._settings.conversation_events_topic,
+                event,
+                kind="ToolInvoked",
+            )
         )
 
     def _require_phone(self, phone: str | None) -> str:
