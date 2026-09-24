@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 	"github.com/opendesk/booking-service/internal/events"
 	"go.temporal.io/sdk/temporal"
 	"go.uber.org/zap"
@@ -415,7 +416,7 @@ func DialPayoutStore(ctx context.Context, databaseURL string) (*PayoutStore, err
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
@@ -619,16 +620,23 @@ func (s *PayoutStore) MarkPaid(ctx context.Context, tenantID, id uuid.UUID, prov
 			}
 			return nil // idempotent replay — no status change, no extra rows
 		}
+		// SPEC-W46 (W46-A item 11, PERF-22): the extra outbox rows go in ONE
+		// pgx CopyFrom (bulk binary copy) instead of a per-row INSERT loop.
+		rows := make([][]any, 0, len(extra))
 		for _, e := range extra {
 			if e.Topic == "" || len(e.Payload) == 0 {
 				continue
 			}
+			rows = append(rows, []any{id, e.Topic, e.Payload})
+		}
+		if len(rows) > 0 {
 			// NOTE (RLS): the outbox table is not tenant-scoped (drained
 			// cross-tenant by the dispatcher) — same insert as
-			// store.insertExtraOutbox.
-			if _, err := tx.Exec(ctx,
-				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
-				id, e.Topic, e.Payload); err != nil {
+			// store.insertExtraOutbox, just batched.
+			if _, err := tx.CopyFrom(ctx,
+				pgx.Identifier{"outbox"},
+				[]string{"aggregate_id", "topic", "payload"},
+				pgx.CopyFromRows(rows)); err != nil {
 				return fmt.Errorf("insert extra outbox: %w", err)
 			}
 		}
