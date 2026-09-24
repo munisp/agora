@@ -106,6 +106,7 @@ fn test_config(database_url: &str, identity_base_url: &str) -> config::Config {
         tenant_cache_ttl_s: 60,
         dunning_interval_s: 3600,
         invoice_due_days: 14,
+        db_pool_max: 10,
     }
 }
 
@@ -190,13 +191,14 @@ struct Harness {
 }
 
 /// All migrations (0001..0006, the boot path), in order.
-pub const MIGRATIONS: [&str; 6] = [
+pub const MIGRATIONS: [&str; 7] = [
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_rls.sql"),
     include_str!("../migrations/0003_ledger.sql"),
     include_str!("../migrations/0004_outbox.sql"),
     include_str!("../migrations/0005_hardening.sql"),
     include_str!("../migrations/0006_plan_presets.sql"),
+    include_str!("../migrations/0007_perf.sql"),
 ];
 
 static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();

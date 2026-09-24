@@ -185,6 +185,11 @@ def create_app(
         yield
         if state.scheduler is not None:
             state.scheduler.shutdown(wait=False)
+        # W46-F P8: close the connection pools on shutdown (stores injected
+        # by tests may not expose close()).
+        _close = getattr(store, "close", None)
+        if callable(_close):
+            _close()
 
     app = FastAPI(title="opendesk-model-registry",
                   version="0.1.0", lifespan=lifespan)
