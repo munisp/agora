@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -302,7 +303,7 @@ func (h *Handlers) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	sv, err := h.Store.GetSurvey(r.Context(), tenant.ID, id)
 	if err != nil {
-		h.mapErr(w, err)
+	h.mapErr(w, err)
 		return
 	}
 	stats, err := h.Store.Stats(r.Context(), tenant.ID, id)
@@ -521,28 +522,37 @@ func (h *Handlers) Results(w http.ResponseWriter, r *http.Request) {
 		h.mapErr(w, err)
 		return
 	}
-	responses, total, truncated, err := h.Store.ListResponses(r.Context(), tenant.ID, id)
+	// SPEC-W46 (W46-A item 9, PERF-15): the fetch is bounded + pageable
+	// (optional ?limit=&offset= query params; store-side defaults/clamps
+	// apply) instead of a 10k-row in-memory scan.
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	responses, total, truncated, err := h.Store.ListResponses(r.Context(), tenant.ID, sv.ID, limit, offset)
 	if err != nil {
 		h.mapErr(w, err)
 		return
 	}
-	results := BuildResults(sv, responses)
-	results.ResponseCount = total // exact COUNT(*), not the scan cap
-	writeJSON(w, http.StatusOK, map[string]any{"results": results, "truncated": truncated})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"survey":    sv,
+		"results":   AggregateResults(sv, responses),
+		"total":     total,
+		"truncated": truncated,
+		"limit":     len(responses),
+		"offset":    offset,
+	})
 }
 
-// Themes (GET /v1/surveys/voc/themes?survey_id=) returns the naive keyword
-// frequency over text answers (lowercase, stopwords stripped, top 20) —
-// documented as naive, NOT NLP. survey_id is optional; without it the
-// tenant's surveys aggregate together.
+// Themes (GET /v1/surveys/voc/themes?survey_id=) — keyword-frequency VoC
+// themes over text answers (optionally one survey, otherwise tenant-wide).
 func (h *Handlers) Themes(w http.ResponseWriter, r *http.Request) {
 	tenant, ok := h.tenantOr400(w, r)
 	if !ok {
 		return
 	}
 	var surveyID *uuid.UUID
-	if v := strings.TrimSpace(r.URL.Query().Get("survey_id")); v != "" {
-		id, err := uuid.Parse(v)
+	if raw := strings.TrimSpace(r.URL.Query().Get("survey_id")); raw != "" {
+		id, err := uuid.Parse(raw)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid survey_id")
 			return
@@ -555,30 +565,30 @@ func (h *Handlers) Themes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"themes":            BuildThemes(texts),
+		"themes":            ExtractThemes(texts),
 		"responses_scanned": scanned,
-		"naive":             true,
-		"note":              "naive keyword frequency (lowercase, stopwords stripped, top 20) — not NLP",
+		"survey_id":         surveyID,
 	})
 }
 
 // ---------------------------------------------------------------------------
-// PUBLIC respond
+// PUBLIC respond (no tenant middleware — token resolves the tenant)
 // ---------------------------------------------------------------------------
 
-// respondRequest is the POST /v1/surveys/respond body: {token, answers}.
-// The token is the ONLY credential — 128-bit random hex, delivered to the
-// customer inside the invite message.
+// respondRequest is the POST /v1/surveys/respond body.
 type respondRequest struct {
 	Token   string         `json:"token"`
 	Answers map[string]any `json:"answers"`
 }
 
-// Respond (POST /v1/surveys/respond) is the PUBLIC submit path (no tenant
-// header, no JWT — registered outside the gated group). Unknown token →
-// 404; already answered → 409 already_answered; expired → 410; invalid
-// answers → 400. On success the answered lifecycle event + the metered
-// survey_response_received usage record are enqueued (best-effort).
+// Respond (POST /v1/surveys/respond) persists one public response. This
+// is the ONLY public route of the package: no X-Tenant-Slug, no JWT — the
+// 128-bit invite token resolves the tenant server-side (see the SECURITY
+// note in store.go). Answers are validated against the survey definition
+// (a bad score cannot inflate the aggregates); idempotent per invite
+// (double-submit → 409); expired invites → 410; unknown token → 404. The
+// answered event + the survey_response_received usage meter are emitted
+// best-effort. 201.
 func (h *Handlers) Respond(w http.ResponseWriter, r *http.Request) {
 	var req respondRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -586,34 +596,91 @@ func (h *Handlers) Respond(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Token = strings.TrimSpace(req.Token)
-	if req.Token == "" || len(req.Token) > 128 {
-		writeError(w, http.StatusNotFound, "not found")
+	if req.Token == "" {
+		writeError(w, http.StatusBadRequest, "token is required")
 		return
-	}
-	if req.Answers == nil {
-		req.Answers = map[string]any{}
 	}
 	res, err := h.Store.SubmitResponse(r.Context(), req.Token, req.Answers)
 	if err != nil {
 		h.mapErr(w, err)
 		return
 	}
-	// The invite carries the tenant slug only implicitly; the lifecycle
-	// event subject uses the tenant id (the respond path deliberately
-	// performs no slug lookup — one less cross-tenant read on a public
-	// endpoint).
-	h.publishAnswered(r.Context(), res.Invite.TenantID.String(), res)
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"response": map[string]any{
-			"id":           res.Response.ID,
-			"survey_id":    res.Response.SurveyID,
-			"score":        res.Response.Score,
-			"submitted_at": res.Response.SubmittedAt,
-		},
-		"survey": map[string]any{
-			"id":   res.Survey.ID,
-			"name": res.Survey.Name,
-			"kind": res.Survey.Kind,
-		},
-	})
+	h.publishSurveyAnswered(r.Context(), res)
+	h.meterSurveyResponse(r.Context(), res)
+	writeJSON(w, http.StatusCreated, map[string]any{"response": res.Response})
+}
+
+// ---------------------------------------------------------------------------
+// Emissions (best-effort; all topics optional — empty disables)
+// ---------------------------------------------------------------------------
+
+// inviteLink renders the public respond URL for one token.
+func (h *Handlers) inviteLink(token string) string {
+	base := strings.TrimRight(h.PublicBaseURL, "/")
+	if base == "" {
+		base = DefaultPublicBaseURL
+	}
+	return base + "?t=" + token
+}
+
+// publishInviteSent emits survey_invite_sent after the PacedSend command
+// was queued (the invite flipped to sent).
+func (h *Handlers) publishInviteSent(ctx context.Context, tenantSlug string, inv Invite, channel string) {
+	if h.EventsTopic == "" {
+		return
+	}
+	summary := map[string]any{
+		"invite_id":  inv.ID.String(),
+		"survey_id":  inv.SurveyID.String(),
+		"contact_id": inv.ContactID.String(),
+		"channel":    channel,
+	}
+	payload, err := MarshalInviteSent(tenantSlug, inv, summary)
+	if err != nil {
+		h.log().Warn("invite sent event marshal failed", zap.Error(err))
+		return
+	}
+	if err := h.Store.EnqueueOutbox(ctx, inv.ID, h.EventsTopic, payload); err != nil {
+		h.log().Warn("invite sent event enqueue failed", zap.Error(err))
+	}
+}
+
+// publishSurveyAnswered emits survey_answered after a public submit.
+func (h *Handlers) publishSurveyAnswered(ctx context.Context, res SubmitResult) {
+	if h.EventsTopic == "" {
+		return
+	}
+	summary := map[string]any{
+		"survey_id":   res.Survey.ID.String(),
+		"survey_name": res.Survey.Name,
+		"kind":        res.Survey.Kind,
+		"contact_id":  res.Invite.ContactID.String(),
+	}
+	if res.Response.Score != nil {
+		summary["score"] = *res.Response.Score
+	}
+	payload, err := MarshalSurveyAnswered("", res, summary)
+	if err != nil {
+		h.log().Warn("survey answered event marshal failed", zap.Error(err))
+		return
+	}
+	if err := h.Store.EnqueueOutbox(ctx, res.Response.ID, h.EventsTopic, payload); err != nil {
+		h.log().Warn("survey answered event enqueue failed", zap.Error(err))
+	}
+}
+
+// meterSurveyResponse emits the usage.events survey_response_received
+// meter (tenant rollups; same UsageRecord shape as geo/loyalty).
+func (h *Handlers) meterSurveyResponse(ctx context.Context, res SubmitResult) {
+	if h.UsageTopic == "" {
+		return
+	}
+	payload, err := MarshalSurveyResponseUsage(res, 1)
+	if err != nil {
+		h.log().Warn("survey usage meter marshal failed", zap.Error(err))
+		return
+	}
+	if err := h.Store.EnqueueOutbox(ctx, res.Response.ID, h.UsageTopic, payload); err != nil {
+		h.log().Warn("survey usage meter enqueue failed", zap.Error(err))
+	}
 }
