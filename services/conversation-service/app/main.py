@@ -131,135 +131,180 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Tenant slug -> UUID resolution for ?tenant=<slug> (admin-web passes the
     # org slug). identity-service via Dapr invoke, TTL-cached; every success
     # is written through to the tenant_slugs projection so /v1/agents/resolve
-    # can answer tenant_id -> slug for the voice dial-plan without a second
-    # invoke.
-    resolver = TenantResolver(
+    # can answer tenant_id -> slug for the voice runtime.
+    tenant_resolver = TenantResolver(
         dapr,
-        identity_app_id=cfg.identity_app_id,
-        ttl_s=cfg.tenant_cache_ttl_s,
-        store=agent_store,
+        cfg.identity_app_id,
+        cfg.tenant_cache_ttl_seconds,
+        remember=agent_store.remember_tenant_slug,
         internal_token=cfg.identity_internal_token,
-        base_url=cfg.identity_base_url,
     )
 
-    # Transcript sinks (SPEC §5): default both to Fluvio; the knowledge
-    # indexer consumes intel_sink.
-    sink = build_sink(cfg.fluvio_profile_path, cfg.fluvio_topic, cfg.kafka_brokers)
-    intel_sink = build_sink(cfg.fluvio_profile_path, cfg.fluvio_intel_topic,
-                            cfg.kafka_brokers)
-    quality_sink = build_sink(cfg.fluvio_profile_path, cfg.fluvio_quality_topic,
-                              cfg.kafka_brokers)
+    sink = build_sink(cfg)
+    try:
+        await sink.start()
+    except Exception as exc:
+        # Transcript sink is a streaming optimization; Postgres is the source
+        # of truth. Degrade to "log-only" rather than refusing to start.
+        log.error("transcript sink start failed; turns will only hit Postgres+Dapr",
+                  error=str(exc))
+        sink = _NullSink()
 
-    # Knowledge indexer (SPEC-W3 §4 innovation 4): consumes
-    # opendesk.conversation.intel.
-    indexer = None
+    # Enriched turns (call intelligence) → opendesk.conversation.enriched.
+    intel_sink: TranscriptSink = KafkaSink(cfg.kafka_brokers, cfg.enriched_topic)
+    try:
+        await intel_sink.start()
+    except Exception as exc:
+        log.error("enriched sink start failed; enrichment stays in Postgres",
+                  error=str(exc))
+        intel_sink = _NullSink()
+
+    # CallQualityEnriched (avg sentiment) → opendesk.conversation.quality
+    # (Wave 5 #2). Separate topic so enriched events never retrigger the
+    # SessionEnded consumers on opendesk.conversation.events.
+    quality_sink: TranscriptSink = KafkaSink(cfg.kafka_brokers, cfg.quality_topic)
+    try:
+        await quality_sink.start()
+    except Exception as exc:
+        log.error("quality sink start failed; CallQualityEnriched will not be published",
+                  error=str(exc))
+        quality_sink = _NullSink()
+
+    indexer: TranscriptIndexer | None = None
     if cfg.indexer_enabled:
-        indexer = TranscriptIndexer(cfg, intel_sink, log)
-        await indexer.start()
+        indexer = TranscriptIndexer(cfg, db)
+        indexer.start()
 
-    # Call-quality enrichment (SPEC-W3 §4 innovation 5): subscribes
-    # TurnEnded on conversation.events via Dapr /subscribe, publishes
-    # CallQuality metrics to opendesk.conversation.quality.
-    quality_enricher = None
-    if cfg.quality_enabled:
-        quality_enricher = CallQualityEnricher(cfg, db, quality_sink, log)
+    quality_enricher: CallQualityEnricher | None = None
+    if cfg.quality_enrich_enabled:
+        quality_enricher = CallQualityEnricher(cfg, db, quality_sink)
+        quality_enricher.start()
 
-    # Field-capture extraction (SPEC-W16 contract §5): subscribes the same
-    # TurnEnded consumer group; POSTs to booking /v1/field/capture.
-    capture_extractor = None
+    # SPEC-W38 F3: post-call capture extraction (LLM, degrade = skip).
+    # Publishes CaptureExtracted via the Dapr pubsub path (like transcripts)
+    # so daprd owns broker delivery to opendesk.conversation.captures.
+    capture_extractor: CaptureExtractor | None = None
     if cfg.capture_enabled:
-        capture_extractor = CaptureExtractor(cfg, db, log)
+        capture_extractor = CaptureExtractor(cfg, db, agent_store, dapr)
+        capture_extractor.start()
 
-    # SPEC-W44 W-06: the booking-persistence path (Graph EntityExtractor +
-    # Projector, app/entities.py) was removed this wave — read models now
-    # persist via graph-sync consuming opendesk.conversation.events
-    # (services/graph-sync/app/graph_conversations.py). DB plumbing deleted:
-    # _ENTITY_TABLES_DDL, Database.ensure_entities_schema,
-    # Database.upsert_graph_entity, Database.upsert_graph_edge.
-
-    # SPEC-W43 Y-06: transactional-outbox relay for turn CloudEvents (Turns
-    # land on opendesk.conversation.events via conversation_outbox; the relay
-    # republishes until published_at, then the direct Dapr publish in
-    # db.add_turn is the fast path).
-    outbox_relay = OutboxRelay(db, dapr, cfg, log)
-    await outbox_relay.start()
-
-    # GDPR erasure consumer (opendesk.privacy.events → anonymization).
-    privacy = None
+    privacy: PrivacyEraseConsumer | None = None
     if cfg.privacy_enabled:
-        await db.ensure_contact_column()
-        privacy = PrivacyEraseConsumer(cfg, db, log)
-        await privacy.start()
+        try:
+            await db.ensure_contact_column()
+        except Exception as exc:
+            log.error("contact column bootstrap failed; privacy erase will fail",
+                      error=str(exc))
+        privacy = PrivacyEraseConsumer(cfg, db)
+        privacy.start()
 
-    # Conversation retention sweeper (SPEC-W3 §3 innovation 3).
-    retention = None
+    # SPEC-W43 Y-08: conversation_outbox relay — republishes unsent turn
+    # events (inline publish failure or crash) with backoff.
+    outbox_relay: OutboxRelay | None = None
+    if cfg.outbox_relay_enabled:
+        outbox_relay = OutboxRelay(cfg, db, dapr)
+        outbox_relay.start()
+
+    # SPEC-W43 Y-03: incident retry worker — republishes incident_emitted
+    # rows whose Dapr publish failed (durable, never silent).
+    incident_retry: incidents_mod.IncidentRetryWorker | None = None
+    if cfg.incident_enabled:
+        incident_retry = incidents_mod.IncidentRetryWorker(cfg, db, dapr)
+        incident_retry.start()
+
+    # NDPA/GDPR storage limitation: hourly hard-delete of aged turns
+    # (RETENTION_DAYS, default 365; NDPA profile sets 180).
+    retention: RetentionSweeper | None = None
     if cfg.retention_enabled:
-        retention = RetentionSweeper(cfg, db, log)
-        await retention.start()
+        retention = RetentionSweeper(cfg, db)
+        retention.start()
 
-    # Incident auto-detection sweep (SPEC-W11 Part A): republishes IDPs that
-    # were emitted to incident_emitted but never published (Y-03 durable
-    # gate: the turn path records first, this sweep drains stragglers).
-    incident_sweeper = incidents_mod.IncidentSweeper(db, dapr, cfg, log)
-    await incident_sweeper.start()
-
-    # Helpdesk automation (SPEC-W19 contract §6): consumes
-    # TurnEnded and drives auto-ticket creation + escalations.
-    helpdesk = None
+    # SPEC-W45 UC helpdesk automation: human-escalation turns open a real
+    # booking helpdesk ticket (X-Internal-Token, tenant-bound).
+    helpdesk_auto: HelpdeskAutomation | None = None
     if cfg.helpdesk_enabled:
-        helpdesk = HelpdeskAutomation(cfg, db, dapr, log)
-        await helpdesk.start()
+        helpdesk_auto = HelpdeskAutomation(cfg, dapr, agent_store)
+        if not cfg.booking_internal_token:
+            log.error(
+                "CONVERSATION_BOOKING_INTERNAL_TOKEN unset: helpdesk ticket "
+                "creation will be skipped with an error log per escalation"
+            )
 
-    # Tenant lifecycle (SPEC-W44 W-D-3): twin Deleted tombstones purge the
-    # tenant's rows and drop its tenant_slugs projection entry.
-    tenant_lifecycle = None
-    if cfg.tenant_lifecycle_enabled:
-        tenant_lifecycle = TenantLifecycleConsumer(cfg, db, agent_store, log)
-        await tenant_lifecycle.start()
+    # SPEC-W45 K9: TenantDeleted cascade — purge tenant sessions/history.
+    tenant_lifecycle = TenantLifecycleConsumer(cfg, db)
+    tenant_lifecycle.start()
 
     app.state.cfg = cfg
     app.state.db = db
+    app.state.agent_store = agent_store
+    app.state.intel_client = intel_client
     app.state.dapr = dapr
+    app.state.tenant_resolver = tenant_resolver
     app.state.sink = sink
     app.state.intel_sink = intel_sink
     app.state.quality_sink = quality_sink
+    app.state.helpdesk = helpdesk_auto
+    app.state.tenant_lifecycle = tenant_lifecycle
     app.state.log = log
-    app.state.resolver = resolver
-    app.state.helpdesk = helpdesk
-    app.state.outbox_relay = outbox_relay
-    app.state.agent_store = agent_store
-    app.state.incident_sweeper = incident_sweeper
+    log.info("conversation-service started", port=cfg.port, sink=cfg.transcript_sink,
+             intel_llm=cfg.intel_llm, quality_enrich=cfg.quality_enrich_enabled,
+             capture=cfg.capture_enabled,
+             retention_days=cfg.retention_days if cfg.retention_enabled else None)
 
-    yield
+    try:
+        yield
+    finally:
+        log.info("conversation-service shutting down")
+        if indexer is not None:
+            await indexer.stop()
+        if quality_enricher is not None:
+            with contextlib.suppress(Exception):
+                await quality_enricher.stop()
+        if capture_extractor is not None:
+            with contextlib.suppress(Exception):
+                await capture_extractor.stop()
+        if privacy is not None:
+            with contextlib.suppress(Exception):
+                await privacy.stop()
+        if retention is not None:
+            with contextlib.suppress(Exception):
+                await retention.stop()
+        if outbox_relay is not None:
+            with contextlib.suppress(Exception):
+                await outbox_relay.stop()
+        if incident_retry is not None:
+            with contextlib.suppress(Exception):
+                await incident_retry.stop()
+        if tenant_lifecycle is not None:
+            with contextlib.suppress(Exception):
+                await tenant_lifecycle.stop()
+        with contextlib.suppress(Exception):
+            await sink.close()
+        with contextlib.suppress(Exception):
+            await intel_sink.close()
+        with contextlib.suppress(Exception):
+            await quality_sink.close()
+        with contextlib.suppress(Exception):
+            await dapr.close()
+        if intel_client is not None:
+            with contextlib.suppress(Exception):
+                await intel_client.aclose()
+        with contextlib.suppress(Exception):
+            await db.close()
 
-    await incident_sweeper.stop()
-    if tenant_lifecycle is not None:
-        await tenant_lifecycle.stop()
-    if helpdesk is not None:
-        await helpdesk.stop()
-    if retention is not None:
-        await retention.stop()
-    if privacy is not None:
-        await privacy.stop()
-    if capture_extractor is not None:
-        await capture_extractor.stop()
-    if indexer is not None:
-        await indexer.stop()
-    await outbox_relay.stop()
-    if intel_client is not None:
-        await intel_client.aclose()
-    await dapr.close()
-    await sink.close()
-    if intel_sink is not sink:
-        await intel_sink.close()
-    if quality_sink is not sink and quality_sink is not intel_sink:
-        await quality_sink.close()
-    await db.close()
+
+class _NullSink:
+    async def publish(self, record: dict) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
 
 
-app = FastAPI(title="conversation-service", lifespan=lifespan)
+app = FastAPI(title="OpenDesk conversation-service", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
 app.include_router(agent_router)
+# SPEC-W45 K19: internauth-gated service-to-service routes (/internal/gdpr/*).
 app.include_router(internal_router)
 
 
@@ -267,15 +312,20 @@ app.include_router(internal_router)
 async def healthz() -> JSONResponse:
     try:
         await app.state.db.ping()
-        return JSONResponse({"status": "ok"})
-    except Exception as exc:  # noqa: BLE001 - honest 503
-        return JSONResponse({"status": "db-unreachable", "error": str(exc)},
-                            status_code=503)
+    except Exception as exc:
+        return JSONResponse(
+            {"status": "unavailable", "error": str(exc)}, status_code=503
+        )
+    return JSONResponse({"status": "ok"})
 
 
 @app.get("/metrics")
 async def metrics() -> PlainTextResponse:
-    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    """W44: Prometheus scrape endpoint (default registry: process + platform
+    collectors) on the existing app port — closes the F15-02 scrape gap."""
+    return PlainTextResponse(
+        generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST
+    )
 
 
 def main() -> None:
@@ -284,7 +334,8 @@ def main() -> None:
         "app.main:app",
         host="0.0.0.0",
         port=cfg.port,
-        log_level=cfg.log_level,
+        log_config=None,  # structlog owns logging
+        timeout_graceful_shutdown=15,
     )
 
 
