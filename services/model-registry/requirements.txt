@@ -6,6 +6,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.9.2
 psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
 APScheduler==3.11.0
 prometheus-client==0.21.1
 
