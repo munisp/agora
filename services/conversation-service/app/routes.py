@@ -250,6 +250,70 @@ async def add_turn(
     return models.TurnCreated(turn=turn)
 
 
+def _spawn_background(st: Any, coro: Any, *, name: str) -> None:
+    """Track a fire-and-forget task on app state (W46-F P5/P10).
+
+    Same registry pattern as the incident IDP / helpdesk escalation tasks:
+    the set keeps a strong reference until completion and the done callback
+    logs unexpected failures (never raised onto the request path).
+    """
+    tasks = getattr(st, "background_tasks", None)
+    if tasks is None:
+        tasks = set()
+        st.background_tasks = tasks
+    task = asyncio.create_task(coro, name=name)
+    tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            st.log.error("background task failed", task=name, error=str(exc))
+
+    task.add_done_callback(_done)
+
+
+async def _llm_enrich_and_publish(
+    st: Any,
+    *,
+    turn_id: uuid.UUID,
+    text: str,
+    tenant_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    enriched: dict[str, Any],
+) -> None:
+    """W46-F P10: post-response LLM NER → turn write-back → enriched publish.
+
+    Runs ONLY when INTEL_LLM=on (the caller persists the turn lexicon-only).
+    llm_extract never raises (None on failure → lexicon-only enriched event);
+    the DB write-back and the sink publish are best-effort with error logs,
+    exactly like the previous inline publish.
+    """
+    ner = await intel.llm_extract(
+        text, st.cfg, client=getattr(st, "intel_client", None)
+    )
+    if ner is not None:
+        enriched["intent"] = ner.get("intent")
+        enriched["entities"] = ner.get("entities") or {}
+        try:
+            await st.db.update_turn_intel(
+                turn_id,
+                tenant_id,
+                intent=enriched["intent"],
+                entities=enriched["entities"],
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort write-back
+            st.log.error("turn intel write-back failed", error=str(exc),
+                         conversation_id=str(conversation_id))
+    try:
+        await st.intel_sink.publish(enriched)
+    except Exception as exc:  # noqa: BLE001 — best-effort like the raw sink
+        st.log.error("enriched turn publish failed", error=str(exc),
+                     conversation_id=str(conversation_id))
+
+
 async def _persist_turn(
     st: Any,
     conversation_id: uuid.UUID,
@@ -268,9 +332,20 @@ async def _persist_turn(
     effects, exactly like the REST path.
     """
 
-    # Call intelligence (SPEC-W3 §4, innovation 3): lexicon sentiment always;
-    # optional LLM NER when INTEL_LLM=on (failure degrades to lexicon-only).
-    enrichment = await intel.enrich_turn(text, st.cfg)
+    # Call intelligence (SPEC-W3 §4, innovation 3): lexicon sentiment always.
+    # W46-F P10: when INTEL_LLM=on the LLM NER call runs POST-RESPONSE in a
+    # background task (shared app-lifetime httpx client) — never on the turn
+    # path; the turn is persisted lexicon-only and updated when NER lands.
+    if st.cfg.intel_llm:
+        _sent = intel.analyze_sentiment(text)
+        enrichment = {
+            "sentiment": _sent["score"],
+            "sentiment_label": _sent["label"],
+            "intent": None,
+            "entities": None,
+        }
+    else:
+        enrichment = await intel.enrich_turn(text, st.cfg)
 
     # Conversation context for the event subject + incident IDP. Fetched
     # BEFORE the insert because the outbox payload is built inside the turn
@@ -330,7 +405,10 @@ async def _persist_turn(
     if not created:
         return turn, False
 
-    # 1) raw record to the high-throughput transcript sink (Fluvio/Kafka)
+    # 1)+2) W46-F P5: the raw transcript sink publish and the Dapr CloudEvent
+    #    publish fan out CONCURRENTLY (previously 2 sequential network RTTs on
+    #    the request path). Per-publish error handling is unchanged — each
+    #    leg logs and degrades independently.
     raw = {
         "conversationId": str(conversation_id),
         "tenantId": str(tenant_id),
@@ -338,26 +416,33 @@ async def _persist_turn(
         "text": turn.text,
         "ts": turn.ts.isoformat(),
     }
-    try:
-        await st.sink.publish(raw)
-    except Exception as exc:
-        st.log.error("transcript sink publish failed", error=str(exc),
-                     conversation_id=str(conversation_id))
-
-    # 2) CloudEvent to Kafka via Dapr pubsub `pubsub-kafka` (always, SPEC §4).
-    #    SPEC-W43 Y-08: the event was already persisted to
-    #    conversation_outbox in the SAME tx as the turn insert. The inline
-    #    publish marks the row sent on success; on failure the row stays
-    #    unsent and the OutboxRelay republishes with backoff — a crash or
-    #    broker outage can never silently lose a transcript event.
+    # CloudEvent to Kafka via Dapr pubsub `pubsub-kafka` (always, SPEC §4).
+    # SPEC-W43 Y-08: the event was already persisted to
+    # conversation_outbox in the SAME tx as the turn insert. The inline
+    # publish marks the row sent on success; on failure the row stays
+    # unsent and the OutboxRelay republishes with backoff — a crash or
+    # broker outage can never silently lose a transcript event.
     event = event_holder["event"]
-    try:
-        await st.dapr.publish_event(st.cfg.transcripts_topic, event)
-        if outbox_id is not None:
-            await st.db.outbox_mark_sent(outbox_id, tenant_id)
-    except Exception as exc:
+    sink_res, dapr_res = await asyncio.gather(
+        st.sink.publish(raw),
+        st.dapr.publish_event(st.cfg.transcripts_topic, event),
+        return_exceptions=True,
+    )
+    if isinstance(sink_res, Exception):
+        st.log.error("transcript sink publish failed", error=str(sink_res),
+                     conversation_id=str(conversation_id))
+    if isinstance(dapr_res, Exception):
         st.log.error("dapr transcript publish failed; outbox relay will retry",
-                     error=str(exc), conversation_id=str(conversation_id))
+                     error=str(dapr_res), conversation_id=str(conversation_id))
+    elif outbox_id is not None:
+        # W46-F P5: outbox_mark_sent off the response path (background task,
+        # not awaited). The row is durable; a lost/crashed mark just means
+        # the relay republishes — at-least-once semantics are unchanged.
+        _spawn_background(
+            st,
+            st.db.outbox_mark_sent(outbox_id, tenant_id),
+            name=f"outbox-mark-sent-{outbox_id}",
+        )
 
     # 3) Enriched turn to opendesk.conversation.enriched via aiokafka
     #    (SPEC-W3 §4, innovation 3; best-effort like the raw sink).
@@ -374,11 +459,30 @@ async def _persist_turn(
         "entities": turn.entities,
         "ts": turn.ts.isoformat(),
     }
-    try:
-        await st.intel_sink.publish(enriched)
-    except Exception as exc:
-        st.log.error("enriched turn publish failed", error=str(exc),
-                     conversation_id=str(conversation_id))
+    if st.cfg.intel_llm:
+        # W46-F P10: INTEL_LLM=on — the LLM NER call + turn write-back +
+        # enriched publish run post-response in a background task (shared
+        # app-lifetime httpx client). The enriched event is still published
+        # exactly once per persisted turn, now carrying the NER results
+        # (lexicon-only intent/entities=None when the LLM call fails).
+        _spawn_background(
+            st,
+            _llm_enrich_and_publish(
+                st,
+                turn_id=turn.id,
+                text=text,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                enriched=enriched,
+            ),
+            name=f"intel-ner-{turn.id}",
+        )
+    else:
+        try:
+            await st.intel_sink.publish(enriched)
+        except Exception as exc:
+            st.log.error("enriched turn publish failed", error=str(exc),
+                         conversation_id=str(conversation_id))
 
     # 4) SPEC-W11 Part A: emergency-intent detection on USER turns. The
     #    lexicon classify is cheap and inline; only when the score crosses
@@ -486,17 +590,27 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
     reply, continue_session, selected = ussd.build_reply(
         body, st.cfg.ussd_text_mode_reply
     )
-    # Record the reply as an agent turn (deduped on the same callback key),
-    # mirroring the telegram/whatsapp bridge's user-turn → agent-turn pair.
-    await _persist_turn(
-        st, conv_id, tenant_id, "agent", reply,
-        idempotency_key=idem + ":reply",
-    )
-
-    return ussd.response_payload(
+    payload = ussd.response_payload(
         conversation_id=conv_id,
         reply=reply,
         continue_session=continue_session,
         body=body,
         selected=selected,
     )
+    # W46-F P5: record the reply as an agent turn (deduped on the same
+    # callback key, mirroring the telegram/whatsapp bridge's user-turn →
+    # agent-turn pair) in a BACKGROUND task AFTER the response — the USSD
+    # 1s turn budget no longer pays a second enrich+insert+fan-out. Order
+    # is preserved: the user turn committed above, so seq ordering is
+    # unchanged; the idempotency key keeps AT callback replays exact-once.
+    # Failures are logged by the background-task done callback (previously
+    # a failed agent persist 500'd an already-answered callback).
+    _spawn_background(
+        st,
+        _persist_turn(
+            st, conv_id, tenant_id, "agent", reply,
+            idempotency_key=idem + ":reply",
+        ),
+        name=f"ussd-agent-reply-{conv_id}",
+    )
+    return payload
