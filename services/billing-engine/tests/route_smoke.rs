@@ -116,6 +116,7 @@ fn test_config() -> config::Config {
         tenant_cache_ttl_s: 60,
         dunning_interval_s: 3600,
         invoice_due_days: 14,
+        db_pool_max: 10,
     }
 }
 
