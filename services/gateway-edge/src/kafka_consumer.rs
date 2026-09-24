@@ -125,6 +125,59 @@ mod tests {
     }
 }
 
+/// SPEC-W46 R17 buffered-commit discipline (same as payments-service):
+/// auto-commit OFF, manual commit every `COMMIT_EVERY` processed messages
+/// or `COMMIT_INTERVAL`, whichever first. Commit-after-process keeps
+/// at-least-once semantics (a crash before the flush redelivers).
+pub const COMMIT_EVERY: u32 = 50;
+pub const COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Tracks the highest processed offset per (topic, partition) and flushes
+/// them as one commit — replaces per-message `commit_message` (which also
+/// ran redundantly on top of `enable.auto.commit=true`).
+pub(crate) struct OffsetBuffer {
+    latest: std::collections::HashMap<(String, i32), i64>,
+    pending: u32,
+}
+
+impl OffsetBuffer {
+    pub(crate) fn new() -> Self {
+        Self {
+            latest: std::collections::HashMap::new(),
+            pending: 0,
+        }
+    }
+
+    /// Record a processed message. Returns true when the buffered batch has
+    /// reached the flush threshold.
+    pub(crate) fn record<M: rdkafka::Message>(&mut self, m: &M) -> bool {
+        self.latest
+            .insert((m.topic().to_string(), m.partition()), m.offset());
+        self.pending += 1;
+        self.pending >= COMMIT_EVERY
+    }
+
+    /// Flush buffered offsets (one commit for all partitions), async.
+    pub(crate) fn flush(&mut self, consumer: &StreamConsumer) {
+        if self.pending == 0 {
+            return;
+        }
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        for ((topic, partition), offset) in self.latest.drain() {
+            // Committed offset = next message to read.
+            if let Err(e) =
+                tpl.add_partition_offset(&topic, partition, rdkafka::Offset::Offset(offset + 1))
+            {
+                warn!(error = %e, topic = %topic, partition, "offset buffer entry rejected");
+            }
+        }
+        self.pending = 0;
+        if let Err(e) = consumer.commit(&tpl, CommitMode::Async) {
+            warn!(error = %e, "buffered offset commit failed; redelivery on rebalance covers it");
+        }
+    }
+}
+
 /// Task entry point: runs the consumer and, on ANY return path, records
 /// the exit so `/healthz` goes degraded (F15-07) instead of silently
 /// losing the booking-event source.
@@ -155,7 +208,8 @@ async fn run_inner(
     let consumer: StreamConsumer = match rdkafka::config::ClientConfig::new()
         .set("group.id", &group_id)
         .set("bootstrap.servers", &brokers)
-        .set("enable.auto.commit", "true")
+        // R17: manual buffered commits (see OffsetBuffer) — auto-commit off.
+        .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "latest")
         .set("session.timeout.ms", "10000")
         .create()
@@ -172,18 +226,28 @@ async fn run_inner(
     }
     info!(topic = %topic, brokers = %brokers, "booking events consumer started");
 
+    let mut offsets = OffsetBuffer::new();
+    let mut commit_tick = tokio::time::interval(COMMIT_INTERVAL);
+    commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_ok() {
                     info!("booking events consumer shutting down");
                 }
+                offsets.flush(&consumer);
                 break;
             }
             // F15-07: fixed-interval heartbeat independent of message flow,
             // so an idle topic does not read as a dead consumer.
             _ = beat.tick() => {
                 health::KAFKA_BOOKING.beat();
+            }
+            // R17: time-based flush so a low-traffic topic never parks
+            // uncommitted offsets longer than COMMIT_INTERVAL.
+            _ = commit_tick.tick() => {
+                offsets.flush(&consumer);
             }
             msg = consumer.recv() => {
                 match msg {
@@ -207,7 +271,10 @@ async fn run_inner(
                                 warn!(error = %e, "unparseable booking event; skipped");
                             }
                         }
-                        let _ = consumer.commit_message(&m, CommitMode::Async);
+                        // Commit AFTER processing (at-least-once), buffered.
+                        if offsets.record(&m) {
+                            offsets.flush(&consumer);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "kafka receive error");

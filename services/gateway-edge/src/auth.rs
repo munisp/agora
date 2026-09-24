@@ -73,6 +73,13 @@ impl Authenticator {
     }
 }
 
+/// SPEC-W46 R16: a token carrying an unknown `kid` is negative-cached for
+/// this long — previously EVERY such token triggered a full JWKS HTTP fetch
+/// (an unauthenticated DoS amplifier: 1 request = 1 upstream fetch).
+const UNKNOWN_KID_TTL: Duration = Duration::from_secs(60);
+/// Bound on the negative cache (kid strings are attacker-controlled).
+const UNKNOWN_KID_CACHE_MAX: usize = 1024;
+
 pub struct JwksValidator {
     http: reqwest::Client,
     jwks_url: String,
@@ -81,6 +88,13 @@ pub struct JwksValidator {
     ttl: Duration,
     keys: RwLock<HashMap<String, DecodingKey>>,
     loaded_at: RwLock<Option<Instant>>,
+    /// R16 single-flight: at most one JWKS refresh in flight; concurrent
+    /// validations that all miss the cache queue on this mutex and reuse the
+    /// winner's fetch (double-checked after acquisition).
+    refresh_lock: tokio::sync::Mutex<()>,
+    /// R16 negative cache: kid -> when it was confirmed absent from a FRESH
+    /// key set. Bounded (UNKNOWN_KID_CACHE_MAX, expired/oldest evicted).
+    unknown_kids: RwLock<HashMap<String, Instant>>,
 }
 
 impl JwksValidator {
@@ -101,6 +115,8 @@ impl JwksValidator {
             ttl,
             keys: RwLock::new(HashMap::new()),
             loaded_at: RwLock::new(None),
+            refresh_lock: tokio::sync::Mutex::new(()),
+            unknown_kids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -137,24 +153,88 @@ impl JwksValidator {
         Ok(())
     }
 
+    /// True while the kid sits in the (fresh) negative cache.
+    async fn kid_recently_unknown(&self, kid: &str) -> bool {
+        self.unknown_kids
+            .read()
+            .await
+            .get(kid)
+            .map(|t| t.elapsed() < UNKNOWN_KID_TTL)
+            .unwrap_or(false)
+    }
+
+    /// Record a confirmed-unknown kid, bounded: expired entries are evicted
+    /// first, then the oldest if still full.
+    async fn mark_kid_unknown(&self, kid: &str) {
+        let mut cache = self.unknown_kids.write().await;
+        if cache.len() >= UNKNOWN_KID_CACHE_MAX {
+            cache.retain(|_, t| t.elapsed() < UNKNOWN_KID_TTL);
+            while cache.len() >= UNKNOWN_KID_CACHE_MAX {
+                if let Some(oldest) = cache
+                    .iter()
+                    .max_by_key(|(_, t)| t.elapsed())
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        cache.insert(kid.to_string(), Instant::now());
+    }
+
     pub async fn validate(&self, token: &str) -> Result<Claims, AuthError> {
         let header = decode_header(token).map_err(|_| AuthError::MalformedToken)?;
         let kid = header.kid.ok_or(AuthError::MalformedToken)?;
 
+        let key = {
+            let keys = self.keys.read().await;
+            keys.get(&kid).cloned()
+        };
+        let key = match key {
+            Some(k) => Some(k),
+            None => {
+                // R16: unknown kid — serve the negative cache instead of a
+                // full JWKS fetch per request.
+                if self.kid_recently_unknown(&kid).await {
+                    return Err(AuthError::MalformedToken);
+                }
+                None
+            }
+        };
         let stale = self
             .loaded_at
             .read()
             .await
             .map(|t| t.elapsed() > self.ttl)
             .unwrap_or(true);
-        if stale || !self.keys.read().await.contains_key(&kid) {
-            self.refresh().await?;
-        }
 
-        let key = {
-            let keys = self.keys.read().await;
-            keys.get(&kid).cloned().ok_or(AuthError::MalformedToken)?
+        let key = if stale || key.is_none() {
+            // R16 single-flight: exactly one refresh runs; everyone else
+            // waits and then re-checks the winner's fresh key set.
+            let _permit = self.refresh_lock.lock().await;
+            // Double-checked under the lock: only refresh when the set the
+            // lock winner left behind is still stale/missing.
+            let fresh = self
+                .loaded_at
+                .read()
+                .await
+                .map(|t| t.elapsed() <= self.ttl)
+                .unwrap_or(false);
+            if !fresh {
+                self.refresh().await?;
+            }
+            let key = self.keys.read().await.get(&kid).cloned();
+            if key.is_none() {
+                // Confirmed absent from a fresh set: negative-cache it.
+                self.mark_kid_unknown(&kid).await;
+            }
+            key
+        } else {
+            key
         };
+        let key = key.ok_or(AuthError::MalformedToken)?;
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[self.issuer.clone()]);
@@ -195,6 +275,25 @@ mod tests {
             Duration::from_secs(60),
         );
         assert_eq!(v.audience.as_deref(), Some("opendesk"));
+    }
+
+    /// R16: the unknown-kid negative cache is bounded and fresh entries hit.
+    #[tokio::test]
+    async fn unknown_kid_negative_cache_is_bounded_and_fresh() {
+        let v = JwksValidator::new(
+            "http://keycloak:8080/certs".into(),
+            "http://keycloak:8080/realms/opendesk".into(),
+            None,
+            Duration::from_secs(60),
+        );
+        assert!(!v.kid_recently_unknown("kid-x").await);
+        v.mark_kid_unknown("kid-x").await;
+        assert!(v.kid_recently_unknown("kid-x").await);
+        // Fill far past the bound: the map never exceeds UNKNOWN_KID_CACHE_MAX.
+        for i in 0..(UNKNOWN_KID_CACHE_MAX * 2) {
+            v.mark_kid_unknown(&format!("kid-{i}")).await;
+        }
+        assert!(v.unknown_kids.read().await.len() <= UNKNOWN_KID_CACHE_MAX);
     }
 
     #[test]

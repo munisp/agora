@@ -112,27 +112,57 @@ func NormalizePhone(phone string) string {
 	return n
 }
 
+// dndImportBatchSize bounds the unnest array of one batched import
+// statement (statement-size/lock-duration bound; registry snapshots run to
+// tens of thousands of numbers).
+const dndImportBatchSize = 1000
+
 // ImportGlobalDND bulk-loads numbers into the GLOBAL NCC 2442 list
 // (tenant_id NULL). Idempotent: existing numbers are skipped
 // (ON CONFLICT DO NOTHING), so re-importing an updated registry snapshot is
 // safe. source defaults to ncc2442. Returns the number of NEW rows. Runs on
 // the internal pool (N-08): writing global rows is a cross-tenant
 // operation authorized by the role-gated RLS escape.
+//
+// SPEC-W46 PERF-19/22: the import inserts in BATCHES (one
+// INSERT ... SELECT FROM unnest per ≤1000 numbers, a single RTT per batch)
+// instead of one INSERT per row — a 10k-number registry snapshot went from
+// 10k sequential RTTs to 10. Semantics preserved: same columns, same
+// ON CONFLICT DO NOTHING idempotency, same count-of-new-rows return; the
+// per-batch error aborts with the rows inserted so far, as before.
+// Duplicates WITHIN one batch are de-duped in Go first — a repeated value
+// in a single INSERT's unnest set would trip the "ON CONFLICT DO NOTHING
+// command cannot affect row a second time" cardinality violation.
 func (s *Store) ImportGlobalDND(ctx context.Context, phones []string, source string) (int, error) {
 	if source == "" {
 		source = DNDSourceNCC2442
 	}
-	inserted := 0
+	// Normalize + drop empties + dedupe (preserves first-seen order).
+	norm := make([]string, 0, len(phones))
+	seen := make(map[string]struct{}, len(phones))
 	for _, p := range phones {
 		p = NormalizePhone(p)
 		if p == "" {
 			continue
 		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		norm = append(norm, p)
+	}
+	inserted := 0
+	for start := 0; start < len(norm); start += dndImportBatchSize {
+		end := start + dndImportBatchSize
+		if end > len(norm) {
+			end = len(norm)
+		}
 		tag, err := s.internal().Exec(ctx,
 			`INSERT INTO dnd_numbers (tenant_id, tenant_slug, phone_e164, source)
-			 VALUES (NULL, '', $1, $2) ON CONFLICT DO NOTHING`, p, source)
+			 SELECT NULL, '', phone, $2 FROM unnest($1::text[]) AS phone
+			 ON CONFLICT DO NOTHING`, norm[start:end], source)
 		if err != nil {
-			return inserted, fmt.Errorf("import dnd number: %w", err)
+			return inserted, fmt.Errorf("import dnd numbers: %w", err)
 		}
 		inserted += int(tag.RowsAffected())
 	}
