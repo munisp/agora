@@ -202,34 +202,51 @@ class WhisperSTTNode(lk_stt.STT):
 class PiperTTSNode(lk_tts.TTS):
     """Bridge a TTSInterface stage into the LiveKit pipeline (chunked
     synthesis). Since SPEC-W10 the impl is the FallbackTTS provider chain
-    (piper-only by default)."""
+    (piper-only by default).
 
-    def __init__(self, impl: TTSInterface) -> None:
+    SPEC-W46 P4: when the impl exposes ``stream_pcm`` (PiperTTS and the
+    FallbackTTS chain both do) and ``chunked`` is on (VOICE_TTS_CHUNKED,
+    default true), sentence-level chunks are yielded as they synthesize —
+    the first audio frame ships after the first chunk instead of the full
+    utterance. ``chunked=False`` restores the pre-W46 full-buffer path.
+    """
+
+    def __init__(self, impl: TTSInterface, *, chunked: bool = True) -> None:
         super().__init__(
             capabilities=lk_tts.TTSCapabilities(streaming=False),
             sample_rate=impl.sample_rate,
             num_channels=1,
         )
         self._impl = impl
+        self._chunked = chunked
 
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         return self._stream(text)
 
-    async def _stream(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
-        pcm = await self._impl.synthesize_pcm(text)
-        if not pcm:
-            return
+    def _audio(self, pcm: bytes) -> lk_tts.SynthesizedAudio:
         frame = rtc.AudioFrame(
             data=pcm,
             sample_rate=self._impl.sample_rate,
             num_channels=1,
             samples_per_channel=len(pcm) // 2,
         )
-        yield lk_tts.SynthesizedAudio(
+        return lk_tts.SynthesizedAudio(
             request_id=str(uuid.uuid4()),
             segment_id=str(uuid.uuid4()),
             frame=frame,
         )
+
+    async def _stream(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
+        stream_pcm = getattr(self._impl, "stream_pcm", None)
+        if self._chunked and stream_pcm is not None:
+            async for pcm in stream_pcm(text):
+                if pcm:
+                    yield self._audio(pcm)
+            return
+        pcm = await self._impl.synthesize_pcm(text)
+        if not pcm:
+            return
+        yield self._audio(pcm)
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +688,7 @@ async def build_voice_agent(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
         ),
-        tts=PiperTTSNode(tts_impl),
+        tts=PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
@@ -702,7 +719,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # shared app/metrics.py registry — expose it for Prometheus here too
     # (first binder wins; SO_REUSEPORT lets multiple job procs share 9464).
     _start_worker_metrics(settings)
-    dapr = DaprClient(settings.dapr_base_url, settings.http_timeout_s)
+    # SPEC-W46 P-02: direct booking base with daprd fallback (same as the
+    # control plane) — the per-turn tool calls skip the sidecar hop.
+    dapr = DaprClient(
+        settings.dapr_base_url,
+        settings.http_timeout_s,
+        direct_bases={settings.booking_app_id: settings.booking_base_url},
+    )
 
     await ctx.connect()
     room_name = ctx.room.name or ""

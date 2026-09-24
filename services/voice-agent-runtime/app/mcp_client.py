@@ -543,7 +543,20 @@ def _normalise_call_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 class MCPTool:
-    """One remote MCP tool exposed as a plugin tool (name/schema/execute)."""
+    """One remote MCP tool exposed as a plugin tool (name/schema/execute).
+
+    SPEC-W46 P3: the production path keeps a PERSISTENT per-session
+    MCPClient — the transport open + initialize handshake happens once
+    (lazily on the first call, in the caller's event loop) and every
+    subsequent ``tools/call`` reuses the connection instead of paying
+    3–4 RTTs per invocation. Sends are serialized by a per-tool lock
+    (the legacy SSE transport matches responses on a shared queue, so
+    concurrent in-flight calls are unsafe). On a transport/protocol
+    failure the client is dropped and ONE reconnect+retry is attempted;
+    a second failure propagates to the runner's apology path. The
+    injected ``client_factory`` seam (tests) keeps the legacy per-call
+    connect/close behavior.
+    """
 
     def __init__(
         self,
@@ -553,6 +566,7 @@ class MCPTool:
         runner: AsyncToolRunner | None = None,
         connect_timeout_s: float | None = None,
         client_factory: Callable[..., MCPClient] | None = None,
+        persistent_client: MCPClient | None = None,
     ) -> None:
         self.server = spec.name
         self.remote_name = str(tool.get("name") or "").strip()
@@ -571,6 +585,12 @@ class MCPTool:
         self._spec = spec
         self._connect_timeout_s = connect_timeout_s
         self._client_factory = client_factory
+        # Injected or lazily created persistent client. The handshake runs
+        # on FIRST execute (in the caller's event loop — httpx connections
+        # are loop-bound), not at build time.
+        self._persistent_client = persistent_client
+        self._persistent_connected = False
+        self._send_lock = asyncio.Lock()
         self._runner = runner or AsyncToolRunner(timeout_s=_tool_timeout_s())
 
     def schema(self) -> dict[str, Any]:
@@ -584,22 +604,61 @@ class MCPTool:
             },
         }
 
+    async def _get_client(self) -> MCPClient:
+        """The persistent client, handshaked once (lazy on first call)."""
+        if self._persistent_client is None:
+            self._persistent_client = MCPClient(
+                self._spec, timeout_s=self._connect_timeout_s
+            )
+            self._persistent_connected = False
+        if not self._persistent_connected:
+            await self._persistent_client.connect()
+            self._persistent_connected = True
+        return self._persistent_client
+
+    async def _drop_client(self) -> None:
+        client, self._persistent_client = self._persistent_client, None
+        self._persistent_connected = False
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - best-effort close
+                pass
+
+    async def aclose(self) -> None:
+        """Session end: release the persistent connection (idempotent)."""
+        await self._drop_client()
+
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """tools/call routed through the AsyncToolRunner hard timeout —
         a timeout/failure resolves to the spoken-apology payload."""
 
         async def _call() -> dict[str, Any]:
-            client = (
-                self._client_factory(self._spec)
-                if self._client_factory is not None
-                else MCPClient(self._spec, timeout_s=self._connect_timeout_s)
-            )
-            try:
-                await client.connect()
-                result = await client.call_tool(self.remote_name, dict(arguments))
-            finally:
-                await client.aclose()
-            return _normalise_call_result(result)
+            if self._client_factory is not None:
+                # Injected factory seam (tests): legacy per-call client.
+                client = self._client_factory(self._spec)
+                try:
+                    await client.connect()
+                    result = await client.call_tool(self.remote_name, dict(arguments))
+                finally:
+                    await client.aclose()
+                return _normalise_call_result(result)
+            # Persistent per-session client (P3): one handshake, reuse
+            # across calls, per-session send lock, one reconnect+retry.
+            async with self._send_lock:
+                client = await self._get_client()
+                try:
+                    result = await client.call_tool(self.remote_name, dict(arguments))
+                except Exception as exc:  # noqa: BLE001 - one reconnect+retry
+                    log.warning(
+                        "mcp persistent call failed; reconnecting once",
+                        tool=self.name,
+                        error=str(exc)[:200],
+                    )
+                    await self._drop_client()
+                    client = await self._get_client()
+                    result = await client.call_tool(self.remote_name, dict(arguments))
+                return _normalise_call_result(result)
 
         return await self._runner.run(self.name, _call)
 
@@ -690,10 +749,54 @@ def _run_blocking(coro: Awaitable[list[MCPTool]], timeout_s: float) -> list[MCPT
     return future.result(timeout_s)
 
 
+async def close_mcp_tools(tools: list[Any]) -> None:
+    """Session end / cache eviction: close persistent clients (best-effort,
+    never raises). Tools without a persistent client are no-ops."""
+    for tool in tools or []:
+        aclose = getattr(tool, "aclose", None)
+        if aclose is None:
+            continue
+        try:
+            await aclose()
+        except Exception as exc:  # noqa: BLE001 - close must never raise
+            log.warning("mcp tool close failed", error=str(exc)[:200])
+
+
+def _close_tools_background(tools: list[MCPTool]) -> None:
+    """Best-effort close from a sync context (cache eviction)."""
+    clients = [t for t in tools if getattr(t, "_persistent_client", None) is not None]
+    if not clients:
+        return
+
+    async def _close() -> None:
+        await close_mcp_tools(clients)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(asyncio.wait_for(_close(), _connect_timeout_s()))
+        except Exception:  # noqa: BLE001 - best-effort close
+            pass
+        return
+    # Inside a running loop: close on THIS loop (clients are loop-bound).
+    def _log_close(task: "asyncio.Task[None]") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.warning("mcp cache-eviction close failed", error=str(exc)[:200])
+
+    task = loop.create_task(_close())
+    task.add_done_callback(_log_close)
+
+
 def clear_mcp_cache() -> None:
-    """Test hook: drop all cached tool defs/failures."""
+    """Test hook: drop all cached tool defs/failures (closing clients)."""
     with _cache_lock:
+        evicted = [tool for _key, (_exp, tools) in _tools_cache.items() for tool in tools]
         _tools_cache.clear()
+    _close_tools_background(evicted)
 
 
 def build_mcp_tools_sync(tenant_ctx: Any = None) -> list[MCPTool]:
@@ -711,6 +814,7 @@ def build_mcp_tools_sync(tenant_ctx: Any = None) -> list[MCPTool]:
     now = time.monotonic()
     tools: list[MCPTool] = []
     missing: list[MCPServerSpec] = []
+    stale: list[MCPTool] = []
     with _cache_lock:
         for spec in specs:
             key = (spec.name, spec.url)
@@ -718,6 +822,8 @@ def build_mcp_tools_sync(tenant_ctx: Any = None) -> list[MCPTool]:
             if hit is not None and hit[0] > now:
                 tools.extend(hit[1])
             else:
+                if hit is not None:
+                    stale.extend(hit[1])  # expired: close after rebuild
                 missing.append(spec)
     for spec in missing:
         key = (spec.name, spec.url)
@@ -738,4 +844,8 @@ def build_mcp_tools_sync(tenant_ctx: Any = None) -> list[MCPTool]:
         with _cache_lock:
             _tools_cache[key] = (time.monotonic() + ttl, fetched)
         tools.extend(fetched)
+    if stale:
+        # Expired entries replaced: release their persistent connections
+        # (session-end discipline for the cached tool layer).
+        _close_tools_background(stale)
     return tools

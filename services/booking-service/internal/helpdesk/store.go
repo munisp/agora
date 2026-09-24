@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store persists SLA policies, tickets and ticket events. Same packaging
@@ -42,7 +43,8 @@ func DialStore(ctx context.Context, databaseURL string, maxConns int32) (*Store,
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
 	if maxConns <= 0 {
-		maxConns = 4
+		// SPEC-W46 (W46-A item 7): shared satellite pool budget.
+		maxConns = config.SatellitePoolMaxConns()
 	}
 	poolCfg.MaxConns = maxConns
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
@@ -173,6 +175,15 @@ CREATE TABLE IF NOT EXISTS csat_tokens (
 CREATE INDEX IF NOT EXISTS idx_csat_tokens_ticket ON csat_tokens (tenant_id, ticket_id);`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure helpdesk tables: %w", err)
+	}
+	// SPEC-W46 (W46-A item 1, P-DATA DDL #11 / PERF-13): GIN trigram index
+	// backing the subject ILIKE '%…%' search. CONCURRENTLY must run outside
+	// a transaction block / multi-statement Exec, hence a separate Exec.
+	// Best-effort: a server without the pg_trgm contrib module keeps the
+	// previous seq-scan search instead of failing the boot.
+	if _, err := s.pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err == nil {
+		_, _ = s.pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tickets_subject_trgm
+			ON tickets USING gin (subject gin_trgm_ops)`)
 	}
 	return nil
 }
@@ -471,14 +482,20 @@ func (s *Store) GetTicket(ctx context.Context, tenantID, id uuid.UUID) (Ticket, 
 	return t, err
 }
 
-// ListEvents returns the ticket's timeline (oldest first) — the tenant
-// scoping makes a cross-tenant ticket_id read return an empty list.
+// maxTimelineEvents bounds the ticket timeline read (SPEC-W46 W46-A item 8,
+// PERF-14): the event log grows unbounded and every row carries a JSONB
+// payload, so the view previously decoded an ever-growing history per view.
+const maxTimelineEvents = 200
+
+// ListEvents returns the ticket's timeline (oldest first, capped at
+// maxTimelineEvents) — the tenant scoping makes a cross-tenant ticket_id
+// read return an empty list.
 func (s *Store) ListEvents(ctx context.Context, tenantID, ticketID uuid.UUID) ([]TicketEvent, error) {
 	out := []TicketEvent{}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
 			`SELECT id, tenant_id, ticket_id, kind, actor, payload, ts
-			 FROM ticket_events WHERE tenant_id=$1 AND ticket_id=$2 ORDER BY ts, id`, tenantID, ticketID)
+			 FROM ticket_events WHERE tenant_id=$1 AND ticket_id=$2 ORDER BY ts, id LIMIT $3`, tenantID, ticketID, maxTimelineEvents)
 		if err != nil {
 			return err
 		}
@@ -864,7 +881,7 @@ func (s *Store) ListTeamMembers(ctx context.Context, tenantID uuid.UUID) ([]Team
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
 			`SELECT id, name, COALESCE(email, '') FROM team_members
-			 WHERE tenant_id=$1 AND active ORDER BY name`, tenantID)
+			 WHERE tenant_id=$1 AND active ORDER BY name LIMIT 1000`, tenantID)
 		if err != nil {
 			return err
 		}
@@ -888,49 +905,43 @@ func (s *Store) ListTeamMembers(ctx context.Context, tenantID uuid.UUID) ([]Team
 // Stats computes GET /v1/helpdesk/stats: open tickets by priority, current
 // breach count (now > due_*, status not resolved|closed) and the 30-day
 // averages for first response / resolve (and CSAT, for the UI tiles).
+//
+// SPEC-W46 (W46-A item 8, PERF-12): the three sequential aggregate queries
+// are collapsed into ONE single-pass scan with FILTER clauses (one round
+// trip inside the tenant tx instead of three).
 func (s *Store) Stats(ctx context.Context, tenantID uuid.UUID) (Stats, error) {
 	st := Stats{OpenByPriority: map[string]int{
 		PriorityLow: 0, PriorityNormal: 0, PriorityHigh: 0, PriorityUrgent: 0,
 	}}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx,
-			`SELECT priority, COUNT(*) FROM tickets
-			 WHERE tenant_id=$1 AND status IN ('open','pending')
-			 GROUP BY priority`, tenantID)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var p string
-			var c int
-			if err := rows.Scan(&p, &c); err != nil {
-				return err
-			}
-			st.OpenByPriority[p] = c
-			st.OpenCount += c
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
+		var openLow, openNormal, openHigh, openUrgent int
 		if err := tx.QueryRow(ctx,
-			`SELECT COUNT(*) FROM tickets
-			 WHERE tenant_id=$1 AND status NOT IN ('resolved','closed')
-			   AND ((first_response_at IS NULL AND due_first_response_at IS NOT NULL AND now() > due_first_response_at)
-			        OR (due_resolve_at IS NOT NULL AND now() > due_resolve_at))`, tenantID).
-			Scan(&st.BreachedCount); err != nil {
+			`SELECT
+			        COUNT(*) FILTER (WHERE status IN ('open','pending') AND priority='low'),
+			        COUNT(*) FILTER (WHERE status IN ('open','pending') AND priority='normal'),
+			        COUNT(*) FILTER (WHERE status IN ('open','pending') AND priority='high'),
+			        COUNT(*) FILTER (WHERE status IN ('open','pending') AND priority='urgent'),
+			        COUNT(*) FILTER (WHERE status NOT IN ('resolved','closed')
+			                   AND ((first_response_at IS NULL AND due_first_response_at IS NOT NULL AND now() > due_first_response_at)
+			                        OR (due_resolve_at IS NOT NULL AND now() > due_resolve_at))),
+			        COUNT(*) FILTER (WHERE created_at > now() - interval '30 days' AND resolved_at IS NOT NULL),
+			        AVG(EXTRACT(EPOCH FROM (first_response_at - created_at)) / 60)
+			          FILTER (WHERE created_at > now() - interval '30 days' AND first_response_at IS NOT NULL),
+			        AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 60)
+			          FILTER (WHERE created_at > now() - interval '30 days' AND resolved_at IS NOT NULL),
+			        AVG(csat_rating) FILTER (WHERE created_at > now() - interval '30 days' AND csat_rating IS NOT NULL)
+			 FROM tickets
+			 WHERE tenant_id=$1`, tenantID).
+			Scan(&openLow, &openNormal, &openHigh, &openUrgent, &st.BreachedCount,
+				&st.Resolved30d, &st.AvgFirstResponseMin30d, &st.AvgResolveMinutes30d, &st.AvgCSAT30d); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx,
-			`SELECT COUNT(*) FILTER (WHERE resolved_at IS NOT NULL),
-			        AVG(EXTRACT(EPOCH FROM (first_response_at - created_at)) / 60)
-			          FILTER (WHERE first_response_at IS NOT NULL),
-			        AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 60)
-			          FILTER (WHERE resolved_at IS NOT NULL),
-			        AVG(csat_rating) FILTER (WHERE csat_rating IS NOT NULL)
-			 FROM tickets
-			 WHERE tenant_id=$1 AND created_at > now() - interval '30 days'`, tenantID).
-			Scan(&st.Resolved30d, &st.AvgFirstResponseMin30d, &st.AvgResolveMinutes30d, &st.AvgCSAT30d)
+		st.OpenByPriority[PriorityLow] = openLow
+		st.OpenByPriority[PriorityNormal] = openNormal
+		st.OpenByPriority[PriorityHigh] = openHigh
+		st.OpenByPriority[PriorityUrgent] = openUrgent
+		st.OpenCount = openLow + openNormal + openHigh + openUrgent
+		return nil
 	})
 	return st, err
 }

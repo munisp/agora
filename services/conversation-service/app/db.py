@@ -211,6 +211,31 @@ class Database:
             )
         log.info("conversation ussd channel check ensured")
 
+    async def ensure_perf_indexes(self) -> None:
+        """W46-F (P-DATA DDL #4/#9): idempotent hot-path indexes.
+
+        - idx_incident_emitted_unsent: the incident retry worker polls
+          ``WHERE published_at IS NULL ORDER BY created_at`` every second —
+          a partial index keeps the poll O(unsent) instead of a seq scan of
+          a monotonically-growing table.
+        - idx_turns_ts: the retention sweep hard-deletes by turns.ts in
+          chunks; turns is the platform's fastest-growing table.
+
+        CREATE INDEX IF NOT EXISTS (non-concurrent, matches the existing
+        ensure_* bootstrap pattern). Runs at boot OUTSIDE any
+        tenant-scoped transaction, like ensure_relay_tables. Safe on every
+        startup.
+        """
+        async with self._pool_acquire() as conn:
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_incident_emitted_unsent "
+                "ON incident_emitted (created_at) WHERE published_at IS NULL"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns (ts)"
+            )
+        log.info("perf indexes ensured (incident_emitted unsent, turns ts)")
+
     # ------------------------------------------------------------------
     # SPEC-W43 Y-03/Y-06/Y-08: durable relay tables + accessors
     # ------------------------------------------------------------------
@@ -792,6 +817,29 @@ class Database:
                     json.dumps(builder(row)),
                 )
             return row, True, outbox_id
+
+    async def update_turn_intel(
+        self,
+        turn_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        *,
+        intent: str | None,
+        entities: dict[str, Any] | None,
+    ) -> None:
+        """W46-F P10: post-response LLM NER write-back.
+
+        When INTEL_LLM=on the turn is persisted lexicon-only on the request
+        path and the background NER task fills intent/entities here once the
+        LLM call lands. Tenant-scoped (RLS GUC via _tenant_tx) like every
+        other turns mutation.
+        """
+        async with self._tenant_tx(tenant_id) as conn:
+            await conn.execute(
+                "UPDATE turns SET intent = $2, entities = $3::jsonb WHERE id = $1",
+                turn_id,
+                intent,
+                json.dumps(entities) if entities is not None else None,
+            )
 
     async def list_turns(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID
