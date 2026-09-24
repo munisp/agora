@@ -186,13 +186,13 @@ declare module "expo-auth-session" {
   export function makeRedirectUri(options?: {
     scheme?: string;
     path?: string;
-    native?: boolean;
+    native?: string;
     isTripleSlashed?: boolean;
   }): string;
 
   export interface AuthRequestConfig {
     clientId: string;
-    redirectUri: string;
+    redirectUri?: string;
     scopes?: string[];
     responseType?: ResponseType;
     usePKCE?: boolean;
