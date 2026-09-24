@@ -322,5 +322,8 @@ func (s *Store) ClaimWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID
 		entry.Status = WaitlistClaimed
 		return nil
 	})
+	if err == nil {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
 	return entry, err
 }

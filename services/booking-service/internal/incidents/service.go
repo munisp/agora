@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/events"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // DeliveryStart is one signed dispatch delivery handed to the Wave-5
@@ -65,6 +67,59 @@ type Service struct {
 	// disables metering).
 	UsageTopic string
 	Log        *zap.Logger
+
+	// SPEC-W46 (W46-A item 10, PERF-20 booking half): the active dispatch
+	// endpoints ("webhook subscriptions") were re-queried on EVERY incident
+	// dispatch; they are now cached per tenant for endpointsCacheTTL.
+	// Invalidation discipline: TTL-only — a created/updated/deleted
+	// endpoint takes effect on dispatch within 30s (same posture as the
+	// notification-worker's 30s subs cache); the map is bounded
+	// (endpointsCacheMax) with full-clear eviction.
+	endpointsMu sync.Mutex
+	endpoints   map[uuid.UUID]endpointsCacheEntry
+}
+
+type endpointsCacheEntry struct {
+	eps       []store.DispatchEndpoint
+	fetchedAt time.Time
+}
+
+const (
+	// endpointsCacheTTL bounds subscription staleness (SPEC-W46: 30s).
+	endpointsCacheTTL = 30 * time.Second
+	// endpointsCacheMax bounds the per-tenant cache map.
+	endpointsCacheMax = 1024
+	// workflowStartCap bounds parallel Temporal workflow starts per
+	// dispatch (SPEC-W46: errgroup, cap 8).
+	workflowStartCap = 8
+)
+
+// activeEndpoints returns the tenant's active dispatch endpoints, cached
+// for endpointsCacheTTL. Errors are never cached (the next dispatch
+// retries, matching the previous fail-through behavior).
+func (s *Service) activeEndpoints(ctx context.Context, tenantID uuid.UUID) ([]store.DispatchEndpoint, error) {
+	s.endpointsMu.Lock()
+	if s.endpoints == nil {
+		s.endpoints = map[uuid.UUID]endpointsCacheEntry{}
+	}
+	entry, cached := s.endpoints[tenantID]
+	if cached && time.Since(entry.fetchedAt) < endpointsCacheTTL {
+		s.endpointsMu.Unlock()
+		return entry.eps, nil
+	}
+	s.endpointsMu.Unlock()
+
+	eps, err := s.Store.ListDispatchEndpoints(ctx, tenantID, true)
+	if err != nil {
+		return nil, err
+	}
+	s.endpointsMu.Lock()
+	if len(s.endpoints) >= endpointsCacheMax {
+		s.endpoints = map[uuid.UUID]endpointsCacheEntry{} // bounded: full clear
+	}
+	s.endpoints[tenantID] = endpointsCacheEntry{eps: eps, fetchedAt: time.Now()}
+	s.endpointsMu.Unlock()
+	return eps, nil
 }
 
 func (s *Service) log() *zap.Logger {
@@ -131,7 +186,9 @@ func (s *Service) Dispatch(ctx context.Context, tenantID, incidentID uuid.UUID) 
 	if err != nil {
 		return nil, err
 	}
-	endpoints, err := s.Store.ListDispatchEndpoints(ctx, tenantID, true)
+	// SPEC-W46 (W46-A item 10): endpoints ride the 30s per-tenant cache
+	// instead of a withTenant round trip per dispatch.
+	endpoints, err := s.activeEndpoints(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -149,21 +206,39 @@ func (s *Service) Dispatch(ctx context.Context, tenantID, incidentID uuid.UUID) 
 		if err := s.Store.InsertIncidentDelivery(ctx, &d); err != nil {
 			return out, err
 		}
-		if s.Starter != nil {
-			_, err := s.Starter.StartIncidentDelivery(ctx, DeliveryStart{
-				DeliveryID:  d.ID.String(),
-				URL:         ep.URL,
-				Secret:      ep.Secret,
-				EventType:   EventTypeIDPCreated,
-				PayloadType: PayloadTypeIncident,
-				IncidentID:  incidentID.String(),
-				Body:        inc.Payload,
-			})
-			if err != nil {
-				return out, fmt.Errorf("start delivery workflow: %w", err)
-			}
-		}
 		out = append(out, d)
+	}
+	if s.Starter != nil {
+		// SPEC-W46 (W46-A item 10): the workflow starts fan out with bounded
+		// parallelism (errgroup, cap 8) instead of strict sequential —
+		// Temporal starts cost ~5–15ms each. Idempotency is unchanged:
+		// delivery ids are deterministic (incident×endpoint), so a partial
+		// failure retried by the caller re-attempts every start and
+		// duplicates are rejected as already-running, exactly as the old
+		// abort-on-first-error path relied on.
+		var g errgroup.Group
+		g.SetLimit(workflowStartCap)
+		for i, ep := range endpoints {
+			d := out[i]
+			g.Go(func() error {
+				_, err := s.Starter.StartIncidentDelivery(ctx, DeliveryStart{
+					DeliveryID:  d.ID.String(),
+					URL:         ep.URL,
+					Secret:      ep.Secret,
+					EventType:   EventTypeIDPCreated,
+					PayloadType: PayloadTypeIncident,
+					IncidentID:  incidentID.String(),
+					Body:        inc.Payload,
+				})
+				if err != nil {
+					return fmt.Errorf("start delivery workflow for %s: %w", ep.URL, err)
+				}
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return out, err
+		}
 	}
 	if err := s.Store.MarkIncidentDispatched(ctx, tenantID, incidentID); err != nil {
 		return out, err

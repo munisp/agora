@@ -13,13 +13,21 @@
  * the exact Go sources each interface mirrors.
  */
 import { apiBase } from "../config";
-import { getAccessToken, getTenantSlug } from "../auth/session";
+import {
+  getAccessToken,
+  getTenantSlug,
+  getRefreshToken,
+  updateTokens,
+  clearSession,
+} from "../auth/session";
+import { refreshAccessToken } from "../auth/keycloak";
 import type {
   Booking,
   CreateLeadRequest,
   CreateLeadResponse,
   CreateReferralRequest,
   CreateReferralResponse,
+  FieldCaptureItemResult,
   FieldCaptureRequest,
   Incident,
   IncidentDelivery,
@@ -52,13 +60,99 @@ export class NotAuthenticatedError extends Error {
   }
 }
 
+/**
+ * MB-1 (SPEC-W46): typed timeout error so screens can distinguish a dead
+ * network from a server rejection (e.g. lead-capture queues offline on
+ * TimeoutError instead of reporting a hard failure).
+ */
+export class TimeoutError extends Error {
+  constructor(url: string) {
+    super(
+      `Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s (${url}) — check your connection and retry.`,
+    );
+    this.name = "TimeoutError";
+  }
+}
+
+/** MB-1: every API call is bounded — no more requests hanging until the
+ * OS TCP timeout (minutes) on a dead network. */
+export const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Session-expired hook: registered by the SessionProvider (useSession.tsx)
+ * so a failed 401→refresh can drop the React session state, which makes
+ * the root AuthGate route to /login. Kept as a callback (not an
+ * expo-router import) to avoid a navigation dependency in the API layer.
+ */
+let sessionExpiredHandler: (() => void) | null = null;
+export function setSessionExpiredHandler(fn: (() => void) | null): void {
+  sessionExpiredHandler = fn;
+}
+
+/**
+ * MB-2 (SPEC-W46): single-flight token refresh. Concurrent 401s share ONE
+ * in-flight Keycloak refresh instead of racing N refresh grants (a losing
+ * race can invalidate the winning refresh token on rotating grants).
+ * On refresh failure the stored session is cleared and the UI session is
+ * dropped (logout → /login via AuthGate).
+ */
+let inFlightRefresh: Promise<boolean> | null = null;
+
+function refreshSessionSingleFlight(): Promise<boolean> {
+  if (inFlightRefresh) return inFlightRefresh;
+  inFlightRefresh = (async () => {
+    const refreshToken = await getRefreshToken();
+    if (!refreshToken) return false;
+    const refreshed = await refreshAccessToken(refreshToken);
+    if (!refreshed) return false;
+    await updateTokens(refreshed);
+    return true;
+  })().then(
+    async (ok) => {
+      inFlightRefresh = null;
+      if (!ok) {
+        await clearSession();
+        try {
+          sessionExpiredHandler?.();
+        } catch {
+          // handler must never break the request path
+        }
+      }
+      return ok;
+    },
+    (err) => {
+      inFlightRefresh = null;
+      throw err;
+    },
+  );
+  return inFlightRefresh;
+}
+
+/** fetch bounded by REQUEST_TIMEOUT_MS; rejects with TimeoutError on abort. */
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (controller.signal.aborted) throw new TimeoutError(url);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 interface RequestOptions {
   method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
   query?: Record<string, string | number | undefined>;
 }
 
-async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+async function request<T>(
+  path: string,
+  opts: RequestOptions = {},
+  retriedAfterRefresh = false,
+): Promise<T> {
   const [token, tenantSlug] = await Promise.all([getAccessToken(), getTenantSlug()]);
   if (!token || !tenantSlug) throw new NotAuthenticatedError();
 
@@ -80,11 +174,21 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     body = JSON.stringify(opts.body);
   }
 
-  const res = await fetch(url.toString(), {
+  const res = await fetchWithTimeout(url.toString(), {
     method: opts.method ?? "GET",
     headers,
     body,
   });
+
+  // MB-2: an expired access token (default 5-min Keycloak TTL) must not
+  // hard-fail the app until restart — refresh once (single-flight) and
+  // retry the request exactly once with the new token.
+  if (res.status === 401 && !retriedAfterRefresh) {
+    const refreshed = await refreshSessionSingleFlight();
+    if (!refreshed) throw new NotAuthenticatedError();
+    return request<T>(path, opts, true);
+  }
+
   const text = await res.text();
   if (!res.ok) throw new ApiError(res.status, text);
   if (text.length === 0) return undefined as T;
@@ -156,8 +260,21 @@ export async function transitionLead(id: string, status: LeadStatus): Promise<Le
 // modal posts /v1/leads directly when online.
 // ---------------------------------------------------------------------------
 
-export async function submitFieldCapture(items: FieldCaptureRequest): Promise<void> {
-  await request<unknown>("/v1/field/capture", { method: "POST", body: items });
+/**
+ * POST one offline-queue flush. Returns the server's per-item results
+ * ({results:[{client_id, status: applied|deduped|error, error?}]} —
+ * services/booking-service/internal/fieldcapture/handlers.go). Items the
+ * server already deduped count as delivered (exactly-once on client_id);
+ * "error" items stay in the caller's queue.
+ */
+export async function submitFieldCapture(
+  items: FieldCaptureRequest,
+): Promise<FieldCaptureItemResult[]> {
+  const data = await request<{ results?: FieldCaptureItemResult[] }>(
+    "/v1/field/capture",
+    { method: "POST", body: items },
+  );
+  return data?.results ?? [];
 }
 
 // ---------------------------------------------------------------------------
