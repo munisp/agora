@@ -324,6 +324,16 @@ global_rules:
                 ngx.req.clear_header(h)
               end
             end
+      # W46-I (P-DATA A-01): gateway-wide response compression. The gzip
+      # plugin has been loaded since config.yaml plugins:76 but was attached
+      # to ZERO routes — JSON list endpoints shipped uncompressed. Scoped to
+      # text/JSON types so binary (audio, exports) and websocket upgrades are
+      # untouched; min_length skips tiny bodies where gzip overhead loses.
+      gzip:
+        min_length: 256
+        types:
+          - "text/*"
+          - application/json
       prometheus:
         prefer_name: true
       opentelemetry:
@@ -548,6 +558,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -555,12 +577,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -583,7 +620,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -705,6 +742,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -712,12 +761,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -740,7 +804,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -756,11 +820,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -801,6 +864,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -808,12 +883,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -836,7 +926,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -852,11 +942,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -915,6 +1004,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -922,12 +1023,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -950,7 +1066,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -966,11 +1082,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1011,6 +1126,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1018,12 +1145,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1046,7 +1188,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1062,11 +1204,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1107,6 +1248,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1114,12 +1267,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1142,7 +1310,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1158,11 +1326,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1207,6 +1374,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1214,12 +1393,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1242,7 +1436,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1258,11 +1452,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1324,6 +1517,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1331,12 +1536,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1359,7 +1579,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1375,11 +1595,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1422,6 +1641,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1429,12 +1660,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1457,7 +1703,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1473,11 +1719,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1517,6 +1762,18 @@ routes:
             -- route): X-Tenant-Slugs / X-User-Id / X-User-Roles from the JWT.
             -- openid-connect verifies the signature in the access phase
             -- AFTER this runs, so a forged token 401s before upstream.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1524,12 +1781,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
               if arr then
@@ -1546,7 +1818,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1574,11 +1846,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         allow_origins: "http://localhost:3001,http://localhost:9080"
@@ -1622,6 +1893,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1629,12 +1912,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1657,7 +1955,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1673,11 +1971,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1751,6 +2048,18 @@ routes:
             -- verifies the token signature in the access phase AFTER this
             -- runs, so a forged token never reaches upstream (it 401s
             -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -1758,12 +2067,27 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
               -- realm_access.roles (EMPTY STRING when the claim is absent, so
@@ -1786,7 +2110,7 @@ routes:
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -1802,11 +2126,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1884,11 +2207,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         allow_origins: "*"
         allow_methods: "GET,OPTIONS"
@@ -2030,6 +2352,18 @@ routes:
             -- for the claim; openid-connect bearer_only still verifies the
             -- signature in the access phase AFTER this runs, so a forged
             -- token 401s before it ever reaches upstream.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -2037,14 +2371,29 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]') or ""
               local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
               for _, r in ipairs({"admin", "staff", "platform-admin"}) do
                 if roles:find('"' .. r .. '"', 1, true) then return end
@@ -2056,11 +2405,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -2098,11 +2446,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -2133,11 +2480,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: remote_addr
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         allow_origins: "*"
         allow_methods: "*"
@@ -2181,6 +2527,18 @@ routes:
             -- _require_admin_access guard (W45 FX2) can trust the gateway role
             -- header. openid-connect verifies the signature in the access phase
             -- AFTER this runs, so a forged token 401s before upstream.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -2188,19 +2546,34 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
               local sub = json:match('"sub"%s*:%s*"([^"]-)"')
               if sub then
                 ngx.req.set_header("X-User-Id", sub)
               end
               local roles = {}
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]')
               if realm then
                 local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
                 if rarr then
@@ -2217,6 +2590,18 @@ routes:
             -- is safe pre-verification: openid-connect verifies the JWT
             -- signature in the access phase AFTER this runs, so a forged
             -- token 401s before upstream.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
             return function()
               local auth = ngx.var.http_authorization
               if not auth then return end
@@ -2224,14 +2609,29 @@ routes:
               if not token then return end
               local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
               if not payload then return end
-              local b64 = payload:gsub("%-", "+"):gsub("_", "/")
-              local rem = #b64 % 4
-              if rem == 2 then b64 = b64 .. "=="
-              elseif rem == 3 then b64 = b64 .. "="
-              elseif rem == 1 then return end
-              local json = ngx.decode_base64(b64)
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
               if not json then return end
-              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
+              local realm = json:match('"realm_access"%s*:%s*%[(.-)%]') or ""
               local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
               for _, r in ipairs({"staff", "admin", "platform-admin"}) do
                 if roles:find('"' .. r .. '"', 1, true) then return end
@@ -2340,11 +2740,10 @@ routes:
         time_window: 60
         rejected_code: 429
         key: http_x_tenant_plan
-        policy: redis
-        redis_host: redis
-        redis_port: 6379
-        redis_database: 0
-        redis_timeout: 1000
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # Redis policy is retained only on auth-sensitive and
+        # public-unauthenticated money/webhook ingress routes.
       cors:
         allow_origins: "*"
         allow_methods: "*"
