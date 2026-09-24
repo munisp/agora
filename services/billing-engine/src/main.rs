@@ -78,12 +78,22 @@ pub struct AppState {
     pub dlq: Arc<dyn consumer::DlqSink>,
 }
 
-async fn connect_pool(database_url: &str) -> Result<PgPool, Box<dyn std::error::Error>> {
+/// SPEC-W46 R9: `acquire_timeout(5s)` on every pool — the sqlx 0.7 default
+/// is a 30s acquire wait, so pool exhaustion used to hang requests into a
+/// silent 30s p95 tail instead of fast-failing (503). Pool size is
+/// env-configurable (`BILLING_DB_POOL_MAX`, default 10); both pools
+/// (app + internal) use the same value, so a pod holds at most
+/// `2 * BILLING_DB_POOL_MAX` connections to the billing database.
+async fn connect_pool(
+    database_url: &str,
+    max_connections: u32,
+) -> Result<PgPool, Box<dyn std::error::Error>> {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         match PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(5))
             .connect(database_url)
             .await
         {
@@ -148,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting billing-engine"
     );
 
-    let pool = connect_pool(&cfg.database_url).await?;
+    let pool = connect_pool(&cfg.database_url, cfg.db_pool_max).await?;
     // Idempotent schema bootstrap (same pattern as notification-worker; the
     // `billing` database itself is created by infra/postgres init scripts).
     sqlx::raw_sql(include_str!("../migrations/0001_init.sql"))
@@ -180,12 +190,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(include_str!("../migrations/0006_plan_presets.sql"))
         .execute(&pool)
         .await?;
-    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox, 0005 hardening, 0006 plan presets)");
+    // SPEC-W46 R10: idx_invoices_tenant_created for the bounded/keyset
+    // list_invoices read.
+    sqlx::raw_sql(include_str!("../migrations/0007_perf.sql"))
+        .execute(&pool)
+        .await?;
+    info!("billing schema applied (incl. 0002 RLS, 0003 ledger, 0004 outbox, 0005 hardening, 0006 plan presets, 0007 perf)");
 
     let internal_pool = match &cfg.internal_database_url {
         Some(dsn) => {
             info!("internal jobs pool: INTERNAL_DATABASE_URL configured");
-            connect_pool(dsn).await?
+            connect_pool(dsn, cfg.db_pool_max).await?
         }
         None => {
             warn!(

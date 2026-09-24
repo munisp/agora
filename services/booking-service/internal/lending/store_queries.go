@@ -130,58 +130,51 @@ func (s *Store) ListApplications(ctx context.Context, tenantID uuid.UUID, f Appl
 // ---------------------------------------------------------------------------
 
 // ComputeScore gathers the naive-score signals for one contact and computes
-// the 0..100 score. Every signal query is independent and best-effort.
+// the 0..100 score.
+//
+// SPEC-W46 (W46-A item 2, PERF-03): the signals used to cost 4–5 SEQUENTIAL
+// withTenant transactions (~16–20 RTTs) per scoring call. They are now ONE
+// withTenant transaction running ONE statement with scalar subselects. The
+// defensive posture is unchanged: the schema facts the statement depends on
+// (contacts.created_at presence, bookings table presence) are probed once at
+// bootstrap (probeScoringSchema), and any residual runtime failure leaves
+// the zero-valued signals — a missing/broken source contributes 0, never a
+// 500 (SPEC-W20 "code defensively").
 func (s *Store) ComputeScore(ctx context.Context, tenantID, contactID uuid.UUID) (int, ScoreSignals) {
 	var sig ScoreSignals
 	now := time.Now().UTC()
 
 	// Tenure: earliest known contact activity. The canonical contacts table
-	// carries no created_at — try it first (future schemas), then fall back
-	// to the first booking's created_at.
+	// carries no created_at — prefer it when present (future schemas), then
+	// fall back to the first booking's created_at (COALESCE preserves the
+	// exact precedence of the old two-step logic).
+	contactsHasCreated, bookingsTable := s.ensureSchemaProbes(ctx)
+	firstSeenExpr := "NULL::timestamptz"
+	completedExpr := "0"
+	if bookingsTable {
+		firstSeenExpr = `(SELECT min(created_at) FROM bookings WHERE tenant_id=$1 AND contact_id=$2)`
+		completedExpr = `(SELECT count(*) FROM bookings WHERE tenant_id=$1 AND contact_id=$2 AND status='completed')`
+	}
+	if contactsHasCreated {
+		firstSeenExpr = `COALESCE((SELECT created_at FROM contacts WHERE tenant_id=$1 AND id=$2), ` + firstSeenExpr + `)`
+	}
+
 	var firstSeen *time.Time
 	_ = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var ts *time.Time
+		var completed, repaid int
 		if err := tx.QueryRow(ctx,
-			`SELECT created_at FROM contacts WHERE tenant_id=$1 AND id=$2`,
-			tenantID, contactID).Scan(&ts); err == nil && ts != nil {
-			firstSeen = ts
+			`SELECT `+firstSeenExpr+`, `+completedExpr+`,
+			        (SELECT count(*) FROM loan_applications WHERE tenant_id=$1 AND contact_id=$2 AND status='repaid')`,
+			tenantID, contactID).Scan(&firstSeen, &completed, &repaid); err != nil {
+			return nil // defensive: any failure leaves the zero signals
 		}
-		return nil // defensive: any failure leaves firstSeen nil
+		sig.CompletedBookings = completed
+		sig.RepaidLoans = repaid
+		return nil
 	})
-	if firstSeen == nil {
-		_ = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-			var ts *time.Time
-			if err := tx.QueryRow(ctx,
-				`SELECT min(created_at) FROM bookings WHERE tenant_id=$1 AND contact_id=$2`,
-				tenantID, contactID).Scan(&ts); err == nil && ts != nil {
-				firstSeen = ts
-			}
-			return nil
-		})
-	}
 	if firstSeen != nil {
 		sig.TenureDays = int(now.Sub(*firstSeen).Hours() / 24)
 	}
-
-	_ = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var n int
-		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM bookings WHERE tenant_id=$1 AND contact_id=$2 AND status='completed'`,
-			tenantID, contactID).Scan(&n); err == nil {
-			sig.CompletedBookings = n
-		}
-		return nil
-	})
-
-	_ = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		var n int
-		if err := tx.QueryRow(ctx,
-			`SELECT count(*) FROM loan_applications WHERE tenant_id=$1 AND contact_id=$2 AND status='repaid'`,
-			tenantID, contactID).Scan(&n); err == nil {
-			sig.RepaidLoans = n
-		}
-		return nil
-	})
 
 	return Score(sig), sig
 }

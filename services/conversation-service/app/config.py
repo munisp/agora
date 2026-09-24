@@ -116,14 +116,16 @@ class Config:
 
     # SPEC-W43 Y-03: durable incident emission — incident_emitted rows whose
     # Dapr publish failed are republished by this background loop (never
-    # silent).
-    incident_retry_seconds: float = 30.0
+    # silent). W46-F K-03: poll interval 30s → 1s (env-overridable via
+    # INCIDENT_RETRY_SECONDS) so failed emissions retry within the turn SLO.
+    incident_retry_seconds: float = 1.0
 
     # SPEC-W43 Y-08: conversation_outbox relay — one outbox row per created
     # turn written in the SAME tx as the turn insert; a background relay
-    # publishes with backoff and marks rows sent.
+    # publishes with backoff and marks rows sent. W46-F K-03: poll interval
+    # 5s → 1s (env-overridable via OUTBOX_RELAY_SECONDS).
     outbox_relay_enabled: bool = True
-    outbox_relay_seconds: float = 5.0
+    outbox_relay_seconds: float = 1.0
     outbox_relay_batch: int = 100
 
     # USSD inbound (SPEC-W12 contract §1/§2): synchronous hook at
@@ -217,9 +219,9 @@ def load() -> Config:
         incidents_topic=_env("INCIDENTS_TOPIC", "opendesk.incidents"),
         trust_direct_tenant=_env("OPENDESK_TRUST_DIRECT_TENANT", "off").lower()
         in ("1", "on", "true", "yes"),
-        incident_retry_seconds=float(_env("INCIDENT_RETRY_SECONDS", "30")),
+        incident_retry_seconds=float(_env("INCIDENT_RETRY_SECONDS", "1")),
         outbox_relay_enabled=_env("OUTBOX_RELAY_ENABLED", "true").lower() == "true",
-        outbox_relay_seconds=float(_env("OUTBOX_RELAY_SECONDS", "5")),
+        outbox_relay_seconds=float(_env("OUTBOX_RELAY_SECONDS", "1")),
         outbox_relay_batch=int(_env("OUTBOX_RELAY_BATCH", "100")),
         ussd_enabled=_env("USSD_ENABLED", "true").lower() == "true",
         ussd_text_mode_reply=_env(
