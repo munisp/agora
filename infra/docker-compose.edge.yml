@@ -6,8 +6,32 @@ volumes:
   appsec-data: null
   appsec-logs: null
   opensearch-data: null
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
   apisix-etcd:
+    logging: *default-logging
+    deploy: *default-limits
     image: bitnami/etcd:3.5
     container_name: opendesk-apisix-etcd
     environment:
@@ -28,6 +52,8 @@ services:
       start_period: 5s
     restart: unless-stopped
   apisix:
+    logging: *default-logging
+    deploy: *default-limits
     image: apache/apisix:3.9.0-debian
     container_name: opendesk-apisix
     environment:
@@ -57,6 +83,8 @@ services:
       start_period: 10s
     restart: unless-stopped
   openappsec:
+    logging: *default-logging
+    deploy: *default-limits
     image: ghcr.io/openappsec/agent:latest
     container_name: opendesk-openappsec
     ipc: shareable
@@ -81,6 +109,8 @@ services:
       start_period: 15s
     restart: unless-stopped
   apisix-appsec:
+    logging: *default-logging
+    deploy: *default-limits
     image: ghcr.io/openappsec/apisix-attachment:latest
     container_name: opendesk-apisix-appsec
     profiles:
@@ -113,6 +143,8 @@ services:
       start_period: 10s
     restart: unless-stopped
   opensearch:
+    logging: *default-logging
+    deploy: *default-limits
     image: opensearchproject/opensearch:2.13.0
     container_name: opendesk-opensearch
     environment:
@@ -149,6 +181,8 @@ services:
       start_period: 30s
     restart: unless-stopped
   opensearch-dashboards:
+    logging: *default-logging
+    deploy: *default-limits
     image: opensearchproject/opensearch-dashboards:2.13.0
     container_name: opendesk-opensearch-dashboards
     environment:
@@ -175,6 +209,8 @@ services:
       start_period: 40s
     restart: unless-stopped
   opensearch-init:
+    logging: *default-logging
+    deploy: *default-limits
     image: curlimages/curl:8.7.1
     container_name: opendesk-opensearch-init
     entrypoint:

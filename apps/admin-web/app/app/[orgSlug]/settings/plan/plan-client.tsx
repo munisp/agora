@@ -10,6 +10,7 @@
  */
 import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
@@ -35,54 +36,36 @@ const PLANS = [
 
 export function PlanClient({
   orgSlug,
-  currentUserId,
   isPlatformAdmin,
+  initialTenant,
+  initialIsOwner,
+  initialError,
 }: {
   orgSlug: string;
   currentUserId: string | null;
   isPlatformAdmin: boolean;
+  /** SPEC-W46 AW-2: fetched server-side in page.tsx. */
+  initialTenant: Tenant | null;
+  initialIsOwner: boolean;
+  initialError: string | null;
 }) {
   const { toast } = useToast();
-  const [tenant, setTenant] = React.useState<Tenant | null>(null);
-  const [isOwner, setIsOwner] = React.useState(false);
-  const [selected, setSelected] = React.useState<string>("");
-  const [error, setError] = React.useState<string | null>(null);
+  const router = useRouter();
+  const [tenant, setTenant] = React.useState<Tenant | null>(initialTenant);
+  const [isOwner, setIsOwner] = React.useState(initialIsOwner);
+  const [selected, setSelected] = React.useState<string>(
+    initialTenant?.plan ?? "",
+  );
+  const [error, setError] = React.useState<string | null>(initialError);
   const [busy, setBusy] = React.useState(false);
 
+  // Sync when the server props change (router.refresh() after save). The
+  // in-progress plan selection is deliberately not overwritten.
   React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const t = await api.get<Tenant>(`/api/identity/v1/tenants/${orgSlug}`);
-        if (cancelled) return;
-        setTenant(t);
-        setSelected(t.plan);
-      } catch (e) {
-        if (!cancelled)
-          setError(e instanceof ApiError ? e.message : "Failed to load plan.");
-      }
-      // Owner determination: find the caller's membership row. A missing row
-      // (or a failed read) fails safe — the change control stays hidden and
-      // the server-side 403 remains the enforcement of record.
-      if (currentUserId) {
-        try {
-          const data = await api.get<{
-            members?: { user_id: string; role: string }[];
-          }>(`/api/identity/v1/tenants/${orgSlug}/members`);
-          if (cancelled) return;
-          const me = (data.members ?? []).find(
-            (m) => m.user_id === currentUserId,
-          );
-          setIsOwner(me?.role === "owner");
-        } catch {
-          /* stay hidden */
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [orgSlug, currentUserId]);
+    setTenant(initialTenant);
+    setIsOwner(initialIsOwner);
+    setError(initialError);
+  }, [initialTenant, initialIsOwner, initialError]);
 
   const canChangePlan = isPlatformAdmin || isOwner;
 
@@ -99,6 +82,8 @@ export function PlanClient({
         title: res.changed ? "Plan updated" : "Plan unchanged",
         variant: "success",
       });
+      // SPEC-W46 AW-2: revalidate the server-fetched props.
+      router.refresh();
     } catch (e) {
       toast({
         title: "Plan change failed",

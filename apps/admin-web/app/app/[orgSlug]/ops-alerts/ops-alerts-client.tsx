@@ -27,7 +27,7 @@ import {
 } from "@/components/ui/table";
 import { formatDateTime } from "@/lib/utils";
 
-interface OpsAlert {
+export interface OpsAlert {
   id: string;
   event_id: string;
   tenant_id: string;
@@ -75,36 +75,68 @@ function severityVariant(
   return "secondary";
 }
 
-export function OpsAlertsClient({ orgSlug }: { orgSlug: string }) {
-  const [alerts, setAlerts] = React.useState<OpsAlert[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
+/**
+ * SPEC-W46 AW-4: page size for the bounded list. Must match the server-side
+ * fetch in page.tsx. The endpoint accepts limit (clamped to 500 server-side)
+ * but no cursor, so "load more" refetches with a larger limit.
+ */
+const PAGE_SIZE = 100;
+const MAX_LIMIT = 500;
 
-  const load = React.useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await api.get<{ alerts?: OpsAlert[] }>(
-        "/api/notifications/v1/ops-alerts",
-        { tenant: orgSlug, limit: 200 },
-      );
-      setAlerts(data.alerts ?? []);
-    } catch (e) {
-      setError(
-        e instanceof ApiError && e.status === 403
-          ? "Ops alerts require an admin role."
-          : e instanceof ApiError
-            ? e.message
-            : "Failed to load ops alerts.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [orgSlug]);
+export function OpsAlertsClient({
+  orgSlug,
+  initialAlerts,
+  initialError,
+}: {
+  orgSlug: string;
+  /** SPEC-W46 AW-2: first page fetched server-side in page.tsx. */
+  initialAlerts: OpsAlert[];
+  initialError: string | null;
+}) {
+  const [alerts, setAlerts] = React.useState<OpsAlert[]>(initialAlerts);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(initialError);
+  const [limit, setLimit] = React.useState(PAGE_SIZE);
 
+  // Keep the table in sync when the server props change (router.refresh()).
   React.useEffect(() => {
-    void load();
-  }, [load]);
+    setAlerts(initialAlerts);
+    setError(initialError);
+  }, [initialAlerts, initialError]);
+
+  const load = React.useCallback(
+    async (nextLimit: number = limit) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await api.get<{ alerts?: OpsAlert[] }>(
+          "/api/notifications/v1/ops-alerts",
+          { tenant: orgSlug, limit: nextLimit },
+        );
+        setAlerts(data.alerts ?? []);
+      } catch (e) {
+        setError(
+          e instanceof ApiError && e.status === 403
+            ? "Ops alerts require an admin role."
+            : e instanceof ApiError
+              ? e.message
+              : "Failed to load ops alerts.",
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [orgSlug, limit],
+  );
+
+  const loadMore = () => {
+    const nextLimit = Math.min(limit + PAGE_SIZE, MAX_LIMIT);
+    setLimit(nextLimit);
+    void load(nextLimit);
+  };
+
+  // A full page means there may be more rows on the server.
+  const canLoadMore = alerts.length >= limit && limit < MAX_LIMIT;
 
   return (
     <div>
@@ -160,6 +192,19 @@ export function OpsAlertsClient({ orgSlug }: { orgSlug: string }) {
           </TableBody>
         </Table>
       </Card>
+
+      {canLoadMore ? (
+        <div className="mt-3 flex justify-center">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={loadMore}
+            disabled={loading}
+          >
+            {loading ? "Loading…" : "Load more"}
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }

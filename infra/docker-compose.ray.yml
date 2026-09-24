@@ -46,9 +46,33 @@ networks:
 volumes:
   graph-ml-models: null  # shared with the graph stack: graphsage-vN artifacts
 
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
   # --------------------------- Ray head node -------------------------------
   ray-head:
+    logging: *default-logging
+    deploy: *default-limits
     # Overlay on the graph-ml torch overlay pattern (I5): graph-ml:latest
     # (heuristic base) + requirements-gnn.txt (torch/PyG — the Dockerfile.gnn
     # stack) + ray. Build the base first (see header). Pin an exact ray tag
@@ -97,6 +121,7 @@ services:
 
   # --------------------------- Ray workers ---------------------------------
   ray-worker:
+    logging: *default-logging
     # Same overlay image as ray-head (one build, two roles).
     build:
       context: ../services/graph-ml
@@ -112,6 +137,11 @@ services:
     # port mappings so replicas are legal.
     deploy:
       replicas: ${RAY_WORKER_REPLICAS:-2}
+      # W46-I C-01: default 1G/1.0 cap (see anchor comment) — replicas above.
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
     environment:
       GRAPH_ML_MODEL_DIR: /data/graph-ml-models
       RAY_DATASETS_ROOT: /datasets

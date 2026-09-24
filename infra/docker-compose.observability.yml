@@ -23,8 +23,32 @@ volumes:
   loki-data: null
   backups: null
 
+# ---------------------------------------------------------------------------
+# W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
+#   x-logging        — bound the json-file driver (was UNBOUNDED: a chatty
+#                      container could fill the host disk).
+#   x-deploy-limits  — default CPU/memory cap (compose v2 enforces
+#                      deploy.resources.limits outside swarm). One runaway
+#                      service (ollama/keycloak/temporal) can no longer
+#                      starve Postgres/API of memory. Per-service overrides:
+#                      postgres 2G/2.0, redis 512M/0.5, ollama* 4G, and a few
+#                      JVM/big-process services at 2G (see anchor comment).
+# ---------------------------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "1.0"
+      memory: 1G
+
 services:
   prometheus:
+    logging: *default-logging
+    deploy: *default-limits
     image: prom/prometheus:v2.53.1
     container_name: opendesk-prometheus
     restart: unless-stopped
@@ -48,6 +72,8 @@ services:
     networks: [opendesk]
 
   grafana:
+    logging: *default-logging
+    deploy: *default-limits
     image: grafana/grafana:11.1.0
     container_name: opendesk-grafana
     restart: unless-stopped
@@ -77,6 +103,8 @@ services:
     networks: [opendesk]
 
   otel-collector:
+    logging: *default-logging
+    deploy: *default-limits
     image: otel/opentelemetry-collector:0.104.0
     container_name: opendesk-otel-collector
     restart: unless-stopped
@@ -96,6 +124,8 @@ services:
     networks: [opendesk]
 
   loki:
+    logging: *default-logging
+    deploy: *default-limits
     image: grafana/loki:3.1.0
     container_name: opendesk-loki
     restart: unless-stopped
@@ -114,6 +144,8 @@ services:
     networks: [opendesk]
 
   promtail:
+    logging: *default-logging
+    deploy: *default-limits
     image: grafana/promtail:3.1.0
     container_name: opendesk-promtail
     restart: unless-stopped
@@ -132,6 +164,8 @@ services:
   # Long-running container with the docker CLI + the repo mounted; ofelia
   # triggers backup.sh inside it on a cron schedule.
   backup:
+    logging: *default-logging
+    deploy: *default-limits
     image: docker:27-cli
     container_name: opendesk-backup
     restart: unless-stopped
@@ -149,6 +183,8 @@ services:
     networks: [opendesk]
 
   ofelia:
+    logging: *default-logging
+    deploy: *default-limits
     image: mcuadros/ofelia:v0.14.1
     container_name: opendesk-ofelia
     restart: unless-stopped

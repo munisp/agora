@@ -26,10 +26,18 @@ class _FakeScan:
 
 
 class _FakeTable:
+    last_scan: dict | None = None
+
     def __init__(self, rows):
         self._rows = rows
 
-    def scan(self, selected_fields):
+    def scan(self, selected_fields, row_filter=None):
+        # W46-F P6: record the pushed-down predicate for assertion (the
+        # fake returns all rows so the in-Python reduction is exercised).
+        _FakeTable.last_scan = {
+            "selected_fields": selected_fields,
+            "row_filter": row_filter,
+        }
         return _FakeScan(self._rows)
 
 
@@ -143,3 +151,16 @@ def test_fetch_usage_missing_table_returns_empty(monkeypatch, settings):
 def test_fetch_usage_tenant_without_rows_returns_empty(monkeypatch, settings):
     monkeypatch.setattr(metering, "load_rest_catalog", lambda s: _FakeCatalog(_rows()))
     assert metering.fetch_usage(settings, "33333333-3333-3333-3333-333333333333") == []
+
+
+def test_scan_pushes_down_tenant_filter(monkeypatch, settings):
+    """W46-F P6: the Iceberg scan carries row_filter (tenant predicate) +
+    projected fields — no full-table scan per request."""
+    from pyiceberg.expressions import EqualTo
+
+    monkeypatch.setattr(metering, "load_rest_catalog", lambda s: _FakeCatalog(_rows()))
+    metering.fetch_usage(settings, T1)
+    scan = _FakeTable.last_scan
+    assert scan is not None
+    assert scan["selected_fields"] == metering._USAGE_FIELDS
+    assert scan["row_filter"] == EqualTo("tenant_id", T1)

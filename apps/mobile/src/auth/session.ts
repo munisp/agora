@@ -13,6 +13,56 @@ const KEY_TENANT_SLUG = "opendesk.tenant_slug";
 const KEY_USER_EMAIL = "opendesk.user_email";
 const KEY_DEVICE_TOKEN = "opendesk.device_token"; // expo push token we registered
 
+/**
+ * MB-3 (SPEC-W46): in-memory cache of the hot-path credentials
+ * (access token, refresh token, tenant slug). Every API call used to pay
+ * two SecureStore reads across the native bridge (Keychain /
+ * EncryptedSharedPreferences); now the first read populates this cache
+ * and subsequent calls are in-memory. The cache is INVALIDATED on every
+ * mutation (saveSession / updateTokens / clearSession) and primed by
+ * loadSession, so it can never serve a stale token after a write.
+ * SecureStore remains the source of truth (app restart, process death).
+ */
+interface CredentialCache {
+  accessToken: string | null;
+  refreshToken: string | null;
+  tenantSlug: string | null;
+}
+let credentialCache: CredentialCache | null = null;
+let credentialRead: Promise<CredentialCache> | null = null;
+/** Bumped on every invalidation so an in-flight read started BEFORE a
+ * write can never repopulate the cache with pre-write values. */
+let credentialGeneration = 0;
+
+async function readCredentials(): Promise<CredentialCache> {
+  if (credentialCache) return credentialCache;
+  if (!credentialRead) {
+    const gen = credentialGeneration;
+    credentialRead = Promise.all([
+      SecureStore.getItemAsync(KEY_ACCESS_TOKEN),
+      SecureStore.getItemAsync(KEY_REFRESH_TOKEN),
+      SecureStore.getItemAsync(KEY_TENANT_SLUG),
+    ]).then(
+      ([accessToken, refreshToken, tenantSlug]) => {
+        credentialRead = null;
+        const fresh: CredentialCache = { accessToken, refreshToken, tenantSlug };
+        if (gen === credentialGeneration) credentialCache = fresh;
+        return fresh;
+      },
+      (err) => {
+        credentialRead = null;
+        throw err;
+      },
+    );
+  }
+  return credentialRead;
+}
+
+function invalidateCredentialCache(): void {
+  credentialGeneration++;
+  credentialCache = null;
+}
+
 export interface StoredSession {
   accessToken: string;
   refreshToken: string | null;
@@ -40,6 +90,7 @@ export async function saveSession(s: {
   }
   await SecureStore.setItemAsync(KEY_TENANT_SLUG, s.tenantSlug);
   if (s.email) await SecureStore.setItemAsync(KEY_USER_EMAIL, s.email);
+  invalidateCredentialCache();
 }
 
 export async function loadSession(): Promise<StoredSession | null> {
@@ -53,6 +104,8 @@ export async function loadSession(): Promise<StoredSession | null> {
       SecureStore.getItemAsync(KEY_USER_EMAIL),
     ]);
   if (!accessToken || !tenantSlug) return null;
+  // Prime the MB-3 credential cache from the reads we already paid for.
+  credentialCache = { accessToken, refreshToken, tenantSlug };
   const expiresAt = expiresAtRaw ? Number(expiresAtRaw) : null;
   return {
     accessToken,
@@ -75,14 +128,20 @@ export async function updateTokens(t: {
     const at = Math.floor(Date.now() / 1000) + t.expiresIn;
     await SecureStore.setItemAsync(KEY_EXPIRES_AT, String(at));
   }
+  invalidateCredentialCache();
 }
 
 export async function getAccessToken(): Promise<string | null> {
-  return SecureStore.getItemAsync(KEY_ACCESS_TOKEN);
+  return (await readCredentials()).accessToken;
 }
 
 export async function getTenantSlug(): Promise<string | null> {
-  return SecureStore.getItemAsync(KEY_TENANT_SLUG);
+  return (await readCredentials()).tenantSlug;
+}
+
+/** Refresh token for the single-flight 401→refresh path (MB-2). */
+export async function getRefreshToken(): Promise<string | null> {
+  return (await readCredentials()).refreshToken;
 }
 
 /** The push token we most recently registered with POST /v1/devices. */
@@ -109,4 +168,5 @@ export async function clearSession(): Promise<void> {
     SecureStore.deleteItemAsync(KEY_USER_EMAIL),
     SecureStore.deleteItemAsync(KEY_DEVICE_TOKEN),
   ]);
+  invalidateCredentialCache();
 }

@@ -121,6 +121,23 @@ export interface FieldCaptureRequest {
   items: FieldCaptureItem[];
 }
 
+/**
+ * Per-item outcome of POST /v1/field/capture — mirrors
+ * fieldcapture.ItemResult (services/booking-service/internal/fieldcapture/
+ * fieldcapture.go): status applied | deduped | error, with the server-side
+ * entity id / validation message where relevant.
+ */
+export interface FieldCaptureItemResult {
+  client_id: string;
+  kind?: string;
+  status: "applied" | "deduped" | "error" | string;
+  lead_id?: string;
+  checkin_id?: string;
+  case_id?: string;
+  case_ref?: string;
+  error?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Referrals + commissions (SPEC-W14)
 // ---------------------------------------------------------------------------

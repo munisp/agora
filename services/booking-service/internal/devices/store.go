@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/opendesk/booking-service/internal/config"
 )
 
 // Store persists device tokens. Same packaging idiom as the W14
@@ -36,7 +37,7 @@ func DialStore(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse postgres config: %w", err)
 	}
-	poolCfg.MaxConns = 4
+	poolCfg.MaxConns = config.SatellitePoolMaxConns()
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
