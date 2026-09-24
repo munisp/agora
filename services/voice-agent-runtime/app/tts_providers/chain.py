@@ -26,12 +26,12 @@ CircuitBreaker (``tts_cb_failures`` consecutive failures -> open for
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from typing import Any, AsyncIterator, Callable
 
 from .. import metrics
 from ..logging import get_logger
 from ..pipeline.llm import CircuitBreaker
-from ..pipeline.tts import PiperTTS, _wav_to_pcm
+from ..pipeline.tts import PiperTTS, TtsLruCache, _wav_to_pcm, split_sentences
 from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
 from .mms import MmsTTS
@@ -91,6 +91,7 @@ class FallbackTTS:
         cooldown_s: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
         sample_rate: int = 22050,
+        cache_size: int = 256,
     ) -> None:
         self._providers = dict(providers)
         # Stable chain order: configured order first, then any implicit
@@ -107,6 +108,9 @@ class FallbackTTS:
         # Routing state (set by callers the same way PiperTTS.voice is set).
         self.voice = ""
         self.language = ""
+        # SPEC-W46 P4: chain-level LRU keyed (voice, text, format) covering
+        # every provider (the piper adapter additionally caches internally).
+        self._cache = TtsLruCache(cache_size)
 
     # ------------------------------------------------------------- accessors
     @property
@@ -215,16 +219,28 @@ class FallbackTTS:
         )
 
     async def synthesize_pcm(self, text: str) -> bytes:
-        """TTSInterface: signed-16-bit mono PCM at ``sample_rate``."""
+        """TTSInterface: signed-16-bit mono PCM at ``sample_rate``.
+
+        SPEC-W46 P4: results are cached per (voice, language, text); the
+        cache deliberately lives ABOVE synthesize() so repeated utterances
+        skip the provider chain entirely (the circuit breakers keep
+        accounting only real synthesis attempts).
+        """
         text = text.strip()
         if not text:
             return b""
+        cache_key = (f"{self.voice}|{self.language}", text, "pcm")
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            metrics.session_tts()  # cache hit still counts as served
+            return cached
         try:
             with metrics.get_registry().tts_latency.time():
                 wav = await self.synthesize(text)
                 pcm, rate = _wav_to_pcm(wav)
         finally:
             metrics.session_tts()  # per-session quality accumulator
+        self._cache.set(cache_key, pcm)
         if rate != self.sample_rate:
             log.warning(
                 "tts sample rate mismatch; audio may be pitched",
@@ -232,6 +248,39 @@ class FallbackTTS:
                 got=rate,
             )
         return pcm
+
+    async def stream_pcm(self, text: str) -> AsyncIterator[bytes]:
+        """Sentence-level streaming synthesis (SPEC-W46 P4).
+
+        Full-utterance cache hits ship the whole buffer immediately;
+        otherwise sentence chunks are synthesized through the chain in
+        order, so the first audio frame is available after the FIRST
+        chunk instead of the full utterance. Chunk PCM is concatenated
+        into the full-utterance cache entry for the next repeat.
+        """
+        text = text.strip()
+        if not text:
+            return
+        cache_key = (f"{self.voice}|{self.language}", text, "pcm")
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            metrics.session_tts()
+            yield cached
+            return
+        chunks = split_sentences(text)
+        if len(chunks) <= 1:
+            pcm = await self.synthesize_pcm(text)
+            if pcm:
+                yield pcm
+            return
+        parts: list[bytes] = []
+        for chunk in chunks:
+            pcm = await self.synthesize_pcm(chunk)
+            if pcm:
+                parts.append(pcm)
+                yield pcm
+        if parts:
+            self._cache.set(cache_key, b"".join(parts))
 
 
 def build_provider(name: str, settings: Any) -> TTSProvider:
@@ -244,6 +293,7 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
             piper_bin=settings.piper_bin,
             model_dir=settings.piper_model_dir,
             sample_rate=settings.piper_sample_rate,
+            cache_size=getattr(settings, "tts_cache_size", 256),
         )
         voices = [settings.piper_voice, *settings.piper_voice_map.values()]
         return PiperProvider(piper, voices=voices)
@@ -292,4 +342,5 @@ def build_fallback_tts(settings: Any) -> FallbackTTS:
         failure_threshold=settings.tts_cb_failures,
         cooldown_s=settings.tts_cb_cooldown_s,
         sample_rate=settings.piper_sample_rate,
+        cache_size=getattr(settings, "tts_cache_size", 256),
     )

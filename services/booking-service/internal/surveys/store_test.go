@@ -239,7 +239,7 @@ func TestInvitesAndSubmit(t *testing.T) {
 	if err != nil || stats.Responses != 1 || stats.InvitesAnswered != 1 || stats.InvitesExpired != 1 {
 		t.Fatalf("stats = %+v, %v", stats, err)
 	}
-	responses, total, truncated, err := st.ListResponses(ctx, tenantID, sv.ID)
+	responses, total, truncated, err := st.ListResponses(ctx, tenantID, sv.ID, 0, 0)
 	if err != nil || total != 1 || truncated || len(responses) != 1 {
 		t.Fatalf("list responses = %d/%d/%v, %v", len(responses), total, truncated, err)
 	}
