@@ -852,6 +852,55 @@ func (s *Store) RedeemCSATToken(ctx context.Context, token string, rating int, c
 	return t, nil
 }
 
+// RecordStaffCSAT records a CSAT rating (1-5) on a ticket from the STAFF
+// side (SPEC-W47 W47-A item 2, A-UIWEB UIWEB-05): POST
+// /v1/helpdesk/tickets/{id}/csat-note, Permify-gated by the staff group —
+// the public capability-token flow (RedeemCSATToken) is untouched. Same
+// state rule as the customer path: only resolved|closed tickets can be
+// rated (ErrInvalidTransition otherwise). Re-recording overwrites the prior
+// rating (staff correction) and appends a 'note' timeline event carrying
+// the rating and actor — the free-text comment stays ONLY on the ticket
+// row (not duplicated into the audit payload, so the W47 tenant-erasure
+// NULL of tickets.csat_comment remains complete).
+func (s *Store) RecordStaffCSAT(ctx context.Context, tenantID, ticketID uuid.UUID, rating int, comment, actor string) (Ticket, error) {
+	var t Ticket
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		t, err = scanTicket(tx.QueryRow(ctx,
+			`SELECT `+ticketCols+` FROM tickets WHERE tenant_id=$1 AND id=$2 FOR UPDATE`, tenantID, ticketID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if t.Status != StatusResolved && t.Status != StatusClosed {
+			return fmt.Errorf("%w: csat can only be recorded on a resolved or closed ticket", ErrInvalidTransition)
+		}
+		var commentArg *string
+		if c := strings.TrimSpace(comment); c != "" {
+			commentArg = &c
+		}
+		if err := tx.QueryRow(ctx,
+			`UPDATE tickets SET csat_rating=$3, csat_comment=$4, csat_at=now(), updated_at=now()
+			 WHERE tenant_id=$1 AND id=$2
+			 RETURNING csat_at, updated_at`, tenantID, ticketID, rating, commentArg).
+			Scan(&t.CSATAt, &t.UpdatedAt); err != nil {
+			return err
+		}
+		if err := insertEvent(ctx, tx, tenantID, ticketID, "note", actor, map[string]any{
+			"csat_staff": true,
+			"rating":     rating,
+		}); err != nil {
+			return err
+		}
+		t.CSATRating = &rating
+		t.CSATComment = commentArg
+		return nil
+	})
+	return t, err
+}
+
 // leastLoadedMember picks the active team member with the fewest
 // open|pending tickets (ties broken by name) — the SPEC-W19 "auto"
 // assignment rule. team_members is the core booking table (read-only here);
