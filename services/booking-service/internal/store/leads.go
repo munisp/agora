@@ -61,7 +61,9 @@ type PromoRedemption struct {
 // Campaign mirrors booking.campaigns: the minimal general marketing-campaign
 // entity the CAC spend endpoint attaches to (geo_campaigns stays the Wave-8
 // PostGIS-coupled sibling; leads.campaign_id may reference either — no FK by
-// design).
+// design). SPEC-W47 (W47-A item 7, A-DB DB-07): Status makes the entity
+// manageable end-to-end — active ↔ paused, → cancelled (terminal
+// soft-delete; the row + its spend ledger stay for CAC audit).
 type Campaign struct {
 	ID        uuid.UUID  `json:"id"`
 	TenantID  uuid.UUID  `json:"tenant_id"`
@@ -69,8 +71,16 @@ type Campaign struct {
 	Channel   string     `json:"channel"`
 	StartsAt  *time.Time `json:"start_ts"`
 	EndsAt    *time.Time `json:"end_ts"`
+	Status    string     `json:"status"`
 	CreatedAt time.Time  `json:"created_at"`
 }
+
+// Campaign status values (SPEC-W47 item 7).
+const (
+	CampaignStatusActive    = "active"
+	CampaignStatusPaused    = "paused"
+	CampaignStatusCancelled = "cancelled" // terminal soft-delete
+)
 
 // CampaignView is a Campaign plus its lifetime spend sum (GET /v1/campaigns).
 type CampaignView struct {
@@ -183,8 +193,16 @@ CREATE TABLE IF NOT EXISTS campaigns (
     channel    TEXT NOT NULL DEFAULT '',
     starts_at  TIMESTAMPTZ,
     ends_at    TIMESTAMPTZ,
+    status     TEXT NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- SPEC-W47 (W47-A item 7, A-DB DB-07): the lifecycle status column +
+-- constraint on pre-existing databases (CREATE TABLE IF NOT EXISTS never
+-- alters an existing table). Idempotent.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+ALTER TABLE campaigns DROP CONSTRAINT IF EXISTS campaigns_status_check;
+ALTER TABLE campaigns ADD CONSTRAINT campaigns_status_check
+    CHECK (status IN ('active','paused','cancelled'));
 CREATE INDEX IF NOT EXISTS idx_campaigns_tenant ON campaigns (tenant_id, created_at);
 ALTER TABLE campaigns ENABLE ROW LEVEL SECURITY;
 ALTER TABLE campaigns FORCE ROW LEVEL SECURITY;
@@ -542,27 +560,28 @@ var ErrPromoExhausted = errors.New("promo code exhausted")
 // Campaigns + spend
 // ---------------------------------------------------------------------------
 
-// CreateCampaign inserts a campaign.
+const campaignCols = `id, tenant_id, name, channel, starts_at, ends_at, status, created_at`
+
+// CreateCampaign inserts a campaign (status defaults to 'active').
 func (s *Store) CreateCampaign(ctx context.Context, c *Campaign) error {
 	if c.ID == uuid.Nil {
 		c.ID = uuid.New()
 	}
 	const q = `INSERT INTO campaigns (id, tenant_id, name, channel, starts_at, ends_at, created_at)
-		           VALUES ($1,$2,$3,$4,$5,$6,now()) RETURNING created_at`
+		           VALUES ($1,$2,$3,$4,$5,$6,now()) RETURNING status, created_at`
 	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, q, c.ID, c.TenantID, c.Name, c.Channel, c.StartsAt, c.EndsAt).
-			Scan(&c.CreatedAt)
+			Scan(&c.Status, &c.CreatedAt)
 	})
 }
 
 // GetCampaign fetches one campaign scoped to a tenant.
 func (s *Store) GetCampaign(ctx context.Context, tenantID, id uuid.UUID) (Campaign, error) {
-	const q = `SELECT id, tenant_id, name, channel, starts_at, ends_at, created_at
-		           FROM campaigns WHERE tenant_id=$1 AND id=$2`
+	const q = `SELECT ` + campaignCols + ` FROM campaigns WHERE tenant_id=$1 AND id=$2`
 	var c Campaign
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, q, tenantID, id).Scan(&c.ID, &c.TenantID, &c.Name,
-			&c.Channel, &c.StartsAt, &c.EndsAt, &c.CreatedAt)
+			&c.Channel, &c.StartsAt, &c.EndsAt, &c.Status, &c.CreatedAt)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return c, ErrNotFound
@@ -570,16 +589,119 @@ func (s *Store) GetCampaign(ctx context.Context, tenantID, id uuid.UUID) (Campai
 	return c, err
 }
 
+// ErrCampaignCancelled marks mutations attempted on a cancelled (soft-
+// deleted) campaign — the status is terminal, the spend ledger stays as
+// the CAC audit trail (SPEC-W47 item 7).
+var ErrCampaignCancelled = errors.New("campaign is cancelled")
+
+// CampaignUpdate carries the mutable fields of PATCH /v1/campaigns/{id}
+// (nil = leave unchanged).
+type CampaignUpdate struct {
+	Name     *string
+	Channel  *string
+	StartsAt *time.Time
+	EndsAt   *time.Time
+	// Status, when non-empty, must be a legal transition from the current
+	// status: active ↔ paused, anything → cancelled; cancelled is terminal.
+	Status string
+}
+
+// UpdateCampaign applies a partial update to a campaign (SPEC-W47 W47-A
+// item 7, A-DB DB-07). A cancelled campaign rejects every mutation with
+// ErrCampaignCancelled (the service maps it to 409); an invalid status
+// value or transition answers ErrInvalidCampaignStatus. Returns the updated
+// row.
+func (s *Store) UpdateCampaign(ctx context.Context, tenantID, id uuid.UUID, u CampaignUpdate) (Campaign, error) {
+	var c Campaign
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		c, err = scanCampaign(tx.QueryRow(ctx,
+			`SELECT `+campaignCols+` FROM campaigns WHERE tenant_id=$1 AND id=$2 FOR UPDATE`, tenantID, id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if c.Status == CampaignStatusCancelled {
+			return ErrCampaignCancelled
+		}
+		if u.Status != "" && u.Status != c.Status {
+			switch u.Status {
+			case CampaignStatusActive:
+				if c.Status != CampaignStatusPaused {
+					return fmt.Errorf("%w: %s → %s", ErrInvalidCampaignStatus, c.Status, u.Status)
+				}
+			case CampaignStatusPaused:
+				if c.Status != CampaignStatusActive {
+					return fmt.Errorf("%w: %s → %s", ErrInvalidCampaignStatus, c.Status, u.Status)
+				}
+			case CampaignStatusCancelled:
+				// active|paused → cancelled: always legal (terminal).
+			default:
+				return fmt.Errorf("%w: unknown status %q", ErrInvalidCampaignStatus, u.Status)
+			}
+			c.Status = u.Status
+		}
+		if u.Name != nil {
+			c.Name = *u.Name
+		}
+		if u.Channel != nil {
+			c.Channel = *u.Channel
+		}
+		if u.StartsAt != nil {
+			c.StartsAt = u.StartsAt
+		}
+		if u.EndsAt != nil {
+			c.EndsAt = u.EndsAt
+		}
+		return scanCampaignInto(tx.QueryRow(ctx,
+			`UPDATE campaigns SET name=$3, channel=$4, starts_at=$5, ends_at=$6, status=$7
+			 WHERE tenant_id=$1 AND id=$2 RETURNING `+campaignCols,
+			tenantID, id, c.Name, c.Channel, c.StartsAt, c.EndsAt, c.Status), &c)
+	})
+	return c, err
+}
+
+// ErrInvalidCampaignStatus marks an unknown campaign status or an illegal
+// lifecycle transition (SPEC-W47 item 7).
+var ErrInvalidCampaignStatus = errors.New("invalid campaign status")
+
+// CancelCampaign soft-deletes a campaign (status → cancelled). Idempotent:
+// cancelling an already-cancelled campaign returns the row unchanged.
+func (s *Store) CancelCampaign(ctx context.Context, tenantID, id uuid.UUID) (Campaign, error) {
+	c, err := s.GetCampaign(ctx, tenantID, id)
+	if err != nil {
+		return c, err
+	}
+	if c.Status == CampaignStatusCancelled {
+		return c, nil
+	}
+	return s.UpdateCampaign(ctx, tenantID, id, CampaignUpdate{Status: CampaignStatusCancelled})
+}
+
+func scanCampaign(row pgx.Row) (Campaign, error) {
+	var c Campaign
+	err := scanCampaignInto(row, &c)
+	return c, err
+}
+
+func scanCampaignInto(row pgx.Row, c *Campaign) error {
+	return row.Scan(&c.ID, &c.TenantID, &c.Name, &c.Channel, &c.StartsAt, &c.EndsAt, &c.Status, &c.CreatedAt)
+}
+
 // ListCampaignsWithSpend returns all campaigns of a tenant with their
 // lifetime spend sums (GET /v1/campaigns — analytics dashboard read).
+// SPEC-W47 item 7: cancelled (soft-deleted) campaigns stay listed — the
+// spend audit trail must remain visible; consumers filter by status.
 func (s *Store) ListCampaignsWithSpend(ctx context.Context, tenantID uuid.UUID) ([]CampaignView, error) {
-	const q = `SELECT c.id, c.tenant_id, c.name, c.channel, c.starts_at, c.ends_at, c.created_at,
-		                  COALESCE(SUM(s.amount_ngn), 0)::float8 AS spend_ngn
-		           FROM campaigns c
-		           LEFT JOIN campaign_spend s ON s.tenant_id = c.tenant_id AND s.campaign_id = c.id
-		           WHERE c.tenant_id = $1
-		           GROUP BY c.id
-		           ORDER BY c.created_at DESC LIMIT 500`
+	const q = `SELECT c.id, c.tenant_id, c.name, c.channel, c.starts_at, c.ends_at, c.status, c.created_at,
+	                  COALESCE(SUM(s.amount_ngn), 0)::float8 AS spend_ngn
+	           FROM campaigns c
+	           LEFT JOIN campaign_spend s ON s.tenant_id = c.tenant_id AND s.campaign_id = c.id
+	           WHERE c.tenant_id = $1
+	           GROUP BY c.id
+	           ORDER BY c.created_at DESC LIMIT 500`
 	var out []CampaignView
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID)
@@ -590,7 +712,7 @@ func (s *Store) ListCampaignsWithSpend(ctx context.Context, tenantID uuid.UUID) 
 		for rows.Next() {
 			var v CampaignView
 			if err := rows.Scan(&v.ID, &v.TenantID, &v.Name, &v.Channel, &v.StartsAt,
-				&v.EndsAt, &v.CreatedAt, &v.SpendNGN); err != nil {
+				&v.EndsAt, &v.Status, &v.CreatedAt, &v.SpendNGN); err != nil {
 				return err
 			}
 			out = append(out, v)
@@ -603,17 +725,24 @@ func (s *Store) ListCampaignsWithSpend(ctx context.Context, tenantID uuid.UUID) 
 // UpsertCampaignSpend records spend for one (campaign, day, channel) with
 // SET semantics: reposting the same key REPLACES the amount, so a retried
 // POST /v1/campaigns/{id}/spend never double-counts. The campaign must
-// exist in the tenant (FK + explicit check → ErrNotFound).
+// exist in the tenant (explicit check → ErrNotFound) and must not be
+// cancelled (SPEC-W47 item 7: no new spend against a soft-deleted campaign
+// → ErrCampaignCancelled; the historical spend rows stay as the CAC audit
+// trail).
 func (s *Store) UpsertCampaignSpend(ctx context.Context, sp *CampaignSpend) error {
 	return s.withTenant(ctx, sp.TenantID, func(tx pgx.Tx) error {
-		var exists bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM campaigns WHERE tenant_id=$1 AND id=$2)`,
-			sp.TenantID, sp.CampaignID).Scan(&exists); err != nil {
+		var status string
+		err := tx.QueryRow(ctx,
+			`SELECT status FROM campaigns WHERE tenant_id=$1 AND id=$2`,
+			sp.TenantID, sp.CampaignID).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
 			return err
 		}
-		if !exists {
-			return ErrNotFound
+		if status == CampaignStatusCancelled {
+			return ErrCampaignCancelled
 		}
 		const q = `INSERT INTO campaign_spend (tenant_id, campaign_id, day, channel, amount_ngn, created_at, updated_at)
 			           VALUES ($1,$2,$3::date,$4,$5,now(),now())
@@ -631,7 +760,7 @@ func (s *Store) UpsertCampaignSpend(ctx context.Context, sp *CampaignSpend) erro
 // analytics-service (SPEC-W13 §4/§5).
 func (s *Store) CampaignSpendSum(ctx context.Context, tenantID, campaignID uuid.UUID, from, to *time.Time) (total float64, byChannel []ChannelSpend, err error) {
 	q := `SELECT channel, COALESCE(SUM(amount_ngn),0)::float8
-		           FROM campaign_spend WHERE tenant_id=$1 AND campaign_id=$2`
+	           FROM campaign_spend WHERE tenant_id=$1 AND campaign_id=$2`
 	args := []any{tenantID, campaignID}
 	n := 2
 	if from != nil {
