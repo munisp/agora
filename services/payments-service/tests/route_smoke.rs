@@ -55,6 +55,8 @@ mod payouts;
 mod registry;
 #[path = "../src/routes.rs"]
 mod routes;
+#[path = "../src/tenant.rs"]
+mod tenant;
 #[path = "../src/transfers.rs"]
 mod transfers;
 
@@ -175,6 +177,7 @@ fn test_config() -> config::Config {
         internal_token: None,
         trust_direct_tenant: true,
         database_url: None,
+        internal_database_url: None,
         payout_reconciler_interval_secs: 30,
         money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,
@@ -1006,7 +1009,11 @@ async fn k7_deposit_provenance_records_declared_by() {
     let deposit_id = resp.json::<serde_json::Value>().await.unwrap()["deposit_id"]
         .as_str().unwrap().to_string();
 
-    let prov = handles.registry.deposit_provenance(&deposit_id).await.unwrap()
+    let prov = handles
+        .registry
+        .deposit_provenance(&deposit_id, "t-d")
+        .await
+        .unwrap()
         .expect("provenance recorded");
     assert_eq!(prov.declared_by, "user-42");
     assert_eq!(prov.psp_reference.as_deref(), Some("fw-tx-998"));
@@ -1024,7 +1031,12 @@ async fn k7_deposit_provenance_records_declared_by() {
         }))
         .send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
-    let prov = handles.registry.deposit_provenance(&deposit_id).await.unwrap().unwrap();
+    let prov = handles
+        .registry
+        .deposit_provenance(&deposit_id, "t-d")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(prov.declared_by, "user-42", "first record wins");
 }
 
