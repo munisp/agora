@@ -391,6 +391,14 @@ routes:
       - /api/payments/activities/*
       - /api/payments/internal
       - /api/payments/internal/*
+      # GW-07 (SPEC-W47): payments-service internals live one level deeper
+      # (src/routes.rs — /v1/internal/accounts/provision etc. -> gateway path
+      # /api/payments/v1/internal/*). Defense-in-depth on top of the
+      # service-side X-Internal-Token gate (the edge strips that header
+      # globally, so these were never reachable — keep it that way even if a
+      # future route plugin re-injects tokens).
+      - /api/payments/v1/internal
+      - /api/payments/v1/internal/*
     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     priority: 10
     plugins:
@@ -505,6 +513,12 @@ routes:
       - /api/graph/activities/*
       - /api/graph/internal
       - /api/graph/internal/*
+      # GW-07 (SPEC-W47): graph-service internals live one level deeper
+      # (app/routers/internal_*.py — prefix /v1/graph/internal/* -> gateway
+      # path /api/graph/v1/graph/internal/*). Same defense-in-depth rationale
+      # as block-payments-internal.
+      - /api/graph/v1/graph/internal
+      - /api/graph/v1/graph/internal/*
     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     priority: 10
     plugins:
@@ -526,6 +540,83 @@ routes:
         block_rules: [".*"]
         rejected_code: 404
         rejected_msg: "not found"
+
+  # GW-01 (SPEC-W47): POST /v1/incidents/ingest is a service-to-service
+  # surface by design (booking-service registers it root-level with NO tenant
+  # middleware; the handler reads the tenant from the body and triggers
+  # auto-dispatch + SMS/WhatsApp outreach). Through the gateway it was
+  # reachable by ANY valid user JWT on the api-bookings wildcard. Its only
+  # caller (messaging-gateway) reaches booking-service in-cluster directly,
+  # so the edge path is closed outright — 404 like the internal blockers.
+  - id: block-bookings-incidents-ingest
+    uris:
+      - /api/bookings/v1/incidents/ingest
+      - /api/bookings/v1/incidents/ingest/
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  # GW-06 (SPEC-W47): POST /v1/leads/resolve is Dapr-internal by design
+  # (booking-service leads_resolve.go: "Invoked ONLY by notification-worker
+  # via Dapr") and bulk-resolves up to 500 lead->E.164-phone mappings per
+  # call — a PII export endpoint. It rode the api-bookings OIDC wildcard
+  # reachable by any tenant member. The only caller invokes it via Dapr
+  # service invocation (in-cluster, never through the gateway), so the edge
+  # path 404s.
+  - id: block-bookings-leads-resolve
+    uris:
+      - /api/bookings/v1/leads/resolve
+      - /api/bookings/v1/leads/resolve/
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  # ---- Public consent capture (GW-05 / SPEC-W47) --------------------------
+  # POST /v1/consents is PUBLIC BY DESIGN at the service (identity-service
+  # internal/consent/handlers.go: "consent is captured at PUBLIC surfaces …
+  # BEFORE they hold any credential"). Anonymous like api-bookings-public,
+  # with the stricter limit-count of an auth-adjacent surface. Exact-URI +
+  # POST-only: the radix tree prefers this route over the /api/identity/*
+  # OIDC wildcard for POST, while GET /v1/consents (subject list) and
+  # POST /v1/consents/erasure stay on the authenticated api-identity route
+  # (method/URI mismatch here falls through to it). No OIDC; no header
+  # injection — the service applies its own fail-closed gates.
+  - id: api-identity-consents-public
+    uris:
+      - /api/identity/v1/consents
+      - /api/identity/v1/consents/
+    methods: [POST, OPTIONS]
+    upstream_id: identity
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/identity/v1/consents/?$"
+          - "/v1/consents"
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "POST,OPTIONS"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
 
   # ---- Service APIs: JWT (HS256 dev) + redis-backed rate limiting + CORS ----
   - id: api-identity
@@ -712,6 +803,51 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- Public waitlist claim (GW-03 / SPEC-W45 K13) -----------------------
+  # The K13 claim page (/p/[siteSlug]/claim?token=...) is ANONYMOUS: the
+  # claim_token (random UUID, emailed/SMSed, single-use) is itself the
+  # capability — booking-service registers these two endpoints root-level
+  # with no tenant middleware and rate-limits per token + per IP
+  # (internal/httpapi/waitlist.go). Only the two token-capability endpoints
+  # are public here:
+  #   GET  /api/bookings/v1/waitlist/claim-info?token=...  (claim preview)
+  #   POST /api/bookings/v1/waitlist/claim  {token}        (perform claim)
+  # Exact URIs only — the tenant-scoped POST /v1/waitlist/{id}/claim and all
+  # other /v1/waitlist/* admin routes stay on the OIDC api-bookings route
+  # (exact match wins over the /api/bookings/* wildcard; a different path
+  # falls through to OIDC). No OIDC, no header injection; redis limit-count
+  # (replica-independent) on top of the service-side token/IP limiter.
+  - id: api-bookings-waitlist-claim
+    uris:
+      - /api/bookings/v1/waitlist/claim-info
+      - /api/bookings/v1/waitlist/claim
+      - /api/bookings/v1/waitlist/claim-info/
+      - /api/bookings/v1/waitlist/claim/
+    methods: [GET, POST, OPTIONS]
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/bookings/?(.*)"
+          - "/$1"
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
   - id: api-bookings
     uris:
       - /api/bookings/*
@@ -822,8 +958,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -944,8 +1089,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1084,8 +1238,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1206,8 +1369,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1328,8 +1500,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1454,8 +1635,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1597,8 +1787,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1721,8 +1920,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -1848,8 +2056,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         allow_origins: "http://localhost:3001,http://localhost:9080"
@@ -1973,11 +2190,19 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
-        # admin-web origin (direct dev) + gateway origin (served via APISIX).
         allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
@@ -2128,11 +2353,19 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
-        # admin-web origin (direct dev) + gateway origin (served via APISIX).
         allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
@@ -2209,8 +2442,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         allow_origins: "*"
         allow_methods: "GET,OPTIONS"
@@ -2407,8 +2649,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -2448,8 +2699,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
         # admin-web origin (direct dev) + gateway origin (served via APISIX).
@@ -2482,8 +2742,17 @@ routes:
         key: remote_addr
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         allow_origins: "*"
         allow_methods: "*"
@@ -2742,8 +3011,17 @@ routes:
         key: http_x_tenant_plan
         policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
         # removes the shared-Redis RTT from this route's hot path.
-        # Redis policy is retained only on auth-sensitive and
-        # public-unauthenticated money/webhook ingress routes.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
       cors:
         allow_origins: "*"
         allow_methods: "*"
