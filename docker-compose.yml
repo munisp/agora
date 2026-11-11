@@ -19,10 +19,13 @@ networks:
 # superuser bypasses FORCE ROW LEVEL SECURITY, so tenant isolation is only
 # real when runtime traffic uses the app roles.
 #   migrated:  identity, booking, notification, conversation, knowledge,
-#              crm-sync, billing-engine, kyc
+#              crm-sync, billing-engine, kyc, payments (W47 / A-DB DB-01:
+#              PAYMENTS_DATABASE_URL -> app_payments_login on the dedicated
+#              payments DB, PAYMENTS_INTERNAL_DATABASE_URL ->
+#              app_payments_internal_login for the cross-tenant reconciler)
 #   still superuser (no per-service role exists yet — their PG_DSN is a base
-#   DSN for cross-DB/infra access or TigerBeetle-backed): payments, edge,
-#   voice, analytics. Extend 05-app-roles.sql before migrating these.
+#   DSN for cross-DB/infra access): edge, voice, analytics.
+#   Extend 05-app-roles.sql before migrating these.
 # ---------------------------------------------------------------------------
 x-app-env:
   DAPR_HOST: ${DAPR_HOST:-}
@@ -537,7 +540,16 @@ services:
   payments:
     logging: *default-logging
     deploy: *default-limits
-    build: ./services/payments-service
+    build:
+      context: ./services/payments-service
+      args:
+        # MW-M2 (SPEC-W47): CARGO_FEATURES passthrough (edge models the
+        # pattern below). Default "" = sim-ledger build. The LIVE TigerBeetle
+        # wiring (build-arg + LEDGER_IMPL=tigerbeetle) ships as the
+        # documented override infra/compose/tigerbeetle.compose.yml — the
+        # Dockerfile ARG here takes the FULL flag string ("--features
+        # tb-live"), unlike edge's bare feature name.
+        CARGO_FEATURES: ${PAYMENTS_CARGO_FEATURES:-}
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
     env_file:
@@ -548,7 +560,26 @@ services:
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
-      PG_DSN: postgres://opendesk:opendesk@postgres:5432
+      # DB-01 (SPEC-W47 / A-DB CRIT): payments moved OFF the bootstrap
+      # superuser onto the least-privilege roles from
+      # infra/postgres/init-scripts (00 creates the `payments` database; 05
+      # creates app_payments(_login) + app_payments_internal(_login) with
+      # grants). FORCE ROW LEVEL SECURITY (migrations/0001_rls.sql, applied
+      # by the service at boot) only binds non-superuser roles, so this DSN
+      # swap is what makes the tenant_isolation policies real.
+      # MIGRATION/BOOTSTRAP NOTE (billing idiom): on a database whose tables
+      # were created by the OLD superuser DSN, the RLS migration must run
+      # once as the table owner — set PAYMENTS_PG_USER=opendesk
+      # PAYMENTS_PG_PASS=opendesk for that bootstrap deploy, then revert.
+      # Fresh volumes bootstrap cleanly on the least-privilege role (05
+      # grants CREATE ON SCHEMA public to app_payments for exactly this).
+      PAYMENTS_DATABASE_URL: postgres://${PAYMENTS_PG_USER:-app_payments_login}:${PAYMENTS_PG_PASS:-app_payments_dev_password}@postgres:5432/payments
+      # Cross-tenant internal jobs (payout reconciler sweep, approval-path
+      # tenant lookup) connect as app_payments_internal_login — the RLS
+      # policies gate that escape on pg_has_role (not a spoofable GUC).
+      # W47-D config reads PAYMENTS_INTERNAL_DATABASE_URL; when unset the
+      # service falls back to the main pool.
+      PAYMENTS_INTERNAL_DATABASE_URL: postgres://${PAYMENTS_INTERNAL_PG_USER:-app_payments_internal_login}:${PAYMENTS_INTERNAL_PG_PASS:-app_payments_internal_dev_password}@postgres:5432/payments
       KEYCLOAK_URL: http://keycloak:8080
       PERMIFY_URL: http://permify:3476
       TEMPORAL_HOST_PORT: temporal:7233
@@ -558,7 +589,9 @@ services:
       PORT: '7004'
       # DEV ONLY — mock rail: in-memory sim ledger (ADR-0007) so the dev
       # stack boots without a TigerBeetle client; prod sets LEDGER_IMPL=tigerbeetle
-      # explicitly. Sim postings move NO real money.
+      # explicitly. Sim postings move NO real money. Live wiring from compose:
+      # -f infra/compose/tigerbeetle.compose.yml (MW-M2 / SPEC-W47) — it
+      # rebuilds with --features tb-live AND flips this var together.
       LEDGER_IMPL: ${LEDGER_IMPL:-sim}
       # W39 RS-007 env-name fix: payments-service reads TB_ADDRESSES
       # (src/config.rs, default tigerbeetle:3000) — the previous
@@ -795,7 +828,16 @@ services:
       # block's BOOKING_INTERNAL_TOKEN (SAME shared secret var, distinct
       # caller-side name per contract).
       CONVERSATION_BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+      # Transcript sink (SPEC §5, MW-M1/W47-H): kafka is the default and the
+      # only path the SHIPPED image can serve — the FluvioSink path requires
+      # the optional `fluvio` pip extra (pyproject.toml `fluvio` extra) which
+      # the Dockerfile does NOT install yet (service-code change, flagged to
+      # the lead). With TRANSCRIPT_SINK=fluvio on the current image the
+      # service logs a warning and falls back to KafkaSink — fail-soft, never
+      # silent data loss (sinks.py build_sink). FULL enable path documented
+      # in infra/fluvio/README.md ("Enabling the Fluvio sink").
       TRANSCRIPT_SINK: ${TRANSCRIPT_SINK:-kafka}
+      FLUVIO_TOPIC: ${FLUVIO_TOPIC:-opendesk.transcripts-raw}
       # Retention + intel toggles (NDPA profile: infra/privacy/ndpa-profile.env).
       RETENTION_ENABLED: ${RETENTION_ENABLED:-true}
       RETENTION_DAYS: ${RETENTION_DAYS:-365}
@@ -872,7 +914,11 @@ services:
     deploy: *default-limits
     build: ./services/analytics-pipeline
     environment:
-      DAPR_HOST: ${DAPR_HOST:-}
+      # MW-H1 (SPEC-W47): the previous ${DAPR_HOST:-} override evaluated to
+      # EMPTY, clobbering the code default (daprd-analytics) — every Dapr call
+      # (tenant resolution for the CAC spend join) failed. The sidecar below
+      # now exists and this points at it explicitly.
+      DAPR_HOST: daprd-analytics
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
       REDIS_ADDR: redis:6379
@@ -907,6 +953,22 @@ services:
     - kafka
     - iceberg-rest
     - minio
+    - daprd-analytics
+  # MW-H1 (SPEC-W47): analytics-pipeline Dapr sidecar — mirrors the other
+  # daprd-* blocks. The pubsub-kafka component already scopes `analytics`
+  # (infra/dapr/components/pubsub.kafka.yaml), so app-id analytics is
+  # covered; the CAC consumer + identity tenant-resolution call flow through
+  # this sidecar.
+  daprd-analytics:
+    logging: *default-logging
+    deploy: *default-limits
+    image: daprio/daprd:1.14.4
+    command: *id001
+    volumes: *id002
+    networks: *id003
+    environment:
+      DAPR_APP_ID: analytics
+      DAPR_APP_PORT: '7009'
   web:
     logging: *default-logging
     deploy: *default-limits
@@ -923,6 +985,12 @@ services:
       KEYCLOAK_CLIENT_ID: admin-web
       AUTH_SECRET: ${AUTH_SECRET:-dev-secret-change-me}
       API_BASE_URL: http://apisix:9080
+      # GW-04 (SPEC-W47): admin-web BFF forwards /api/analytics/* to
+      # ANALYTICS_BASE_URL (app/api/[[...path]]/route.ts). The code default
+      # is http://localhost:7009, which is wrong INSIDE this container —
+      # the analytics-pipeline service is `analytics:7009` on the opendesk
+      # network. Without this, the CAC/billing analytics pages 502.
+      ANALYTICS_BASE_URL: ${ANALYTICS_BASE_URL:-http://analytics:7009}
       KEYCLOAK_ISSUER_PUBLIC: http://localhost:8080/realms/opendesk
       # GF4: port 3001 is no longer host-published; the app is reached through
       # the gateway (admin-web route), so NextAuth callbacks use :9080.
