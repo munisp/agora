@@ -20,6 +20,15 @@
 //!   payment-link additionally require `X-User-Roles` ∩ `MONEY_ROLES`
 //!   (default owner/admin; internal-token callers exempt; fail-closed when
 //!   the header is absent).
+//! - **Billing ReBAC (SPEC-W47 D item 2, closes A-MW MW-L5)**: on the human
+//!   (gateway) path, invoice list/get additionally require the Permify
+//!   `view_billing` permission and issue/void require `manage_billing`
+//!   (`organization:{tenant}` entity, `user:{X-User-Id}` subject — see
+//!   src/permify.rs). Fail-CLOSED: 401 without a subject, 403 on denial,
+//!   502 on a Permify outage. Internal-token service callers (K2) keep
+//!   their existing auth (exempt); `/webhooks/paystack` is untouched.
+//!   Disabled only when PERMIFY_URL is configured EMPTY (dev escape,
+//!   boot WARN).
 //! - `/webhooks/paystack` is exempt from both: it authenticates via the
 //!   Paystack HMAC signature instead. `/healthz` + `/metrics` are exempt
 //!   liveness/observability probes.
@@ -221,6 +230,70 @@ fn require_money_role(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError
     Err(ApiError::forbidden(
         "a money role is required for this operation (X-User-Roles intersect MONEY_ROLES)",
     ))
+}
+
+/// SPEC-W47 D item 2 (A-MW MW-L5): Permify ReBAC gate for the human
+/// (gateway) call path — `view_billing` on invoice list/get,
+/// `manage_billing` on issue/void (src/permify.rs). Exemptions mirror the
+/// existing auth contract: internal-token service callers (K2) keep their
+/// existing auth, and the headerless dev escape
+/// (`OPENDESK_TRUST_DIRECT_TENANT=1`, never set in compose) bypasses.
+/// FAIL-CLOSED: a missing caller subject is 401, a Permify denial is 403,
+/// a Permify outage/error is 502 (never a silent allow), and a disabled
+/// client (PERMIFY_URL empty — dev escape, boot WARNs) skips the check.
+/// Runs AFTER `bind_tenant`, so `tenant_id` is always the caller-bound
+/// tenant.
+async fn require_billing_perm(
+    st: &AppState,
+    headers: &HeaderMap,
+    tenant_id: Uuid,
+    permission: &str,
+) -> Result<(), ApiError> {
+    // K2: internal-token service callers are fully authenticated under the
+    // existing contract (internal routes keep their auth).
+    if internal_token_matches(&st.config.internal_token, headers) {
+        return Ok(());
+    }
+    // Dev escape (PERMIFY_URL configured empty): checks disabled.
+    if !st.permify.configured() {
+        return Ok(());
+    }
+    // Headerless standalone dev escape (parity with bind_tenant /
+    // require_money_role): only when NO gateway claim is present.
+    if st.config.trust_direct_tenant && gateway_slugs(headers).is_none() {
+        return Ok(());
+    }
+    let subject = headers
+        .get("x-user-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    if subject.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "authenticated subject required (gateway-injected X-User-Id)",
+        ));
+    }
+    match st
+        .permify
+        .check(&tenant_id.to_string(), subject, permission)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::forbidden(format!(
+            "missing permission {permission}"
+        ))),
+        Err(e) => {
+            // Fail CLOSED: an authorization-service outage must never widen
+            // access; 502 (booking's require() idiom) so the caller can
+            // distinguish it from a real denial.
+            tracing::warn!(error = %e, tenant = %tenant_id, permission, "permify check failed");
+            Err(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("authorization service error: {e}"),
+            ))
+        }
+    }
 }
 
 /// Begin a tenant-scoped transaction for an invoice-ID-addressed route.
@@ -670,6 +743,9 @@ async fn list_invoices(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<Invoice>>, ApiError> {
     bind_tenant(&st, &headers, params.tenant_id).await?;
+    // SPEC-W47 D item 2: invoice list requires Permify view_billing.
+    require_billing_perm(&st, &headers, params.tenant_id, crate::permify::PERM_VIEW_BILLING)
+        .await?;
     let status = match &params.status {
         Some(s) => Some(
             InvoiceStatus::parse(s)
@@ -705,6 +781,9 @@ async fn get_invoice(
     headers: HeaderMap,
 ) -> Result<Json<Invoice>, ApiError> {
     let (tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
+    // SPEC-W47 D item 2: invoice get requires Permify view_billing (the
+    // scoped tx already bound the invoice's OWN tenant).
+    require_billing_perm(&st, &headers, inv.tenant_id, crate::permify::PERM_VIEW_BILLING).await?;
     tx.commit().await?;
     Ok(Json(inv))
 }
@@ -716,6 +795,9 @@ async fn issue_invoice(
 ) -> Result<Json<Invoice>, ApiError> {
     let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
     require_money_role(&st, &headers)?;
+    // SPEC-W47 D item 2: issue requires Permify manage_billing.
+    require_billing_perm(&st, &headers, inv.tenant_id, crate::permify::PERM_MANAGE_BILLING)
+        .await?;
     let (_prev, updated) = invoices::transition_invoice(&mut tx, id, InvoiceStatus::Issued).await?;
     // Ledger: invoice issued -> DR AR-control / CR revenue (code 200).
     // Zero-amount invoices skip the posting (the ledger rejects 0).
@@ -759,6 +841,9 @@ async fn void_invoice(
 ) -> Result<Json<Invoice>, ApiError> {
     let (mut tx, inv) = begin_scoped_invoice_tx(&st, &headers, id).await?;
     require_money_role(&st, &headers)?;
+    // SPEC-W47 D item 2: void requires Permify manage_billing.
+    require_billing_perm(&st, &headers, inv.tenant_id, crate::permify::PERM_MANAGE_BILLING)
+        .await?;
     let (prev, updated) = invoices::transition_invoice(&mut tx, id, InvoiceStatus::Void).await?;
     // SPEC-W43 B-02: voiding an ISSUED/PAST_DUE invoice must unwind its
     // receivable — reversing entry DR revenue / CR AR (deterministic
