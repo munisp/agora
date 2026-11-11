@@ -696,12 +696,12 @@ func scanCampaignInto(row pgx.Row, c *Campaign) error {
 // spend audit trail must remain visible; consumers filter by status.
 func (s *Store) ListCampaignsWithSpend(ctx context.Context, tenantID uuid.UUID) ([]CampaignView, error) {
 	const q = `SELECT c.id, c.tenant_id, c.name, c.channel, c.starts_at, c.ends_at, c.status, c.created_at,
-		                  COALESCE(SUM(s.amount_ngn), 0)::float8 AS spend_ngn
-		           FROM campaigns c
-		           LEFT JOIN campaign_spend s ON s.tenant_id = c.tenant_id AND s.campaign_id = c.id
-		           WHERE c.tenant_id = $1
-		           GROUP BY c.id
-		           ORDER BY c.created_at DESC LIMIT 500`
+	                  COALESCE(SUM(s.amount_ngn), 0)::float8 AS spend_ngn
+	           FROM campaigns c
+	           LEFT JOIN campaign_spend s ON s.tenant_id = c.tenant_id AND s.campaign_id = c.id
+	           WHERE c.tenant_id = $1
+	           GROUP BY c.id
+	           ORDER BY c.created_at DESC LIMIT 500`
 	var out []CampaignView
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, q, tenantID)
@@ -760,7 +760,7 @@ func (s *Store) UpsertCampaignSpend(ctx context.Context, sp *CampaignSpend) erro
 // analytics-service (SPEC-W13 §4/§5).
 func (s *Store) CampaignSpendSum(ctx context.Context, tenantID, campaignID uuid.UUID, from, to *time.Time) (total float64, byChannel []ChannelSpend, err error) {
 	q := `SELECT channel, COALESCE(SUM(amount_ngn),0)::float8
-		           FROM campaign_spend WHERE tenant_id=$1 AND campaign_id=$2`
+	           FROM campaign_spend WHERE tenant_id=$1 AND campaign_id=$2`
 	args := []any{tenantID, campaignID}
 	n := 2
 	if from != nil {
