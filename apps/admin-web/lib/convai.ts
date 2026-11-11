@@ -26,6 +26,13 @@ export interface ConvAiCallbacks {
 /** PCM16 mono sample rate used by the ConvAI websocket stream. */
 const SAMPLE_RATE = 16000;
 
+/**
+ * Source type of AudioBuffer.copyToChannel, resolved from the DOM lib so the
+ * cast below stays valid across the TS 5.7 TypedArray-generics boundary
+ * (plain Float32Array on TS <= 5.6, Float32Array<ArrayBuffer> on TS >= 5.7).
+ */
+type CopyChannelSource = Parameters<AudioBuffer["copyToChannel"]>[0];
+
 function floatTo16kPcmBase64(input: Float32Array, srcRate: number): string {
   // Downsample to 16 kHz by linear interpolation, then to PCM16 little-endian.
   const ratio = srcRate / SAMPLE_RATE;
@@ -177,7 +184,11 @@ export class ElevenLabsConvAiSession {
     }
     if (samples.length === 0) return;
     const buffer = ctx.createBuffer(1, samples.length, SAMPLE_RATE);
-    buffer.copyToChannel(samples as Float32Array<ArrayBuffer>, 0);
+    // CopyChannelSource keeps this compiling on both sides of the TS 5.7
+    // TypedArray-generics boundary: it resolves to plain Float32Array on
+    // TS <= 5.6 and Float32Array<ArrayBuffer> on TS >= 5.7 (W48 gate pins
+    // tsc 5.6.3 while the repo toolchain is newer).
+    buffer.copyToChannel(samples as CopyChannelSource, 0);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);

@@ -71,6 +71,15 @@ class Settings:
     whisper_model: str = "base"
     whisper_device: str = "auto"  # auto|cpu|cuda
     whisper_compute_type: str = "int8"
+    # SPEC-W48-C: streaming STT endpoint (/v1/stt/stream, WebSocket).
+    # Rolling-window chunked inference: window_s of audio re-transcribed
+    # every hop_s; an utterance endpoints after silence_ms of trailing
+    # silence. Undrained client input is bounded at max_buffer_s of audio
+    # (backpressure -> close 1008).
+    stt_stream_window_s: float = 1.0
+    stt_stream_hop_s: float = 0.25
+    stt_stream_silence_ms: int = 700
+    stt_stream_max_buffer_s: float = 8.0
 
     # TTS (piper): http sidecar or local subprocess
     piper_mode: str = "http"  # http|subprocess
@@ -279,6 +288,10 @@ def load_settings() -> Settings:
         whisper_model=_env("WHISPER_MODEL", "base"),
         whisper_device=_env("WHISPER_DEVICE", "auto"),
         whisper_compute_type=_env("WHISPER_COMPUTE_TYPE", "int8"),
+        stt_stream_window_s=float(os.environ.get("STT_STREAM_WINDOW_S", "1.0")),
+        stt_stream_hop_s=float(os.environ.get("STT_STREAM_HOP_S", "0.25")),
+        stt_stream_silence_ms=_env_int("STT_STREAM_SILENCE_MS", 700),
+        stt_stream_max_buffer_s=float(os.environ.get("STT_STREAM_MAX_BUFFER_S", "8")),
         piper_mode=_env("PIPER_MODE", "http"),
         piper_http_url=_env("PIPER_HTTP_URL", "http://piper:5500"),
         piper_voice=_env("PIPER_VOICE", "en_US-lessac-medium"),

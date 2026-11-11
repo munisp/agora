@@ -216,3 +216,65 @@ func (c *PaymentsClient) Refund(ctx context.Context, tenantID string, depositID 
 		zap.String("idempotency_key", idempotencyKey))
 	return res, nil
 }
+
+// ---------------------------------------------------------------------------
+// Flutterwave checkout initialize (SPEC-W48 A3): the public pay leg.
+// ---------------------------------------------------------------------------
+
+// FlutterwaveInitializeRequest is the booking-side input of the public pay
+// leg (POST /public/sites/{slug}/bookings/{id}/pay).
+type FlutterwaveInitializeRequest struct {
+	// AmountCents is the charge amount (the offering price); must be > 0.
+	AmountCents int64
+	// Currency is the tenant currency (payments is NGN-only today and
+	// rejects anything else with 400 — surfaced as a 502 PaymentsError).
+	Currency string
+	// Email is the Flutterwave customer email (required by the rail).
+	Email string
+	// BookingID is carried into the rail metadata + the
+	// FlutterwavePaymentInitialized event for the webhook reconciliation.
+	BookingID string
+	// IdempotencyKey is REQUIRED by payments on money-moving endpoints
+	// (400 when absent); booking passes "agora-<booking_id>-<unix>".
+	IdempotencyKey string
+	// RedirectURL overrides the tenant-level FLUTTERWAVE_REDIRECT_URL.
+	RedirectURL string
+}
+
+// FlutterwaveInitializeResult mirrors the payments initialize response
+// (POST /v1/payments/flutterwave/initialize → 201 {tx_ref, link,
+// deposit_id}; duplicated per service-boundary rules).
+type FlutterwaveInitializeResult struct {
+	TxRef     string `json:"tx_ref"`
+	Link      string `json:"link"`
+	DepositID string `json:"deposit_id"`
+}
+
+// InitializeFlutterwave invokes POST /v1/payments/flutterwave/initialize
+// (SPEC-W48 A3). Auth mirrors capture/refund exactly: the K2
+// X-Internal-Token (PAYMENTS_INTERNAL_TOKEN) authenticates the service (and
+// satisfies the payments money-role gate); the public caller has no gateway
+// identity, so caller stays empty.
+func (c *PaymentsClient) InitializeFlutterwave(ctx context.Context, tenantID string, in FlutterwaveInitializeRequest, caller CallerIdentity) (FlutterwaveInitializeResult, error) {
+	payload := map[string]any{
+		"tenant_id":       tenantID,
+		"amount_cents":    in.AmountCents,
+		"currency":        in.Currency,
+		"email":           in.Email,
+		"idempotency_key": in.IdempotencyKey,
+	}
+	if in.BookingID != "" {
+		payload["booking_id"] = in.BookingID
+	}
+	if strings.TrimSpace(in.RedirectURL) != "" {
+		payload["redirect_url"] = strings.TrimSpace(in.RedirectURL)
+	}
+	var res FlutterwaveInitializeResult
+	if err := c.do(ctx, "/v1/payments/flutterwave/initialize", payload, caller, &res); err != nil {
+		return FlutterwaveInitializeResult{}, err
+	}
+	c.log.Info("flutterwave checkout initialized via payments rail",
+		zap.String("tx_ref", res.TxRef), zap.String("booking_id", in.BookingID),
+		zap.String("idempotency_key", in.IdempotencyKey))
+	return res, nil
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +67,12 @@ type Service struct {
 	// UsageTopic meters outreach sends (opendesk.usage.events; empty
 	// disables metering).
 	UsageTopic string
-	Log        *zap.Logger
+	// EventsTopic is the booking events topic (opendesk.booking.events) the
+	// SPEC-W48 A1 resolve audit event is written to (transactional outbox
+	// row inside ResolveIncidentTx). Empty = the status flip still commits
+	// but no audit event is emitted.
+	EventsTopic string
+	Log         *zap.Logger
 
 	// SPEC-W46 (W46-A item 10, PERF-20 booking half): the active dispatch
 	// endpoints ("webhook subscriptions") were re-queried on EVERY incident
@@ -250,6 +256,42 @@ func (s *Service) Dispatch(ctx context.Context, tenantID, incidentID uuid.UUID) 
 // (uuid v5-style: SHA-256 of the pair, RFC-4122 version bits set).
 func DeliveryID(incidentID uuid.UUID, url string) uuid.UUID {
 	return uuid.NewSHA1(uuid.NameSpaceURL, []byte(incidentID.String()+"|"+url))
+}
+
+// EventTypeIncidentResolved is the CloudEvent type of the resolve audit row
+// appended to the transactional outbox by ResolveIncidentTx (SPEC-W48 A1).
+const EventTypeIncidentResolved = "com.opendesk.booking.IncidentResolved"
+
+// Resolve transitions an incident new|dispatched|acknowledged → resolved
+// (SPEC-W48 A1), recording the operator (actorID) + optional note. The
+// status flip and the audit CloudEvent commit in ONE transaction
+// (store.ResolveIncidentTx) so the resolution can never be half-recorded.
+// Errors: store.ErrNotFound (unknown → 404), store.ErrConflict (already
+// resolved/closed → 409).
+func (s *Service) Resolve(ctx context.Context, tenantID, incidentID uuid.UUID, actorID, note, tenantSlug string) (store.Incident, error) {
+	var payload []byte
+	if s.EventsTopic != "" {
+		data := map[string]any{
+			"incident_id": incidentID.String(),
+			"resolved_by": actorID,
+		}
+		if strings.TrimSpace(note) != "" {
+			data["note"] = strings.TrimSpace(note)
+		}
+		p, err := json.Marshal(events.New("booking-service", EventTypeIncidentResolved,
+			tenantSlug, tenantID.String(), data))
+		if err != nil {
+			return store.Incident{}, fmt.Errorf("marshal resolve audit event: %w", err)
+		}
+		payload = p
+	}
+	inc, err := s.Store.ResolveIncidentTx(ctx, tenantID, incidentID, actorID, note, s.EventsTopic, payload)
+	if err != nil {
+		return store.Incident{}, err
+	}
+	s.log().Info("incident resolved",
+		zap.String("incident_id", incidentID.String()), zap.String("resolved_by", actorID))
+	return inc, nil
 }
 
 // Outreach sends the critical/high-severity alert through the

@@ -14,8 +14,9 @@ export const metadata = { title: "Incidents" };
  * dispatch endpoints load server-side.
  *
  * Incident lifecycle is delivery-driven (new → dispatched → acknowledged →
- * closed via the signed endpoint callbacks); the staff action is DISPATCH —
- * there is no manual "resolve" route, so none is offered.
+ * closed via the signed endpoint callbacks); staff actions are DISPATCH and,
+ * since W48, RESOLVE (POST /v1/incidents/{id}/resolve, optional note) for
+ * incidents handled out-of-band.
  */
 export default async function IncidentsPage({
   params,

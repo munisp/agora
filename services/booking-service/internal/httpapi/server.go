@@ -280,6 +280,11 @@ func NewRouter(d Deps) http.Handler {
 		r.Route("/waitlist", func(r chi.Router) {
 			r.With(s.require("manage_bookings")).Post("/", s.createWaitlistEntry)
 			r.Get("/", s.listWaitlist)
+			// SPEC-W48 A2: staff manual notify/expire (same authn +
+			// manage_bookings Permify posture as create; fail-closed on
+			// authz outage → 502).
+			r.With(s.require("manage_bookings")).Post("/{id}/notify", s.notifyWaitlistEntry)
+			r.With(s.require("manage_bookings")).Post("/{id}/expire", s.expireWaitlistEntry)
 			// Claim is token-authorized (capability), not permify-guarded —
 			// the claimant is an end customer following the backfill link.
 			r.Post("/{id}/claim", s.claimWaitlist)
@@ -296,6 +301,10 @@ func NewRouter(d Deps) http.Handler {
 			r.Get("/", s.listIncidents)
 			r.Get("/{id}", s.getIncident)
 			r.With(s.require("manage_bookings")).Post("/{id}/dispatch", s.dispatchIncident)
+			// SPEC-W48 A1: operator resolve (new|dispatched|acknowledged →
+			// resolved), same authn + manage_bookings Permify posture as
+			// dispatch (fail-closed on authz outage → 502).
+			r.With(s.require("manage_bookings")).Post("/{id}/resolve", s.resolveIncident)
 			r.With(s.require("manage_bookings")).Post("/dispatch-endpoints", s.createDispatchEndpoint)
 			r.Get("/dispatch-endpoints", s.listDispatchEndpoints)
 			r.With(s.require("manage_bookings")).Delete("/dispatch-endpoints", s.deleteDispatchEndpoint)
@@ -583,6 +592,12 @@ func NewRouter(d Deps) http.Handler {
 		r.Get("/context", s.publicContext)
 		r.Get("/availability", s.publicAvailability)
 		r.Post("/bookings", s.publicCreateBooking)
+		// SPEC-W48 A3/A4: public pay + review legs (no auth; the site slug
+		// resolves the tenant server-side, rate-limited via the existing
+		// public-endpoint limiter). APISIX routes added by W48-D.
+		r.Post("/bookings/{id}/pay", s.publicPayBooking)
+		r.Post("/bookings/{id}/review", s.publicCreateReview)
+		r.Get("/reviews", s.publicListReviews)
 		// Customer self-service portal (Wave 5 #7): magic-code login. The
 		// authenticated half lives under /portal (portal JWT middleware).
 		r.Post("/portal/request", s.portalRequestCode)

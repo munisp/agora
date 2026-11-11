@@ -147,6 +147,55 @@ func (s *server) claimWaitlist(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Staff notify/expire (SPEC-W48 A2)
+// ---------------------------------------------------------------------------
+
+// notifyWaitlistEntry handles POST /v1/waitlist/{id}/notify
+// (manage_bookings): waiting → notified with the WaitlistEntryNotified
+// outbox event committed in the same transaction (the notification bridge
+// consumes it with the WaitlistBackfill payload shape). 404 unknown entry;
+// 409 entry no longer waiting.
+func (s *server) notifyWaitlistEntry(w http.ResponseWriter, r *http.Request) {
+	if s.d.Ops == nil {
+		writeError(w, http.StatusServiceUnavailable, "booking ops unavailable")
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	entry, err := s.d.Ops.NotifyWaitlistEntry(r.Context(), tenant.ID, tenant.Slug, id)
+	if err != nil {
+		s.mapOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// expireWaitlistEntry handles POST /v1/waitlist/{id}/expire
+// (manage_bookings): waiting|notified → expired (audit event in-tx). 404
+// unknown entry; 409 already claimed/expired.
+func (s *server) expireWaitlistEntry(w http.ResponseWriter, r *http.Request) {
+	if s.d.Ops == nil {
+		writeError(w, http.StatusServiceUnavailable, "booking ops unavailable")
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	actor := userFrom(r.Context())
+	entry, err := s.d.Ops.ExpireWaitlistEntry(r.Context(), tenant.ID, tenant.Slug, id, actor)
+	if err != nil {
+		s.mapOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// ---------------------------------------------------------------------------
 // Public token claim endpoints (SPEC-W45 CODER-M, K13 completion)
 // ---------------------------------------------------------------------------
 //

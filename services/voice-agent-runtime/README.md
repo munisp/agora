@@ -70,6 +70,7 @@ The agent exposes exactly six tools: `get_business_info`, `get_availability`,
 | POST | `/voice/elevenlabs/tools` | ElevenLabs tool webhook payload | only when `AGENT_BACKEND=elevenlabs` |
 | POST | `/voice-admin/voices/enroll` | `{name, sample_base64, tenant}` | XTTS brand-voice enrollment (K15(d): moved off `/voice/*`); guarded by `_require_admin_access` — see the **Admin-access guard (F-2)** note below |
 | POST | `/voice-admin/escalations/{conversation_id}/staff-token` | — | K15(e): on-demand staff join token for the escalation room (replaces publishing it on the events topic); same `_require_admin_access` guard |
+| WS | `/v1/stt/stream?conversation_id=...` | binary 16kHz mono PCM16 frames | W48-C streaming STT: emits `{type:"interim", text, ts}` per `STT_STREAM_HOP_S` hop (rolling `STT_STREAM_WINDOW_S` window) and `{type:"final", text, start_ts, end_ts}` after `STT_STREAM_SILENCE_MS` of trailing silence. Auth: K15(b) session credential — `X-Session-Secret` header (or `session_secret` query param) matching the named `conversation_id`; unauthenticated upgrades rejected with close 1008 (fail-closed). Undrained input bounded at `STT_STREAM_MAX_BUFFER_S` (8s default); overflow closes 1008 + reason |
 
 **Admin-access guard (SPEC-W45 K15(d)/(e), verifier F-2).** Both
 `/voice-admin/*` endpoints accept EITHER of two credentials (`401` when
@@ -124,6 +125,9 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `LLM_API_KEY` | `ollama` | optional pass-through to the OpenAI-compatible client; ignored by Ollama, required by hosted providers (e.g. MiniMax) |
 | `WHISPER_MODEL` | `base` | faster-whisper model size |
 | `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | `auto` / `int8` | ctranslate2 device/precision |
+| `STT_STREAM_WINDOW_S` / `STT_STREAM_HOP_S` | `1.0` / `0.25` | W48-C `/v1/stt/stream`: rolling inference window / hop (seconds) |
+| `STT_STREAM_SILENCE_MS` | `700` | W48-C: trailing silence that endpoints an utterance into a `final` event |
+| `STT_STREAM_MAX_BUFFER_S` | `8` | W48-C: undrained-input backpressure bound (overflow → WS close 1008) |
 | `PIPER_MODE` | `http` | `http` (sidecar) or `subprocess` (local binary) |
 | `PIPER_HTTP_URL` | `http://piper:5500` | piper sidecar URL (`POST /speak` → wav) |
 | `PIPER_VOICE` | `en_US-lessac-medium` | voice model name |

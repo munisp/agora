@@ -33,7 +33,7 @@ from .quality import CallQualityEnricher
 from .outbox import OutboxRelay
 from .retention import RetentionSweeper
 from .routes import router
-from .sinks import KafkaSink, TranscriptSink, build_sink
+from .sinks import TranscriptSink, build_sink
 from .tenant_lifecycle import TenantLifecycleConsumer
 from .tenants import TenantResolver
 
@@ -151,7 +151,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         sink = _NullSink()
 
     # Enriched turns (call intelligence) → opendesk.conversation.enriched.
-    intel_sink: TranscriptSink = KafkaSink(cfg.kafka_brokers, cfg.enriched_topic)
+    # W48-B: same TRANSCRIPT_SINK selection as the raw transcript sink
+    # (fluvio honored identically, per-sink topic name unchanged).
+    intel_sink: TranscriptSink = build_sink(cfg, cfg.enriched_topic)
     try:
         await intel_sink.start()
     except Exception as exc:
@@ -162,7 +164,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # CallQualityEnriched (avg sentiment) → opendesk.conversation.quality
     # (Wave 5 #2). Separate topic so enriched events never retrigger the
     # SessionEnded consumers on opendesk.conversation.events.
-    quality_sink: TranscriptSink = KafkaSink(cfg.kafka_brokers, cfg.quality_topic)
+    quality_sink: TranscriptSink = build_sink(cfg, cfg.quality_topic)
     try:
         await quality_sink.start()
     except Exception as exc:

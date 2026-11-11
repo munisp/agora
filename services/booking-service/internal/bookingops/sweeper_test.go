@@ -231,3 +231,77 @@ func TestSweeperNilSagaNoop(t *testing.T) {
 		t.Fatalf("nil-saga sweep n=%d err=%v, want 0/nil", n, err)
 	}
 }
+
+
+// TestSweeperExpiresStaleWaitlist (SPEC-W48 A2/A5): the waitlist sweep
+// flips only past-window waiting|notified entries to expired and writes one
+// audit outbox row per expired entry; future windows are untouched.
+func TestSweeperExpiresStaleWaitlist(t *testing.T) {
+	st, ctx := newSweeperFixture(t)
+	tenantID := uuid.New()
+	now := time.Now()
+
+	mk := func(start, end time.Time) store.WaitlistEntry {
+		t.Helper()
+		e := store.WaitlistEntry{TenantID: tenantID, OfferingID: uuid.New(),
+			ContactName: "Ada", ContactPhone: "+234800", WindowStart: start, WindowEnd: end}
+		if err := st.CreateWaitlistEntry(ctx, &e); err != nil {
+			t.Fatalf("seed entry: %v", err)
+		}
+		return e
+	}
+
+	pastWaiting := mk(now.Add(-3*time.Hour), now.Add(-time.Hour))
+	pastNotified := mk(now.Add(-3*time.Hour), now.Add(-time.Hour))
+	// Flip the second fixture to notified via the real tx (waiting →
+	// notified, no outbox topic so no event rows pollute the audit count).
+	if _, err := st.MarkWaitlistNotifiedTx(ctx, tenantID, pastNotified.ID, "", nil); err != nil {
+		t.Fatalf("force notified: %v", err)
+	}
+	future := mk(now.Add(time.Hour), now.Add(2*time.Hour))
+
+	sw := &Sweeper{Store: st, Log: zap.NewNop(), WaitlistEventsTopic: "test.events"}
+	n, err := sw.SweepWaitlistOnce(ctx)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expired = %d, want 2 (past-window waiting+notified)", n)
+	}
+	for _, tc := range []struct {
+		id   uuid.UUID
+		want string
+	}{
+		{pastWaiting.ID, store.WaitlistExpired},
+		{pastNotified.ID, store.WaitlistExpired},
+		{future.ID, store.WaitlistWaiting},
+	} {
+		got, err := st.GetWaitlistEntry(ctx, tenantID, tc.id)
+		if err != nil {
+			t.Fatalf("get %s: %v", tc.id, err)
+		}
+		if got.Status != tc.want {
+			t.Fatalf("entry %s status = %q, want %q", tc.id, got.Status, tc.want)
+		}
+	}
+	// One audit outbox row per expired entry (the sweep wrote them).
+	pool, err := pgxpool.New(ctx, fmt.Sprintf(
+		"postgres://postgres:postgres@localhost:%d/booking_sweeper_test?sslmode=disable", sweeperTestPort))
+	if err != nil {
+		t.Fatalf("raw pool: %v", err)
+	}
+	defer pool.Close()
+	var rows int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbox WHERE topic='test.events'`).Scan(&rows); err != nil {
+		t.Fatalf("audit count: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("audit outbox rows = %d, want 2", rows)
+	}
+	// Idempotent: a second sweep expires nothing new.
+	n, err = sw.SweepWaitlistOnce(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("second sweep = %d, %v; want 0, nil", n, err)
+	}
+}

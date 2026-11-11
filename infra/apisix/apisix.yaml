@@ -1,6 +1,10 @@
 # APISIX standalone declarative config (file-driven data plane) — OpenDesk edge routes.
 # Contract: SPEC §3 (ports) and SPEC §12 (routes & plugins). Hot-reloaded ~1s after save.
 #
+# Route inventory: 48 routes (45 pre-W48-D + 3 W48-D public booking legs:
+# api-bookings-public-pay, api-bookings-public-review,
+# api-bookings-public-reviews). Update this count when adding/removing routes.
+#
 # WAF note: there is deliberately no `open-appsec` plugin block here. The open-appsec nano
 # agent attaches at the image level (compose service `apisix-appsec`, profile `appsec`,
 # image ghcr.io/openappsec/apisix-attachment sharing IPC with the `openappsec` agent
@@ -848,6 +852,115 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- W48 public pay + review legs (SPEC-W48 A3/A4) ----------------------
+  # Anonymous like api-bookings-waitlist-claim: the booking-service routes
+  # (POST /public/sites/{slug}/bookings/{id}/pay, POST .../review, GET
+  # /public/sites/{slug}/reviews) are registered OUTSIDE the tenant group,
+  # slug-resolved server-side with no session — the pay leg redirects the
+  # customer to the Flutterwave checkout link, the review leg accepts one
+  # review per completed booking. Same plugin set as the waitlist-claim
+  # public block (redis limit-count 60/min — replica-independent, stricter
+  # than the generic api-bookings-public bucket because the pay leg is
+  # money-adjacent). No OIDC; no header injection.
+  #
+  # Router note: the gateway runs router http=radixtree_host_uri
+  # (config.yaml), whose `*` wildcard is TRAILING-ONLY — mid-path segments
+  # ({slug}, {id}) cannot be expressed as uri patterns. These three routes
+  # therefore share the /api/bookings/public/* prefix with
+  # api-bookings-public and disambiguate via a `vars` uri regex; priority 10
+  # makes them win over the default-priority generic public route (same
+  # mechanism as the block-* routes above). Requests that do not match the
+  # regex fall through to api-bookings-public (120/min) unchanged.
+  - id: api-bookings-public-pay
+    uri: /api/bookings/public/*
+    vars:
+      - ["uri", "~~", "^/api/bookings/public/sites/[^/]+/bookings/[^/]+/pay/?$"]
+    methods: [POST, OPTIONS]
+    priority: 10
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/bookings/?(.*)"
+          - "/$1"
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  - id: api-bookings-public-review
+    uri: /api/bookings/public/*
+    vars:
+      - ["uri", "~~", "^/api/bookings/public/sites/[^/]+/bookings/[^/]+/review/?$"]
+    methods: [POST, OPTIONS]
+    priority: 10
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/bookings/?(.*)"
+          - "/$1"
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+  - id: api-bookings-public-reviews
+    uri: /api/bookings/public/*
+    vars:
+      - ["uri", "~~", "^/api/bookings/public/sites/[^/]+/reviews/?$"]
+    methods: [GET, OPTIONS]
+    priority: 10
+    upstream_id: booking
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/bookings/?(.*)"
+          - "/$1"
+      limit-count:
+        count: 60
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: redis
+        redis_host: redis
+        redis_port: 6379
+        redis_database: 0
+        redis_timeout: 1000
+      cors:
+        allow_origins: "*"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
   - id: api-bookings
     uris:
       - /api/bookings/*
@@ -962,6 +1075,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1093,6 +1208,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1242,6 +1359,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1373,6 +1492,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1504,6 +1625,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1639,6 +1762,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1791,6 +1916,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -1924,6 +2051,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2060,6 +2189,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2194,6 +2325,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2358,6 +2491,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2448,6 +2583,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2655,6 +2792,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2705,6 +2844,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -2748,6 +2889,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be
@@ -3017,6 +3160,8 @@ routes:
         # auth-sensitive routes api-identity + api-voice-admin, and every
         # public/anonymous ingress (api-bookings-public,
         # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
         # api-identity-consents-public, api-civic-public, ussd-callback,
         # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
         # voice-runtime) — those keep redis because their limit must be

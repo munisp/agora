@@ -1,15 +1,23 @@
 "use client";
 
 import * as React from "react";
-import { ChevronDown, ChevronRight, Plus, RefreshCw, Send, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, CircleCheck, Plus, RefreshCw, Send, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { ConfirmDialog } from "@/components/ui/dialog";
-import { Input, Label, Select } from "@/components/ui/input";
+import {
+  ConfirmDialog,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input, Label, Select, Textarea } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -27,7 +35,14 @@ import type {
   IncidentDispatchEndpoint,
 } from "@/lib/types";
 
-type StatusFilter = "" | "new" | "dispatched" | "acknowledged" | "closed";
+type StatusFilter = "" | "new" | "dispatched" | "acknowledged" | "resolved" | "closed";
+
+/** Statuses from which POST /v1/incidents/{id}/resolve is accepted (409 otherwise). */
+const RESOLVABLE: ReadonlySet<string> = new Set([
+  "new",
+  "dispatched",
+  "acknowledged",
+]);
 
 function statusVariant(
   status: string,
@@ -39,6 +54,7 @@ function statusVariant(
       return "warning";
     case "acknowledged":
       return "secondary";
+    case "resolved":
     case "closed":
       return "success";
     default:
@@ -86,6 +102,11 @@ export function IncidentsClient({
   const [epBusy, setEpBusy] = React.useState(false);
   const [deleteEp, setDeleteEp] =
     React.useState<IncidentDispatchEndpoint | null>(null);
+  const [resolveTarget, setResolveTarget] = React.useState<Incident | null>(
+    null,
+  );
+  const [resolveNote, setResolveNote] = React.useState("");
+  const [resolving, setResolving] = React.useState(false);
 
   const load = React.useCallback(
     async (f: StatusFilter) => {
@@ -151,6 +172,37 @@ export function IncidentsClient({
     }
   };
 
+  const resolveIncident = async () => {
+    if (!resolveTarget) return;
+    setResolving(true);
+    try {
+      const note = resolveNote.trim();
+      await api.post<{ incident?: Incident }>(
+        `/api/bookings/v1/incidents/${resolveTarget.id}/resolve`,
+        { note: note || undefined },
+        { tenant: orgSlug },
+      );
+      toast({
+        title: "Incident resolved",
+        description: `${
+          resolveTarget.reference_number || resolveTarget.id
+        } marked resolved.`,
+        variant: "success",
+      });
+      setResolveTarget(null);
+      setResolveNote("");
+      await load(status);
+    } catch (e) {
+      toast({
+        title: "Resolve failed",
+        description: e instanceof ApiError ? e.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setResolving(false);
+    }
+  };
+
   const addEndpoint = async (e: React.FormEvent) => {
     e.preventDefault();
     const url = epUrl.trim();
@@ -203,7 +255,7 @@ export function IncidentsClient({
     <div>
       <PageHeader
         title="Incidents"
-        description="Device and civic incidents ingested from IoT/webhook sources. Dispatch signs and delivers the incident payload to every active endpoint; acknowledgement and closure come back from the endpoints' callbacks."
+        description="Device and civic incidents ingested from IoT/webhook sources. Dispatch signs and delivers the incident payload to every active endpoint; acknowledgement and closure come back from the endpoints' callbacks. Staff can also resolve an incident manually once the underlying issue is handled."
         actions={
           <Button
             variant="outline"
@@ -232,6 +284,7 @@ export function IncidentsClient({
           <option value="new">New</option>
           <option value="dispatched">Dispatched</option>
           <option value="acknowledged">Acknowledged</option>
+          <option value="resolved">Resolved</option>
           <option value="closed">Closed</option>
         </Select>
       </div>
@@ -267,6 +320,10 @@ export function IncidentsClient({
                     setOpenId((id) => (id === inc.id ? null : inc.id))
                   }
                   onDispatch={() => void dispatch(inc)}
+                  onResolve={() => {
+                    setResolveNote("");
+                    setResolveTarget(inc);
+                  }}
                 />
               ))
             )}
@@ -340,6 +397,48 @@ export function IncidentsClient({
         </CardContent>
       </Card>
 
+      <Dialog
+        open={resolveTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !resolving) setResolveTarget(null);
+        }}
+      >
+        <DialogContent onClose={() => !resolving && setResolveTarget(null)}>
+          <DialogHeader>
+            <DialogTitle>Resolve incident</DialogTitle>
+            <DialogDescription>
+              Mark{" "}
+              {resolveTarget
+                ? resolveTarget.reference_number || resolveTarget.id
+                : ""}{" "}
+              as resolved. The note below is optional and is kept with the
+              incident&apos;s audit trail.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-1.5">
+            <Label htmlFor="resolve-note">Resolution note (optional)</Label>
+            <Textarea
+              id="resolve-note"
+              value={resolveNote}
+              onChange={(e) => setResolveNote(e.target.value)}
+              placeholder="What fixed it?"
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setResolveTarget(null)}
+              disabled={resolving}
+            >
+              Cancel
+            </Button>
+            <Button onClick={() => void resolveIncident()} disabled={resolving}>
+              {resolving ? "Resolving…" : "Resolve incident"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <ConfirmDialog
         open={deleteEp !== null}
         onOpenChange={(open) => !open && setDeleteEp(null)}
@@ -364,12 +463,14 @@ function IncidentRow({
   open,
   onToggle,
   onDispatch,
+  onResolve,
 }: {
   orgSlug: string;
   incident: Incident;
   open: boolean;
   onToggle: () => void;
   onDispatch: () => void;
+  onResolve: () => void;
 }) {
   const [deliveries, setDeliveries] = React.useState<IncidentDelivery[] | null>(
     null,
@@ -422,21 +523,33 @@ function IncidentRow({
           {formatDateTime(incident.created_at)}
         </TableCell>
         <TableCell className="pr-5 text-right">
-          {incident.status === "new" ? (
+          <div className="flex items-center justify-end gap-2">
+            {incident.status === "new" ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDispatch();
+                }}
+              >
+                <Send className="h-3.5 w-3.5" />
+                Dispatch
+              </Button>
+            ) : null}
             <Button
               variant="outline"
               size="sm"
+              disabled={!RESOLVABLE.has(incident.status)}
               onClick={(e) => {
                 e.stopPropagation();
-                onDispatch();
+                onResolve();
               }}
             >
-              <Send className="h-3.5 w-3.5" />
-              Dispatch
+              <CircleCheck className="h-3.5 w-3.5" />
+              Resolve
             </Button>
-          ) : (
-            <span className="text-xs text-muted-foreground">—</span>
-          )}
+          </div>
         </TableCell>
       </TableRow>
       {open ? (

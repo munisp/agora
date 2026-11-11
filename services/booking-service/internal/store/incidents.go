@@ -17,7 +17,9 @@ import (
 // ---------------------------------------------------------------------------
 
 // Incident mirrors booking.incidents. Payload holds the full Incident Data
-// Packet (SPEC-W11 canonical IDP JSON).
+// Packet (SPEC-W11 canonical IDP JSON). ResolvedBy/ResolvedAt record the
+// W48-A resolve transition (operator + timestamp; resolved_at NULL while
+// unresolved).
 type Incident struct {
 	ID              uuid.UUID       `json:"id"`
 	TenantID        uuid.UUID       `json:"tenant_id"`
@@ -28,6 +30,8 @@ type Incident struct {
 	Status          string          `json:"status"`
 	CreatedAt       time.Time       `json:"created_at"`
 	DispatchedAt    *time.Time      `json:"dispatched_at,omitempty"`
+	ResolvedBy      string          `json:"resolved_by,omitempty"`
+	ResolvedAt      *time.Time      `json:"resolved_at,omitempty"`
 }
 
 // IncidentDelivery mirrors booking.incident_deliveries: the per-endpoint
@@ -72,9 +76,11 @@ CREATE TABLE IF NOT EXISTS incidents (
                      CHECK (severity IN ('critical','high','medium','low')),
     payload          JSONB NOT NULL,
     status           TEXT NOT NULL DEFAULT 'new'
-                     CHECK (status IN ('new','dispatched','acknowledged','closed')),
+                     CHECK (status IN ('new','dispatched','acknowledged','resolved','closed')),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    dispatched_at    TIMESTAMPTZ
+    dispatched_at    TIMESTAMPTZ,
+    resolved_by      TEXT NOT NULL DEFAULT '',
+    resolved_at      TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_tenant_status ON incidents (tenant_id, status, created_at);
 ALTER TABLE incidents ENABLE ROW LEVEL SECURITY;
@@ -131,15 +137,41 @@ END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure incident tables: %w", err)
 	}
+	// SPEC-W48 (W48-A item A1): in-place migration for existing databases —
+	// the CREATE TABLE above only shapes fresh installs. Adds the resolve
+	// audit columns and widens the status CHECK with 'resolved'. Idempotent:
+	// the constraint is only swapped when its definition predates 'resolved'
+	// (a fresh install's inline CHECK already includes it).
+	const migrate = `
+DO $$
+BEGIN
+    IF to_regclass('public.incidents') IS NOT NULL THEN
+        ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_by TEXT NOT NULL DEFAULT '';
+        ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+        IF EXISTS (
+            SELECT 1 FROM pg_constraint
+             WHERE conname = 'incidents_status_check'
+               AND conrelid = 'public.incidents'::regclass
+               AND pg_get_constraintdef(oid) NOT LIKE '%''resolved''%'
+        ) THEN
+            ALTER TABLE incidents DROP CONSTRAINT incidents_status_check;
+            ALTER TABLE incidents ADD CONSTRAINT incidents_status_check
+                CHECK (status IN ('new','dispatched','acknowledged','resolved','closed'));
+        END IF;
+    END IF;
+END $$;`
+	if _, err := s.pool.Exec(ctx, migrate); err != nil {
+		return fmt.Errorf("migrate incident resolve columns: %w", err)
+	}
 	return nil
 }
 
-const incidentCols = `id, tenant_id, reference_number, incident_type, severity, payload, status, created_at, dispatched_at`
+const incidentCols = `id, tenant_id, reference_number, incident_type, severity, payload, status, created_at, dispatched_at, resolved_by, resolved_at`
 
 func scanIncident(row pgx.Row) (Incident, error) {
 	var i Incident
 	err := row.Scan(&i.ID, &i.TenantID, &i.ReferenceNumber, &i.IncidentType, &i.Severity,
-		&i.Payload, &i.Status, &i.CreatedAt, &i.DispatchedAt)
+		&i.Payload, &i.Status, &i.CreatedAt, &i.DispatchedAt, &i.ResolvedBy, &i.ResolvedAt)
 	return i, err
 }
 
@@ -150,7 +182,7 @@ func (s *Store) InsertIncident(ctx context.Context, in *Incident) (created bool,
 		in.ID = uuid.New()
 	}
 	const q = `INSERT INTO incidents (` + incidentCols + `)
-	           VALUES ($1,$2,$3,$4,$5,$6,'new',now(),NULL)
+	           VALUES ($1,$2,$3,$4,$5,$6,'new',now(),NULL,'',NULL)
 	           ON CONFLICT (id) DO NOTHING
 	           RETURNING created_at`
 	err = s.withTenant(ctx, in.TenantID, func(tx pgx.Tx) error {
@@ -242,6 +274,73 @@ func (s *Store) MarkIncidentDispatched(ctx context.Context, tenantID, id uuid.UU
 		}
 		return nil
 	})
+}
+
+// resolvableIncidentStatuses are the states from which POST
+// /v1/incidents/{id}/resolve may transition (SPEC-W48 A1). resolved/closed
+// are terminal for this route (409).
+var resolvableIncidentStatuses = map[string]bool{
+	"new":          true,
+	"dispatched":   true,
+	"acknowledged": true,
+}
+
+// ResolveIncidentTx atomically transitions an incident from
+// new|dispatched|acknowledged → resolved, stamping resolved_by/resolved_at
+// (SPEC-W48 A1). Inside ONE transaction it:
+//
+//  1. locks the row FOR UPDATE (the resolve race mutex: two concurrent
+//     resolves serialize, the loser sees status='resolved' → 409);
+//  2. validates the transition (already resolved/closed → ErrConflict);
+//  3. flips status + stamps resolved_by/resolved_at;
+//  4. appends the audit row: the resolve CloudEvent written to the
+//     transactional outbox in the same tx (the durable audit trail —
+//     mirrors the claim path's booking+outbox pattern; the row carries
+//     actor/note/timestamps, so the resolution can never be lost or half
+//     recorded). Skipped when outboxTopic is empty.
+//
+// Errors: ErrNotFound (unknown incident), ErrConflict (already
+// resolved/closed — mapped to HTTP 409 by the handler).
+func (s *Store) ResolveIncidentTx(ctx context.Context, tenantID, id uuid.UUID, actorID, note, outboxTopic string, eventPayload []byte) (Incident, error) {
+	var inc Incident
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		inc, err = scanIncident(tx.QueryRow(ctx,
+			`SELECT `+incidentCols+` FROM incidents WHERE tenant_id=$1 AND id=$2 FOR UPDATE`,
+			tenantID, id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if !resolvableIncidentStatuses[inc.Status] {
+			return fmt.Errorf("%w: incident already %s", ErrConflict, inc.Status)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE incidents SET status='resolved', resolved_by=$3, resolved_at=now()
+			 WHERE tenant_id=$1 AND id=$2`,
+			tenantID, id, actorID); err != nil {
+			return fmt.Errorf("resolve incident: %w", err)
+		}
+		if outboxTopic != "" && len(eventPayload) > 0 {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+				inc.ID, outboxTopic, eventPayload); err != nil {
+				return fmt.Errorf("insert resolve audit outbox row: %w", err)
+			}
+		}
+		inc.Status = "resolved"
+		inc.ResolvedBy = actorID
+		now := time.Now().UTC()
+		inc.ResolvedAt = &now
+		_ = note // the note rides the audit outbox payload (see caller)
+		return nil
+	})
+	if err == nil && outboxTopic != "" && len(eventPayload) > 0 {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return inc, err
 }
 
 // ---------------------------------------------------------------------------

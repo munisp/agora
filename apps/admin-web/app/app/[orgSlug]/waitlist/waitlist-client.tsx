@@ -1,13 +1,14 @@
 "use client";
 
 import * as React from "react";
-import { Link2, Plus, RefreshCw } from "lucide-react";
+import { Bell, Link2, Plus, RefreshCw, TimerOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { Input, Label, Select } from "@/components/ui/input";
 import {
   Table,
@@ -22,7 +23,25 @@ import { useToast } from "@/components/ui/toast";
 import { formatDateTime } from "@/lib/utils";
 import type { Offering, WaitlistEntry } from "@/lib/types";
 
-type StatusFilter = "" | "waiting" | "claimed" | "expired";
+type StatusFilter = "" | "waiting" | "notified" | "claimed" | "expired";
+
+/**
+ * Row-action guards. The W48 backend spells the pre-claim state "waiting"
+ * (pending in the W48-A contract); both spellings are accepted so the UI
+ * keeps working across either naming.
+ */
+const NOTIFYABLE: ReadonlySet<string> = new Set(["waiting", "pending"]);
+const EXPIRABLE: ReadonlySet<string> = new Set([
+  "waiting",
+  "pending",
+  "notified",
+]);
+/** Entries whose claim link is still usable (not yet claimed/expired). */
+const LINKABLE: ReadonlySet<string> = new Set([
+  "waiting",
+  "pending",
+  "notified",
+]);
 
 function statusVariant(
   status: string,
@@ -31,6 +50,8 @@ function statusVariant(
     case "claimed":
       return "success";
     case "waiting":
+    case "pending":
+    case "notified":
       return "warning";
     case "expired":
       return "secondary";
@@ -66,6 +87,10 @@ export function WaitlistClient({
   const [status, setStatus] = React.useState<StatusFilter>("");
   const [creating, setCreating] = React.useState(false);
   const [showCreate, setShowCreate] = React.useState(false);
+  const [busyId, setBusyId] = React.useState<string | null>(null);
+  const [expireTarget, setExpireTarget] = React.useState<WaitlistEntry | null>(
+    null,
+  );
   const [form, setForm] = React.useState({
     offering_id: "",
     contact_name: "",
@@ -156,6 +181,62 @@ export function WaitlistClient({
     }
   };
 
+  /** POST /v1/waitlist/{id}/notify — sends the claim link to the customer. */
+  const notify = async (entry: WaitlistEntry) => {
+    setBusyId(entry.id);
+    try {
+      await api.post(
+        `/api/bookings/v1/waitlist/${entry.id}/notify`,
+        {},
+        { tenant: orgSlug },
+      );
+      toast({
+        title: "Customer notified",
+        description: `${
+          entry.contact_name || entry.contact_phone
+        } was sent their single-use claim link.`,
+        variant: "success",
+      });
+      await load(status);
+    } catch (e) {
+      toast({
+        title: "Notify failed",
+        description: e instanceof ApiError ? e.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /** POST /v1/waitlist/{id}/expire — manual expiry (confirmed first). */
+  const expire = async () => {
+    if (!expireTarget) return;
+    setBusyId(expireTarget.id);
+    try {
+      await api.post(
+        `/api/bookings/v1/waitlist/${expireTarget.id}/expire`,
+        {},
+        { tenant: orgSlug },
+      );
+      toast({
+        title: "Entry expired",
+        description: "The claim link for this entry no longer works.",
+        variant: "success",
+      });
+      setExpireTarget(null);
+      await load(status);
+    } catch (e) {
+      toast({
+        title: "Expire failed",
+        description: e instanceof ApiError ? e.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const copyClaimLink = async (entry: WaitlistEntry) => {
     const link = `${window.location.origin}/p/${siteSlug}/claim?token=${entry.claim_token}`;
     try {
@@ -178,7 +259,7 @@ export function WaitlistClient({
     <div>
       <PageHeader
         title="Waitlist"
-        description="Customers waiting for an opening. When a booking is cancelled the top 3 waiting entries for the offering are notified automatically with a single-use claim link; you can also copy the link for manual outreach."
+        description="Customers waiting for an opening. When a booking is cancelled the top 3 waiting entries for the offering are notified automatically with a single-use claim link; you can also notify an entry manually, copy its link for manual outreach, or expire it."
         actions={
           <>
             <Button
@@ -302,6 +383,7 @@ export function WaitlistClient({
         >
           <option value="">All</option>
           <option value="waiting">Waiting</option>
+          <option value="notified">Notified</option>
           <option value="claimed">Claimed</option>
           <option value="expired">Expired</option>
         </Select>
@@ -352,18 +434,44 @@ export function WaitlistClient({
                     {formatDateTime(w.created_at)}
                   </TableCell>
                   <TableCell className="pr-5 text-right">
-                    {w.status === "waiting" ? (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => void copyClaimLink(w)}
-                      >
-                        <Link2 className="h-3.5 w-3.5" />
-                        Copy claim link
-                      </Button>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    )}
+                    <div className="flex items-center justify-end gap-2">
+                      {LINKABLE.has(w.status) ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => void copyClaimLink(w)}
+                        >
+                          <Link2 className="h-3.5 w-3.5" />
+                          Copy claim link
+                        </Button>
+                      ) : null}
+                      {NOTIFYABLE.has(w.status) ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={busyId === w.id}
+                          onClick={() => void notify(w)}
+                        >
+                          <Bell className="h-3.5 w-3.5" />
+                          Notify
+                        </Button>
+                      ) : null}
+                      {EXPIRABLE.has(w.status) ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="text-destructive"
+                          disabled={busyId === w.id}
+                          onClick={() => setExpireTarget(w)}
+                        >
+                          <TimerOff className="h-3.5 w-3.5" />
+                          Expire
+                        </Button>
+                      ) : null}
+                      {!LINKABLE.has(w.status) ? (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      ) : null}
+                    </div>
                   </TableCell>
                 </TableRow>
               ))
@@ -372,10 +480,29 @@ export function WaitlistClient({
         </Table>
       </Card>
       <p className="mt-3 text-xs text-muted-foreground">
-        Entries expire automatically when their window passes; claims on an
-        expired window are refused (410). Claimed entries are linked to the
-        resulting booking.
+        A background sweep marks entries expired about every 5 minutes once
+        their window passes; claims on an expired window are refused (410).
+        Claimed entries are linked to the resulting booking.
       </p>
+
+      <ConfirmDialog
+        open={expireTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && busyId === null) setExpireTarget(null);
+        }}
+        title="Expire waitlist entry?"
+        description={
+          expireTarget
+            ? `${
+                expireTarget.contact_name || expireTarget.contact_phone
+              } will no longer be able to claim this window — the entry is marked expired and its claim link stops working.`
+            : undefined
+        }
+        confirmLabel="Expire entry"
+        destructive
+        busy={expireTarget !== null && busyId === expireTarget.id}
+        onConfirm={() => void expire()}
+      />
     </div>
   );
 }

@@ -2,12 +2,14 @@ package bookingops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/availability"
+	"github.com/opendesk/booking-service/internal/events"
 	"github.com/opendesk/booking-service/internal/store"
 )
 
@@ -15,6 +17,91 @@ import (
 // claimed again — the window has passed or the entry left the waiting
 // state without a booking to replay. Handlers map it to HTTP 410 (Gone).
 var ErrClaimExpired = errors.New("waitlist claim token expired or consumed")
+
+// Waitlist lifecycle event types (SPEC-W48 A2), CloudEvents published to
+// the booking events topic via the transactional outbox.
+const (
+	// EventTypeWaitlistEntryNotified accompanies the waiting → notified
+	// flip (staff-triggered manual notify, POST /v1/waitlist/{id}/notify).
+	// The data payload mirrors the notification-worker's WaitlistBackfill
+	// send shape (PacedWaitlistSend: input + entry with claim_token), so
+	// the existing notification bridge can deliver it with the same
+	// claim-link template as the cancellation backfill.
+	EventTypeWaitlistEntryNotified = "com.opendesk.booking.WaitlistEntryNotified"
+	// EventTypeWaitlistEntryExpired is the audit row of every expiry —
+	// staff manual expire (actor) or the auto-expiry sweeper
+	// (actor "waitlist-sweeper").
+	EventTypeWaitlistEntryExpired = "com.opendesk.booking.WaitlistEntryExpired"
+)
+
+// waitlistNotifyData builds the WaitlistEntryNotified payload data in the
+// WaitlistBackfillWorkflow's notification shape: the backfill input
+// (tenant addressing) + the entry (contact phone + claim_token — the
+// consumer builds the single-use claim link from it exactly as the
+// cancellation backfill does). Channel: the entry carries a phone (SMS/
+// WhatsApp per tenant routing), same as the backfill send.
+func waitlistNotifyData(tenantSlug string, e store.WaitlistEntry) map[string]any {
+	return map[string]any{
+		"input": map[string]any{
+			"tenant_id":   e.TenantID.String(),
+			"tenant_slug": tenantSlug,
+			"offering_id": e.OfferingID.String(),
+		},
+		"entry": map[string]any{
+			"id":            e.ID.String(),
+			"offering_id":   e.OfferingID.String(),
+			"contact_name":  e.ContactName,
+			"contact_phone": e.ContactPhone,
+			"window_start":  e.WindowStart,
+			"window_end":    e.WindowEnd,
+			"status":        e.Status,
+			"claim_token":   e.ClaimToken.String(),
+		},
+		// Relative claim link (the public host prefix is the consumer's
+		// PublicBaseURL, same as the backfill claimLink builder).
+		"claim_path": "/p/" + tenantSlug + "/claim?entry=" + e.ID.String() + "&token=" + e.ClaimToken.String(),
+	}
+}
+
+// NotifyWaitlistEntry performs the staff-triggered manual notify
+// (SPEC-W48 A2): waiting → notified with the WaitlistEntryNotified audit/
+// delivery event committed in the SAME transaction (store.MarkWaitlistNotifiedTx).
+// 409 (store.ErrConflict) when the entry is no longer waiting.
+func (s *Service) NotifyWaitlistEntry(ctx context.Context, tenantID uuid.UUID, tenantSlug string, entryID uuid.UUID) (store.WaitlistEntry, error) {
+	entry, err := s.Store.GetWaitlistEntry(ctx, tenantID, entryID)
+	if err != nil {
+		return store.WaitlistEntry{}, err
+	}
+	payload, err := json.Marshal(events.New("booking-service", EventTypeWaitlistEntryNotified,
+		tenantSlug, tenantID.String(), waitlistNotifyData(tenantSlug, entry)))
+	if err != nil {
+		return store.WaitlistEntry{}, fmt.Errorf("marshal waitlist-notified event: %w", err)
+	}
+	return s.Store.MarkWaitlistNotifiedTx(ctx, tenantID, entryID, s.EventsTopic, payload)
+}
+
+// ExpireWaitlistEntry performs the staff-triggered manual expire
+// (SPEC-W48 A2): waiting|notified → expired with the audit event committed
+// in the same transaction (store.ExpireWaitlistTx). 409 (store.ErrConflict)
+// when the entry is already claimed/expired.
+func (s *Service) ExpireWaitlistEntry(ctx context.Context, tenantID uuid.UUID, tenantSlug string, entryID uuid.UUID, actorID string) (store.WaitlistEntry, error) {
+	entry, err := s.Store.GetWaitlistEntry(ctx, tenantID, entryID)
+	if err != nil {
+		return store.WaitlistEntry{}, err
+	}
+	payload, err := json.Marshal(events.New("booking-service", EventTypeWaitlistEntryExpired,
+		tenantSlug, tenantID.String(), map[string]any{
+			"entry_id":    entryID.String(),
+			"offering_id": entry.OfferingID.String(),
+			"actor":       actorID,
+			"via":         "manual",
+		}))
+	if err != nil {
+		return store.WaitlistEntry{}, fmt.Errorf("marshal waitlist-expired event: %w", err)
+	}
+	return s.Store.ExpireWaitlistTx(ctx, tenantID, entryID, actorID, s.EventsTopic, payload)
+}
+
 
 // ClaimInput describes a waitlist claim attempt (SPEC-W3 §3 innovation 7).
 // The claim token is the capability secret delivered to the contact by the

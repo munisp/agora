@@ -49,7 +49,10 @@ const (
 	StatusNew          = "new"
 	StatusDispatched   = "dispatched"
 	StatusAcknowledged = "acknowledged"
-	StatusClosed       = "closed"
+	// StatusResolved (SPEC-W48 A1): operator-resolved via
+	// POST /v1/incidents/{id}/resolve; terminal for that route.
+	StatusResolved = "resolved"
+	StatusClosed   = "closed"
 )
 
 // Delivery row statuses (mirrors the Wave-5 webhook delivery workflow:

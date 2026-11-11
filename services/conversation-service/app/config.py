@@ -52,8 +52,11 @@ class Config:
     booking_internal_token: str = ""
 
     # Raw transcript sink (SPEC §5). "kafka" (aiokafka fallback) or "fluvio".
+    # fluvio_endpoint (W48-B) is the Fluvio SC endpoint the client connects
+    # to via an explicit FluvioConfig (no ~/.fluvio profile in the image).
     transcript_sink: str = "kafka"
     fluvio_topic: str = "opendesk.transcripts-raw"
+    fluvio_endpoint: str = "fluvio:9003"
     kafka_brokers: list[str] = field(default_factory=lambda: ["kafka:9092"])
 
     # Call intelligence (SPEC-W3 §4, innovation 3). Lexicon sentiment always
@@ -180,6 +183,7 @@ def load() -> Config:
         transcripts_topic=_env("TRANSCRIPTS_TOPIC", "opendesk.conversation.transcripts"),
         transcript_sink=_env("TRANSCRIPT_SINK", "kafka").lower(),
         fluvio_topic=_env("FLUVIO_TOPIC", "opendesk.transcripts-raw"),
+        fluvio_endpoint=_env("FLUVIO_ENDPOINT", "fluvio:9003"),
         kafka_brokers=[b.strip() for b in _env("KAFKA_BROKERS", "kafka:9092").split(",") if b.strip()],
         intel_llm=_env("INTEL_LLM", "off").lower() in ("1", "on", "true", "yes"),
         intel_llm_base_url=_env("INTEL_LLM_BASE_URL", _env("LLM_BASE_URL", "http://ollama:11434/v1")),

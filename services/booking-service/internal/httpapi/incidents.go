@@ -43,7 +43,7 @@ func (s *server) listIncidents(w http.ResponseWriter, r *http.Request) {
 	status := q.Get("status")
 	if status != "" {
 		switch status {
-		case incidents.StatusNew, incidents.StatusDispatched, incidents.StatusAcknowledged, incidents.StatusClosed:
+		case incidents.StatusNew, incidents.StatusDispatched, incidents.StatusAcknowledged, incidents.StatusResolved, incidents.StatusClosed:
 		default:
 			writeError(w, http.StatusBadRequest, "invalid status filter")
 			return
@@ -140,6 +140,55 @@ func (s *server) dispatchIncident(w http.ResponseWriter, r *http.Request) {
 		deliveries = []store.IncidentDelivery{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deliveries": deliveries})
+}
+
+// resolveIncidentRequest is the POST /v1/incidents/{id}/resolve body
+// (SPEC-W48 A1); the note is optional.
+type resolveIncidentRequest struct {
+	Note string `json:"note,omitempty"`
+}
+
+// resolveIncident handles POST /v1/incidents/{id}/resolve (manage_bookings,
+// mirroring dispatchIncident exactly — the require() middleware owns authn +
+// the fail-closed Permify check, 502 on authz outage). The transition +
+// audit outbox row commit atomically in store.ResolveIncidentTx.
+//
+//	200 with the updated incident;
+//	404 unknown incident;
+//	409 already resolved/closed (invalid transition).
+func (s *server) resolveIncident(w http.ResponseWriter, r *http.Request) {
+	svc := s.incidentsSvc(w)
+	if svc == nil {
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req resolveIncidentRequest
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+	}
+	// The operator identity comes from the tenant middleware context (JWT
+	// sub or X-User-Id) — require() already rejected anonymous callers.
+	actor := userFrom(r.Context())
+	inc, err := svc.Resolve(r.Context(), tenant.ID, id, actor, req.Note, tenant.Slug)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if errors.Is(err, store.ErrConflict) {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, inc)
 }
 
 // ---------------------------------------------------------------------------

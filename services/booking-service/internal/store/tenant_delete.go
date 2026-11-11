@@ -113,6 +113,9 @@ var tenantPIIPurgeSteps = []piiPurgeStep{
 	{"csat_tokens", "delete CSAT capability tokens", `DELETE FROM csat_tokens WHERE tenant_id=$1`},
 	{"qr_scans", "delete scan events", `DELETE FROM qr_scans WHERE tenant_id=$1`},
 	{"geo_campaign_sends", "delete send ledger", `DELETE FROM geo_campaign_sends WHERE tenant_id=$1`},
+	// SPEC-W48 A4: reviews carry reviewer PII (reviewer_name) and have no
+	// owner after tenant deletion — hard-deleted like the other PII rows.
+	{"booking_reviews", "delete reviews (reviewer PII)", `DELETE FROM booking_reviews WHERE tenant_id=$1`},
 	// The outbox has no tenant_id column (A-DB DB-13) and no RLS by design
 	// (cross-tenant dispatcher); payload->>'tenant_id' is the only handle.
 	// Rows whose payloads lack the key are untouched (documented limit).

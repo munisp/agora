@@ -132,6 +132,18 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W48 (W48-A item A3): bookings payment_ref/payment_status columns
+	// for the public pay leg (idempotent ADD COLUMN IF NOT EXISTS).
+	if err := s.ensureBookingPaymentColumns(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W48 (W48-A item A4): booking_reviews (public review leg,
+	// RLS-enabled).
+	if err := s.ensureBookingReviewsTable(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// SPEC-W45 CODER-A item 5: contacts dedupe — fold duplicate
 	// (tenant_id, phone) rows and create the UNIQUE index (fresh installs
 	// get it from 01-booking-schema.sql directly).

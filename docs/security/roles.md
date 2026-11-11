@@ -15,7 +15,8 @@ This document is the single role × capability matrix (SPEC-W7 Part C).
 | Manage catalog (offerings/team/availability) | ✔ | ✔ | — | — | — | — |
 | Manage bookings (book/reschedule/cancel) | ✔ | ✔ | ✔ | — | — | — |
 | Publish/edit public site + white label | ✔ | ✔ | — | — | — | — |
-| **Analytics dashboards (KPIs, text-to-SQL)** | ✔ | ✔ | — | — | ✔ | — |
+| **Analytics dashboards (KPIs, text-to-SQL)** | ✔ | ✔ | —² | — | ✔ | — |
+| Growth/ops reads (leads, referrals, campaigns, QR scans) | ✔ | ✔ | ✔² | — | ✔ | — |
 | **Billing section (invoices, payouts, QR)** | ✔ | — | — | — | — | ✔ |
 | Generate/void invoices, rate cards | ✔ | — | — | — | — | ✔¹ |
 
@@ -23,6 +24,17 @@ This document is the single role × capability matrix (SPEC-W7 Part C).
 for `POST /v1/invoices/generate` and `POST /v1/invoices/{id}/void` at the
 service level; the dashboard additionally hides the whole section from anyone
 without `owner`/`billing`.
+
+² W47 (UIMOB-07): Permify `view_analytics` is now
+`owner or admin or analyst or member`, so **staff** (Permify `member`) CAN
+read the tenant-local growth/ops lists that booking-service gates on
+`view_analytics` (`GET /v1/leads`, `/v1/referrals`, `/v1/campaigns`,
+`/v1/qr/scans` — the mobile Leads/Growth tabs). The admin-web **Analytics
+section** (KPI cards, text-to-SQL) is a separate, stricter gate: realm-role
+`owner`/`admin`/`analyst` only (`apps/admin-web/lib/roles.ts`
+`canViewAnalytics`), so staff still never see that dashboard section. The
+Permify grant is strictly tenant-local (every check evaluates against
+`organization:{tenant_id}`) and confers no cross-tenant analytics.
 
 ## Layer-by-layer mapping
 
@@ -51,7 +63,7 @@ server-side guards and the client-side nav hiding can never drift apart.
 | `manage_bookings` | `owner or admin or member` |
 | `view_dashboard` | `owner or admin or member or viewer` |
 | `publish_site` | `owner or admin` |
-| `view_analytics` | `owner or admin or analyst` |
+| `view_analytics` | `owner or admin or analyst or member` (W47 UIMOB-07 — see footnote ² above) |
 | `view_billing` | `owner or billing` |
 | `manage_billing` | `owner or billing` |
 
@@ -77,8 +89,11 @@ server-side guards and the client-side nav hiding can never drift apart.
 | `/app/{org}/billing` (invoices, QR, payouts) | owner, billing | server-side redirect in `page.tsx` + nav hiding in `org-nav.tsx` |
 | all other sections | any authenticated tenant member (`view_dashboard`) | tenant membership via `tenant_slugs` claim in `layout.tsx` |
 
-`staff` and `viewer` see **neither** Analytics nor Billing — both the nav
-entry and the route itself are closed.
+`staff` and `viewer` see **neither** the Analytics nor the Billing dashboard
+**section** — both the nav entry and the route itself are closed. (Staff do
+hold the Permify `view_analytics` grant for the tenant-local growth/ops API
+reads since W47 UIMOB-07 — footnote ² — but that grant never unlocks the
+dashboard section, which is realm-role gated.)
 
 ## Assigning roles (onboarding)
 

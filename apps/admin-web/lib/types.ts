@@ -515,7 +515,7 @@ export interface WaitlistEntry {
   contact_phone: string;
   window_start: string;
   window_end: string;
-  /** waiting | claimed | expired */
+  /** waiting (a.k.a. pending) | notified | claimed | expired (W48 adds notified + explicit expire). */
   status: string;
   /** Single-use claim capability (admin list only; never public). */
   claim_token: string;
@@ -530,10 +530,13 @@ export interface Incident {
   incident_type: string;
   severity: string;
   payload: unknown;
-  /** new | dispatched | acknowledged | closed */
+  /** new | dispatched | acknowledged | resolved | closed (W48 adds resolved). */
   status: string;
   created_at: string;
   dispatched_at?: string | null;
+  /** W48 resolve audit: who resolved it and when (POST /v1/incidents/{id}/resolve). */
+  resolved_by?: string | null;
+  resolved_at?: string | null;
 }
 
 /** Per-endpoint dispatch ledger row (GET /v1/incidents/{id} → deliveries). */

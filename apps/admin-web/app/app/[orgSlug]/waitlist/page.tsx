@@ -15,10 +15,11 @@ export const metadata = { title: "Waitlist" };
  *
  * Notification is AUTOMATED: the notification-worker WaitlistBackfillWorkflow
  * notifies the top-3 waiting entries with their single-use claim link
- * whenever a booking is cancelled. The console additionally exposes each
- * entry's claim link for manual outreach. There is no manual-expire backend
- * route — entries expire automatically when their window passes (claims on
- * expired windows answer 410).
+ * whenever a booking is cancelled. Since W48 the console also offers manual
+ * per-entry actions: POST /v1/waitlist/{id}/notify (resend the claim link)
+ * and POST /v1/waitlist/{id}/expire. A bookingops sweep also marks entries
+ * expired (~every 5 minutes) once their window passes; claims on expired
+ * windows answer 410.
  */
 export default async function WaitlistPage({
   params,

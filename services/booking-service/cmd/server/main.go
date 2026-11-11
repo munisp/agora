@@ -332,7 +332,9 @@ func run() error {
 		Starter:      incidentStarter,
 		AutoDispatch: cfg.IncidentAutoDispatch,
 		UsageTopic:   cfg.UsageEventsTopic,
-		Log:          logger,
+		// SPEC-W48 A1: resolve audit events ride the booking events topic.
+		EventsTopic: cfg.BookingEventsTopic,
+		Log:         logger,
 	}
 
 	// Leads service (SPEC-W13 Agent A): CAC lead capture with first-touch
@@ -597,27 +599,37 @@ func run() error {
 	// StartBookingSaga for `pending` rows whose saga start failed at create
 	// (idempotent by deterministic workflow id). On by default; requires a
 	// Temporal client.
-	if cfg.BookingSweeperEnabled {
-		if saga != nil {
-			sweeper := &bookingops.Sweeper{
-				Store:    st,
-				Saga:     saga,
-				Log:      logger,
-				Interval: cfg.BookingSweeperInterval,
-				ResolveSlug: func(ctx context.Context, tenantID uuid.UUID) string {
-					site, err := st.GetSiteByTenant(ctx, tenantID)
-					if err != nil {
-						return "" // slug unknown; the saga start is still idempotent
-					}
-					return site.TenantSlug
-				},
-			}
-			go sweeper.Run(ctx)
-			logger.Info("pending-booking saga sweeper enabled",
-				zap.Duration("interval", cfg.BookingSweeperInterval))
-		} else {
-			logger.Warn("pending-booking sweeper enabled but Temporal is unavailable; sweeper inert until redeploy")
+	// SPEC-W48 A2: the same sweeper hosts the waitlist auto-expiry sweep
+	// (WAITLIST_SWEEP_INTERVAL, default 5m; <=0 disables) — it is NOT
+	// Temporal-dependent, so it runs even when the saga starter is nil
+	// (SweepOnce no-ops without a Saga).
+	if cfg.BookingSweeperEnabled && saga == nil {
+		logger.Warn("pending-booking sweeper enabled but Temporal is unavailable; saga re-drive inert until redeploy")
+	}
+	if (cfg.BookingSweeperEnabled && saga != nil) || cfg.WaitlistSweepInterval > 0 {
+		sweeper := &bookingops.Sweeper{
+			Store:    st,
+			Log:      logger,
+			Interval: cfg.BookingSweeperInterval,
+			// SPEC-W48 A2: waitlist auto-expiry sweep.
+			WaitlistSweepInterval: cfg.WaitlistSweepInterval,
+			WaitlistEventsTopic:   cfg.BookingEventsTopic,
+			ResolveSlug: func(ctx context.Context, tenantID uuid.UUID) string {
+				site, err := st.GetSiteByTenant(ctx, tenantID)
+				if err != nil {
+					return "" // slug unknown; the saga start is still idempotent
+				}
+				return site.TenantSlug
+			},
 		}
+		if cfg.BookingSweeperEnabled {
+			sweeper.Saga = saga
+		}
+		go sweeper.Run(ctx)
+		logger.Info("sweeper enabled",
+			zap.Duration("interval", cfg.BookingSweeperInterval),
+			zap.Bool("saga_redrive", cfg.BookingSweeperEnabled && saga != nil),
+			zap.Duration("waitlist_sweep_interval", cfg.WaitlistSweepInterval))
 	}
 
 	// SPEC-W43 K-09: per-consumer liveness registry read by /healthz — a

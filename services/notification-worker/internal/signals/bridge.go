@@ -130,6 +130,20 @@ func (b *Bridge) Process(ctx context.Context, raw []byte) error {
 		b.log.Warn("malformed booking event; skipping", zap.Error(err))
 		return nil
 	}
+
+	// SPEC-W48 (A2/G): entry-scoped waitlist events carry NO booking_id —
+	// they must be handled before the booking-scoped gate below or they are
+	// silently dropped (the exact gap W48-A flagged).
+	switch env.Type {
+	case eventTypeWaitlistEntryNotified:
+		return b.startWaitlistNotify(ctx, env)
+	case eventTypeWaitlistEntryExpired:
+		// Audit-only lifecycle event: paced sends are single-shot (no
+		// pending future send for an entry exists), so an expiry has
+		// nothing to stop. Explicitly acknowledged, never retried.
+		return nil
+	}
+
 	id := env.bookingID()
 	if id == "" {
 		return nil // events without a booking reference need no signals
@@ -185,6 +199,76 @@ func (b *Bridge) startBackfill(ctx context.Context, env eventEnvelope) error {
 	}
 	b.log.Info("WaitlistBackfillWorkflow started",
 		zap.String("booking_id", env.bookingID()), zap.String("offering_id", offeringID))
+	return nil
+}
+
+// SPEC-W48 (A2/G): event types emitted by booking-service's staff waitlist
+// routes (POST /v1/waitlist/{id}/notify|expire) and the auto-expiry sweep.
+const (
+	eventTypeWaitlistEntryNotified = "com.opendesk.booking.WaitlistEntryNotified"
+	eventTypeWaitlistEntryExpired  = "com.opendesk.booking.WaitlistEntryExpired"
+)
+
+// startWaitlistNotify starts one WaitlistNotifyWorkflow per
+// WaitlistEntryNotified event: the staff-chosen entry is delivered via the
+// same paced waitlist-claim send path the backfill uses
+// (PacedSendWaitlistClaim → SendWaitlistClaimNotification). The payload is
+// the drop-in PacedWaitlistSend shape booking-service emits
+// (data.input + data.entry with claim_token/contact_phone).
+//
+// Fail-closed: an event without a resolvable claim (entry id + claim_token)
+// or a reachable customer channel (contact_phone) is acknowledged WITHOUT
+// sending — a malformed event must never produce a customer-facing message.
+// Redelivered events dedupe on the deterministic workflow ID
+// (waitlist-notify-<entry_id>, WorkflowExecutionAlreadyStarted → ack), so a
+// Kafka redelivery can never double-send.
+func (b *Bridge) startWaitlistNotify(ctx context.Context, env eventEnvelope) error {
+	if b.starter == nil {
+		return nil
+	}
+	var data struct {
+		Input workflows.WaitlistBackfillInput `json:"input"`
+		Entry workflows.WaitlistEntry         `json:"entry"`
+	}
+	raw, err := json.Marshal(env.Data)
+	if err != nil {
+		return fmt.Errorf("marshal WaitlistEntryNotified data: %w", err)
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		b.log.Warn("malformed WaitlistEntryNotified payload; acknowledged without send", zap.Error(err))
+		return nil
+	}
+	if data.Entry.ID == "" || data.Entry.ClaimToken == "" || data.Entry.ContactPhone == "" {
+		b.log.Warn("WaitlistEntryNotified missing entry id/claim_token/contact_phone; acknowledged without send",
+			zap.String("entry_id", data.Entry.ID))
+		return nil
+	}
+	// Envelope defaults when the payload omits addressing fields.
+	if data.Input.TenantID == "" {
+		data.Input.TenantID = env.TenantID
+	}
+	if data.Input.TenantSlug == "" {
+		data.Input.TenantSlug = env.Subject
+	}
+	if data.Input.OfferingID == "" {
+		data.Input.OfferingID = data.Entry.OfferingID
+	}
+	send := workflows.PacedWaitlistSend{Input: data.Input, Entry: data.Entry}
+	_, err = b.starter.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        "waitlist-notify-" + data.Entry.ID,
+		TaskQueue: b.taskQueue,
+	}, "WaitlistNotifyWorkflow", send)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) || strings.Contains(err.Error(), "already started") {
+			b.log.Info("WaitlistNotifyWorkflow already running; event acknowledged (no double-send)",
+				zap.String("entry_id", data.Entry.ID))
+			return nil
+		}
+		return fmt.Errorf("start WaitlistNotifyWorkflow: %w", err)
+	}
+	b.log.Info("WaitlistNotifyWorkflow started",
+		zap.String("entry_id", data.Entry.ID), zap.String("offering_id", data.Input.OfferingID))
 	return nil
 }
 

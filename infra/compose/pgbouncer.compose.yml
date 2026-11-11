@@ -1,0 +1,127 @@
+# PgBouncer connection pooler (SPEC-W48-D, recon F6) — OPTIONAL compose
+# override. The base stack connects every service DIRECTLY to postgres:5432
+# (root docker-compose.yml DSNs are unchanged — pooling is opt-in only, for
+# risk containment). This override adds a transaction-mode pooler at
+# pgbouncer:6432 and rewrites the Go/Rust runtime DSNs onto it:
+#
+#   docker compose -f docker-compose.yml -f infra/compose/pgbouncer.compose.yml \
+#       up -d pgbouncer identity booking notification payments crm-sync billing-engine kyc
+#
+# What it does:
+#   1. Starts edoburu/pgbouncer (env-driven config; entrypoint generates
+#      pgbouncer.ini + userlist.txt from the env below — pinned precisely,
+#      no mounted config files).
+#   2. Flips the RUNTIME DSN of the Go/Rust services (identity, booking,
+#      notification, payments, crm-sync, billing-engine, kyc) from
+#      postgres:5432 to pgbouncer:6432. Credentials and db names are
+#      IDENTICAL to the direct DSNs — only the host:port changes.
+#   3. The pooler authenticates clients with the SAME app_*_login roles the
+#      services already use (infra/postgres/init-scripts/05-app-roles.sql);
+#      each DATABASE_URLS entry adds that user to the generated userlist.
+#
+# Deliberately NOT pooled (stay direct even with this override):
+#   - PG_DSN base DSNs and *_INTERNAL_DATABASE_URL (app_payments_internal_login
+#     etc.): cross-tenant reconciler/bootstrap jobs with tiny connection
+#     counts. The internal logins are intentionally NOT in the pooler
+#     userlist — a second DATABASE_URLS entry for the same db name would
+#     emit a duplicate [databases] key, which pgbouncer rejects at boot.
+#   - Superuser bootstrap (opendesk): never route DDL/migrations bootstrap
+#     through the pooler.
+#
+# Python services (conversation/knowledge/analytics) keep direct DSNs in
+# this override; the pooler DOES carry their databases in [databases]
+# (identity of last resort) so a later wave can flip them by env alone.
+#
+# Prod notes: transaction pooling breaks session-level features (LISTEN/
+# NOTIFY, session GUCs, advisory locks); the app services here open plain
+# transactions only. MAX_PREPARED_STATEMENTS=200 keeps pgx's default
+# statement-cache exec mode working in transaction mode (pgbouncer >=1.21).
+# Without this file the sim default posture is unchanged — no silent flip.
+
+services:
+  pgbouncer:
+    # edoburu/pgbouncer: config is generated from env vars by the image
+    # entrypoint (DATABASE_URLS -> [databases] + userlist, POOL_MODE etc.
+    # -> [pgbouncer]). Tag pinned (never :latest).
+    image: edoburu/pgbouncer:v1.25.2-p0
+    restart: unless-stopped
+    environment:
+      # One [databases] entry + one userlist line per comma-separated URL.
+      # Passwords MUST NOT contain commas (entrypoint splits on ','); the
+      # dev defaults satisfy this.
+      DATABASE_URLS: >-
+        postgres://${IDENTITY_PG_USER:-app_identity_login}:${IDENTITY_PG_PASS:-app_identity_dev_password}@postgres:5432/identity,
+        postgres://${BOOKING_PG_USER:-app_booking_login}:${BOOKING_PG_PASS:-app_booking_dev_password}@postgres:5432/booking,
+        postgres://${NOTIFICATIONS_PG_USER:-app_notifications_login}:${NOTIFICATIONS_PG_PASS:-app_notifications_dev_password}@postgres:5432/notifications,
+        postgres://${CONVERSATION_PG_USER:-app_conversation_login}:${CONVERSATION_PG_PASS:-app_conversation_dev_password}@postgres:5432/conversation,
+        postgres://${KNOWLEDGE_PG_USER:-app_knowledge_login}:${KNOWLEDGE_PG_PASS:-app_knowledge_dev_password}@postgres:5432/knowledge,
+        postgres://${CRM_SYNC_PG_USER:-app_crm_sync_login}:${CRM_SYNC_PG_PASS:-app_crm_sync_dev_password}@postgres:5432/crm_sync,
+        postgres://${BILLING_PG_USER:-app_billing_login}:${BILLING_PG_PASS:-app_billing_dev_password}@postgres:5432/billing,
+        postgres://${KYC_PG_USER:-app_kyc_login}:${KYC_PG_PASS:-app_kyc_dev_password}@postgres:5432/kyc,
+        postgres://${PAYMENTS_PG_USER:-app_payments_login}:${PAYMENTS_PG_PASS:-app_payments_dev_password}@postgres:5432/payments
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-25}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-1000}
+      LISTEN_PORT: '6432'
+      # pgx (Go services) uses the prepared-statement cache exec mode by
+      # default; without this the first prepared query under transaction
+      # pooling fails with "prepared statement ... does not exist".
+      MAX_PREPARED_STATEMENTS: ${PGBOUNCER_MAX_PREPARED_STATEMENTS:-200}
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits,options
+      # Fail-closed default: no userlist entry matches the admin user, so
+      # the pgbouncer admin console (SHOW POOLS etc.) has NO provisioned
+      # login in this dev wiring. Set PGBOUNCER_ADMIN_USERS to one of the
+      # pooled app logins to debug pools in a pinch.
+      ADMIN_USERS: ${PGBOUNCER_ADMIN_USERS:-pgbouncer_admin_disabled}
+    # GF4 (SPEC-W34): expose on the opendesk network only — no host port
+    # published. Services reach it as pgbouncer:6432.
+    expose:
+    - '6432'
+    networks:
+    - opendesk
+    depends_on:
+    - postgres
+
+  # --- Go/Rust service DSN flips (identical user/pass/db, pooled host) ----
+  identity:
+    environment:
+      DATABASE_URL: postgres://${IDENTITY_PG_USER:-app_identity_login}:${IDENTITY_PG_PASS:-app_identity_dev_password}@pgbouncer:6432/identity
+    depends_on:
+    - pgbouncer
+  booking:
+    environment:
+      DATABASE_URL: postgres://${BOOKING_PG_USER:-app_booking_login}:${BOOKING_PG_PASS:-app_booking_dev_password}@pgbouncer:6432/booking
+    depends_on:
+    - pgbouncer
+  notification:
+    environment:
+      DATABASE_URL: postgres://${NOTIFICATIONS_PG_USER:-app_notifications_login}:${NOTIFICATIONS_PG_PASS:-app_notifications_dev_password}@pgbouncer:6432/notifications
+    depends_on:
+    - pgbouncer
+  payments:
+    environment:
+      # PAYMENTS_INTERNAL_DATABASE_URL (cross-tenant reconciler,
+      # app_payments_internal_login) stays DIRECT — see header note.
+      PAYMENTS_DATABASE_URL: postgres://${PAYMENTS_PG_USER:-app_payments_login}:${PAYMENTS_PG_PASS:-app_payments_dev_password}@pgbouncer:6432/payments
+    depends_on:
+    - pgbouncer
+  crm-sync:
+    environment:
+      DATABASE_URL: postgres://${CRM_SYNC_PG_USER:-app_crm_sync_login}:${CRM_SYNC_PG_PASS:-app_crm_sync_dev_password}@pgbouncer:6432/crm_sync
+    depends_on:
+    - pgbouncer
+  billing-engine:
+    environment:
+      # Note: billing runs its migrations (0001-0004) on this connection at
+      # boot; single-statement DDL is fine through transaction pooling. The
+      # existing superuser bootstrap idiom (BILLING_PG_USER=opendesk) must
+      # stay DIRECT — do not combine it with this override.
+      DATABASE_URL: postgres://${BILLING_PG_USER:-app_billing_login}:${BILLING_PG_PASS:-app_billing_dev_password}@pgbouncer:6432/billing
+    depends_on:
+    - pgbouncer
+  kyc:
+    environment:
+      DATABASE_URL: postgres://${KYC_PG_USER:-app_kyc_login}:${KYC_PG_PASS:-app_kyc_dev_password}@pgbouncer:6432/kyc
+    depends_on:
+    - pgbouncer

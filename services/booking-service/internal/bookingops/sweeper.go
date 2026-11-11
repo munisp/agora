@@ -2,9 +2,11 @@ package bookingops
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/opendesk/booking-service/internal/events"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
 )
@@ -34,6 +36,16 @@ type Sweeper struct {
 	// ResolveSlug resolves the tenant slug for the saga input (events use it
 	// as the CloudEvent subject). Optional: nil leaves TenantSlug empty.
 	ResolveSlug func(ctx context.Context, tenantID uuid.UUID) string
+
+	// WaitlistSweepInterval enables the waitlist auto-expiry sweep
+	// (SPEC-W48 A2) when > 0: every interval, waiting|notified entries
+	// whose window_end has passed flip to expired (batched, SKIP LOCKED),
+	// one audit outbox row per entry. <= 0 disables the sweep entirely
+	// (WAITLIST_SWEEP_INTERVAL, default 5m, wired in cmd/server/main.go).
+	WaitlistSweepInterval time.Duration
+	// WaitlistEventsTopic is the CloudEvents topic for the per-entry expiry
+	// audit rows (empty = status flips still happen, no audit events).
+	WaitlistEventsTopic string
 }
 
 func (s *Sweeper) logger() *zap.Logger {
@@ -44,7 +56,9 @@ func (s *Sweeper) logger() *zap.Logger {
 }
 
 // Run sweeps on a ticker until ctx is cancelled. A failing sweep is logged
-// and retried next tick (self-healing background job).
+// and retried next tick (self-healing background job). The waitlist
+// auto-expiry sweep (SPEC-W48 A2) runs on its own ticker when
+// WaitlistSweepInterval > 0.
 func (s *Sweeper) Run(ctx context.Context) {
 	interval := s.Interval
 	if interval <= 0 {
@@ -52,6 +66,15 @@ func (s *Sweeper) Run(ctx context.Context) {
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// The waitlist sweep ticker is nil-channel disabled (a nil channel
+	// blocks forever in select) when the interval is not positive.
+	var waitlistC <-chan time.Time
+	var waitlistT *time.Ticker
+	if s.WaitlistSweepInterval > 0 {
+		waitlistT = time.NewTicker(s.WaitlistSweepInterval)
+		waitlistC = waitlistT.C
+		defer waitlistT.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -63,8 +86,57 @@ func (s *Sweeper) Run(ctx context.Context) {
 			} else if n > 0 {
 				s.logger().Info("pending-booking sweep re-drove sagas", zap.Int("redriven", n))
 			}
+		case <-waitlistC:
+			n, err := s.SweepWaitlistOnce(ctx)
+			if err != nil {
+				s.logger().Error("waitlist expiry sweep failed", zap.Error(err))
+			} else if n > 0 {
+				s.logger().Info("waitlist expiry sweep expired entries", zap.Int("expired", n))
+			}
 		}
 	}
+}
+
+// SweepWaitlistOnce expires one batch of stale waitlist entries
+// (waiting|notified with window_end < now()) and writes one audit outbox
+// row per expired entry (SPEC-W48 A2). Returns the number expired.
+// Audit-row failures are logged and skipped — the expiry itself is already
+// committed and the sweeper must not stall on a Kafka-facing hiccup.
+func (s *Sweeper) SweepWaitlistOnce(ctx context.Context) (int, error) {
+	if s.Store == nil {
+		return 0, nil
+	}
+	expired, err := s.Store.ExpireStaleWaitlist(ctx, s.Batch)
+	if err != nil {
+		return 0, err
+	}
+	if s.WaitlistEventsTopic == "" {
+		return len(expired), nil
+	}
+	for _, e := range expired {
+		slug := ""
+		if s.ResolveSlug != nil {
+			slug = s.ResolveSlug(ctx, e.TenantID)
+		}
+		payload, merr := json.Marshal(events.New("booking-service", EventTypeWaitlistEntryExpired,
+			slug, e.TenantID.String(), map[string]any{
+				"entry_id":    e.ID.String(),
+				"offering_id": e.OfferingID.String(),
+				"actor":       "waitlist-sweeper",
+				"via":         "sweep",
+				"window_end":  e.WindowEnd,
+			}))
+		if merr != nil {
+			s.logger().Warn("waitlist expiry audit marshal failed; skipping audit row",
+				zap.String("entry_id", e.ID.String()), zap.Error(merr))
+			continue
+		}
+		if err := s.Store.EnqueueOutbox(ctx, e.ID, s.WaitlistEventsTopic, payload); err != nil {
+			s.logger().Warn("waitlist expiry audit enqueue failed; skipping audit row",
+				zap.String("entry_id", e.ID.String()), zap.Error(err))
+		}
+	}
+	return len(expired), nil
 }
 
 // SweepOnce re-drives the saga for one batch of stale pending bookings.

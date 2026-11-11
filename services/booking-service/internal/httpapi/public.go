@@ -3,8 +3,12 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/store"
 )
 
@@ -208,4 +212,237 @@ func (s *server) publicCreateBooking(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, booking)
+}
+
+// ---------------------------------------------------------------------------
+// Public pay leg (SPEC-W48 A3)
+// ---------------------------------------------------------------------------
+
+const (
+	publicPayRateLimit  = 10
+	publicPayRateWindow = time.Minute
+)
+
+// publicPayRequest is the POST /public/sites/{slug}/bookings/{id}/pay body.
+type publicPayRequest struct {
+	Email       string `json:"email"`
+	Phone       string `json:"phone,omitempty"` // accepted for future rails; Flutterwave needs email only
+	RedirectURL string `json:"redirect_url,omitempty"`
+}
+
+// publicPayBooking serves POST /public/sites/{slug}/bookings/{id}/pay —
+// slug-resolved public, no session: the site resolves the tenant
+// server-side, so cross-tenant access is impossible by construction (a
+// booking of another tenant is a 404). The booking must be payable (status
+// pending|confirmed, offering price > 0); the Flutterwave checkout is
+// initialized via payments-service (idempotency key
+// "agora-<booking_id>-<unix>") and payment_ref/payment_status='initialized'
+// are persisted on the booking. 409 when the booking is already paid.
+//
+// Rate limiting reuses the existing public-endpoint limiter instance
+// (portalLimiter) under a pay-specific key prefix — no new middleware.
+func (s *server) publicPayBooking(w http.ResponseWriter, r *http.Request) {
+	site, ok := s.resolveSite(w, r)
+	if !ok {
+		return
+	}
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	if !s.portalLimiter.Allow("pay-ip:"+r.RemoteAddr, publicPayRateLimit*6, publicPayRateWindow) ||
+		!s.portalLimiter.Allow("pay-booking:"+id.String(), publicPayRateLimit, publicPayRateWindow) {
+		writeError(w, http.StatusTooManyRequests, "too many payment attempts — try again later")
+		return
+	}
+	var req publicPayRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	if req.Email == "" {
+		writeError(w, http.StatusBadRequest, "email is required (flutterwave customer)")
+		return
+	}
+	booking, err := s.d.Store.GetBooking(r.Context(), site.TenantID, id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if booking.Status != store.StatusPending && booking.Status != store.StatusConfirmed {
+		writeError(w, http.StatusConflict, "booking is not payable (status "+booking.Status+")")
+		return
+	}
+	// Honest pre-flight 409; InitializeBookingPaymentTx re-checks under a
+	// row lock after the rail answers (the authoritative double-pay guard).
+	if status, _, err := s.d.Store.GetBookingPayment(r.Context(), site.TenantID, id); err == nil &&
+		status == store.PaymentStatusPaid {
+		writeError(w, http.StatusConflict, "booking already paid")
+		return
+	}
+	offering, err := s.d.Store.GetOffering(r.Context(), site.TenantID, booking.OfferingID)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if offering.PriceCents <= 0 {
+		writeError(w, http.StatusConflict, "booking has no payable amount")
+		return
+	}
+	tenant, err := s.d.Resolver.BySlug(r.Context(), site.TenantSlug)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if s.d.Ops == nil || s.d.Ops.Payments == nil {
+		s.mapOpError(w, bookingops.ErrPaymentsNotConfigured)
+		return
+	}
+	key := "agora-" + booking.ID.String() + "-" + strconv.FormatInt(time.Now().Unix(), 10)
+	res, err := s.d.Ops.Payments.InitializeFlutterwave(r.Context(), site.TenantID.String(), bookingops.FlutterwaveInitializeRequest{
+		AmountCents:    offering.PriceCents,
+		Currency:       tenant.Currency,
+		Email:          req.Email,
+		BookingID:      booking.ID.String(),
+		IdempotencyKey: key,
+		RedirectURL:    req.RedirectURL,
+	}, bookingops.CallerIdentity{}) // public leg: no gateway identity — the K2 internal token authenticates the service
+	if err != nil {
+		s.mapOpError(w, err)
+		return
+	}
+	txRef := res.TxRef
+	if txRef == "" {
+		txRef = key // honest fallback: the idempotency key identifies the hold
+	}
+	if err := s.d.Store.InitializeBookingPaymentTx(r.Context(), site.TenantID, booking.ID, txRef); err != nil {
+		s.mapOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"link": res.Link, "tx_ref": txRef})
+}
+
+// ---------------------------------------------------------------------------
+// Public review leg (SPEC-W48 A4)
+// ---------------------------------------------------------------------------
+
+const (
+	publicReviewRateLimit  = 10
+	publicReviewRateWindow = time.Minute
+	// publicReviewCommentMax bounds the stored free-text fields.
+	publicReviewCommentMax = 4000
+	publicReviewNameMax    = 200
+)
+
+// publicReviewRequest is the POST /public/sites/{slug}/bookings/{id}/review
+// body.
+type publicReviewRequest struct {
+	Rating       int    `json:"rating"`
+	Comment      string `json:"comment,omitempty"`
+	ReviewerName string `json:"reviewer_name,omitempty"`
+}
+
+// publicCreateReview serves POST /public/sites/{slug}/bookings/{id}/review
+// — slug-resolved public, no session (same tenant-isolation-by-construction
+// posture as the pay leg: a booking of another tenant is a 404). The
+// booking must be status completed; one review per booking (UNIQUE on
+// booking_id → 409 on a duplicate).
+//
+// Rate limiting reuses the existing public-endpoint limiter instance
+// (portalLimiter) under a review-specific key prefix — no new middleware.
+func (s *server) publicCreateReview(w http.ResponseWriter, r *http.Request) {
+	site, ok := s.resolveSite(w, r)
+	if !ok {
+		return
+	}
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	if !s.portalLimiter.Allow("review-ip:"+r.RemoteAddr, publicReviewRateLimit*6, publicReviewRateWindow) ||
+		!s.portalLimiter.Allow("review-booking:"+id.String(), publicReviewRateLimit, publicReviewRateWindow) {
+		writeError(w, http.StatusTooManyRequests, "too many review attempts — try again later")
+		return
+	}
+	var req publicReviewRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Rating < 1 || req.Rating > 5 {
+		writeError(w, http.StatusBadRequest, "rating must be between 1 and 5")
+		return
+	}
+	req.Comment = strings.TrimSpace(req.Comment)
+	req.ReviewerName = strings.TrimSpace(req.ReviewerName)
+	if len(req.Comment) > publicReviewCommentMax || len(req.ReviewerName) > publicReviewNameMax {
+		writeError(w, http.StatusBadRequest, "comment/reviewer_name too long")
+		return
+	}
+	booking, err := s.d.Store.GetBooking(r.Context(), site.TenantID, id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if booking.Status != store.StatusCompleted {
+		writeError(w, http.StatusConflict, "only completed bookings can be reviewed")
+		return
+	}
+	review := store.BookingReview{
+		TenantID:     site.TenantID,
+		BookingID:    booking.ID,
+		Rating:       req.Rating,
+		Comment:      req.Comment,
+		ReviewerName: req.ReviewerName,
+	}
+	if err := s.d.Store.CreateBookingReview(r.Context(), &review); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, review)
+}
+
+// publicListReviews serves GET /public/sites/{slug}/reviews?limit=&offset=
+// — the public aggregate list over the tenant's completed bookings:
+// {reviews: [...], average, count}. limit is capped at 50 (store-enforced).
+func (s *server) publicListReviews(w http.ResponseWriter, r *http.Request) {
+	site, ok := s.resolveSite(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	limit, err := strconv.Atoi(q.Get("limit"))
+	if q.Get("limit") != "" && err != nil {
+		writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	offset, err := strconv.Atoi(q.Get("offset"))
+	if q.Get("offset") != "" && err != nil {
+		writeError(w, http.StatusBadRequest, "invalid offset")
+		return
+	}
+	reviews, average, count, err := s.d.Store.ListBookingReviews(r.Context(), site.TenantID, limit, offset)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	if reviews == nil {
+		reviews = []store.BookingReview{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"reviews": reviews,
+		"average": average,
+		"count":   count,
+	})
 }

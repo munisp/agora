@@ -6,7 +6,7 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install .
+RUN pip install '.[fluvio]'
 
 # ---------- run ----------
 FROM python:3.12-slim

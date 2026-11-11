@@ -132,6 +132,11 @@ func run() error {
 	w.RegisterWorkflowWithOptions(workflows.TenantOnboardingWorkflow, workflow.RegisterOptions{Name: "TenantOnboardingWorkflow"})
 	// SPEC-W3 §3 innovation 7: waitlist backfill on BookingCancelled.
 	w.RegisterWorkflowWithOptions(workflows.WaitlistBackfillWorkflow, workflow.RegisterOptions{Name: "WaitlistBackfillWorkflow"})
+	// SPEC-W48 (A2/G): single-entry waitlist notify, started by the signals
+	// bridge on com.opendesk.booking.WaitlistEntryNotified (staff manual
+	// notify). Without this registration the started workflow would queue
+	// forever on a worker that does not host the type.
+	w.RegisterWorkflowWithOptions(workflows.WaitlistNotifyWorkflow, workflow.RegisterOptions{Name: "WaitlistNotifyWorkflow"})
 	// SPEC-W19 integrator (additive): fire-and-forget paced sends from the
 	// notifications outbox (notifyoutbox consumer starts one per PacedSend
 	// command — e.g. field-service dispatch push).

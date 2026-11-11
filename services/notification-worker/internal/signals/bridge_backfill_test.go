@@ -9,12 +9,14 @@ import (
 	"go.uber.org/zap"
 )
 
-// fakeStarter records ExecuteWorkflow calls.
+// fakeStarter records ExecuteWorkflow calls. err, when set, is returned
+// (e.g. WorkflowExecutionAlreadyStarted for the redelivery-dedupe tests).
 type fakeStarter struct {
 	workflowType interface{}
 	args         []interface{}
 	options      client.StartWorkflowOptions
 	calls        int
+	err          error
 }
 
 func (f *fakeStarter) ExecuteWorkflow(_ context.Context, options client.StartWorkflowOptions, workflowType interface{}, args ...interface{}) (client.WorkflowRun, error) {
@@ -22,7 +24,7 @@ func (f *fakeStarter) ExecuteWorkflow(_ context.Context, options client.StartWor
 	f.options = options
 	f.workflowType = workflowType
 	f.args = args
-	return nil, nil
+	return nil, f.err
 }
 
 func TestBookingCancelledStartsWaitlistBackfill(t *testing.T) {

@@ -8,7 +8,10 @@ Every accepted turn is streamed as a raw record
 Two implementations behind the TranscriptSink protocol, selected by env
 TRANSCRIPT_SINK=fluvio|kafka (default kafka):
   - FluvioSink  — official fluvio python client (import guarded; the sync
-                  client is invoked via asyncio.to_thread)
+                  client is invoked via asyncio.to_thread). W48-B: connects
+                  with an explicit FluvioConfig built from FLUVIO_ENDPOINT
+                  (default fluvio:9003) instead of the ~/.fluvio profile,
+                  which does not exist inside the container image.
   - KafkaSink   — aiokafka producer fallback writing the same topic on Kafka
 """
 
@@ -31,31 +34,39 @@ class TranscriptSink(Protocol):
 
 
 class FluvioSink:
-    """Publishes raw transcripts via the fluvio python client.
+    """Publishes records via the fluvio python client.
 
     The import is guarded so the service runs without the optional
     `fluvio` package; construction then raises RuntimeError and the
     factory falls back to KafkaSink.
+
+    W48-B: the connection uses an explicit endpoint config
+    (`FluvioConfig.new(endpoint)` + `Fluvio.connect_with_config`) so the
+    broker address comes from FLUVIO_ENDPOINT — never the default
+    `~/.fluvio/config` profile.
     """
 
-    def __init__(self, topic: str) -> None:
+    def __init__(self, topic: str, endpoint: str = "fluvio:9003") -> None:
         try:
-            from fluvio import Fluvio  # type: ignore[import-not-found]
+            from fluvio import Fluvio, FluvioConfig  # type: ignore[import-not-found]
         except ImportError as exc:  # pragma: no cover - env dependent
             raise RuntimeError(
                 "TRANSCRIPT_SINK=fluvio requires the optional 'fluvio' package"
             ) from exc
         self._topic = topic
-        self._fluvio_mod = Fluvio
+        self._endpoint = endpoint
+        self._fluvio = Fluvio
+        self._fluvio_config = FluvioConfig
         self._producer: Any = None
 
     async def start(self) -> None:
         def _connect() -> Any:
-            client = self._fluvio_mod.connect()
+            config = self._fluvio_config.new(self._endpoint)
+            client = self._fluvio.connect_with_config(config)
             return client.topic_producer(self._topic)
 
         self._producer = await asyncio.to_thread(_connect)
-        log.info("fluvio sink connected", topic=self._topic)
+        log.info("fluvio sink connected", topic=self._topic, endpoint=self._endpoint)
 
     async def publish(self, record: dict[str, Any]) -> None:
         assert self._producer is not None, "FluvioSink.start() not called"
@@ -99,14 +110,21 @@ class KafkaSink:
             self._producer = None
 
 
-def build_sink(cfg: Config) -> TranscriptSink:
-    """Select the sink per TRANSCRIPT_SINK (default kafka).
+def build_sink(cfg: Config, topic: str | None = None) -> TranscriptSink:
+    """Select the sink per TRANSCRIPT_SINK (default kafka) for one topic.
+
+    W48-B: shared by all three sink topics — the raw transcript topic
+    (default, cfg.fluvio_topic), the intel enriched topic
+    (cfg.enriched_topic) and the call-quality topic (cfg.quality_topic) —
+    so TRANSCRIPT_SINK=fluvio is honored identically everywhere, on the
+    same per-sink topic names the Kafka path uses.
 
     Falls back to KafkaSink when the fluvio client is unavailable.
     """
+    topic = topic or cfg.fluvio_topic
     if cfg.transcript_sink == "fluvio":
         try:
-            return FluvioSink(cfg.fluvio_topic)
+            return FluvioSink(topic, cfg.fluvio_endpoint)
         except RuntimeError as exc:
             log.warning("fluvio sink unavailable, falling back to kafka", error=str(exc))
-    return KafkaSink(cfg.kafka_brokers, cfg.fluvio_topic)
+    return KafkaSink(cfg.kafka_brokers, topic)

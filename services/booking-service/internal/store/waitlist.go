@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,10 +12,14 @@ import (
 	"github.com/opendesk/booking-service/internal/availability"
 )
 
-// Waitlist status values (SPEC-W3 §3 innovation 7).
+// Waitlist status values (SPEC-W3 §3 innovation 7; SPEC-W48 A2 adds
+// notified/expired writers — notified = staff-triggered claim notification
+// sent, expired = window lapsed (manual or sweeper)).
 const (
-	WaitlistWaiting = "waiting"
-	WaitlistClaimed = "claimed"
+	WaitlistWaiting  = "waiting"
+	WaitlistNotified = "notified"
+	WaitlistClaimed  = "claimed"
+	WaitlistExpired  = "expired"
 )
 
 // WaitlistEntry mirrors booking.waitlist: a contact who wants a booking in
@@ -61,7 +66,7 @@ CREATE TABLE IF NOT EXISTS waitlist (
     window_start  TIMESTAMPTZ NOT NULL,
     window_end    TIMESTAMPTZ NOT NULL,
     status        TEXT NOT NULL DEFAULT 'waiting'
-                  CHECK (status IN ('waiting','claimed','expired')),
+                  CHECK (status IN ('waiting','notified','claimed','expired')),
     claim_token   UUID NOT NULL DEFAULT gen_random_uuid(),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (window_end > window_start)
@@ -81,6 +86,28 @@ BEGIN
 END $$;`
 	if _, err := s.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("ensure waitlist table: %w", err)
+	}
+	// SPEC-W48 (W48-A item A2): in-place migration for existing databases —
+	// widens the status CHECK with 'notified' (fresh installs get it inline
+	// above). Idempotent: the swap only runs when the constraint definition
+	// predates 'notified'.
+	const migrate = `
+DO $$
+BEGIN
+    IF to_regclass('public.waitlist') IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM pg_constraint
+            WHERE conname = 'waitlist_status_check'
+              AND conrelid = 'public.waitlist'::regclass
+              AND pg_get_constraintdef(oid) NOT LIKE '%''notified''%'
+       ) THEN
+        ALTER TABLE waitlist DROP CONSTRAINT waitlist_status_check;
+        ALTER TABLE waitlist ADD CONSTRAINT waitlist_status_check
+            CHECK (status IN ('waiting','notified','claimed','expired'));
+    END IF;
+END $$;`
+	if _, err := s.pool.Exec(ctx, migrate); err != nil {
+		return fmt.Errorf("migrate waitlist status check: %w", err)
 	}
 	return nil
 }
@@ -326,4 +353,146 @@ func (s *Store) ClaimWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID
 		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
 	}
 	return entry, err
+}
+
+// MarkWaitlistNotifiedTx transitions a waiting entry to notified and appends
+// the WaitlistEntryNotified outbox event in the SAME transaction (SPEC-W48
+// A2) — the event is the audit row: the status flip and the notification
+// request commit or roll back together, so a notified entry always has its
+// delivery event and a failed notify never strands a status. The row is
+// locked FOR UPDATE (the notify race mutex: a concurrent claim flips the
+// status under the loser, which then 409s).
+//
+// Errors: ErrNotFound (unknown entry), ErrConflict (entry no longer
+// waiting — already notified/claimed/expired).
+func (s *Store) MarkWaitlistNotifiedTx(ctx context.Context, tenantID, entryID uuid.UUID, outboxTopic string, eventPayload []byte) (WaitlistEntry, error) {
+	var entry WaitlistEntry
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		entry, err = scanWaitlist(tx.QueryRow(ctx,
+			`SELECT `+waitlistCols+` FROM waitlist WHERE tenant_id=$1 AND id=$2 FOR UPDATE`,
+			tenantID, entryID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if entry.Status != WaitlistWaiting {
+			return fmt.Errorf("%w: entry already %s", ErrConflict, entry.Status)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE waitlist SET status=$3 WHERE tenant_id=$1 AND id=$2`,
+			tenantID, entryID, WaitlistNotified); err != nil {
+			return fmt.Errorf("mark waitlist notified: %w", err)
+		}
+		if outboxTopic != "" && len(eventPayload) > 0 {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+				entry.ID, outboxTopic, eventPayload); err != nil {
+				return fmt.Errorf("insert waitlist-notified outbox row: %w", err)
+			}
+		}
+		entry.Status = WaitlistNotified
+		return nil
+	})
+	if err == nil && outboxTopic != "" && len(eventPayload) > 0 {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return entry, err
+}
+
+// ExpireWaitlistTx transitions a waiting|notified entry to expired
+// (SPEC-W48 A2, staff manual expire). FOR UPDATE lock; already
+// claimed/expired entries conflict (409). The audit trail is the outbox
+// event row committed in the same tx (same pattern as
+// MarkWaitlistNotifiedTx); skipped when outboxTopic is empty.
+func (s *Store) ExpireWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID, actorID, outboxTopic string, eventPayload []byte) (WaitlistEntry, error) {
+	var entry WaitlistEntry
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		entry, err = scanWaitlist(tx.QueryRow(ctx,
+			`SELECT `+waitlistCols+` FROM waitlist WHERE tenant_id=$1 AND id=$2 FOR UPDATE`,
+			tenantID, entryID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if entry.Status != WaitlistWaiting && entry.Status != WaitlistNotified {
+			return fmt.Errorf("%w: entry already %s", ErrConflict, entry.Status)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE waitlist SET status=$3 WHERE tenant_id=$1 AND id=$2`,
+			tenantID, entryID, WaitlistExpired); err != nil {
+			return fmt.Errorf("expire waitlist entry: %w", err)
+		}
+		if outboxTopic != "" && len(eventPayload) > 0 {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+				entry.ID, outboxTopic, eventPayload); err != nil {
+				return fmt.Errorf("insert waitlist-expired outbox row: %w", err)
+			}
+		}
+		entry.Status = WaitlistExpired
+		return nil
+	})
+	if err == nil && outboxTopic != "" && len(eventPayload) > 0 {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return entry, err
+}
+
+// ExpireStaleWaitlist flips every waiting|notified entry whose window has
+// passed to expired, batched (limit) and locked SKIP LOCKED so concurrent
+// sweeps never serialize on the same rows (SPEC-W48 A2 auto-expiry).
+// Returns the expired rows (the sweeper writes one audit outbox row per
+// entry).
+//
+// NOTE (RLS): cross-tenant background path — like ListStalePendingBookings
+// it intentionally runs outside withTenant. Under FORCE RLS the waitlist
+// policy hides rows without app.tenant_id; the sweeper therefore requires a
+// superuser/owner connection (as the existing booking sweeper does) and
+// silently sees no rows otherwise (fail-safe direction: no spurious
+// expiries).
+func (s *Store) ExpireStaleWaitlist(ctx context.Context, limit int) ([]WaitlistEntry, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	rows, err := s.pool.Query(ctx,
+		`WITH doomed AS (
+		     SELECT id FROM waitlist
+		      WHERE status IN ('waiting','notified') AND window_end < now()
+		      ORDER BY window_end
+		      LIMIT $1
+		      FOR UPDATE SKIP LOCKED
+		 )
+		 UPDATE waitlist w SET status='expired'
+		   FROM doomed d WHERE w.id = d.id
+		 RETURNING `+waitlistColsWithAlias("w"), limit)
+	if err != nil {
+		return nil, fmt.Errorf("expire stale waitlist: %w", err)
+	}
+	defer rows.Close()
+	var out []WaitlistEntry
+	for rows.Next() {
+		e, err := scanWaitlist(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// waitlistColsWithAlias renders the waitlist column list prefixed with a
+// table alias (for the UPDATE ... RETURNING of ExpireStaleWaitlist).
+func waitlistColsWithAlias(alias string) string {
+	cols := []string{"id", "tenant_id", "offering_id", "contact_name", "contact_phone",
+		"window_start", "window_end", "status", "claim_token", "created_at"}
+	for i, c := range cols {
+		cols[i] = alias + "." + c
+	}
+	return strings.Join(cols, ", ")
 }

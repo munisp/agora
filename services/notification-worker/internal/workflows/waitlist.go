@@ -72,3 +72,29 @@ func WaitlistBackfillWorkflow(ctx workflow.Context, in WaitlistBackfillInput) er
 	logger.Info("waitlist backfill notified", "offering_id", in.OfferingID, "notified", len(entries))
 	return nil
 }
+
+// WaitlistNotifyWorkflow is started by the signals bridge on a
+// com.opendesk.booking.WaitlistEntryNotified event (SPEC-W48 A2/G): a staff
+// member manually notified ONE waitlist entry on booking-service (which
+// already flipped it waiting → notified and carries the entry — claim_token
+// included — in the event payload). It delivers exactly one claim
+// notification through the SAME paced send path as the backfill
+// (PacedSendWaitlistClaim → SendWaitlistClaimNotification; the claim link
+// is built from the entry's single-use claim_token).
+//
+// It deliberately does NOT list the waitlist: the target entry is no longer
+// `waiting`, and re-running the backfill listing would notify the next
+// candidates instead of the staff-chosen entry (double-send).
+func WaitlistNotifyWorkflow(ctx workflow.Context, send PacedWaitlistSend) error {
+	logger := workflow.GetLogger(ctx)
+	ctx = workflow.WithActivityOptions(ctx, sagaActivityOptions())
+	req := PacedSendRequest{Kind: PacedSendWaitlistClaim, Waitlist: &send}
+	if err := workflow.ExecuteActivity(ctx, ActivityNotifyPaced, req).Get(ctx, nil); err != nil {
+		// Mirrors the backfill: a failed notification is logged, never
+		// fatal — delivery is best-effort and the claim link stays valid.
+		logger.Error("waitlist notify send failed", "entry_id", send.Entry.ID, "error", err)
+		return nil
+	}
+	logger.Info("waitlist entry notified", "entry_id", send.Entry.ID)
+	return nil
+}

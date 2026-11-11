@@ -117,6 +117,14 @@ services:
       # 05-app-roles.sql). The opendesk superuser is for migration/bootstrap
       # jobs only — override via IDENTITY_PG_USER/IDENTITY_PG_PASS in .env.
       DATABASE_URL: postgres://${IDENTITY_PG_USER:-app_identity_login}:${IDENTITY_PG_PASS:-app_identity_dev_password}@postgres:5432/identity
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches this DSN's host postgres:5432 -> pgbouncer:6432.
+      # This var itself is NOT read by service code; it exposes the pooler
+      # endpoint to operators/tooling when the override is active.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       INDUSTRIES_DIR: /industries
       # SPEC-W44 K2 internal-auth contract: every /internal/* surface requires
       # X-Internal-Token matching this value (constant-time compare; 503
@@ -208,6 +216,14 @@ services:
       PG_USER: ${BOOKING_PG_USER:-app_booking_login}
       PG_PASS: ${BOOKING_PG_PASS:-app_booking_dev_password}
       DATABASE_URL: postgres://${BOOKING_PG_USER:-app_booking_login}:${BOOKING_PG_PASS:-app_booking_dev_password}@postgres:5432/booking
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches this DSN's host postgres:5432 -> pgbouncer:6432.
+      # This var itself is NOT read by service code; it exposes the pooler
+      # endpoint to operators/tooling when the override is active.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       # Wave 5 #7 customer portal: HMAC secret for 15-min portal JWTs.
       # Dev default is repo-known; prod MUST override via .env. Bootable
       # only because OPENDESK_DEV_INSECURE is explicitly set below (W44 D4).
@@ -323,6 +339,14 @@ services:
       # PG_DSN — and the DSN MUST carry the /notifications dbname (pgx
       # otherwise defaults the database to the user name).
       DATABASE_URL: postgres://${NOTIFICATIONS_PG_USER:-app_notifications_login}:${NOTIFICATIONS_PG_PASS:-app_notifications_dev_password}@postgres:5432/notifications
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches this DSN's host postgres:5432 -> pgbouncer:6432.
+      # This var itself is NOT read by service code; it exposes the pooler
+      # endpoint to operators/tooling when the override is active.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       KEYCLOAK_URL: http://keycloak:8080
       PERMIFY_HTTP: http://permify:3476
       # SPEC-W44 F16-3: code reads TEMPORAL_HOST_PORT (notification
@@ -580,6 +604,14 @@ services:
       # W47-D config reads PAYMENTS_INTERNAL_DATABASE_URL; when unset the
       # service falls back to the main pool.
       PAYMENTS_INTERNAL_DATABASE_URL: postgres://${PAYMENTS_INTERNAL_PG_USER:-app_payments_internal_login}:${PAYMENTS_INTERNAL_PG_PASS:-app_payments_internal_dev_password}@postgres:5432/payments
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSNs above keep pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches PAYMENTS_DATABASE_URL's host postgres:5432 ->
+      # pgbouncer:6432 (the internal/reconciler DSN stays direct — see the
+      # override header). This var itself is NOT read by service code.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       KEYCLOAK_URL: http://keycloak:8080
       PERMIFY_URL: http://permify:3476
       TEMPORAL_HOST_PORT: temporal:7233
@@ -1126,6 +1158,14 @@ services:
       # SPEC-W43 G-01: least-privilege app_crm_sync_login by default
       # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
       DATABASE_URL: postgres://${CRM_SYNC_PG_USER:-app_crm_sync_login}:${CRM_SYNC_PG_PASS:-app_crm_sync_dev_password}@postgres:5432/crm_sync
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches this DSN's host postgres:5432 -> pgbouncer:6432.
+      # This var itself is NOT read by service code; it exposes the pooler
+      # endpoint to operators/tooling when the override is active.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       TWENTY_API_URL: http://twenty-api:3000
       TWENTY_API_KEY: ${TWENTY_API_KEY:-opendesk-dev-twenty-api-key}
       TWENTY_WEBHOOK_SECRET: ${TWENTY_WEBHOOK_SECRET:-opendesk-dev-twenty-webhook-secret}
@@ -1188,6 +1228,15 @@ services:
       # against the billing DB) and keep BILLING_PG_USER=app_billing_login,
       # or point DATABASE_URL at the superuser for the bootstrap deploy only.
       DATABASE_URL: postgres://${BILLING_PG_USER:-app_billing_login}:${BILLING_PG_PASS:-app_billing_dev_password}@postgres:5432/billing
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches this DSN's host postgres:5432 -> pgbouncer:6432. Do
+      # NOT combine with the superuser bootstrap idiom above (BILLING_PG_USER=
+      # opendesk) — bootstrap/DDL must stay direct.
+      # This var itself is NOT read by service code.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       KAFKA_GROUP_ID: billing-engine
       USAGE_EVENTS_TOPIC: opendesk.usage.events
       BILLING_EVENTS_TOPIC: opendesk.billing.events
@@ -1254,6 +1303,14 @@ services:
       # SPEC-W43 G-01: least-privilege app_kyc_login by default
       # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
       DATABASE_URL: postgres://${KYC_PG_USER:-app_kyc_login}:${KYC_PG_PASS:-app_kyc_dev_password}@postgres:5432/kyc
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432 (risk
+      # containment: default DSNs unchanged). Enable pooling with
+      # `-f infra/compose/pgbouncer.compose.yml`, which starts the pooler
+      # and switches this DSN's host postgres:5432 -> pgbouncer:6432.
+      # This var itself is NOT read by service code; it exposes the pooler
+      # endpoint to operators/tooling when the override is active.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
       KYC_MOCK: ${KYC_MOCK:-0}  # W34 GF8: safe default off; DEV ONLY — mock resolver via explicit KYC_MOCK=1 (CRITICAL startup log)
       # Consent gate: identity GET /internal/consents/check (Dapr app-id
       # identity); empty = Dapr invoke via the sidecar.

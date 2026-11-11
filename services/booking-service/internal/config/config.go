@@ -61,6 +61,10 @@ type Config struct {
 	// StartBookingSaga for pending rows whose saga start failed at create.
 	BookingSweeperEnabled  bool          // BOOKING_SWEEPER_ENABLED (default true)
 	BookingSweeperInterval time.Duration // BOOKING_SWEEPER_INTERVAL_SECONDS (default 120)
+	// WaitlistSweepInterval is the waitlist auto-expiry cadence (SPEC-W48
+	// A2): WAITLIST_SWEEP_INTERVAL, a Go duration ("5m") or bare seconds;
+	// default 5m; <= 0 disables the sweep.
+	WaitlistSweepInterval time.Duration
 	// Customer portal (Wave 5 #7)
 	PortalSecret       string // HMAC secret signing 15-min portal JWTs (PORTAL_SECRET)
 	NotificationsTopic string // opendesk.notifications.outbox (SendPortalCode delivery)
@@ -195,6 +199,8 @@ func Load() (Config, error) {
 		// SPEC-W43 K-08: pending-booking saga sweeper — ON by default.
 		BookingSweeperEnabled:  envStr("BOOKING_SWEEPER_ENABLED", "true") == "true",
 		BookingSweeperInterval: time.Duration(envInt("BOOKING_SWEEPER_INTERVAL_SECONDS", 120)) * time.Second,
+		// SPEC-W48 A2: waitlist auto-expiry sweep (default 5m; <=0 disables).
+		WaitlistSweepInterval: envDur("WAITLIST_SWEEP_INTERVAL", 5*time.Minute),
 		// Dev fallback keeps the portal bootable locally under
 		// OPENDESK_DEV_INSECURE=1; prod MUST override (fail-closed below).
 		PortalSecret:                  envStr("PORTAL_SECRET", DevPortalSecretDefault),
@@ -288,6 +294,23 @@ func envInt(key string, def int) int {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
+	}
+	return def
+}
+
+// envDur parses a duration env var: a Go duration string ("5m", "90s") or a
+// bare integer (seconds). <= 0 is preserved (callers use it as the disable
+// signal). Unparseable values fall back to def.
+func envDur(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
 	}
 	return def
 }

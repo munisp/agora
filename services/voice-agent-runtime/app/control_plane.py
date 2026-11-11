@@ -19,6 +19,18 @@
 - GET  /voice/voices -> aggregated TTS provider/voice catalog (SPEC-W10)
 - POST /voice/tts-preview {text, language?, provider?, voice?} -> audio/wav
          through the same FallbackTTS chain (SPEC-W10)
+- WS   /v1/stt/stream?conversation_id=... -> streaming STT (SPEC-W48-C):
+         client streams 16kHz mono PCM16 frames; server emits
+         {type:"interim", text, ts} per hop and
+         {type:"final", text, start_ts, end_ts} on silence endpointing.
+         Auth: same K15(b) session-secret mechanism as /voice/chat — the
+         X-Session-Secret header (or session_secret query param) must match
+         the named session; unauthenticated upgrades are rejected
+         (fail-closed, close 1008 before accept). Input bounded at
+         STT_STREAM_MAX_BUFFER_S (8s default) of undrained audio; overflow
+         closes with 1008 + reason. Capabilities declared by this endpoint:
+         streaming=True, interim_results=True (the LiveKit batch bridge
+         keeps streaming=False).
 - POST /voice-admin/voices/enroll {name, sample_base64, tenant} -> {voice_id}
          SPEC-W45 K15(d) + verifier F-2: XTTS brand-voice enrollment moved
          off the public /voice/* prefix; guarded by _require_admin_access —
@@ -47,7 +59,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -62,6 +74,12 @@ from .livekit_worker import ROOM_PREFIX
 from .logging import configure_logging, get_logger
 from .multilang import resolve_tts_voice
 from .pipeline.llm import build_llm
+from .pipeline.stt import FasterWhisperSTT, STTInterface
+from .pipeline.stt_stream import (
+    STREAMING_STT_CAPABILITIES,
+    BackpressureError,
+    StreamingSTTEngine,
+)
 from .session_state import SessionStore
 from .tts_providers.chain import build_fallback_tts
 
@@ -134,7 +152,11 @@ class VoiceSessionResponse(BaseModel):
     avatar: dict | None = None
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    stt_stream_recognizer: STTInterface | None = None,
+) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
 
@@ -147,6 +169,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         direct_bases={settings.booking_app_id: settings.booking_base_url},
     )
     sessions = SessionStore()
+    # SPEC-W48-C: recognizer for the /v1/stt/stream WebSocket endpoint,
+    # behind the STTInterface seam (app/pipeline/stt.py). Default is the
+    # real in-process faster-whisper impl (lazy model load, same settings
+    # as the batch path); tests inject a stub recognizer through the same
+    # interface — no mocks on the production path.
+    if stt_stream_recognizer is None:
+        stt_stream_recognizer = FasterWhisperSTT(
+            model_size=settings.whisper_model,
+            device=settings.whisper_device,
+            compute_type=settings.whisper_compute_type,
+        )
     # Primary LLM endpoint + optional circuit-broken fallback chain
     # (LLM_FALLBACK_* envs, VOICE-SCALING §3).
     llm = build_llm(settings)
@@ -162,6 +195,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     app = FastAPI(title="OpenDesk voice-agent-runtime", version="0.1.0")
+    # Exposed for in-process tests/embedding (K15(b) session credentials for
+    # /v1/stt/stream auth are minted here); not part of the HTTP surface.
+    app.state.session_store = sessions
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -403,6 +439,91 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             log.warning("chat failed", site_slug=req.site_slug, error=str(exc))
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # SPEC-W48-C: streaming STT over WebSocket (POST-upgraded).
+    # Client streams 16kHz mono PCM16 frames; per hop an
+    # {type:"interim", text, ts} event is emitted from a rolling
+    # STT_STREAM_WINDOW_S window; on STT_STREAM_SILENCE_MS of trailing
+    # silence the segment endpoints as {type:"final", text, start_ts,
+    # end_ts}. Undrained input is bounded at STT_STREAM_MAX_BUFFER_S
+    # (default 8s) of audio; overflow closes 1008 + reason.
+    # ------------------------------------------------------------------
+    @app.websocket("/v1/stt/stream")
+    async def stt_stream(websocket: WebSocket) -> None:
+        # Auth (fail-closed): the same K15(b) session-secret mechanism as
+        # /voice/chat — the caller names an existing conversation_id (query
+        # param) and presents its resume credential in the X-Session-Secret
+        # header (session_secret query param accepted as a fallback for
+        # WebSocket clients that cannot set headers; the header wins).
+        # SessionStore.check_secret is constant-time; unknown conversation,
+        # missing or wrong secret => reject the upgrade with 1008 before
+        # accept. A wrong secret NEVER binds the socket to the session.
+        conversation_id = websocket.query_params.get("conversation_id", "")
+        secret = websocket.headers.get("X-Session-Secret") or websocket.query_params.get(
+            "session_secret"
+        )
+        session = sessions.get(conversation_id) if conversation_id else None
+        if session is None or not session.check_secret(secret):
+            log.warning("stt stream upgrade rejected: bad session credentials")
+            await websocket.close(code=1008, reason="valid conversation_id and X-Session-Secret required")
+            return
+        session.touch()
+        await websocket.accept()
+        engine = StreamingSTTEngine(
+            stt_stream_recognizer,
+            window_s=settings.stt_stream_window_s,
+            hop_s=settings.stt_stream_hop_s,
+            silence_ms=settings.stt_stream_silence_ms,
+            max_buffer_s=settings.stt_stream_max_buffer_s,
+        )
+        await websocket.send_json(
+            {
+                "type": "ready",
+                "capabilities": engine.capabilities,
+                "window_s": settings.stt_stream_window_s,
+                "hop_s": settings.stt_stream_hop_s,
+                "silence_ms": settings.stt_stream_silence_ms,
+            }
+        )
+        overflow: list[str] = []
+
+        async def _receiver() -> None:
+            try:
+                while True:
+                    data = await websocket.receive_bytes()
+                    if not data:  # text frame or empty payload: ignore
+                        continue
+                    engine.feed(data)
+            except WebSocketDisconnect:
+                pass
+            except BackpressureError as exc:
+                overflow.append(str(exc))
+            except ValueError as exc:  # malformed PCM frame
+                overflow.append(str(exc))
+            finally:
+                engine.finish()
+
+        recv_task = asyncio.create_task(_receiver())
+        try:
+            while True:
+                if overflow:
+                    await websocket.close(code=1008, reason=overflow[0][:120])
+                    break
+                events = await engine.process_pending()
+                for event in events:
+                    await websocket.send_json(event)
+                if engine.finished and engine.drained:
+                    final = await engine.flush_final()
+                    if final is not None:
+                        await websocket.send_json(final)
+                    await websocket.close(code=1000)
+                    break
+                if not events:
+                    await asyncio.sleep(0.01)
+        finally:
+            recv_task.cancel()
+            await asyncio.gather(recv_task, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # SPEC-W10 Part A: voice provider catalog, preview, brand-voice enroll.
