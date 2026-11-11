@@ -765,18 +765,48 @@ class ToolLayer:
             return await self._refuse_gate("lookup_appointment", gate)
         confirmed = gate
 
+        # SPEC-W47 (UIMOB-05): the Booking JSON has NO contact_phone field
+        # (bookings carry contact_id), so the old client-side
+        # ``b.get("contact_phone")`` filter matched zero rows for every
+        # verified caller. The lookup now uses the booking-service
+        # server-side filter ``GET /v1/bookings?contact_phone=`` (W47-A:
+        # internal-token-gated, same internauth guard as the other internal
+        # routes) over the W46 P-02 direct BOOKING_BASE_URL client
+        # (dapr_client direct_bases, daprd fallback on transport failure).
+        # FAIL-CLOSED: without the internal token the filter route would
+        # 401 — refuse honestly instead of returning an empty list that
+        # reads as "you have no bookings".
+        if not self._settings.voice_booking_internal_token:
+            log.error(
+                "lookup_appointment refused: VOICE_BOOKING_INTERNAL_TOKEN "
+                "unset (the contact_phone filter route is internal-token-"
+                "gated) — failing closed"
+            )
+            await self._emit_tool_event(
+                "lookup_appointment", "unavailable", {}
+            )
+            return _verification_unavailable_payload()
+
         now = datetime.now(timezone.utc)
         resp = await self._dapr.invoke_get(
             self._settings.booking_app_id,
             "v1/bookings",
             params={
+                # K15(f): the verified phone goes ONLY to the internal
+                # booking route — never into logs/events.
+                "contact_phone": confirmed,
                 "from": (now - timedelta(days=1)).isoformat(),
                 "to": (now + timedelta(days=180)).isoformat(),
             },
-            headers={"X-Tenant-Slug": self._ctx.tenant_slug},
+            headers={
+                "X-Tenant-Slug": self._ctx.tenant_slug,
+                "X-Internal-Token": self._settings.voice_booking_internal_token,
+            },
         )
-        bookings = resp if isinstance(resp, list) else (resp or {}).get("bookings") or []
-        mine = [b for b in bookings if b.get("contact_phone") == confirmed]
+        # Contract (W47-A item 4): a JSON list of
+        # {id, status, starts_at, offering, ...}; tolerate the legacy
+        # {"bookings": [...]} envelope while the backend rolls out.
+        mine = resp if isinstance(resp, list) else (resp or {}).get("bookings") or []
         for b in mine:
             bid = b.get("id")
             if bid and bid not in self._session.last_booking_ids:
