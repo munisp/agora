@@ -220,6 +220,10 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_catalog")).Post("/", s.createOffering)
 			r.Get("/{id}", s.getOffering)
 			r.With(s.require("manage_catalog")).Put("/{id}", s.updateOffering)
+			// SPEC-W47 (W47-A item 1, A-UIWEB UIWEB-02): PATCH alias of the
+			// PUT handler — the admin-web offerings client sends PATCH for
+			// edit-save + bookable toggle and 405'd. Additive; same handler.
+			r.With(s.require("manage_catalog")).Patch("/{id}", s.updateOffering)
 			r.With(s.require("manage_catalog")).Delete("/{id}", s.deleteOffering)
 		})
 		r.Route("/team-members", func(r chi.Router) {
@@ -227,6 +231,10 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_catalog")).Post("/", s.createTeamMember)
 			r.Get("/{id}", s.getTeamMember)
 			r.With(s.require("manage_catalog")).Put("/{id}", s.updateTeamMember)
+			// SPEC-W47 (W47-A item 1, A-UIWEB UIWEB-03): PATCH alias of the
+			// PUT handler — the admin-web team client PATCHes the active
+			// toggle and 405'd. Additive; same handler.
+			r.With(s.require("manage_catalog")).Patch("/{id}", s.updateTeamMember)
 			r.With(s.require("manage_catalog")).Delete("/{id}", s.deleteTeamMember)
 			r.With(s.require("manage_catalog")).Put("/{id}/availability", s.putAvailability)
 			r.Get("/{id}/availability", s.getAvailabilityRules)
@@ -341,6 +349,10 @@ func NewRouter(d Deps) http.Handler {
 		r.Route("/campaigns", func(r chi.Router) {
 			r.With(s.require("view_analytics")).Get("/", s.listCampaigns)
 			r.With(s.require("manage_bookings")).Post("/", s.createCampaign)
+			// SPEC-W47 (W47-A item 7, A-DB DB-07): campaign lifecycle —
+			// partial update + terminal soft-delete (cancel), manage_bookings.
+			r.With(s.require("manage_bookings")).Patch("/{id}", s.updateCampaign)
+			r.With(s.require("manage_bookings")).Post("/{id}/cancel", s.cancelCampaign)
 			r.With(s.require("manage_bookings")).Post("/{id}/spend", s.recordCampaignSpend)
 		})
 		// Referrals + commissions (SPEC-W14 Agent A): manage_bookings for
