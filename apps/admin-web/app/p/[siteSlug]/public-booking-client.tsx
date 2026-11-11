@@ -43,6 +43,7 @@ export function PublicBookingClient({
   const [date, setDate] = React.useState<string>(toISODate(new Date()));
   const [slots, setSlots] = React.useState<AvailabilitySlot[]>([]);
   const [slotsLoading, setSlotsLoading] = React.useState(false);
+  const [slotsError, setSlotsError] = React.useState<string | null>(null);
   const [slot, setSlot] = React.useState<AvailabilitySlot | null>(null);
   const [details, setDetails] = React.useState<Details>({
     name: "",
@@ -56,22 +57,39 @@ export function PublicBookingClient({
   const [bookingRef, setBookingRef] = React.useState<string | null>(null);
 
   // Load availability slots whenever offering/date changes.
+  // SPEC-W47 (UIMOB-01): the public availability endpoint accepts
+  // {offering_id, date} and answers with a `{slots: [...]}` envelope
+  // (slots fanned out across the offering's active team members). Older
+  // deployments returned a bare array or {items}; accept all three.
   React.useEffect(() => {
     if (!offering) return;
     let cancelled = false;
     setSlotsLoading(true);
+    setSlotsError(null);
     setSlot(null);
     api
-      .get<AvailabilitySlot[] | { items: AvailabilitySlot[] }>(
+      .get<
+        | AvailabilitySlot[]
+        | { slots?: AvailabilitySlot[]; items?: AvailabilitySlot[] }
+      >(
         `/api/bookings/public/sites/${site.site_slug}/availability`,
         { offering_id: offering.id, date },
       )
       .then((data) => {
         if (cancelled) return;
-        setSlots(Array.isArray(data) ? data : (data.items ?? []));
+        setSlots(
+          Array.isArray(data) ? data : (data.slots ?? data.items ?? []),
+        );
       })
       .catch(() => {
-        if (!cancelled) setSlots([]);
+        // Honest failure state: do NOT render this as "no free slots" —
+        // the guest cannot tell a broken booking flow from a full day.
+        if (!cancelled) {
+          setSlots([]);
+          setSlotsError(
+            "Availability could not be loaded right now. Please try another date, call us, or use the chat.",
+          );
+        }
       })
       .finally(() => {
         if (!cancelled) setSlotsLoading(false);
@@ -255,6 +273,10 @@ export function PublicBookingClient({
                 </p>
                 {slotsLoading ? (
                   <p className="text-sm text-muted-foreground">Checking availability…</p>
+                ) : slotsError ? (
+                  <p className="rounded-md bg-danger-soft px-3 py-2 text-sm text-destructive">
+                    {slotsError}
+                  </p>
                 ) : slots.length === 0 ? (
                   <p className="text-sm text-muted-foreground">
                     No free slots this day — try another date.
@@ -428,25 +450,37 @@ export function PublicBookingClient({
             </p>
             <p className="mt-4 text-sm text-muted-foreground">
               A confirmation is on its way to {details.phone}. Need to change
-              or cancel? Just use the chat — our receptionist can handle it.
+              or cancel? Track and manage your booking in the customer portal,
+              or just use the chat — our receptionist can handle it.
             </p>
             {bookingRef ? (
               <p className="mt-3 font-mono text-xs text-muted-foreground">
                 ref {bookingRef}
               </p>
             ) : null}
-            <button
-              onClick={() => {
-                setStep("offering");
-                setOffering(null);
-                setSlot(null);
-                setPhoneConfirm("");
-                setBookingRef(null);
-              }}
-              className="mt-6 inline-flex items-center gap-2 rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-accent cursor-pointer"
+            {/* UIMOB-13: link the customer portal from the confirmation
+                screen so guests can track/reschedule without the chat. */}
+            <a
+              href={`/portal/${site.site_slug}`}
+              className="mt-5 inline-flex items-center gap-2 rounded-md px-4 py-2 text-sm font-medium text-white"
+              style={{ backgroundColor: accent }}
             >
-              Book another <ArrowRight className="h-4 w-4" />
-            </button>
+              Track my booking <ArrowRight className="h-4 w-4" />
+            </a>
+            <div>
+              <button
+                onClick={() => {
+                  setStep("offering");
+                  setOffering(null);
+                  setSlot(null);
+                  setPhoneConfirm("");
+                  setBookingRef(null);
+                }}
+                className="mt-3 inline-flex items-center gap-2 rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-accent cursor-pointer"
+              >
+                Book another <ArrowRight className="h-4 w-4" />
+              </button>
+            </div>
           </div>
         ) : null}
       </main>

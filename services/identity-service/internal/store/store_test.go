@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -491,5 +492,60 @@ func TestMemberLifecycleStore(t *testing.T) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 		t.Errorf("bogus plan: err = %v, want pg 23514", err)
+	}
+}
+
+// TestUpdateTenantStore (SPEC-W47 UIWEB-01): partial update round trip under
+// RLS — only patched columns change, terminology replaces wholesale.
+func TestUpdateTenantStore(t *testing.T) {
+	appDSN, internalDSN := setupStoreTest(t)
+	ctx := context.Background()
+	st, err := New(ctx, appDSN, internalDSN)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+
+	a := Tenant{Slug: "acme", Name: "Acme", Terminology: json.RawMessage(`{"booking":"reservation","contact":"guest"}`)}
+	if err := st.CreateTenant(ctx, &a); err != nil {
+		t.Fatal(err)
+	}
+
+	// Partial: name + industry only — plan/timezone/terminology untouched.
+	name, industry := "Acme Two", "clinic"
+	updated, err := st.UpdateTenant(ctx, "acme", TenantPatch{Name: &name, Industry: &industry})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Name != "Acme Two" || updated.Industry != "clinic" {
+		t.Errorf("patched fields: %+v", updated)
+	}
+	if updated.Plan != a.Plan || updated.Timezone != a.Timezone {
+		t.Errorf("untouched fields drifted: %+v", updated)
+	}
+	// jsonb normalizes whitespace — compare terminology semantically.
+	var termBefore map[string]string
+	if err := json.Unmarshal(updated.Terminology, &termBefore); err != nil ||
+		len(termBefore) != 2 || termBefore["booking"] != "reservation" || termBefore["contact"] != "guest" {
+		t.Errorf("terminology drifted: %s", updated.Terminology)
+	}
+
+	// Terminology replaces (not merges): the removed key must disappear.
+	term := json.RawMessage(`{"booking":"session"}`)
+	updated, err = st.UpdateTenant(ctx, "acme", TenantPatch{Terminology: term})
+	if err != nil {
+		t.Fatalf("terminology update: %v", err)
+	}
+	var m map[string]string
+	if err := json.Unmarshal(updated.Terminology, &m); err != nil || len(m) != 1 || m["booking"] != "session" {
+		t.Errorf("terminology = %s, want exactly {booking: session}", updated.Terminology)
+	}
+
+	// Empty patch is a caller bug; unknown slug is ErrNotFound.
+	if _, err := st.UpdateTenant(ctx, "acme", TenantPatch{}); err == nil {
+		t.Errorf("empty patch must error")
+	}
+	if _, err := st.UpdateTenant(ctx, "ghost", TenantPatch{Name: &name}); err != ErrNotFound {
+		t.Errorf("unknown slug: err = %v, want ErrNotFound", err)
 	}
 }

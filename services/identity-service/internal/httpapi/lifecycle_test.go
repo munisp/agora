@@ -76,6 +76,13 @@ func TestInviteMemberRealmRoles(t *testing.T) {
 	if !strings.Contains(joined, ":staff") || !strings.Contains(joined, ":analyst") || !strings.Contains(joined, ":billing") {
 		t.Errorf("assignments = %v, want staff+analyst+billing", h.kc.assigned)
 	}
+	// W47 role-mapping: realm_roles are mirrored to same-named Permify
+	// relations so view_analytics / view_billing / manage_billing can
+	// actually evaluate (the realm role alone never reaches Permify checks).
+	joinedW := strings.Join(h.perm.relWritten, ",")
+	if !strings.Contains(joinedW, "#analyst@user:") || !strings.Contains(joinedW, "#billing@user:") {
+		t.Errorf("permify relation writes = %v, want analyst+billing overlay tuples", h.perm.relWritten)
+	}
 	// Unknown functional role: 400.
 	rec = h.do(http.MethodPost, "/v1/tenants/acme/members",
 		`{"email":"d@example.com","realm_roles":["superuser"]}`,
@@ -172,8 +179,16 @@ func TestRemoveMemberLifecycle(t *testing.T) {
 	if len(h.kc.loggedOut) != 1 || h.kc.loggedOut[0] != "u-staff" {
 		t.Errorf("keycloak logouts = %v", h.kc.loggedOut)
 	}
-	if len(h.perm.relDeleted) != 1 || !strings.Contains(h.perm.relDeleted[0], "#member@user:u-staff") {
-		t.Errorf("permify unlinks = %v (staff must map to member)", h.perm.relDeleted)
+	// W47: base relation + best-effort analyst/billing overlay unlinks
+	// (absent tuples are Permify no-ops; removal must not strand overlays).
+	if len(h.perm.relDeleted) != 3 {
+		t.Fatalf("permify unlinks = %v, want member+analyst+billing", h.perm.relDeleted)
+	}
+	joinedDel := strings.Join(h.perm.relDeleted, ",")
+	for _, rel := range []string{"#member@user:u-staff", "#analyst@user:u-staff", "#billing@user:u-staff"} {
+		if !strings.Contains(joinedDel, rel) {
+			t.Errorf("permify unlinks = %v, missing %s (staff must map to member)", h.perm.relDeleted, rel)
+		}
 	}
 	if _, err := h.st.GetMember(context.Background(), h.tenID, "u-staff"); err != store.ErrNotFound {
 		t.Errorf("membership row must be gone: %v", err)

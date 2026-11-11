@@ -27,6 +27,11 @@ import (
 // deployments (SPEC-W45 ORPH O2, compose service name/port).
 const defaultIdentityURL = "http://identity:7001"
 
+// defaultNotificationURL is the compose service address of
+// notification-worker (SPEC-W47-C UIMOB-06: USSD menu-action confirmation
+// SMS intake). Mirrors defaultIdentityURL.
+const defaultNotificationURL = "http://notification:7003"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
@@ -179,6 +184,18 @@ func run() error {
 			0),
 		Conversation: channel.NewUSSDConversation(convBase),
 		SessionTTL:   time.Duration(cfg.USSDSessionTTL) * time.Second,
+		// SPEC-W47-C (UIMOB-06): menu-action dispatch — booking-service
+		// effects (helpdesk ticket for book/handoff, booking status lookup
+		// for status) + the promised confirmation SMS via notification-worker
+		// (paced send). Same ResolveInvokeBase posture as the other
+		// upstreams: direct in-cluster bases sidecar-less, Dapr invoke when
+		// a sidecar is present.
+		Actions: httpapi.NewUSSDActionDispatcher(
+			bookingBase,
+			cfg.BookingInternalToken,
+			channel.ResolveInvokeBase(cfg.NotificationURL, "notification", defaultNotificationURL, cfg.DaprHTTPPort, cfg.DaprSidecar),
+			cfg.NotificationInternalToken,
+			logger),
 		// SPEC-W45 K14/OOS-06: shared-secret path auth (fail-closed unset)
 		// + per-phone sliding-window rate limit.
 		CallbackSecret: cfg.ATCallbackSecret,
@@ -186,6 +203,14 @@ func run() error {
 	}
 	if cfg.ATCallbackSecret == "" {
 		logger.Warn("AT_CALLBACK_SECRET unset: USSD callback rejects every post (503, fail-closed) until configured")
+	}
+	// SPEC-W47-C (UIMOB-06): fail-loud boot signal when the machine tokens
+	// for menu-action dispatch are unset (effects/confirmation SMS would
+	// fail closed per dispatch, logged as errors per selection).
+	if cfg.BookingInternalToken == "" || cfg.NotificationInternalToken == "" {
+		logger.Warn("USSD menu-action dispatch degraded: MESSAGING_BOOKING_INTERNAL_TOKEN / MESSAGING_NOTIFICATION_INTERNAL_TOKEN unset",
+			zap.Bool("booking_token", cfg.BookingInternalToken != ""),
+			zap.Bool("notification_token", cfg.NotificationInternalToken != ""))
 	}
 	logger.Info("ussd channel configured",
 		zap.String("session_backend", cfg.USSDSessionBackend),

@@ -6,8 +6,11 @@ network (`opendesk`) from infra/docker-compose.lakehouse.yml + the core compose.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
+
+_log = logging.getLogger("analytics_pipeline.config")
 
 
 def _int(name: str, default: int) -> int:
@@ -22,6 +25,31 @@ def _bool(name: str, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEFAULT_DAPR_HOST = "daprd-analytics"
+
+
+def _dapr_host() -> str:
+    """SPEC-W47 MW-H1: the compose file ships ``DAPR_HOST: ${DAPR_HOST:-}``
+    — an EMPTY override that used to win over this code default and point
+    every Dapr call at an unresolvable host (CAC tenant resolution failed
+    on every request, spend joins zeroed out). Treat an empty/whitespace
+    DAPR_HOST as UNSET: fall back to the ``daprd-analytics`` sidecar host
+    and log LOUDLY so the misconfiguration is impossible to miss."""
+    raw = os.getenv("DAPR_HOST")
+    if raw is None:
+        return DEFAULT_DAPR_HOST
+    host = raw.strip()
+    if host:
+        return host
+    _log.error(
+        "DAPR_HOST is set but EMPTY (compose '${DAPR_HOST:-}' override) — "
+        "falling back to default sidecar host %r; set DAPR_HOST to a real "
+        "sidecar or remove the empty override",
+        DEFAULT_DAPR_HOST,
+    )
+    return DEFAULT_DAPR_HOST
 
 
 @dataclass(frozen=True)
@@ -107,10 +135,11 @@ class Settings:
     pg_min_size: int = field(default_factory=lambda: _int("PG_MIN_SIZE", 1))
     pg_max_size: int = field(default_factory=lambda: _int("PG_MAX_SIZE", 4))
     # Dapr sidecar (spend join to booking-service + tenant slug resolution
-    # against identity-service).
-    dapr_host: str = field(
-        default_factory=lambda: os.getenv("DAPR_HOST", "daprd-analytics")
-    )
+    # against identity-service). SPEC-W47 MW-H1: an EMPTY DAPR_HOST env
+    # (the shipped compose override) falls back to the daprd-analytics
+    # default WITH a loud error log instead of silently breaking every
+    # Dapr call.
+    dapr_host: str = field(default_factory=_dapr_host)
     dapr_http_port: int = field(default_factory=lambda: _int("DAPR_HTTP_PORT", 3500))
     booking_app_id: str = field(
         default_factory=lambda: os.getenv("BOOKING_APP_ID", "booking")

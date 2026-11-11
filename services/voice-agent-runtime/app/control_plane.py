@@ -81,7 +81,9 @@ class ChatRequest(BaseModel):
     # (returned as `session_secret` in every chat response). A
     # conversation_id presented WITHOUT the matching secret NEVER resumes
     # confirmed/verified phone, history or escalation state — the server
-    # starts a fresh session instead.
+    # starts a fresh session instead. SPEC-W47: the credential is also
+    # accepted via the X-Session-Secret request header (web widget resume;
+    # the body field wins when both are present).
     session_secret: str | None = None
     # SPEC-W3 §3: stream=true switches the response to text/event-stream.
     stream: bool = False
@@ -336,6 +338,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/voice/chat")
     async def voice_chat(req: ChatRequest, request: Request) -> Any:
+        # SPEC-W47 (K15(b), UIMOB-04 service side): the web widget may carry
+        # the resume credential in the X-Session-Secret HEADER instead of the
+        # JSON body — accept both (body wins when both are present). This is
+        # purely additive: SessionStore.get_or_create still enforces the
+        # constant-time match, and a missing/wrong secret still spawns a
+        # fresh unverified session (no resume, no state leak).
+        session_secret = (
+            req.session_secret
+            or request.headers.get("X-Session-Secret")
+            or None
+        )
         # K15(c): pin the provider-verified channel identity (wa_id) as the
         # session's verified phone — but ONLY for an internal-token-
         # authorized in-cluster caller on a provider-verified channel. A
@@ -365,7 +378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         site_slug=req.site_slug,
                         message=req.message,
                         conversation_id=req.conversation_id,
-                        session_secret=req.session_secret,
+                        session_secret=session_secret,
                     ):
                         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 except Exception as exc:  # noqa: BLE001
@@ -382,7 +395,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 site_slug=req.site_slug,
                 message=req.message,
                 conversation_id=req.conversation_id,
-                session_secret=req.session_secret,
+                session_secret=session_secret,
                 persona_override=req.persona_override,
                 channel=req.channel,
                 pin_verified_identity=pin,

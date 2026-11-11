@@ -35,6 +35,8 @@ type TenantStore interface {
 	CreateTenant(ctx context.Context, t *store.Tenant) error
 	DeleteTenant(ctx context.Context, slug string) error
 	MergeTerminology(ctx context.Context, slug string, patch json.RawMessage) (json.RawMessage, error)
+	// SPEC-W47 UIWEB-01: partial tenant update (PATCH /v1/tenants/{slug}).
+	UpdateTenant(ctx context.Context, slug string, p store.TenantPatch) (store.Tenant, error)
 	ListMembers(ctx context.Context, tenantID uuid.UUID) ([]store.Membership, error)
 	AddMember(ctx context.Context, m store.Membership) error
 	// SPEC-W45 K16 member lifecycle.
@@ -127,6 +129,9 @@ func NewRouter(d Deps) http.Handler {
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/tenants", s.createTenant)
 		r.Get("/tenants/{slug}", s.getTenant)
+		// SPEC-W47 UIWEB-01: partial tenant update (settings save, pack
+		// activation, terminology) — owner/admin Permify-gated, audit-logged.
+		r.Patch("/tenants/{slug}", s.updateTenant)
 		// SPEC-W3 §3 innovation 12: tenant deletion (twin cleanup + guarded
 		// admin deletion — see twin.go for the guard rules).
 		r.Delete("/tenants/{slug}", s.deleteTenant)
@@ -231,6 +236,14 @@ func (s *server) getTenant(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	resp := s.tenantResponse(t)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// tenantResponse builds the public tenant payload shared by GET
+// /v1/tenants/{slug} and PATCH /v1/tenants/{slug} (SPEC-W47 UIWEB-01 — the
+// settings/packs/terminology clients apply the PATCH response directly).
+func (s *server) tenantResponse(t store.Tenant) map[string]any {
 	resp := map[string]any{
 		"id":          t.ID,
 		"slug":        t.Slug,
@@ -241,6 +254,7 @@ func (s *server) getTenant(w http.ResponseWriter, r *http.Request) {
 		"terminology": t.Terminology,
 		"plan":        t.Plan,
 		"industry":    t.Industry,
+		"created_at":  t.CreatedAt,
 	}
 	// SPEC-CRM §C1: resolved pack summary with the tenant's terminology
 	// overrides merged over the pack defaults.
@@ -249,7 +263,7 @@ func (s *server) getTenant(w http.ResponseWriter, r *http.Request) {
 			resp["pack"] = p.Summary(terminologyOverrides(t.Terminology))
 		}
 	}
-	writeJSON(w, http.StatusOK, resp)
+	return resp
 }
 
 // terminologyOverrides flattens the tenant's terminology JSON document into a
@@ -635,6 +649,19 @@ func (s *server) inviteMember(w http.ResponseWriter, r *http.Request) {
 	if err := s.d.Permify.WriteRelationship(r.Context(), t.ID.String(),
 		"organization:"+t.ID.String(), relation, "user:"+userID); err != nil {
 		s.d.Logger.Warn("permify member relationship deferred", zap.Error(err))
+	}
+	// SPEC-W47: mirror the functional realm roles (analyst/billing) to the
+	// same-named Permify relations. Without these tuples the schema
+	// permissions view_analytics (analyst) and view_billing/manage_billing
+	// (billing) could never evaluate — the realm role alone is invisible to
+	// service-side Permify checks (role-mapping layer fix; W47-D enforces
+	// view_billing/manage_billing in billing-engine).
+	for _, rr := range req.RealmRoles {
+		if err := s.d.Permify.WriteRelationship(r.Context(), t.ID.String(),
+			"organization:"+t.ID.String(), rr, "user:"+userID); err != nil {
+			s.d.Logger.Warn("permify functional-relation write deferred",
+				zap.String("user_id", userID), zap.String("relation", rr), zap.Error(err))
+		}
 	}
 	// SPEC-W45 K16/STK O4: mirror the membership role to the same-named
 	// Keycloak realm role (admin/staff/viewer) + grant any requested

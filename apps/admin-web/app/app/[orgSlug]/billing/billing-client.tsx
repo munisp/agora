@@ -48,6 +48,14 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
   const [newPartyIdType, setNewPartyIdType] = React.useState("MSISDN");
   const [newPartyIdentifier, setNewPartyIdentifier] = React.useState("");
   const [creatingBeneficiary, setCreatingBeneficiary] = React.useState(false);
+  // W45 K20 / SPEC-W47 UIWEB-20: above-threshold payouts park as
+  // `pending_approval` (no rail transfer yet) until POST
+  // /v1/payouts/{id}/approve. There is no payout list endpoint, so the
+  // approval surface covers payouts requested from this session plus a
+  // manual id entry.
+  const [pendingPayouts, setPendingPayouts] = React.useState<Payout[]>([]);
+  const [approveBusyId, setApproveBusyId] = React.useState<string | null>(null);
+  const [manualPayoutId, setManualPayoutId] = React.useState("");
 
   const loadBeneficiaries = React.useCallback(async () => {
     setBeneficiariesError(null);
@@ -157,9 +165,24 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
         currency,
         idempotency_key: crypto.randomUUID(),
       });
+      // K20: above the approval threshold the payout parks as
+      // pending_approval — surface it in the approval queue below.
+      const id = payout.payout_id ?? payout.id;
+      if (payout.status === "pending_approval" && id) {
+        setPendingPayouts((p) => [
+          { ...payout, id },
+          ...p.filter((x) => x.id !== id),
+        ]);
+      }
       toast({
-        title: "Payout requested",
-        description: `${formatMoney(payout.amount_cents ?? amountCents, payout.currency ?? currency)} · status ${payout.status ?? "requested"}. Settlement runs over the Mojaloop rails.`,
+        title:
+          payout.status === "pending_approval"
+            ? "Payout awaiting approval"
+            : "Payout requested",
+        description:
+          payout.status === "pending_approval"
+            ? `${formatMoney(payout.amount_cents ?? amountCents, payout.currency ?? currency)} is above the approval threshold — an owner must approve it below before any money moves.`
+            : `${formatMoney(payout.amount_cents ?? amountCents, payout.currency ?? currency)} · status ${payout.status ?? "requested"}. Settlement runs over the Mojaloop rails.`,
         variant: "success",
       });
       await load();
@@ -174,6 +197,36 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
     }
   };
 
+  // W45 K20: approve a parked payout (owner role required above the
+  // threshold — enforced server-side, fail-closed).
+  const approvePayout = async (id: string) => {
+    setApproveBusyId(id);
+    try {
+      await api.post(`/api/payments/v1/payouts/${encodeURIComponent(id)}/approve`, {});
+      toast({
+        title: "Payout approved",
+        description: "The rail transfer now runs over the Mojaloop rails.",
+        variant: "success",
+      });
+      setPendingPayouts((p) => p.filter((x) => x.id !== id));
+      setManualPayoutId("");
+      await load();
+    } catch (err) {
+      toast({
+        title: "Approval failed",
+        description:
+          err instanceof ApiError
+            ? err.status === 403
+              ? "Above-threshold payouts require the owner role."
+              : err.message
+            : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setApproveBusyId(null);
+    }
+  };
+
   return (
     <div>
       <PageHeader
@@ -183,6 +236,76 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
       {error ? <ErrorNote message={error} /> : null}
 
       <InvoicesPanel orgSlug={orgSlug} />
+
+      <Card className="mt-6">
+        <CardHeader>
+          <CardTitle>Payout approvals</CardTitle>
+          <CardDescription>
+            Payouts above the configured approval threshold park here until an
+            owner approves them (W45 K20). No money moves before approval.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {pendingPayouts.length === 0 ? (
+            <p className="mb-3 text-sm text-muted-foreground">
+              Nothing awaiting approval. Above-threshold payouts requested from
+              this page appear here automatically; approve one by id if it was
+              requested elsewhere.
+            </p>
+          ) : (
+            <ul className="mb-4 space-y-2">
+              {pendingPayouts.map((p) => (
+                <li
+                  key={p.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-sm"
+                >
+                  <div>
+                    <span className="font-medium">
+                      {formatMoney(p.amount_cents, p.currency ?? currency)}
+                    </span>
+                    <span className="ml-2 font-mono text-xs text-muted-foreground">
+                      {p.id}
+                    </span>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={approveBusyId === p.id}
+                    onClick={() => void approvePayout(p.id)}
+                  >
+                    {approveBusyId === p.id ? "Approving…" : "Approve payout"}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const id = manualPayoutId.trim();
+              if (id) void approvePayout(id);
+            }}
+            className="flex flex-wrap items-end gap-3"
+          >
+            <div className="grid min-w-64 flex-1 gap-1.5">
+              <Label htmlFor="approve-payout-id">Payout id</Label>
+              <Input
+                id="approve-payout-id"
+                placeholder="uuid of a pending_approval payout"
+                value={manualPayoutId}
+                onChange={(e) => setManualPayoutId(e.target.value)}
+              />
+            </div>
+            <Button
+              type="submit"
+              variant="outline"
+              disabled={approveBusyId !== null || !manualPayoutId.trim()}
+            >
+              Approve by id
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
 
       <div className="grid gap-4 sm:grid-cols-3">
         <Card>

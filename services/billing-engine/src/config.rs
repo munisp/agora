@@ -73,6 +73,15 @@ pub struct Config {
     /// and unknown slugs always re-fetch (fail-closed authz decision — no
     /// stale serving, unlike booking's availability-oriented resolver).
     pub tenant_cache_ttl_s: u64,
+    /// SPEC-W47 D item 2 (A-MW MW-L5): Permify base URL for the
+    /// `view_billing` / `manage_billing` ReBAC checks on the human (gateway)
+    /// call path (src/permify.rs; booking-service's HTTP API v1 pattern).
+    /// Default `http://permify:3476` (compose service name, same default as
+    /// booking/identity). Set EMPTY to disable the checks — the dev-only
+    /// escape (mirrors booking's AUTHZ_DISABLED); boot logs a WARN. A
+    /// configured-but-unreachable Permify fails CLOSED (502) on the gated
+    /// routes.
+    pub permify_url: Option<String>,
     /// Dunning sweep cadence (B3).
     pub dunning_interval_s: u64,
     /// Issued invoices older than this many days become past_due.
@@ -246,6 +255,12 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             tenant_cache_ttl_s: env_parse("TENANT_CACHE_TTL_SECONDS", 60),
+            permify_url: match std::env::var("PERMIFY_URL") {
+                // Explicitly empty = the dev-only disable escape.
+                Ok(v) if v.trim().is_empty() => None,
+                Ok(v) => Some(v.trim_end_matches('/').to_string()),
+                Err(_) => Some("http://permify:3476".to_string()),
+            },
             dunning_interval_s: env_parse("DUNNING_INTERVAL_S", 3600),
             invoice_due_days: env_parse("INVOICE_DUE_DAYS", 14),
             db_pool_max: env_parse("BILLING_DB_POOL_MAX", 10),
@@ -387,6 +402,30 @@ mod tests {
         let cfg = Config::from_env().expect("paystack mode must load");
         assert_eq!(cfg.payment_mode(), "paystack");
         assert_eq!(cfg.billing_static_account, "");
+        clear_posture_env();
+    }
+
+    /// SPEC-W47 D item 2: PERMIFY_URL defaults to the compose service name
+    /// (enforcement ON out of the box, booking/identity parity); an
+    /// explicitly EMPTY value is the dev-only disable escape.
+    #[test]
+    fn permify_url_defaults_on_and_empty_disables() {
+        let _g = env_lock();
+        clear_posture_env();
+        std::env::remove_var("PERMIFY_URL");
+        std::env::set_var("BILLING_INTERNAL_TOKEN", "tok");
+        std::env::set_var("PAYSTACK_SECRET_KEY", "sk_test_x");
+        let cfg = Config::from_env().expect("defaults must load");
+        assert_eq!(cfg.permify_url.as_deref(), Some("http://permify:3476"));
+
+        std::env::set_var("PERMIFY_URL", "http://permify.example:3476/");
+        let cfg = Config::from_env().expect("explicit url must load");
+        assert_eq!(cfg.permify_url.as_deref(), Some("http://permify.example:3476"));
+
+        std::env::set_var("PERMIFY_URL", "");
+        let cfg = Config::from_env().expect("empty disables (dev escape)");
+        assert_eq!(cfg.permify_url, None);
+        std::env::remove_var("PERMIFY_URL");
         clear_posture_env();
     }
 }

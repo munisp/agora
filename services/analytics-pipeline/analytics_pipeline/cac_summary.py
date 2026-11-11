@@ -11,8 +11,14 @@ POST /v1/campaigns/{id}/spend), so the summary reads it back per campaign
 via Dapr invoke ``GET /internal/campaigns/{id}/spend-sum?from&to`` (built by
 Agent A in parallel — CONTRACT ASSUMPTION on the response shape, see
 BookingSpendClient below). The join is RESILIENT: a 404/unreachable
-booking-service never fails the summary — that campaign's spend counts as 0
-and the response is marked ``data_quality: "spend_unavailable"``.
+booking-service never fails the summary. SPEC-W47 MW-H1: a failed lookup
+must NEVER silently zero spend — the affected channel reports
+``spend_ngn: null`` / ``cac_ngn: null`` (unknown, not zero), the blended
+CAC is withheld (a blended figure over partial spend is a lie), the
+response is marked ``data_quality: "spend_unavailable"`` and
+``totals.spend_unknown_channels`` names the affected channels; each failure
+increments the ``cac_spend_lookups_total{outcome="unavailable"}`` metric
+and logs a warning.
 
 Payback: ``payback_days_estimate = blended_cac_ngn / (avg daily gross margin
 per converted lead)``. v1 has no COGS signal, so gross margin is approximated
@@ -48,7 +54,8 @@ class SpendFetcher(Protocol):
 
 
 class SpendUnavailable(Exception):
-    """booking-service spend endpoint unreachable/404 — spend counts as 0."""
+    """booking-service spend endpoint unreachable/404 — the channel's spend
+    is UNKNOWN (reported null, never silently zeroed; MW-H1)."""
 
 
 class BookingSpendClient:
@@ -125,8 +132,15 @@ def build_summary(
     spend_by_channel: dict[str, Decimal],
     spend_unavailable: bool,
     day_bounds: tuple[date | None, date | None],
+    spend_missing_channels: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """Pure rollup math — unit-tested without Postgres/Dapr."""
+    """Pure rollup math — unit-tested without Postgres/Dapr.
+
+    MW-H1: channels in ``spend_missing_channels`` had at least one spend
+    lookup FAIL — their spend is unknown, so they report null spend/CAC
+    (never a misleading 0) and any partial spend already accumulated for
+    them is excluded from the totals."""
+    missing = set(spend_missing_channels)
     by_channel: list[dict[str, Any]] = []
     total_spend = Decimal("0")
     total_leads = 0
@@ -134,21 +148,23 @@ def build_summary(
     total_revenue = Decimal("0")
     for row in channel_rows:
         channel = row["channel"]
+        spend_known = channel not in missing
         spend = spend_by_channel.get(channel, Decimal("0"))
         leads = int(row["leads"])
         conversions = int(row["conversions"])
         revenue = decimal_or_none(row.get("revenue_ngn")) or Decimal("0")
-        total_spend += spend
+        if spend_known:
+            total_spend += spend
         total_leads += leads
         total_conversions += conversions
         total_revenue += revenue
         by_channel.append(
             {
                 "channel": channel,
-                "spend_ngn": _money(spend),
+                "spend_ngn": _money(spend) if spend_known else None,
                 "leads": leads,
                 "conversions": conversions,
-                "cac_ngn": _money(_cac(spend, conversions)),
+                "cac_ngn": _money(_cac(spend, conversions)) if spend_known else None,
             }
         )
 
@@ -158,13 +174,15 @@ def build_summary(
     for channel, spend in sorted(spend_by_channel.items()):
         if channel in seen:
             continue  # spend already counted in the first loop
-        total_spend += spend
-        if spend == 0:
-            continue
+        spend_known = channel not in missing
+        if spend_known:
+            total_spend += spend
+            if spend == 0:
+                continue
         by_channel.append(
             {
                 "channel": channel,
-                "spend_ngn": _money(spend),
+                "spend_ngn": _money(spend) if spend_known else None,
                 "leads": 0,
                 "conversions": 0,
                 "cac_ngn": None,
@@ -188,7 +206,10 @@ def build_summary(
         for row in lga_rows
     ]
 
-    blended = _cac(total_spend, total_conversions)
+    # MW-H1: when ANY spend lookup failed the total spend is partial — a
+    # blended CAC computed over it would be silently understated, so it is
+    # withheld (null) instead. Payback depends on blended and follows.
+    blended = None if spend_unavailable else _cac(total_spend, total_conversions)
     ltv = (
         (total_revenue / total_conversions)
         if total_conversions > 0 and total_revenue > 0
@@ -219,11 +240,15 @@ def build_summary(
         "data_quality": "spend_unavailable" if spend_unavailable else "ok",
         # totals are additive context for the dashboard cards (not in the
         # contract but harmless — contract fields above are authoritative).
+        # spend_ngn is KNOWN spend only; spend_unknown_channels lists the
+        # channels whose spend lookup failed (their spend is NOT in the
+        # total — it is unknown, not zero; MW-H1).
         "totals": {
             "spend_ngn": _money(total_spend),
             "leads": total_leads,
             "conversions": total_conversions,
             "revenue_ngn": _money(total_revenue),
+            "spend_unknown_channels": sorted(missing),
         },
     }
 
@@ -246,6 +271,9 @@ async def fetch_summary(
 
     spend_by_channel: dict[str, Decimal] = {}
     spend_unavailable = False
+    # MW-H1: channels with at least one FAILED spend lookup — their spend is
+    # unknown (reported null downstream), never silently counted as zero.
+    spend_missing_channels: set[str] = set()
 
     async def _lookup(campaign_id: str, channel: str) -> None:
         nonlocal spend_unavailable
@@ -253,9 +281,17 @@ async def fetch_summary(
             spend = await spend_client.spend_sum(campaign_id, date_from, date_to)
         except SpendUnavailable as exc:
             # Contract requirement: never fail the summary on spend lookup.
+            # MW-H1: skip + metric + flag — the channel reports spend as
+            # UNKNOWN (null), not 0.
             spend_unavailable = True
+            spend_missing_channels.add(channel)
             metrics.CAC_SPEND_LOOKUPS.labels(outcome="unavailable").inc()
-            log.warning("cac.spend_unavailable", campaign_id=campaign_id, error=str(exc))
+            log.warning(
+                "cac.spend_unavailable",
+                campaign_id=campaign_id,
+                channel=channel,
+                error=str(exc),
+            )
             return
         metrics.CAC_SPEND_LOOKUPS.labels(outcome="ok").inc()
         spend_by_channel[channel] = spend_by_channel.get(channel, Decimal("0")) + spend
@@ -267,6 +303,14 @@ async def fetch_summary(
         )
     )
 
+    if spend_missing_channels:
+        log.error(
+            "cac.spend_skipped_channels: spend lookup failed — reporting "
+            "null spend/CAC (never zero)",
+            channels=sorted(spend_missing_channels),
+            tenant_id=tenant_id,
+        )
+
     return build_summary(
         tenant_id=tenant_id,
         date_from=date_from,
@@ -276,4 +320,5 @@ async def fetch_summary(
         spend_by_channel=spend_by_channel,
         spend_unavailable=spend_unavailable,
         day_bounds=day_bounds,
+        spend_missing_channels=spend_missing_channels,
     )

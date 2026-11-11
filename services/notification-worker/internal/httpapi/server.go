@@ -111,6 +111,14 @@ func NewRouter(s *Server) http.Handler {
 	// bound to X-Tenant-Slugs + workflow-id prefix allowlist.
 	r.With(s.requireInternalToken).Post("/v1/signals", s.sendSignal)
 
+	// SPEC-W47-C (UIMOB-06): USSD menu-action confirmation SMS, posted by
+	// messaging-gateway after dispatching the pack-menu action. Machine-only
+	// (K2 internal token, same posture as /v1/signals); sends ride the
+	// existing paced path (PacedSendWorkflow, kind ussd_action) so CPS
+	// pacing + sender rotation apply. Idempotent per session+action via the
+	// derived workflow id.
+	r.With(s.requireInternalToken).Post("/v1/notify/ussd-action", s.sendUSSDActionConfirmation)
+
 	// Outbound webhook platform (Wave 5 #10): tenant-scoped via
 	// X-Tenant-Slug; reached from the UI through APISIX /api/notifications/*.
 	r.Route("/v1/webhooks", func(r chi.Router) {

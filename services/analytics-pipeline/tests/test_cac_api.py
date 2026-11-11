@@ -131,7 +131,12 @@ def test_summary_spend_unavailable_still_200():
     assert resp.status_code == 200
     body = resp.json()
     assert body["data_quality"] == "spend_unavailable"
-    assert body["by_channel"][0]["spend_ngn"] == 0.0
+    # MW-H1: failed spend lookups report UNKNOWN (null), never a silent 0 —
+    # and the blended CAC is withheld rather than computed over zero spend.
+    assert body["by_channel"][0]["spend_ngn"] is None
+    assert body["by_channel"][0]["cac_ngn"] is None
+    assert body["blended_cac_ngn"] is None
+    assert body["totals"]["spend_unknown_channels"] == ["whatsapp"]
 
 
 def test_summary_unknown_tenant_slug_404():

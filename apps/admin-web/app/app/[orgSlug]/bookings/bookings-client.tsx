@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { RefreshCw } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -303,27 +304,32 @@ export function BookingsClient({
                       <BookingStatusBadge status={b.status} />
                     </TableCell>
                     <TableCell className="pr-5 text-right">
-                      {actionable ? (
-                        <div className="flex justify-end gap-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => setRescheduleTarget(b)}
-                          >
-                            Reschedule
+                      <div className="flex justify-end gap-2">
+                        <Link href={`/app/${orgSlug}/bookings/${b.id}`}>
+                          <Button variant="ghost" size="sm">
+                            Details
                           </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-destructive"
-                            onClick={() => setCancelTarget(b)}
-                          >
-                            Cancel
-                          </Button>
-                        </div>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
+                        </Link>
+                        {actionable ? (
+                          <>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setRescheduleTarget(b)}
+                            >
+                              Reschedule
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-destructive"
+                              onClick={() => setCancelTarget(b)}
+                            >
+                              Cancel
+                            </Button>
+                          </>
+                        ) : null}
+                      </div>
                     </TableCell>
                   </TableRow>
                 );

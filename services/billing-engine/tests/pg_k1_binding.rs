@@ -44,6 +44,8 @@ mod models;
 mod outbox;
 #[path = "../src/payments_qr.rs"]
 mod payments_qr;
+#[path = "../src/permify.rs"]
+mod permify;
 #[path = "../src/routes.rs"]
 mod routes;
 #[path = "../src/tenant.rs"]
@@ -68,6 +70,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub config: Arc<config::Config>,
     pub identity: Arc<identity::SlugResolver>,
+    pub permify: permify::PermifyClient,
     pub outbox_notify: Arc<tokio::sync::Notify>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
@@ -104,6 +107,7 @@ fn test_config(database_url: &str, identity_base_url: &str) -> config::Config {
         identity_base_url: identity_base_url.to_string(),
         identity_internal_token: Some(IDENTITY_TOKEN.to_string()),
         tenant_cache_ttl_s: 60,
+        permify_url: None,
         dunning_interval_s: 3600,
         invoice_due_days: 14,
         db_pool_max: 10,
@@ -221,6 +225,12 @@ fn connect_options(url: &str) -> sqlx::postgres::PgConnectOptions {
 }
 
 async fn harness(tenant: Uuid, identity_fail: bool) -> Option<Harness> {
+    harness_full(tenant, identity_fail, None).await
+}
+
+/// Harness variant with the Permify ReBAC gate pointed at a mock
+/// (`permify_url` = Some(mock base)); `None` keeps the gate disabled.
+async fn harness_full(tenant: Uuid, identity_fail: bool, permify_url: Option<String>) -> Option<Harness> {
     let url = std::env::var("BILLING_TEST_DATABASE_URL").ok()?;
     let pool = PgPool::connect_with(connect_options(&url))
         .await
@@ -236,7 +246,8 @@ async fn harness(tenant: Uuid, identity_fail: bool) -> Option<Harness> {
         })
         .await;
     let (identity_base, identity_hits) = spawn_mock_identity(tenant, identity_fail).await;
-    let cfg = test_config(&url, &identity_base);
+    let mut cfg = test_config(&url, &identity_base);
+    cfg.permify_url = permify_url;
     let ledger = Arc::new(
         ledger::PgLedgerClient::new(pool.clone())
             .await
@@ -254,6 +265,7 @@ async fn harness(tenant: Uuid, identity_fail: bool) -> Option<Harness> {
             cfg.identity_internal_token.clone(),
             std::time::Duration::from_secs(cfg.tenant_cache_ttl_s),
         )),
+        permify: permify::PermifyClient::new(cfg.permify_url.clone()),
         config: Arc::new(cfg),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         events_published: Arc::new(AtomicU64::new(0)),
@@ -484,4 +496,178 @@ async fn k1_human_binding_fails_closed_when_identity_is_down() {
         reqwest::StatusCode::OK,
         "internal-token service path must not depend on identity"
     );
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W47 D item 2 (A-MW MW-L5): Permify view_billing/manage_billing
+// enforcement end-to-end against REAL Postgres + mock identity + a
+// body-aware mock Permify (allows subject "user-owner", denies everyone
+// else). Self-skips without BILLING_TEST_DATABASE_URL.
+// ---------------------------------------------------------------------------
+
+/// Mock Permify enforcing: allow iff the check body's subject.id ==
+/// "user-owner". Captures (path, permission, subject) for assertions.
+async fn spawn_mock_permify_roleaware(
+) -> (String, Arc<std::sync::Mutex<Vec<(String, String, String)>>>) {
+    use axum::extract::{Request, State};
+    use axum::routing::post;
+    use axum::Json;
+
+    type Capture = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+    #[derive(Clone)]
+    struct Mock {
+        hits: Capture,
+    }
+    async fn check(State(m): State<Mock>, req: Request) -> Json<serde_json::Value> {
+        let path = req.uri().path().to_string();
+        let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let permission = json["permission"].as_str().unwrap_or_default().to_string();
+        let subject = json["subject"]["id"].as_str().unwrap_or_default().to_string();
+        m.hits.lock().unwrap().push((path, permission, subject.clone()));
+        Json(serde_json::json!({
+            "can": if subject == "user-owner" { "RESULT_ALLOWED" } else { "RESULT_DENIED" }
+        }))
+    }
+    let hits: Capture = Default::default();
+    let app = axum::Router::new()
+        .route("/v1/tenants/:tenant/permissions/check", post(check))
+        .with_state(Mock { hits: hits.clone() });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// Human request builder with the gateway-injected X-User-Id subject.
+fn human_as(
+    h: &Harness,
+    method: &str,
+    url: String,
+    slugs: &str,
+    roles: Option<&str>,
+    user: &str,
+) -> reqwest::RequestBuilder {
+    human(h, method, url, slugs, roles).header("x-user-id", user)
+}
+
+#[tokio::test]
+async fn w47_permify_view_and_manage_billing_enforced_against_real_pg() {
+    let tenant = Uuid::new_v4();
+    let (permify_base, hits) = spawn_mock_permify_roleaware().await;
+    let Some(h) = harness_full(tenant, false, Some(permify_base)).await else {
+        eprintln!("BILLING_TEST_DATABASE_URL unset; skipping pg integration test");
+        return;
+    };
+    let period = format!("2027-{:02}", (tenant.as_bytes()[1] % 12) + 1);
+
+    // Seed a rate card via the K2 service path (permify-exempt).
+    let resp = h
+        .http
+        .put(format!("{}/v1/rate-cards/{tenant}", h.base))
+        .header("x-internal-token", INTERNAL_TOKEN)
+        .json(&serde_json::json!({
+            "metric": "seat",
+            "unit_price_cents": 500,
+            "currency": "NGN",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "K2 rate card");
+
+    // Generate is NOT permify-gated (K6 money role only).
+    let resp = human_as(
+        &h,
+        "POST",
+        format!("{}/v1/invoices/generate", h.base),
+        TENANT_SLUG,
+        Some("owner"),
+        "user-owner",
+    )
+    .json(&serde_json::json!({ "tenant_id": tenant, "period": period }))
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::CREATED, "generate: {body}");
+    let invoice_id = body["id"].as_str().expect("invoice id").to_string();
+
+    // view_billing: allowed subject lists 200; denied subject 403.
+    let resp = human_as(
+        &h,
+        "GET",
+        format!("{}/v1/invoices?tenant_id={tenant}", h.base),
+        TENANT_SLUG,
+        Some("member"),
+        "user-owner",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "view_billing allow");
+    let resp = human_as(
+        &h,
+        "GET",
+        format!("{}/v1/invoices?tenant_id={tenant}", h.base),
+        TENANT_SLUG,
+        Some("owner"),
+        "user-random",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "view_billing deny (even a money-role holder without the perm)"
+    );
+
+    // manage_billing on issue: denied subject 403 even with the K6 role;
+    // allowed subject issues.
+    let resp = human_as(
+        &h,
+        "POST",
+        format!("{}/v1/invoices/{invoice_id}/issue", h.base),
+        TENANT_SLUG,
+        Some("owner"),
+        "user-random",
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "manage_billing deny on issue"
+    );
+    let resp = human_as(
+        &h,
+        "POST",
+        format!("{}/v1/invoices/{invoice_id}/issue", h.base),
+        TENANT_SLUG,
+        Some("owner"),
+        "user-owner",
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::OK, "manage_billing allow on issue: {body}");
+
+    // The gate asked for the right permissions on the bound tenant.
+    let perms: Vec<String> = hits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p, _)| p.clone())
+        .collect();
+    assert!(perms.contains(&"view_billing".to_string()), "hits: {perms:?}");
+    assert!(perms.contains(&"manage_billing".to_string()), "hits: {perms:?}");
 }

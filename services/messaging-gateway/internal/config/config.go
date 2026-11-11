@@ -75,6 +75,22 @@ type Config struct {
 	// phoneNumber (sliding window, in-memory — per-replica, see
 	// httpapi/ratelimit.go). Default 30.
 	USSDRatePerMinute int
+
+	// USSD menu-action dispatch (SPEC-W47-C UIMOB-06): pack-menu selections
+	// carrying an action (book / status / handoff / info) dispatch via
+	// booking-service (helpdesk tickets / booking status lookup) and deliver
+	// the promised confirmation SMS via notification-worker
+	// (POST /v1/notify/ussd-action → paced send).
+	NotificationURL string // NOTIFICATION_URL override; empty = direct http://notification:7003 (or Dapr invoke with a sidecar)
+	// BookingInternalToken (MESSAGING_BOOKING_INTERNAL_TOKEN) is the K2
+	// machine token booking-service checks on /v1/helpdesk/tickets
+	// (X-Internal-Token; mirrors CONVERSATION_BOOKING_INTERNAL_TOKEN).
+	BookingInternalToken string
+	// NotificationInternalToken (MESSAGING_NOTIFICATION_INTERNAL_TOKEN) is
+	// the K2 machine token notification-worker checks on
+	// /v1/notify/ussd-action (X-Internal-Token, NOTIFICATION_INTERNAL_TOKEN
+	// server-side).
+	NotificationInternalToken string
 }
 
 // Load reads configuration from the environment.
@@ -107,20 +123,23 @@ func Load() Config {
 		// A sidecar is present only when dapr injected its env — compose
 		// runs messaging-gateway WITHOUT one, so the bridge/ingest bases
 		// default to the direct service URLs (ORPH O2).
-		DaprSidecar:            os.Getenv("DAPR_HTTP_PORT") != "" || os.Getenv("DAPR_HOST") != "",
-		IncidentWebhookSecrets: os.Getenv("INCIDENT_WEBHOOK_SECRETS"),
-		BookingURL:             os.Getenv("BOOKING_URL"),
-		EBulkAPIKey:            os.Getenv("EBULK_API_KEY"),
-		EBulkUsername:          os.Getenv("EBULK_USERNAME"),
-		EBulkSender:            os.Getenv("EBULK_SENDER"),
-		EBulkBaseURL:           envStr("EBULK_BASE_URL", "https://api.ebulksms.com"),
-		SMSProviderChain:       envStr("SMS_PROVIDER_CHAIN", "africastalking,termii,ebulksms"),
-		IdentityURL:            os.Getenv("IDENTITY_URL"),
-		USSDSessionBackend:     envStr("USSD_SESSION_BACKEND", "memory"),
-		USSDStateStore:         envStr("USSD_STATE_STORE", "statestore"),
-		USSDSessionTTL:         envInt("USSD_SESSION_TTL_SECONDS", 180),
-		ATCallbackSecret:       os.Getenv("AT_CALLBACK_SECRET"),
-		USSDRatePerMinute:      envInt("USSD_RATE_LIMIT_PER_MINUTE", 30),
+		DaprSidecar:               os.Getenv("DAPR_HTTP_PORT") != "" || os.Getenv("DAPR_HOST") != "",
+		IncidentWebhookSecrets:    os.Getenv("INCIDENT_WEBHOOK_SECRETS"),
+		BookingURL:                os.Getenv("BOOKING_URL"),
+		EBulkAPIKey:               os.Getenv("EBULK_API_KEY"),
+		EBulkUsername:             os.Getenv("EBULK_USERNAME"),
+		EBulkSender:               os.Getenv("EBULK_SENDER"),
+		EBulkBaseURL:              envStr("EBULK_BASE_URL", "https://api.ebulksms.com"),
+		SMSProviderChain:          envStr("SMS_PROVIDER_CHAIN", "africastalking,termii,ebulksms"),
+		IdentityURL:               os.Getenv("IDENTITY_URL"),
+		USSDSessionBackend:        envStr("USSD_SESSION_BACKEND", "memory"),
+		USSDStateStore:            envStr("USSD_STATE_STORE", "statestore"),
+		USSDSessionTTL:            envInt("USSD_SESSION_TTL_SECONDS", 180),
+		ATCallbackSecret:          os.Getenv("AT_CALLBACK_SECRET"),
+		USSDRatePerMinute:         envInt("USSD_RATE_LIMIT_PER_MINUTE", 30),
+		NotificationURL:           os.Getenv("NOTIFICATION_URL"),
+		BookingInternalToken:      os.Getenv("MESSAGING_BOOKING_INTERNAL_TOKEN"),
+		NotificationInternalToken: os.Getenv("MESSAGING_NOTIFICATION_INTERNAL_TOKEN"),
 	}
 }
 

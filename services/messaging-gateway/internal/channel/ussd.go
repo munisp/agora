@@ -35,11 +35,14 @@ import (
 const USSDSessionTTL = 180 * time.Second
 
 // USSDMenuItem is one entry of a tenant pack's ussd.menu list
-// ({key,label,action}).
+// ({key,label,action,text?}). Text is the optional tenant-configured
+// confirmation/info body delivered by SMS after the action dispatch
+// (SPEC-W47-C UIMOB-06).
 type USSDMenuItem struct {
 	Key    string `json:"key"`
 	Label  string `json:"label"`
 	Action string `json:"action"`
+	Text   string `json:"text,omitempty"`
 }
 
 // ParseUSSDMenu extracts pack.ussd.menu from an identity tenant payload
@@ -73,6 +76,7 @@ func ParseUSSDMenu(tenantPayload map[string]any) []USSDMenuItem {
 			Key:    asString(m["key"]),
 			Label:  asString(m["label"]),
 			Action: asString(m["action"]),
+			Text:   asString(m["text"]),
 		}
 		if item.Key == "" || item.Label == "" {
 			continue

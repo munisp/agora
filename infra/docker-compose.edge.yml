@@ -82,11 +82,36 @@ services:
       retries: 6
       start_period: 10s
     restart: unless-stopped
+  # -------------------------------------------------------------------------
+  # OpenAppSec WAF (A-MW MW-M5 / SPEC-W47) — ENABLE PATH, profile `appsec`.
+  #
+  # DEFAULT STACK RUNS WITH **NO WAF**: both containers below are gated behind
+  # the compose profile `appsec`. To run the gateway WITH the open-appsec
+  # nano-agent attachment:
+  #
+  #   docker compose --profile appsec up -d openappsec apisix-appsec
+  #
+  # `apisix-appsec` is a DROP-IN replacement for the stock `apisix` service
+  # (same apisix.yaml, same published ports — stop the plain `apisix`
+  # container first or the 9080/9180 binds collide). It shares IPC with the
+  # `openappsec` agent, which hot-loads ./openappsec/local_policy.yaml.
+  #
+  # POLICY POSTURE: everything in local_policy.yaml is `detect-learn` —
+  # events are LOGGED, NOTHING IS BLOCKED. That is an acceptable default, but
+  # docs/runbooks must never claim blocking protection from this stack. To
+  # enforce, flip `policies.default.mode` (and the specific rules) to
+  # `prevent-learn` in infra/openappsec/local_policy.yaml once the ML engine
+  # has learned the traffic baseline (the file hot-reloads).
+  # -------------------------------------------------------------------------
   openappsec:
     logging: *default-logging
     deploy: *default-limits
     image: ghcr.io/openappsec/agent:latest
     container_name: opendesk-openappsec
+    # W47: profile-gated like its attachment — an always-on agent serving no
+    # attachment was a pure orphan container in the default stack.
+    profiles:
+    - appsec
     ipc: shareable
     command: /cp-nano-agent
     environment:

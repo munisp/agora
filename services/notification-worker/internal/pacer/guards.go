@@ -90,6 +90,10 @@ var kindClasses = map[string]SendClass{
 	// (transactional-class) — never DND-suppressed; the quiet-hours hold
 	// is workflow-side (CivicStatusNotifyWorkflow).
 	"civic_status": ClassTransactional,
+	// SPEC-W47-C UIMOB-06: USSD menu-action confirmation SMS is
+	// user-requested (transactional-class) — never DND-suppressed,
+	// never quiet-hours deferred.
+	"ussd_action": ClassTransactional,
 }
 
 // ClassifyKind returns the compliance class of a paced send kind. Unknown

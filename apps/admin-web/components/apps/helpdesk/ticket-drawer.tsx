@@ -170,8 +170,11 @@ export function TicketDrawer({
     if (csatRating < 1 || csatRating > 5) return;
     setBusy(true);
     try {
-      const data = await api.patch<{ ticket: Ticket }>(
-        `/api/bookings/v1/helpdesk/tickets/${t.id}/csat`,
+      // SPEC-W47 (UIWEB-05): staff-side CSAT route added by W47-A —
+      // POST csat-note is the canonical path (PATCH /csat remains as a
+      // backward-compat alias).
+      const data = await api.post<{ ticket: Ticket }>(
+        `/api/bookings/v1/helpdesk/tickets/${t.id}/csat-note`,
         { rating: csatRating, comment: csatComment.trim() || undefined },
         { tenant: orgSlug },
       );

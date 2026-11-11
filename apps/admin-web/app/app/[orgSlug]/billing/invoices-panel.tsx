@@ -14,6 +14,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -30,13 +31,28 @@ import type { Invoice, Tenant } from "@/lib/types";
 /**
  * Invoice panel (SPEC-W7 Part C) — talks to the billing-engine contract
  * (SPEC-W7 Part B) through the gateway at /api/billing:
- *   GET  /v1/invoices?tenant_id=&status=
+ *   GET  /v1/invoices?tenant_id=&status=&limit=&cursor=
  *   POST /v1/invoices/generate { tenant_id, period: "YYYY-MM" }
  *   GET  /v1/invoices/{id}
  *   GET  /v1/invoices/{id}/qr          (SVG, 404 until a payment_ref exists)
+ *   POST /v1/invoices/{id}/issue       (draft → issued; SPEC-W47 UIWEB-21)
+ *   POST /v1/invoices/{id}/void        (issued/past_due → void; reverses AR)
  * The billing-engine authenticates service-to-service calls with an
  * X-Tenant-ID header matching tenant_id, so every request carries it.
+ *
+ * SPEC-W46 R10 keyset pagination (UIWEB-06): the list is bounded at 50 rows
+ * by default; the cursor is the previous page's last item encoded as
+ * `{created_at_unix_micros}:{id}` (billing-engine InvoiceCursor). "Load
+ * more" appends the next page instead of silently capping the list.
  */
+
+/** Page size for the keyset-paginated invoice list (backend default 50, max 200). */
+const PAGE_SIZE = 50;
+
+/** Encode the keyset cursor for the row AFTER `inv` (see InvoiceCursor::encode). */
+function invoiceCursor(inv: Invoice): string {
+  return `${Date.parse(inv.created_at) * 1000}:${inv.id}`;
+}
 
 /** YYYY-MM of the previous calendar month (last full billing period). */
 function defaultPeriod(): string {
@@ -70,10 +86,28 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
   const [period, setPeriod] = React.useState(defaultPeriod);
   const [generating, setGenerating] = React.useState(false);
   const [openId, setOpenId] = React.useState<string | null>(null);
+  // Keyset pagination state (UIWEB-06): the cursor of the last loaded row;
+  // a full page means there may be more rows beyond it.
+  const [cursor, setCursor] = React.useState<string | null>(null);
+  const [hasMore, setHasMore] = React.useState(false);
+  const [loadingMore, setLoadingMore] = React.useState(false);
 
   const tenantHeaders = React.useCallback(
     () => (tenant ? { "x-tenant-id": tenant.id } : undefined),
     [tenant],
+  );
+
+  const fetchPage = React.useCallback(
+    async (tenantId: string, after: string | null) => {
+      const data = await api.get<Invoice[] | { items: Invoice[] }>(
+        "/api/billing/v1/invoices",
+        { tenant_id: tenantId, limit: PAGE_SIZE, cursor: after ?? undefined },
+        undefined,
+        { "x-tenant-id": tenantId },
+      );
+      return Array.isArray(data) ? data : (data.items ?? []);
+    },
+    [],
   );
 
   const load = React.useCallback(async () => {
@@ -83,13 +117,10 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
         `/api/identity/v1/tenants/${orgSlug}`,
       );
       setTenant(t);
-      const data = await api.get<Invoice[] | { items: Invoice[] }>(
-        "/api/billing/v1/invoices",
-        { tenant_id: t.id },
-        undefined,
-        { "x-tenant-id": t.id },
-      );
-      setInvoices(Array.isArray(data) ? data : (data.items ?? []));
+      const page = await fetchPage(t.id, null);
+      setInvoices(page);
+      setCursor(page.length > 0 ? invoiceCursor(page[page.length - 1]) : null);
+      setHasMore(page.length >= PAGE_SIZE);
     } catch (e) {
       setError(
         e instanceof ApiError
@@ -97,8 +128,27 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
           : "Failed to load invoices — the billing engine may be offline.",
       );
       setInvoices([]);
+      setHasMore(false);
     }
-  }, [orgSlug]);
+  }, [orgSlug, fetchPage]);
+
+  const loadMore = async () => {
+    if (!tenant || !cursor) return;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const page = await fetchPage(tenant.id, cursor);
+      setInvoices((prev) => [...(prev ?? []), ...page]);
+      setCursor(page.length > 0 ? invoiceCursor(page[page.length - 1]) : null);
+      setHasMore(page.length >= PAGE_SIZE);
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.message : "Failed to load more invoices.",
+      );
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   React.useEffect(() => {
     void load();
@@ -229,6 +279,19 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
             </TableBody>
           </Table>
         )}
+
+        {hasMore ? (
+          <div className="mt-3 flex justify-center">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void loadMore()}
+              disabled={loadingMore || !cursor}
+            >
+              {loadingMore ? "Loading…" : "Load more invoices"}
+            </Button>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -252,6 +315,10 @@ function InvoiceRow({
   const [qrUrl, setQrUrl] = React.useState<string | null>(null);
   const [qrNote, setQrNote] = React.useState<string | null>(null);
   const [linkBusy, setLinkBusy] = React.useState(false);
+  const [actionBusy, setActionBusy] = React.useState<"issue" | "void" | null>(
+    null,
+  );
+  const [confirmVoid, setConfirmVoid] = React.useState(false);
 
   React.useEffect(() => {
     if (!open) return;
@@ -324,6 +391,40 @@ function InvoiceRow({
       });
     } finally {
       setLinkBusy(false);
+    }
+  };
+
+  // SPEC-W47 UIWEB-21: invoice lifecycle actions. Issue flips draft →
+  // issued (posts DR AR / CR revenue in the same transaction); void reverses
+  // the receivable for issued/past_due invoices. Both are money-role-gated
+  // server-side (X-User-Roles injected by the gateway).
+  const lifecycle = async (action: "issue" | "void") => {
+    setActionBusy(action);
+    try {
+      await api.post<Invoice>(
+        `/api/billing/v1/invoices/${invoice.id}/${action}`,
+        {},
+        undefined,
+        headers(),
+      );
+      toast({
+        title: action === "issue" ? "Invoice issued" : "Invoice voided",
+        description:
+          action === "issue"
+            ? "The receivable was posted to the ledger."
+            : "The receivable was reversed.",
+        variant: "success",
+      });
+      setConfirmVoid(false);
+      onChanged();
+    } catch (e) {
+      toast({
+        title: action === "issue" ? "Issue failed" : "Void failed",
+        description: e instanceof ApiError ? e.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setActionBusy(null);
     }
   };
 
@@ -422,7 +523,7 @@ function InvoiceRow({
                   <Button
                     variant="outline"
                     size="sm"
-                    disabled={linkBusy}
+                    disabled={linkBusy || actionBusy !== null}
                     onClick={(e) => {
                       e.stopPropagation();
                       void createPaymentLink();
@@ -431,11 +532,48 @@ function InvoiceRow({
                     {linkBusy ? "Creating…" : "Create payment link"}
                   </Button>
                 ) : null}
+                {invoice.status === "draft" ? (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={actionBusy !== null}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void lifecycle("issue");
+                    }}
+                  >
+                    {actionBusy === "issue" ? "Issuing…" : "Issue invoice"}
+                  </Button>
+                ) : null}
+                {invoice.status !== "paid" && invoice.status !== "void" ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive"
+                    disabled={actionBusy !== null}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setConfirmVoid(true);
+                    }}
+                  >
+                    Void
+                  </Button>
+                ) : null}
               </div>
             </div>
           </TableCell>
         </TableRow>
       ) : null}
+      <ConfirmDialog
+        open={confirmVoid}
+        onOpenChange={(open) => !open && setConfirmVoid(false)}
+        title="Void this invoice?"
+        description={`Invoice ${invoice.period} · ${formatMoney(invoice.subtotal_cents, invoice.currency)}. Voiding an issued invoice reverses the receivable in the ledger; voided invoices can no longer be paid.`}
+        confirmLabel="Void invoice"
+        destructive
+        busy={actionBusy === "void"}
+        onConfirm={() => void lifecycle("void")}
+      />
     </>
   );
 }

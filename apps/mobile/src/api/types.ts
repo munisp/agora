@@ -36,6 +36,18 @@ export interface Booking {
   updated_at: string;
 }
 
+/** bookingops.CompleteResult — POST /v1/bookings/{id}/complete (SPEC-W45
+ * K11, UIMOB-11). already_completed marks an idempotent replay; capture is
+ * set only when a deposit hold was captured via the payments rail. */
+export interface CompleteBookingResult {
+  booking: Booking;
+  already_completed: boolean;
+  capture?: {
+    deposit_id: string;
+    captured: boolean;
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Leads + CAC (SPEC-W13)
 // ---------------------------------------------------------------------------

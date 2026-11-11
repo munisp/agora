@@ -90,6 +90,18 @@ const (
 	// ActivitySendIncidentAlert is the name of the incident alert send
 	// activity (SPEC-W11 Part B §5).
 	ActivitySendIncidentAlert = "SendIncidentAlert"
+
+	// PacedSendUSSDAction routes to SendUSSDActionMessage (SPEC-W47-C
+	// UIMOB-06): the USSD pack-menu action confirmation SMS (book / status /
+	// handoff / info), scheduled by the httpapi POST /v1/notify/ussd-action
+	// intake for messaging-gateway. TRANSACTIONAL-class — the message is
+	// user-requested (the caller dialed the code and picked the item).
+	PacedSendUSSDAction = "ussd_action"
+
+	// ActivitySendUSSDActionMessage is the name of the USSD action
+	// confirmation send activity (SPEC-W47-C UIMOB-06). NotifyPaced invokes
+	// it in-process (mirrors ActivitySendWhatsAppCampaignMessage).
+	ActivitySendUSSDActionMessage = "SendUSSDActionMessage"
 )
 
 // PacedSendRequest is the payload of the NotifyPaced activity: which send
@@ -120,6 +132,10 @@ type PacedSendRequest struct {
 	// Civic carries the SendCivicStatusUpdate arguments for the civic_status
 	// kind (SPEC-W32 WS-B): TRANSACTIONAL-class citizen case updates.
 	Civic *PacedCivicStatusSend `json:"civic,omitempty"`
+	// USSDAction carries the SendUSSDActionMessage arguments for the
+	// ussd_action kind (SPEC-W47-C UIMOB-06): TRANSACTIONAL-class USSD
+	// menu-action confirmation SMS.
+	USSDAction *PacedUSSDActionSend `json:"ussd_action,omitempty"`
 }
 
 // PushTarget is one explicit device token in a push payload (SPEC-W16
@@ -286,6 +302,19 @@ type PacedStaffAlertSend struct {
 	Input SupportEscalationInput `json:"input"`
 }
 
+// PacedUSSDActionSend carries the SendUSSDActionMessage arguments
+// (SPEC-W47-C UIMOB-06): one confirmation SMS to the USSD caller after the
+// pack-menu action was dispatched. The JSON contract is duplicated by
+// messaging-gateway's action dispatcher (service boundary: duplicated, not
+// shared) — keep the field tags in sync.
+type PacedUSSDActionSend struct {
+	TenantSlug string `json:"tenant_slug"`
+	Phone      string `json:"phone"` // E.164 recipient (the USSD caller)
+	Text       string `json:"text"`  // rendered confirmation/info text
+	// Action is audit context only (book | status | handoff | info).
+	Action string `json:"action,omitempty"`
+}
+
 // ---------------------------------------------------------------------------
 // SPEC-W12 Agent B: DND/quiet-hours compliance guards
 // ---------------------------------------------------------------------------
@@ -341,6 +370,11 @@ func PacedSendChannel(req PacedSendRequest) string {
 		if req.Civic != nil {
 			return req.Civic.Channel
 		}
+	case PacedSendUSSDAction:
+		// SPEC-W47-C UIMOB-06: fixed channel key "sms" (the confirmation
+		// goes to the USSD caller's phone; transactional, so no quiet-hours
+		// hold applies — carried for the override lookup symmetry).
+		return "sms"
 	}
 	return ""
 }

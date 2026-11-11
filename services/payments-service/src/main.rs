@@ -14,6 +14,7 @@ mod mojaloop;
 mod payouts;
 mod registry;
 mod routes;
+mod tenant;
 mod transfers;
 
 use std::net::SocketAddr;
@@ -243,37 +244,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(consumer::UnavailableDlqSink)
         }
     };
+    let registry_store: Arc<dyn registry::Registry>;
+    let transfer_store: Arc<dyn transfers::TransferAttemptStore>;
     // P-01 (C3): durable payout_attempts store. When a DSN is configured
     // (PAYMENTS_DATABASE_URL / DATABASE_URL / PG_DSN) the table is
     // bootstrapped at startup and an unreachable database fails the boot
     // (fail-closed). Without a DSN the store is in-memory (dev only).
+    //
+    // SPEC-W47 DB-01: with a DSN configured, all three stores bootstrap their
+    // tables first, then migrations/0001_rls.sql is applied (ENABLE+FORCE
+    // RLS + tenant policies + least-privilege roles) — fail-closed: if the
+    // RLS migration cannot be applied the service refuses to start rather
+    // than serving cross-tenant money data. The cross-tenant internal paths
+    // (reconciler sweep, approval lookup) use
+    // PAYMENTS_INTERNAL_DATABASE_URL when set, else the main pool.
     let payout_attempts: Arc<dyn payouts::PayoutAttemptStore> = match &cfg.database_url {
-        Some(dsn) => Arc::new(payouts::PgPayoutAttemptStore::connect_with_retry(dsn).await?),
+        Some(dsn) => {
+            let payout_pg = payouts::PgPayoutAttemptStore::connect_with_retry(
+                dsn,
+                cfg.internal_database_url.as_deref(),
+            )
+            .await?;
+            if cfg.internal_database_url.is_none() {
+                warn!("PAYMENTS_INTERNAL_DATABASE_URL unset: cross-tenant internal payouts                        paths (reconciler sweep, approval lookup) use the main pool (dev superuser posture)");
+            }
+            // SPEC-W44 K7: payee registry + deposit provenance store (same
+            // DSN posture as payout_attempts).
+            let registry_pg = registry::PgRegistry::connect_with_retry(dsn).await?;
+            // SPEC-W45: rail_attempts store for /v1/transfers + the K12
+            // refund rail.
+            let transfers_pg = transfers::PgTransferAttemptStore::connect_with_retry(dsn).await?;
+            // DB-01: RLS LAST, after every store's bootstrap DDL created its
+            // tables (the policies require the relations to exist).
+            tenant::apply_rls_migration(payout_pg.pool()).await?;
+            registry_store = Arc::new(registry_pg);
+            transfer_store = Arc::new(transfers_pg);
+            Arc::new(payout_pg)
+        }
         None => {
             warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: payout_attempts store is                    in-memory (dev only — reconciliation records are lost on restart)");
+            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: payee registry / deposit                    provenance store is in-memory (dev only — beneficiary records are lost on restart)");
+            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: rail_attempts store is                    in-memory (dev only — transfer/refund replay records are lost on restart)");
+            registry_store = Arc::new(registry::MemRegistry::default());
+            transfer_store = Arc::new(transfers::MemTransferAttemptStore::default());
             Arc::new(payouts::MemPayoutAttemptStore::default())
         }
     };
-    // SPEC-W44 K7: payee registry + deposit provenance store (same DSN
-    // posture as payout_attempts: fail-closed when configured, in-memory dev
-    // fallback otherwise).
-    let registry: Arc<dyn registry::Registry> = match &cfg.database_url {
-        Some(dsn) => Arc::new(registry::PgRegistry::connect_with_retry(dsn).await?),
-        None => {
-            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: payee registry / deposit                    provenance store is in-memory (dev only — beneficiary records are lost on restart)");
-            Arc::new(registry::MemRegistry::default())
-        }
-    };
-    // SPEC-W45: rail_attempts store for /v1/transfers + the K12 refund rail
-    // (same DSN posture as payout_attempts: fail-closed when configured,
-    // in-memory dev fallback otherwise).
-    let transfer_attempts: Arc<dyn transfers::TransferAttemptStore> = match &cfg.database_url {
-        Some(dsn) => Arc::new(transfers::PgTransferAttemptStore::connect_with_retry(dsn).await?),
-        None => {
-            warn!("PAYMENTS_DATABASE_URL/DATABASE_URL/PG_DSN unset: rail_attempts store is                    in-memory (dev only — transfer/refund replay records are lost on restart)");
-            Arc::new(transfers::MemTransferAttemptStore::default())
-        }
-    };
+    let registry = registry_store;
+    let transfer_attempts = transfer_store;
     if cfg.payout_approval_threshold_cents > 0 {
         info!(
             threshold_kobo = cfg.payout_approval_threshold_cents,

@@ -98,6 +98,14 @@ func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
 			in.TenantSlug = req.Civic.TenantSlug
 			in.Phone = req.Civic.Phone
 		}
+	case workflows.PacedSendUSSDAction:
+		// SPEC-W47-C UIMOB-06: ussd_action is transactional-class (guard
+		// short-circuits before reading these); carried for audit
+		// completeness.
+		if req.USSDAction != nil {
+			in.TenantSlug = req.USSDAction.TenantSlug
+			in.Phone = req.USSDAction.Phone
+		}
 	}
 	return in
 }
@@ -181,6 +189,11 @@ func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedS
 			return fmt.Errorf("NotifyPaced %s: missing civic payload", req.Kind)
 		}
 		return a.SendCivicStatusUpdate(ctx, *req.Civic)
+	case workflows.PacedSendUSSDAction:
+		if req.USSDAction == nil {
+			return fmt.Errorf("NotifyPaced %s: missing ussd_action payload", req.Kind)
+		}
+		return a.SendUSSDActionMessage(ctx, *req.USSDAction)
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
 	}

@@ -209,6 +209,56 @@ class TestSessionSecret:
         assert not s.check_secret("")
         assert not s.check_secret(s.session_secret + "x")
 
+    async def test_chat_rest_path_accepts_x_session_secret_header(self, monkeypatch):
+        """SPEC-W47 (K15(b), UIMOB-04 service side): POST /voice/chat must
+        accept the resume credential via the X-Session-Secret header as well
+        as the JSON body (body wins when both are present)."""
+        from app import control_plane
+
+        captured: dict = {}
+
+        async def fake_handle(self, **kwargs):  # noqa: ANN001 - test stub
+            captured.clear()
+            captured.update(kwargs)
+            return {"conversation_id": kwargs.get("conversation_id") or "new",
+                    "session_secret": "issued-secret", "reply": "ok"}
+
+        monkeypatch.setattr(
+            control_plane.ChatService, "handle_message", fake_handle
+        )
+        app = create_app(_settings())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # Header-only credential is threaded into the chat service.
+            resp = await client.post(
+                "/voice/chat",
+                json={"site_slug": "acme", "message": "hi",
+                      "conversation_id": "c1"},
+                headers={"X-Session-Secret": "hdr-secret"},
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["session_secret"] == "hdr-secret"
+            assert captured["conversation_id"] == "c1"
+            # Body field wins when both are present.
+            resp = await client.post(
+                "/voice/chat",
+                json={"site_slug": "acme", "message": "hi",
+                      "conversation_id": "c1",
+                      "session_secret": "body-secret"},
+                headers={"X-Session-Secret": "hdr-secret"},
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["session_secret"] == "body-secret"
+            # Neither -> None (fresh session; resume still gated server-side).
+            resp = await client.post(
+                "/voice/chat",
+                json={"site_slug": "acme", "message": "hi",
+                      "conversation_id": "c1"},
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["session_secret"] is None
+
 
 # --------------------------------------------------------------------------
 # K15(c): OTP gate on the mutating tools
@@ -244,9 +294,12 @@ class TestOtpGate:
     async def test_otp_happy_path_then_lookup(self):
         requests: list[httpx.Request] = []
         dapr = FakeDapr()
-        dapr.get_responses["v1/bookings"] = {
-            "bookings": [{"id": "b1", "contact_phone": PHONE_NORM}]
-        }
+        # W47 (UIMOB-05): the server filters by contact_phone — the tool
+        # sends the verified phone as a query param and trusts the
+        # (internal-token-gated) response list as-is.
+        dapr.get_responses["v1/bookings"] = [
+            {"id": "b1", "status": "confirmed", "starts_at": "2026-01-02T10:00:00Z"}
+        ]
         session = SessionState(conversation_id="c1", site_slug="demo")
         layer = _tool_layer(dapr, session, verifier_factory=_verifier_factory(requests))
 
@@ -268,6 +321,42 @@ class TestOtpGate:
         result = await layer.dispatch("lookup_appointment", {"phone": PHONE})
         assert result["count"] == 1
         assert result["phone"] == PHONE_NORM
+        # The booking call went to v1/bookings with the server-side
+        # contact_phone filter + internal token (W47 contract).
+        app_id, method, params, headers = dapr.invoke_get_calls[-1]
+        assert app_id == "booking"
+        assert method == "v1/bookings"
+        assert params["contact_phone"] == PHONE_NORM
+        assert headers["X-Internal-Token"] == "book-tok"
+        assert headers["X-Tenant-Slug"] == "acme"
+
+    async def test_lookup_tolerates_legacy_bookings_envelope(self):
+        dapr = FakeDapr()
+        dapr.get_responses["v1/bookings"] = {
+            "bookings": [{"id": "b1", "status": "confirmed"}]
+        }
+        session = SessionState(conversation_id="c1", site_slug="demo")
+        session.mark_verified(PHONE_NORM)
+        layer = _tool_layer(dapr, session)
+        result = await layer.dispatch("lookup_appointment", {"phone": PHONE})
+        assert result["count"] == 1
+        assert session.last_booking_ids == ["b1"]
+
+    async def test_lookup_fails_closed_when_internal_token_unset(self):
+        """A channel-verified session with no VOICE_BOOKING_INTERNAL_TOKEN
+        must NOT call the gated route nor report a misleading empty list."""
+        dapr = FakeDapr()
+        session = SessionState(conversation_id="c1", site_slug="demo")
+        session.mark_verified(PHONE_NORM)
+        layer = _tool_layer(
+            dapr,
+            session,
+            settings=_settings(voice_booking_internal_token=""),
+        )
+        result = await layer.dispatch("lookup_appointment", {"phone": PHONE})
+        assert result["status"] == "error"
+        assert result["error"] == "verification_unavailable"
+        assert dapr.invoke_get_calls == []
 
     async def test_wrong_code_does_not_verify(self):
         requests: list[httpx.Request] = []

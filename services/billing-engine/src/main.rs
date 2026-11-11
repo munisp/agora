@@ -15,6 +15,7 @@ mod metering;
 mod models;
 mod outbox;
 mod payments_qr;
+mod permify;
 mod routes;
 mod tenant;
 
@@ -62,6 +63,12 @@ pub struct AppState {
     /// X-Tenant-Slugs entry to a uuid-form tenant param via identity's
     /// GET /v1/tenants/{slug}. Fail-closed on identity errors.
     pub identity: Arc<identity::SlugResolver>,
+    /// SPEC-W47 D item 2 (A-MW MW-L5): Permify ReBAC checks — `view_billing`
+    /// on invoice list/get, `manage_billing` on issue/void — on the human
+    /// (gateway) call path. Fail-closed (502 on outage, 403 on denial);
+    /// internal-token callers and the Paystack webhook keep their existing
+    /// auth. Disabled only when PERMIFY_URL is configured EMPTY (dev escape).
+    pub permify: permify::PermifyClient,
     /// Signalled after a transaction commits with a fresh outbox row so the
     /// relay flushes immediately instead of waiting for the poll tick.
     pub outbox_notify: Arc<tokio::sync::Notify>,
@@ -158,6 +165,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting billing-engine"
     );
 
+    if cfg.internal_token.is_empty() {
+        // Unreachable (from_env requires it) — defensive.
+        error!("BILLING_INTERNAL_TOKEN empty; refusing to start");
+        return Err("internal token empty".into());
+    }
+    // SPEC-W47 D item 2: surface the Permify posture at boot.
+    match &cfg.permify_url {
+        Some(url) => info!(permify_url = %url, "permify billing ReBAC checks enabled (view_billing/manage_billing)"),
+        None => warn!(
+            "PERMIFY_URL empty: view_billing/manage_billing ReBAC checks DISABLED \
+             (dev-only escape; the K1 tenant binding + K6 money-role gates still apply)"
+        ),
+    }
+
     let pool = connect_pool(&cfg.database_url, cfg.db_pool_max).await?;
     // Idempotent schema bootstrap (same pattern as notification-worker; the
     // `billing` database itself is created by infra/postgres init scripts).
@@ -251,6 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.identity_internal_token.clone(),
             Duration::from_secs(cfg.tenant_cache_ttl_s),
         )),
+        permify: permify::PermifyClient::new(cfg.permify_url.clone()),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         events_published: Arc::new(AtomicU64::new(0)),
         events_failed: Arc::new(AtomicU64::new(0)),

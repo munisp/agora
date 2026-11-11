@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowRight, KeyRound, MessagesSquare, Save, Users } from "lucide-react";
+import { ArrowRight, KeyRound, MessagesSquare, Save, ShieldCheck, Users } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -220,6 +220,26 @@ export function SettingsClient({ orgSlug }: { orgSlug: string }) {
             <Link href={`/app/${orgSlug}/settings/api-keys`}>
               <Button variant="outline" size="sm">
                 Manage API keys <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </Link>
+          </CardContent>
+        </Card>
+
+        {/* SPEC-W47 UIWEB-17: NDPA data-subject rights console. */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4" /> Privacy
+            </CardTitle>
+            <CardDescription>
+              Data-subject requests: export a person&apos;s data or erase it
+              across all services (NDPA).
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Link href={`/app/${orgSlug}/settings/privacy`}>
+              <Button variant="outline" size="sm">
+                Open privacy console <ArrowRight className="h-3.5 w-3.5" />
               </Button>
             </Link>
           </CardContent>

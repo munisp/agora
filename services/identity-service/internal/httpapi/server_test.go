@@ -90,6 +90,37 @@ func (f *fakeStore) MergeTerminology(_ context.Context, slug string, patch json.
 	return patch, nil
 }
 
+// UpdateTenant applies the non-nil patch fields (terminology replaces), the
+// same semantics as the Postgres store method (SPEC-W47 UIWEB-01).
+func (f *fakeStore) UpdateTenant(_ context.Context, slug string, p store.TenantPatch) (store.Tenant, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.tenants[slug]
+	if !ok {
+		return store.Tenant{}, store.ErrNotFound
+	}
+	if p.Name != nil {
+		t.Name = *p.Name
+	}
+	if p.Timezone != nil {
+		t.Timezone = *p.Timezone
+	}
+	if p.Currency != nil {
+		t.Currency = *p.Currency
+	}
+	if p.Locale != nil {
+		t.Locale = *p.Locale
+	}
+	if p.Industry != nil {
+		t.Industry = *p.Industry
+	}
+	if p.Terminology != nil {
+		t.Terminology = p.Terminology
+	}
+	f.tenants[slug] = t
+	return t, nil
+}
+
 func (f *fakeStore) ListMembers(_ context.Context, tenantID uuid.UUID) ([]store.Membership, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -205,6 +236,7 @@ func (f *fakeStore) GetAPIKeyByHash(_ context.Context, keyHash string) (store.AP
 type fakePermify struct {
 	allowed    map[string]bool
 	err        error
+	relWritten []string
 	relDeleted []string
 	tenantDel  []string
 }
@@ -218,7 +250,8 @@ func (f *fakePermify) Check(_ context.Context, tenantID, subject, permission, re
 
 func (f *fakePermify) CreateTenant(context.Context, string, string) error { return nil }
 
-func (f *fakePermify) WriteRelationship(context.Context, string, string, string, string) error {
+func (f *fakePermify) WriteRelationship(_ context.Context, tenantID, entity, relation, subject string) error {
+	f.relWritten = append(f.relWritten, entity+"#"+relation+"@"+subject)
 	return nil
 }
 

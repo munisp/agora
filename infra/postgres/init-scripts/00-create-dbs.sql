@@ -26,3 +26,12 @@ CREATE DATABASE billing;
 -- (kyc_audit with FORCE ROW LEVEL SECURITY) is applied idempotently by the
 -- service itself from services/kyc-service/internal/store.
 CREATE DATABASE kyc;
+-- W47 (SPEC-W47 / A-DB DB-01 CRIT): payments-service database. Previously the
+-- tenant-scoped money tables (payout_beneficiaries, deposit_provenance,
+-- payout_attempts, rail_attempts) lived in the default superuser database
+-- over a superuser DSN with NO RLS. Schema (CREATE TABLE IF NOT EXISTS) +
+-- RLS migration are applied idempotently by the service at boot
+-- (services/payments-service/migrations/0001_rls.sql); roles/grants are in
+-- 05-app-roles.sql. The service connects as app_payments_login /
+-- app_payments_internal_login (see docker-compose.yml payments block).
+CREATE DATABASE payments;

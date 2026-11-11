@@ -193,6 +193,10 @@ func run() error {
 	// callback + escalation event).
 	w.RegisterActivityWithOptions(acts.SendCivicStatusUpdate, activity.RegisterOptions{Name: workflows.ActivitySendCivicStatusUpdate})
 	w.RegisterActivityWithOptions(acts.ReportCivicSLABreach, activity.RegisterOptions{Name: workflows.ActivityReportCivicSLABreach})
+	// SPEC-W47-C UIMOB-06: USSD menu-action confirmation SMS (via NotifyPaced
+	// kind ussd_action, scheduled by httpapi POST /v1/notify/ussd-action for
+	// messaging-gateway).
+	w.RegisterActivityWithOptions(acts.SendUSSDActionMessage, activity.RegisterOptions{Name: workflows.ActivitySendUSSDActionMessage})
 	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
 	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
 

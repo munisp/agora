@@ -42,6 +42,8 @@ func (s *server) mapLeadError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, store.ErrPromoExhausted):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrCampaignCancelled), errors.Is(err, store.ErrInvalidCampaignStatus):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		s.internal(w, err)
 	}
@@ -358,6 +360,78 @@ func (s *server) listCampaigns(w http.ResponseWriter, r *http.Request) {
 		rows = []store.CampaignView{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"campaigns": rows})
+}
+
+// updateCampaignRequest is the PATCH /v1/campaigns/{id} body (SPEC-W47
+// W47-A item 7, A-DB DB-07). Pointer fields: only present fields change.
+// status accepts active|paused|cancelled (cancelled is terminal; use the
+// POST /{id}/cancel endpoint for the dedicated soft-delete path).
+type updateCampaignRequest struct {
+	Name    *string    `json:"name,omitempty"`
+	Channel *string    `json:"channel,omitempty"`
+	StartTs *time.Time `json:"start_ts,omitempty"`
+	EndTs   *time.Time `json:"end_ts,omitempty"`
+	Status  *string    `json:"status,omitempty"`
+}
+
+// updateCampaign handles PATCH /v1/campaigns/{id} (manage_bookings).
+func (s *server) updateCampaign(w http.ResponseWriter, r *http.Request) {
+	svc := s.leadsSvc(w)
+	if svc == nil {
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	var req updateCampaignRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	u := store.CampaignUpdate{StartsAt: req.StartTs, EndsAt: req.EndTs}
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, "name must not be empty")
+			return
+		}
+		u.Name = &name
+	}
+	if req.Channel != nil {
+		ch := strings.ToLower(strings.TrimSpace(*req.Channel))
+		u.Channel = &ch
+	}
+	if req.Status != nil {
+		u.Status = strings.TrimSpace(*req.Status)
+	}
+	c, err := svc.Store.UpdateCampaign(r.Context(), tenant.ID, id, u)
+	if err != nil {
+		s.mapLeadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"campaign": c})
+}
+
+// cancelCampaign handles POST /v1/campaigns/{id}/cancel (manage_bookings):
+// terminal soft-delete (SPEC-W47 item 7). Idempotent — an already-cancelled
+// campaign answers 200 with the unchanged row.
+func (s *server) cancelCampaign(w http.ResponseWriter, r *http.Request) {
+	svc := s.leadsSvc(w)
+	if svc == nil {
+		return
+	}
+	tenant := tenantFrom(r.Context())
+	id, ok := urlUUID(w, r, "id")
+	if !ok {
+		return
+	}
+	c, err := svc.Store.CancelCampaign(r.Context(), tenant.ID, id)
+	if err != nil {
+		s.mapLeadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"campaign": c})
 }
 
 // recordSpendRequest is the POST /v1/campaigns/{id}/spend body (§4).

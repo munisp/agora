@@ -30,9 +30,14 @@ import { Card } from "../components/Card";
 import { Button, Field, ErrorBox } from "../components/ui";
 import { colors, spacing } from "../src/theme";
 
-/** Loose E.164 check — the server is the authoritative validator. */
-function looksLikeE164(phone: string): boolean {
-  return /^\+[1-9]\d{6,14}$/.test(phone.trim());
+/** UIMOB-02 (SPEC-W47): conservative client-side E.164 normalization —
+ * strip separators, upgrade a leading international "00" to "+". Anything
+ * still not matching E.164 is rejected here; the server stays the
+ * authoritative validator. Returns the normalized value or null. */
+function normalizeE164(phone: string): string | null {
+  let s = phone.trim().replace(/[\s().\-/]/g, "");
+  if (s.startsWith("00")) s = `+${s.slice(2)}`;
+  return /^\+[1-9]\d{6,14}$/.test(s) ? s : null;
 }
 
 /** True when the request never got a server response (offline/dead
@@ -98,14 +103,15 @@ export default function LeadCaptureModal() {
   );
 
   const onSubmit = async () => {
-    if (!looksLikeE164(phone)) {
+    const normalizedPhone = normalizeE164(phone);
+    if (!normalizedPhone) {
       setError("Phone must be E.164, e.g. +2348012345678");
       return;
     }
     setError(null);
     setResult(null);
     setBusy(true);
-    const trimmedPhone = phone.trim();
+    const trimmedPhone = normalizedPhone;
     const trimmedNotes = notes.trim();
     try {
       const res = await createLead({

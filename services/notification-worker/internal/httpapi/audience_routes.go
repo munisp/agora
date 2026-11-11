@@ -77,14 +77,26 @@ func (h *AudienceHandler) createAudience(w http.ResponseWriter, r *http.Request)
 		http.Error(w, `{"error":"audience intake not configured"}`, http.StatusServiceUnavailable)
 		return
 	}
-	// JWT seam: APISIX maps the workforce JWT sub → X-Tenant-Id; the slug
-	// twin rides X-Tenant-Slug (same contract as /v1/webhooks).
+	// JWT seam (GW-02, SPEC-W47-C): the APISIX api-notifications route
+	// strips the caller-sent singular x-tenant-* headers and re-injects
+	// ONLY the plural X-Tenant-Slugs membership list from the verified JWT
+	// (K1 header contract, auth.go). Accept BOTH: the plural list is
+	// preferred (first entry scopes single-tenant callers — audience sends
+	// are always single-tenant); the legacy singular X-Tenant-Id /
+	// X-Tenant-Slug headers remain the fallback for direct/pre-gateway
+	// callers. Fail-closed: no tenant scope at all → 400.
 	tenantID := strings.TrimSpace(r.Header.Get("X-Tenant-Id"))
 	tenantSlug := strings.TrimSpace(r.Header.Get("X-Tenant-Slug"))
+	if slugs := parseCSV(r.Header.Get(HeaderTenantSlugs)); len(slugs) > 0 {
+		tenantSlug = slugs[0]
+		if tenantID == "" {
+			// Deployments fronted only by the slug header (current APISIX
+			// jwt+rewrite pattern) use the slug as the scope token;
+			// graph-service still enforces the tenant filter server-side.
+			tenantID = tenantSlug
+		}
+	}
 	if tenantID == "" {
-		// Deployments fronted only by the slug header (current APISIX
-		// jwt+rewrite pattern) use the slug as the scope token; graph-service
-		// still enforces the tenant filter server-side.
 		tenantID = tenantSlug
 	}
 	if tenantID == "" {

@@ -14,6 +14,64 @@ interface Turn {
 interface ChatResult {
   reply: string;
   conversationId?: string;
+  sessionSecret?: string;
+}
+
+/**
+ * K15(b) session resume: the runtime issues a session_secret with every
+ * response (and the terminal SSE done frame); resuming a conversation
+ * requires it. The widget persists it in localStorage so a returning
+ * visitor continues the SAME session instead of silently spawning a fresh
+ * one (UIMOB-04). Stored per tenant+site.
+ */
+function sessionStorageKey(tenant: string, siteSlug: string): string {
+  return `opendesk.chat.${tenant}.${siteSlug}`;
+}
+
+function loadPersistedSession(
+  tenant: string,
+  siteSlug: string,
+): { conversationId?: string; sessionSecret?: string } {
+  try {
+    const raw = localStorage.getItem(sessionStorageKey(tenant, siteSlug));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as {
+      conversation_id?: unknown;
+      session_secret?: unknown;
+    };
+    return {
+      conversationId:
+        typeof parsed.conversation_id === "string"
+          ? parsed.conversation_id
+          : undefined,
+      sessionSecret:
+        typeof parsed.session_secret === "string"
+          ? parsed.session_secret
+          : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function persistSession(
+  tenant: string,
+  siteSlug: string,
+  conversationId: string | undefined,
+  sessionSecret: string | undefined,
+) {
+  if (!conversationId && !sessionSecret) return;
+  try {
+    localStorage.setItem(
+      sessionStorageKey(tenant, siteSlug),
+      JSON.stringify({
+        conversation_id: conversationId,
+        session_secret: sessionSecret,
+      }),
+    );
+  } catch {
+    // Private mode / quota — resume simply won't survive a reload.
+  }
 }
 
 /**
@@ -24,6 +82,7 @@ interface ChatResult {
  */
 async function sendStreaming(
   payload: Record<string, unknown>,
+  sessionSecret: string | undefined,
   onDelta: (text: string) => void,
 ): Promise<ChatResult | null> {
   let res: Response;
@@ -33,6 +92,9 @@ async function sendStreaming(
       headers: {
         "content-type": "application/json",
         accept: "text/event-stream",
+        // K15(b): resume credential. Also sent in the body for runtimes
+        // that read it there; the header is the W47 contract.
+        ...(sessionSecret ? { "x-session-secret": sessionSecret } : {}),
       },
       body: JSON.stringify({ ...payload, stream: true }),
       cache: "no-store",
@@ -50,6 +112,7 @@ async function sendStreaming(
   let buffer = "";
   let reply = "";
   let conversationId: string | undefined;
+  let secret: string | undefined;
   let sawDone = false;
 
   const handleEvent = (data: string) => {
@@ -60,9 +123,13 @@ async function sendStreaming(
         done?: boolean;
         reply?: string;
         conversation_id?: string;
+        session_secret?: string;
       };
       if (typeof evt.conversation_id === "string") {
         conversationId = evt.conversation_id;
+      }
+      if (typeof evt.session_secret === "string") {
+        secret = evt.session_secret;
       }
       if (typeof evt.delta === "string") {
         reply += evt.delta;
@@ -94,7 +161,7 @@ async function sendStreaming(
     handleEvent(buffer.trim().slice(5).trim());
   }
   if (!reply && !sawDone) return null;
-  return { reply, conversationId };
+  return { reply, conversationId, sessionSecret: secret };
 }
 
 /**
@@ -116,12 +183,30 @@ export function ChatWidget({
   const [turns, setTurns] = React.useState<Turn[]>([]);
   const [draft, setDraft] = React.useState("");
   const [conversationId, setConversationId] = React.useState<string | undefined>();
+  const [sessionSecret, setSessionSecret] = React.useState<string | undefined>();
   const [sending, setSending] = React.useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [turns, open]);
+
+  // K15(b): restore the persisted session on mount so a returning visitor
+  // resumes their conversation instead of starting a fresh one.
+  React.useEffect(() => {
+    const persisted = loadPersistedSession(tenant, siteSlug);
+    if (persisted.conversationId) setConversationId(persisted.conversationId);
+    if (persisted.sessionSecret) setSessionSecret(persisted.sessionSecret);
+  }, [tenant, siteSlug]);
+
+  const rememberSession = React.useCallback(
+    (conversation: string | undefined, secret: string | undefined) => {
+      if (conversation) setConversationId(conversation);
+      if (secret) setSessionSecret(secret);
+      persistSession(tenant, siteSlug, conversation, secret);
+    },
+    [tenant, siteSlug],
+  );
 
   const send = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -135,11 +220,13 @@ export function ChatWidget({
       site_slug: siteSlug,
       message,
       conversation_id: conversationId,
+      // K15(b): resume credential in the body (current runtime contract).
+      session_secret: sessionSecret,
     };
     try {
       // 1. Streaming path: append an empty agent turn and fill it as deltas arrive.
       let streamedIdx = -1;
-      const streamed = await sendStreaming(payload, (text) => {
+      const streamed = await sendStreaming(payload, sessionSecret, (text) => {
         setTurns((t) => {
           if (streamedIdx === -1) {
             streamedIdx = t.length;
@@ -152,7 +239,12 @@ export function ChatWidget({
       });
 
       if (streamed) {
-        if (streamed.conversationId) setConversationId(streamed.conversationId);
+        if (streamed.conversationId || streamed.sessionSecret) {
+          rememberSession(
+            streamed.conversationId ?? conversationId,
+            streamed.sessionSecret ?? sessionSecret,
+          );
+        }
         if (!streamed.reply) {
           // Stream ended without content — drop the placeholder turn.
           setTurns((t) => t.filter((_, i) => i !== streamedIdx));
@@ -162,8 +254,13 @@ export function ChatWidget({
       }
 
       // 2. Fallback: classic request/response.
-      const res = await api.post<ChatResponse>("/voice/chat", payload);
-      setConversationId(res.conversation_id);
+      const res = await api.post<ChatResponse>(
+        "/voice/chat",
+        payload,
+        undefined,
+        sessionSecret ? { "x-session-secret": sessionSecret } : undefined,
+      );
+      rememberSession(res.conversation_id, res.session_secret ?? sessionSecret);
       setTurns((t) => [...t, { role: "agent", text: res.reply }]);
     } catch (err) {
       setTurns((t) => [

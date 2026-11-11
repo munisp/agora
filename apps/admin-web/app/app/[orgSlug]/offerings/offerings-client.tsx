@@ -127,9 +127,20 @@ export function OfferingsClient({ orgSlug }: { orgSlug: string }) {
 
   const toggleBookable = async (o: Offering) => {
     try {
+      // Send the full record (not just {bookable}): the W47-A PATCH alias
+      // maps to the PUT handler, which validates a complete body.
       await api.patch(
         `/api/bookings/v1/offerings/${o.id}`,
-        { bookable: !o.bookable },
+        {
+          name: o.name,
+          description: o.description,
+          duration_min: o.duration_min,
+          buffer_min: o.buffer_min,
+          price_cents: o.price_cents,
+          currency: o.currency,
+          capacity: o.capacity,
+          bookable: !o.bookable,
+        },
         { tenant: orgSlug },
       );
       setOfferings((prev) =>

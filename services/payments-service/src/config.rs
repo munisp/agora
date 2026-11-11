@@ -48,6 +48,12 @@ pub struct Config {
     /// When unset an in-memory store is used (dev only — reconciliation
     /// records are lost on restart; a loud warning is logged).
     pub database_url: Option<String>,
+    /// SPEC-W47 DB-01: separate DSN for the cross-tenant internal paths
+    /// (payout reconciler sweep over `payout_attempts.state='unknown'`, the
+    /// K20 approval lookup) — role `app_payments_internal_login`
+    /// (migrations/0001_rls.sql). When unset the internal pool IS the main
+    /// pool (dev default: bootstrap superuser, which bypasses RLS anyway).
+    pub internal_database_url: Option<String>,
     /// Reconciler sweep interval (seconds) for unknown payout rail outcomes.
     pub payout_reconciler_interval_secs: u64,
     /// SPEC-W44 K6: roles allowed to perform money mutations
@@ -162,6 +168,9 @@ impl Config {
                 .filter(|s| !s.trim().is_empty()),
             trust_direct_tenant: env_parse("OPENDESK_TRUST_DIRECT_TENANT", false),
             database_url: ["PAYMENTS_DATABASE_URL", "DATABASE_URL", "PG_DSN"]
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|s| !s.trim().is_empty())),
+            internal_database_url: ["PAYMENTS_INTERNAL_DATABASE_URL", "INTERNAL_DATABASE_URL"]
                 .iter()
                 .find_map(|k| std::env::var(k).ok().filter(|s| !s.trim().is_empty())),
             payout_reconciler_interval_secs: env_parse("PAYOUT_RECONCILER_INTERVAL_SECS", 30),

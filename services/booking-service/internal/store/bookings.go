@@ -229,6 +229,10 @@ type BookingFilter struct {
 	// Contact filters bookings to those whose linked contact matches this
 	// phone number OR e-mail address (GDPR export lookup, SPEC-W3 §2).
 	Contact string
+	// ContactPhone filters bookings to those whose linked contact's phone
+	// matches exactly (SPEC-W47 W47-A item 4, A-UIMOB UIMOB-05: the voice
+	// runtime's lookup_appointment — phone-only, no e-mail fallback).
+	ContactPhone string
 	// ContactID restricts to one contact's bookings (customer portal,
 	// Wave 5 #7 — exact id match, no contact-table join needed).
 	ContactID *uuid.UUID
@@ -267,6 +271,11 @@ func (s *Store) ListBookings(ctx context.Context, tenantID uuid.UUID, f BookingF
 		n++
 		q += fmt.Sprintf(` AND contact_id IN (SELECT id FROM contacts WHERE tenant_id=$1 AND (phone=$%[1]d OR email=$%[1]d))`, n)
 		args = append(args, f.Contact)
+	}
+	if f.ContactPhone != "" {
+		n++
+		q += fmt.Sprintf(` AND contact_id IN (SELECT id FROM contacts WHERE tenant_id=$1 AND phone=$%[1]d)`, n)
+		args = append(args, f.ContactPhone)
 	}
 	if f.ContactID != nil {
 		n++
@@ -409,8 +418,27 @@ func (s *Store) RescheduleBooking(ctx context.Context, tenantID, id, teamMemberI
 // (SPEC-W3 §2 innovation 13): name is replaced with 'erased' and phone/email
 // with their salted SHA-256 hashes so booking history stays referentially
 // intact while PII is irreversibly pseudonymized. Returns rows affected.
-// Empty phone/email values are ignored (never match NULL/” columns).
+// Empty phone/email values are ignored (never match NULL/'' columns).
+//
+// NOTE (SPEC-W47, A-DB DB-03): contacts-only erasure is incomplete — the
+// same phone survives in leads/waitlist/referral_agents/referrals/
+// promo_redemptions/civic_cases. Callers wanting a full per-subject erasure
+// use AnonymizeSubject (erasure.go); this contacts-only variant is kept for
+// backward compatibility and delegates to the shared tx body.
 func (s *Store) AnonymizeContacts(ctx context.Context, tenantID uuid.UUID, phone, email string) (int64, error) {
+	var affected int64
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var err error
+		affected, err = anonymizeContactsTx(ctx, tx, tenantID, phone, email)
+		return err
+	})
+	return affected, err
+}
+
+// anonymizeContactsTx is the transaction body shared by AnonymizeContacts
+// and AnonymizeSubject (SPEC-W47 DB-03): tombstones the matching contacts
+// rows and returns rows affected.
+func anonymizeContactsTx(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, phone, email string) (int64, error) {
 	if phone == "" && email == "" {
 		return 0, nil
 	}
@@ -431,16 +459,11 @@ func (s *Store) AnonymizeContacts(ctx context.Context, tenantID uuid.UUID, phone
 	}
 	q := `UPDATE contacts SET ` + strings.Join(sets, ", ") +
 		` WHERE tenant_id=$1 AND name <> 'erased' AND (` + strings.Join(conds, ` OR `) + `)`
-	var affected int64
-	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, q, args...)
-		if err != nil {
-			return err
-		}
-		affected = tag.RowsAffected()
-		return nil
-	})
-	return affected, err
+	tag, err := tx.Exec(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // hashPii returns the deterministic SHA-256 tombstone for a PII value

@@ -25,8 +25,20 @@ entity organization {
     // Public booking site /p/{siteSlug} publishing.
     permission publish_site    = owner or admin
     // KPI/analytics dashboards (Wave 7): read-only, no mutations.
-    permission view_analytics  = owner or admin or analyst
-    // Invoices, rate cards, payment links (Wave 7 billing-engine).
+    // W47 UIMOB-07: member (Keycloak staff) is included so field staff can
+    // READ the same-tenant growth/ops lists they write via manage_bookings
+    // (mobile Leads/Growth tabs: /v1/leads, /v1/referrals, /v1/payouts —
+    // booking-service gates those reads on this permission). Scope note:
+    // every Permify check evaluates against organization:{tenant_id}, so
+    // this is strictly tenant-local and grants NO cross-tenant analytics;
+    // the admin-web analytics section (KPI cards, text-to-SQL) is
+    // additionally realm-role gated (owner/admin/analyst only) and is
+    // unaffected by this grant.
+    permission view_analytics  = owner or admin or analyst or member
+    // Invoices, rate cards, payment links (Wave 7 billing-engine; W47-D
+    // wires enforcement). The billing relation is granted via identity
+    // invite realm_roles (platform-admin only, STK O4) which now also
+    // writes the Permify tuple (W47 role-mapping fix).
     permission view_billing    = owner or billing
     permission manage_billing  = owner or billing
 }

@@ -112,9 +112,11 @@ export function TeamClient({
 
   const toggleActive = async (m: TeamMember) => {
     try {
+      // Full record (not just {active}): the W47-A PATCH alias maps to the
+      // PUT handler, which requires at least the member name.
       await api.patch(
         `/api/bookings/v1/team-members/${m.id}`,
-        { active: !m.active },
+        { name: m.name, email: m.email, role: m.role, active: !m.active },
         { tenant: orgSlug },
       );
       setMembers((prev) =>

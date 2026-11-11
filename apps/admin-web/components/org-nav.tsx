@@ -30,6 +30,10 @@ import {
   Shield,
   FileWarning,
   Bell,
+  Hourglass,
+  Magnet,
+  ContactRound,
+  Siren,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -53,10 +57,15 @@ type NavItem =
 const items: NavItem[] = [
   { segment: "", label: "Overview", icon: LayoutDashboard },
   { segment: "bookings", label: "Bookings", icon: CalendarCheck },
+  // SPEC-W47 UIWEB-12: waitlist console.
+  { segment: "waitlist", label: "Waitlist", icon: Hourglass },
   { segment: "schedule", label: "My Schedule", icon: CalendarDays },
   { segment: "offerings", label: "Offerings", icon: Store },
   { segment: "team", label: "Team", icon: Users },
   { segment: "availability", label: "Availability", icon: Clock },
+  // SPEC-W47 UIWEB-14/15: lead pipeline + contacts directory.
+  { segment: "leads", label: "Leads", icon: Magnet },
+  { segment: "contacts", label: "Contacts", icon: ContactRound },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
   { segment: "voice-agent", label: "Voice Agent", icon: Mic },
   // SPEC-W38: self-serve agents registry (wizard + capture records).
@@ -73,6 +82,8 @@ const items: NavItem[] = [
   { segment: "segments", label: "Segments", icon: Filter },
   // SPEC-W30: fraud & trust alert queue — same gate as segments.
   { segment: "alerts", label: "Alerts", icon: Shield },
+  // SPEC-W47 UIWEB-13: IoT/civic incident ops surface.
+  { segment: "incidents", label: "Incidents", icon: Siren },
   // SPEC-W45 ORPH O15: platform ops alerts read-back — admin/platform-admin.
   { segment: "ops-alerts", label: "Ops alerts", icon: Bell },
   // SPEC-W32: civic case triage console — operational, owner/admin/staff.
@@ -152,6 +163,10 @@ export function OrgNav({
     // gate as voices; the pages enforce it server-side too.
     if ("segment" in item && item.segment === "agents")
       return canViewAgents(roles);
+    // SPEC-W47 UIWEB-14: leads read path is view_analytics-gated (same as
+    // CAC); the page enforces it server-side too.
+    if ("segment" in item && item.segment === "leads")
+      return canViewAnalytics(roles);
     // SPEC-W45 ORPH O15: ops alerts mirror the gateway gate — admin or
     // platform-admin only; the page redirects everyone else.
     if ("segment" in item && item.segment === "ops-alerts")

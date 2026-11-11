@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -304,6 +305,67 @@ func (s *Store) MergeTerminology(ctx context.Context, slug string, patch json.Ra
 		return nil, fmt.Errorf("merge terminology: %w", err)
 	}
 	return out, nil
+}
+
+// TenantPatch carries the optional field updates of PATCH
+// /v1/tenants/{slug} (SPEC-W47 UIWEB-01). Nil pointer fields are left
+// untouched; a non-nil Terminology REPLACES the terminology document (the
+// admin UI always sends the full edited map — merge semantics would make
+// deleted rows unremovable). Plan/slug/is_twin are deliberately absent:
+// plan changes go through the owner/platform-admin PATCH /plan endpoint.
+type TenantPatch struct {
+	Name        *string
+	Timezone    *string
+	Currency    *string
+	Locale      *string
+	Industry    *string
+	Terminology json.RawMessage // nil = unchanged; otherwise replaces
+}
+
+// UpdateTenant applies a partial update to the tenants row and returns the
+// updated tenant. Runs on the tenants pool (internal escape role), same
+// posture as SetTenantPlan. SET columns are static strings; only values are
+// parameterized. ErrNotFound for an unknown slug.
+func (s *Store) UpdateTenant(ctx context.Context, slug string, p TenantPatch) (Tenant, error) {
+	sets := []string{}
+	args := []any{slug}
+	add := func(col string, v any) {
+		args = append(args, v)
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
+	}
+	if p.Name != nil {
+		add("name", *p.Name)
+	}
+	if p.Timezone != nil {
+		add("timezone", *p.Timezone)
+	}
+	if p.Currency != nil {
+		add("currency", *p.Currency)
+	}
+	if p.Locale != nil {
+		add("locale", *p.Locale)
+	}
+	if p.Industry != nil {
+		add("industry", *p.Industry)
+	}
+	if p.Terminology != nil {
+		add("terminology", string(p.Terminology))
+	}
+	if len(sets) == 0 {
+		return Tenant{}, errors.New("update tenant: empty patch")
+	}
+	q := `UPDATE tenants SET ` + strings.Join(sets, ", ") + ` WHERE slug = $1
+	      RETURNING id, slug, name, timezone, currency, locale, terminology, plan, industry, metadata, is_twin, created_at`
+	var t Tenant
+	err := s.tenants.QueryRow(ctx, q, args...).Scan(
+		&t.ID, &t.Slug, &t.Name, &t.Timezone, &t.Currency, &t.Locale, &t.Terminology, &t.Plan, &t.Industry, &t.Metadata, &t.IsTwin, &t.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return t, ErrNotFound
+	}
+	if err != nil {
+		return t, fmt.Errorf("update tenant: %w", err)
+	}
+	return t, nil
 }
 
 // withTenant runs fn inside a transaction with `SET LOCAL app.tenant_id`

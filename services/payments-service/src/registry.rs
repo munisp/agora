@@ -7,10 +7,12 @@
 //! human-created deposits record WHO declared them (`declared_by` from the
 //! gateway-injected `X-User-Id`) plus an optional PSP reference.
 //!
-//! Storage follows the payout_attempts idiom (payments has no migrations
-//! dir): bootstrap DDL applied idempotently at boot by [`PgRegistry`]
-//! (fail-closed when a DSN is configured but unreachable), with a
-//! [`MemRegistry`] dev fallback when no DSN is set.
+//! Storage follows the payout_attempts idiom: bootstrap DDL applied
+//! idempotently at boot by [`PgRegistry`] (fail-closed when a DSN is
+//! configured but unreachable), with a [`MemRegistry`] dev fallback when no
+//! DSN is set. SPEC-W47 DB-01: migrations/0001_rls.sql (applied at boot
+//! after the bootstrap DDL) ENABLEs+FORCEs RLS on both tables and every Pg
+//! method pins the `app.tenant_id` GUC transaction-locally (src/tenant.rs).
 
 use std::collections::BTreeMap;
 
@@ -53,7 +55,15 @@ pub trait Registry: Send + Sync {
     async fn create_beneficiary(&self, b: &Beneficiary) -> Result<(), String>;
     /// All beneficiaries of the tenant (disabled included; callers filter).
     async fn list_beneficiaries(&self, tenant_id: &str) -> Result<Vec<Beneficiary>, String>;
-    async fn get_beneficiary(&self, id: Uuid) -> Result<Option<Beneficiary>, String>;
+    /// SPEC-W47 DB-01: tenant-scoped by construction — a row owned by a
+    /// different tenant is indistinguishable from an unknown id (no
+    /// cross-tenant oracle), and on the Postgres store the RLS GUC is pinned
+    /// to `tenant_id` so the database enforces the scope.
+    async fn get_beneficiary(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+    ) -> Result<Option<Beneficiary>, String>;
     /// Idempotent disable scoped to the owning tenant. Returns the updated
     /// row, or None when the id is unknown / foreign (defense in depth —
     /// routes re-check tenancy before calling).
@@ -64,9 +74,11 @@ pub trait Registry: Send + Sync {
     ) -> Result<Option<Beneficiary>, String>;
     /// First write wins (deposit holds are idempotent by transfer id).
     async fn record_deposit_provenance(&self, p: &DepositProvenance) -> Result<(), String>;
+    /// SPEC-W47 DB-01: tenant-scoped read (see get_beneficiary).
     async fn deposit_provenance(
         &self,
         deposit_id: &str,
+        tenant_id: &str,
     ) -> Result<Option<DepositProvenance>, String>;
 }
 
@@ -75,8 +87,9 @@ pub trait Registry: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Bootstrap DDL (K7). Run idempotently at boot when a DSN is configured.
-/// NOTE: payments-service has no migrations dir (runtime-DDL idiom, same as
-/// `payout_attempts`); this constant is the canonical schema.
+/// The RLS hardening on top of these tables lives in
+/// migrations/0001_rls.sql (SPEC-W47 DB-01), applied at boot right after the
+/// bootstrap DDL (src/tenant.rs::apply_rls_migration).
 pub const BOOTSTRAP_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS payout_beneficiaries (
     id            UUID PRIMARY KEY,
@@ -174,6 +187,10 @@ impl Registry for PgRegistry {
     }
 
     async fn create_beneficiary(&self, b: &Beneficiary) -> Result<(), String> {
+        // SPEC-W47 DB-01: pin the RLS tenant GUC for every statement.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, &b.tenant_id)
+            .await
+            .map_err(|e| format!("payout_beneficiaries tx failed: {e}"))?;
         sqlx::query(
             "INSERT INTO payout_beneficiaries
                 (id, tenant_id, label, party_id_info, created_by)
@@ -184,34 +201,57 @@ impl Registry for PgRegistry {
         .bind(&b.label)
         .bind(&b.party_id_info)
         .bind(&b.created_by)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("payout_beneficiaries insert failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_beneficiaries commit failed: {e}"))?;
         Ok(())
     }
 
     async fn list_beneficiaries(&self, tenant_id: &str) -> Result<Vec<Beneficiary>, String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_beneficiaries tx failed: {e}"))?;
         let rows = sqlx::query(
             "SELECT id, tenant_id, label, party_id_info, created_by, created_at, disabled_at
              FROM payout_beneficiaries WHERE tenant_id = $1 ORDER BY created_at",
         )
         .bind(tenant_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| format!("payout_beneficiaries list failed: {e}"))?;
-        rows.iter().map(Self::row_to_beneficiary).collect()
+        let out = rows.iter().map(Self::row_to_beneficiary).collect::<Result<Vec<_>, _>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_beneficiaries commit failed: {e}"))?;
+        out
     }
 
-    async fn get_beneficiary(&self, id: Uuid) -> Result<Option<Beneficiary>, String> {
+    async fn get_beneficiary(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+    ) -> Result<Option<Beneficiary>, String> {
+        // DB-01: the WHERE id = $1 lookup is additionally RLS-scoped to the
+        // pinned tenant — a foreign id reads as None (no oracle).
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_beneficiaries tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT id, tenant_id, label, party_id_info, created_by, created_at, disabled_at
              FROM payout_beneficiaries WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("payout_beneficiaries read failed: {e}"))?;
-        row.as_ref().map(Self::row_to_beneficiary).transpose()
+        let out = row.as_ref().map(Self::row_to_beneficiary).transpose();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_beneficiaries commit failed: {e}"))?;
+        out
     }
 
     async fn disable_beneficiary(
@@ -219,22 +259,43 @@ impl Registry for PgRegistry {
         id: Uuid,
         tenant_id: &str,
     ) -> Result<Option<Beneficiary>, String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_beneficiaries tx failed: {e}"))?;
         let res = sqlx::query(
             "UPDATE payout_beneficiaries SET disabled_at = COALESCE(disabled_at, now())
              WHERE id = $1 AND tenant_id = $2",
         )
         .bind(id)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("payout_beneficiaries disable failed: {e}"))?;
         if res.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .map_err(|e| format!("payout_beneficiaries commit failed: {e}"))?;
             return Ok(None); // unknown or foreign id — no cross-tenant oracle
         }
-        self.get_beneficiary(id).await
+        let row = sqlx::query(
+            "SELECT id, tenant_id, label, party_id_info, created_by, created_at, disabled_at
+             FROM payout_beneficiaries WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_beneficiaries read failed: {e}"))?;
+        let out = row.as_ref().map(Self::row_to_beneficiary).transpose();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_beneficiaries commit failed: {e}"))?;
+        out
     }
 
     async fn record_deposit_provenance(&self, p: &DepositProvenance) -> Result<(), String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, &p.tenant_id)
+            .await
+            .map_err(|e| format!("deposit_provenance tx failed: {e}"))?;
         sqlx::query(
             "INSERT INTO deposit_provenance
                 (deposit_id, tenant_id, declared_by, psp_reference)
@@ -245,26 +306,34 @@ impl Registry for PgRegistry {
         .bind(&p.tenant_id)
         .bind(&p.declared_by)
         .bind(&p.psp_reference)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("deposit_provenance insert failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("deposit_provenance commit failed: {e}"))?;
         Ok(())
     }
 
     async fn deposit_provenance(
         &self,
         deposit_id: &str,
+        tenant_id: &str,
     ) -> Result<Option<DepositProvenance>, String> {
         use sqlx::Row;
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("deposit_provenance tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT deposit_id, tenant_id, declared_by, psp_reference, created_at
              FROM deposit_provenance WHERE deposit_id = $1",
         )
         .bind(deposit_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("deposit_provenance read failed: {e}"))?;
-        row.as_ref()
+        let out = row
+            .as_ref()
             .map(|r| {
                 Ok(DepositProvenance {
                     deposit_id: r.try_get("deposit_id").map_err(|e| e.to_string())?,
@@ -274,7 +343,11 @@ impl Registry for PgRegistry {
                     created_at: r.try_get("created_at").map_err(|e| e.to_string())?,
                 })
             })
-            .transpose()
+            .transpose();
+        tx.commit()
+            .await
+            .map_err(|e| format!("deposit_provenance commit failed: {e}"))?;
+        out
     }
 }
 
@@ -310,8 +383,20 @@ impl Registry for MemRegistry {
             .collect())
     }
 
-    async fn get_beneficiary(&self, id: Uuid) -> Result<Option<Beneficiary>, String> {
-        Ok(self.beneficiaries.lock().await.get(&id).cloned())
+    async fn get_beneficiary(
+        &self,
+        id: Uuid,
+        tenant_id: &str,
+    ) -> Result<Option<Beneficiary>, String> {
+        // DB-01: same no-oracle posture as the Pg store — a foreign id is
+        // indistinguishable from an unknown one.
+        Ok(self
+            .beneficiaries
+            .lock()
+            .await
+            .get(&id)
+            .filter(|b| b.tenant_id == tenant_id)
+            .cloned())
     }
 
     async fn disable_beneficiary(
@@ -344,8 +429,15 @@ impl Registry for MemRegistry {
     async fn deposit_provenance(
         &self,
         deposit_id: &str,
+        tenant_id: &str,
     ) -> Result<Option<DepositProvenance>, String> {
-        Ok(self.provenance.lock().await.get(deposit_id).cloned())
+        Ok(self
+            .provenance
+            .lock()
+            .await
+            .get(deposit_id)
+            .filter(|p| p.tenant_id == tenant_id)
+            .cloned())
     }
 }
 
@@ -388,7 +480,15 @@ mod tests {
         // Disable is tenant-scoped: the owning tenant disables, a foreign
         // tenant gets None and the row stays enabled.
         assert!(reg.disable_beneficiary(a.id, "t-b").await.unwrap().is_none());
-        assert!(reg.get_beneficiary(a.id).await.unwrap().unwrap().disabled_at.is_none());
+        // DB-01: a foreign-tenant GET is indistinguishable from unknown.
+        assert!(reg.get_beneficiary(a.id, "t-b").await.unwrap().is_none());
+        assert!(reg
+            .get_beneficiary(a.id, "t-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .disabled_at
+            .is_none());
         let disabled = reg.disable_beneficiary(a.id, "t-a").await.unwrap().unwrap();
         assert!(disabled.disabled_at.is_some());
         // Idempotent re-disable keeps the first timestamp.
@@ -411,10 +511,13 @@ mod tests {
         let mut replay = p.clone();
         replay.declared_by = "attacker".to_string();
         reg.record_deposit_provenance(&replay).await.unwrap();
-        let got = reg.deposit_provenance("dep-1").await.unwrap().unwrap();
+        let got = reg.deposit_provenance("dep-1", "t-a").await.unwrap().unwrap();
         assert_eq!(got.declared_by, "user-1", "provenance is write-once");
         assert_eq!(got.psp_reference.as_deref(), Some("psp-abc"));
-        assert!(reg.deposit_provenance("nope").await.unwrap().is_none());
+        // DB-01: a foreign-tenant provenance read is indistinguishable from
+        // unknown.
+        assert!(reg.deposit_provenance("dep-1", "t-b").await.unwrap().is_none());
+        assert!(reg.deposit_provenance("nope", "t-a").await.unwrap().is_none());
     }
 
     /// K7: the Postgres registry against a REAL database — bootstrap DDL is
@@ -433,7 +536,7 @@ mod tests {
 
         let b = beneficiary(&format!("t-pg-{}", Uuid::new_v4()));
         reg.create_beneficiary(&b).await.unwrap();
-        let got = reg.get_beneficiary(b.id).await.unwrap().unwrap();
+        let got = reg.get_beneficiary(b.id, &b.tenant_id).await.unwrap().unwrap();
         assert_eq!(got.tenant_id, b.tenant_id);
         assert_eq!(got.party_id_info["partyIdentifier"], "payee-1");
         assert!(got.disabled_at.is_none());
@@ -443,7 +546,8 @@ mod tests {
             .unwrap()
             .iter()
             .any(|x| x.id == b.id));
-        // Foreign disable is a no-op; owning tenant disables.
+        // Foreign reads/disables are no-ops; the owning tenant disables.
+        assert!(reg.get_beneficiary(b.id, "t-foreign").await.unwrap().is_none());
         assert!(reg.disable_beneficiary(b.id, "t-foreign").await.unwrap().is_none());
         let disabled = reg.disable_beneficiary(b.id, &b.tenant_id).await.unwrap().unwrap();
         assert!(disabled.disabled_at.is_some());
@@ -456,8 +560,17 @@ mod tests {
             created_at: Utc::now(),
         };
         reg.record_deposit_provenance(&p).await.unwrap();
-        let got = reg.deposit_provenance(&p.deposit_id).await.unwrap().unwrap();
+        let got = reg
+            .deposit_provenance(&p.deposit_id, &b.tenant_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.declared_by, "user-9");
         assert!(got.psp_reference.is_none());
+        assert!(reg
+            .deposit_provenance(&p.deposit_id, "t-foreign")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

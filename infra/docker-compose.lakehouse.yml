@@ -257,3 +257,39 @@ services:
       retries: 6
       start_period: 15s
     restart: unless-stopped
+  # ---- Batch scheduler (SPEC-W47 / A-MW "Sedona unscheduled") --------------
+  # The batch jobs (silver clean, cac_analytics, revenue_intelligence, and the
+  # Apache Sedona geo_analytics gold job) previously ran only via manual
+  # spark-submit / the seed bootstrap hook. This sidecar runs them on a fixed
+  # interval (default hourly; jobs are idempotent + degrade gracefully on
+  # missing inputs — infra/lakehouse/spark/README.md). Profile-gated so the
+  # default lakehouse stack is unchanged; enable with:
+  #   docker compose --profile batch-scheduler up -d spark-scheduler
+  spark-scheduler:
+    logging: *default-logging
+    deploy: *default-limits
+    image: bitnami/spark:3.5
+    container_name: opendesk-spark-scheduler
+    profiles:
+    - batch-scheduler
+    command: ["/bin/bash", "/opt/spark-scheduler/run-scheduled.sh"]
+    environment:
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+      SPARK_JOBS_DIR: /opt/spark-jobs
+      BATCH_INTERVAL_SECONDS: ${BATCH_INTERVAL_SECONDS:-3600}
+      # MinIO/Iceberg env the jobs read (sedona_common.py / silver jobs use
+      # these same defaults; set explicitly so .env overrides propagate).
+      ICEBERG_REST_URI: ${ICEBERG_REST_URI:-http://iceberg-rest:8181}
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+    - ./lakehouse/spark/jobs:/opt/spark-jobs:ro
+    - ./lakehouse/spark/run-scheduled.sh:/opt/spark-scheduler/run-scheduled.sh:ro
+    - spark-ivy:/opt/bitnami/spark/.ivy2
+    networks:
+    - opendesk
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped

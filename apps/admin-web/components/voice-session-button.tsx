@@ -4,6 +4,7 @@ import * as React from "react";
 import { Mic, PhoneOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { VoiceSession } from "@/lib/types";
+import type { ElevenLabsConvAiSession } from "@/lib/convai";
 
 type CallState = "idle" | "joining" | "connected" | "error";
 
@@ -40,11 +41,17 @@ function AvatarVideoTile({
 /**
  * "Talk to receptionist" voice button.
  *
- * STUB (clearly bounded): obtains a LiveKit token from the voice runtime via
- * POST /voice/session (same-origin via the Next.js /voice/* rewrite) and
- * connects a `livekit-client` Room with the mic enabled. The surrounding UX
- * (waveform, transcripts, mute, volume) is intentionally minimal — this is
- * the integration seam for the full voice UI.
+ * Two backends (SPEC-W47 UIMOB-10): the runtime answers POST /voice/session
+ * with either a LiveKit {url, token} pair (connected via `livekit-client`,
+ * dynamically imported) or — when AGENT_BACKEND=elevenlabs — a ConvAI
+ * {signed_url} handled by the dependency-free websocket client in
+ * lib/convai.ts. Older server builds omit `backend` and always return
+ * LiveKit fields; null/undefined url+token without a signed_url is an
+ * honest error, never a crash.
+ *
+ * STUB (clearly bounded): the surrounding UX (waveform, transcripts, mute,
+ * volume) is intentionally minimal — this is the integration seam for the
+ * full voice UI.
  */
 export function VoiceSessionButton({
   tenant,
@@ -60,12 +67,15 @@ export function VoiceSessionButton({
   const [avatarTrack, setAvatarTrack] =
     React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
+  const convaiRef = React.useRef<ElevenLabsConvAiSession | null>(null);
 
   const hangUp = React.useCallback(async () => {
     try {
       await roomRef.current?.disconnect();
+      await convaiRef.current?.stop();
     } finally {
       roomRef.current = null;
+      convaiRef.current = null;
       setAvatarTrack(null);
       setState("idle");
     }
@@ -74,6 +84,7 @@ export function VoiceSessionButton({
   React.useEffect(() => {
     return () => {
       void roomRef.current?.disconnect();
+      void convaiRef.current?.stop();
     };
   }, []);
 
@@ -81,14 +92,43 @@ export function VoiceSessionButton({
     setState("joining");
     setError(null);
     try {
-      // 1. Mint a LiveKit access token via the voice runtime (through APISIX).
+      // 1. Mint a session via the voice runtime (through APISIX).
       const session = await api.post<VoiceSession>("/voice/session", {
         tenant,
         site_slug: siteSlug,
       });
 
-      // 2. Connect the LiveKit room (livekit-client, dynamic import so the
-      //    SDK stays out of the initial public-page bundle).
+      // 2a. ElevenLabs backend: connect the ConvAI signed URL directly
+      //     (no LiveKit fields exist in this mode).
+      if (session.backend === "elevenlabs" || session.signed_url) {
+        if (!session.signed_url) {
+          throw new ApiError(502, {
+            message: "The voice runtime did not return a signed URL.",
+          });
+        }
+        const { ElevenLabsConvAiSession } = await import("@/lib/convai");
+        const convai = new ElevenLabsConvAiSession(session.signed_url, {
+          onStatusChange: (s) => {
+            if (s === "connected") setState("connected");
+            else if (s === "ended") void hangUp();
+          },
+          onError: (message) => {
+            setError(message);
+            setState("error");
+          },
+        });
+        convaiRef.current = convai;
+        await convai.start();
+        return;
+      }
+
+      // 2b. LiveKit backend (default, and pre-W47 builds with no `backend`).
+      if (!session.url || !session.token) {
+        throw new ApiError(502, {
+          message:
+            "The voice runtime returned an unrecognised session (no LiveKit credentials, no signed URL).",
+        });
+      }
       const { Room, RoomEvent, Track } = await import("livekit-client");
       const room = new Room();
       roomRef.current = room;
@@ -118,6 +158,8 @@ export function VoiceSessionButton({
       );
       setState("error");
       roomRef.current = null;
+      void convaiRef.current?.stop();
+      convaiRef.current = null;
     }
   };
 

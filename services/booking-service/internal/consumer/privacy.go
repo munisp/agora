@@ -135,13 +135,16 @@ func (c *PrivacyConsumer) process(ctx context.Context, msg kafka.Message) error 
 	if env.Data.Phone == "" && env.Data.Email == "" {
 		return permanentPrivacy(errors.New("erase event carries neither phone nor email"))
 	}
-	affected, err := c.store.AnonymizeContacts(ctx, tenantID, env.Data.Phone, env.Data.Email)
+	// SPEC-W47 (W47-A item 6, A-DB DB-03): full per-subject erasure —
+	// contacts PLUS every subject-keyed table (leads, promo_redemptions,
+	// waitlist, referral_agents, referrals, civic_cases) in one tenant tx.
+	sum, err := c.store.AnonymizeSubject(ctx, tenantID, env.Data.Phone, env.Data.Email)
 	if err != nil {
-		return fmt.Errorf("anonymize contacts: %w", err)
+		return fmt.Errorf("anonymize subject: %w", err)
 	}
-	c.log.Info("contacts anonymized (GDPR erase)",
+	c.log.Info("subject anonymized (GDPR erase)",
 		zap.String("event_id", env.ID), zap.String("tenant_id", env.Data.TenantID),
-		zap.Int64("contacts", affected))
+		zap.Int64("contacts", sum.ContactsAnonymized), zap.Any("details", sum.Details))
 	return nil
 }
 

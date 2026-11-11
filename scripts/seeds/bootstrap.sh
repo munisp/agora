@@ -149,7 +149,10 @@ step_iceberg_ddl() {
         docker exec -i "$TRINO_CONTAINER" trino --catalog iceberg < "$ddl" >/dev/null \
             && log "iceberg DDL applied via trino" || fail "trino rejected sql/iceberg/seed_ddl.sql"
     elif container_up "$SPARK_MASTER_CONTAINER"; then
-        docker exec -i "$SPARK_MASTER_CONTAINER" /opt/spark/bin/spark-sql < "$ddl" >/dev/null \
+        # MW-H2 (SPEC-W47): bitnami/spark:3.5 installs Spark under
+        # /opt/bitnami/spark (not /opt/spark) — mirrors
+        # docs/runbooks/operations.md.
+        docker exec -i "$SPARK_MASTER_CONTAINER" /opt/bitnami/spark/bin/spark-sql < "$ddl" >/dev/null \
             && log "iceberg DDL applied via spark-sql" || fail "spark-sql rejected sql/iceberg/seed_ddl.sql"
     else
         log "lakehouse down (no $TRINO_CONTAINER/$SPARK_MASTER_CONTAINER) — Iceberg DDL skip-with-log; cac_silver/cac_gold seed tables will be created on the first lakehouse seed run"
@@ -186,7 +189,12 @@ step_fx_and_gold() {
     fi
     if [ "$DRY" = 1 ]; then log "dry-run: skip cac_gold spark load"; return 0; fi
     if container_up "$SPARK_MASTER_CONTAINER"; then
-        docker exec "$SPARK_MASTER_CONTAINER" /opt/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark/jobs/seed_gold_load.py \
+        # MW-H2 (SPEC-W47): bitnami/spark:3.5 binary path is
+        # /opt/bitnami/spark/bin and the jobs volume mounts at
+        # /opt/spark-jobs (infra/docker-compose.lakehouse.yml) — the previous
+        # /opt/spark/{bin,jobs} paths matched nothing in the container and
+        # hard-failed the gold-load step.
+        docker exec "$SPARK_MASTER_CONTAINER" /opt/bitnami/spark/bin/spark-submit --master spark://spark-master:7077 /opt/spark-jobs/seed_gold_load.py \
             && log "cac_gold load submitted" || fail "seed_gold_load spark-submit failed"
     else
         log "lakehouse down — cac_gold load DEFERRED with log; rerun bootstrap.sh with the lakehouse profile up (manifests are durable under \${SEED_MANIFEST_DIR:-/var/tmp/seed_manifests})"

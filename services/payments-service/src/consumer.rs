@@ -554,6 +554,7 @@ mod tests {
             internal_token: None,
             trust_direct_tenant: true,
             database_url: None,
+            internal_database_url: None,
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,

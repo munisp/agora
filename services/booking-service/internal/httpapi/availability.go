@@ -284,6 +284,128 @@ func (s *server) loadSlots(r *http.Request, tenantID uuid.UUID, loc *time.Locati
 	return data, nil
 }
 
+// publicDaySlot is one aggregate availability slot of the public
+// {offering_id, date} variant (SPEC-W47 W47-A item 3, A-UIMOB UIMOB-01):
+// the time window plus the team_member_id of one member free then (the
+// booking create path requires it) and how many members can still take the
+// slot.
+type publicDaySlot struct {
+	StartsAt          time.Time `json:"starts_at"`
+	EndsAt            time.Time `json:"ends_at"`
+	TeamMemberID      uuid.UUID `json:"team_member_id"`
+	RemainingCapacity int       `json:"remaining_capacity"`
+}
+
+// publicAvailabilityMaxMembers bounds the fan-out across team members so a
+// pathological tenant cannot turn one anonymous request into unlimited work.
+const publicAvailabilityMaxMembers = 100
+
+// computePublicDayAvailability aggregates one tenant-local day's slots
+// across ALL active team members for the offering:
+// GET /public/sites/{slug}/availability?offering_id=<uuid>&date=YYYY-MM-DD
+// → {"offering_id", "date", "slots": [{starts_at, ends_at, team_member_id,
+// remaining_capacity}]}. Slots are merged by (starts_at, ends_at); the slot
+// carries the first free member's id (deterministic: members sorted by
+// name) and the aggregate remaining capacity. The "items" key mirrors
+// "slots" for the pre-W47 public client (which read data.items); W47-F
+// consumes "slots".
+func (s *server) computePublicDayAvailability(w http.ResponseWriter, r *http.Request, tenantID uuid.UUID, loc *time.Location) {
+	q := r.URL.Query()
+	offeringID, err := uuid.Parse(q.Get("offering_id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "offering_id is required (uuid)")
+		return
+	}
+	day, err := time.ParseInLocation("2006-01-02", q.Get("date"), loc)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "date must be YYYY-MM-DD")
+		return
+	}
+	from, to := day, day.AddDate(0, 0, 1)
+	if day.After(time.Now().Add(62 * 24 * time.Hour)) {
+		writeError(w, http.StatusBadRequest, "date too far in the future (max 62 days)")
+		return
+	}
+	if now := time.Now(); from.Before(now) {
+		from = now
+	}
+
+	offering, err := s.d.Store.GetOffering(r.Context(), tenantID, offeringID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "offering not found")
+		return
+	}
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	// A non-bookable offering is invisible on the public site (the public
+	// offerings list filters it) — availability answers 404 alike.
+	if !offering.Bookable {
+		writeError(w, http.StatusNotFound, "offering not found")
+		return
+	}
+
+	slots := []publicDaySlot{}
+	if to.After(from) {
+		members, err := s.d.Store.ListTeamMembers(r.Context(), tenantID)
+		if err != nil {
+			s.internal(w, err)
+			return
+		}
+		type slotKey struct{ start, end time.Time }
+		merged := map[slotKey]*publicDaySlot{}
+		var order []slotKey
+		counted := 0
+		for _, m := range members {
+			if !m.Active {
+				continue
+			}
+			counted++
+			if counted > publicAvailabilityMaxMembers {
+				s.d.Logger.Warn("public availability: member fan-out capped",
+					zap.String("tenant_id", tenantID.String()), zap.Int("cap", publicAvailabilityMaxMembers))
+				break
+			}
+			data, err := s.loadSlots(r, tenantID, loc, offeringID, m.ID, from, to)
+			if err != nil {
+				s.mapLoadError(w, err)
+				return
+			}
+			capPer := offering.Capacity
+			if capPer <= 0 {
+				capPer = 1
+			}
+			for _, sl := range data.slots {
+				k := slotKey{sl.StartsAt, sl.EndsAt}
+				if e, ok := merged[k]; ok {
+					e.RemainingCapacity += capPer
+					continue
+				}
+				merged[k] = &publicDaySlot{
+					StartsAt:          sl.StartsAt,
+					EndsAt:            sl.EndsAt,
+					TeamMemberID:      m.ID,
+					RemainingCapacity: capPer,
+				}
+				order = append(order, k)
+			}
+		}
+		sort.Slice(order, func(i, j int) bool { return order[i].start.Before(order[j].start) })
+		for _, k := range order {
+			slots = append(slots, *merged[k])
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"offering_id": offeringID,
+		"date":        q.Get("date"),
+		"slots":       slots,
+		// Backward-compat mirror for the pre-W47 public client, which reads
+		// data.items (public-booking-client.tsx:64-71); W47-F reads "slots".
+		"items": slots,
+	})
+}
+
 // mapLoadError translates loadSlots errors into HTTP responses.
 func (s *server) mapLoadError(w http.ResponseWriter, err error) {
 	switch {

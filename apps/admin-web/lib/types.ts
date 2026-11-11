@@ -262,6 +262,8 @@ export interface Payout {
   status: "requested" | "settled" | "failed" | string;
   /** Mojaloop transfer reference when settled cross-border. */
   rail_ref?: string | null;
+  /** payments-service PayoutResponse spelling of the id (POST /v1/payouts). */
+  payout_id?: string;
   created_at: string;
 }
 
@@ -419,14 +421,31 @@ export interface ChatResponse {
   conversation_id: string;
   reply: string;
   tool_calls?: { name: string; result: unknown }[];
+  /**
+   * K15(b) resume credential (SPEC-W47 UIMOB-04): issued at session
+   * creation and echoed on every response; required to resume the
+   * conversation. The web widget persists it (localStorage) and sends it
+   * back in the body and as X-Session-Secret.
+   */
+  session_secret?: string;
 }
 
+/**
+ * Voice session (POST /voice/session). The runtime picks the backend by
+ * AGENT_BACKEND: "livekit" (default) returns url+token; "elevenlabs"
+ * returns a ConvAI signed_url with url/token null (SPEC-W47 UIMOB-10).
+ */
 export interface VoiceSession {
-  /** LiveKit access token for the browser client */
-  token: string;
-  /** LiveKit websocket URL, e.g. ws://localhost:7880 */
-  url: string;
-  room: string;
+  backend?: "livekit" | "elevenlabs" | string;
+  /** LiveKit access token for the browser client (livekit backend) */
+  token?: string;
+  /** LiveKit websocket URL, e.g. ws://localhost:7880 (livekit backend) */
+  url?: string;
+  room?: string;
+  /** ElevenLabs ConvAI signed websocket URL (elevenlabs backend) */
+  signed_url?: string | null;
+  /** Optional avatar presence descriptor (SPEC-W9 Part A) */
+  avatar?: Record<string, unknown> | null;
 }
 
 // ---------- gateway-edge WebSocket events ----------
@@ -481,6 +500,86 @@ export interface ApiProblem {
   error: string;
   message?: string;
   status?: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* SPEC-W47 — admin surfaces for previously orphaned backend routes    */
+/* ------------------------------------------------------------------ */
+
+/** Waitlist entry (booking-service GET /v1/waitlist → {entries}). */
+export interface WaitlistEntry {
+  id: string;
+  tenant_id: string;
+  offering_id: string;
+  contact_name: string;
+  contact_phone: string;
+  window_start: string;
+  window_end: string;
+  /** waiting | claimed | expired */
+  status: string;
+  /** Single-use claim capability (admin list only; never public). */
+  claim_token: string;
+  created_at: string;
+}
+
+/** IoT/civic incident row (booking-service GET /v1/incidents → {incidents}). */
+export interface Incident {
+  id: string;
+  tenant_id: string;
+  reference_number: string;
+  incident_type: string;
+  severity: string;
+  payload: unknown;
+  /** new | dispatched | acknowledged | closed */
+  status: string;
+  created_at: string;
+  dispatched_at?: string | null;
+}
+
+/** Per-endpoint dispatch ledger row (GET /v1/incidents/{id} → deliveries). */
+export interface IncidentDelivery {
+  id: string;
+  incident_id: string;
+  endpoint_url: string;
+  /** pending | retrying | delivered | dlq */
+  status: string;
+  attempts: number;
+  last_status_code?: number | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Signed dispatch endpoint (GET /v1/incidents/dispatch-endpoints; keyed by URL, secret never returned). */
+export interface IncidentDispatchEndpoint {
+  tenant_id?: string;
+  url: string;
+  active: boolean;
+  created_at?: string;
+}
+
+/** Lead pipeline row (booking-service GET /v1/leads → {leads}). */
+export interface Lead {
+  lead_id: string;
+  tenant_id: string;
+  phone_e164: string;
+  channel_of_first_touch: string;
+  campaign_id?: string | null;
+  promo_code?: string | null;
+  utm?: Record<string, unknown>;
+  lga_id?: number | null;
+  /** new | contacted | qualified | converted | lost */
+  status: string;
+  consent_id?: string | null;
+  dedupe_key?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Response of POST /v1/privacy/{export,erase} (202, workflow started). */
+export interface PrivacyWorkflowStarted {
+  status: string;
+  kind: "export" | "erase" | string;
+  workflow_id: string;
 }
 
 // ---------- notification-worker: outbound webhooks (Wave 5 #10) ----------

@@ -98,6 +98,19 @@ func (s *server) removeMember(w http.ResponseWriter, r *http.Request) {
 			zap.String("user_id", userID), zap.Error(err))
 		warnings = append(warnings, "permify unlink failed: "+err.Error())
 	}
+	// SPEC-W47: functional overlay relations (analyst/billing, STK O4) are
+	// not persisted on the membership row, so unlink both best-effort —
+	// deleting an absent tuple is a Permify no-op (permify client doc), and
+	// a removed member must not keep view_analytics/view_billing through an
+	// orphaned overlay tuple.
+	for _, overlay := range []string{"analyst", "billing"} {
+		if err := s.d.Permify.DeleteRelationship(r.Context(), t.ID.String(),
+			"organization:"+t.ID.String(), overlay, "user:"+userID); err != nil {
+			s.d.Logger.Error("permify overlay unlink failed (member removal continues)",
+				zap.String("user_id", userID), zap.String("relation", overlay), zap.Error(err))
+			warnings = append(warnings, "permify "+overlay+" unlink failed: "+err.Error())
+		}
+	}
 	if err := s.d.Store.RemoveMember(r.Context(), t.ID, userID); err != nil {
 		s.internal(w, err)
 		return

@@ -321,6 +321,87 @@ $$;
 \endif
 
 -- ---------------------------------------------------------------------------
+-- W47 (SPEC-W47 / A-DB DB-01 CRIT): payments-service roles.
+-- Same NOLOGIN group + LOGIN member pattern as above. W47-D's
+-- services/payments-service/migrations/0001_rls.sql creates the SAME four
+-- roles (idempotently, pg_roles-guarded) so the migration also applies
+-- standalone on a fresh cluster — passwords here MUST stay in sync with it.
+--
+--   app_payments(_login)              — runtime DSN role (PAYMENTS_DATABASE_URL)
+--   app_payments_internal(_login)     — cross-tenant escape group for the
+--                                       payout reconciler / approval lookups
+--                                       (PAYMENTS_INTERNAL_DATABASE_URL); the
+--                                       RLS policies gate on
+--                                       pg_has_role(current_user,
+--                                       'app_payments_internal', 'member') —
+--                                       a role property no GUC can forge.
+--
+-- BOOTSTRAP EXCEPTION (documented): app_payments keeps CREATE ON SCHEMA
+-- public because payments-service has no separate migration runner — its
+-- schema bootstrap (CREATE TABLE IF NOT EXISTS) runs at boot on the runtime
+-- DSN. Revoke once a migration-runner split lands.
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_payments') THEN
+        CREATE ROLE app_payments NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_payments_login') THEN
+        CREATE ROLE app_payments_login LOGIN PASSWORD 'app_payments_dev_password' IN ROLE app_payments;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_payments_internal') THEN
+        CREATE ROLE app_payments_internal NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_payments_internal_login') THEN
+        CREATE ROLE app_payments_internal_login LOGIN PASSWORD 'app_payments_internal_dev_password' IN ROLE app_payments_internal;
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- payments database (schema is bootstrapped by payments-service at startup —
+-- same fresh-volume caveat as notifications above: ALL TABLES is a no-op on
+-- first init and the default privileges + CREATE grant are what matter)
+-- ---------------------------------------------------------------------------
+SELECT EXISTS (SELECT FROM pg_database WHERE datname = 'payments') AS payments_db_exists\gset
+\if :payments_db_exists
+\c payments
+
+GRANT CONNECT ON DATABASE payments TO app_payments;
+GRANT CONNECT ON DATABASE payments TO app_payments_internal;
+GRANT USAGE ON SCHEMA public TO app_payments;
+GRANT USAGE ON SCHEMA public TO app_payments_internal;
+-- TEMPORARY bootstrap exception (see header note above): payments-service
+-- creates its tables (payout_beneficiaries, deposit_provenance,
+-- payout_attempts, rail_attempts) at startup on the runtime DSN.
+GRANT CREATE ON SCHEMA public TO app_payments;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_payments;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_payments_internal;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_payments;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_payments_internal;
+DO $$
+DECLARE
+    bootstrap TEXT;
+BEGIN
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_payments', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_payments', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_payments_internal', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_payments_internal', bootstrap);
+        END IF;
+    END LOOP;
+END
+$$;
+\else
+\echo '05-app-roles: database payments absent — skipping its grants section'
+\endif
+
+-- ---------------------------------------------------------------------------
 -- Wave 38 (SPEC-W38 F1/F3): agents registry + capture tables
 -- ---------------------------------------------------------------------------
 -- Explicit grants on the three W38 tables (created by

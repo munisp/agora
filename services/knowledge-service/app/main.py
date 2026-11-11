@@ -2,6 +2,7 @@
 
 Routes:
   POST   /v1/documents          ingest: store, chunk (~500 tokens), embed, bulk index
+  GET    /v1/documents          tenant-scoped document list from Postgres (SPEC-W47)
   DELETE /v1/documents/{id}     delete doc + chunks from Postgres and OpenSearch
   GET    /v1/search             hybrid BM25 + kNN with reciprocal rank fusion
   GET    /v1/context            top snippets formatted for agent prompt injection
@@ -23,6 +24,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from . import analytics
+from . import suggestions as kb_suggestions
 from .chunking import chunk_text
 from .config import settings
 from .dapr_client import DaprClient
@@ -188,6 +190,68 @@ async def ingest_document(
 ):
     tenant_id = await _bound_tenant_id(request, req.tenant, deps)
     return await _ingest_document(deps, tenant_id, req.title, req.body, req.source_url)
+
+
+@app.get("/v1/documents")
+async def list_documents(
+    request: Request,
+    tenant: str = Query(..., description="tenant slug or UUID"),
+    limit: int = Query(50, ge=1, le=200, description="page size (default 50)"),
+    offset: int = Query(0, ge=0, description="page offset"),
+    deps: AppState = Depends(get_state),
+):
+    """SPEC-W47 (UIWEB-04 + DB-08): tenant-scoped document list read from
+    POSTGRES (the source of truth for stored documents — the admin Knowledge
+    page lists what the tenant actually ingested).
+
+    DRIFT NOTE: this reflects the PG `documents`/`chunks` tables only. The
+    OpenSearch `kb-chunks` index is written on ingest and removed on delete,
+    but there is NO reconciliation job — PG and OpenSearch can drift silently
+    (e.g. a failed bulk index after a committed insert). /v1/search answers
+    from OpenSearch, so search results may lag or diverge from this list;
+    `chunk_count` here is the PG truth. OpenSearch remains the k-NN/BM25
+    query engine (unchanged).
+
+    Reads run under tenant_conn (RLS `app.tenant_id` context) AND an explicit
+    tenant_id predicate — belt and braces; cross-tenant enumeration is
+    impossible even if the RLS policy is ever relaxed.
+    """
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
+    tenant_uuid = uuid.UUID(tenant_id)
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT d.id, d.title, d.body, d.source_url, d.created_at,"
+            " (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id)"
+            "   AS chunk_count"
+            " FROM documents d"
+            " WHERE d.tenant_id = $1"
+            " ORDER BY d.created_at DESC, d.id"
+            " LIMIT $2 OFFSET $3",
+            tenant_uuid, limit, offset,
+        )
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM documents WHERE tenant_id = $1", tenant_uuid
+        )
+    items = [
+        {
+            "id": str(r["id"]),
+            "tenant_id": tenant_id,
+            "title": r["title"],
+            "body": r["body"],
+            "source_url": r["source_url"],
+            "created_at": r["created_at"].isoformat(),
+            "chunk_count": int(r["chunk_count"]),
+        }
+        for r in rows
+    ]
+    return {
+        "tenant_id": tenant_id,
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "count": len(items),
+        "total": int(total or 0),
+    }
 
 
 @app.delete("/v1/documents/{document_id}", status_code=204)

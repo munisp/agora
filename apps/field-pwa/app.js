@@ -284,15 +284,34 @@ function enqueue(kind, payload, gps) {
   });
 }
 
+/* UIMOB-02 (SPEC-W47): the server LeadCapturePayload REQUIRES phone_e164
+ * (fieldcapture/service.go — "phone_e164 is required" → per-item error,
+ * retried forever). Normalize the typed number to E.164 client-side and
+ * refuse to enqueue without one (a name-only capture can never apply).
+ * Normalization is conservative: strip separators, upgrade a leading
+ * international "00" to "+"; anything else must already be +<country><n>. */
+function normalizeE164(raw) {
+  var s = String(raw || "").trim().replace(/[\s().\-/]/g, "");
+  if (s.indexOf("00") === 0) s = "+" + s.slice(2);
+  return /^\+[1-9]\d{6,14}$/.test(s) ? s : null;
+}
+
 function captureLead() {
   var name = document.getElementById("f-name").value.trim();
-  var phone = document.getElementById("f-phone").value.trim();
+  var phoneRaw = document.getElementById("f-phone").value;
   var notes = document.getElementById("f-notes").value.trim();
-  if (!name && !phone) { toast("Add at least a name or phone."); return; }
+  var phoneE164 = normalizeE164(phoneRaw);
+  if (!phoneE164) {
+    toast("Phone is required in international format, e.g. +2348012345678.");
+    return;
+  }
   var wantGps = document.getElementById("f-gps").checked;
   (wantGps ? getGps() : Promise.resolve(null)).then(function (gps) {
     if (wantGps && !gps) toast("Location unavailable — saved without it.");
-    return enqueue("lead_capture", { name: name, phone: phone, notes: notes }, gps).then(function () {
+    // `phone` rides along for backward compatibility with older readers of
+    // the outbox/anchor payload; the server only consumes phone_e164.
+    var payload = { name: name, phone_e164: phoneE164, phone: phoneE164, notes: notes };
+    return enqueue("lead_capture", payload, gps).then(function () {
       document.getElementById("f-name").value = "";
       document.getElementById("f-phone").value = "";
       document.getElementById("f-notes").value = "";
@@ -513,7 +532,10 @@ function renderOutbox(syncingLabel) {
       var when = new Date(i.captured_at);
       var summary = i.kind === "checkin"
         ? (i.gps ? i.gps.lat.toFixed(4) + ", " + i.gps.lng.toFixed(4) : "no gps")
-        : ((i.payload.name || "—") + (i.payload.phone ? " · " + i.payload.phone : ""));
+        : ((i.payload.name || "—") +
+           (i.payload.phone_e164 || i.payload.phone
+             ? " · " + (i.payload.phone_e164 || i.payload.phone)
+             : ""));
       body.textContent = summary + " · " + when.toLocaleString();
       var st = document.createElement("span");
       st.className = "st" + (i.status && i.status.indexOf("failed") === 0 ? " failed" : "");

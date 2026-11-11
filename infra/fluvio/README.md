@@ -65,3 +65,34 @@ and prints the exact command instead of failing — the connector runtime is
 not containerised in this dev stack. Until the connector runs, the
 Kafka-mirror path (conversation-service producing directly, plus the
 gateway-edge mirror) remains the live transcript flow.
+
+## Enabling the Fluvio transcript sink (W47-H / A-MW MW-M1)
+
+The full Fluvio plane is deployed (cluster, topics, pii-redact smartmodule,
+gateway-edge live-tail) but **no shipped image can produce to the Fluvio
+topic by default** — the conversation-service Dockerfile does not install the
+optional `fluvio` pip extra (`pyproject.toml`: `fluvio = ["fluvio==0.16.1"]`),
+so `TRANSCRIPT_SINK=fluvio` logs a warning and falls back to `KafkaSink`
+(`sinks.py build_sink` — fail-soft, same topic name on Kafka; never silent
+data loss). The Dockerfile is service code and was out of W47-H's ownership
+scope; **flagged to the lead** for the one-line change below.
+
+Exact enable steps:
+
+1. **Service code (lead/W47-E):** in `services/conversation-service/Dockerfile`
+   change the install to pull the extra: `pip install .[fluvio]` (or
+   `pip install fluvio==0.16.1` alongside `pip install .`).
+2. **Compose (already wired, W47-H):** the conversation service now exposes
+   `TRANSCRIPT_SINK` (default `kafka`) and `FLUVIO_TOPIC`
+   (default `opendesk.transcripts-raw`) env passthroughs in
+   `docker-compose.yml`. Set `TRANSCRIPT_SINK=fluvio` in `.env` after step 1.
+   The Fluvio python client connects via its profile — inside the compose
+   network the SC is `fluvio:9003` (see `start-cluster.sh`); the client's
+   default profile targets localhost, so the service image must also carry a
+   Fluvio profile pointing at `fluvio:9003` (or the client must gain an
+   endpoint env — a second small service-code change).
+3. **Connector (manual, unchanged):** `./infra/fluvio/deploy.sh` — needs the
+   `cdk` CLI; without it the script prints the exact `cdk deploy start`
+   command and the Kafka-mirror path stays live.
+
+Kafka remains the default sink; nothing above flips the default stack.

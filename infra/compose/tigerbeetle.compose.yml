@@ -1,0 +1,36 @@
+# TigerBeetle LIVE ledger override (SPEC-W47 / A-MW MW-M2) — OPTIONAL compose
+# override for payments-service.
+#
+# The root docker-compose.yml ships payments with LEDGER_IMPL=sim (ADR-0007
+# in-memory sim ledger: dev-safe, moves NO real money) and builds the image
+# with CARGO_FEATURES="" — the TigerBeetle client is not compiled in, and
+# payments-service refuses LEDGER_IMPL=tigerbeetle without the tb-live
+# feature (src/main.rs). This override wires the live path end-to-end:
+#
+#   docker compose -f docker-compose.yml -f infra/compose/tigerbeetle.compose.yml \
+#       up -d --build payments
+#
+# What it does:
+#   1. Rebuilds payments-service with CARGO_FEATURES="--features tb-live"
+#      (the payments Dockerfile ARG takes the FULL flag string — unlike the
+#      edge service's bare feature name; see services/payments-service/
+#      Dockerfile and the PAYMENTS_CARGO_FEATURES passthrough in the root
+#      compose payments build block).
+#   2. Sets LEDGER_IMPL=tigerbeetle + TB_ADDRESSES so postings land in the
+#      `tigerbeetle` container (already running in the base stack;
+#      payments depends_on it).
+#
+# The `sim` default is unchanged without this file — no silent posture flip.
+# Prod: keep this override, set TB_ADDRESSES/TB_CLUSTER_ID via the secrets
+# store, and never combine with LEDGER_IMPL=sim.
+
+services:
+  payments:
+    build:
+      context: ./services/payments-service
+      args:
+        CARGO_FEATURES: "--features tb-live"
+    environment:
+      LEDGER_IMPL: tigerbeetle
+      TB_ADDRESSES: ${TB_ADDRESSES:-tigerbeetle:3000}
+      TB_CLUSTER_ID: ${TB_CLUSTER_ID:-0}

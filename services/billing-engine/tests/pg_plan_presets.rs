@@ -34,6 +34,8 @@ mod models;
 mod outbox;
 #[path = "../src/payments_qr.rs"]
 mod payments_qr;
+#[path = "../src/permify.rs"]
+mod permify;
 #[path = "../src/routes.rs"]
 mod routes;
 #[path = "../src/tenant.rs"]
@@ -58,6 +60,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub config: Arc<config::Config>,
     pub identity: Arc<identity::SlugResolver>,
+    pub permify: permify::PermifyClient,
     pub outbox_notify: Arc<tokio::sync::Notify>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
@@ -91,6 +94,7 @@ fn test_config(database_url: &str) -> config::Config {
         identity_base_url: String::new(),
         identity_internal_token: None,
         tenant_cache_ttl_s: 60,
+        permify_url: None,
         dunning_interval_s: 3600,
         invoice_due_days: 14,
         db_pool_max: 10,
@@ -165,6 +169,7 @@ async fn harness() -> Option<Harness> {
             None,
             std::time::Duration::from_secs(60),
         )),
+        permify: permify::PermifyClient::new(None),
         config: Arc::new(test_config(&url)),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         events_published: Arc::new(AtomicU64::new(0)),

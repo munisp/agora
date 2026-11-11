@@ -143,6 +143,16 @@ func (s *server) publicOfferings(w http.ResponseWriter, r *http.Request) {
 }
 
 // publicAvailability serves GET /public/sites/{slug}/availability.
+//
+// SPEC-W47 (W47-A item 3, A-UIMOB UIMOB-01): two request shapes are
+// accepted —
+//   - offering_id + team_member_id + from/to (RFC3339): the ORIGINAL
+//     per-member range computation (unchanged behavior, cache-backed);
+//   - offering_id + date (YYYY-MM-DD, tenant-local): the aggregate public
+//     variant the booking page actually sends — slots are computed across
+//     ALL active team members and merged by start time, each slot carrying
+//     the team_member_id of a member free at that time so the subsequent
+//     POST /bookings satisfies the required-field validation.
 func (s *server) publicAvailability(w http.ResponseWriter, r *http.Request) {
 	site, ok := s.resolveSite(w, r)
 	if !ok {
@@ -151,6 +161,10 @@ func (s *server) publicAvailability(w http.ResponseWriter, r *http.Request) {
 	tenant, err := s.d.Resolver.BySlug(r.Context(), site.TenantSlug)
 	if err != nil {
 		s.internal(w, err)
+		return
+	}
+	if r.URL.Query().Get("team_member_id") == "" && r.URL.Query().Get("date") != "" {
+		s.computePublicDayAvailability(w, r, site.TenantID, tenant.Location())
 		return
 	}
 	s.computeAvailability(w, r, site.TenantID, tenant.Location())

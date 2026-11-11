@@ -120,6 +120,13 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		r.Post("/tickets", h.CreateTicket)
 		r.Get("/tickets/{id}", h.GetTicket)
 		r.Patch("/tickets/{id}", h.PatchTicket)
+		// SPEC-W47 (W47-A item 2, A-UIWEB UIWEB-05): STAFF-side CSAT
+		// recording, gated by the group middleware (Permify manage_bookings
+		// for writes). The public capability-token route above is
+		// untouched. The W47 route is POST .../csat-note ONLY — the pre-W45
+		// PATCH .../csat route stays REMOVED (K24/OOS-11 invariant, pinned
+		// by TestConflictPaths); the ticket drawer moves to csat-note.
+		r.Post("/tickets/{id}/csat-note", h.RecordStaffCSAT)
 		r.Get("/sla-policies", h.ListPolicies)
 		r.Post("/sla-policies", h.CreatePolicy)
 		r.Patch("/sla-policies/{id}", h.UpdatePolicy)
@@ -502,6 +509,43 @@ func (h *Handlers) SubmitCSAT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, err := h.Store.RedeemCSATToken(r.Context(), token, req.Rating, req.Comment)
+	if err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ticket": t})
+}
+
+// RecordStaffCSAT (POST /v1/helpdesk/tickets/{id}/csat-note) — SPEC-W47
+// W47-A item 2 (A-UIWEB UIWEB-05): staff-side CSAT recording on
+// resolved|closed tickets. Runs
+// INSIDE the staff middleware group (Permify manage_bookings via the
+// integrator chain) — unlike the public token flow, the caller is an
+// authenticated operator; the actor lands on the ticket_events timeline.
+// Body: {rating 1-5, comment?}.
+func (h *Handlers) RecordStaffCSAT(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := h.tenant(w, r)
+	if !ok {
+		return
+	}
+	id, ok := parseIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	var req csatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Rating < 1 || req.Rating > 5 {
+		writeError(w, http.StatusBadRequest, "rating must be 1-5")
+		return
+	}
+	if len(req.Comment) > maxCSATLen {
+		writeError(w, http.StatusBadRequest, "comment exceeds maximum length")
+		return
+	}
+	t, err := h.Store.RecordStaffCSAT(r.Context(), tenant.ID, id, req.Rating, req.Comment, h.actor(r))
 	if err != nil {
 		h.mapErr(w, err)
 		return

@@ -58,7 +58,28 @@ specs readable; re-runs use dynamic partition overwrite, so jobs are idempotent.
 
 ```bash
 docker compose -f infra/docker-compose.lakehouse.yml up -d   # whole lakehouse tier
+```
 
+### Scheduled batch (SPEC-W47 / A-MW: Sedona + batch jobs were unscheduled)
+
+A profile-gated scheduler sidecar runs the batch chain on a fixed interval
+(default hourly; every job is idempotent and degrades gracefully on missing
+inputs, so fixed-interval re-runs are safe):
+
+```bash
+docker compose --profile batch-scheduler up -d spark-scheduler
+```
+
+Default pass order (env-overridable via `BATCH_JOBS`):
+`silver_clean_bookings.py silver_clean_transcripts.py cac_analytics.py
+revenue_intelligence.py geo_analytics.py` (the Sedona job). Tune with
+`BATCH_INTERVAL_SECONDS` (default 3600). The loop is
+`infra/lakehouse/spark/run-scheduled.sh`; failures log WARN and retry on the
+next pass (one broken job never starves the others).
+
+### Manual runs
+
+```bash
 docker exec opendesk-spark-master /opt/bitnami/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
   --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1 \

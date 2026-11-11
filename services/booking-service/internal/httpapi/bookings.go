@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"strconv"
@@ -92,6 +93,25 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 	var f store.BookingFilter
 	f.Status = q.Get("status")
 	f.Contact = q.Get("contact")
+	// SPEC-W47 (W47-A item 4, A-UIMOB UIMOB-05): ?contact_phone= is the
+	// voice runtime's lookup_appointment filter. It is PHONE-keyed PII
+	// lookup, so it is gated on the service-to-service internal token
+	// (X-Internal-Token == BOOKING_INTERNAL_TOKEN, K2 fail-closed semantics:
+	// 503 when unset, 401 on missing/wrong — constant-time compare), NOT on
+	// Permify: the caller is a verified-session machine, not a staff member.
+	contactPhone := strings.TrimSpace(q.Get("contact_phone"))
+	if contactPhone != "" {
+		if s.d.InternalToken == "" {
+			s.d.Logger.Error("contact_phone booking lookup hit but BOOKING_INTERNAL_TOKEN is unset (fail closed)")
+			writeError(w, http.StatusServiceUnavailable, "internal token not configured")
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Token")), []byte(s.d.InternalToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid internal token")
+			return
+		}
+		f.ContactPhone = contactPhone
+	}
 	// mine=true: restrict to the caller's own team member, resolved by
 	// matching the JWT email claim (X-User-Email header fallback, then an
 	// email-shaped sub) against team_members.email. No matching member is a
@@ -163,7 +183,26 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	if contactPhone != "" {
+		// Voice contract (UIMOB-05): each row carries the matched
+		// contact_phone alongside id/status/starts_at/offering_id, so both
+		// the legacy client-side filter (b["contact_phone"] == phone) and
+		// the server-side filter agree.
+		out := make([]bookingWithPhone, 0, len(items))
+		for _, b := range items {
+			out = append(out, bookingWithPhone{Booking: b, ContactPhone: contactPhone})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"bookings": out})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"bookings": items})
+}
+
+// bookingWithPhone flattens a booking row plus the matched contact phone
+// for the internal-token-gated ?contact_phone= listing (SPEC-W47 item 4).
+type bookingWithPhone struct {
+	store.Booking
+	ContactPhone string `json:"contact_phone"`
 }
 
 func (s *server) getBooking(w http.ResponseWriter, r *http.Request) {

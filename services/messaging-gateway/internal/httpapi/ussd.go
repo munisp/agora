@@ -43,6 +43,14 @@ type USSDConfig struct {
 	Conversation channel.USSDConversation // nil: every session ends with the fallback line
 	SessionTTL   time.Duration            // default channel.USSDSessionTTL (180s)
 
+	// Actions dispatches pack-menu action selections (book / status /
+	// handoff / info) end-to-end — booking-service effect + the promised
+	// confirmation SMS via notification-worker (SPEC-W47-C UIMOB-06). nil:
+	// the END reply still promises the confirmation, so a nil dispatcher
+	// logs an ERROR per action selection (loud misconfiguration, never a
+	// silent no-op).
+	Actions USSDActionDispatcher
+
 	// CallbackSecret (AT_CALLBACK_SECRET) authenticates the callback path
 	// (K14). Empty = fail-closed: every callback answers 503.
 	CallbackSecret string
@@ -174,7 +182,37 @@ func (s *Server) ussdTurn(ctx context.Context, sessionID, serviceCode, phone, te
 
 	// Every callback is forwarded to conversation-service (menu navigation
 	// lives conversation-side — the resolved pack menu rides along).
-	reply, end := s.ussdConversation(ctx, log, sess, text)
+	resp, reply, end := s.ussdConversation(ctx, log, sess, text)
+
+	// SPEC-W47-C (UIMOB-06): a closing menu selection carrying an action
+	// dispatches it end-to-end (booking-service effect + confirmation SMS
+	// via notification-worker). Idempotent per session+action: the session
+	// row is deleted on END, so the claim rides a separate marker key —
+	// an Africa's Talking at-least-once redelivery of the final callback
+	// (which would otherwise rebuild a fresh session and re-dispatch) hits
+	// the marker and skips. Claim BEFORE dispatch (at-most-once; failures
+	// are logged loudly for ops replay).
+	if end && resp.Action != "" {
+		if cfg.Actions == nil {
+			log.Error("ussd menu action selected but no dispatcher is wired (confirmation SMS NOT sent)",
+				zap.String("action", resp.Action), zap.String("phone", phone))
+		} else if s.claimUSSDAction(ctx, log, sess, resp.Action, ttl) {
+			label, infoText := resolveUSSDActionContext(sess.Menu, resp)
+			if err := cfg.Actions.Dispatch(ctx, USSDActionRequest{
+				TenantID:       sess.TenantID,
+				TenantSlug:     sess.SiteSlug, // single-site tenants: site slug is the tenant slug (channel.HTTPUSSDMenuFetcher contract)
+				SessionID:      sess.ID,
+				Phone:          sess.Phone,
+				Action:         resp.Action,
+				Label:          label,
+				Text:           infoText,
+				ConversationID: resp.ConversationID,
+			}); err != nil {
+				log.Error("ussd menu action dispatch failed",
+					zap.String("action", resp.Action), zap.Error(err))
+			}
+		}
+	}
 
 	if end {
 		if err := cfg.Store.Delete(ctx, sessionID); err != nil {
@@ -192,11 +230,13 @@ func (s *Server) ussdTurn(ctx context.Context, sessionID, serviceCode, phone, te
 
 // ussdConversation forwards one callback to conversation-service via the
 // synchronous request/reply contract (Agent D's POST /v1/ussd/turns) and
-// maps the response onto (reply, end): continue=true → CON, else END.
-func (s *Server) ussdConversation(ctx context.Context, log *zap.Logger, sess *channel.USSDSession, text string) (string, bool) {
+// maps the response onto (reply, end): continue=true → CON, else END. The
+// full response is returned so the caller can dispatch a closing menu
+// action (SPEC-W47-C UIMOB-06).
+func (s *Server) ussdConversation(ctx context.Context, log *zap.Logger, sess *channel.USSDSession, text string) (channel.USSDTurnResponse, string, bool) {
 	if s.USSD.Conversation == nil {
 		log.Warn("ussd conversation client not configured")
-		return ussdFallbackLine, true
+		return channel.USSDTurnResponse{}, ussdFallbackLine, true
 	}
 	resp, err := s.USSD.Conversation.Turn(ctx, channel.USSDTurnRequest{
 		TenantID:    sess.TenantID,
@@ -209,12 +249,53 @@ func (s *Server) ussdConversation(ctx context.Context, log *zap.Logger, sess *ch
 	})
 	if err != nil {
 		log.Warn("ussd conversation turn failed", zap.Error(err))
-		return ussdFallbackLine, true
+		return channel.USSDTurnResponse{}, ussdFallbackLine, true
 	}
 	if resp.Reply == "" {
-		return ussdFallbackLine, true
+		return channel.USSDTurnResponse{}, ussdFallbackLine, true
 	}
-	return resp.Reply, !resp.Continue
+	return resp, resp.Reply, !resp.Continue
+}
+
+// ussdActionClaimTTL pins the session+action dispatch marker well beyond
+// the session TTL: an AT redelivery of the final callback arrives within
+// seconds, but the marker also covers operator replays of the callback log.
+const ussdActionClaimTTL = 24 * time.Hour
+
+// ussdActionClaimKey is the store key of the session+action dispatch marker
+// (separate from the session row, which is deleted on END).
+func ussdActionClaimKey(sessionID, action string) string {
+	return "ussd-action-claim:" + sessionID + ":" + action
+}
+
+// claimUSSDAction records that the session+action dispatch is claimed and
+// reports whether THIS callback holds the claim (first writer wins). Claim
+// persistence failures fail OPEN to dispatch (logged): blocking the user's
+// requested action because the dedupe marker could not be written is worse
+// than the residual double-dispatch window (notification-worker's derived
+// workflow id still suppresses a duplicate SMS).
+func (s *Server) claimUSSDAction(ctx context.Context, log *zap.Logger, sess *channel.USSDSession, action string, sessionTTL time.Duration) bool {
+	key := ussdActionClaimKey(sess.ID, action)
+	existing, err := s.USSD.Store.Get(ctx, key)
+	if err != nil {
+		log.Warn("ussd action claim check failed, dispatching anyway", zap.String("action", action), zap.Error(err))
+		return true
+	}
+	if existing != nil {
+		log.Info("ussd action already dispatched for this session, skipping duplicate",
+			zap.String("action", action))
+		return false
+	}
+	ttl := sessionTTL
+	if ttl < ussdActionClaimTTL {
+		ttl = ussdActionClaimTTL
+	}
+	marker := &channel.USSDSession{ID: key, ServiceCode: sess.ServiceCode, Phone: sess.Phone,
+		SiteSlug: sess.SiteSlug, TenantID: sess.TenantID, UpdatedAt: time.Now()}
+	if err := s.USSD.Store.Save(ctx, marker, ttl); err != nil {
+		log.Warn("ussd action claim save failed, dispatching anyway", zap.String("action", action), zap.Error(err))
+	}
+	return true
 }
 
 // replyPrefix maps the end flag onto the contract prefix.

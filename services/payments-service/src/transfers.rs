@@ -83,12 +83,23 @@ pub struct TransferAttempt {
 #[async_trait]
 pub trait TransferAttemptStore: Send + Sync {
     /// Insert a new attempt row (idempotent: first record for an id wins;
-    /// replays do not rewrite history).
+    /// replays do not rewrite history). DB-01: pinned to
+    /// `attempt.tenant_id`.
     async fn record(&self, attempt: &TransferAttempt) -> Result<(), String>;
-    async fn get(&self, transfer_id: &str) -> Result<Option<TransferAttempt>, String>;
-    async fn mark(
+    /// SPEC-W47 DB-01: tenant-scoped read — a row owned by another tenant
+    /// reads as None (no cross-tenant oracle; enforced by RLS on the Pg
+    /// store via the transaction-local `app.tenant_id` GUC).
+    async fn get_scoped(
         &self,
         transfer_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<TransferAttempt>, String>;
+    /// DB-01: tenant-scoped state transition (a foreign tenant's id is a
+    /// no-op).
+    async fn mark_scoped(
+        &self,
+        transfer_id: &str,
+        tenant_id: &str,
         state: TransferAttemptState,
         detail: Option<&str>,
     ) -> Result<(), String>;
@@ -164,6 +175,13 @@ impl PgTransferAttemptStore {
         ))
     }
 
+    /// Test seam (tests/pg_rls.rs): build a store over a pre-connected pool
+    /// without the connect-retry loop or the bootstrap (the test applies the
+    /// DDL itself). NOT used on the production boot path.
+    pub fn from_pool(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
     fn row_to_attempt(row: &sqlx::postgres::PgRow) -> Result<TransferAttempt, String> {
         use sqlx::Row;
         let amount: i64 = row
@@ -191,6 +209,10 @@ impl PgTransferAttemptStore {
 #[async_trait]
 impl TransferAttemptStore for PgTransferAttemptStore {
     async fn record(&self, attempt: &TransferAttempt) -> Result<(), String> {
+        // SPEC-W47 DB-01: pin the RLS tenant GUC for every statement.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, &attempt.tenant_id)
+            .await
+            .map_err(|e| format!("rail_attempts tx failed: {e}"))?;
         sqlx::query(
             "INSERT INTO rail_attempts
                 (transfer_id, kind, tenant_id, amount_cents, currency, destination, state, detail)
@@ -205,31 +227,49 @@ impl TransferAttemptStore for PgTransferAttemptStore {
         .bind(&attempt.destination)
         .bind(attempt.state.as_str())
         .bind(&attempt.detail)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("rail_attempts insert failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("rail_attempts commit failed: {e}"))?;
         Ok(())
     }
 
-    async fn get(&self, transfer_id: &str) -> Result<Option<TransferAttempt>, String> {
+    async fn get_scoped(
+        &self,
+        transfer_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<TransferAttempt>, String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("rail_attempts tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT transfer_id, kind, tenant_id, amount_cents, currency, destination,
                     state, detail, created_at, updated_at
              FROM rail_attempts WHERE transfer_id = $1",
         )
         .bind(transfer_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("rail_attempts read failed: {e}"))?;
-        row.as_ref().map(Self::row_to_attempt).transpose()
+        let out = row.as_ref().map(Self::row_to_attempt).transpose();
+        tx.commit()
+            .await
+            .map_err(|e| format!("rail_attempts commit failed: {e}"))?;
+        out
     }
 
-    async fn mark(
+    async fn mark_scoped(
         &self,
         transfer_id: &str,
+        tenant_id: &str,
         state: TransferAttemptState,
         detail: Option<&str>,
     ) -> Result<(), String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("rail_attempts tx failed: {e}"))?;
         sqlx::query(
             "UPDATE rail_attempts SET state = $2, detail = COALESCE($3, detail),
                     updated_at = now()
@@ -238,9 +278,12 @@ impl TransferAttemptStore for PgTransferAttemptStore {
         .bind(transfer_id)
         .bind(state.as_str())
         .bind(detail)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("rail_attempts update failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("rail_attempts commit failed: {e}"))?;
         Ok(())
     }
 }
@@ -263,18 +306,30 @@ impl TransferAttemptStore for MemTransferAttemptStore {
         Ok(())
     }
 
-    async fn get(&self, transfer_id: &str) -> Result<Option<TransferAttempt>, String> {
-        Ok(self.rows.lock().await.get(transfer_id).cloned())
-    }
-
-    async fn mark(
+    async fn get_scoped(
         &self,
         transfer_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<TransferAttempt>, String> {
+        // DB-01: same no-oracle posture as the Pg store.
+        Ok(self
+            .rows
+            .lock()
+            .await
+            .get(transfer_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    async fn mark_scoped(
+        &self,
+        transfer_id: &str,
+        tenant_id: &str,
         state: TransferAttemptState,
         detail: Option<&str>,
     ) -> Result<(), String> {
         let mut rows = self.rows.lock().await;
-        if let Some(a) = rows.get_mut(transfer_id) {
+        if let Some(a) = rows.get_mut(transfer_id).filter(|a| a.tenant_id == tenant_id) {
             a.state = state;
             if let Some(d) = detail {
                 a.detail = Some(d.to_string());
@@ -320,13 +375,19 @@ mod tests {
             .record(&attempt(&id, TransferAttemptState::Committed))
             .await
             .unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        let got = store.get_scoped(&id, "t-1").await.unwrap().unwrap();
         assert_eq!(got.state, TransferAttemptState::QueuedManual);
+        // DB-01: a foreign-tenant scoped read is invisible / mark a no-op.
+        assert!(store.get_scoped(&id, "t-foreign").await.unwrap().is_none());
         store
-            .mark(&id, TransferAttemptState::Committed, Some("rail committed"))
+            .mark_scoped(&id, "t-foreign", TransferAttemptState::Committed, None)
             .await
             .unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        store
+            .mark_scoped(&id, "t-1", TransferAttemptState::Committed, Some("rail committed"))
+            .await
+            .unwrap();
+        let got = store.get_scoped(&id, "t-1").await.unwrap().unwrap();
         assert_eq!(got.state, TransferAttemptState::Committed);
         assert_eq!(got.detail.as_deref(), Some("rail committed"));
     }
@@ -351,13 +412,14 @@ mod tests {
             .record(&attempt(&id, TransferAttemptState::Committed))
             .await
             .unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        let got = store.get_scoped(&id, "t-1").await.unwrap().unwrap();
         assert_eq!(got.state, TransferAttemptState::QueuedManual);
+        assert!(store.get_scoped(&id, "t-foreign").await.unwrap().is_none());
         store
-            .mark(&id, TransferAttemptState::Committed, Some("done"))
+            .mark_scoped(&id, "t-1", TransferAttemptState::Committed, Some("done"))
             .await
             .unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        let got = store.get_scoped(&id, "t-1").await.unwrap().unwrap();
         assert_eq!(got.state, TransferAttemptState::Committed);
     }
 }

@@ -1,6 +1,7 @@
 """CAC summary math + spend-join resilience tests (SPEC-W13 contract §5):
 per-channel CAC, blended CAC, ltv_ngn, payback_days_estimate, and the
-never-fail spend lookup (404/unreachable -> spend 0 + spend_unavailable)."""
+never-fail spend lookup (404/unreachable -> spend reported UNKNOWN/null
++ spend_unavailable flag + metric, never silently zeroed — MW-H1)."""
 
 from __future__ import annotations
 
@@ -88,6 +89,7 @@ def test_build_summary_contract_math():
         "leads": 150,
         "conversions": 15,
         "revenue_ngn": 372000.0,
+        "spend_unknown_channels": [],
     }
     # by_lga: no spend allocation, geom null (no boundary endpoint this wave)
     assert summary["by_lga"] == [
@@ -222,10 +224,47 @@ def test_fetch_summary_survives_spend_lookup_failure():
     summary = asyncio.run(
         fetch_summary(load_settings(), store, spend, T1, FROM, TO)
     )
-    # summary still succeeds: failed campaign counts as 0, quality flagged
-    assert summary["by_channel"][0]["spend_ngn"] == 30000.0
+    # Summary still succeeds, but MW-H1: the failed lookup must NOT silently
+    # zero/half-count the channel's spend — whatsapp spend is UNKNOWN (null),
+    # the partial 30000 is excluded from the totals, and the blended CAC is
+    # withheld (a blended figure over partial spend would be understated).
+    assert summary["by_channel"][0]["spend_ngn"] is None
+    assert summary["by_channel"][0]["cac_ngn"] is None
     assert summary["data_quality"] == "spend_unavailable"
-    assert summary["blended_cac_ngn"] == 3000.0
+    assert summary["blended_cac_ngn"] is None
+    assert summary["totals"]["spend_ngn"] == 0.0
+    assert summary["totals"]["spend_unknown_channels"] == ["whatsapp"]
+
+
+def test_build_summary_missing_channel_never_zeroed():
+    """build_summary unit: a spend-missing channel reports null spend/CAC and
+    its (partial) spend is excluded from totals; blended is withheld."""
+    summary = build_summary(
+        tenant_id=T1,
+        date_from=FROM,
+        date_to=TO,
+        channel_rows=[
+            _channel("whatsapp", leads=100, conversions=10, revenue=310000),
+            _channel("web", leads=50, conversions=5, revenue=62000),
+        ],
+        lga_rows=[],
+        spend_by_channel={"whatsapp": Decimal("30000"), "web": Decimal("20000")},
+        spend_unavailable=True,
+        spend_missing_channels={"whatsapp"},
+        day_bounds=(FROM, TO),
+    )
+    wa, web = summary["by_channel"]
+    assert wa["spend_ngn"] is None
+    assert wa["cac_ngn"] is None
+    # The unaffected channel keeps its exact figures.
+    assert web["spend_ngn"] == 20000.0
+    assert web["cac_ngn"] == 4000.0
+    assert summary["blended_cac_ngn"] is None
+    assert summary["payback_days_estimate"] is None
+    assert summary["data_quality"] == "spend_unavailable"
+    # Totals carry KNOWN spend only (whatsapp's partial 30000 excluded).
+    assert summary["totals"]["spend_ngn"] == 20000.0
+    assert summary["totals"]["spend_unknown_channels"] == ["whatsapp"]
 
 
 # ---------------------------------------------------------------------------

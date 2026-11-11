@@ -23,6 +23,7 @@ import {
 import { refreshAccessToken } from "../auth/keycloak";
 import type {
   Booking,
+  CompleteBookingResult,
   CreateLeadRequest,
   CreateLeadResponse,
   CreateReferralRequest,
@@ -215,6 +216,43 @@ export async function listBookings(f: ListBookingsFilter = {}): Promise<Booking[
     },
   });
   return data.bookings ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Booking actions (UIMOB-11, SPEC-W47) — the manage_bookings ops routes the
+// field persona needs on-site. Contracts mirror
+// services/booking-service/internal/httpapi/bookings.go:
+//   POST /v1/bookings/{id}/complete   (empty body; 200 CompleteResult —
+//     idempotent, already_completed on replays; 409 invalid transition,
+//     503 payments unconfigured when a deposit is referenced)
+//   POST /v1/bookings/{id}/cancel     ({reason?}; 200 Booking, idempotent)
+//   POST /v1/bookings/{id}/reschedule ({starts_at RFC3339}; 200 Booking;
+//     409 slot unavailable, 400 cancelled booking)
+// ---------------------------------------------------------------------------
+
+export async function getBooking(id: string): Promise<Booking> {
+  return request<Booking>(`/v1/bookings/${id}`);
+}
+
+export async function completeBooking(id: string): Promise<CompleteBookingResult> {
+  return request<CompleteBookingResult>(`/v1/bookings/${id}/complete`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function cancelBooking(id: string, reason?: string): Promise<Booking> {
+  return request<Booking>(`/v1/bookings/${id}/cancel`, {
+    method: "POST",
+    body: { reason: reason || undefined },
+  });
+}
+
+export async function rescheduleBooking(id: string, startsAtISO: string): Promise<Booking> {
+  return request<Booking>(`/v1/bookings/${id}/reschedule`, {
+    method: "POST",
+    body: { starts_at: startsAtISO },
+  });
 }
 
 // ---------------------------------------------------------------------------
