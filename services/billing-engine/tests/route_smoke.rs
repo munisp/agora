@@ -52,6 +52,8 @@ mod models;
 mod outbox;
 #[path = "../src/payments_qr.rs"]
 mod payments_qr;
+#[path = "../src/permify.rs"]
+mod permify;
 #[path = "../src/routes.rs"]
 mod routes;
 #[path = "../src/tenant.rs"]
@@ -77,6 +79,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub config: Arc<config::Config>,
     pub identity: Arc<identity::SlugResolver>,
+    pub permify: permify::PermifyClient,
     pub outbox_notify: Arc<tokio::sync::Notify>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
@@ -114,6 +117,7 @@ fn test_config() -> config::Config {
         identity_base_url: String::new(),
         identity_internal_token: None,
         tenant_cache_ttl_s: 60,
+        permify_url: None,
         dunning_interval_s: 3600,
         invoice_due_days: 14,
         db_pool_max: 10,
@@ -152,6 +156,7 @@ async fn spawn_server_with(cfg: config::Config) -> String {
             cfg.identity_internal_token.clone(),
             std::time::Duration::from_secs(cfg.tenant_cache_ttl_s),
         )),
+        permify: permify::PermifyClient::new(cfg.permify_url.clone()),
         config: Arc::new(cfg),
         outbox_notify: Arc::new(tokio::sync::Notify::new()),
         events_published: Arc::new(AtomicU64::new(0)),
@@ -783,5 +788,189 @@ fn apisix_oidc_routes_never_inject_internal_token() {
     assert!(
         block.contains("serverless-pre-function"),
         "api-billing must keep the K1 header injection (X-Tenant-Slugs etc.)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W47 D item 2 (A-MW MW-L5): Permify view_billing/manage_billing gate
+// on the human (gateway) path. The list route is the only permify-gated
+// route reachable without a database (the id-addressed get/issue/void learn
+// the tenant from a DB lookup first), so the gate is exercised end-to-end
+// here via GET /v1/invoices; all four routes share require_billing_perm.
+// ---------------------------------------------------------------------------
+
+/// Mock Permify: `can` = RESULT_ALLOWED/RESULT_DENIED; `fail` answers 500.
+/// Captures the last request (path + body) for shape assertions.
+async fn spawn_mock_permify(
+    can: &'static str,
+    fail: bool,
+) -> (String, Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>) {
+    use axum::extract::{Request, State};
+    use axum::routing::post;
+    use axum::Json;
+
+    type Capture = Arc<std::sync::Mutex<Option<(String, serde_json::Value)>>>;
+    #[derive(Clone)]
+    struct Mock {
+        can: &'static str,
+        fail: bool,
+        last: Capture,
+    }
+    async fn check(
+        State(m): State<Mock>,
+        req: Request,
+    ) -> (reqwest::StatusCode, Json<serde_json::Value>) {
+        let path = req.uri().path().to_string();
+        let body = axum::body::to_bytes(req.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
+        *m.last.lock().unwrap() = Some((
+            path,
+            serde_json::from_slice(&body).unwrap_or_default(),
+        ));
+        if m.fail {
+            return (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "mock permify outage"})),
+            );
+        }
+        (
+            reqwest::StatusCode::OK,
+            Json(serde_json::json!({"can": m.can})),
+        )
+    }
+    let last: Capture = Default::default();
+    let app = axum::Router::new()
+        .route("/v1/tenants/:tenant/permissions/check", post(check))
+        .with_state(Mock {
+            can,
+            fail,
+            last: last.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), last)
+}
+
+fn config_with_permify(permify_url: &str) -> config::Config {
+    let mut cfg = test_config();
+    cfg.permify_url = Some(permify_url.to_string());
+    cfg
+}
+
+/// Allowed: the gate passes and the request reaches the DB layer (500 on the
+/// lazy pool), and the Permify call carries the contract shape (organization
+/// entity, user subject, view_billing, tenant path from the BOUND tenant).
+#[tokio::test]
+async fn permify_view_billing_allow_reaches_db() {
+    let tenant = uuid::Uuid::new_v4();
+    let (permify, last) = spawn_mock_permify("RESULT_ALLOWED", false).await;
+    let server = spawn_server_with(config_with_permify(&permify)).await;
+    let resp = client()
+        .get(format!("{server}/v1/invoices?tenant_id={tenant}"))
+        .header("x-tenant-slugs", tenant.to_string())
+        .header("x-user-id", "user-42")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "allowed request must pass the gate and hit the lazy pool (500)"
+    );
+    let (path, body) = last.lock().unwrap().clone().expect("permify hit");
+    assert_eq!(path, format!("/v1/tenants/{tenant}/permissions/check"));
+    assert_eq!(
+        body["entity"],
+        serde_json::json!({"type": "organization", "id": tenant.to_string()})
+    );
+    assert_eq!(body["permission"], serde_json::json!("view_billing"));
+    assert_eq!(
+        body["subject"],
+        serde_json::json!({"type": "user", "id": "user-42"})
+    );
+}
+
+/// Denied: RESULT_DENIED -> 403 BEFORE any DB access.
+#[tokio::test]
+async fn permify_view_billing_denied_is_403() {
+    let tenant = uuid::Uuid::new_v4();
+    let (permify, _) = spawn_mock_permify("RESULT_DENIED", false).await;
+    let server = spawn_server_with(config_with_permify(&permify)).await;
+    let resp = client()
+        .get(format!("{server}/v1/invoices?tenant_id={tenant}"))
+        .header("x-tenant-slugs", tenant.to_string())
+        .header("x-user-id", "user-42")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "denial must be 403: {body}");
+    assert!(body.contains("view_billing"), "error names the permission: {body}");
+}
+
+/// Fail-closed: no caller subject (X-User-Id) -> 401; a Permify outage ->
+/// 502 (never a silent allow).
+#[tokio::test]
+async fn permify_gate_fails_closed() {
+    let tenant = uuid::Uuid::new_v4();
+    let (permify, _) = spawn_mock_permify("RESULT_ALLOWED", false).await;
+    let server = spawn_server_with(config_with_permify(&permify)).await;
+    let http = client();
+    // Missing X-User-Id on the gateway path -> 401 before any Permify call.
+    let resp = http
+        .get(format!("{server}/v1/invoices?tenant_id={tenant}"))
+        .header("x-tenant-slugs", tenant.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED, "no subject must be 401");
+
+    // Permify unreachable -> 502 (fail-closed outage), not 2xx/403.
+    let server = spawn_server_with(config_with_permify("http://127.0.0.1:1")).await;
+    let resp = http
+        .get(format!("{server}/v1/invoices?tenant_id={tenant}"))
+        .header("x-tenant-slugs", tenant.to_string())
+        .header("x-user-id", "user-42")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_GATEWAY,
+        "permify outage must fail closed with 502: {body}"
+    );
+}
+
+/// K2 exemption: internal-token service callers keep their existing auth —
+/// the Permify gate does not run even when configured (and denying).
+#[tokio::test]
+async fn permify_gate_exempts_internal_token_callers() {
+    let tenant = uuid::Uuid::new_v4();
+    let (permify, last) = spawn_mock_permify("RESULT_DENIED", false).await;
+    let server = spawn_server_with(config_with_permify(&permify)).await;
+    let resp = client()
+        .get(format!("{server}/v1/invoices?tenant_id={tenant}"))
+        .header("x-internal-token", INTERNAL_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "internal-token caller must skip the permify gate and hit the lazy pool (500)"
+    );
+    assert!(
+        last.lock().unwrap().is_none(),
+        "no permify call for internal-token callers"
     );
 }

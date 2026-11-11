@@ -89,13 +89,30 @@ pub struct PayoutAttempt {
 #[async_trait]
 pub trait PayoutAttemptStore: Send + Sync {
     /// Insert a new attempt row (idempotent: first record for a payout id
-    /// wins; replays do not rewrite history).
+    /// wins; replays do not rewrite history). DB-01: pinned to
+    /// `attempt.tenant_id`.
     async fn record(&self, attempt: &PayoutAttempt) -> Result<(), String>;
-    async fn get(&self, payout_id: &str) -> Result<Option<PayoutAttempt>, String>;
-    async fn list_unknown(&self, limit: i64) -> Result<Vec<PayoutAttempt>, String>;
-    async fn mark(
+    /// SPEC-W47 DB-01: tenant-scoped read for request paths that already
+    /// authorized `tenant_id`. A row owned by another tenant reads as None
+    /// (no cross-tenant oracle; enforced by RLS on the Pg store).
+    async fn get_scoped(
         &self,
         payout_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<PayoutAttempt>, String>;
+    /// Cross-tenant read for INTERNAL jobs only (the K20 approval path
+    /// learns the tenant from the row, then binds the caller to it — the
+    /// billing begin_scoped_invoice_tx pattern). The Pg store runs this on
+    /// the internal pool (role-gated escape, migrations/0001_rls.sql).
+    async fn get_internal(&self, payout_id: &str) -> Result<Option<PayoutAttempt>, String>;
+    /// Cross-tenant sweep (reconciler). Pg: internal pool.
+    async fn list_unknown(&self, limit: i64) -> Result<Vec<PayoutAttempt>, String>;
+    /// DB-01: tenant-scoped state transition — a foreign tenant's id is a
+    /// no-op (RLS hides the row, so the UPDATE matches 0 rows).
+    async fn mark_scoped(
+        &self,
+        payout_id: &str,
+        tenant_id: &str,
         state: AttemptState,
         detail: Option<&str>,
     ) -> Result<(), String>;
@@ -132,6 +149,12 @@ ALTER TABLE payout_attempts ADD CONSTRAINT payout_attempts_state_check
 
 pub struct PgPayoutAttemptStore {
     pool: sqlx::PgPool,
+    /// SPEC-W47 DB-01: pool for the cross-tenant internal paths
+    /// (`list_unknown` reconciler sweep, `get_internal` approval lookup).
+    /// Points at `PAYMENTS_INTERNAL_DATABASE_URL` (role
+    /// `app_payments_internal_login`) when configured; falls back to the main
+    /// pool when unset (dev default: bootstrap superuser bypasses RLS).
+    internal_pool: sqlx::PgPool,
 }
 
 /// SPEC-W46 R2: every payments Postgres pool fast-fails a connection
@@ -179,7 +202,13 @@ impl PgPayoutAttemptStore {
     /// Connect (with bounded retry) and bootstrap the table. Fail-closed:
     /// when a DSN is configured but unreachable/invalid, the service refuses
     /// to boot rather than silently losing reconciliation durability.
-    pub async fn connect_with_retry(dsn: &str) -> Result<Self, String> {
+    ///
+    /// SPEC-W47 DB-01: `internal_dsn` (PAYMENTS_INTERNAL_DATABASE_URL) feeds
+    /// the cross-tenant internal pool (role `app_payments_internal_login`);
+    /// when unset/invalid-omitted the internal pool is the main pool (dev
+    /// superuser posture, identical to billing's INTERNAL_DATABASE_URL
+    /// fallback).
+    pub async fn connect_with_retry(dsn: &str, internal_dsn: Option<&str>) -> Result<Self, String> {
         let options = pg_connect_options(dsn)?;
         let mut last_err = String::new();
         for attempt in 1..=10u32 {
@@ -192,7 +221,21 @@ impl PgPayoutAttemptStore {
                 .await
             {
                 Ok(pool) => {
-                    let store = Self { pool };
+                    let internal_pool = match internal_dsn {
+                        Some(idsn) => {
+                            let iopts = pg_connect_options(idsn)?;
+                            sqlx::postgres::PgPoolOptions::new()
+                                .max_connections(2)
+                                .acquire_timeout(DB_ACQUIRE_TIMEOUT)
+                                .connect_with(iopts)
+                                .await
+                                .map_err(|e| {
+                                    format!("payout_attempts internal pool connect failed: {e}")
+                                })?
+                        }
+                        None => pool.clone(),
+                    };
+                    let store = Self { pool, internal_pool };
                     store.bootstrap().await?;
                     info!("payout_attempts store: postgres (bootstrapped)");
                     return Ok(store);
@@ -208,6 +251,19 @@ impl PgPayoutAttemptStore {
         Err(format!(
             "payout_attempts postgres unavailable after 10 attempts: {last_err}"
         ))
+    }
+
+    /// Test seam (tests/pg_rls.rs): build a store over pre-connected pools
+    /// without the connect-retry loop or the bootstrap (the test applies the
+    /// DDL itself). NOT used on the production boot path.
+    pub fn from_pools(pool: sqlx::PgPool, internal_pool: sqlx::PgPool) -> Self {
+        Self { pool, internal_pool }
+    }
+
+    /// The app pool (used by main.rs to apply migrations/0001_rls.sql after
+    /// every store's bootstrap DDL has run).
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
     }
 
     async fn bootstrap(&self) -> Result<(), String> {
@@ -246,6 +302,10 @@ impl PgPayoutAttemptStore {
 #[async_trait]
 impl PayoutAttemptStore for PgPayoutAttemptStore {
     async fn record(&self, attempt: &PayoutAttempt) -> Result<(), String> {
+        // SPEC-W47 DB-01: pin the RLS tenant GUC for every statement.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, &attempt.tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         sqlx::query(
             "INSERT INTO payout_attempts
                 (payout_id, tenant_id, amount_cents, currency, payee, state, detail)
@@ -259,26 +319,68 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
         .bind(&attempt.payee)
         .bind(attempt.state.as_str())
         .bind(&attempt.detail)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("payout_attempts insert failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
         Ok(())
     }
 
-    async fn get(&self, payout_id: &str) -> Result<Option<PayoutAttempt>, String> {
+    async fn get_scoped(
+        &self,
+        payout_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<PayoutAttempt>, String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
                     created_at, updated_at
              FROM payout_attempts WHERE payout_id = $1",
         )
         .bind(payout_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("payout_attempts read failed: {e}"))?;
-        row.as_ref().map(Self::row_to_attempt).transpose()
+        let out = row.as_ref().map(Self::row_to_attempt).transpose();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
+    }
+
+    async fn get_internal(&self, payout_id: &str) -> Result<Option<PayoutAttempt>, String> {
+        // Internal pool (role-gated cross-tenant escape): the K20 approval
+        // path learns the tenant from the row, then binds the caller to it.
+        let mut tx = crate::tenant::begin_internal_tx(&self.internal_pool)
+            .await
+            .map_err(|e| format!("payout_attempts internal tx failed: {e}"))?;
+        let row = sqlx::query(
+            "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
+                    created_at, updated_at
+             FROM payout_attempts WHERE payout_id = $1",
+        )
+        .bind(payout_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_attempts internal read failed: {e}"))?;
+        let out = row.as_ref().map(Self::row_to_attempt).transpose();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
     }
 
     async fn list_unknown(&self, limit: i64) -> Result<Vec<PayoutAttempt>, String> {
+        // Internal pool: the reconciler sweeps unknown rows across ALL
+        // tenants; each settlement write is then pinned to the row's own
+        // tenant via mark_scoped.
+        let mut tx = crate::tenant::begin_internal_tx(&self.internal_pool)
+            .await
+            .map_err(|e| format!("payout_attempts internal tx failed: {e}"))?;
         let rows = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
                     created_at, updated_at
@@ -286,18 +388,26 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
              ORDER BY created_at LIMIT $1",
         )
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| format!("payout_attempts sweep read failed: {e}"))?;
-        rows.iter().map(Self::row_to_attempt).collect()
+        let out = rows.iter().map(Self::row_to_attempt).collect::<Result<Vec<_>, _>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
     }
 
-    async fn mark(
+    async fn mark_scoped(
         &self,
         payout_id: &str,
+        tenant_id: &str,
         state: AttemptState,
         detail: Option<&str>,
     ) -> Result<(), String> {
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         sqlx::query(
             "UPDATE payout_attempts SET state = $2, detail = COALESCE($3, detail),
                     updated_at = now()
@@ -306,9 +416,12 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
         .bind(payout_id)
         .bind(state.as_str())
         .bind(detail)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("payout_attempts update failed: {e}"))?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
         Ok(())
     }
 }
@@ -331,7 +444,22 @@ impl PayoutAttemptStore for MemPayoutAttemptStore {
         Ok(())
     }
 
-    async fn get(&self, payout_id: &str) -> Result<Option<PayoutAttempt>, String> {
+    async fn get_scoped(
+        &self,
+        payout_id: &str,
+        tenant_id: &str,
+    ) -> Result<Option<PayoutAttempt>, String> {
+        // DB-01: same no-oracle posture as the Pg store.
+        Ok(self
+            .rows
+            .lock()
+            .await
+            .get(payout_id)
+            .filter(|a| a.tenant_id == tenant_id)
+            .cloned())
+    }
+
+    async fn get_internal(&self, payout_id: &str) -> Result<Option<PayoutAttempt>, String> {
         Ok(self.rows.lock().await.get(payout_id).cloned())
     }
 
@@ -345,14 +473,15 @@ impl PayoutAttemptStore for MemPayoutAttemptStore {
             .collect())
     }
 
-    async fn mark(
+    async fn mark_scoped(
         &self,
         payout_id: &str,
+        tenant_id: &str,
         state: AttemptState,
         detail: Option<&str>,
     ) -> Result<(), String> {
         let mut rows = self.rows.lock().await;
-        if let Some(a) = rows.get_mut(payout_id) {
+        if let Some(a) = rows.get_mut(payout_id).filter(|a| a.tenant_id == tenant_id) {
             a.state = state;
             if let Some(d) = detail {
                 a.detail = Some(d.to_string());
@@ -392,8 +521,9 @@ pub async fn sweep_once(state: &AppState) -> Result<(), String> {
                     "payout_attempts row with unparseable id; marking resolved_failed");
                 state
                     .payout_attempts
-                    .mark(
+                    .mark_scoped(
                         &attempt.payout_id,
+                        &attempt.tenant_id,
                         AttemptState::ResolvedFailed,
                         Some("unparseable payout id"),
                     )
@@ -441,8 +571,9 @@ pub async fn sweep_once(state: &AppState) -> Result<(), String> {
                     Ok(()) => {
                         state
                             .payout_attempts
-                            .mark(
+                            .mark_scoped(
                                 &attempt.payout_id,
+                                &attempt.tenant_id,
                                 AttemptState::ResolvedCommitted,
                                 Some("reconciler: rail confirmed COMMITTED; ledger settled"),
                             )
@@ -458,8 +589,9 @@ pub async fn sweep_once(state: &AppState) -> Result<(), String> {
             RailQueryState::Failed(reason) => {
                 state
                     .payout_attempts
-                    .mark(
+                    .mark_scoped(
                         &attempt.payout_id,
+                        &attempt.tenant_id,
                         AttemptState::ResolvedFailed,
                         Some(&format!("reconciler: {reason}")),
                     )
@@ -533,14 +665,24 @@ mod tests {
         store.record(&attempt(&id, AttemptState::Unknown)).await.unwrap();
         // First record wins on replay.
         store.record(&attempt(&id, AttemptState::Failed)).await.unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        let got = store.get_scoped(&id, "t-rec").await.unwrap().unwrap();
         assert_eq!(got.state, AttemptState::Unknown);
         assert_eq!(store.list_unknown(10).await.unwrap().len(), 1);
+        // DB-01: scoped ops with a foreign tenant are no-ops / invisible.
         store
-            .mark(&id, AttemptState::ResolvedFailed, Some("rail 404"))
+            .mark_scoped(&id, "t-foreign", AttemptState::Failed, None)
             .await
             .unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        assert!(store.get_scoped(&id, "t-foreign").await.unwrap().is_none());
+        assert_eq!(
+            store.get_scoped(&id, "t-rec").await.unwrap().unwrap().state,
+            AttemptState::Unknown
+        );
+        store
+            .mark_scoped(&id, "t-rec", AttemptState::ResolvedFailed, Some("rail 404"))
+            .await
+            .unwrap();
+        let got = store.get_scoped(&id, "t-rec").await.unwrap().unwrap();
         assert_eq!(got.state, AttemptState::ResolvedFailed);
         assert_eq!(got.detail.as_deref(), Some("rail 404"));
         assert_eq!(store.list_unknown(10).await.unwrap().len(), 0);
@@ -567,6 +709,7 @@ mod tests {
             internal_token: None,
             trust_direct_tenant: true,
             database_url: None,
+            internal_database_url: None,
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,
@@ -658,7 +801,7 @@ mod tests {
 
         let got = st
             .payout_attempts
-            .get(&payout_id.to_string())
+            .get_scoped(&payout_id.to_string(), "t-rec")
             .await
             .unwrap()
             .unwrap();
@@ -682,16 +825,20 @@ mod tests {
     async fn pg_store_bootstrap_and_roundtrip() {
         let dsn = std::env::var("PAYMENTS_TEST_DATABASE_URL")
             .expect("PAYMENTS_TEST_DATABASE_URL must point at a real Postgres");
-        let store = PgPayoutAttemptStore::connect_with_retry(&dsn).await.unwrap();
+        let store = PgPayoutAttemptStore::connect_with_retry(&dsn, None).await.unwrap();
         // Bootstrap is idempotent.
-        let store2 = PgPayoutAttemptStore::connect_with_retry(&dsn).await.unwrap();
+        let store2 = PgPayoutAttemptStore::connect_with_retry(&dsn, None).await.unwrap();
         drop(store2);
 
         let id = format!("pg-{}", Uuid::new_v4());
         store.record(&attempt(&id, AttemptState::Unknown)).await.unwrap();
         // First record wins.
         store.record(&attempt(&id, AttemptState::Failed)).await.unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        let got = store.get_scoped(&id, "t-rec").await.unwrap().unwrap();
+        // DB-01: a foreign-tenant scoped read is invisible.
+        assert!(store.get_scoped(&id, "t-foreign").await.unwrap().is_none());
+        // The internal (cross-tenant) read sees the row.
+        assert!(store.get_internal(&id).await.unwrap().is_some());
         assert_eq!(got.state, AttemptState::Unknown);
         assert_eq!(got.amount_cents, 5_000);
         assert_eq!(got.currency, "NGN");
@@ -702,11 +849,20 @@ mod tests {
             .unwrap()
             .iter()
             .any(|a| a.payout_id == id));
+        // DB-01: a foreign-tenant scoped mark must be a no-op.
         store
-            .mark(&id, AttemptState::ResolvedCommitted, Some("rail confirmed"))
+            .mark_scoped(&id, "t-foreign", AttemptState::Failed, None)
             .await
             .unwrap();
-        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(
+            store.get_scoped(&id, "t-rec").await.unwrap().unwrap().state,
+            AttemptState::Unknown
+        );
+        store
+            .mark_scoped(&id, "t-rec", AttemptState::ResolvedCommitted, Some("rail confirmed"))
+            .await
+            .unwrap();
+        let got = store.get_scoped(&id, "t-rec").await.unwrap().unwrap();
         assert_eq!(got.state, AttemptState::ResolvedCommitted);
         assert_eq!(got.detail.as_deref(), Some("rail confirmed"));
         assert!(!store
@@ -747,7 +903,7 @@ mod tests {
 
         let got = st
             .payout_attempts
-            .get(&payout_id.to_string())
+            .get_scoped(&payout_id.to_string(), "t-rec")
             .await
             .unwrap()
             .unwrap();
