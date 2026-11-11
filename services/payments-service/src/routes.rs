@@ -680,7 +680,8 @@ async fn resolve_fw_tx_id(st: &AppState, body: &RefundBody) -> Option<u64> {
     let deposit_id = body.deposit_id?;
     // Provenance is keyed by the ledger id string (hyphenless hex).
     let key = deposit_id.simple().to_string();
-    match st.registry.deposit_provenance(&key).await {
+    // DB-01: provenance read pinned to the authorized request tenant.
+    match st.registry.deposit_provenance(&key, &body.tenant_id).await {
         Ok(Some(p)) => p
             .psp_reference
             .as_deref()
@@ -717,7 +718,8 @@ async fn refund_rail_status(st: &AppState, body: &RefundBody, t: &Transfer) -> (
     }
     let tid = t.id_string();
     // Replay: the durable attempt record is authoritative.
-    match st.transfer_attempts.get(&tid).await {
+    // DB-01: replay detection is tenant-scoped (RLS-pinned).
+    match st.transfer_attempts.get_scoped(&tid, &body.tenant_id).await {
         Ok(Some(att)) => {
             let status = match att.state {
                 TransferAttemptState::Committed => "refunded",
@@ -938,7 +940,7 @@ async fn transfer(
     // outcome (same status + same HTTP code) without re-executing anything.
     if let Some(att) = st
         .transfer_attempts
-        .get(&pid)
+        .get_scoped(&pid, &body.tenant_id)
         .await
         .map_err(|e| ApiError::bad_gateway(format!("transfer attempt store error: {e}")))?
     {
@@ -1326,7 +1328,7 @@ async fn resolve_payee(
         || ApiError::unprocessable(format!("invalid beneficiary {beneficiary_id}"));
     let b = st
         .registry
-        .get_beneficiary(beneficiary_id)
+        .get_beneficiary(beneficiary_id, &body.tenant_id)
         .await
         .map_err(|e| ApiError::bad_gateway(format!("beneficiary store error: {e}")))?
         .ok_or_else(invalid)?;
@@ -1376,7 +1378,7 @@ async fn payout(
     // Idempotent replay: a durable attempt record short-circuits the rail.
     if let Some(attempt) = st
         .payout_attempts
-        .get(&pid)
+        .get_scoped(&pid, &body.tenant_id)
         .await
         .map_err(|e| ApiError::bad_gateway(format!("payout attempt store error: {e}")))?
     {
@@ -1727,9 +1729,13 @@ async fn approve_payout(
 ) -> Result<(StatusCode, Json<PayoutResponse>), ApiError> {
     let payout_id = Uuid::parse_str(id.trim())
         .map_err(|_| ApiError::bad_request("payout id must be a uuid"))?;
+    // DB-01: the approval path learns the tenant from the durable row
+    // (billing's begin_scoped_invoice_tx idiom) — the cross-tenant read runs
+    // on the internal pool, then the caller is bound to the row's tenant
+    // below (authorize_tenant) and every subsequent write is tenant-scoped.
     let attempt = st
         .payout_attempts
-        .get(&payout_id.to_string())
+        .get_internal(&payout_id.to_string())
         .await
         .map_err(|e| ApiError::bad_gateway(format!("payout attempt store error: {e}")))?
         .ok_or_else(|| ApiError::not_found(format!("payout {payout_id} not found")))?;
@@ -1791,7 +1797,12 @@ async fn approve_payout(
             // A concurrent approval already dispatched; mark + replay.
             let _ = st
                 .payout_attempts
-                .mark(&pid, AttemptState::Committed, Some("approved (concurrent dispatch replay)"))
+                .mark_scoped(
+                    &pid,
+                    &attempt.tenant_id,
+                    AttemptState::Committed,
+                    Some("approved (concurrent dispatch replay)"),
+                )
                 .await;
             let t = st
                 .ledger
