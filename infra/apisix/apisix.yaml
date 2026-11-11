@@ -2203,6 +2203,7 @@ routes:
         # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
         allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
@@ -2366,6 +2367,7 @@ routes:
         # api-billing) back to policy: redis.
       cors:
         # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
         allow_origins: "http://localhost:3001,http://localhost:9080"
         allow_methods: "*"
         allow_headers: "*"
