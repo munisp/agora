@@ -40,4 +40,23 @@ impl DaprOutbox {
             .error_for_status()?;
         Ok(())
     }
+
+    /// Publish a pre-serialized CloudEvent JSON value verbatim (SPEC-W49 A1:
+    /// `/internal/events/replay` re-publishes the recorded payload byte-shape
+    /// unchanged, keeping the original event `id` so idempotent consumers
+    /// dedupe a replay against a late original delivery).
+    pub async fn publish_value(&self, payload: &serde_json::Value) -> Result<(), reqwest::Error> {
+        let url = format!(
+            "{}/v1.0/publish/{}/{}",
+            self.base_url, self.pubsub, self.topic
+        );
+        self.http
+            .post(url)
+            .header("content-type", "application/cloudevents+json")
+            .json(payload)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
 }

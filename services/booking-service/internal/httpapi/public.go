@@ -264,6 +264,13 @@ func (s *server) publicPayBooking(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "email is required (flutterwave customer)")
 		return
 	}
+	// SPEC-W49 B2: redirect_url is open-redirect-grade caller input — it is
+	// allow-listed (PUBLIC_PAY_REDIRECT_ALLOW_HOSTS, fail-closed when unset).
+	req.RedirectURL = strings.TrimSpace(req.RedirectURL)
+	if err := bookingops.ValidatePayRedirectURL(req.RedirectURL, s.d.PayRedirectAllowHosts); err != nil {
+		writeError(w, http.StatusBadRequest, bookingops.ErrRedirectNotAllowed.Error())
+		return
+	}
 	booking, err := s.d.Store.GetBooking(r.Context(), site.TenantID, id)
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -319,7 +326,7 @@ func (s *server) publicPayBooking(w http.ResponseWriter, r *http.Request) {
 	if txRef == "" {
 		txRef = key // honest fallback: the idempotency key identifies the hold
 	}
-	if err := s.d.Store.InitializeBookingPaymentTx(r.Context(), site.TenantID, booking.ID, txRef); err != nil {
+	if err := s.d.Store.InitializeBookingPaymentTx(r.Context(), site.TenantID, booking.ID, txRef, res.Link); err != nil {
 		s.mapOpError(w, err)
 		return
 	}

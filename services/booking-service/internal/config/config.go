@@ -155,6 +155,18 @@ type Config struct {
 	MetaMock          string // META_MOCK (default "0")
 	TikTokMock        string // TIKTOK_MOCK (default "0")
 	XMock             string // X_MOCK (default "0")
+	// SPEC-W49 B1: payment-capture reconciliation consumer on
+	// opendesk.payments.events (FlutterwavePaymentCaptured →
+	// payment_status paid). Empty topic disables the consumer.
+	PaymentsEventsTopic string // PAYMENTS_EVENTS_TOPIC (default opendesk.payments.events)
+	PaymentsEventsGroup string // PAYMENTS_EVENTS_GROUP (default booking-service-payments-events)
+	// SPEC-W49 B2: PUBLIC_PAY_REDIRECT_ALLOW_HOSTS — csv of hostnames the
+	// public pay leg's caller-supplied redirect_url may point at (exact or
+	// leading-* parent-domain match, https only). UNSET/EMPTY fails closed:
+	// every non-empty redirect_url is rejected with 400
+	// redirect_url_not_allowed; the empty value (provider default) stays
+	// allowed.
+	PayRedirectAllowHosts []string
 }
 
 // Load reads configuration from the environment.
@@ -268,6 +280,12 @@ func Load() (Config, error) {
 		MetaMock:          envStr("META_MOCK", "0"),
 		TikTokMock:        envStr("TIKTOK_MOCK", "0"),
 		XMock:             envStr("X_MOCK", "0"),
+		// SPEC-W49 B1/B2 (additive): payments-events consumer + pay-redirect
+		// allow-list (fail-closed default — empty list rejects all custom
+		// redirect_urls).
+		PaymentsEventsTopic:   envStr("PAYMENTS_EVENTS_TOPIC", "opendesk.payments.events"),
+		PaymentsEventsGroup:   envStr("PAYMENTS_EVENTS_GROUP", "booking-service-payments-events"),
+		PayRedirectAllowHosts: csvHosts(os.Getenv("PUBLIC_PAY_REDIRECT_ALLOW_HOSTS")),
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
@@ -280,6 +298,19 @@ func Load() (Config, error) {
 			DevPortalSecretDefault, EnvDevInsecure)
 	}
 	return cfg, nil
+}
+
+// csvHosts parses a comma-separated hostname list (SPEC-W49 B2,
+// PUBLIC_PAY_REDIRECT_ALLOW_HOSTS): entries trimmed, lowercased, empties
+// dropped. Empty input → nil (the fail-closed signal for the pay leg).
+func csvHosts(env string) []string {
+	var out []string
+	for _, h := range strings.Split(env, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 func envStr(key, def string) string {

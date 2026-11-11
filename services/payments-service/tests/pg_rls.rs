@@ -44,6 +44,8 @@ mod config;
 mod consumer;
 #[path = "../src/dapr.rs"]
 mod dapr;
+#[path = "../src/event_failures.rs"]
+mod event_failures;
 #[path = "../src/events.rs"]
 mod events;
 #[path = "../src/flutterwave.rs"]
@@ -89,6 +91,7 @@ pub struct AppState {
     pub payout_attempts: Arc<dyn payouts::PayoutAttemptStore>,
     pub registry: Arc<dyn registry::Registry>,
     pub transfer_attempts: Arc<dyn transfers::TransferAttemptStore>,
+    pub event_failures: Arc<dyn event_failures::EventFailureStore>,
     pub ensured_tenants: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub events_published: Arc<AtomicU64>,
     pub events_failed: Arc<AtomicU64>,
@@ -155,6 +158,84 @@ impl AppState {
             }
         });
     }
+    /// Mirror of `src/main.rs::publish_event_reliable` (SPEC-W49 A1:
+    /// retry-with-backoff + durable payment_event_failures record).
+    pub async fn publish_event_reliable<T: Serialize + Send + Sync + 'static>(
+        &self,
+        type_name: &str,
+        tx_ref: &str,
+        tenant_id: &str,
+        data: T,
+    ) {
+        let event = events::CloudEvent::new(
+            "payments-service",
+            &format!("com.opendesk.payments.{type_name}"),
+            tx_ref,
+            tenant_id,
+            data,
+        );
+        let outbox = self.outbox.clone();
+        let failures = self.event_failures.clone();
+        let events_published = self.events_published.clone();
+        let events_failed = self.events_failed.clone();
+        let tx_ref = tx_ref.to_string();
+        let tenant_id = tenant_id.to_string();
+        tokio::spawn(async move {
+            let mut last_err: Option<reqwest::Error> = None;
+            for attempt in 1..=event_failures::PUBLISH_ATTEMPTS {
+                if attempt > 1 {
+                    let backoff = std::time::Duration::from_millis(
+                        event_failures::RETRY_BACKOFF_MS[(attempt - 2) as usize],
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                match outbox.publish(&event).await {
+                    Ok(()) => {
+                        events_published.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(
+                            attempt,
+                            error = %e,
+                            type_ = %event.type_,
+                            tx_ref = %tx_ref,
+                            "dapr pubsub publish failed; retrying"
+                        );
+                        last_err = Some(e);
+                    }
+                }
+            }
+            events_failed.fetch_add(1, Ordering::Relaxed);
+            let err_text = last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "publish failed".to_string());
+            let failure = event_failures::PaymentEventFailure {
+                id: uuid::Uuid::new_v4(),
+                tx_ref: tx_ref.clone(),
+                tenant_id,
+                payload: serde_json::to_value(&event)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                error: err_text.clone(),
+                created_at: chrono::Utc::now(),
+            };
+            if let Err(e) = failures.record(&failure).await {
+                tracing::error!(
+                    error = %e,
+                    publish_error = %err_text,
+                    tx_ref = %tx_ref,
+                    "payment_event_failures record failed; capture event is ONLY in this log line"
+                );
+            } else {
+                tracing::error!(
+                    tx_ref = %tx_ref,
+                    publish_error = %err_text,
+                    "capture event publish exhausted retries; recorded to payment_event_failures \
+                     (replay via POST /internal/events/replay)"
+                );
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +272,7 @@ async fn provision(dsn: &str) -> sqlx::PgPool {
                 payouts::BOOTSTRAP_DDL,
                 registry::BOOTSTRAP_DDL,
                 transfers::BOOTSTRAP_DDL,
+                event_failures::BOOTSTRAP_DDL,
             ] {
                 for stmt in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                     sqlx::query(stmt)

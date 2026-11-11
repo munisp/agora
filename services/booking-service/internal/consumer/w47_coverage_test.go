@@ -53,6 +53,10 @@ var tenantTableKeepList = map[string]string{
 	// Financial / audit spine — retained per A-DB DB-02 ("keep
 	// financial/audit rows"), with PII links anonymized via contacts.
 	"bookings":             "open bookings cancelled; terminal rows are the audit/financial spine",
+	// SPEC-W49 B3: payment-attempt audit (tx_ref reconciliation chain) —
+	// financial audit rows keyed by booking/tx_ref, no customer PII; kept
+	// with the bookings spine they annotate.
+	"booking_payment_attempts": "financial payment-attempt audit (tx_ref reconciliation); no customer PII",
 	"campaigns":            "campaign spine; spend ledger audit (W47 lifecycle adds terminal cancel)",
 	"campaign_spend":       "financial spend ledger",
 	"promo_codes":          "campaign config + redemption-count audit",

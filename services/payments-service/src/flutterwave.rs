@@ -10,7 +10,11 @@
 //!   initialize -> mark-paid flow (NOTE: the billing-engine ledger codes
 //!   200/201/202 belong to that service's invoice ledger; this service's
 //!   LedgerClient models the same flow with its deposit hold/capture codes);
-//! * outbox: best-effort `AppState::publish_event` (ADR-0007 note), events
+//! * outbox: initialize events use best-effort `AppState::publish_event`
+//!   (ADR-0007 note); the CAPTURED event uses SPEC-W49 A1 reliable
+//!   publication (`AppState::publish_event_reliable`: retry-with-backoff +
+//!   durable `payment_event_failures` record + K2-guarded replay route —
+//!   see src/event_failures.rs). Events
 //!   `com.opendesk.payments.FlutterwavePayment{Initialized,Captured}`;
 //! * webhook auth: `verif-hash` header == configured `FLUTTERWAVE_SECRET_HASH`
 //!   compared in CONSTANT TIME (`constant_time_eq` mirrors the Paystack
@@ -709,18 +713,40 @@ async fn webhook(
         Err(e) => return map_ledger_error(e),
     };
 
-    st.publish_event(
+    // SPEC-W49 A1: reliable emission (retry-with-backoff + durable
+    // payment_event_failures record + K2 replay route — see
+    // AppState::publish_event_reliable / src/event_failures.rs for the tier
+    // decision). The payload is enriched to the W49 cross-scope contract
+    // (`tx_ref`, `amount` in MAJOR units, `currency`, `tenant_id`,
+    // `captured_at` RFC3339) that booking-service reconciles on
+    // (`payment_ref == tx_ref`); the pre-W49 camelCase fields are kept
+    // unchanged for existing consumers. Amount comes from the LEDGER result
+    // (the verified, captured amount), never the webhook payload.
+    let captured_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let currency = data
+        .get("currency")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&verified.currency)
+        .to_string();
+    st.publish_event_reliable(
         "FlutterwavePaymentCaptured",
         tx_ref,
         &tenant_id,
         serde_json::json!({
+            // W49 cross-scope contract fields (sacred — do not reshape
+            // without both W49 scopes agreeing):
+            "tx_ref": tx_ref,
+            "amount": result.post.amount as f64 / 100.0,
+            "currency": currency,
+            "tenant_id": tenant_id,
+            "captured_at": captured_at,
+            // Pre-W49 fields (unchanged):
             "txRef": tx_ref,
             "depositId": hold_id.to_string(),
             "flutterwaveId": data.get("id"),
             "postedAmountCents": result.post.amount,
             "revenueCents": result.revenue.amount,
             "platformFeeCents": result.platform_fee.as_ref().map(|t| t.amount),
-            "currency": data.get("currency"),
             "ledgerRef": result.post.id_string(),
         }),
     )
@@ -838,12 +864,26 @@ mod tests {
     use crate::config::Config;
     use crate::consumer::UnavailableDlqSink;
     use crate::dapr::DaprOutbox;
+    use crate::event_failures::MemEventFailureStore;
     use crate::ledger::sim::SimLedgerClient;
     use crate::mojaloop::MojaloopAdapter;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     fn test_state(secret_hash: Option<&str>, fw_base_url: &str) -> AppState {
+        test_state_full(secret_hash, fw_base_url, "http://127.0.0.1:1", None, true)
+    }
+
+    /// Full test-state builder (SPEC-W49 A1/A2): `outbox_url` lets a test
+    /// point the Dapr outbox at a local capture sink; `internal_token` /
+    /// `trust_direct` exercise the K2 replay-route gate.
+    fn test_state_full(
+        secret_hash: Option<&str>,
+        fw_base_url: &str,
+        outbox_url: &str,
+        internal_token: Option<&str>,
+        trust_direct: bool,
+    ) -> AppState {
         let cfg = Config {
             port: 0,
             ledger_impl: "sim".to_string(),
@@ -861,8 +901,8 @@ mod tests {
             mojaloop_endpoint: "http://127.0.0.1:1".to_string(),
             mojaloop_allow_sim: false,
             platform_fee_bps: 0,
-            internal_token: None,
-            trust_direct_tenant: true,
+            internal_token: internal_token.map(|s| s.to_string()),
+            trust_direct_tenant: trust_direct,
             database_url: None,
             internal_database_url: None,
             payout_reconciler_interval_secs: 30,
@@ -872,7 +912,7 @@ mod tests {
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
             outbox: DaprOutbox::new(
-                "http://127.0.0.1:1".to_string(),
+                outbox_url.to_string(),
                 "pubsub".to_string(),
                 "opendesk.payments.events".to_string(),
             ),
@@ -886,13 +926,14 @@ mod tests {
             config: Arc::new(cfg),
             dlq: Arc::new(UnavailableDlqSink),
             auth: crate::auth::AuthConfig::new(
-                None,
-                true,
+                internal_token.map(|s| s.to_string()),
+                trust_direct,
                 vec!["owner".to_string(), "admin".to_string()],
             ),
             payout_attempts: Arc::new(crate::payouts::MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
             transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
+            event_failures: Arc::new(MemEventFailureStore::default()),
             ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),
@@ -1184,5 +1225,341 @@ mod tests {
         ));
         let ad = FlutterwaveAdapter::with_credentials("http://127.0.0.1:1", "sk", None, None);
         assert!(ad.configured());
+    }
+
+    // ------------------------------------------------------------------
+    // SPEC-W49 A2: webhook hardening proofs with a CAPTURED pubsub sink
+    // (test-only stub of the Dapr publish endpoint) — forged verif-hash =>
+    // 401 + no capture + NO event; verify-API failure => 5xx + no capture +
+    // NO event; replay => exactly one capture (at-least-once event OK).
+    // SPEC-W49 A1: publish exhaustion => durable payment_event_failures
+    // record; the K2-guarded replay route re-publishes it verbatim.
+    // ------------------------------------------------------------------
+
+    #[derive(Clone, Default)]
+    struct PubsubSink {
+        events: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    /// Test-only Dapr pubsub sink: POST /v1.0/publish/:pubsub/:topic records
+    /// the CloudEvent body and answers 204 (the axum-stub idiom of
+    /// spawn_verify_stub).
+    async fn spawn_pubsub_sink() -> (String, PubsubSink) {
+        let sink = PubsubSink::default();
+        async fn handler(
+            axum::extract::State(s): axum::extract::State<PubsubSink>,
+            body: axum::body::Bytes,
+        ) -> StatusCode {
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            s.events.lock().unwrap_or_else(|p| p.into_inner()).push(v);
+            StatusCode::NO_CONTENT
+        }
+        let app = Router::new()
+            .route("/v1.0/publish/:pubsub/:topic", axum::routing::post(handler))
+            .with_state(sink.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), sink)
+    }
+
+    fn sink_events(sink: &PubsubSink) -> Vec<serde_json::Value> {
+        sink.events.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Poll `cond` for up to ~5s (publication runs in a spawned task, so
+    /// tests must yield until it lands — or prove it never does).
+    async fn eventually<F: FnMut() -> bool>(mut cond: F) -> bool {
+        for _ in 0..100 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn posted_revenue(st: &AppState, tenant: &str) -> i128 {
+        st.ledger
+            .balance(tenant)
+            .await
+            .unwrap()
+            .accounts
+            .iter()
+            .find(|a| a.account.ends_with(":revenue"))
+            .map(|a| a.posted_net)
+            .unwrap_or(0)
+    }
+
+    /// A2: forged verif-hash => 401, NO capture, NO event (mock verify API +
+    /// captured pubsub sink).
+    #[tokio::test]
+    async fn webhook_forged_hash_captures_nothing_and_emits_no_event() {
+        let hold_id = Uuid::new_v4();
+        let fw_base = spawn_verify_stub(make_tx_ref(hold_id), 12.0, 123).await;
+        let (outbox_url, sink) = spawn_pubsub_sink().await;
+        let st = test_state_full(Some("s3cret"), &fw_base, &outbox_url, None, true);
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "forged".parse().unwrap());
+
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(posted_revenue(&st, "t-1").await, 0, "forged hash moved money");
+        // Give the (never-scheduled) publish path ample time: nothing may
+        // reach the sink and nothing may be recorded as failed.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            sink_events(&sink).is_empty(),
+            "forged webhook must emit no event"
+        );
+        assert_eq!(
+            st.event_failures.list_internal(None, 10).await.unwrap().len(),
+            0,
+            "forged webhook must not touch the failure log"
+        );
+    }
+
+    /// A2 happy path + contract proof: a valid webhook captures ONCE and the
+    /// emitted event carries the W49 cross-scope contract fields
+    /// (tx_ref/amount/currency/tenant_id/captured_at).
+    #[tokio::test]
+    async fn webhook_capture_emits_contract_shaped_event() {
+        let hold_id = Uuid::new_v4();
+        let tx_ref = make_tx_ref(hold_id);
+        let fw_base = spawn_verify_stub(tx_ref.clone(), 12.0, 123).await;
+        let (outbox_url, sink) = spawn_pubsub_sink().await;
+        let st = test_state_full(Some("s3cret"), &fw_base, &outbox_url, None, true);
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            eventually(|| !sink_events(&sink).is_empty()).await,
+            "captured event never reached the pubsub sink"
+        );
+        let events = sink_events(&sink);
+        let ev = events
+            .iter()
+            .find(|e| e["type"] == "com.opendesk.payments.FlutterwavePaymentCaptured")
+            .expect("FlutterwavePaymentCaptured event");
+        assert_eq!(ev["specversion"], "1.0");
+        assert_eq!(ev["source"], "payments-service");
+        assert_eq!(ev["tenantid"], "t-1");
+        let data = &ev["data"];
+        assert_eq!(data["tx_ref"], tx_ref);
+        assert_eq!(data["amount"].as_f64().unwrap(), 12.0, "major units");
+        assert_eq!(data["currency"], "NGN");
+        assert_eq!(data["tenant_id"], "t-1");
+        let captured_at = data["captured_at"].as_str().expect("captured_at string");
+        chrono::DateTime::parse_from_rfc3339(captured_at).expect("captured_at is RFC3339");
+        // Pre-W49 fields still present for existing consumers.
+        assert_eq!(data["postedAmountCents"], 1_200);
+        assert_eq!(
+            st.event_failures.list_internal(None, 10).await.unwrap().len(),
+            0,
+            "successful publish must not touch the failure log"
+        );
+    }
+
+    /// A2 replay: the same webhook delivered twice captures exactly once;
+    /// at-least-once event delivery is acceptable (consumers are idempotent).
+    #[tokio::test]
+    async fn webhook_replay_captures_once_event_at_least_once() {
+        let hold_id = Uuid::new_v4();
+        let fw_base = spawn_verify_stub(make_tx_ref(hold_id), 12.0, 123).await;
+        let (outbox_url, sink) = spawn_pubsub_sink().await;
+        let st = test_state_full(Some("s3cret"), &fw_base, &outbox_url, None, true);
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+
+        let r1 = webhook(State(st.clone()), headers.clone(), webhook_body(hold_id)).await;
+        let r2 = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(
+            posted_revenue(&st, "t-1").await,
+            1_200,
+            "double delivery must not double-capture"
+        );
+        assert!(
+            eventually(|| !sink_events(&sink).is_empty()).await,
+            "at least one captured event must be delivered"
+        );
+    }
+
+    /// A2: verify-API failure => 502 (provider retries), no capture, no event.
+    #[tokio::test]
+    async fn webhook_verify_api_failure_is_5xx_no_capture_no_event() {
+        let hold_id = Uuid::new_v4();
+        let (outbox_url, sink) = spawn_pubsub_sink().await;
+        // fw base URL unreachable => verify_transaction fails.
+        let st = test_state_full(Some("s3cret"), "http://127.0.0.1:1", &outbox_url, None, true);
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(posted_revenue(&st, "t-1").await, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(sink_events(&sink).is_empty(), "verify failure must emit no event");
+        assert_eq!(
+            st.event_failures.list_internal(None, 10).await.unwrap().len(),
+            0
+        );
+    }
+
+    /// A1: with the broker unreachable, all 3 publish attempts fail and the
+    /// FULL CloudEvent is durably recorded (nothing silently lost).
+    #[tokio::test]
+    async fn capture_publish_exhaustion_records_durable_failure() {
+        let hold_id = Uuid::new_v4();
+        let tx_ref = make_tx_ref(hold_id);
+        let fw_base = spawn_verify_stub(tx_ref.clone(), 12.0, 123).await;
+        // Outbox unreachable: connection refused, fast attempts + backoff.
+        let st = test_state(Some("s3cret"), &fw_base);
+        seed_hold(&st, hold_id, 1_200).await;
+        let mut headers = HeaderMap::new();
+        headers.insert("verif-hash", "s3cret".parse().unwrap());
+
+        let resp = webhook(State(st.clone()), headers, webhook_body(hold_id)).await;
+        // Capture itself still succeeds (money path independent of outbox).
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(posted_revenue(&st, "t-1").await, 1_200);
+        // The publish retries (3 attempts, 200ms/800ms backoff) run in the
+        // spawned task; poll until the durable record lands.
+        let mut recorded = false;
+        for _ in 0..100 {
+            if !st
+                .event_failures
+                .list_internal(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(recorded, "failed publish was not durably recorded");
+        let rows = st.event_failures.list_internal(None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "exactly one durable failure record");
+        let row = &rows[0];
+        assert_eq!(row.tx_ref, tx_ref);
+        assert_eq!(row.tenant_id, "t-1");
+        assert!(!row.error.is_empty());
+        assert_eq!(
+            row.payload["type"], "com.opendesk.payments.FlutterwavePaymentCaptured",
+            "the recorded payload is the full CloudEvent, replayable verbatim"
+        );
+        assert_eq!(row.payload["data"]["tx_ref"], tx_ref);
+        assert_eq!(row.payload["data"]["amount"].as_f64().unwrap(), 12.0);
+    }
+
+    /// A1: the replay route is K2-guarded — no token / wrong token => 401
+    /// when a token is configured.
+    #[tokio::test]
+    async fn replay_route_requires_internal_token() {
+        let (outbox_url, _sink) = spawn_pubsub_sink().await;
+        let st = test_state_full(
+            Some("s3cret"),
+            "http://127.0.0.1:1",
+            &outbox_url,
+            Some("internal-tok"),
+            false,
+        );
+        // No token => 401.
+        let resp = crate::event_failures::replay(
+            State(st.clone()),
+            HeaderMap::new(),
+            Json(crate::event_failures::ReplayBody {
+                id: None,
+                tx_ref: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Wrong token => 401.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-internal-token", "nope".parse().unwrap());
+        let resp = crate::event_failures::replay(
+            State(st.clone()),
+            headers,
+            Json(crate::event_failures::ReplayBody {
+                id: None,
+                tx_ref: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A1: a recorded failure is re-published verbatim by the K2-guarded
+    /// replay route and cleared on success (same CloudEvent id retained).
+    #[tokio::test]
+    async fn replay_route_republishes_recorded_failure_verbatim() {
+        let (outbox_url, sink) = spawn_pubsub_sink().await;
+        let st = test_state_full(
+            Some("s3cret"),
+            "http://127.0.0.1:1",
+            &outbox_url,
+            Some("internal-tok"),
+            false,
+        );
+        let tx_ref = make_tx_ref(Uuid::new_v4());
+        let payload = serde_json::json!({
+            "specversion": "1.0",
+            "id": "evt-fixed-id",
+            "source": "payments-service",
+            "type": "com.opendesk.payments.FlutterwavePaymentCaptured",
+            "subject": tx_ref,
+            "time": "2026-01-01T00:00:00.000Z",
+            "tenantid": "t-1",
+            "data": {"tx_ref": tx_ref, "amount": 12.0, "currency": "NGN",
+                     "tenant_id": "t-1", "captured_at": "2026-01-01T00:00:00.000Z"}
+        });
+        let failure = crate::event_failures::PaymentEventFailure {
+            id: Uuid::new_v4(),
+            tx_ref: tx_ref.clone(),
+            tenant_id: "t-1".to_string(),
+            payload: payload.clone(),
+            error: "connect refused".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        st.event_failures.record(&failure).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-internal-token", "internal-tok".parse().unwrap());
+        let resp = crate::event_failures::replay(
+            State(st.clone()),
+            headers,
+            Json(crate::event_failures::ReplayBody {
+                id: Some(failure.id),
+                tx_ref: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = sink_events(&sink);
+        assert_eq!(events.len(), 1, "replay must reach the pubsub sink");
+        assert_eq!(events[0], payload, "republished verbatim (same event id)");
+        assert!(
+            st.event_failures
+                .list_internal(None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "successful replay clears the failure row"
+        );
     }
 }

@@ -733,6 +733,7 @@ mod tests {
             payout_attempts: Arc::new(MemPayoutAttemptStore::default()),
             registry: Arc::new(crate::registry::MemRegistry::default()),
             transfer_attempts: Arc::new(crate::transfers::MemTransferAttemptStore::default()),
+            event_failures: Arc::new(crate::event_failures::MemEventFailureStore::default()),
             ensured_tenants: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             events_published: Arc::new(AtomicU64::new(0)),
             events_failed: Arc::new(AtomicU64::new(0)),

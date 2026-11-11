@@ -757,6 +757,31 @@ func run() error {
 			}
 		}
 		// SPEC-W24 Agent B (WS-B2) — END
+
+		// SPEC-W49 B1 — BEGIN (additive): payment-capture reconciliation
+		// consumer (group booking-service-payments-events) on
+		// opendesk.payments.events. FlutterwavePaymentCaptured →
+		// payment_status 'paid' (payment_ref == tx_ref match within the
+		// tenant), idempotent under at-least-once delivery; unknown tx_ref
+		// and malformed events are acked with a structured warning (never
+		// retry-looped). Success/alert events ride the transactional outbox
+		// (BookingPaymentConfirmed / BookingPaymentAmountMismatch). Empty
+		// topic disables the consumer.
+		if cfg.PaymentsEventsTopic != "" {
+			paymentsConsumer := consumer.NewPaymentsEvents(cfg.KafkaBrokers, cfg.PaymentsEventsTopic, cfg.PaymentsEventsGroup,
+				cfg.DLQTopic, st, cfg.BookingEventsTopic, logger)
+			paymentsHealth := consumerHealth.Register("payments-events")
+			go func() {
+				if err := paymentsConsumer.Run(ctx); err != nil && ctx.Err() == nil {
+					paymentsHealth.Store(false)
+					logger.Error("payments events consumer exited; liveness flag cleared", zap.Error(err))
+				}
+			}()
+			defer paymentsConsumer.Close() //nolint:errcheck
+			logger.Info("payments events consumer started",
+				zap.String("topic", cfg.PaymentsEventsTopic), zap.String("group", cfg.PaymentsEventsGroup))
+		}
+		// SPEC-W49 B1 — END
 	}
 
 	deps := httpapi.Deps{
@@ -805,6 +830,12 @@ func run() error {
 		// (IDENTITY_BASE_URL + IDENTITY_INTERNAL_TOKEN); either empty → the
 		// validator fails closed with 503 per request (never silently open).
 		ExtKeys: apikey.New(cfg.IdentityBaseURL, cfg.IdentityInternalToken, logger),
+		// SPEC-W49 B2: pay-leg redirect_url allow-list — fail-closed when
+		// PUBLIC_PAY_REDIRECT_ALLOW_HOSTS is unset/empty.
+		PayRedirectAllowHosts: cfg.PayRedirectAllowHosts,
+	}
+	if len(cfg.PayRedirectAllowHosts) == 0 {
+		logger.Warn("PUBLIC_PAY_REDIRECT_ALLOW_HOSTS unset — every custom pay-leg redirect_url is rejected (fail closed); empty redirect_url still uses the provider default")
 	}
 	if cfg.IdentityBaseURL == "" || cfg.IdentityInternalToken == "" {
 		logger.Warn("IDENTITY_BASE_URL/IDENTITY_INTERNAL_TOKEN unset — /v1/ext/bookings api-key validation fails closed (503)")

@@ -235,7 +235,7 @@ func TestInitializeBookingPaymentTx(t *testing.T) {
 	bookingID := w48SeedBooking(t, st, tenantID, StatusPending)
 
 	// Happy path: stamps ref + initialized.
-	if err := st.InitializeBookingPaymentTx(ctx, tenantID, bookingID, "tx-1"); err != nil {
+	if err := st.InitializeBookingPaymentTx(ctx, tenantID, bookingID, "tx-1", ""); err != nil {
 		t.Fatalf("init payment: %v", err)
 	}
 	status, ref, err := st.GetBookingPayment(ctx, tenantID, bookingID)
@@ -243,7 +243,7 @@ func TestInitializeBookingPaymentTx(t *testing.T) {
 		t.Fatalf("payment state = %q/%q, %v", status, ref, err)
 	}
 	// Re-initialization over "initialized" is allowed (abandoned checkout).
-	if err := st.InitializeBookingPaymentTx(ctx, tenantID, bookingID, "tx-2"); err != nil {
+	if err := st.InitializeBookingPaymentTx(ctx, tenantID, bookingID, "tx-2", ""); err != nil {
 		t.Fatalf("re-init: %v", err)
 	}
 	// 409: paid is terminal.
@@ -253,11 +253,11 @@ func TestInitializeBookingPaymentTx(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("force paid: %v", err)
 	}
-	if err := st.InitializeBookingPaymentTx(ctx, tenantID, bookingID, "tx-3"); !errors.Is(err, ErrConflict) {
+	if err := st.InitializeBookingPaymentTx(ctx, tenantID, bookingID, "tx-3", ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("paid init err = %v, want ErrConflict", err)
 	}
 	// Tenant isolation: another tenant cannot see/initialize the booking.
-	if err := st.InitializeBookingPaymentTx(ctx, uuid.New(), bookingID, "tx-4"); !errors.Is(err, ErrNotFound) {
+	if err := st.InitializeBookingPaymentTx(ctx, uuid.New(), bookingID, "tx-4", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-tenant init err = %v, want ErrNotFound", err)
 	}
 	if _, _, err := st.GetBookingPayment(ctx, uuid.New(), bookingID); !errors.Is(err, ErrNotFound) {

@@ -538,7 +538,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
          # HELP payments_events_published_total Outbox events published (best-effort).\n\
          # TYPE payments_events_published_total counter\n\
          payments_events_published_total {}\n\
-         # HELP payments_events_failed_total Outbox publish failures (reconciler republishes).\n\
+         # HELP payments_events_failed_total Outbox publish failures (W49: durable payment_event_failures record; replay via /internal/events/replay).\n\
          # TYPE payments_events_failed_total counter\n\
          payments_events_failed_total {}\n",
         st.commands_processed.load(Ordering::Relaxed),

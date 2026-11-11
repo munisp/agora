@@ -145,3 +145,45 @@ in-repo caller is the admin-web claim page, SPEC-W45 K13):
 
 Integrators embedding a booking widget may rely on the same claim-link
 shape: the token in the link is the entire authorization for one claim.
+
+## 7. `opendesk.payments.events` — payments-service (SPEC-W49 A3)
+
+Producer: payments-service (`PAYMENTS_EVENTS_TOPIC`, default
+`opendesk.payments.events`) via Dapr pubsub `pubsub-kafka`. The ledger
+(TigerBeetle-compatible, ADR-0007) commits FIRST; events are published after
+the durable ledger write. The topic also carries `DepositHeld`,
+`DepositCaptured`, `RefundPosted`, `NoShowFeePosted`, `PayoutPosted`,
+`HoldVoided` (see `services/payments-service/src/routes.rs`).
+
+| Type | `data` payload |
+|---|---|
+| `com.opendesk.payments.FlutterwavePaymentInitialized` | `{txRef, depositId, bookingId, amountCents, currency, ledgerRef}` |
+| `com.opendesk.payments.FlutterwavePaymentCaptured` | `{tx_ref, amount, currency, tenant_id, captured_at}` **contract fields** + `{txRef, depositId, flutterwaveId, postedAmountCents, revenueCents, platformFeeCents?, ledgerRef}` |
+
+**W49 cross-scope contract (booking-service ↔ payments-service).**
+`FlutterwavePaymentCaptured` is emitted by `POST /webhooks/flutterwave`
+after the charge is verified server-side and the deposit hold is captured
+(code 101). `data` carries at minimum:
+
+- `tx_ref` (string) — `fw-{hold_uuid}`; booking-service reconciles on
+  `payment_ref == tx_ref`;
+- `amount` (number, MAJOR units — e.g. `1250.00` for ₦1,250; the verified,
+  ledger-captured amount, never the webhook's self-declared amount);
+- `currency` (string);
+- `tenant_id` (string — duplicated on the CloudEvents `tenantid` extension);
+- `captured_at` (RFC3339 timestamp).
+
+**Delivery semantics: at-least-once; consumers MUST be idempotent.**
+Publication is reliable since SPEC-W49 A1: retry-with-backoff (3 attempts),
+then the full CloudEvent is recorded in the durable
+`payment_event_failures` table (no capture event is silently lost) and can
+be re-emitted verbatim — same event `id` — via the K2-guarded
+`POST /internal/events/replay`, so dedupe keyed on event `id` is safe.
+Pre-W49 the publish was best-effort fire-and-forget.
+`FlutterwavePaymentInitialized` remains best-effort. Publish failures are
+visible via `payments_events_failed_total` on `/metrics`.
+
+Consumer (SPEC-W49 B1): **booking-service** consumes
+`FlutterwavePaymentCaptured` to transition booking `payment_status`
+`initialized → paid` (idempotent replay = ack no-op; unknown `tx_ref` =
+warn + ack; amount mismatch = `paid_amount_mismatch`).

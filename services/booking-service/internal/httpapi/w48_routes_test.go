@@ -135,6 +135,9 @@ func (f *w48Fixture) buildRouter(overlay Deps, payments *bookingops.PaymentsClie
 		Authz:             overlay.Authz,
 		AuthzDisabled:     overlay.AuthzDisabled,
 		AuthzOutagePolicy: overlay.AuthzOutagePolicy,
+		// SPEC-W49 B2: pay-leg redirect_url allow-list overlay (nil = the
+		// fail-closed posture).
+		PayRedirectAllowHosts: overlay.PayRedirectAllowHosts,
 	}
 	return NewRouter(d)
 }

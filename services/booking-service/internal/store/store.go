@@ -144,6 +144,12 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W49 (W49-B item B3): booking_payment_attempts audit table
+	// (checkout supersede chain + capture reconciliation, RLS-enabled).
+	if err := s.ensureBookingPaymentAttemptsTable(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// SPEC-W45 CODER-A item 5: contacts dedupe — fold duplicate
 	// (tenant_id, phone) rows and create the UNIQUE index (fresh installs
 	// get it from 01-booking-schema.sql directly).

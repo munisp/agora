@@ -7,6 +7,9 @@
 -- by payout_id only, so any holder of the DSN could read/update every
 -- tenant's rows (payee party_id_info = financial PII).
 --
+-- (SPEC-W49 A1 added payment_event_failures, covered by the same
+-- tenant_isolation policy below.)
+--
 -- This migration closes the hole at the database layer, mirroring
 -- billing-engine/migrations/0002_rls.sql (the platform idiom):
 --
@@ -158,6 +161,19 @@ ALTER TABLE rail_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE rail_attempts FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON rail_attempts;
 CREATE POLICY tenant_isolation ON rail_attempts
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
+           OR pg_has_role(current_user, 'app_payments_internal', 'member'))
+    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
+           OR pg_has_role(current_user, 'app_payments_internal', 'member'));
+
+-- SPEC-W49 A1: durable failed-event log (capture events whose Dapr pubsub
+-- publication exhausted every retry). Same tenant_isolation posture: writes
+-- are pinned to the event's tenant GUC; the K2-guarded replay route reads
+-- and deletes through the internal role escape.
+ALTER TABLE payment_event_failures ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payment_event_failures FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON payment_event_failures;
+CREATE POLICY tenant_isolation ON payment_event_failures
     USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')
            OR pg_has_role(current_user, 'app_payments_internal', 'member'))
     WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')

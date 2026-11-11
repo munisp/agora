@@ -169,6 +169,14 @@ type Deps struct {
 	// (tenant auth + manage_bookings) and the internal sla-breach callback.
 	// Nil → those routes answer 503.
 	Civic *civic.Service
+
+	// PayRedirectAllowHosts is the SPEC-W49 B2 allow-list for the public
+	// pay leg's caller-supplied redirect_url
+	// (PUBLIC_PAY_REDIRECT_ALLOW_HOSTS: exact hosts or leading-`*`
+	// parent-domain entries, https only). Nil/empty FAILS CLOSED — every
+	// non-empty redirect_url is rejected 400 redirect_url_not_allowed; the
+	// empty value (provider default) stays allowed.
+	PayRedirectAllowHosts []string
 }
 
 type ctxKey string

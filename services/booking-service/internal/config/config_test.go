@@ -88,3 +88,43 @@ func TestWBAdditiveEnvs(t *testing.T) {
 		t.Fatalf("additive envs not loaded: %+v", cfg)
 	}
 }
+
+// SPEC-W49 B1/B2 additive envs: payments-events consumer topic/group
+// defaults and the pay-redirect allow-list csv parse (fail-closed empty).
+func TestW49PaymentEnvs(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x:x@localhost/x")
+	t.Setenv("PORTAL_SECRET", "prod-secret-9f2c")
+	t.Setenv("PAYMENTS_EVENTS_TOPIC", "")
+	t.Setenv("PAYMENTS_EVENTS_GROUP", "")
+	t.Setenv("PUBLIC_PAY_REDIRECT_ALLOW_HOSTS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PaymentsEventsTopic != "opendesk.payments.events" || cfg.PaymentsEventsGroup != "booking-service-payments-events" {
+		t.Fatalf("payments consumer defaults = %q/%q", cfg.PaymentsEventsTopic, cfg.PaymentsEventsGroup)
+	}
+	if len(cfg.PayRedirectAllowHosts) != 0 {
+		t.Fatalf("unset allow-list must stay empty (fail closed): %v", cfg.PayRedirectAllowHosts)
+	}
+
+	t.Setenv("PAYMENTS_EVENTS_TOPIC", "custom.payments")
+	t.Setenv("PAYMENTS_EVENTS_GROUP", "g1")
+	t.Setenv("PUBLIC_PAY_REDIRECT_ALLOW_HOSTS", " Pay.Acme.NG , *.opendesk.ng ,, ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PaymentsEventsTopic != "custom.payments" || cfg.PaymentsEventsGroup != "g1" {
+		t.Fatalf("payments consumer envs not loaded: %q/%q", cfg.PaymentsEventsTopic, cfg.PaymentsEventsGroup)
+	}
+	want := []string{"pay.acme.ng", "*.opendesk.ng"}
+	if len(cfg.PayRedirectAllowHosts) != len(want) {
+		t.Fatalf("allow-list = %v, want %v", cfg.PayRedirectAllowHosts, want)
+	}
+	for i := range want {
+		if cfg.PayRedirectAllowHosts[i] != want[i] {
+			t.Fatalf("allow-list[%d] = %q, want %q (trimmed/lowercased)", i, cfg.PayRedirectAllowHosts[i], want[i])
+		}
+	}
+}
