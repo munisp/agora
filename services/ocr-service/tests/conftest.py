@@ -1,0 +1,293 @@
+"""Shared fixtures + fakes for ocr-service tests (SPEC-W53 Scope A).
+
+OFFLINE contract: no network (local in-process stub servers only), no
+model download. All external systems are fakes/stubs defined HERE —
+production code has no mock paths other than the OCR_MOCK gate.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import sys
+import threading
+import zlib
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+sys.path.insert(0, ".")
+
+from app import main as main_module  # noqa: E402
+from app.config import settings  # noqa: E402
+
+TENANT_A = "11111111-2222-3333-4444-555555555555"
+TENANT_B = "99999999-8888-7777-6666-555555555555"
+INTERNAL_TOKEN = "test-internal-token"
+
+
+# ---------------------------------------------------------------------------
+# byte fixtures (built in pure python — no Pillow, no network)
+# ---------------------------------------------------------------------------
+def make_png(width: int = 16, height: int = 16, seed: int = 7) -> bytes:
+    """Minimal valid non-interlaced 8-bit RGB PNG."""
+    def chunk(ctype: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + ctype
+            + payload
+            + struct.pack(">I", zlib.crc32(ctype + payload) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)  # filter type 0
+        for x in range(width):
+            rows += bytes(((x * seed + y) % 256, (y * seed) % 256, (x + y) % 256))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(rows)))
+        + chunk(b"IEND", b"")
+    )
+
+
+def make_jpeg() -> bytes:
+    # magic + plausible JFIF-ish body (validation only sniffs magic).
+    return b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + b"\x00" * 64
+
+
+def make_webp() -> bytes:
+    payload = b"WEBPVP8 " + b"\x00" * 32
+    return b"RIFF" + struct.pack("<I", len(payload)) + payload
+
+
+def make_pdf(pages: int = 2) -> bytes:
+    """Fake-but-sniffable PDF with `pages` /Type /Page objects (mock mode
+    never rasterizes; pdf_page_count counts the objects)."""
+    objs = b"".join(
+        b"%d 0 obj\n<< /Type /Page /Parent 0 0 R >>\nendobj\n" % (i + 1)
+        for i in range(pages)
+    )
+    return b"%PDF-1.4\n" + objs + b"trailer\n<< >>\n%%EOF\n"
+
+
+# ---------------------------------------------------------------------------
+# fakes
+# ---------------------------------------------------------------------------
+class FakeConn:
+    """asyncpg-shaped connection bound to one tenant; rows live on FakeDB."""
+
+    def __init__(self, db: "FakeDB", tenant_id: str):
+        self._db = db
+        self._tenant = tenant_id
+
+    # The routes call Database helper classmethods with this conn; the fakes
+    # below shadow them via FakeDB overriding the helpers' conn protocol.
+
+
+class FakeDB:
+    """In-memory ocr_documents store enforcing tenant isolation."""
+
+    def __init__(self):
+        self.rows: dict[str, dict[str, Any]] = {}  # str(id) -> row
+        self.transitions: list[tuple[str, str]] = []  # (id, new_status)
+
+    @asynccontextmanager
+    async def tenant_conn(self, tenant_id):
+        yield _TenantScope(self, tenant_id)
+
+    async def ping(self) -> bool:
+        return True
+
+    # Database helper API (classmethods in the real impl) ----------------
+    async def insert_document(self, scope, doc: dict[str, Any]) -> None:
+        assert doc["tenant_id"] == scope.tenant_id, "cross-tenant insert"
+        self.rows[str(doc["id"])] = {
+            **doc,
+            "id": doc["id"],
+            "status": "uploaded",
+            "model_version": "",
+            "extracted_text": None,
+            "extracted_fields": None,
+            "error": None,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        self.transitions.append((str(doc["id"]), "uploaded"))
+
+    async def mark_extracted(self, scope, document_id, **kw) -> None:
+        row = self._owned(scope, document_id)
+        row.update(kw)
+        row["status"] = "extracted"
+        row["error"] = None
+        self.transitions.append((str(document_id), "extracted"))
+
+    async def mark_failed(self, scope, document_id, *, error: str) -> None:
+        row = self._owned(scope, document_id)
+        row["status"] = "failed"
+        row["error"] = error
+        self.transitions.append((str(document_id), "failed"))
+
+    async def get_document(self, scope, document_id):
+        return self._owned(scope, document_id, missing_ok=True)
+
+    def _owned(self, scope, document_id, missing_ok=False):
+        row = self.rows.get(str(document_id))
+        if row is None or row["tenant_id"] != scope.tenant_id:
+            if missing_ok:
+                return None
+            raise AssertionError("cross-tenant or missing row")
+        return row
+
+
+class _TenantScope:
+    def __init__(self, db: FakeDB, tenant_id: str):
+        self.db = db
+        self.tenant_id = tenant_id
+
+
+class FakeMinio:
+    def __init__(self):
+        self.objects: dict[tuple[str, str], bytes] = {}
+
+    @property
+    def bucket(self) -> str:
+        return "documents"
+
+    async def put(self, key: str, data: bytes, mime: str) -> None:
+        self.objects[(self.bucket, key)] = data
+
+
+class FakeDapr:
+    """Captures published messages: [(pubsub, topic, payload)]."""
+
+    def __init__(self):
+        self.published: list[tuple[str, str, Any]] = []
+
+    async def publish(self, pubsub: str, topic: str, data: Any, **_kw) -> None:
+        self.published.append((pubsub, topic, json.loads(json.dumps(data))))
+
+    async def invoke(self, *a, **k):  # UUID tenants never reach this
+        raise AssertionError("identity lookup not expected in tests")
+
+    async def aclose(self) -> None:
+        pass
+
+
+class FakeDeps:
+    def __init__(self, db=None, documents=None, dapr=None, ocr=None):
+        self.db = db or FakeDB()
+        self.documents = documents or FakeMinio()
+        self.dapr = dapr or FakeDapr()
+        self.ocr = ocr  # only used when OCR_MOCK is false
+
+
+@pytest.fixture
+def deps():
+    return FakeDeps()
+
+
+@pytest.fixture
+def client(deps, monkeypatch):
+    """Bare FastAPI app with the real routes + fake deps (lifespan skipped)."""
+    monkeypatch.setattr(settings, "ocr_mock", True)
+    monkeypatch.setattr(settings, "internal_token", INTERNAL_TOKEN)
+    monkeypatch.setattr(settings, "trust_direct_tenant", False)
+    monkeypatch.setattr(settings, "ocr_max_bytes", 25 * 1024 * 1024)
+    # Copy routes WITHOUT include_router — FastAPI 0.115 merges the
+    # source router's lifespan (real DB/Dapr connect) on include_router;
+    # appending routes directly keeps the test app lifespan-free.
+    test_app = FastAPI()
+    for route in main_module.app.router.routes:
+        test_app.router.routes.append(route)
+    test_app.state.deps = deps
+    with TestClient(test_app) as c:
+        yield c
+
+
+# ---------------------------------------------------------------------------
+# local stub HTTP server (llama-server / document_url fetches) — LOOPBACK ONLY
+# ---------------------------------------------------------------------------
+class StubServer:
+    def __init__(self, handler):
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def make_chat_completion_stub(content: str) -> tuple[StubServer, list[dict]]:
+    """Stub llama-server: captures POST /v1/chat/completions bodies."""
+    captured: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            captured.append({"path": self.path, "json": json.loads(body)})
+            payload = json.dumps(
+                {
+                    "id": "chatcmpl-stub",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": content}}
+                    ],
+                    "model": "minicpm-ocr",
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *a):  # silence
+            pass
+
+    return StubServer(Handler), captured
+
+
+def make_failing_stub(status: int = 500) -> StubServer:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self.send_response(status)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    return StubServer(Handler)
+
+
+def make_download_stub(data: bytes, filename_ok: bool = True) -> StubServer:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    return StubServer(Handler)

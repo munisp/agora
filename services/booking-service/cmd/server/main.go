@@ -380,10 +380,22 @@ func run() error {
 		fieldCaptureHandlers = &fieldcapture.Handlers{
 			Svc:        &fieldcapture.Service{Store: fs, Leads: leadSvc, Civic: civicSvc, Log: logger},
 			BatchLimit: cfg.FieldCaptureBatchLimit,
-			Log:        logger,
+			// SPEC-W53 Scope B (additive): receipt OCR via ocr-service
+			// (POST /v1/field/captures/{id}/receipt). Fail-CLOSED: either
+			// OCR_SERVICE_URL or OCR_INTERNAL_TOKEN unset → the endpoint
+			// answers 503; the capture flush path is unaffected.
+			OCR: fieldcapture.NewOCRClient(cfg.OCRServiceURL, cfg.OCRInternalToken, logger),
+			Log: logger,
 		}
 	}
 	// SPEC-W16 Agent B — END
+	// SPEC-W53 Scope B (additive): receipt-OCR posture WARN at boot
+	// (never a startup error — the endpoint itself owns the 503).
+	if cfg.OCRServiceURL == "" || cfg.OCRInternalToken == "" {
+		logger.Warn("OCR_SERVICE_URL/OCR_INTERNAL_TOKEN unset — POST /v1/field/captures/{id}/receipt fails closed (503)",
+			zap.Bool("ocr_service_url_set", cfg.OCRServiceURL != ""),
+			zap.Bool("ocr_internal_token_set", cfg.OCRInternalToken != ""))
+	}
 
 	// SPEC-W19 integrator — BEGIN (additive): the helpdesk, field-service
 	// and loyalty app stores (campaign-studio is hoisted above for the
@@ -825,6 +837,15 @@ func run() error {
 		Social:        socialDeps,           // SPEC-W21 integrator (additive): /v1/social gated behind app "social-publisher" (opt-in)
 		Civic:         civicSvc,             // SPEC-W32 WS-A (additive): /v1/civic public intake + operator console
 		Health:        consumerHealth,       // SPEC-W43 K-09: consumer liveness flags read by /healthz
+		// SPEC-W53 Scope B (W52 residual cleanup, per the W52-B deviation
+		// note): config pass-through for the geo enrichment client + the
+		// public-create coverage-zone gate. Explicit Deps win over the
+		// httpapi.NewRouter env fallback, which reads the SAME env vars
+		// (GEO_SERVICE_URL / BOOKING_GEO_ENFORCE) config.Load already read —
+		// behavior-identical either way; the fallback is now dead code for
+		// the server.go owner to remove.
+		GeoEnrich:         geo.NewEnrichClient(cfg.GeoServiceURL, logger),
+		BookingGeoEnforce: cfg.BookingGeoEnforce,
 		// SPEC-W45 K17 (booking half): X-Api-Key validation for the ext
 		// bookings surface. Reuses the W44 identity config
 		// (IDENTITY_BASE_URL + IDENTITY_INTERNAL_TOKEN); either empty → the

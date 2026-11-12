@@ -1,0 +1,13 @@
+# ocr-service runtime deps (fully pinned, SPEC-W53 test gate 1).
+fastapi==0.115.6
+uvicorn==0.30.6
+httpx==0.27.2
+asyncpg==0.29.0
+structlog==24.4.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
+prometheus-client==0.21.1
+python-multipart==0.0.12
+# Official MinIO client — pure-Python, ~1 MB wheel (+ certifi/urllib3/
+# argon2-cffi/pycryptodome). Slim enough for I5; see README rationale.
+minio==7.2.15

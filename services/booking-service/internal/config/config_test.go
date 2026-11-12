@@ -128,3 +128,41 @@ func TestW49PaymentEnvs(t *testing.T) {
 		}
 	}
 }
+
+// SPEC-W53 Scope B: OCR envs default EMPTY (fail-closed — the receipt
+// endpoint then answers 503) and pass through when set; the W52 residual
+// GEO fields pass through for the main.go Deps wiring (previously read as
+// env fallbacks inside httpapi.NewRouter — same values, behavior-identical).
+func TestW53OCRAndGeoEnvs(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x:x@localhost/x")
+	t.Setenv("PORTAL_SECRET", "prod-secret-9f2c")
+	t.Setenv("OCR_SERVICE_URL", "")
+	t.Setenv("OCR_INTERNAL_TOKEN", "")
+	t.Setenv("GEO_SERVICE_URL", "")
+	t.Setenv("BOOKING_GEO_ENFORCE", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OCRServiceURL != "" || cfg.OCRInternalToken != "" {
+		t.Fatalf("OCR envs must default empty (fail closed): %+v", cfg)
+	}
+	if cfg.GeoServiceURL != "" || cfg.BookingGeoEnforce {
+		t.Fatalf("GEO defaults = %q/%v, want empty/false", cfg.GeoServiceURL, cfg.BookingGeoEnforce)
+	}
+
+	t.Setenv("OCR_SERVICE_URL", "http://ocr:7020")
+	t.Setenv("OCR_INTERNAL_TOKEN", "ocr-tok")
+	t.Setenv("GEO_SERVICE_URL", "http://geo-service:7010")
+	t.Setenv("BOOKING_GEO_ENFORCE", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OCRServiceURL != "http://ocr:7020" || cfg.OCRInternalToken != "ocr-tok" {
+		t.Fatalf("OCR envs not loaded: %+v", cfg)
+	}
+	if cfg.GeoServiceURL != "http://geo-service:7010" || !cfg.BookingGeoEnforce {
+		t.Fatalf("GEO pass-through not loaded: %q/%v", cfg.GeoServiceURL, cfg.BookingGeoEnforce)
+	}
+}

@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Check, Plus, Search, Sparkles, Trash2, X } from "lucide-react";
+import { Check, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -27,6 +27,13 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);
+  const [scanning, setScanning] = React.useState(false);
+  /** SPEC-W53: OCR-extracted draft that pre-fills the add dialog. */
+  const [prefill, setPrefill] = React.useState<{
+    title: string;
+    body: string;
+    source_url: string;
+  } | null>(null);
   const [deleting, setDeleting] = React.useState<KnowledgeDocument | null>(null);
   const [busy, setBusy] = React.useState(false);
 
@@ -132,9 +139,14 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
         title="Knowledge base"
         description="Documents that ground the receptionist's answers (hybrid BM25 + vector search)."
         actions={
-          <Button size="sm" onClick={() => setAdding(true)}>
-            <Plus className="h-4 w-4" /> Add document
-          </Button>
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setScanning(true)}>
+              <Upload className="h-4 w-4" /> Upload scan
+            </Button>
+            <Button size="sm" onClick={() => setAdding(true)}>
+              <Plus className="h-4 w-4" /> Add document
+            </Button>
+          </div>
         }
       />
       {error ? <ErrorNote message={error} /> : null}
@@ -235,8 +247,22 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
       <AddDocumentDialog
         open={adding}
         busy={busy}
-        onClose={() => setAdding(false)}
+        initial={prefill}
+        onClose={() => {
+          setAdding(false);
+          setPrefill(null);
+        }}
         onAdd={add}
+      />
+      <ScanUploadDialog
+        orgSlug={orgSlug}
+        open={scanning}
+        onClose={() => setScanning(false)}
+        onUseText={(draft) => {
+          setScanning(false);
+          setPrefill(draft);
+          setAdding(true);
+        }}
       />
       <ConfirmDialog
         open={deleting !== null}
@@ -255,11 +281,14 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
 function AddDocumentDialog({
   open,
   busy,
+  initial,
   onClose,
   onAdd,
 }: {
   open: boolean;
   busy: boolean;
+  /** SPEC-W53: OCR-extracted draft to pre-fill the form with, if any. */
+  initial?: { title: string; body: string; source_url: string } | null;
   onClose: () => void;
   onAdd: (form: { title: string; body: string; source_url: string }) => void;
 }) {
@@ -269,11 +298,11 @@ function AddDocumentDialog({
 
   React.useEffect(() => {
     if (open) {
-      setTitle("");
-      setBody("");
-      setSourceUrl("");
+      setTitle(initial?.title ?? "");
+      setBody(initial?.body ?? "");
+      setSourceUrl(initial?.source_url ?? "");
     }
-  }, [open]);
+  }, [open, initial]);
 
   const valid = title.trim().length > 0 && body.trim().length > 0;
 
@@ -283,6 +312,12 @@ function AddDocumentDialog({
         <DialogHeader>
           <DialogTitle>Add document</DialogTitle>
         </DialogHeader>
+        {initial?.body ? (
+          <p className="mb-1 rounded-md border border-border bg-accent px-3 py-2 text-xs text-muted-foreground">
+            Pre-filled from an OCR scan — review the extracted text for
+            recognition errors before adding it to the knowledge base.
+          </p>
+        ) : null}
         <div className="grid gap-4">
           <div className="grid gap-1.5">
             <Label htmlFor="kb-title">Title</Label>
@@ -589,6 +624,273 @@ function ApproveSuggestionDialog({
             {busy ? "Publishing…" : "Approve & publish"}
           </Button>
         </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* SPEC-W53 Scope C: scan/image/PDF upload via the ocr-service.        */
+/* ------------------------------------------------------------------ */
+
+/** Extensions the ocr-service accepts (magic bytes verified server-side). */
+const SCAN_ACCEPT = ".jpg,.jpeg,.png,.webp,.pdf";
+/** Mirror of the ocr-service hard cap (OCR_MAX_BYTES, 25 MB). */
+const SCAN_MAX_BYTES = 25 * 1024 * 1024;
+
+interface ScanExtraction {
+  documentId: string | null;
+  status: string | null;
+  pageCount: number | null;
+  /** Extracted markdown/text ready for the knowledge ingest path. */
+  text: string | null;
+  /** First few structured fields, for the confirmation summary. */
+  fields: [string, string][];
+}
+
+function asString(v: unknown): string | null {
+  return typeof v === "string" && v.trim() !== "" ? v : null;
+}
+
+/**
+ * Tolerant decode of the ocr-service extract response
+ * {document_id, status, extracted_fields, page_count}. The extracted body
+ * text rides either as top-level `extracted_text` or as a text/markdown key
+ * inside extracted_fields — accept both so the A-side contract can settle
+ * without another UI change.
+ */
+function normalizeExtraction(data: unknown): ScanExtraction {
+  const o = (typeof data === "object" && data !== null ? data : {}) as Record<
+    string,
+    unknown
+  >;
+  const fieldsRaw =
+    typeof o.extracted_fields === "object" && o.extracted_fields !== null
+      ? (o.extracted_fields as Record<string, unknown>)
+      : {};
+  const pageCount =
+    typeof o.page_count === "number" && Number.isFinite(o.page_count)
+      ? o.page_count
+      : null;
+  const text =
+    asString(o.extracted_text) ??
+    asString(fieldsRaw.markdown) ??
+    asString(fieldsRaw.text) ??
+    asString(fieldsRaw.content);
+  const fields: [string, string][] = [];
+  for (const [k, v] of Object.entries(fieldsRaw)) {
+    if (fields.length >= 5) break;
+    if (typeof v === "string" && v.trim() !== "" && v.length <= 120) {
+      fields.push([k, v.trim()]);
+    } else if (typeof v === "number" && Number.isFinite(v)) {
+      fields.push([k, String(v)]);
+    }
+  }
+  return {
+    documentId: asString(o.document_id),
+    status: asString(o.status),
+    pageCount,
+    text,
+    fields,
+  };
+}
+
+/**
+ * Upload a scanned document/photo → ocr-service → review the extraction →
+ * confirm into the EXISTING knowledge ingest path (the same
+ * POST /api/knowledge/v1/documents the textarea uses, via AddDocumentDialog).
+ *
+ * Multipart POST goes through the BFF binary passthrough (W52-D) to
+ * /api/ocr/v1/ocr/extract with kind=knowledge_scan; api.post is JSON-only so
+ * this fetch mirrors its x-tenant-slug header convention directly (same
+ * pattern as locations/boundary-import.tsx).
+ */
+function ScanUploadDialog({
+  orgSlug,
+  open,
+  onClose,
+  onUseText,
+}: {
+  orgSlug: string;
+  open: boolean;
+  onClose: () => void;
+  onUseText: (draft: { title: string; body: string; source_url: string }) => void;
+}) {
+  const [file, setFile] = React.useState<File | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [result, setResult] = React.useState<ScanExtraction | null>(null);
+
+  React.useEffect(() => {
+    if (open) {
+      setFile(null);
+      setError(null);
+      setResult(null);
+    }
+  }, [open]);
+
+  const pick = (f: File | null) => {
+    setResult(null);
+    setError(null);
+    if (f && f.size > SCAN_MAX_BYTES) {
+      setFile(null);
+      setError("File exceeds the 25 MB upload cap — compress or split it and retry.");
+      return;
+    }
+    setFile(f);
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!file || busy) return;
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      form.append("kind", "knowledge_scan");
+      const res = await fetch("/api/ocr/v1/ocr/extract", {
+        method: "POST",
+        headers: { "x-tenant-slug": orgSlug, accept: "application/json" },
+        body: form,
+        cache: "no-store",
+      });
+      const text = await res.text();
+      let data: unknown = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = text;
+        }
+      }
+      if (!res.ok) throw new ApiError(res.status, data);
+      const extraction = normalizeExtraction(data);
+      if (extraction.status === "failed") {
+        const msg =
+          typeof data === "object" && data !== null && "error" in data
+            ? String((data as { error: unknown }).error)
+            : "extraction failed";
+        throw new Error(`The OCR service could not extract this document: ${msg}`);
+      }
+      setResult(extraction);
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "Extraction failed — the ocr-service may be offline.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const useText = () => {
+    if (!result?.text || !file) return;
+    const stem = file.name.replace(/\.[^.]+$/, "").trim() || "Scanned document";
+    onUseText({ title: stem, body: result.text, source_url: "" });
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent onClose={onClose} className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Upload a scan</DialogTitle>
+        </DialogHeader>
+        <p className="mb-4 text-sm text-muted-foreground">
+          Upload a photo or PDF of a document. The OCR service extracts the
+          text with a local vision model; you review it, then add it to the
+          knowledge base.
+        </p>
+
+        {error ? <ErrorNote message={error} /> : null}
+
+        {result ? (
+          <div className="space-y-3">
+            <div className="rounded-md border border-border bg-accent px-3 py-2 text-sm">
+              <p className="font-medium">
+                Extracted {result.text ? result.text.length.toLocaleString() : 0}{" "}
+                characters
+                {result.pageCount !== null
+                  ? ` from ${result.pageCount} page${result.pageCount === 1 ? "" : "s"}`
+                  : ""}
+              </p>
+              {result.documentId ? (
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  Document <span className="font-mono">{result.documentId}</span>
+                  {result.status ? ` · ${result.status}` : ""}
+                </p>
+              ) : null}
+            </div>
+            {result.fields.length > 0 ? (
+              <dl className="rounded-md border border-border px-3 py-2 text-xs">
+                {result.fields.map(([k, v]) => (
+                  <div key={k} className="flex justify-between gap-3 py-0.5">
+                    <dt className="text-muted-foreground">{k}</dt>
+                    <dd className="truncate font-medium">{v}</dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
+            {result.text ? (
+              <p className="line-clamp-4 whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-3 text-xs text-muted-foreground">
+                {result.text}
+              </p>
+            ) : (
+              <ErrorNote message="The OCR service returned no text for this file — try a sharper scan." />
+            )}
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setResult(null);
+                  setFile(null);
+                }}
+              >
+                Scan another file
+              </Button>
+              <Button onClick={useText} disabled={!result.text}>
+                Review &amp; add to knowledge base
+              </Button>
+            </DialogFooter>
+          </div>
+        ) : (
+          <form onSubmit={(e) => void submit(e)} className="space-y-4">
+            <div className="grid gap-1.5">
+              <Label htmlFor="scan-file">Scanned document</Label>
+              <Input
+                id="scan-file"
+                type="file"
+                accept={SCAN_ACCEPT}
+                onChange={(e) => pick(e.target.files?.[0] ?? null)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {SCAN_ACCEPT} · up to 25 MB. Uploaded files may contain personal
+                data and are stored under your organisation&apos;s document
+                bucket.
+              </p>
+            </div>
+            {busy ? (
+              <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Uploading and extracting… OCR runs on a local vision model and
+                can take a minute or more per page on CPU. Don&apos;t close this
+                dialog.
+              </p>
+            ) : null}
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!file || busy}>
+                <Upload className="h-4 w-4" />
+                {busy ? "Extracting…" : "Extract text"}
+              </Button>
+            </DialogFooter>
+          </form>
+        )}
       </DialogContent>
     </Dialog>
   );

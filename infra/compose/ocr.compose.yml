@@ -1,0 +1,83 @@
+# MiniCPM-OCR llama.cpp sidecar (SPEC-W53 Scope A) — OPTIONAL compose overlay.
+#
+# Adds the `llama-ocr` OpenAI-compatible vision-model server consumed by
+# ocr-service via OCR_LLM_BASE_URL (default http://llama-ocr:8080/v1).
+# NOT part of the base stack; start as an overlay on the root compose
+# (voices.compose.yml precedent, RECON §1-E/§3):
+#
+#   docker compose -f docker-compose.yml -f infra/compose/ocr.compose.yml up -d
+#
+# Model weights are NEVER downloaded at request time: the two GGUFs are
+# provisioned ONCE into the `ocr-models` volume (ONE-TIME runbook with
+# sha256 verification + LICENSE warning in services/ocr-service/README.md).
+# If the volume is empty the container will fail to start — that is
+# intentional (offline-first; no silent HF downloads).
+#
+# CPU-only by default (dev sandbox, RECON §5: expect multi-second per page;
+# vendor guidance AVX2 + >=16GB RAM comfortable at ctx 40960). For prod GPU
+# throughput uncomment the deploy block at the bottom and keep
+# --n-gpu-layers aligned.
+
+# Local anchors: YAML anchors do not cross files, and this overlay is
+# started standalone — mirror the root x-logging / x-deploy-limits from
+# infra/docker-compose.core.yml (W46-I), with a higher ceiling for the
+# model server (llama-server + 1.3B Q8_0 + projector ~ 2-3 GB RSS).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "2.0"
+      memory: 4G
+
+services:
+  llama-ocr:
+    logging: *default-logging
+    deploy: *default-limits
+    # Pinned llama.cpp server image (re-verify the tag against ggml-org
+    # releases at provisioning — see services/ocr-service/README.md).
+    image: ghcr.io/ggml-org/llama.cpp:server-b6992
+    container_name: opendesk-llama-ocr
+    restart: unless-stopped
+    # OpenAI-compatible server; MiniCPM-OCR GGUF + mmproj projector on the
+    # ocr-models volume. ctx 40960 per vendor guidance; CPU defaults
+    # (--n-gpu-layers 0 is llama.cpp's default without GPU).
+    command:
+      - --model
+      - /models/MiniCPM-OCR-1_0-Q8_0.gguf
+      - --mmproj
+      - /models/mmproj-model-f16-4x.gguf
+      - --ctx-size
+      - "40960"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    volumes:
+      - ocr-models:/models:ro
+    healthcheck:
+      # llama-server exposes GET /health (200 once the model is loaded).
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s   # first GGUF load on CPU is slow
+    # Prod GPU mode (uncomment together; also pass --n-gpu-layers 99):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    # Joins the `opendesk` network defined by the root docker-compose.yml
+    # (no re-declaration needed when used as a -f override). No host port
+    # published (GF4): ocr-service reaches it on the internal network.
+    networks:
+      - opendesk
+
+volumes:
+  ocr-models:

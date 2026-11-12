@@ -494,6 +494,61 @@ $$;
 \endif
 
 -- ---------------------------------------------------------------------------
+-- Wave 53 (SPEC-W53 Scope A): ocr-service role. Same NOLOGIN group + LOGIN
+-- member pattern as above; the group holds the grants so FORCE ROW LEVEL
+-- SECURITY binds the runtime DSN (the opendesk superuser bypasses RLS).
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_ocr') THEN
+        CREATE ROLE app_ocr NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_ocr_login') THEN
+        CREATE ROLE app_ocr_login LOGIN PASSWORD 'app_ocr_dev_password' IN ROLE app_ocr;
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- ocr database (ocr_documents created by 31-ocr-schema.sql and, on
+-- pre-existing/standalone clusters, idempotently by the service at boot)
+-- ---------------------------------------------------------------------------
+SELECT EXISTS (SELECT FROM pg_database WHERE datname = 'ocr') AS ocr_db_exists\gset
+\if :ocr_db_exists
+\c ocr
+
+GRANT CONNECT ON DATABASE ocr TO app_ocr;
+GRANT USAGE ON SCHEMA public TO app_ocr;
+-- BOOTSTRAP EXCEPTION (documented, geo/payments idiom): ocr-service has no
+-- separate migration runner — app/store.py ensure_ocr_documents_table
+-- (CREATE TABLE IF NOT EXISTS + RLS) runs at boot on the runtime DSN, so
+-- the role needs CREATE on a fresh database (a no-op once 31-ocr-schema.sql
+-- has provisioned the table). Revoke once a migration-runner split lands.
+GRANT CREATE ON SCHEMA public TO app_ocr;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_ocr;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_ocr;
+-- Future tables created by the bootstrap superuser stay reachable; W51-C:
+-- the service's own runtime-DSN bootstrap (app_ocr_login owns the table
+-- when the init script did not run first) gets the same defaults.
+DO $$
+DECLARE
+    bootstrap TEXT;
+BEGIN
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres', 'app_ocr_login'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_ocr', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_ocr', bootstrap);
+        END IF;
+    END LOOP;
+END
+$$;
+\else
+\echo '05-app-roles: database ocr absent — skipping its grants section'
+\endif
+
+-- ---------------------------------------------------------------------------
 -- Wave 38 (SPEC-W38 F1/F3): agents registry + capture tables
 -- ---------------------------------------------------------------------------
 -- Explicit grants on the three W38 tables (created by

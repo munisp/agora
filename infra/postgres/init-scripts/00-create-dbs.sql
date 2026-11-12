@@ -26,6 +26,12 @@ CREATE DATABASE billing;
 -- (kyc_audit with FORCE ROW LEVEL SECURITY) is applied idempotently by the
 -- service itself from services/kyc-service/internal/store.
 CREATE DATABASE kyc;
+-- W53 (SPEC-W53 Scope A): ocr-service (:7020) document-metadata database.
+-- Schema (ocr_documents with FORCE ROW LEVEL SECURITY) is applied by
+-- 31-ocr-schema.sql and, idempotently, at boot by the service itself
+-- (services/ocr-service/app/store.py ensure* idiom; roles/grants in
+-- 05-app-roles.sql).
+CREATE DATABASE ocr;
 -- W47 (SPEC-W47 / A-DB DB-01 CRIT): payments-service database. Previously the
 -- tenant-scoped money tables (payout_beneficiaries, deposit_provenance,
 -- payout_attempts, rail_attempts) lived in the default superuser database

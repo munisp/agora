@@ -1,9 +1,11 @@
 # APISIX standalone declarative config (file-driven data plane) — OpenDesk edge routes.
 # Contract: SPEC §3 (ports) and SPEC §12 (routes & plugins). Hot-reloaded ~1s after save.
 #
-# Route inventory: 49 routes (45 pre-W48-D + 3 W48-D public booking legs
+# Route inventory: 50 routes (45 pre-W48-D + 3 W48-D public booking legs
 # + 1 W52-A geo-service: api-geo. geo-service exposes NO /internal/* surface, so
-# no new block-* deny is required — the existing generic denies stand):
+# no new block-* deny is required — the existing generic denies stand;
+# + 1 W53-A ocr-service: api-ocr. Same posture: no /internal/* path, no
+# new block-* deny):
 # api-bookings-public-pay, api-bookings-public-review,
 # api-bookings-public-reviews). Update this count when adding/removing routes.
 #
@@ -86,6 +88,26 @@ upstreams:
     type: roundrobin
     nodes:
       "geo:7015": 1
+    retries: 1
+    timeout: {connect: 5, send: 30, read: 30}
+    checks:
+      active:
+        type: http
+        http_path: /healthz
+        healthy: {interval: 5, successes: 1, http_statuses: [200]}
+        unhealthy: {interval: 5, http_failures: 2, http_statuses: [500, 502, 503, 504]}
+        timeout: 2
+      passive:
+        type: http
+        healthy: {http_statuses: [200, 201, 204, 301, 302, 400, 401, 403, 404]}
+        unhealthy: {http_statuses: [500, 502, 503, 504], http_failures: 3, tcp_failures: 2}
+
+  # SPEC-W53 Scope A: ocr-service (Python/FastAPI) — MiniCPM-OCR document
+  # extraction (receipts/documents/knowledge scans), MinIO `documents`.
+  - id: ocr
+    type: roundrobin
+    nodes:
+      "ocr:7020": 1
     retries: 1
     timeout: {connect: 5, send: 30, read: 30}
     checks:
@@ -1360,6 +1382,148 @@ routes:
             end
       limit-count:
         count: 300
+        time_window: 60
+        rejected_code: 429
+        key: remote_addr
+        policy: local   # W46-I (P-DATA A-02): per-worker in-memory counter —
+        # removes the shared-Redis RTT from this route's hot path.
+        # GW-08 (SPEC-W47) — the actual redis-policy kept set is: the
+        # auth-sensitive routes api-identity + api-voice-admin, and every
+        # public/anonymous ingress (api-bookings-public,
+        # api-bookings-portal, api-bookings-waitlist-claim,
+        # api-bookings-public-pay, api-bookings-public-review,
+        # api-bookings-public-reviews (W48-D),
+        # api-identity-consents-public, api-civic-public, ussd-callback,
+        # webhooks-messaging, webhooks-paystack, webhooks-flutterwave,
+        # voice-runtime) — those keep redis because their limit must be
+        # replica-independent. NOTE: local counters multiply the effective
+        # per-IP limit by the APISIX replica count; before scaling the
+        # gateway beyond one replica, move the money routes (api-payments,
+        # api-billing) back to policy: redis.
+      cors:
+        # GF4: scoped — no wildcard on authenticated routes (SPEC-W34).
+        # admin-web origin (direct dev) + gateway origin (served via APISIX).
+        allow_origins: "http://localhost:3001,http://localhost:9080"
+        allow_methods: "*"
+        allow_headers: "*"
+        expose_headers: "*"
+        max_age: 3600
+        allow_credential: false
+
+
+  # ---- ocr-service (SPEC-W53 Scope A): /api/ocr/* -> ocr:7020 ----
+  # Same jwt (openid-connect bearer_only) + claim-injection + prefix-strip
+  # rewrite + limit-count pattern as api-geo. Tighter limit-count (60/min):
+  # OCR is a CPU-heavy VLM pass with a 25MB upload cap. ocr-service exposes
+  # NO /internal/* path (internal callers hit /v1/ocr/* in-cluster with
+  # X-Internal-Token, which the global strip rule removes from gateway
+  # traffic) so NO new block-* deny route is required — the existing
+  # generic denies stand.
+  - id: api-ocr
+    uris:
+      - /api/ocr/*
+      - /api/ocr
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    upstream_id: ocr
+    plugins:
+      proxy-rewrite:
+        regex_uri:
+          - "^/api/ocr/?(.*)"
+          - "/$1"
+      openid-connect:
+        discovery: http://keycloak:8080/realms/opendesk/.well-known/openid-configuration
+        bearer_only: true
+        realm: opendesk
+        client_id: admin-web
+        use_pkce: true
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+          - |
+            -- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,
+            -- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT
+            -- tenant_slugs claim (etc.). global_rules id 1 already stripped any
+            -- client-supplied x-tenant-*/x-user-* header (global rules run before
+            -- route plugins in the rewrite phase), so the value set here is
+            -- claim-derived only. openid-connect (bearer_only) still
+            -- verifies the token signature in the access phase AFTER this
+            -- runs, so a forged token never reaches upstream (it 401s
+            -- first) — decoding the payload without re-verifying is safe.
+            -- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload
+            -- JSON keyed by the token payload segment (resty.lrucache,
+            -- 1000 entries). Created ONCE at chunk load — nil (caching
+            -- disabled, original per-request decode) if lrucache fails to
+            -- load, so behavior degrades safely.
+            local jwt_claims_cache = nil
+            do
+              local ok_lru, lrucache = pcall(require, "resty.lrucache")
+              if ok_lru and lrucache then
+                jwt_claims_cache = lrucache.new(1000)
+              end
+            end
+            return function()
+              local auth = ngx.var.http_authorization
+              if not auth then return end
+              local token = auth:match("^[Bb]earer%s+(%S+)%s*$")
+              if not token then return end
+              local payload = token:match("^[^%.]+%.([^%.]+)%.[^%.]+$")
+              if not payload then return end
+              -- W46-I (P-DATA A-03): the base64 decode below is a pure
+              -- function of the token payload segment, so its result is
+              -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000
+              -- entries, chunk-local). Extracted claims / injected headers
+              -- are BYTE-IDENTICAL to the uncached path; openid-connect
+              -- still verifies the signature in the access phase AFTER this
+              -- rewrite-phase function, so a cached decode can never
+              -- authenticate a forged token. `false` is the "undecodable"
+              -- sentinel (distinguished from a cache miss == nil).
+              local json = jwt_claims_cache and jwt_claims_cache:get(payload)
+              if json == nil then
+                local b64 = payload:gsub("%-", "+"):gsub("_", "/")
+                local rem = #b64 % 4
+                if rem == 2 then b64 = b64 .. "=="
+                elseif rem == 3 then b64 = b64 .. "="
+                elseif rem == 1 then return end
+                json = ngx.decode_base64(b64)
+                if jwt_claims_cache then
+                  jwt_claims_cache:set(payload, json or false)
+                end
+              end
+              if not json then return end
+              -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of
+              -- realm_access.roles (EMPTY STRING when the claim is absent, so
+              -- downstream fail-closed role gates (K6) can distinguish
+              -- "gateway ran, user has no roles" from a stripped caller
+              -- header). Claims are matched independently: a token without
+              -- tenant_slugs still gets its identity headers.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
+              local sub = json:match('"sub"%s*:%s*"([^"]-)"')
+              if sub then
+                ngx.req.set_header("X-User-Id", sub)
+              end
+              local roles = {}
+              local realm = json:match('"realm_access"%s*:%s*%{(.-)%}')
+              if realm then
+                local rarr = realm:match('"roles"%s*:%s*%[(.-)%]')
+                if rarr then
+                  for r in rarr:gmatch('"([^"]-)"') do
+                    roles[#roles + 1] = r
+                  end
+                end
+              end
+              ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+            end
+      limit-count:
+        count: 60
         time_window: 60
         rejected_code: 429
         key: remote_addr

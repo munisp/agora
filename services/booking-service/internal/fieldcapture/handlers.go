@@ -17,7 +17,11 @@ type Handlers struct {
 	// BatchLimit caps items per request (FIELD_CAPTURE_BATCH_LIMIT, default
 	// 100 — one offline flush stays well inside the 60s server timeout).
 	BatchLimit int
-	Log        *zap.Logger
+	// OCR serves POST /v1/field/captures/{id}/receipt (SPEC-W53 Scope B:
+	// receipt/invoice OCR via the ocr-service). Nil/disabled → the receipt
+	// endpoint fails closed with 503 (never silently open).
+	OCR *OCRClient
+	Log *zap.Logger
 }
 
 func (h *Handlers) log() *zap.Logger {

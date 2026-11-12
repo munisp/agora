@@ -9,6 +9,12 @@
 import { Badge } from "@/components/ui/badge";
 import { GeoAutoBadge } from "@/components/geo-auto-badge";
 import {
+  ReceiptFields,
+  ReceiptOcrBadge,
+  ReceiptSummary,
+  parseReceiptFields,
+} from "@/components/fieldcapture/receipt-fields";
+import {
   Card,
   CardContent,
   CardDescription,
@@ -25,7 +31,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatDateTime } from "@/lib/utils";
-import type { Person360 } from "./types";
+import type { ReceiptFieldsData } from "@/components/fieldcapture/receipt-fields";
+import type { Person360, PersonContact } from "./types";
 
 function dash(v: unknown): string {
   if (v === null || v === undefined || v === "") return "—";
@@ -38,6 +45,13 @@ function ts(v?: string): string {
 }
 
 export function Person360View({ person }: { person: Person360 }) {
+  // SPEC-W53: captures whose field-capture row carries a receipt OCR
+  // extraction. parseReceiptFields returns null for absent/empty payloads,
+  // so older API responses simply render nothing here.
+  const receiptCaptures = person.contacts
+    .map((contact) => ({ contact, receipt: parseReceiptFields(contact.receipt_fields) }))
+    .filter((x): x is { contact: PersonContact; receipt: ReceiptFieldsData } => x.receipt !== null);
+
   return (
     <div className="space-y-4">
       <Card>
@@ -83,13 +97,16 @@ export function Person360View({ person }: { person: Person360 }) {
                 <TableHead>LGA</TableHead>
                 <TableHead>Ward</TableHead>
                 <TableHead>Captured</TableHead>
+                <TableHead>Receipt</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {person.contacts.length === 0 ? (
-                <TableEmpty colSpan={6}>No contacts recorded.</TableEmpty>
+                <TableEmpty colSpan={7}>No contacts recorded.</TableEmpty>
               ) : (
-                person.contacts.map((c, i) => (
+                person.contacts.map((c, i) => {
+                  const receipt = parseReceiptFields(c.receipt_fields);
+                  return (
                   <TableRow key={c.lead_id ?? i}>
                     <TableCell className="font-mono text-xs">{dash(c.lead_id)}</TableCell>
                     <TableCell>{dash(c.channel_of_first_touch)}</TableCell>
@@ -107,13 +124,47 @@ export function Person360View({ person }: { person: Person360 }) {
                       ) : null}
                     </TableCell>
                     <TableCell>{ts(c.captured_at)}</TableCell>
+                    <TableCell>
+                      {receipt ? (
+                        <span className="flex flex-col gap-1">
+                          <ReceiptOcrBadge />
+                          <ReceiptSummary fields={receipt} />
+                        </span>
+                      ) : (
+                        "—"
+                      )}
+                    </TableCell>
                   </TableRow>
-                ))
+                  );
+                })
               )}
             </TableBody>
           </Table>
         </CardContent>
       </Card>
+
+      {receiptCaptures.length > 0 ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Receipt captures</CardTitle>
+            <CardDescription>
+              Receipt/invoice OCR extractions attached to this person&apos;s
+              field captures (uploaded by staff via the field-capture API).
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {receiptCaptures.map(({ contact, receipt }, i) => (
+              <div key={contact.receipt_document_id ?? contact.lead_id ?? i}>
+                <p className="mb-1 text-xs text-muted-foreground">
+                  Capture <span className="font-mono">{dash(contact.lead_id)}</span>
+                  {contact.captured_at ? <> · {ts(contact.captured_at)}</> : null}
+                </p>
+                <ReceiptFields fields={receipt} />
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Card>
         <CardHeader>

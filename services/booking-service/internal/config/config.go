@@ -90,6 +90,13 @@ type Config struct {
 	// booking contact carries a contact_locations point. Default false keeps
 	// every create path byte-identical to pre-W52 behavior (opt-in).
 	BookingGeoEnforce bool
+	// Receipt OCR (SPEC-W53 Scope B): booking→ocr-service internal extract
+	// calls for POST /v1/field/captures/{id}/receipt.
+	OCRServiceURL string // OCR_SERVICE_URL (default "" = receipt endpoint fails closed 503)
+	// OCRInternalToken is sent as X-Internal-Token on booking→ocr calls
+	// (OCR_INTERNAL_TOKEN; NO default — unset fails the receipt endpoint
+	// closed with 503, the kyc-service internauth posture).
+	OCRInternalToken string
 	// Incidents (SPEC-W11 Part B)
 	IncidentsTopic       string // opendesk.incidents (IDP ingestion)
 	IncidentsGroup       string // consumer group booking-incidents
@@ -233,6 +240,11 @@ func Load() (Config, error) {
 		// + public-booking coverage-zone enforcement (default off = inert).
 		GeoServiceURL:     envStr("GEO_SERVICE_URL", ""),
 		BookingGeoEnforce: envStr("BOOKING_GEO_ENFORCE", "false") == "true",
+		// SPEC-W53 Scope B: receipt OCR via ocr-service. Both default empty —
+		// the receipt endpoint then answers 503 (fail closed, never a silent
+		// unauthenticated call).
+		OCRServiceURL:    envStr("OCR_SERVICE_URL", ""),
+		OCRInternalToken: envStr("OCR_INTERNAL_TOKEN", ""),
 		IncidentsTopic:                envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
 		IncidentsGroup:                envStr("INCIDENTS_GROUP", "booking-incidents"),
 		IncidentAutoDispatch:          envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",

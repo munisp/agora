@@ -1,0 +1,260 @@
+openapi: 3.0.3
+info:
+  title: OpenDesk ocr-service API
+  version: "1.0.0"
+  description: |
+    REST API of `ocr-service` (Python, FastAPI) — MiniCPM-OCR document
+    intelligence: upload validation (extension + magic-byte allow-list,
+    25 MB hard cap), MinIO `documents` object storage (tenant-prefixed
+    keys), llama.cpp sidecar extraction, RLS metadata, `ocr_page` usage
+    metering, CloudEvents (SPEC-W53 Scope A).
+
+    Generated from `services/ocr-service/app/*.py`.
+
+    ## Tenancy & auth
+    * Gateway calls (APISIX route `api-ocr`, `/api/ocr/*` prefix-stripped)
+      arrive with the K1 `X-Tenant-Slugs` header injected from the
+      validated JWT; an explicit `tenant` selector must match one of its
+      entries (SPEC-W43 C1 binding).
+    * Service-to-service callers (e.g. booking-service fieldcapture) call
+      in-cluster with `X-Internal-Token` (constant-time compare,
+      fail-closed 503 when the service token is unset) and an explicit
+      `tenant` (slug or UUID).
+    * Document BYTES are never served by this API — only metadata and
+      extracted fields.
+paths:
+  /healthz:
+    get:
+      summary: Liveness/readiness probe
+      operationId: ocrHealthz
+      security: []
+      responses:
+        "200":
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: Degraded (Postgres unreachable)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /v1/ocr/extract:
+    post:
+      summary: Upload a document/image and run OCR extraction
+      description: |
+        Accepts EITHER a multipart file upload OR a JSON body with a
+        `document_url` to fetch (http/https only, bounded). Content must
+        match the extension + magic-byte allow-list (image/jpeg,
+        image/png, image/webp, application/pdf) and the 25 MB hard cap.
+        On success the row transitions uploaded -> extracted; on sidecar
+        failure uploaded -> failed and the call returns 502 (NO retries).
+      operationId: ocrExtract
+      parameters:
+        - name: X-Internal-Token
+          in: header
+          required: false
+          description: Service-to-service token (fail-closed when unset).
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, kind]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: .jpg/.jpeg/.png/.webp/.pdf, <= 25 MB
+                kind:
+                  $ref: "#/components/schemas/DocumentKind"
+                tenant_id:
+                  type: string
+                  description: Preferred tenant selector (slug or UUID).
+                    Optional — gateway calls are bound via X-Tenant-Slugs
+                    and internal callers may instead send the X-Tenant-Slug
+                    header; an internal call with no resolvable tenant is a
+                    400, and conflicting selectors are a 400.
+                tenant:
+                  type: string
+                  deprecated: true
+                  description: Legacy alias for tenant_id; still accepted.
+          application/json:
+            schema:
+              type: object
+              required: [document_url, kind]
+              properties:
+                document_url:
+                  type: string
+                  format: uri
+                  description: http(s) URL to fetch the document from
+                    (same validation + caps as a direct upload).
+                kind:
+                  $ref: "#/components/schemas/DocumentKind"
+                tenant_id:
+                  type: string
+                  description: Preferred tenant selector (slug or UUID);
+                    optional — see multipart schema.
+                tenant:
+                  type: string
+                  deprecated: true
+                  description: Legacy alias for tenant_id; still accepted.
+      responses:
+        "200":
+          description: Extraction succeeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExtractResponse"
+        "400":
+          description: Missing/invalid kind, tenant, or document_url
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401":
+          description: Missing tenant context or bad internal token
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "403":
+          description: Tenant selector not granted (X-Tenant-Slugs mismatch)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "413":
+          description: Upload exceeds the 25 MB hard cap
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "415":
+          description: Extension/magic-byte allow-list violation
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "502":
+          description: OCR sidecar or object-store failure; the document
+            row is persisted with status=failed
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "503":
+          description: Internal auth not configured (OCR_INTERNAL_TOKEN unset)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/ocr/documents/{document_id}:
+    get:
+      summary: Document metadata + extracted fields (NO bytes)
+      operationId: ocrGetDocument
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - name: tenant
+          in: query
+          required: true
+          schema: {type: string}
+        - name: X-Internal-Token
+          in: header
+          required: false
+          schema: {type: string}
+      responses:
+        "200":
+          description: Document metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentMetadata"
+        "400":
+          description: Invalid document id
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "404":
+          description: Not found (or not visible to this tenant — RLS)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+components:
+  schemas:
+    DocumentKind:
+      type: string
+      enum: [receipt, document, knowledge_scan]
+    ExtractResponse:
+      type: object
+      required: [document_id, status, extracted_fields, page_count, extracted_text]
+      properties:
+        document_id: {type: string, format: uuid}
+        status:
+          type: string
+          enum: [extracted]
+        extracted_fields:
+          $ref: "#/components/schemas/ExtractedFields"
+        page_count: {type: integer, minimum: 1}
+        extracted_text:
+          type: string
+          description: Full extracted markdown/plain text of the document.
+    ExtractedFields:
+      type: object
+      description: |
+        Tolerant parse — every field may be null. Receipts:
+        {vendor, amount, currency, date, items[]}; other kinds:
+        {title, date, summary}.
+      properties:
+        vendor: {type: [string, "null"]}
+        amount: {type: [number, "null"]}
+        currency: {type: [string, "null"]}
+        date: {type: [string, "null"], format: date}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: [string, "null"]}
+              quantity: {type: [number, "null"]}
+              price: {type: [number, "null"]}
+        title: {type: [string, "null"]}
+        summary: {type: [string, "null"]}
+    DocumentMetadata:
+      type: object
+      properties:
+        document_id: {type: string, format: uuid}
+        tenant_id: {type: string, format: uuid}
+        kind: {$ref: "#/components/schemas/DocumentKind"}
+        mime:
+          type: string
+          enum: [image/jpeg, image/png, image/webp, application/pdf]
+        bytes: {type: integer, minimum: 0}
+        sha256: {type: string}
+        phash: {type: [string, "null"]}
+        page_count: {type: integer}
+        model_version: {type: string}
+        storage_bucket: {type: string}
+        storage_key:
+          type: string
+          description: Tenant-prefixed MinIO key {tenant_id}/{uuid}.<ext>
+        status:
+          type: string
+          enum: [uploaded, extracted, failed]
+        error: {type: [string, "null"]}
+        extracted_text: {type: [string, "null"]}
+        extracted_fields:
+          $ref: "#/components/schemas/ExtractedFields"
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Health:
+      type: object
+      properties:
+        status: {type: string, enum: [ok, degraded]}
+        postgres: {type: boolean}
+        mock: {type: boolean}
+    Error:
+      type: object
+      properties:
+        detail:
+          description: string message, or {error, document_id, status} on 502

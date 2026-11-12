@@ -1,0 +1,119 @@
+"""Environment configuration for ocr-service (SPEC-W53 Scope A).
+
+All runtime configuration is env-driven; every value has a dev-safe default
+matching docker-compose.yml / .env.example. OCR_MOCK is safe-default-OFF —
+never default it on (XTTS_MOCK precedent, RECON §4).
+"""
+
+from __future__ import annotations
+
+from pydantic import AliasChoices, Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: MIME allow-list (magic-byte validated, RECON §4): images + PDF only.
+ALLOWED_MIMES = ("image/jpeg", "image/png", "image/webp", "application/pdf")
+
+#: Document kinds accepted by POST /v1/ocr/extract (CHECK constraint mirrors).
+DOCUMENT_KINDS = ("receipt", "document", "knowledge_scan")
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="", case_sensitive=False)
+
+    port: int = 7020
+    log_level: str = "INFO"
+
+    # Postgres `ocr` database (00-create-dbs.sql / 31-ocr-schema.sql).
+    # Accepts OCR_DATABASE_URL (preferred, .env.example) or DATABASE_URL, or
+    # PG_DSN + PG_DATABASE (root-compose convention).
+    database_url: str = Field(
+        default="", validation_alias=AliasChoices("OCR_DATABASE_URL", "DATABASE_URL")
+    )
+    pg_dsn: str = ""
+    pg_database: str = ""
+
+    # --- MiniCPM-OCR llama.cpp sidecar (infra/compose/ocr.compose.yml) ---
+    # OpenAI-compatible base URL of the llama-server sidecar.
+    llm_base_url: str = Field(
+        default="http://llama-ocr:8080/v1",
+        validation_alias=AliasChoices("OCR_LLM_BASE_URL"),
+    )
+    # Model name sent on /v1/chat/completions (llama-server accepts any
+    # string; keep it equal to the provisioned GGUF alias for observability).
+    ocr_model: str = Field(default="minicpm-ocr", validation_alias=AliasChoices("OCR_MODEL"))
+    # Sidecar call timeout. OCR on CPU is slow (RECON §5: multi-second per
+    # page); 120s, NO retries (a retry would double-bill ocr_page).
+    ocr_timeout_s: float = Field(default=120.0, validation_alias=AliasChoices("OCR_TIMEOUT_S"))
+    # Max PDF pages rasterized per document (ctx 40960 / CPU latency bound).
+    ocr_max_pages: int = Field(default=8, validation_alias=AliasChoices("OCR_MAX_PAGES"))
+
+    # DEV ONLY deterministic fixture extraction (fixed vendor/amount/date).
+    # Safe default OFF; CRITICAL startup log when on. NEVER set in prod.
+    ocr_mock: bool = Field(default=False, validation_alias=AliasChoices("OCR_MOCK"))
+
+    # Upload hard cap: 25 MB (SPEC-W53 sacred constraint).
+    ocr_max_bytes: int = Field(
+        default=25 * 1024 * 1024, validation_alias=AliasChoices("OCR_MAX_BYTES")
+    )
+
+    # Service-to-service auth (SPEC-W44 K2): X-Internal-Token, constant-time
+    # compare, FAIL-CLOSED (503) when unset. Callers (booking-service
+    # fieldcapture) carry the SAME value.
+    internal_token: str = Field(
+        default="", validation_alias=AliasChoices("OCR_INTERNAL_TOKEN")
+    )
+
+    # MinIO document storage (PII — tenant-prefixed keys, bucket `documents`
+    # created by the lakehouse createbucket job).
+    minio_endpoint: str = Field(
+        default="minio:9000", validation_alias=AliasChoices("MINIO_ENDPOINT", "OCR_MINIO_ENDPOINT")
+    )
+    minio_access_key: str = Field(
+        default="minioadmin",
+        validation_alias=AliasChoices("MINIO_ROOT_USER", "MINIO_ACCESS_KEY"),
+    )
+    minio_secret_key: str = Field(
+        default="minioadmin",
+        validation_alias=AliasChoices("MINIO_ROOT_PASSWORD", "MINIO_SECRET_KEY"),
+    )
+    minio_bucket: str = Field(
+        default="documents", validation_alias=AliasChoices("OCR_MINIO_BUCKET")
+    )
+    minio_secure: bool = Field(default=False, validation_alias=AliasChoices("MINIO_SECURE"))
+
+    # Dapr pubsub (Kafka) for usage metering + OCR domain events.
+    dapr_host: str = "daprd-ocr"
+    dapr_http_port: int = 3500
+    dapr_pubsub_name: str = Field(
+        default="pubsub-kafka", validation_alias=AliasChoices("DAPR_PUBSUB_NAME")
+    )
+    usage_topic: str = Field(
+        default="opendesk.usage.events", validation_alias=AliasChoices("OCR_USAGE_TOPIC")
+    )
+    ocr_events_topic: str = Field(
+        default="opendesk.ocr.events", validation_alias=AliasChoices("OCR_EVENTS_TOPIC")
+    )
+
+    # Tenant binding (SPEC-W43 C1): X-Tenant-Slugs header binding for
+    # gateway-authenticated calls; slugs resolve via identity-service.
+    trust_direct_tenant: bool = Field(
+        default=False, validation_alias=AliasChoices("OPENDESK_TRUST_DIRECT_TENANT")
+    )
+    identity_app_id: str = "identity"
+    identity_internal_token: str = Field(
+        default="", validation_alias=AliasChoices("IDENTITY_INTERNAL_TOKEN")
+    )
+
+    @model_validator(mode="after")
+    def _compose_database_url(self) -> "Settings":
+        if not self.database_url:
+            if self.pg_dsn and self.pg_database:
+                self.database_url = f"{self.pg_dsn.rstrip('/')}/{self.pg_database}"
+            else:
+                self.database_url = (
+                    "postgres://app_ocr_login:app_ocr_dev_password@postgres:5432/ocr"
+                )
+        return self
+
+
+settings = Settings()

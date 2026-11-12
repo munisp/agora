@@ -97,6 +97,10 @@ TOPICS=(
   opendesk.cac.events              # prefixed CAC stream (fraud-engine FRAUD_KAFKA_TOPICS default consumes it; producers migrate from cac.events)
   opendesk.conversation.captures   # conversation-service CAPTURE_TOPIC default (CaptureExtracted, SPEC-W38 F3); crm-sync CAPTURES_TOPIC consumes
   opendesk.ops.alerts              # K3 canonical ops alerts: notification-worker OPS_ALERTS_TOPIC default + model-registry ALERTS_TOPIC default (SPEC-W44)
+  # SPEC-W53 (additive): ocr-service emits com.opendesk.ocr.DocumentExtracted
+  # (ocr_page usage metering rides the EXISTING opendesk.usage.events topic
+  # above — the metric column is free-text, zero consumer changes).
+  opendesk.ocr.events              # OCR DocumentExtracted results (SPEC-W53: ocr-service emits; fraud D9/analytics consume later)
 )
 
 echo "[kafka-topics] waiting for broker at ${BOOTSTRAP}..."

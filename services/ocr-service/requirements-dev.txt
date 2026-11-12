@@ -1,0 +1,5 @@
+# ocr-service test deps (fully pinned). Tests are offline: no network, no
+# model download (OCR_MOCK path + local stub servers only).
+-r requirements.txt
+pytest==8.3.3
+pytest-asyncio==0.24.0

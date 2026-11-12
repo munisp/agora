@@ -63,7 +63,9 @@ services:
     restart: unless-stopped
   # Bucket init: `lake` is the Iceberg/lakehouse warehouse; `exports` holds
   # GDPR data-subject export bundles written by notification-worker's
-  # GdprExportWorkflow (plain S3 PUT, SPEC-W3 §2 innovation 13).
+  # GdprExportWorkflow (plain S3 PUT, SPEC-W3 §2 innovation 13). `documents`
+  # (SPEC-W53 Scope A) holds uploaded OCR source documents (PII) written by
+  # ocr-service under tenant-prefixed keys {tenant_id}/{uuid}.<ext>.
   createbucket:
     logging: *default-logging
     deploy: *default-limits
@@ -79,9 +81,13 @@ services:
 
       mc mb --ignore-existing local/exports
 
+      mc mb --ignore-existing local/documents
+
       mc anonymous set none local/lake
 
       mc anonymous set none local/exports
+
+      mc anonymous set none local/documents
 
       mc ls local
 

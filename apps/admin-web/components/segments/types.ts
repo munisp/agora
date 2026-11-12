@@ -130,6 +130,14 @@ export interface PersonContact {
   lga?: string | null;
   ward?: string | null;
   geo_enrichment_source?: string | null;
+  /**
+   * SPEC-W53: receipt OCR extraction attached to the underlying field
+   * capture (ocr-service via POST /v1/field/captures/{id}/receipt). Absent in
+   * all older API responses and on captures without a receipt — render
+   * defensively via parseReceiptFields.
+   */
+  receipt_document_id?: string | null;
+  receipt_fields?: unknown;
 }
 
 export interface PersonBooking {

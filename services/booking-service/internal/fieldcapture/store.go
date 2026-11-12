@@ -97,6 +97,12 @@ ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS server_received_at TIMESTAMP
 ALTER TABLE field_captures DROP CONSTRAINT IF EXISTS field_captures_kind_check;
 ALTER TABLE field_captures ADD CONSTRAINT field_captures_kind_check
     CHECK (kind IN ('lead_capture','checkin','civic_report'));
+-- SPEC-W53 Scope B (additive): receipt OCR attachment pointers, filled by
+-- POST /v1/field/captures/{id}/receipt after a successful ocr-service
+-- extraction. Both NULLable with no defaults, so every pre-W53 insert path
+-- (Anchor never names these columns) keeps working byte-identically.
+ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS receipt_document_id UUID;
+ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS receipt_fields JSONB;
 ALTER TABLE field_captures ENABLE ROW LEVEL SECURITY;
 ALTER TABLE field_captures FORCE ROW LEVEL SECURITY;
 DO $$
@@ -218,6 +224,47 @@ func (s *Store) Resolve(ctx context.Context, tenantID uuid.UUID, clientID, statu
 			`UPDATE field_captures SET status=$3, result=$4 WHERE tenant_id=$1 AND client_id=$2`,
 			tenantID, clientID, status, raw)
 		return err
+	})
+}
+
+// CaptureExists reports whether a capture anchor row exists for
+// (tenant_id, client_id) (SPEC-W53: the receipt endpoint checks this BEFORE
+// forwarding bytes to the ocr-service — an extraction is never spent on a
+// 404). Tenant-scoped via withTenant (RLS intact).
+func (s *Store) CaptureExists(ctx context.Context, tenantID uuid.UUID, clientID string) (bool, error) {
+	var exists bool
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM field_captures WHERE tenant_id=$1 AND client_id=$2)`,
+			tenantID, clientID).Scan(&exists)
+	})
+	return exists, err
+}
+
+// AttachReceipt stores the ocr-service extraction outcome on the capture
+// anchor (SPEC-W53 Scope B): the ocr document id + the extracted fields
+// jsonb verbatim (nulls allowed — the receipt_fields column accepts NULL
+// when A returned no fields). Only the two additive W53 columns are
+// written; status/result/payload are untouched, so the capture's
+// idempotency semantics are unaffected. ErrNotFound when no anchor matches
+// (tenant_id, client_id) — RLS-scoped via withTenant.
+func (s *Store) AttachReceipt(ctx context.Context, tenantID uuid.UUID, clientID string, docID uuid.UUID, fields json.RawMessage) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var fieldsArg any
+		if len(fields) > 0 && string(fields) != "null" {
+			fieldsArg = []byte(fields)
+		}
+		tag, err := tx.Exec(ctx,
+			`UPDATE field_captures SET receipt_document_id=$3, receipt_fields=$4
+			 WHERE tenant_id=$1 AND client_id=$2`,
+			tenantID, clientID, docID, fieldsArg)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
 	})
 }
 

@@ -272,6 +272,14 @@ services:
       # enforcement master switch (default OFF; sites without drawn service
       # areas always pass — docs/geospatial-terrio.md §4).
       GEO_SERVICE_URL: ${GEO_SERVICE_URL:-http://geo:7015}
+      # SPEC-W53 Scope B: receipt OCR — booking calls ocr-service (:7020)
+      # /v1/ocr/extract. Caller side of the internal-auth contract (W44 K2):
+      # the call carries X-Internal-Token matching the ocr block's
+      # OCR_INTERNAL_TOKEN (SAME shared secret var — one .env entry wires
+      # both sides). Same DEV ONLY default; prod via secrets store. Empty
+      # URL disables the receipt endpoint (fail-closed 503).
+      OCR_SERVICE_URL: ${OCR_SERVICE_URL:-http://ocr:7020}
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:-opendesk-dev-ocr-internal-token-change-in-prod}
       BOOKING_GEO_ENFORCE: ${BOOKING_GEO_ENFORCE:-false}
       # W39 mock-rail contract — the dev stack has no payout-provider
       # credentials, no live TigerBeetle bridge for lending, and no social
@@ -1407,6 +1415,76 @@ services:
     environment:
       DAPR_APP_ID: kyc
       DAPR_APP_PORT: '7013'
+  # SPEC-W53 Scope A: ocr-service (:7020 — next free after kyc:7013 and the
+  # core/graph 7015-7019 range; credit-bureau holds 7022). Dapr app-id ocr;
+  # publishes opendesk.usage.events (ocr_page) + opendesk.ocr.events.
+  # The MiniCPM-OCR llama.cpp sidecar (llama-ocr) is an OPT-IN overlay:
+  # -f infra/compose/ocr.compose.yml (voices.compose.yml precedent).
+  ocr:
+    logging: *default-logging
+    deploy: *default-limits
+    build: ./services/ocr-service
+    env_file:
+    - path: .env
+      required: false
+    environment:
+      DAPR_HOST: daprd-ocr
+      DAPR_HTTP_PORT: '3500'
+      PORT: '7020'
+      # SPEC-W43 G-01: least-privilege app_ocr_login by default
+      # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
+      DATABASE_URL: postgres://${OCR_PG_USER:-app_ocr_login}:${OCR_PG_PASS:-app_ocr_dev_password}@postgres:5432/ocr
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default
+      # (direct postgres:5432 DSN above unchanged). See the kyc block.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
+      # MiniCPM-OCR llama.cpp sidecar (OpenAI-compatible; overlay file
+      # infra/compose/ocr.compose.yml). 120s timeout, NO retries (CPU OCR is
+      # slow; a retry would double-bill ocr_page).
+      OCR_LLM_BASE_URL: ${OCR_LLM_BASE_URL:-http://llama-ocr:8080/v1}
+      OCR_MODEL: ${OCR_MODEL:-minicpm-ocr}
+      OCR_TIMEOUT_S: ${OCR_TIMEOUT_S:-120}
+      OCR_MAX_BYTES: ${OCR_MAX_BYTES:-26214400}
+      # W39 SIM-013 / XTTS_MOCK precedent: safe default OFF. DEV ONLY —
+      # deterministic fixture extraction via explicit OCR_MOCK=true
+      # (CRITICAL startup log). NEVER set in production.
+      OCR_MOCK: ${OCR_MOCK:-false}
+      # Service-to-service auth (SPEC-W44 K2): /v1/ocr/* requires
+      # X-Internal-Token matching this value for internal callers (booking
+      # fieldcapture); APISIX strips client-supplied x-internal-token, so
+      # gateway calls use the K1 X-Tenant-Slugs binding instead. DEV ONLY
+      # default; prod MUST set via the secrets store.
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:-opendesk-dev-ocr-internal-token-change-in-prod}
+      # SPEC-W44 K2 caller side: resolve_tenant_id GET identity
+      # /v1/tenants/{slug} carries X-Internal-Token (same DEV ONLY default
+      # as the other blocks).
+      IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # MinIO `documents` bucket (PII, tenant-prefixed keys) — credentials
+      # via the shared indirection (OOS-18), must match the minio block in
+      # infra/docker-compose.lakehouse.yml.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      OCR_MINIO_BUCKET: ${OCR_MINIO_BUCKET:-documents}
+      OCR_USAGE_TOPIC: ${OCR_USAGE_TOPIC:-opendesk.usage.events}
+      OCR_EVENTS_TOPIC: ${OCR_EVENTS_TOPIC:-opendesk.ocr.events}
+    # GF4 (SPEC-W34): no host port published — backends are reachable only on the
+    # opendesk docker network (inter-service by name) and through APISIX :9080.
+    networks:
+    - opendesk
+    depends_on:
+    - postgres
+    - minio
+    - daprd-ocr
+  daprd-ocr:
+    logging: *default-logging
+    deploy: *default-limits
+    image: daprio/daprd:1.14.4
+    command: *id001
+    volumes: *id002
+    networks: *id003
+    environment:
+      DAPR_APP_ID: ocr
+      DAPR_APP_PORT: '7020'
   # SPEC-W33 §3 B2 credit-bureau (:7022) — F16-1: this service was an ORPHAN
   # (no compose entry, no gateway route). It is NOT part of the default
   # stack: profile-gated `experimental` (booking-service lending falls back

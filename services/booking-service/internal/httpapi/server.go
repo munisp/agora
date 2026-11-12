@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -181,14 +180,13 @@ type Deps struct {
 
 	// SPEC-W52 Scope B: geospatial foundation wiring.
 	// GeoEnrich is the geo-service point-in-polygon enrichment client
-	// (civic_cases + field_checkins ward/lga autofill, fail-open). Nil →
-	// NewRouter builds one from GEO_SERVICE_URL (empty = disabled); see the
-	// wiring note in NewRouter for why the env fallback lives here.
+	// (civic_cases + field_checkins ward/lga autofill, fail-open). Injected
+	// by cmd/server/main.go from config.Config.GeoServiceURL; nil/disabled
+	// simply skips enrichment (Enabled() is nil-safe).
 	GeoEnrich *geo.EnrichClient
 	// BookingGeoEnforce gates PUBLIC booking creates to the site's
-	// service_areas coverage zones (BOOKING_GEO_ENFORCE; bookingops has the
-	// full semantics). NewRouter ORs the env var in when false — the only
-	// "off" posture that stays off is both unset.
+	// service_areas coverage zones (config.Config.BookingGeoEnforce;
+	// bookingops has the full semantics). Injected by cmd/server/main.go.
 	BookingGeoEnforce bool
 }
 
@@ -202,13 +200,40 @@ const (
 	ctxRoles ctxKey = "roles"
 )
 
+// receiptOCRTimeout bounds ONLY POST /v1/field/captures/{id}/receipt:
+// fieldcapture.OCRTimeout (150s, SPEC-W53 Scope B — MiniCPM-OCR on CPU is
+// multi-second per page) plus headroom for the persist + response write.
+const receiptOCRTimeout = fieldcapture.OCRTimeout + 30*time.Second
+
+// requestTimeoutMiddleware applies the global 60s request timeout to every
+// route EXCEPT the receipt-OCR upload, which gets receiptOCRTimeout.
+// chi's middleware.Timeout derives a context deadline, so a longer
+// per-route Timeout INSIDE the group could never extend past an outer 60s
+// one — the exemption must live here, at the outermost layer (smallest
+// diff: the route registration stays in the /v1 group below, only the
+// timeout selection is path-aware). The global 60s bound is UNCHANGED for
+// all other routes.
+func requestTimeoutMiddleware(next http.Handler) http.Handler {
+	global := middleware.Timeout(60 * time.Second)(next)
+	receipt := middleware.Timeout(receiptOCRTimeout)(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost &&
+			strings.HasPrefix(r.URL.Path, "/v1/field/captures/") &&
+			strings.HasSuffix(r.URL.Path, "/receipt") {
+			receipt.ServeHTTP(w, r)
+			return
+		}
+		global.ServeHTTP(w, r)
+	})
+}
+
 // NewRouter builds the chi router with all routes.
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
+	r.Use(requestTimeoutMiddleware)
 
 	if d.TenantBySlug == nil && d.Resolver != nil {
 		d.TenantBySlug = d.Resolver.BySlug
@@ -216,18 +241,11 @@ func NewRouter(d Deps) http.Handler {
 	s := &server{d: d, portalLimiter: newPortalRateLimiter(), promoLimiter: newPortalRateLimiter(), qrLimiter: newPortalRateLimiter(), waitlistLimiter: newPortalRateLimiter()}
 
 	// SPEC-W52 Scope B wiring: geo enrichment + coverage-zone enforcement.
-	// The canonical config fields are config.Config.GeoServiceURL /
-	// BookingGeoEnforce (internal/config/config.go); cmd/server/main.go sits
-	// outside this wave's file scope, so when the Deps fields are unset
-	// NewRouter falls back to reading the same env vars directly — the
-	// QUIET_HOURS_* direct-env precedent (geo/handlers.go). Explicit Deps
-	// values win, which is how tests (and future main.go wiring) inject.
-	if s.d.GeoEnrich == nil {
-		s.d.GeoEnrich = geo.NewEnrichClient(os.Getenv("GEO_SERVICE_URL"), d.Logger)
-	}
-	if !s.d.BookingGeoEnforce && os.Getenv("BOOKING_GEO_ENFORCE") == "true" {
-		s.d.BookingGeoEnforce = true
-	}
+	// cmd/server/main.go passes Deps.GeoEnrich / Deps.BookingGeoEnforce from
+	// config.Config (GeoServiceURL / BookingGeoEnforce) — the W52 direct-env
+	// fallback was removed in W53-D (main.go is in wave scope and does the
+	// pass-through, so a second env read here was dead code). Tests inject
+	// via the Deps fields directly.
 	if s.d.GeoEnrich.Enabled() {
 		// Civic + field-capture inserts self-enrich post-commit (fail-open).
 		if s.d.Store != nil {
@@ -455,6 +473,11 @@ func NewRouter(d Deps) http.Handler {
 		// flush (contract §4). manage_bookings — same posture as the lead
 		// capture + contact-location writes it performs.
 		r.With(s.require("manage_bookings")).Post("/field/capture", s.fieldCaptureHandler)
+		// SPEC-W53 Scope B (additive): receipt OCR upload against an existing
+		// capture anchor ({id} = the capture's client_id). manage_bookings —
+		// the same perm as the capture flush it attaches to. This route is
+		// exempt from the global 60s timeout (see requestTimeoutMiddleware).
+		r.With(s.require("manage_bookings")).Post("/field/captures/{id}/receipt", s.fieldCaptureReceiptHandler)
 		// SPEC-W19 integrator (additive): loyalty self-mounts "/loyalty"
 		// INSIDE this /v1 group (chi panics on a second Mount("/v1"), and
 		// this way the group inherits the tenant middleware for free);
@@ -1019,6 +1042,18 @@ func (s *server) fieldCaptureHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.d.FieldCapture.Capture(w, r, tenantFrom(r.Context()))
+}
+
+// fieldCaptureReceiptHandler adapts POST /v1/field/captures/{id}/receipt
+// (SPEC-W53 Scope B). Answers 503 when the field-capture service is not
+// configured; the fail-open/fail-closed OCR posture lives in
+// fieldcapture.Handlers.Receipt.
+func (s *server) fieldCaptureReceiptHandler(w http.ResponseWriter, r *http.Request) {
+	if s.d.FieldCapture == nil {
+		writeError(w, http.StatusServiceUnavailable, "field capture unavailable")
+		return
+	}
+	s.d.FieldCapture.Receipt(w, r, tenantFrom(r.Context()))
 }
 
 // publicCreateBookingMarked wraps the public booking create with the
