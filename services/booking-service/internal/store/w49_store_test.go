@@ -49,6 +49,11 @@ func w49Fixture(t *testing.T, st *Store) (uuid.UUID, uuid.UUID) {
 	if err := st.ensureBookingPaymentAttemptsTable(ctx); err != nil {
 		t.Fatalf("payment attempts table: %v", err)
 	}
+	// SPEC-W51 B1: same re-run idiom for bookings.public_ref (column +
+	// backfill + unique index); the re-run also proves idempotency.
+	if err := st.ensureBookingPublicRef(ctx); err != nil {
+		t.Fatalf("bookings public_ref: %v", err)
+	}
 	tenantID := uuid.New()
 	off := Offering{TenantID: tenantID, Name: "Consult", DurationMin: 30,
 		PriceCents: 7500, Currency: "NGN", Bookable: true}

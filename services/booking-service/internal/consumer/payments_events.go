@@ -237,13 +237,16 @@ func (c *PaymentsEventsConsumer) Process(ctx context.Context, raw []byte) error 
 // outboxBuilder returns the store.PaymentOutboxBuilder that marshals the
 // reconciliation CloudEvent (BookingPaymentConfirmed on paid,
 // BookingPaymentAmountMismatch on mismatch) for the atomic outbox insert.
-// The payload follows the SPEC-W50 sacred cross-scope contract: booking_id,
-// tenant_id, tx_ref, amount_minor (int64 — the event arrives in MAJOR
-// units; converted ONCE here at the boundary), currency, customer_name,
-// contact_phone, contact_email ("" when unknown, never nil), booking_ref
-// and paid_at (RFC3339, time of the transition — both supplied by the
-// store from the locked booking row). tenantSlug becomes the CloudEvent
-// SUBJECT (V-INT-50 — the ChannelRouter provider-routing key), exactly as
+// The payload follows the SPEC-W50/W51 sacred cross-scope contract:
+// booking_id, tenant_id, tx_ref, amount_minor (int64 — the event arrives in
+// MAJOR units; converted ONCE here at the boundary), currency,
+// customer_name, contact_phone, contact_email ("" when unknown, never nil),
+// booking_ref (SPEC-W51: the booking's public_ref BK-XXXXXXXX, supplied by
+// the store from the locked booking row) and paid_at (RFC3339, time of the
+// transition). The mismatch alert additionally carries
+// expected_amount_minor (int64 — the offering price at the transition,
+// SPEC-W51 contract delta). tenantSlug becomes the CloudEvent SUBJECT
+// (V-INT-50 — the ChannelRouter provider-routing key), exactly as
 // bookingops sets it on the other booking events.
 func (c *PaymentsEventsConsumer) outboxBuilder(tenantID, tenantSlug, txRef string, amountMajor float64, currency string) store.PaymentOutboxBuilder {
 	amountMinor := int64(math.Round(amountMajor * 100))
@@ -257,7 +260,7 @@ func (c *PaymentsEventsConsumer) outboxBuilder(tenantID, tenantSlug, txRef strin
 		default:
 			return "", nil, nil
 		}
-		payload, err := json.Marshal(events.New("booking-service", evtType, tenantSlug, tenantID, map[string]any{
+		data := map[string]any{
 			"booking_id":    info.BookingID.String(),
 			"tenant_id":     tenantID,
 			"tx_ref":        txRef,
@@ -268,7 +271,15 @@ func (c *PaymentsEventsConsumer) outboxBuilder(tenantID, tenantSlug, txRef strin
 			"contact_email": info.ContactEmail,
 			"booking_ref":   info.BookingRef,
 			"paid_at":       info.PaidAt.UTC().Format(time.RFC3339),
-		}))
+		}
+		// SPEC-W51 sacred contract delta: ONLY the mismatch alert carries the
+		// expected amount (the offering price in minor units captured at the
+		// transition) — BookingPaymentConfirmed stays byte-contractual except
+		// booking_ref now being the public_ref.
+		if outcome == store.PaymentMarkAmountMismatch {
+			data["expected_amount_minor"] = info.ExpectedAmountMinor
+		}
+		payload, err := json.Marshal(events.New("booking-service", evtType, tenantSlug, tenantID, data))
 		if err != nil {
 			return "", nil, err
 		}

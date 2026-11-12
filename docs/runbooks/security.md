@@ -93,6 +93,21 @@ While learning, open-appsec auto-discovers the API surface of `/api/*`
   `BOOKING_PG_USER`/`BOOKING_PG_PASS` in `.env` (see `.env.example`), consumed
   by the booking `DATABASE_URL` construction in `docker-compose.yml` (and by
   booking-service's config fallback `PG_DSN`+`PG_USER`/`PG_PASS`).
+- **Runtime-created tables (W51-C, V-FUNDS grants gap)**: several services
+  apply schema DDL at boot on their own runtime DSN (booking-service
+  `ensure*` migrations, payments-service boot bootstrap, notification-worker,
+  crm-sync, kyc, billing, conversation/knowledge helpers), so those tables
+  are owned by the `app_*_login` role — not by the bootstrap superuser.
+  `05-app-roles.sql` therefore sets `ALTER DEFAULT PRIVILEGES FOR ROLE
+  <app_*_login> IN SCHEMA public` (in addition to `opendesk`/`postgres`) in
+  every service database, granting SELECT/INSERT/UPDATE/DELETE on future
+  tables and USAGE/SELECT on future sequences to the `app_*` group — and to
+  the `app_*_internal` escape group where one exists (identity,
+  notifications, payments). Without this, runtime tables such as
+  `booking_reviews` / `booking_payment_attempts` were invisible to the other
+  app roles. Tables already existing when the script (re)runs are covered by
+  the same section's `GRANT ... ON ALL TABLES` statements; `USAGE ON SCHEMA
+  public` is granted per database for every app role.
 - Verify enforcement manually:
 
   ```sh

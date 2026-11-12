@@ -196,6 +196,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (store.Booking, er
 		Source:         in.Source,
 		IdempotencyKey: in.IdempotencyKey,
 	}
+	// SPEC-W51 B1/B3: pre-assign the canonical public_ref so the
+	// BookingCreated payload (marshalled BEFORE the insert tx) already
+	// carries it. CreateBookingTx prefers this value, regenerates with the
+	// counter loop on an intra-tenant collision and writes the authoritative
+	// ref back into booking.PublicRef.
+	booking.PublicRef = store.PublicRefForBooking(booking.ID)
 	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingCreated", in.TenantSlug, booking, offering, contact)
 	if err != nil {
 		return store.Booking{}, err
@@ -427,6 +433,10 @@ func marshalEvent(eventType, tenantSlug string, b store.Booking, data map[string
 	data["ends_at"] = b.EndsAt
 	data["status"] = b.Status
 	data["source"] = b.Source
+	// SPEC-W51 B3 (additive): the human-readable public ref rides every
+	// booking lifecycle event that already exposes booking_id — "" only for
+	// a pre-W51 row the mandatory backfill somehow missed.
+	data["public_ref"] = b.PublicRef
 	evt := events.New("booking-service", eventType, tenantSlug, b.TenantID.String(), data)
 	return json.Marshal(evt)
 }

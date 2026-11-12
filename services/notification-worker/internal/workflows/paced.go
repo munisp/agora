@@ -114,6 +114,19 @@ const (
 	// activity (SPEC-W50-B). NotifyPaced invokes it in-process (mirrors
 	// ActivitySendWhatsAppCampaignMessage).
 	ActivitySendPaymentReceipt = "SendPaymentReceipt"
+
+	// PacedSendOpsAlert routes to SendPaymentMismatchAlert (SPEC-W51-A):
+	// the OPS/STAFF-only payment amount-mismatch alert after booking-service
+	// emits com.opendesk.booking.BookingPaymentAmountMismatch. SYSTEM/
+	// TRANSACTIONAL-class (a funds-integrity alert): never DND-suppressed,
+	// never quiet-hours deferred — and NEVER addressed to the customer
+	// contact (the payload carries no customer addressing at all).
+	PacedSendOpsAlert = "ops_alert"
+
+	// ActivitySendPaymentMismatchAlert is the name of the payment mismatch
+	// ops-alert activity (SPEC-W51-A). NotifyPaced invokes it in-process
+	// (mirrors ActivitySendPaymentReceipt).
+	ActivitySendPaymentMismatchAlert = "SendPaymentMismatchAlert"
 )
 
 // PacedSendRequest is the payload of the NotifyPaced activity: which send
@@ -152,6 +165,11 @@ type PacedSendRequest struct {
 	// payment_receipt kind (SPEC-W50-B): TRANSACTIONAL-class payment
 	// receipt after BookingPaymentConfirmed.
 	PaymentReceipt *PacedPaymentReceiptSend `json:"payment_receipt,omitempty"`
+	// PaymentMismatch carries the SendPaymentMismatchAlert arguments for
+	// the ops_alert kind (SPEC-W51-A): SYSTEM/TRANSACTIONAL-class
+	// funds-integrity alert after BookingPaymentAmountMismatch. OPS/STAFF
+	// routing only — never the customer contact.
+	PaymentMismatch *PacedPaymentMismatchSend `json:"payment_mismatch,omitempty"`
 }
 
 // PushTarget is one explicit device token in a push payload (SPEC-W16
@@ -338,6 +356,34 @@ type PacedPaymentReceiptSend struct {
 	ContactPhone string `json:"contact_phone"` // E.164, may be ""
 	ContactEmail string `json:"contact_email"` // may be ""
 	BookingRef   string `json:"booking_ref"`   // human string; falls back to booking_id
+}
+
+// PacedPaymentMismatchSend carries the SendPaymentMismatchAlert arguments
+// (SPEC-W51-A): one OPS/STAFF-only alert for a payment amount mismatch. It
+// mirrors the sacred W51 cross-scope contract payload of the
+// com.opendesk.booking.BookingPaymentAmountMismatch CloudEvent
+// (booking_id/tenant_id/tx_ref/amount_minor/currency/booking_ref/paid_at
+// plus the W51 delta expected_amount_minor — the offering price the booking
+// expected) — the service boundary contract is duplicated, not shared; keep
+// the field tags in sync with booking-service's outbox payload. TenantSlug
+// is envelope-derived (CloudEvent subject).
+//
+// GUARD (SPEC-W51-A): this payload deliberately carries NO customer contact
+// fields — mismatch alerts are an internal funds-integrity signal routed to
+// the ops channel, never to the customer.
+type PacedPaymentMismatchSend struct {
+	BookingID  string `json:"booking_id"`
+	TenantID   string `json:"tenant_id"`
+	TenantSlug string `json:"tenant_slug,omitempty"`
+	TxRef      string `json:"tx_ref"`
+	// AmountMinor is the CAPTURED amount (minor units);
+	// ExpectedAmountMinor is the offering price the booking expected
+	// (SPEC-W51 contract delta, int64).
+	AmountMinor         int64  `json:"amount_minor"`
+	ExpectedAmountMinor int64  `json:"expected_amount_minor"`
+	Currency            string `json:"currency"`
+	BookingRef          string `json:"booking_ref"` // human public ref (BK-XXXXXXXX); falls back to booking_id
+	PaidAt              string `json:"paid_at"`     // RFC3339 capture timestamp, may be ""
 }
 
 // PacedUSSDActionSend carries the SendUSSDActionMessage arguments

@@ -16,6 +16,7 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"testing"
 	"time"
 
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     idempotency_key TEXT,
     payment_ref TEXT NOT NULL DEFAULT '',
     payment_status TEXT NOT NULL DEFAULT '',
+    public_ref TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -158,11 +160,14 @@ func (f *w49ConsumerFixture) seed() (uuid.UUID, uuid.UUID, string) {
 		tenantID, seedTenantSlug, seedTenantSlug); err != nil {
 		f.t.Fatalf("seed site: %v", err)
 	}
+	// SPEC-W51 B1/B2: the seed carries the canonical public_ref so the
+	// contract payload asserts the BK-XXXXXXXX booking_ref, not the UUID
+	// fallback (raw inserts bypass the create path's assignment).
 	if _, err := f.raw.Exec(ctx,
-		`INSERT INTO bookings (id, tenant_id, offering_id, contact_id, starts_at, ends_at, status, source)
+		`INSERT INTO bookings (id, tenant_id, offering_id, contact_id, starts_at, ends_at, status, source, public_ref)
 		 VALUES ($1,$2,$3,(SELECT id FROM contacts WHERE tenant_id=$2 AND phone=$4),
-		         now() + interval '1 hour', now() + interval '2 hours', 'pending', 'api')`,
-		bookingID, tenantID, off.ID, seedContactPhone); err != nil {
+		         now() + interval '1 hour', now() + interval '2 hours', 'pending', 'api', $5)`,
+		bookingID, tenantID, off.ID, seedContactPhone, store.PublicRefForBooking(bookingID)); err != nil {
 		f.t.Fatalf("seed booking: %v", err)
 	}
 	txRef := "fw-" + uuid.NewString()
@@ -195,13 +200,19 @@ func (f *w49ConsumerFixture) event(eventType string, tenantID uuid.UUID, txRef s
 	return raw
 }
 
-// assertContractPayload checks the SPEC-W50 sacred cross-scope
+// w51PublicRefRe is the SPEC-W51 booking_ref contract shape.
+var w51PublicRefRe = regexp.MustCompile(`^BK-[0-9A-Z]{8}$`)
+
+// assertContractPayload checks the SPEC-W50/W51 sacred cross-scope
 // BookingPaymentConfirmed/BookingPaymentAmountMismatch event: the CloudEvent
 // SUBJECT carries the tenant slug (V-INT-50 — ChannelRouter provider-routing
 // key) and the data payload matches field-by-field: booking_id, tenant_id,
 // tx_ref, amount_minor (int64 minor units), currency, customer_name,
-// contact_phone, contact_email, booking_ref, paid_at (RFC3339).
-func assertContractPayload(t *testing.T, evt map[string]any, tenantID, bookingID uuid.UUID, txRef string, amountMinor int64, currency string) {
+// contact_phone, contact_email, booking_ref (SPEC-W51: the public_ref
+// BK-XXXXXXXX), paid_at (RFC3339). expectedAmountMinor >= 0 asserts the
+// SPEC-W51 mismatch-only expected_amount_minor field; < 0 asserts the field
+// is ABSENT (BookingPaymentConfirmed payload unchanged otherwise).
+func assertContractPayload(t *testing.T, evt map[string]any, tenantID, bookingID uuid.UUID, txRef string, amountMinor int64, currency string, expectedAmountMinor int64) {
 	t.Helper()
 	if evt["subject"] != seedTenantSlug {
 		t.Fatalf("subject = %v, want %s (tenant slug for ChannelRouter)", evt["subject"], seedTenantSlug)
@@ -231,8 +242,18 @@ func assertContractPayload(t *testing.T, evt map[string]any, tenantID, bookingID
 	if data["contact_email"] != seedContactEmail {
 		t.Fatalf("contact_email = %v, want %s", data["contact_email"], seedContactEmail)
 	}
-	if data["booking_ref"] != bookingID.String() {
-		t.Fatalf("booking_ref = %v, want %s", data["booking_ref"], bookingID)
+	if data["booking_ref"] != store.PublicRefForBooking(bookingID) {
+		t.Fatalf("booking_ref = %v, want public_ref %s", data["booking_ref"], store.PublicRefForBooking(bookingID))
+	}
+	if ref, _ := data["booking_ref"].(string); !w51PublicRefRe.MatchString(ref) {
+		t.Fatalf("booking_ref %q does not match ^BK-[0-9A-Z]{8}$", ref)
+	}
+	if expectedAmountMinor >= 0 {
+		if data["expected_amount_minor"] != float64(expectedAmountMinor) {
+			t.Fatalf("expected_amount_minor = %v (%T), want %d", data["expected_amount_minor"], data["expected_amount_minor"], expectedAmountMinor)
+		}
+	} else if _, present := data["expected_amount_minor"]; present {
+		t.Fatalf("BookingPaymentConfirmed must NOT carry expected_amount_minor (W51 contract): %v", data["expected_amount_minor"])
 	}
 	paidAt, ok := data["paid_at"].(string)
 	if !ok || paidAt == "" {
@@ -288,7 +309,7 @@ func TestPaymentsEvents_CapturedMarksPaid(t *testing.T) {
 	if evt["type"] != BookingPaymentConfirmedEventType {
 		t.Fatalf("event type = %v, want %s", evt["type"], BookingPaymentConfirmedEventType)
 	}
-	assertContractPayload(t, evt, tenantID, bookingID, txRef, 7500, "NGN")
+	assertContractPayload(t, evt, tenantID, bookingID, txRef, 7500, "NGN", -1)
 
 	// Idempotent replay (unprefixed type form): acked, no state churn, no
 	// second outbox row.
@@ -345,6 +366,19 @@ func TestPaymentsEvents_AmountMismatch(t *testing.T) {
 	rows := f.outboxRows(bookingID)
 	if len(rows) != 1 || rows[0]["type"] != BookingPaymentAmountMismatchEventType {
 		t.Fatalf("outbox = %v, want one %s alert", rows, BookingPaymentAmountMismatchEventType)
+	}
+	// SPEC-W51 contract delta: the fast-path mismatch alert carries the
+	// public_ref as booking_ref and the expected offering price.
+	data, _ := rows[0]["data"].(map[string]any)
+	if ref, _ := data["booking_ref"].(string); !w51PublicRefRe.MatchString(ref) ||
+		ref != store.PublicRefForBooking(bookingID) {
+		t.Fatalf("mismatch booking_ref = %v, want public_ref %s", data["booking_ref"], store.PublicRefForBooking(bookingID))
+	}
+	if data["expected_amount_minor"] != 7500.0 {
+		t.Fatalf("expected_amount_minor = %v, want 7500 (offering price)", data["expected_amount_minor"])
+	}
+	if data["amount_minor"] != 7000.0 {
+		t.Fatalf("amount_minor = %v, want 7000 (captured)", data["amount_minor"])
 	}
 
 	// Replay: acked no-op, no duplicate alert.
@@ -421,7 +455,7 @@ func TestPaymentsEvents_SupersededLinkCapture(t *testing.T) {
 	if len(rows) != 1 || rows[0]["type"] != BookingPaymentConfirmedEventType {
 		t.Fatalf("outbox = %v, want one %s", rows, BookingPaymentConfirmedEventType)
 	}
-	assertContractPayload(t, rows[0], tenantID, bookingID, oldRef, 7500, "NGN")
+	assertContractPayload(t, rows[0], tenantID, bookingID, oldRef, 7500, "NGN", -1)
 
 	// Replay of the same capture → acked no-op (exactly-once), no churn.
 	if err := f.c.Process(ctx, f.event(PaymentsCapturedEventType, tenantID, oldRef, 75.00, "NGN")); err != nil {
@@ -469,7 +503,7 @@ func TestPaymentsEvents_FallbackAmountMismatch(t *testing.T) {
 	if len(rows) != 1 || rows[0]["type"] != BookingPaymentAmountMismatchEventType {
 		t.Fatalf("outbox = %v, want one %s alert", rows, BookingPaymentAmountMismatchEventType)
 	}
-	assertContractPayload(t, rows[0], tenantID, bookingID, oldRef, 7000, "NGN")
+	assertContractPayload(t, rows[0], tenantID, bookingID, oldRef, 7000, "NGN", 7500)
 
 	// Replay → no duplicate alert.
 	if err := f.c.Process(ctx, f.event(PaymentsCapturedEventType, tenantID, oldRef, 70.00, "NGN")); err != nil {

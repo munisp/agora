@@ -35,11 +35,15 @@ type Booking struct {
 	Status         string    `json:"status"`
 	Source         string    `json:"source"` // web|voice|api
 	IdempotencyKey string    `json:"idempotency_key"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// PublicRef is the human-readable booking reference BK-XXXXXXXX
+	// (SPEC-W51 B1), unique per tenant; "" only for rows written by a
+	// pre-W51 binary before the mandatory backfill ran.
+	PublicRef string    `json:"public_ref"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-const bookingCols = `id, tenant_id, offering_id, team_member_id, contact_id, starts_at, ends_at, status, source, idempotency_key, created_at, updated_at`
+const bookingCols = `id, tenant_id, offering_id, team_member_id, contact_id, starts_at, ends_at, status, source, idempotency_key, public_ref, created_at, updated_at`
 
 func scanBooking(row pgx.Row) (Booking, error) {
 	var b Booking
@@ -47,7 +51,7 @@ func scanBooking(row pgx.Row) (Booking, error) {
 	// SPEC-W43 K-02) — scan through a pointer so NULL decodes to "".
 	var key *string
 	err := row.Scan(&b.ID, &b.TenantID, &b.OfferingID, &b.TeamMemberID, &b.ContactID,
-		&b.StartsAt, &b.EndsAt, &b.Status, &b.Source, &key, &b.CreatedAt, &b.UpdatedAt)
+		&b.StartsAt, &b.EndsAt, &b.Status, &b.Source, &key, &b.PublicRef, &b.CreatedAt, &b.UpdatedAt)
 	if key != nil {
 		b.IdempotencyKey = *key
 	}
@@ -154,36 +158,61 @@ func checkSlotOverlapTx(ctx context.Context, tx pgx.Tx, tenantID, teamMemberID, 
 // slot inside the transaction under a per-member advisory lock (SPEC-W43
 // K-01), and stores an empty idempotency key as NULL (SPEC-W43 K-02) so the
 // (tenant_id, idempotency_key) partial unique index dedupes only real keys.
+//
+// SPEC-W51 B1: the booking's public_ref is assigned inside the transaction
+// (b.PublicRef is preferred when already set — the caller marshalled it into
+// the outbox payload — and the counter loop regenerates on collision;
+// b.PublicRef is written back with the authoritative value). A residual
+// cross-transaction unique race on uq_bookings_tenant_public_ref retries the
+// whole transaction with a fresh candidate scan; the idempotency-key unique
+// violation keeps its ErrConflict replay semantics.
 func (s *Store) CreateBookingTx(ctx context.Context, b *Booking, guard SlotGuard, outboxTopic string, eventPayload []byte, extra ...ExtraOutbox) error {
 	if b.ID == uuid.Nil {
 		b.ID = uuid.New()
 	}
-	err := s.withTenant(ctx, b.TenantID, func(tx pgx.Tx) error {
-		if err := lockTeamMemberTx(ctx, tx, b.TenantID, b.TeamMemberID); err != nil {
-			return err
-		}
-		if err := checkSlotOverlapTx(ctx, tx, b.TenantID, b.TeamMemberID, uuid.Nil, b.StartsAt, b.EndsAt, guard); err != nil {
-			return err
-		}
-		const ins = `INSERT INTO bookings (` + bookingCols + `)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),now(),now())
-		             RETURNING created_at, updated_at`
-		err := tx.QueryRow(ctx, ins, b.ID, b.TenantID, b.OfferingID, b.TeamMemberID, b.ContactID,
-			b.StartsAt, b.EndsAt, b.Status, b.Source, b.IdempotencyKey).Scan(&b.CreatedAt, &b.UpdatedAt)
-		if err != nil {
-			if isUniqueViolation(err) {
-				return ErrConflict
+	var err error
+	for attempt := 0; ; attempt++ {
+		err = s.withTenant(ctx, b.TenantID, func(tx pgx.Tx) error {
+			if err := lockTeamMemberTx(ctx, tx, b.TenantID, b.TeamMemberID); err != nil {
+				return err
 			}
-			return fmt.Errorf("insert booking: %w", err)
-		}
+			if err := checkSlotOverlapTx(ctx, tx, b.TenantID, b.TeamMemberID, uuid.Nil, b.StartsAt, b.EndsAt, guard); err != nil {
+				return err
+			}
+			ref, err := assignPublicRefTx(ctx, tx, b.TenantID, b.ID, b.PublicRef)
+			if err != nil {
+				return err
+			}
+			b.PublicRef = ref
+			const ins = `INSERT INTO bookings (` + bookingCols + `)
+			             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,now(),now())
+			             RETURNING created_at, updated_at`
+			err = tx.QueryRow(ctx, ins, b.ID, b.TenantID, b.OfferingID, b.TeamMemberID, b.ContactID,
+				b.StartsAt, b.EndsAt, b.Status, b.Source, b.IdempotencyKey, b.PublicRef).Scan(&b.CreatedAt, &b.UpdatedAt)
+			if err != nil {
+				if isPublicRefUniqueViolation(err) {
+					// Concurrent insert won this ref between the EXISTS scan
+					// and the INSERT — retry the whole tx with a fresh scan.
+					return err
+				}
+				if isUniqueViolation(err) {
+					return ErrConflict
+				}
+				return fmt.Errorf("insert booking: %w", err)
+			}
 
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
-			b.ID, outboxTopic, eventPayload); err != nil {
-			return fmt.Errorf("insert outbox: %w", err)
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+				b.ID, outboxTopic, eventPayload); err != nil {
+				return fmt.Errorf("insert outbox: %w", err)
+			}
+			return insertExtraOutbox(ctx, tx, b.ID, extra)
+		})
+		if !isPublicRefUniqueViolation(err) || attempt >= publicRefRetryAttempts {
+			break
 		}
-		return insertExtraOutbox(ctx, tx, b.ID, extra)
-	})
+		b.PublicRef = "" // force a fresh candidate scan on the retry
+	}
 	if err == nil {
 		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
 	}

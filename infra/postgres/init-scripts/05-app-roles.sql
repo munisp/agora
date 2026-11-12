@@ -12,6 +12,19 @@
 -- (docs/runbooks/secrets.md). Roles are cluster-global; this script is
 -- idempotent via pg_roles existence checks. Runs under
 -- docker-entrypoint-initdb.d's psql path (uses \c like the other scripts).
+--
+-- W51-C (V-FUNDS grants gap): several services apply schema DDL at runtime
+-- on their OWN DSN (booking-service ensure* migrations, payments-service
+-- boot bootstrap, notification-worker, crm-sync, kyc, billing,
+-- conversation/knowledge helpers), so those tables are owned by the
+-- app_*_login role — NOT by the opendesk/postgres bootstrap superuser.
+-- Default privileges FOR ROLE opendesk/postgres alone therefore leave
+-- runtime-created tables (booking_reviews, booking_payment_attempts, ...)
+-- with no grants for the other app roles (notably the app_*_internal
+-- cross-tenant escape groups). Every per-database section below now also
+-- sets ALTER DEFAULT PRIVILEGES FOR ROLE <app_*_login> so future tables
+-- inherit the same grants automatically. Tables already existing when this
+-- script (re)runs are covered by the GRANT ... ON ALL TABLES statements.
 
 -- ---------------------------------------------------------------------------
 -- Roles (created once, cluster-wide)
@@ -53,6 +66,13 @@ ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_booking;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_booking;
+-- W51-C: booking-service runs its ensure* migrations at boot on its runtime
+-- DSN (app_booking_login owns booking_reviews, booking_payment_attempts,
+-- ...) — extend default privileges to that migration-owner role too.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_booking_login IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_booking;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_booking_login IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_booking;
 
 -- ---------------------------------------------------------------------------
 -- conversation database
@@ -67,6 +87,12 @@ ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_conversation;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_conversation;
+-- W51-C: conversation-service applies helper DDL at runtime on its own DSN
+-- (app/db.py, app/agent_db.py) as app_conversation_login.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_conversation_login IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_conversation;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_conversation_login IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_conversation;
 
 -- ---------------------------------------------------------------------------
 -- knowledge database
@@ -80,6 +106,12 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_knowledge;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_knowledge;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_knowledge;
+-- W51-C: knowledge-service applies helper DDL at runtime on its own DSN
+-- (app/suggestions.py) as app_knowledge_login.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_knowledge_login IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_knowledge;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_knowledge_login IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_knowledge;
 
 -- ---------------------------------------------------------------------------
@@ -109,6 +141,12 @@ ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_billing;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_billing;
+-- W51-C: billing-engine applies its migrations at boot on the runtime DSN
+-- (app_billing_login owns the migration-created tables).
+ALTER DEFAULT PRIVILEGES FOR ROLE app_billing_login IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_billing;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_billing_login IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_billing;
 
 -- ---------------------------------------------------------------------------
 -- Wave 12 (SPEC-W12): kyc-service role
@@ -136,6 +174,12 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_kyc;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_kyc;
 ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_kyc;
+-- W51-C: kyc-service applies its verification-audit schema at boot on the
+-- runtime DSN (app_kyc_login owns the kyc_audit tables).
+ALTER DEFAULT PRIVILEGES FOR ROLE app_kyc_login IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_kyc;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_kyc_login IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_kyc;
 
 -- ---------------------------------------------------------------------------
@@ -221,12 +265,14 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_identity_internal;
 -- Future tables created by the bootstrap superuser stay reachable. Docker's
 -- bootstrap role is `opendesk`; the embedded test Postgres (pgserver, used
 -- by tests/restore-drill) bootstraps as `postgres` — cover whichever exists
--- (billing 0002_rls.sql idiom, generalized).
+-- (billing 0002_rls.sql idiom, generalized). W51-C: identity-service also
+-- applies startup DDL on its runtime DSN, so include the migration-owner
+-- role app_identity_login in the same loop.
 DO $$
 DECLARE
     bootstrap TEXT;
 BEGIN
-    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres', 'app_identity_login'] LOOP
         IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
                 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_identity', bootstrap);
@@ -265,11 +311,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_notif
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_notifications_internal;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_notifications;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_notifications_internal;
+-- W51-C: notification-worker bootstraps its schema at startup on the
+-- runtime DSN — include the migration-owner role app_notifications_login
+-- alongside the bootstrap superusers.
 DO $$
 DECLARE
     bootstrap TEXT;
 BEGIN
-    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres', 'app_notifications_login'] LOOP
         IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
                 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_notifications', bootstrap);
@@ -302,11 +351,14 @@ GRANT USAGE ON SCHEMA public TO app_crm_sync;
 GRANT CREATE ON SCHEMA public TO app_crm_sync;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_crm_sync;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_crm_sync;
+-- W51-C: crm-sync-service creates sync_map at startup on the runtime DSN —
+-- include the migration-owner role app_crm_sync_login alongside the
+-- bootstrap superusers.
 DO $$
 DECLARE
     bootstrap TEXT;
 BEGIN
-    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres', 'app_crm_sync_login'] LOOP
         IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
                 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_crm_sync', bootstrap);
@@ -379,11 +431,16 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_payme
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_payments_internal;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_payments;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_payments_internal;
+-- W51-C: payments-service bootstraps its schema at startup on the runtime
+-- DSN — include the migration-owner role app_payments_login alongside the
+-- bootstrap superusers (its own 0001_rls.sql covers only opendesk/postgres).
+-- This is what lets the app_payments_internal escape group (payout
+-- reconciler) reach tables the service creates at boot.
 DO $$
 DECLARE
     bootstrap TEXT;
 BEGIN
-    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres'] LOOP
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres', 'app_payments_login'] LOOP
         IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
                 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_payments', bootstrap);

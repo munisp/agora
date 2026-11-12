@@ -114,6 +114,15 @@ func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
 			in.TenantSlug = req.PaymentReceipt.TenantSlug
 			in.Phone = req.PaymentReceipt.ContactPhone
 		}
+	case workflows.PacedSendOpsAlert:
+		// SPEC-W51-A: ops_alert is SYSTEM/transactional-class (guard
+		// short-circuits before reading these) and OPS/STAFF-addressed —
+		// the payload carries NO customer phone, so there is deliberately
+		// nothing for the phone-keyed registries to check; tenant slug
+		// carried for audit completeness only.
+		if req.PaymentMismatch != nil {
+			in.TenantSlug = req.PaymentMismatch.TenantSlug
+		}
 	}
 	return in
 }
@@ -207,6 +216,11 @@ func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedS
 			return fmt.Errorf("NotifyPaced %s: missing payment_receipt payload", req.Kind)
 		}
 		return a.SendPaymentReceipt(ctx, *req.PaymentReceipt)
+	case workflows.PacedSendOpsAlert:
+		if req.PaymentMismatch == nil {
+			return fmt.Errorf("NotifyPaced %s: missing payment_mismatch payload", req.Kind)
+		}
+		return a.SendPaymentMismatchAlert(ctx, *req.PaymentMismatch)
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
 	}

@@ -254,8 +254,11 @@ const (
 // contact INSIDE the same transaction that holds the booking row lock;
 // missing contact fields are EMPTY STRINGS, never nil. PaidAt is the time
 // of the transition (UTC). BookingRef is the human booking reference —
-// bookings carry no separate human ref column, so it is the booking UUID
-// string (notification-worker falls back to booking_id identically).
+// SPEC-W51 B1/B2: the booking's public_ref (BK-XXXXXXXX); the booking UUID
+// string is only the defense-in-depth fallback for a legacy row whose
+// mandatory backfill somehow has not run. ExpectedAmountMinor (SPEC-W51
+// sacred contract delta) is the offering price in MINOR units captured at
+// the transition — what the booking expected the rail to capture.
 type PaymentTransitionInfo struct {
 	BookingID    uuid.UUID
 	BookingRef   string
@@ -263,6 +266,8 @@ type PaymentTransitionInfo struct {
 	ContactPhone string // E.164, "" when unknown
 	ContactEmail string // "" when unknown
 	PaidAt       time.Time
+	// ExpectedAmountMinor is the offering price_cents at transition time.
+	ExpectedAmountMinor int64
 }
 
 // PaymentOutboxBuilder builds the outbox row (topic + CloudEvent payload)
@@ -445,17 +450,22 @@ func (s *Store) paymentTransitionLocked(ctx context.Context, tx pgx.Tx, tenantID
 	// SPEC-W50 A2: enriched payload context — customer/contact fields from
 	// the booking's contact row (same tx, booking row already locked);
 	// absent contact → empty strings, never NULL.
+	// SPEC-W51 B1/B2: booking_ref is the booking's public_ref (BK-XXXXXXXX);
+	// the UUID string is only the fallback for a legacy row the mandatory
+	// backfill somehow missed. ExpectedAmountMinor pins the offering price
+	// the amount check just compared against.
 	info := PaymentTransitionInfo{
-		BookingID:  bookingID,
-		BookingRef: bookingID.String(),
-		PaidAt:     time.Now().UTC(),
+		BookingID:           bookingID,
+		BookingRef:          bookingID.String(), // defense-in-depth fallback
+		PaidAt:              time.Now().UTC(),
+		ExpectedAmountMinor: priceCents,
 	}
 	err = tx.QueryRow(ctx,
-		`SELECT COALESCE(c.name,''), COALESCE(c.phone,''), COALESCE(c.email,'')
+		`SELECT COALESCE(NULLIF(b.public_ref,''), $3), COALESCE(c.name,''), COALESCE(c.phone,''), COALESCE(c.email,'')
 		 FROM bookings b LEFT JOIN contacts c
 		   ON c.tenant_id=b.tenant_id AND c.id=b.contact_id
 		 WHERE b.tenant_id=$1 AND b.id=$2`,
-		tenantID, bookingID).Scan(&info.CustomerName, &info.ContactPhone, &info.ContactEmail)
+		tenantID, bookingID, bookingID.String()).Scan(&info.BookingRef, &info.CustomerName, &info.ContactPhone, &info.ContactEmail)
 	if err != nil {
 		return "", false, fmt.Errorf("load booking contact for confirmation payload: %w", err)
 	}

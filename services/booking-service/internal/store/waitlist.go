@@ -238,6 +238,28 @@ func (s *Store) ClaimWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID
 		booking.ID = uuid.New()
 	}
 	var entry WaitlistEntry
+	var err error
+	for attempt := 0; ; attempt++ {
+		entry, err = s.claimWaitlistOnce(ctx, tenantID, entryID, token, offering, booking, loc, outboxTopic, eventPayload)
+		// SPEC-W51 B1: a public_ref unique race (concurrent insert committed
+		// between the in-tx candidate scan and the INSERT) retries the whole
+		// claim with a fresh candidate scan — the claim itself is atomic, so
+		// the retry is safe.
+		if !isPublicRefUniqueViolation(err) || attempt >= publicRefRetryAttempts {
+			break
+		}
+		booking.PublicRef = ""
+	}
+	if err == nil {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return entry, err
+}
+
+// claimWaitlistOnce is one attempt of ClaimWaitlistTx (see its doc).
+func (s *Store) claimWaitlistOnce(ctx context.Context, tenantID, entryID uuid.UUID, token uuid.UUID,
+	offering Offering, booking *Booking, loc *time.Location, outboxTopic string, eventPayload []byte) (WaitlistEntry, error) {
+	var entry WaitlistEntry
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var err error
 		entry, err = scanWaitlist(tx.QueryRow(ctx,
@@ -324,13 +346,26 @@ func (s *Store) ClaimWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID
 			return fmt.Errorf("%w: slot no longer available", ErrConflict)
 		}
 
+		// SPEC-W51 B1: assign the public_ref inside the claim transaction
+		// (booking.PublicRef is preferred when the caller pre-set it for the
+		// outbox payload; the counter loop regenerates on collision and the
+		// authoritative value is written back).
+		ref, err := assignPublicRefTx(ctx, tx, tenantID, booking.ID, booking.PublicRef)
+		if err != nil {
+			return err
+		}
+		booking.PublicRef = ref
 		const ins = `INSERT INTO bookings (` + bookingCols + `)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),now(),now())
+		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,now(),now())
 		             RETURNING created_at, updated_at`
 		err = tx.QueryRow(ctx, ins, booking.ID, booking.TenantID, booking.OfferingID, booking.TeamMemberID,
 			booking.ContactID, booking.StartsAt, booking.EndsAt, booking.Status, booking.Source,
-			booking.IdempotencyKey).Scan(&booking.CreatedAt, &booking.UpdatedAt)
+			booking.IdempotencyKey, booking.PublicRef).Scan(&booking.CreatedAt, &booking.UpdatedAt)
 		if err != nil {
+			if isPublicRefUniqueViolation(err) {
+				// Concurrent insert won this ref — retried by the outer loop.
+				return err
+			}
 			if isUniqueViolation(err) {
 				return ErrConflict
 			}
@@ -349,9 +384,6 @@ func (s *Store) ClaimWaitlistTx(ctx context.Context, tenantID, entryID uuid.UUID
 		entry.Status = WaitlistClaimed
 		return nil
 	})
-	if err == nil {
-		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
-	}
 	return entry, err
 }
 

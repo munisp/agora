@@ -142,6 +142,11 @@ func (b *Bridge) Process(ctx context.Context, raw []byte) error {
 		// gate so a fail-closed ack (missing booking_id/tx_ref, no
 		// reachable contact) is logged loudly, never silently dropped.
 		return b.startPaymentReceipt(ctx, env)
+	case eventTypeBookingPaymentAmountMismatch, eventTypeBookingPaymentAmountMismatchBare:
+		// SPEC-W51-A: payment amount-mismatch OPS alert — handled BEFORE
+		// the booking-scoped gate so a fail-closed ack (missing
+		// booking_id/tx_ref) is logged loudly, never silently dropped.
+		return b.startPaymentMismatchAlert(ctx, env)
 	case eventTypeWaitlistEntryExpired:
 		// Audit-only lifecycle event: paced sends are single-shot (no
 		// pending future send for an entry exists), so an expiry has
@@ -219,6 +224,13 @@ const (
 	// eventmail's identity/billing tolerance).
 	eventTypeBookingPaymentConfirmed     = "com.opendesk.booking.BookingPaymentConfirmed"
 	eventTypeBookingPaymentConfirmedBare = "BookingPaymentConfirmed"
+
+	// SPEC-W51-A: booking-service emits BookingPaymentAmountMismatch when
+	// a capture's amount differs from the offering price the booking
+	// expected. Both the CloudEvents type-prefix form and the bare form
+	// are accepted (mirroring the BookingPaymentConfirmed tolerance).
+	eventTypeBookingPaymentAmountMismatch     = "com.opendesk.booking.BookingPaymentAmountMismatch"
+	eventTypeBookingPaymentAmountMismatchBare = "BookingPaymentAmountMismatch"
 )
 
 // startWaitlistNotify starts one WaitlistNotifyWorkflow per
@@ -339,6 +351,65 @@ func (b *Bridge) startPaymentReceipt(ctx context.Context, env eventEnvelope) err
 	}
 	b.log.Info("PaymentReceiptWorkflow started",
 		zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef))
+	return nil
+}
+
+// startPaymentMismatchAlert starts one PaymentMismatchAlertWorkflow per
+// BookingPaymentAmountMismatch event (SPEC-W51-A). The payload is the
+// sacred W51 cross-scope contract: booking_id, tenant_id, tx_ref,
+// amount_minor (int64, captured), expected_amount_minor (int64, the
+// offering price the booking expected — the W51 contract delta), currency,
+// booking_ref (human public ref, BK-XXXXXXXX), paid_at.
+//
+// GUARD: the alert is OPS/STAFF-only — unlike the payment receipt there is
+// NO reachable-contact requirement (the payload carries no customer contact
+// fields and the send path never touches a customer-facing binding).
+//
+// Fail-closed: an event without booking_id/tx_ref is acknowledged WITHOUT
+// starting a workflow — a malformed event must never produce an alert with
+// no reconciliation anchors. Redelivered events dedupe on the deterministic
+// workflow ID (payment-mismatch-<tx_ref>, WorkflowExecutionAlreadyStarted →
+// ack), so a Kafka redelivery can never double-alert.
+func (b *Bridge) startPaymentMismatchAlert(ctx context.Context, env eventEnvelope) error {
+	if b.starter == nil {
+		return nil
+	}
+	var send workflows.PacedPaymentMismatchSend
+	raw, err := json.Marshal(env.Data)
+	if err != nil {
+		return fmt.Errorf("marshal BookingPaymentAmountMismatch data: %w", err)
+	}
+	if err := json.Unmarshal(raw, &send); err != nil {
+		b.log.Warn("malformed BookingPaymentAmountMismatch payload; acknowledged without alert", zap.Error(err))
+		return nil
+	}
+	if send.BookingID == "" || send.TxRef == "" {
+		b.log.Warn("BookingPaymentAmountMismatch missing booking_id/tx_ref; acknowledged without alert",
+			zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef))
+		return nil
+	}
+	// Envelope defaults when the payload omits addressing fields.
+	if send.TenantID == "" {
+		send.TenantID = env.TenantID
+	}
+	send.TenantSlug = env.Subject
+	_, err = b.starter.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        "payment-mismatch-" + send.TxRef,
+		TaskQueue: b.taskQueue,
+	}, "PaymentMismatchAlertWorkflow", send)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) || strings.Contains(err.Error(), "already started") {
+			b.log.Info("PaymentMismatchAlertWorkflow already running; event acknowledged (no double-alert)",
+				zap.String("tx_ref", send.TxRef))
+			return nil
+		}
+		return fmt.Errorf("start PaymentMismatchAlertWorkflow: %w", err)
+	}
+	b.log.Info("PaymentMismatchAlertWorkflow started",
+		zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef),
+		zap.Int64("expected_amount_minor", send.ExpectedAmountMinor),
+		zap.Int64("captured_amount_minor", send.AmountMinor))
 	return nil
 }
 

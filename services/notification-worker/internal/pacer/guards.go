@@ -99,6 +99,12 @@ var kindClasses = map[string]SendClass{
 	// suppression must NEVER block a receipt, and no quiet-hours
 	// deferral applies. Mirrors confirmation's exact guard posture.
 	"payment_receipt": ClassTransactional,
+	// SPEC-W51-A: a payment amount-mismatch alert is a SYSTEM/
+	// transactional-class ops/staff signal (funds integrity) — DND
+	// suppression must NEVER block it and no quiet-hours deferral
+	// applies. It is also never addressed to a customer contact, so the
+	// phone-keyed registries have nothing to check anyway.
+	"ops_alert": ClassTransactional,
 }
 
 // ClassifyKind returns the compliance class of a paced send kind. Unknown

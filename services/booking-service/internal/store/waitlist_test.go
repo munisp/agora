@@ -121,6 +121,11 @@ func newTestStore(t *testing.T) *Store {
 	if err := st.ensureTeamMemberUserIDColumn(ctx); err != nil {
 		t.Fatalf("team_members.user_id column: %v", err)
 	}
+	// Same re-run for the SPEC-W51 bookings.public_ref column + backfill +
+	// unique index (B1) — also proves the migration is idempotent.
+	if err := st.ensureBookingPublicRef(ctx); err != nil {
+		t.Fatalf("bookings public_ref: %v", err)
+	}
 	return st
 }
 

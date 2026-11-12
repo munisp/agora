@@ -171,6 +171,11 @@ func (s *Service) ClaimWaitlist(ctx context.Context, in ClaimInput) (store.Booki
 		Source:         "web", // user-driven claim link (bookings.source CHECK)
 		IdempotencyKey: "waitlist-claim:" + in.EntryID.String(),
 	}
+	// SPEC-W51 B1/B3: assign the id + canonical public_ref up front so the
+	// BookingCreated payload carries both; ClaimWaitlistTx prefers this ref,
+	// regenerates on collision and writes the authoritative value back.
+	booking.ID = uuid.New()
+	booking.PublicRef = store.PublicRefForBooking(booking.ID)
 	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingCreated", in.TenantSlug, booking, offering, contact)
 	if err != nil {
 		return store.Booking{}, store.WaitlistEntry{}, err

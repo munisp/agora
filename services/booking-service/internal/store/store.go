@@ -150,6 +150,13 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W51 (W51-B item B1): bookings.public_ref — human-readable
+	// BK-XXXXXXXX reference, per-tenant unique, with the mandatory
+	// deterministic backfill of pre-W51 rows.
+	if err := s.ensureBookingPublicRef(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// SPEC-W45 CODER-A item 5: contacts dedupe — fold duplicate
 	// (tenant_id, phone) rows and create the UNIQUE index (fresh installs
 	// get it from 01-booking-schema.sql directly).
