@@ -137,6 +137,11 @@ func (b *Bridge) Process(ctx context.Context, raw []byte) error {
 	switch env.Type {
 	case eventTypeWaitlistEntryNotified:
 		return b.startWaitlistNotify(ctx, env)
+	case eventTypeBookingPaymentConfirmed, eventTypeBookingPaymentConfirmedBare:
+		// SPEC-W50-B: payment receipt — handled BEFORE the booking-scoped
+		// gate so a fail-closed ack (missing booking_id/tx_ref, no
+		// reachable contact) is logged loudly, never silently dropped.
+		return b.startPaymentReceipt(ctx, env)
 	case eventTypeWaitlistEntryExpired:
 		// Audit-only lifecycle event: paced sends are single-shot (no
 		// pending future send for an entry exists), so an expiry has
@@ -207,6 +212,13 @@ func (b *Bridge) startBackfill(ctx context.Context, env eventEnvelope) error {
 const (
 	eventTypeWaitlistEntryNotified = "com.opendesk.booking.WaitlistEntryNotified"
 	eventTypeWaitlistEntryExpired  = "com.opendesk.booking.WaitlistEntryExpired"
+
+	// SPEC-W50-B: booking-service emits BookingPaymentConfirmed after a
+	// capture transitions a booking to paid. Both the CloudEvents
+	// type-prefix form and the bare form are accepted (mirroring
+	// eventmail's identity/billing tolerance).
+	eventTypeBookingPaymentConfirmed     = "com.opendesk.booking.BookingPaymentConfirmed"
+	eventTypeBookingPaymentConfirmedBare = "BookingPaymentConfirmed"
 )
 
 // startWaitlistNotify starts one WaitlistNotifyWorkflow per
@@ -269,6 +281,64 @@ func (b *Bridge) startWaitlistNotify(ctx context.Context, env eventEnvelope) err
 	}
 	b.log.Info("WaitlistNotifyWorkflow started",
 		zap.String("entry_id", data.Entry.ID), zap.String("offering_id", data.Input.OfferingID))
+	return nil
+}
+
+// startPaymentReceipt starts one PaymentReceiptWorkflow per
+// BookingPaymentConfirmed event (SPEC-W50-B). The payload is the sacred W50
+// cross-scope contract: booking_id, tenant_id, tx_ref, amount_minor
+// (int64), currency, customer_name, contact_phone, contact_email,
+// booking_ref, paid_at.
+//
+// Fail-closed: an event without booking_id/tx_ref, or with BOTH
+// contact_phone and contact_email empty, is acknowledged WITHOUT starting a
+// workflow — no send is possible, and a malformed event must never produce
+// a customer-facing message. Redelivered events dedupe on the deterministic
+// workflow ID (payment-receipt-<tx_ref>, WorkflowExecutionAlreadyStarted →
+// ack), so a Kafka redelivery can never double-send a receipt.
+func (b *Bridge) startPaymentReceipt(ctx context.Context, env eventEnvelope) error {
+	if b.starter == nil {
+		return nil
+	}
+	var send workflows.PacedPaymentReceiptSend
+	raw, err := json.Marshal(env.Data)
+	if err != nil {
+		return fmt.Errorf("marshal BookingPaymentConfirmed data: %w", err)
+	}
+	if err := json.Unmarshal(raw, &send); err != nil {
+		b.log.Warn("malformed BookingPaymentConfirmed payload; acknowledged without send", zap.Error(err))
+		return nil
+	}
+	if send.BookingID == "" || send.TxRef == "" {
+		b.log.Warn("BookingPaymentConfirmed missing booking_id/tx_ref; acknowledged without send",
+			zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef))
+		return nil
+	}
+	if send.ContactPhone == "" && send.ContactEmail == "" {
+		b.log.Warn("BookingPaymentConfirmed has no reachable contact (phone and email empty); acknowledged without send",
+			zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef))
+		return nil
+	}
+	// Envelope defaults when the payload omits addressing fields.
+	if send.TenantID == "" {
+		send.TenantID = env.TenantID
+	}
+	send.TenantSlug = env.Subject
+	_, err = b.starter.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        "payment-receipt-" + send.TxRef,
+		TaskQueue: b.taskQueue,
+	}, "PaymentReceiptWorkflow", send)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) || strings.Contains(err.Error(), "already started") {
+			b.log.Info("PaymentReceiptWorkflow already running; event acknowledged (no double-send)",
+				zap.String("tx_ref", send.TxRef))
+			return nil
+		}
+		return fmt.Errorf("start PaymentReceiptWorkflow: %w", err)
+	}
+	b.log.Info("PaymentReceiptWorkflow started",
+		zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef))
 	return nil
 }
 

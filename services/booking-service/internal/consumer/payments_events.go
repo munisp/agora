@@ -18,6 +18,12 @@
 // amount/currency mismatch against the offering price flips
 // payment_status='paid_amount_mismatch' and emits a
 // BookingPaymentAmountMismatch alert instead, still acked.
+//
+// SPEC-W50 A1/A2: when the bookings.payment_ref fast path misses, the
+// capture is retried through the booking_payment_attempts audit table
+// (superseded-link fallback — same single-tx transition, tenant-scoped),
+// and the outbox payload carries the enriched cross-scope contract fields
+// (amount_minor int64, customer/contact/booking_ref, paid_at).
 package consumer
 
 import (
@@ -25,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,7 +50,7 @@ const PaymentsCapturedEventType = "FlutterwavePaymentCaptured"
 // BookingPaymentConfirmedEventType / BookingPaymentAmountMismatchEventType
 // are the outbox CloudEvent types emitted on reconciliation.
 const (
-	BookingPaymentConfirmedEventType     = "com.opendesk.booking.BookingPaymentConfirmed"
+	BookingPaymentConfirmedEventType      = "com.opendesk.booking.BookingPaymentConfirmed"
 	BookingPaymentAmountMismatchEventType = "com.opendesk.booking.BookingPaymentAmountMismatch"
 )
 
@@ -172,8 +179,33 @@ func (c *PaymentsEventsConsumer) Process(ctx context.Context, raw []byte) error 
 			zap.String("event_id", env.ID), zap.String("tx_ref", txRef), zap.String("tenant_id", tenantStr))
 		return nil
 	}
+	// V-INT-50: notification-worker routes receipt providers via
+	// ChannelRouter.Provider(channel, subject) — the CloudEvent SUBJECT must
+	// carry the tenant slug or tenant SMS overrides (termii/africastalking)
+	// never engage. bookingops sets it from the API layer's site resolution
+	// (MarshalBookingEvent); the consumer reverse-resolves it from the same
+	// site registry (GetSiteByTenant). Fail-closed for the RECEIPT, not the
+	// lookup: a failed/missing slug must never drop a payment confirmation
+	// — emit with an empty subject and log a structured warning.
+	tenantSlug := ""
+	if site, serr := c.store.GetSiteByTenant(ctx, tenantID); serr != nil {
+		c.log.Warn("tenant slug lookup failed; emitting payment event with empty subject",
+			zap.String("event_id", env.ID), zap.String("tenant_id", tenantStr),
+			zap.String("tx_ref", txRef), zap.Error(serr))
+	} else {
+		tenantSlug = site.TenantSlug
+	}
 	outcome, bookingID, err := c.store.MarkBookingPaymentPaidTx(ctx, tenantID, txRef,
-		env.Data.Amount, env.Data.Currency, c.outboxBuilder(tenantStr, txRef, env.Data.Amount, env.Data.Currency))
+		env.Data.Amount, env.Data.Currency, c.outboxBuilder(tenantStr, tenantSlug, txRef, env.Data.Amount, env.Data.Currency))
+	if errors.Is(err, store.ErrNotFound) {
+		// SPEC-W50 A1 superseded-link fallback: the capture may reference
+		// an OLDER checkout link (superseded when the customer
+		// re-initialized payment) that no longer sits on
+		// bookings.payment_ref but IS recorded in booking_payment_attempts.
+		// Same tenant scope, same single-tx transition semantics.
+		outcome, bookingID, err = c.store.MarkBookingPaymentPaidByAttemptTx(ctx, tenantID, txRef,
+			env.Data.Amount, env.Data.Currency, c.outboxBuilder(tenantStr, tenantSlug, txRef, env.Data.Amount, env.Data.Currency))
+	}
 	if errors.Is(err, store.ErrNotFound) {
 		// Unknown tx_ref: the capture is not ours (or the initialize leg
 		// never persisted). ACK — redelivery cannot heal this.
@@ -205,8 +237,17 @@ func (c *PaymentsEventsConsumer) Process(ctx context.Context, raw []byte) error 
 // outboxBuilder returns the store.PaymentOutboxBuilder that marshals the
 // reconciliation CloudEvent (BookingPaymentConfirmed on paid,
 // BookingPaymentAmountMismatch on mismatch) for the atomic outbox insert.
-func (c *PaymentsEventsConsumer) outboxBuilder(tenantID, txRef string, amount float64, currency string) store.PaymentOutboxBuilder {
-	return func(outcome store.PaymentMarkOutcome, bookingID uuid.UUID) (string, []byte, error) {
+// The payload follows the SPEC-W50 sacred cross-scope contract: booking_id,
+// tenant_id, tx_ref, amount_minor (int64 — the event arrives in MAJOR
+// units; converted ONCE here at the boundary), currency, customer_name,
+// contact_phone, contact_email ("" when unknown, never nil), booking_ref
+// and paid_at (RFC3339, time of the transition — both supplied by the
+// store from the locked booking row). tenantSlug becomes the CloudEvent
+// SUBJECT (V-INT-50 — the ChannelRouter provider-routing key), exactly as
+// bookingops sets it on the other booking events.
+func (c *PaymentsEventsConsumer) outboxBuilder(tenantID, tenantSlug, txRef string, amountMajor float64, currency string) store.PaymentOutboxBuilder {
+	amountMinor := int64(math.Round(amountMajor * 100))
+	return func(outcome store.PaymentMarkOutcome, info store.PaymentTransitionInfo) (string, []byte, error) {
 		var evtType string
 		switch outcome {
 		case store.PaymentMarkPaid:
@@ -216,12 +257,17 @@ func (c *PaymentsEventsConsumer) outboxBuilder(tenantID, txRef string, amount fl
 		default:
 			return "", nil, nil
 		}
-		payload, err := json.Marshal(events.New("booking-service", evtType, "", tenantID, map[string]any{
-			"booking_id": bookingID.String(),
-			"tenant_id":  tenantID,
-			"tx_ref":     txRef,
-			"amount":     amount,
-			"currency":   currency,
+		payload, err := json.Marshal(events.New("booking-service", evtType, tenantSlug, tenantID, map[string]any{
+			"booking_id":    info.BookingID.String(),
+			"tenant_id":     tenantID,
+			"tx_ref":        txRef,
+			"amount_minor":  amountMinor,
+			"currency":      currency,
+			"customer_name": info.CustomerName,
+			"contact_phone": info.ContactPhone,
+			"contact_email": info.ContactEmail,
+			"booking_ref":   info.BookingRef,
+			"paid_at":       info.PaidAt.UTC().Format(time.RFC3339),
 		}))
 		if err != nil {
 			return "", nil, err

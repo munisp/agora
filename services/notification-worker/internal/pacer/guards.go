@@ -94,6 +94,11 @@ var kindClasses = map[string]SendClass{
 	// user-requested (transactional-class) — never DND-suppressed,
 	// never quiet-hours deferred.
 	"ussd_action": ClassTransactional,
+	// SPEC-W50-B: a payment receipt is a transaction record (like the
+	// booking confirmation) — transactional-class: marketing DND
+	// suppression must NEVER block a receipt, and no quiet-hours
+	// deferral applies. Mirrors confirmation's exact guard posture.
+	"payment_receipt": ClassTransactional,
 }
 
 // ClassifyKind returns the compliance class of a paced send kind. Unknown

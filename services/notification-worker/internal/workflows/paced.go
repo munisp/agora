@@ -102,6 +102,18 @@ const (
 	// confirmation send activity (SPEC-W47-C UIMOB-06). NotifyPaced invokes
 	// it in-process (mirrors ActivitySendWhatsAppCampaignMessage).
 	ActivitySendUSSDActionMessage = "SendUSSDActionMessage"
+
+	// PacedSendPaymentReceipt routes to SendPaymentReceipt (SPEC-W50-B):
+	// the customer-facing payment receipt delivered after booking-service
+	// emits com.opendesk.booking.BookingPaymentConfirmed. TRANSACTIONAL-class
+	// (a payment receipt is a legal/transaction record, like the booking
+	// confirmation): never DND-suppressed, never quiet-hours deferred.
+	PacedSendPaymentReceipt = "payment_receipt"
+
+	// ActivitySendPaymentReceipt is the name of the payment receipt send
+	// activity (SPEC-W50-B). NotifyPaced invokes it in-process (mirrors
+	// ActivitySendWhatsAppCampaignMessage).
+	ActivitySendPaymentReceipt = "SendPaymentReceipt"
 )
 
 // PacedSendRequest is the payload of the NotifyPaced activity: which send
@@ -136,6 +148,10 @@ type PacedSendRequest struct {
 	// ussd_action kind (SPEC-W47-C UIMOB-06): TRANSACTIONAL-class USSD
 	// menu-action confirmation SMS.
 	USSDAction *PacedUSSDActionSend `json:"ussd_action,omitempty"`
+	// PaymentReceipt carries the SendPaymentReceipt arguments for the
+	// payment_receipt kind (SPEC-W50-B): TRANSACTIONAL-class payment
+	// receipt after BookingPaymentConfirmed.
+	PaymentReceipt *PacedPaymentReceiptSend `json:"payment_receipt,omitempty"`
 }
 
 // PushTarget is one explicit device token in a push payload (SPEC-W16
@@ -300,6 +316,28 @@ type PacedProposalReminderSend struct {
 // PacedStaffAlertSend carries the EscalateTicket arguments.
 type PacedStaffAlertSend struct {
 	Input SupportEscalationInput `json:"input"`
+}
+
+// PacedPaymentReceiptSend carries the SendPaymentReceipt arguments
+// (SPEC-W50-B): one customer-facing payment receipt. It mirrors the sacred
+// W50 cross-scope contract payload of the
+// com.opendesk.booking.BookingPaymentConfirmed CloudEvent
+// (booking_id/tenant_id/tx_ref/amount_minor/currency/customer_name/
+// contact_phone/contact_email/booking_ref) — the service boundary contract
+// is duplicated, not shared; keep the field tags in sync with
+// booking-service's outbox payload. TenantSlug is envelope-derived
+// (CloudEvent subject) and keys the per-tenant ChannelRouter binding.
+type PacedPaymentReceiptSend struct {
+	BookingID    string `json:"booking_id"`
+	TenantID     string `json:"tenant_id"`
+	TenantSlug   string `json:"tenant_slug,omitempty"`
+	TxRef        string `json:"tx_ref"`
+	AmountMinor  int64  `json:"amount_minor"`
+	Currency     string `json:"currency"`
+	CustomerName string `json:"customer_name"`
+	ContactPhone string `json:"contact_phone"` // E.164, may be ""
+	ContactEmail string `json:"contact_email"` // may be ""
+	BookingRef   string `json:"booking_ref"`   // human string; falls back to booking_id
 }
 
 // PacedUSSDActionSend carries the SendUSSDActionMessage arguments

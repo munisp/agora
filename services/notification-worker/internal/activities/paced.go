@@ -106,6 +106,14 @@ func guardInputFromRequest(req workflows.PacedSendRequest) pacer.GuardInput {
 			in.TenantSlug = req.USSDAction.TenantSlug
 			in.Phone = req.USSDAction.Phone
 		}
+	case workflows.PacedSendPaymentReceipt:
+		// SPEC-W50-B: payment_receipt is transactional-class (guard
+		// short-circuits before reading these — marketing DND suppression
+		// must never block a receipt); carried for audit completeness.
+		if req.PaymentReceipt != nil {
+			in.TenantSlug = req.PaymentReceipt.TenantSlug
+			in.Phone = req.PaymentReceipt.ContactPhone
+		}
 	}
 	return in
 }
@@ -194,6 +202,11 @@ func (a *Activities) dispatchPacedSend(ctx context.Context, req workflows.PacedS
 			return fmt.Errorf("NotifyPaced %s: missing ussd_action payload", req.Kind)
 		}
 		return a.SendUSSDActionMessage(ctx, *req.USSDAction)
+	case workflows.PacedSendPaymentReceipt:
+		if req.PaymentReceipt == nil {
+			return fmt.Errorf("NotifyPaced %s: missing payment_receipt payload", req.Kind)
+		}
+		return a.SendPaymentReceipt(ctx, *req.PaymentReceipt)
 	default:
 		return fmt.Errorf("NotifyPaced: unknown send kind %q", req.Kind)
 	}

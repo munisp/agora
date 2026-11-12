@@ -61,9 +61,9 @@ func w49Fixture(t *testing.T, st *Store) (uuid.UUID, uuid.UUID) {
 // w49OutboxBuilder records the outbox rows the tx would commit.
 func w49OutboxBuilder(topic string) (PaymentOutboxBuilder, *[]string) {
 	var got []string
-	return func(outcome PaymentMarkOutcome, bookingID uuid.UUID) (string, []byte, error) {
+	return func(outcome PaymentMarkOutcome, info PaymentTransitionInfo) (string, []byte, error) {
 		got = append(got, string(outcome))
-		return topic, []byte(fmt.Sprintf(`{"outcome":%q,"booking_id":%q}`, outcome, bookingID)), nil
+		return topic, []byte(fmt.Sprintf(`{"outcome":%q,"booking_id":%q}`, outcome, info.BookingID)), nil
 	}, &got
 }
 

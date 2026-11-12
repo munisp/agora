@@ -137,6 +137,11 @@ func run() error {
 	// notify). Without this registration the started workflow would queue
 	// forever on a worker that does not host the type.
 	w.RegisterWorkflowWithOptions(workflows.WaitlistNotifyWorkflow, workflow.RegisterOptions{Name: "WaitlistNotifyWorkflow"})
+	// SPEC-W50-B: payment receipt, started by the signals bridge on
+	// com.opendesk.booking.BookingPaymentConfirmed (deterministic ID
+	// payment-receipt-<tx_ref>). Without this registration the started
+	// workflow would queue forever on a worker that does not host the type.
+	w.RegisterWorkflowWithOptions(workflows.PaymentReceiptWorkflow, workflow.RegisterOptions{Name: "PaymentReceiptWorkflow"})
 	// SPEC-W19 integrator (additive): fire-and-forget paced sends from the
 	// notifications outbox (notifyoutbox consumer starts one per PacedSend
 	// command — e.g. field-service dispatch push).
@@ -202,6 +207,10 @@ func run() error {
 	// kind ussd_action, scheduled by httpapi POST /v1/notify/ussd-action for
 	// messaging-gateway).
 	w.RegisterActivityWithOptions(acts.SendUSSDActionMessage, activity.RegisterOptions{Name: workflows.ActivitySendUSSDActionMessage})
+	// SPEC-W50-B: payment receipt send (via NotifyPaced kind
+	// payment_receipt, scheduled by the signals bridge on
+	// BookingPaymentConfirmed). TRANSACTIONAL — never DND-suppressed.
+	w.RegisterActivityWithOptions(acts.SendPaymentReceipt, activity.RegisterOptions{Name: workflows.ActivitySendPaymentReceipt})
 	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
 	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
 

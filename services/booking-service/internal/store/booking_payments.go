@@ -21,6 +21,13 @@ import (
 // opendesk.payments.events, matched on payment_ref == tx_ref) and the
 // booking_payment_attempts audit table records every initialized checkout
 // (supersede chain + terminal paid/amount_mismatch).
+//
+// SPEC-W50 A1/A2: MarkBookingPaymentPaidByAttemptTx is the superseded-link
+// fallback (capture references an OLD checkout ref no longer on the booking
+// row — matched via booking_payment_attempts, same single-tx transition
+// semantics), and the outbox payload is enriched to the cross-scope
+// BookingPaymentConfirmed contract (customer/contact/booking_ref/paid_at,
+// amount in MINOR units).
 // ---------------------------------------------------------------------------
 
 // Booking payment_status values.
@@ -240,13 +247,31 @@ const (
 	PaymentMarkAlreadyAmountMismatch PaymentMarkOutcome = "already_amount_mismatch"
 )
 
+// PaymentTransitionInfo carries the booking-row context the outbox builder
+// needs for the enriched BookingPaymentConfirmed /
+// BookingPaymentAmountMismatch payload (SPEC-W50 A2, cross-scope sacred
+// contract). The customer/contact fields are read from the booking's
+// contact INSIDE the same transaction that holds the booking row lock;
+// missing contact fields are EMPTY STRINGS, never nil. PaidAt is the time
+// of the transition (UTC). BookingRef is the human booking reference —
+// bookings carry no separate human ref column, so it is the booking UUID
+// string (notification-worker falls back to booking_id identically).
+type PaymentTransitionInfo struct {
+	BookingID    uuid.UUID
+	BookingRef   string
+	CustomerName string
+	ContactPhone string // E.164, "" when unknown
+	ContactEmail string // "" when unknown
+	PaidAt       time.Time
+}
+
 // PaymentOutboxBuilder builds the outbox row (topic + CloudEvent payload)
 // for a paid/amount_mismatch transition. It runs INSIDE the transaction
 // (after the row lock) so the event commits atomically with the state flip;
 // returning ("",
 // nil, nil) skips the outbox write. Not called for the idempotent
 // replay outcomes.
-type PaymentOutboxBuilder func(outcome PaymentMarkOutcome, bookingID uuid.UUID) (topic string, payload []byte, err error)
+type PaymentOutboxBuilder func(outcome PaymentMarkOutcome, info PaymentTransitionInfo) (topic string, payload []byte, err error)
 
 // MarkBookingPaymentPaidTx reconciles one FlutterwavePaymentCaptured event
 // (SPEC-W49 B1): finds the booking by payment_ref == txRef within the
@@ -286,57 +311,9 @@ func (s *Store) MarkBookingPaymentPaidTx(ctx context.Context, tenantID uuid.UUID
 			outcome = PaymentMarkAlreadyAmountMismatch
 			return nil
 		}
-
-		// Amount check: the event carries MAJOR units (contract), the
-		// offering price is minor units (cents). Compare in minor units;
-		// a currency disagreement cannot be compared → mismatch.
-		var priceCents int64
-		var offeringCurrency string
-		err = tx.QueryRow(ctx,
-			`SELECT price_cents, currency FROM offerings WHERE tenant_id=$1 AND id=$2`,
-			tenantID, offeringID).Scan(&priceCents, &offeringCurrency)
-		if err != nil {
-			return fmt.Errorf("load offering for amount check: %w", err)
-		}
-		capturedMinor := int64(math.Round(amountMajor * 100))
-		mismatch := capturedMinor != priceCents ||
-			!strings.EqualFold(strings.TrimSpace(offeringCurrency), strings.TrimSpace(currency))
-
-		newStatus := PaymentStatusPaid
-		attemptStatus := AttemptStatusPaid
-		outcome = PaymentMarkPaid
-		if mismatch {
-			newStatus = PaymentStatusPaidAmountMismatch
-			attemptStatus = AttemptStatusAmountMismatch
-			outcome = PaymentMarkAmountMismatch
-		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE bookings SET payment_status=$3, updated_at=now()
-			 WHERE tenant_id=$1 AND id=$2`,
-			tenantID, bookingID, newStatus); err != nil {
-			return fmt.Errorf("mark booking payment %s: %w", newStatus, err)
-		}
-		if _, err := tx.Exec(ctx,
-			`UPDATE booking_payment_attempts SET status=$3, updated_at=now()
-			 WHERE tenant_id=$1 AND tx_ref=$2`,
-			tenantID, txRef, attemptStatus); err != nil {
-			return fmt.Errorf("mark payment attempt %s: %w", attemptStatus, err)
-		}
-		if buildOutbox != nil {
-			topic, payload, berr := buildOutbox(outcome, bookingID)
-			if berr != nil {
-				return fmt.Errorf("build %s outbox event: %w", outcome, berr)
-			}
-			if topic != "" && payload != nil {
-				if _, err := tx.Exec(ctx,
-					`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
-					bookingID, topic, payload); err != nil {
-					return fmt.Errorf("insert %s outbox: %w", outcome, err)
-				}
-				outboxWritten = true
-			}
-		}
-		return nil
+		var werr error
+		outcome, outboxWritten, werr = s.paymentTransitionLocked(ctx, tx, tenantID, bookingID, offeringID, txRef, false, amountMajor, currency, buildOutbox)
+		return werr
 	})
 	if err != nil {
 		return "", uuid.Nil, err
@@ -345,4 +322,179 @@ func (s *Store) MarkBookingPaymentPaidTx(ctx context.Context, tenantID uuid.UUID
 		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
 	}
 	return outcome, bookingID, nil
+}
+
+// MarkBookingPaymentPaidByAttemptTx is the SPEC-W50 A1 superseded-link
+// fallback: the capture's tx_ref no longer sits on bookings.payment_ref
+// (the customer re-initialized the checkout and a NEW link superseded the
+// one they actually paid through), so reconciliation joins through the
+// booking_payment_attempts audit table instead. Same single-transaction
+// semantics as the fast path:
+//   - attempt looked up by tx_ref STRICTLY within the tenant (RLS +
+//     predicate) and locked FOR UPDATE; unknown → ErrNotFound (the consumer
+//     falls through to its warn+ack poison posture);
+//   - attempt already paid / amount_mismatch → idempotent no-op outcome
+//     (exactly-once under replay: the outbox row was committed by the
+//     first delivery);
+//   - booking already in a terminal payment state (paid / mismatch via
+//     another ref — a second genuine capture on a stale link) → same
+//     idempotent no-op outcomes as the fast path: exactly one confirmation
+//     per booking;
+//   - otherwise the SAME transition as the fast path runs against the
+//     attempt's booking (amount check vs the offering price in minor
+//     units, mismatch path, enriched outbox payload) AND
+//     bookings.payment_ref is advanced to this tx_ref — the paid
+//     reference becomes the booking's current payment ref.
+func (s *Store) MarkBookingPaymentPaidByAttemptTx(ctx context.Context, tenantID uuid.UUID, txRef string, amountMajor float64, currency string, buildOutbox PaymentOutboxBuilder) (PaymentMarkOutcome, uuid.UUID, error) {
+	var outcome PaymentMarkOutcome
+	var bookingID uuid.UUID
+	outboxWritten := false
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var attemptStatus string
+		err := tx.QueryRow(ctx,
+			`SELECT booking_id, status FROM booking_payment_attempts
+			 WHERE tenant_id=$1 AND tx_ref=$2 FOR UPDATE`,
+			tenantID, txRef).Scan(&bookingID, &attemptStatus)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		switch attemptStatus {
+		case AttemptStatusPaid:
+			outcome = PaymentMarkAlreadyPaid
+			return nil
+		case AttemptStatusAmountMismatch:
+			outcome = PaymentMarkAlreadyAmountMismatch
+			return nil
+		}
+		// attempt initialized|superseded: lock the booking row and run the
+		// transition. A cross-tenant booking cannot be reached (the attempt
+		// itself was tenant-scoped); a missing booking is poison → not found.
+		var status string
+		var offeringID uuid.UUID
+		err = tx.QueryRow(ctx,
+			`SELECT payment_status, offering_id FROM bookings
+			 WHERE tenant_id=$1 AND id=$2 FOR UPDATE`,
+			tenantID, bookingID).Scan(&status, &offeringID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		// SAME transition semantics as the fast path: a booking already in
+		// a terminal payment state (paid via ANOTHER ref — e.g. the newer
+		// link's capture landed first, making this a second genuine
+		// capture) is an idempotent no-op here. Exactly one confirmation
+		// per booking; the duplicate capture is acked (the money trail is
+		// already durable rail-side, ops reconcile out-of-band — same
+		// posture as the mismatch path).
+		switch status {
+		case PaymentStatusPaid:
+			outcome = PaymentMarkAlreadyPaid
+			return nil
+		case PaymentStatusPaidAmountMismatch:
+			outcome = PaymentMarkAlreadyAmountMismatch
+			return nil
+		}
+		var werr error
+		outcome, outboxWritten, werr = s.paymentTransitionLocked(ctx, tx, tenantID, bookingID, offeringID, txRef, true, amountMajor, currency, buildOutbox)
+		return werr
+	})
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	if outboxWritten {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
+	return outcome, bookingID, nil
+}
+
+// paymentTransitionLocked performs the paid / amount_mismatch transition
+// shared by the payment_ref fast path and the W50-A attempt fallback. The
+// caller MUST hold the booking row lock (FOR UPDATE) in tx. advanceRef=true
+// (fallback) additionally moves bookings.payment_ref to the capture's
+// tx_ref; the fast path leaves it (it already equals txRef).
+func (s *Store) paymentTransitionLocked(ctx context.Context, tx pgx.Tx, tenantID, bookingID, offeringID uuid.UUID, txRef string, advanceRef bool, amountMajor float64, currency string, buildOutbox PaymentOutboxBuilder) (PaymentMarkOutcome, bool, error) {
+	// Amount check: the event carries MAJOR units (contract), the
+	// offering price is minor units (cents). Compare in minor units;
+	// a currency disagreement cannot be compared → mismatch.
+	var priceCents int64
+	var offeringCurrency string
+	err := tx.QueryRow(ctx,
+		`SELECT price_cents, currency FROM offerings WHERE tenant_id=$1 AND id=$2`,
+		tenantID, offeringID).Scan(&priceCents, &offeringCurrency)
+	if err != nil {
+		return "", false, fmt.Errorf("load offering for amount check: %w", err)
+	}
+	capturedMinor := int64(math.Round(amountMajor * 100))
+	mismatch := capturedMinor != priceCents ||
+		!strings.EqualFold(strings.TrimSpace(offeringCurrency), strings.TrimSpace(currency))
+
+	newStatus := PaymentStatusPaid
+	attemptStatus := AttemptStatusPaid
+	outcome := PaymentMarkPaid
+	if mismatch {
+		newStatus = PaymentStatusPaidAmountMismatch
+		attemptStatus = AttemptStatusAmountMismatch
+		outcome = PaymentMarkAmountMismatch
+	}
+
+	// SPEC-W50 A2: enriched payload context — customer/contact fields from
+	// the booking's contact row (same tx, booking row already locked);
+	// absent contact → empty strings, never NULL.
+	info := PaymentTransitionInfo{
+		BookingID:  bookingID,
+		BookingRef: bookingID.String(),
+		PaidAt:     time.Now().UTC(),
+	}
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(c.name,''), COALESCE(c.phone,''), COALESCE(c.email,'')
+		 FROM bookings b LEFT JOIN contacts c
+		   ON c.tenant_id=b.tenant_id AND c.id=b.contact_id
+		 WHERE b.tenant_id=$1 AND b.id=$2`,
+		tenantID, bookingID).Scan(&info.CustomerName, &info.ContactPhone, &info.ContactEmail)
+	if err != nil {
+		return "", false, fmt.Errorf("load booking contact for confirmation payload: %w", err)
+	}
+
+	if advanceRef {
+		if _, err := tx.Exec(ctx,
+			`UPDATE bookings SET payment_ref=$3, payment_status=$4, updated_at=now()
+			 WHERE tenant_id=$1 AND id=$2`,
+			tenantID, bookingID, txRef, newStatus); err != nil {
+			return "", false, fmt.Errorf("mark booking payment %s: %w", newStatus, err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx,
+			`UPDATE bookings SET payment_status=$3, updated_at=now()
+			 WHERE tenant_id=$1 AND id=$2`,
+			tenantID, bookingID, newStatus); err != nil {
+			return "", false, fmt.Errorf("mark booking payment %s: %w", newStatus, err)
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE booking_payment_attempts SET status=$3, updated_at=now()
+		 WHERE tenant_id=$1 AND tx_ref=$2`,
+		tenantID, txRef, attemptStatus); err != nil {
+		return "", false, fmt.Errorf("mark payment attempt %s: %w", attemptStatus, err)
+	}
+	outboxWritten := false
+	if buildOutbox != nil {
+		topic, payload, berr := buildOutbox(outcome, info)
+		if berr != nil {
+			return "", false, fmt.Errorf("build %s outbox event: %w", outcome, berr)
+		}
+		if topic != "" && payload != nil {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+				bookingID, topic, payload); err != nil {
+				return "", false, fmt.Errorf("insert %s outbox: %w", outcome, err)
+			}
+			outboxWritten = true
+		}
+	}
+	return outcome, outboxWritten, nil
 }
