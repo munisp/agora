@@ -1,0 +1,223 @@
+openapi: 3.0.3
+info:
+  title: OpenDesk geo-service API
+  version: "1.0.0"
+  description: |
+    REST API of `geo-service` (Rust, axum + terrio) — administrative/custom
+    boundary ingest into the booking PostGIS database, point-in-polygon
+    enrichment (coords -> state/lga/ward), and self-hosted PMTiles tile/style
+    serving (SPEC-W52 Scope A).
+
+    Generated from `services/geo-service/src/*.rs`.
+
+    ## Tenancy & authz
+    * Tenant context via the `X-Tenant-Slug` header (house idiom). On this
+      platform the header value used by geo-service is the tenant UUID (the
+      Permify organization id / RLS `app.tenant_id` value). A missing or
+      non-uuid header means "no tenant context": reads (enrich) fall back to
+      platform reference data only, tenant-scope writes 400.
+    * Boundary import (BOTH scopes — reference rows are world-visible, so
+      reference imports require the same perm) is gated by a Permify
+      `manage_bookings` check on `organization:{tenant_id}` for
+      `user:{sub}` (the gateway-injected `X-User-Id`). `AUTHZ_DISABLED=true`
+      is the dev bypass; `PERMIFY_URL` empty disables the gate (dev escape,
+      boot WARN — billing-engine idiom). Never set in production.
+    * The gateway route `api-geo` (`/api/geo/*`) validates the Keycloak JWT
+      (`openid-connect`, realm `opendesk`, client `admin-web`, bearer_only)
+      and strips the `/api/geo` prefix. `NEXT_PUBLIC_GEO_STYLE_URL` defaults
+      to `/api/geo/style.json`, which lands on the service's `/style.json`
+      alias.
+
+    ## RLS
+    `geo_boundaries` runs ENABLE+FORCE ROW LEVEL SECURITY with the
+    NULL-reference `tenant_isolation` variant: `tenant_id IS NULL` rows are
+    platform reference data visible to every tenant; tenant rows are visible
+    only under the transaction-local `app.tenant_id` GUC (set via
+    `set_config(..., true)` per transaction — see src/store.rs).
+
+    ## Errors
+    `{"error": "<message>"}` JSON (tiles/style use plain text). Status map:
+    400 invalid input (bad params, non-uuid tenant on tenant scope),
+    401 caller identity required (live authz without `X-User-Id`),
+    403 Permify denial, 404 tile not in the archive,
+    409 conflict (reserved; imports UPSERT instead of conflicting),
+    413 payload over the 100 MB import cap,
+    422 unparseable/unsupported file or CRS,
+    500 internal (DB) error,
+    502 upstream failure (Permify or `{url}` fetch),
+    503 disabled/unavailable config (GEO_TILES_PATH unset for tiles/style).
+
+    ## No-hit behavior (enrich)
+    A point covered by no boundary is NOT an error: 200 with
+    `{"state":null,"lga":null,"ward":null,"boundaries":[]}` (chosen over 404 —
+    Scope B's fail-open client treats 4xx as "skip enrichment").
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe (APISIX upstream health check)
+      operationId: healthz
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+  /v1/geo/boundaries/import:
+    post:
+      summary: Import boundaries from GeoJSON/Shapefile(zip)/GeoPackage or a URL
+      operationId: importBoundaries
+      description: |
+        Multipart file (`.geojson` / `.json` / `.gpkg` / `.zip` shapefile) OR
+        `{url}` (multipart field or JSON body). Parsed by terrio; non-4326
+        layers are reprojected via terrio's CRS engine (a CRS-less layer is
+        EPSG:4326 per RFC 7946; WKT-only CRS without an EPSG code is 422).
+        Only Polygon/MultiPolygon features import (others count as
+        `skipped`). Insert is one transaction with a per-row savepoint;
+        upsert on (scope-tenant, kind, code). Caps: 50k features / 100 MB.
+      parameters:
+        - in: header
+          name: X-Tenant-Slug
+          required: true
+          schema: {type: string, format: uuid}
+          description: Tenant uuid — the Permify organization for the authz check; the row owner for scope=tenant.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: .geojson/.json/.gpkg/.zip (shapefile) payload (mutually exclusive with `url`)
+                url: {type: string, format: uri, description: http(s) URL of the same formats (mutually exclusive with `file`)}
+                kind: {type: string, enum: [state, lga, ward, custom]}
+                name_field: {type: string, description: attribute carrying the boundary name}
+                code_field: {type: string, description: attribute carrying the boundary code (upsert key)}
+                source: {type: string, description: provenance label (e.g. "geoBoundaries CC-BY-4.0")}
+                scope: {type: string, enum: [reference, tenant], default: reference}
+              required: [kind, name_field, code_field]
+          application/json:
+            schema:
+              type: object
+              properties:
+                url: {type: string, format: uri}
+                kind: {type: string, enum: [state, lga, ward, custom]}
+                name_field: {type: string}
+                code_field: {type: string}
+                source: {type: string}
+                scope: {type: string, enum: [reference, tenant], default: reference}
+              required: [url, kind, name_field, code_field]
+      responses:
+        "200":
+          description: Import summary (per-row problems are reported, not fatal)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported: {type: integer}
+                  skipped: {type: integer, description: features lacking geometry/name/code or non-polygon}
+                  errors:
+                    type: array
+                    items: {type: string}
+                    description: advisory per-feature/per-row messages (capped at 100)
+                required: [imported, skipped, errors]
+        "400": {description: invalid params (kind/name_field/code_field/scope, non-uuid tenant on scope=tenant, missing tenant header)}
+        "401": {description: live authz without caller identity (X-User-Id)}
+        "403": {description: Permify manage_bookings denial}
+        "413": {description: payload over the 100 MB cap}
+        "422": {description: unsupported extension, unparseable file, unsupported/WKT-only CRS, or empty feature set}
+        "500": {description: database error}
+        "502": {description: "Permify outage (fail-closed) or {url} fetch failure"}
+  /v1/geo/enrich:
+    get:
+      summary: Point-in-polygon enrichment (coords -> state/lga/ward + covering boundaries)
+      operationId: enrichPoint
+      description: |
+        `ST_Covers` over reference boundaries first, then the caller's tenant
+        custom rows (RLS-scoped). Reference hits win state/lga/ward; tenant
+        rows only fill slots the reference pass left empty and append to
+        `boundaries`. No hit is 200 with nulls (see "No-hit behavior").
+      parameters:
+        - in: query
+          name: lat
+          required: true
+          schema: {type: number, minimum: -90, maximum: 90}
+        - in: query
+          name: lng
+          required: true
+          schema: {type: number, minimum: -180, maximum: 180}
+        - in: header
+          name: X-Tenant-Slug
+          required: false
+          schema: {type: string, format: uuid}
+          description: Tenant uuid; absent/non-uuid = reference data only.
+      responses:
+        "200":
+          description: Enrichment result (nulls + empty array when no boundary covers the point)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: {type: [string, "null"]}
+                  lga: {type: [string, "null"]}
+                  ward: {type: [string, "null"]}
+                  boundaries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind: {type: string, enum: [state, lga, ward, custom]}
+                        name: {type: string}
+                        code: {type: string}
+                      required: [kind, name, code]
+                required: [state, lga, ward, boundaries]
+        "400": {description: missing/out-of-range lat/lng}
+        "500": {description: database error}
+  /v1/geo/tiles/{z}/{x}/{y}.mvt:
+    get:
+      summary: Vector tile from the self-hosted PMTiles archive (GEO_TILES_PATH)
+      operationId: getTile
+      description: |
+        Read in place from the archive via terrio's tiles reader (header +
+        the tiles needed only). FAIL-CLOSED: 503 with a plain-text error when
+        GEO_TILES_PATH is unset or the archive is unreadable — provisioning
+        is an operator action; a client must never see synthetic tiles. A
+        raster (non-MVT) archive answers 404 (this contract is vector tiles).
+      parameters:
+        - {in: path, name: z, required: true, schema: {type: integer, minimum: 0, maximum: 24}}
+        - {in: path, name: x, required: true, schema: {type: integer, minimum: 0}}
+        - {in: path, name: "y", required: true, schema: {type: integer, minimum: 0}}
+      responses:
+        "200":
+          description: The tile (Cache-Control public, max-age=300)
+          content:
+            application/vnd.mapbox-vector-tile:
+              schema: {type: string, format: binary}
+        "404": {description: no such tile in the archive / archive is not MVT}
+        "503": {description: GEO_TILES_PATH unset or archive unreadable (plain text)}
+  /v1/geo/style.json:
+    get:
+      summary: MapLibre style generated from the PMTiles archive metadata
+      operationId: getStyle
+      description: |
+        Vector source "geo" (bounds/minzoom/maxzoom from the archive) + a
+        background layer + a fill/line pair per declared vector layer. The
+        tiles URL is RELATIVE (`tiles/{z}/{x}/{y}.mvt`) so the same style
+        works from /api/geo/style.json and /api/geo/v1/geo/style.json. No
+        glyphs are referenced (no glyph server this wave). Also served at the
+        `/style.json` alias for the /api/geo gateway strip shape.
+      responses:
+        "200":
+          description: MapLibre style document
+          content:
+            application/json:
+              schema: {type: object}
+        "404": {description: archive is not MVT}
+        "503": {description: GEO_TILES_PATH unset or archive unreadable (plain text)}

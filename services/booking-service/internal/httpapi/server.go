@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -177,6 +178,18 @@ type Deps struct {
 	// non-empty redirect_url is rejected 400 redirect_url_not_allowed; the
 	// empty value (provider default) stays allowed.
 	PayRedirectAllowHosts []string
+
+	// SPEC-W52 Scope B: geospatial foundation wiring.
+	// GeoEnrich is the geo-service point-in-polygon enrichment client
+	// (civic_cases + field_checkins ward/lga autofill, fail-open). Nil →
+	// NewRouter builds one from GEO_SERVICE_URL (empty = disabled); see the
+	// wiring note in NewRouter for why the env fallback lives here.
+	GeoEnrich *geo.EnrichClient
+	// BookingGeoEnforce gates PUBLIC booking creates to the site's
+	// service_areas coverage zones (BOOKING_GEO_ENFORCE; bookingops has the
+	// full semantics). NewRouter ORs the env var in when false — the only
+	// "off" posture that stays off is both unset.
+	BookingGeoEnforce bool
 }
 
 type ctxKey string
@@ -201,6 +214,32 @@ func NewRouter(d Deps) http.Handler {
 		d.TenantBySlug = d.Resolver.BySlug
 	}
 	s := &server{d: d, portalLimiter: newPortalRateLimiter(), promoLimiter: newPortalRateLimiter(), qrLimiter: newPortalRateLimiter(), waitlistLimiter: newPortalRateLimiter()}
+
+	// SPEC-W52 Scope B wiring: geo enrichment + coverage-zone enforcement.
+	// The canonical config fields are config.Config.GeoServiceURL /
+	// BookingGeoEnforce (internal/config/config.go); cmd/server/main.go sits
+	// outside this wave's file scope, so when the Deps fields are unset
+	// NewRouter falls back to reading the same env vars directly — the
+	// QUIET_HOURS_* direct-env precedent (geo/handlers.go). Explicit Deps
+	// values win, which is how tests (and future main.go wiring) inject.
+	if s.d.GeoEnrich == nil {
+		s.d.GeoEnrich = geo.NewEnrichClient(os.Getenv("GEO_SERVICE_URL"), d.Logger)
+	}
+	if !s.d.BookingGeoEnforce && os.Getenv("BOOKING_GEO_ENFORCE") == "true" {
+		s.d.BookingGeoEnforce = true
+	}
+	if s.d.GeoEnrich.Enabled() {
+		// Civic + field-capture inserts self-enrich post-commit (fail-open).
+		if s.d.Store != nil {
+			store.RegisterCivicGeoEnricher(s.d.Store, geoEnricherAdapter{c: s.d.GeoEnrich}, d.Logger)
+		}
+	}
+	if s.d.Ops != nil && s.d.BookingGeoEnforce {
+		// The gate additionally requires the public-create context marker,
+		// so the shared Ops instance stays inert for the tenant API and the
+		// Kafka command consumer.
+		s.d.Ops.GeoEnforce = true
+	}
 
 	// SPEC-W18 Agent D (additive): the entitlement gate prefers the tenant
 	// resolved by tenantMiddleware (covers the JWT-claim path where no
@@ -599,7 +638,10 @@ func NewRouter(d Deps) http.Handler {
 		r.Get("/offerings", s.publicOfferings)
 		r.Get("/context", s.publicContext)
 		r.Get("/availability", s.publicAvailability)
-		r.Post("/bookings", s.publicCreateBooking)
+		// SPEC-W52: the marker tags this as the PUBLIC create path so
+		// bookingops applies the coverage-zone gate here (and ONLY here —
+		// the tenant API and the Kafka consumer share Ops.Create ungated).
+		r.Post("/bookings", s.publicCreateBookingMarked)
 		// SPEC-W48 A3/A4: public pay + review legs (no auth; the site slug
 		// resolves the tenant server-side, rate-limited via the existing
 		// public-endpoint limiter). APISIX routes added by W48-D.
@@ -964,13 +1006,41 @@ func (s *server) devicesHandler(fn func(*devices.Handlers, http.ResponseWriter, 
 }
 
 // fieldCaptureHandler adapts POST /v1/field/capture (SPEC-W16 Agent B).
-// Answers 503 when the field-capture service is not configured.
+// Answers 503 when the field-capture service is not configured. SPEC-W52:
+// with a geo enricher configured the enriched variant runs — freshly applied
+// GPS items get their ward/lga filled post-commit, fail-open.
 func (s *server) fieldCaptureHandler(w http.ResponseWriter, r *http.Request) {
 	if s.d.FieldCapture == nil {
 		writeError(w, http.StatusServiceUnavailable, "field capture unavailable")
 		return
 	}
+	if s.d.GeoEnrich.Enabled() {
+		s.d.FieldCapture.CaptureEnriched(w, r, tenantFrom(r.Context()), geoEnricherAdapter{c: s.d.GeoEnrich})
+		return
+	}
 	s.d.FieldCapture.Capture(w, r, tenantFrom(r.Context()))
+}
+
+// publicCreateBookingMarked wraps the public booking create with the
+// SPEC-W52 path marker: bookingops applies the coverage-zone gate
+// (BOOKING_GEO_ENFORCE) only to marked (public) creates.
+func (s *server) publicCreateBookingMarked(w http.ResponseWriter, r *http.Request) {
+	s.publicCreateBooking(w, r.WithContext(bookingops.MarkPublicBookingCreate(r.Context())))
+}
+
+// geoEnricherAdapter projects *geo.EnrichClient (full A↔B contract result)
+// onto the store package's GeoEnricher interface (the import direction is
+// geo → store, so the store cannot name geo.EnrichResult itself).
+type geoEnricherAdapter struct {
+	c *geo.EnrichClient
+}
+
+func (a geoEnricherAdapter) Enrich(ctx context.Context, tenantID string, lat, lng float64) *store.GeoEnrichment {
+	res := a.c.Enrich(ctx, tenantID, lat, lng)
+	if res == nil {
+		return nil
+	}
+	return &store.GeoEnrichment{State: res.State, LGA: res.LGA, Ward: res.Ward}
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1072,18 @@ func (s *server) mapOpError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "conflict")
 	case errors.Is(err, bookingops.ErrPhoneRequired):
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, bookingops.ErrGeoOutsideCoverage):
+		// SPEC-W52: coverage-zone rejection at public booking create. The
+		// machine-readable code is the contract; "error" keeps the house
+		// error shape for generic clients.
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"code":  "GEO_OUTSIDE_COVERAGE",
+			"error": err.Error(),
+		})
+	case errors.Is(err, store.ErrPostGISUnavailable):
+		// SPEC-W52: coverage enforcement with no PostGIS — the geoHandler
+		// degradation idiom, not a fallback.
+		writeError(w, http.StatusServiceUnavailable, "geo features unavailable")
 	case errors.Is(err, bookingops.ErrSlotUnavailable), errors.Is(err, bookingops.ErrInvalidTransition):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, bookingops.ErrClaimExpired):

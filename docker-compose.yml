@@ -267,6 +267,12 @@ services:
       GEOCODE_ENABLED: ${GEOCODE_ENABLED:-false}
       GEOCODE_BASE_URL: ${GEOCODE_BASE_URL:-https://nominatim.openstreetmap.org}
       GEO_CAMPAIGN_BATCH: ${GEO_CAMPAIGN_BATCH:-50}
+      # SPEC-W52 Scope B: geo-service enrichment client (fail-open, 3s
+      # timeout; empty URL disables it entirely) + booking coverage-zone
+      # enforcement master switch (default OFF; sites without drawn service
+      # areas always pass — docs/geospatial-terrio.md §4).
+      GEO_SERVICE_URL: ${GEO_SERVICE_URL:-http://geo:7015}
+      BOOKING_GEO_ENFORCE: ${BOOKING_GEO_ENFORCE:-false}
       # W39 mock-rail contract — the dev stack has no payout-provider
       # credentials, no live TigerBeetle bridge for lending, and no social
       # API credentials, so these are opted in EXPLICITLY here. Code defaults
@@ -667,6 +673,47 @@ services:
     environment:
       DAPR_APP_ID: payments
       DAPR_APP_PORT: '7004'
+  geo:
+    logging: *default-logging
+    deploy: *default-limits
+    build:
+      context: ./services/geo-service
+    # Optional: secrets/dev overrides (compose still boots without it —
+    # every ${VAR} below carries a dev fallback). cp .env.example .env
+    env_file:
+    - path: .env
+      required: false
+    environment:
+      # SPEC-W52 Scope A: geo-service (Rust/terrio) — boundary ingest into
+      # the BOOKING PostGIS database, point-in-polygon enrichment for
+      # booking-service (Scope B), self-hosted PMTiles tiles/style for
+      # admin-web (Scope C). Least-privilege app_geo_login role
+      # (05-app-roles.sql); FORCE RLS (migrations/0001_geo.sql, applied at
+      # boot) binds it. REQUIRED — the service refuses to boot without it.
+      GEO_DATABASE_URL: postgres://${GEO_PG_USER:-app_geo_login}:${GEO_PG_PASS:-app_geo_dev_password}@postgres:5432/booking
+      # W48-D (recon F6): PgBouncer OPT-IN passthrough — empty by default,
+      # so the DSN above keeps pointing DIRECTLY at postgres:5432. This var
+      # itself is NOT read by service code.
+      PGBOUNCER_URL: ${PGBOUNCER_URL:-}
+      GEO_BIND: ${GEO_BIND:-0.0.0.0:7015}
+      # EMPTY = tiles disabled: /v1/geo/tiles/* + /v1/geo/style.json (and
+      # their /api/geo/* gateway shapes) fail closed with 503 + plain error.
+      # Provision offline: terrio convert boundaries.gpkg       #   data/geo/boundaries.pmtiles --maxzoom 10 (docs/geospatial-terrio.md).
+      GEO_TILES_PATH: ${GEO_TILES_PATH:-}
+      # Permify manage_bookings gate for boundary import (any scope).
+      PERMIFY_URL: http://permify:3476
+      # DEV bypass only (booking-service idiom); never true in prod.
+      AUTHZ_DISABLED: ${AUTHZ_DISABLED:-false}
+    # Drop the PMTiles archive here and set GEO_TILES_PATH=/data/geo/<file>.
+    volumes:
+    - ./data/geo:/data/geo:ro
+    # GF4 (SPEC-W34): no host port published — reachable only on the
+    # opendesk network and through APISIX :9080 (route api-geo).
+    networks:
+    - opendesk
+    depends_on:
+    - postgres
+    - permify
   edge:
     logging: *default-logging
     deploy: *default-limits
@@ -1013,6 +1060,9 @@ services:
     environment:
       NEXT_PUBLIC_API_BASE: http://localhost:9080
       NEXT_PUBLIC_WS_BASE: ws://localhost:9080/ws
+      # SPEC-W52 Scope C: MapLibre basemap style served by geo-service
+      # through APISIX (route api-geo strips the /api/geo prefix).
+      NEXT_PUBLIC_GEO_STYLE_URL: ${NEXT_PUBLIC_GEO_STYLE_URL:-/api/geo/style.json}
       KEYCLOAK_ISSUER: http://keycloak:8080/realms/opendesk
       KEYCLOAK_CLIENT_ID: admin-web
       AUTH_SECRET: ${AUTH_SECRET:-dev-secret-change-me}

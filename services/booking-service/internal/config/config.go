@@ -83,6 +83,13 @@ type Config struct {
 	GeocodeEnabled   bool   // GEOCODE_ENABLED: Nominatim address geocoding hook (default false)
 	GeocodeBaseURL   string // GEOCODE_BASE_URL (default https://nominatim.openstreetmap.org)
 	GeoCampaignBatch int    // GEO_CAMPAIGN_BATCH: recipients per campaign batch (default 50)
+	// Geospatial foundation (SPEC-W52 Scope B)
+	GeoServiceURL string // GEO_SERVICE_URL: geo-service base URL for point-in-polygon enrichment (default "" = enrichment disabled, fail-open)
+	// BookingGeoEnforce (BOOKING_GEO_ENFORCE, default false) gates PUBLIC
+	// booking creates to the site's service_areas coverage zones when the
+	// booking contact carries a contact_locations point. Default false keeps
+	// every create path byte-identical to pre-W52 behavior (opt-in).
+	BookingGeoEnforce bool
 	// Incidents (SPEC-W11 Part B)
 	IncidentsTopic       string // opendesk.incidents (IDP ingestion)
 	IncidentsGroup       string // consumer group booking-incidents
@@ -222,6 +229,10 @@ func Load() (Config, error) {
 		GeocodeEnabled:                envStr("GEOCODE_ENABLED", "false") == "true",
 		GeocodeBaseURL:                envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
 		GeoCampaignBatch:              envInt("GEO_CAMPAIGN_BATCH", 50),
+		// SPEC-W52 Scope B: geo-service enrichment (fail-open; empty disables)
+		// + public-booking coverage-zone enforcement (default off = inert).
+		GeoServiceURL:     envStr("GEO_SERVICE_URL", ""),
+		BookingGeoEnforce: envStr("BOOKING_GEO_ENFORCE", "false") == "true",
 		IncidentsTopic:                envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
 		IncidentsGroup:                envStr("INCIDENTS_GROUP", "booking-incidents"),
 		IncidentAutoDispatch:          envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",

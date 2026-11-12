@@ -1,39 +1,59 @@
 /**
  * Geospatial helpers shared by the Locations and Geo campaigns dashboards
- * (SPEC-W8 Part C). Pure data/types only — nothing here touches WebGL, so it
- * is safe to import from server or client components.
+ * (SPEC-W8 Part C; SPEC-W52 self-hosted basemap). Nothing here touches WebGL,
+ * so it is safe to import from server or client components.
  */
 import type { Feature, Geometry, MultiPolygon, Polygon } from "geojson";
 import type { StyleSpecification } from "maplibre-gl";
 import type { ServiceArea } from "@/lib/types";
 
 /**
- * OpenStreetMap raster basemap as an inline style — no token or external
- * style URL required. `glyphs` is included so symbol layers (cluster counts)
- * can render text; the tiles themselves come from the public OSM raster
- * endpoint and carry the required attribution. Saturation is dialled down to
- * match the dashboard's warm, low-saturation look.
+ * SPEC-W52: self-hosted basemap style served by the geo-service (terrio)
+ * through the APISIX gateway. This replaces the previous hot-linked
+ * `tile.openstreetmap.org` raster source and `demotiles.maplibre.org` glyphs
+ * (ToS + offline-hosting problem — RECON §1-C): the style document returned
+ * by this URL points at the geo-service's own tile/glyph endpoints, so the
+ * browser only ever talks to our gateway. The relative default resolves
+ * through the admin-web BFF proxy, which attaches the Keycloak token before
+ * forwarding to APISIX. Override with NEXT_PUBLIC_GEO_STYLE_URL.
  */
-export const OSM_RASTER_STYLE: StyleSpecification = {
-  version: 8,
-  sources: {
-    osm: {
-      type: "raster",
-      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-      tileSize: 256,
-      attribution: "© OpenStreetMap contributors",
-    },
-  },
-  glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
-  layers: [
-    {
-      id: "osm",
-      type: "raster",
-      source: "osm",
-      paint: { "raster-saturation": -0.3 },
-    },
-  ],
-};
+export const GEO_STYLE_URL: string =
+  process.env.NEXT_PUBLIC_GEO_STYLE_URL ?? "/api/geo/style.json";
+
+/**
+ * @deprecated Use {@link GEO_STYLE_URL}. Kept as a same-typed alias so the
+ * geo-campaigns target map and the CAC LGA map — which still import this name
+ * and are outside the W52 Scope-C file set — keep compiling; its value is now
+ * the self-hosted style URL, not the old OSM raster hot-link.
+ */
+export const OSM_RASTER_STYLE: string = GEO_STYLE_URL;
+
+/**
+ * Fetch and validate the basemap style document. Map components call this
+ * BEFORE constructing `maplibregl.Map` so a missing/unreachable geo-service
+ * (or unprovisioned tiles, answered 503 by the service) is a deterministic,
+ * catchable failure — the caller renders a "map tiles unavailable" notice
+ * instead of a blank canvas. Throws on network error, non-2xx, or a payload
+ * that is not a MapLibre style document. No hotlink fallback: when the
+ * self-hosted style is down, the basemap is honestly absent.
+ */
+export async function fetchMapStyle(
+  signal?: AbortSignal,
+): Promise<StyleSpecification> {
+  const res = await fetch(GEO_STYLE_URL, { signal, cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`Map style request failed with status ${res.status}`);
+  }
+  const style: unknown = await res.json();
+  const candidate =
+    typeof style === "object" && style !== null
+      ? (style as { version?: unknown; layers?: unknown })
+      : null;
+  if (!candidate || candidate.version !== 8 || !Array.isArray(candidate.layers)) {
+    throw new Error("Map style endpoint did not return a valid style document");
+  }
+  return style as StyleSpecification;
+}
 
 /** Default world view before any data is fitted. */
 export const DEFAULT_CENTER: [number, number] = [3.3792, 6.5244]; // Lagos

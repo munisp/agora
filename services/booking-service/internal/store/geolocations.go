@@ -112,6 +112,27 @@ type CampaignRecipient struct {
 // non-postgis deployments (and the embedded-Postgres store tests) keep
 // working with geo features disabled.
 func (s *Store) ensureGeoTables(ctx context.Context) error {
+	// SPEC-W52 Scope B (ensure* addition): geo-enrichment provenance columns
+	// for the field-capture check-in history. field_checkins is created by
+	// the fieldcapture package's own ensureSchema (dedicated pool, dialled
+	// after store.New), so these ALTERs are guarded with IF EXISTS: on a
+	// fresh cluster they no-op here and the fieldcapture package's lazy
+	// ensureGeoEnrichmentColumns (first enrichment attempt) owns them; on
+	// existing deployments they apply at boot. Plain columns — no PostGIS
+	// dependency — hence BEFORE the extension gate below so non-PostGIS
+	// installs migrate too. (civic_cases got the same columns in
+	// ensureCivicTables, whose table THIS store owns.)
+	const w52EnrichDDL = `
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS lga TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS ward TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS geo_enriched_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS geo_enrichment_source TEXT;
+ALTER TABLE IF EXISTS field_checkins DROP CONSTRAINT IF EXISTS field_checkins_geo_enrichment_source_check;
+ALTER TABLE IF EXISTS field_checkins ADD CONSTRAINT field_checkins_geo_enrichment_source_check
+    CHECK (geo_enrichment_source IS NULL OR geo_enrichment_source IN ('geo-service'));`
+	if _, err := s.pool.Exec(ctx, w52EnrichDDL); err != nil {
+		return fmt.Errorf("ensure field_checkins enrichment columns: %w", err)
+	}
 	var available bool
 	if err := s.pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'postgis')`).Scan(&available); err != nil {

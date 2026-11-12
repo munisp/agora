@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.uber.org/zap"
 )
 
 // ---------------------------------------------------------------------------
@@ -221,6 +223,19 @@ BEGIN
             USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
     END IF;
 END $$;
+
+-- SPEC-W52 Scope B: geo-enrichment provenance columns. The geo-service
+-- (terrio point-in-polygon) fills ward/lga ONLY when empty after the insert
+-- commits; geo_enrichment_source='geo-service' marks machine-filled values
+-- so reads can badge them ("auto") and never mistake them for
+-- human/agent-entered text. NULL source = not machine-enriched. The CHECK
+-- is rebuilt idempotently (CREATE TABLE IF NOT EXISTS never updates CHECKs
+-- — the field_captures kind-enum idiom).
+ALTER TABLE civic_cases ADD COLUMN IF NOT EXISTS geo_enriched_at TIMESTAMPTZ;
+ALTER TABLE civic_cases ADD COLUMN IF NOT EXISTS geo_enrichment_source TEXT;
+ALTER TABLE civic_cases DROP CONSTRAINT IF EXISTS civic_cases_geo_enrichment_source_check;
+ALTER TABLE civic_cases ADD CONSTRAINT civic_cases_geo_enrichment_source_check
+    CHECK (geo_enrichment_source IS NULL OR geo_enrichment_source IN ('geo-service'));
 
 -- Per-tenant-per-year reference sequence for GOV-{LGA}-{WARD}-YYYY-{seq6}.
 CREATE TABLE IF NOT EXISTS civic_ref_seqs (
@@ -504,6 +519,11 @@ func scanCivicCase(row pgx.Row) (CivicCase, error) {
 
 // InsertCivicCase persists one case (ref unique per tenant — the sequence
 // generator guarantees uniqueness; a violation maps to ErrConflict).
+//
+// SPEC-W52 Scope B: after the row COMMITS, a configured geo enricher
+// (RegisterCivicGeoEnricher) fills ward/lga from the geo-service when the
+// reporter left them empty. Enrichment is fail-open and never blocks or
+// fails the insert: any error is logged and the row stands as written.
 func (s *Store) InsertCivicCase(ctx context.Context, c *CivicCase) error {
 	if c.ID == uuid.Nil {
 		c.ID = uuid.New()
@@ -511,7 +531,7 @@ func (s *Store) InsertCivicCase(ctx context.Context, c *CivicCase) error {
 	const q = `INSERT INTO civic_cases (` + civicCaseCols + `)
 	           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,now(),now())
 	           RETURNING created_at, updated_at`
-	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+	err := s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, q, c.ID, c.TenantID, c.Ref, c.CategoryID, c.Status, c.Description,
 			c.Ward, c.LGA, c.Lat, c.Lon, c.LocationText, c.ReporterPhoneE164, c.ReporterName,
 			c.Anonymous, c.WantsUpdates, c.PhotoURL, c.Channel, c.MDAQueue, c.AssignedTo,
@@ -522,6 +542,121 @@ func (s *Store) InsertCivicCase(ctx context.Context, c *CivicCase) error {
 		}
 		return err
 	})
+	if err == nil {
+		s.enrichCivicCaseGeo(ctx, c)
+	}
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Geo enrichment (SPEC-W52 Scope B)
+// ---------------------------------------------------------------------------
+
+// GeoEnrichmentSource is the only value the civic_cases/
+// field_checkins geo_enrichment_source CHECK accepts: the row's ward/lga
+// came from the geo-service (machine), not from a human/agent.
+const GeoEnrichmentSource = "geo-service"
+
+// GeoEnrichment is the slice of the geo-service enrich contract
+// (internal/geo.EnrichResult) the store persists. State is carried for
+// completeness of the A↔B contract but not yet a civic_cases column.
+type GeoEnrichment struct {
+	State string
+	LGA   string
+	Ward  string
+}
+
+// GeoEnricher abstracts the geo-service enrich client so the store never
+// imports internal/geo (the import direction is geo → store: geo.Handlers
+// already holds a *Store). *geo.EnrichClient satisfies this via the small
+// adapter wired in httpapi.NewRouter. Fail-open by contract: Enrich returns
+// nil on any error/timeout. tenantID is the tenant UUID — the geo-service
+// parses the forwarded header as a uuid and feeds it to the RLS GUC
+// app.tenant_id, so tenant-scoped custom boundaries participate.
+type GeoEnricher interface {
+	Enrich(ctx context.Context, tenantID string, lat, lng float64) *GeoEnrichment
+}
+
+// civicGeoEnricher is the per-store-instance enrichment wiring. Store is
+// constructed by store.New (cmd/server/main.go) whose struct lives outside
+// the W52 file scope, so the enricher rides a registry keyed by *Store
+// instead of a struct field; registration happens once at router build
+// (httpapi.NewRouter), before any request is served. A Store with no
+// registered enricher behaves exactly as pre-W52.
+type civicGeoWiring struct {
+	enricher GeoEnricher
+	log      *zap.Logger
+}
+
+var civicGeoEnrichers sync.Map // *Store → civicGeoWiring
+
+// RegisterCivicGeoEnricher installs the geo-enrichment hook for one Store
+// instance (SPEC-W52). Passing a nil enricher disables enrichment again
+// (tests). Not hot-swapped mid-traffic: called once at boot wiring.
+func RegisterCivicGeoEnricher(s *Store, e GeoEnricher, log *zap.Logger) {
+	if e == nil {
+		civicGeoEnrichers.Delete(s)
+		return
+	}
+	if log == nil {
+		log = zap.NewNop()
+	}
+	civicGeoEnrichers.Store(s, civicGeoWiring{enricher: e, log: log})
+}
+
+// enrichCivicCaseGeo is the post-commit enrichment hook of InsertCivicCase.
+// It fills ward/lga ONLY when currently empty — human/agent-entered text
+// always wins — and stamps geo_enriched_at/geo_enrichment_source when it
+// actually filled something. Every failure mode (no enricher, no coords,
+// enrich error/timeout, DB error) is fail-open: the inserted row stands.
+func (s *Store) enrichCivicCaseGeo(ctx context.Context, c *CivicCase) {
+	w, ok := civicGeoEnrichers.Load(s)
+	if !ok {
+		return
+	}
+	wiring := w.(civicGeoWiring)
+	if c.Lat == nil || c.Lon == nil {
+		return
+	}
+	if c.Ward != "" && c.LGA != "" {
+		return // nothing to fill — never overwrite human/agent text
+	}
+	res := wiring.enricher.Enrich(ctx, c.TenantID.String(), *c.Lat, *c.Lon)
+	if res == nil || (res.Ward == "" && res.LGA == "") {
+		return
+	}
+	// The CASE guards re-check emptiness inside the UPDATE so a concurrent
+	// human edit between insert and enrichment is never clobbered; the WHERE
+	// clause skips the write (and the provenance stamp) when the enrich
+	// result cannot fill anything still empty.
+	const q = `UPDATE civic_cases SET
+		ward = CASE WHEN ward = '' AND $3 <> '' THEN $3 ELSE ward END,
+		lga  = CASE WHEN lga  = '' AND $4 <> '' THEN $4 ELSE lga  END,
+		geo_enriched_at = now(),
+		geo_enrichment_source = $5
+		WHERE tenant_id = $1 AND id = $2
+		  AND ((ward = '' AND $3 <> '') OR (lga = '' AND $4 <> ''))`
+	err := s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, q, c.TenantID, c.ID, res.Ward, res.LGA, GeoEnrichmentSource)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			if c.Ward == "" {
+				c.Ward = res.Ward
+			}
+			if c.LGA == "" {
+				c.LGA = res.LGA
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		// Fail-open: the case row already committed; enrichment loss is a
+		// provenance gap, not a business failure. No retry loop (SPEC-W52).
+		wiring.log.Warn("civic geo enrichment persist failed (fail-open)",
+			zap.String("tenant_id", c.TenantID.String()), zap.Error(err))
+	}
 }
 
 // GetCivicCase fetches one case scoped to a tenant.

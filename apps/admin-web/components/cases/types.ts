@@ -142,6 +142,13 @@ export interface CivicCase {
   wants_updates: boolean;
   created_at: string | null;
   updated_at: string | null;
+  /**
+   * SPEC-W52: 'geo-service' when ward/lga were auto-filled by point-in-polygon
+   * enrichment at insert time. Absent in pre-W52 API responses — treat as
+   * "manually entered / unknown provenance".
+   */
+  geo_enrichment_source?: string | null;
+  geo_enriched_at?: string | null;
 }
 
 /** One entry in the case event timeline (operator detail only). */
@@ -248,6 +255,8 @@ export function normalizeCase(raw: unknown): CivicCase {
     wants_updates: bool(o.wants_updates),
     created_at: str(o.created_at),
     updated_at: str(o.updated_at),
+    geo_enrichment_source: str(o.geo_enrichment_source),
+    geo_enriched_at: str(o.geo_enriched_at),
   };
 }
 

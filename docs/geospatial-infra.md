@@ -5,6 +5,12 @@ owns the *operational* model (Part A); this document covers the *analytical*
 side: Apache Sedona jobs in the lakehouse, the gold geo tables they produce,
 the GeoLibre GIS workbench, and Trino query recipes.
 
+> **Related (SPEC-W52):** the operational side gained a dedicated
+> **geo-service** (Rust, terrio-based) for boundary ingest, point-in-polygon
+> enrichment, and self-hosted basemap tiles — architecture, import/tile
+> runbooks, coverage-enforcement semantics and env vars are in
+> [`docs/geospatial-terrio.md`](./geospatial-terrio.md).
+
 ## 1. Sedona setup
 
 The lakehouse Spark runtime is `bitnami/spark:3.5` (Spark 3.5, Scala 2.12 —
@@ -189,3 +195,16 @@ LIMIT 50;
 **Bonus — render any cell in PostGIS/GeoJSON tooling without Trino geometry
 functions:** `cell_wkt` is directly consumable by `ST_GeomFromText` (PostGIS),
 `shapely.wkt.loads` (Python), or `ST_AsGeoJSON(...)` as above.
+
+## 5. Related: terrio geo-service (SPEC-W52)
+
+Since SPEC-W52 the *operational* geospatial stack includes a dedicated
+**geo-service** (Rust, built on the terrio crate) alongside this analytical
+stack: bulk boundary import into a `geo_boundaries` table, point-in-polygon
+enrichment (coords → state/LGA/ward) consumed by booking-service, and
+self-hosted PMTiles basemap serving that replaced the admin dashboards'
+hot-linked OSM raster style. See
+[`docs/geospatial-terrio.md`](./geospatial-terrio.md) for the architecture,
+boundary-import and offline-tile runbooks (geoBoundaries / GRID3 attribution
+rules), coverage-enforcement semantics (`BOOKING_GEO_ENFORCE`), the env-var
+table, and degraded-mode behavior.

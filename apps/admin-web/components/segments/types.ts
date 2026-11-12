@@ -121,6 +121,15 @@ export interface PersonContact {
   captured_at?: string;
   source?: string;
   geo?: string;
+  /**
+   * SPEC-W52: LGA/ward of the capture when the backend exposes them, and
+   * 'geo-service' in geo_enrichment_source when they were auto-filled by
+   * point-in-polygon enrichment. All absent in older API responses — render
+   * defensively.
+   */
+  lga?: string | null;
+  ward?: string | null;
+  geo_enrichment_source?: string | null;
 }
 
 export interface PersonBooking {

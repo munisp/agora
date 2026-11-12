@@ -9,6 +9,7 @@
  */
 import * as React from "react";
 import { Badge } from "@/components/ui/badge";
+import { GeoAutoBadge } from "@/components/geo-auto-badge";
 import {
   Table,
   TableBody,
@@ -145,7 +146,12 @@ export function CasesTable({
                   ) : null}
                 </TableCell>
                 <TableCell>{categoryName(c)}</TableCell>
-                <TableCell>{c.ward ?? "—"}</TableCell>
+                <TableCell>
+                  {c.ward ?? "—"}
+                  {c.ward ? (
+                    <GeoAutoBadge source={c.geo_enrichment_source} />
+                  ) : null}
+                </TableCell>
                 <TableCell>
                   <div className="text-xs">
                     <div>{reporter.name}</div>

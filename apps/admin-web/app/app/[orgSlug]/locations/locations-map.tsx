@@ -1,9 +1,12 @@
 "use client";
 
 /**
- * Locations map (SPEC-W8 Part C): OSM raster basemap, client-side clustered
+ * Locations map (SPEC-W8 Part C; SPEC-W52 basemap): self-hosted basemap style
+ * served by the geo-service (lib/geo fetchMapStyle), client-side clustered
  * booking/contact locations, toggleable service-area polygons, and polygon
- * drawing for new service areas.
+ * drawing for new service areas. When the style fetch fails (geo-service
+ * offline / tiles unprovisioned), the container renders an inline "map tiles
+ * unavailable" notice instead of a blank canvas — no hotlink fallback.
  *
  * This component is loaded via next/dynamic with ssr:false, so the
  * maplibre-gl imports below never execute during SSR (WebGL is browser-only).
@@ -26,12 +29,15 @@ import type {
   Point,
   Polygon,
 } from "geojson";
+import { MapPinOff } from "lucide-react";
 import {
   DEFAULT_CENTER,
   DEFAULT_ZOOM,
-  OSM_RASTER_STYLE,
+  GEO_STYLE_URL,
   boundsOf,
+  fetchMapStyle,
 } from "@/lib/geo";
+import { Button } from "@/components/ui/button";
 import type { LocationCluster, LocationPoint } from "@/lib/types";
 
 /** Draw events are emitted by the control, not by maplibre's own event map. */
@@ -102,20 +108,31 @@ export default function LocationsMap({
   const mapRef = React.useRef<maplibregl.Map | null>(null);
   const drawRef = React.useRef<MapLibreDraw | null>(null);
   const [ready, setReady] = React.useState(false);
+  // SPEC-W52 degraded mode: set when the self-hosted style fetch failed.
+  const [styleError, setStyleError] = React.useState<string | null>(null);
+  const [styleAttempt, setStyleAttempt] = React.useState(0);
   // Latest-callback refs so map event handlers never go stale.
   const onAreaDrawnRef = React.useRef(onAreaDrawn);
   onAreaDrawnRef.current = onAreaDrawn;
   const onSelectAreaRef = React.useRef(onSelectArea);
   onSelectAreaRef.current = onSelectArea;
 
-  // ---- map lifecycle (once) ----
+  // ---- map lifecycle (per style attempt) ----
   React.useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    let cancelled = false;
+    setStyleError(null);
+
+    // Fetch the style document first so a geo-service outage is a catchable
+    // failure here, not a silent blank canvas inside maplibre.
+    void fetchMapStyle()
+      .then((style) => {
+        if (cancelled || !containerRef.current) return;
 
     const map = new maplibregl.Map({
       container,
-      style: OSM_RASTER_STYLE,
+      style,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       attributionControl: { compact: true },
@@ -263,14 +280,23 @@ export default function LocationsMap({
         onAreaDrawnRef.current(geometry as Polygon | MultiPolygon);
       }
     });
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setStyleError(
+          e instanceof Error ? e.message : "The map style could not be loaded.",
+        );
+      });
 
     return () => {
+      cancelled = true;
       drawRef.current = null;
+      const map = mapRef.current;
       mapRef.current = null;
       setReady(false);
-      map.remove();
+      if (map) map.remove();
     };
-  }, []);
+  }, [styleAttempt]);
 
   // ---- locations data ----
   React.useEffect(() => {
@@ -327,9 +353,35 @@ export default function LocationsMap({
   }, [ready, drawMode]);
 
   return (
-    <div
-      ref={containerRef}
-      className="h-[520px] w-full rounded-md border border-border bg-muted dark:brightness-90"
-    />
+    <div className="relative h-[520px] w-full rounded-md border border-border bg-muted dark:brightness-90">
+      <div ref={containerRef} className="h-full w-full rounded-md" />
+      {styleError ? (
+        <div className="absolute inset-0 flex items-center justify-center rounded-md bg-muted px-6">
+          <div className="max-w-sm text-center">
+            <MapPinOff className="mx-auto h-6 w-6 text-muted-foreground" />
+            <p className="mt-2 text-sm font-medium text-foreground">
+              Map tiles unavailable
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              The self-hosted basemap ({GEO_STYLE_URL}) could not be loaded —
+              the geo-service may be offline or its tiles are not provisioned.
+              The locations list and filters still work; drawing new service
+              areas is disabled until the map is back.
+            </p>
+            <p className="mt-1 font-mono text-[11px] text-muted-foreground">
+              {styleError}
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              className="mt-3"
+              onClick={() => setStyleAttempt((n) => n + 1)}
+            >
+              Retry
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }

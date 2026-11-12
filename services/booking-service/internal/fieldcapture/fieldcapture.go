@@ -21,13 +21,20 @@
 package fieldcapture
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/opendesk/booking-service/internal/bookingops"
+	"github.com/opendesk/booking-service/internal/store"
+	"go.uber.org/zap"
 )
 
 // Capture kinds (contract §4 enum; SPEC-W32 WS-A adds civic_report).
@@ -206,4 +213,142 @@ func (c *Checkin) ComputeClockSkew() {
 		diff = -diff
 	}
 	c.ClockSkew = diff > ClockSkewThreshold
+}
+
+// ---------------------------------------------------------------------------
+// Geo enrichment (SPEC-W52 Scope B)
+// ---------------------------------------------------------------------------
+//
+// Freshly applied capture items carrying a GPS fix are enriched via the
+// geo-service AFTER the underlying row commits (fail-open — a failed/timed-out
+// enrich never fails the capture item, which is already applied and anchored):
+//
+//   - checkin       → the field_checkins row's lga/ward are filled when empty
+//                     (SetCheckinGeoEnrichment) and stamped with
+//                     geo_enriched_at / geo_enrichment_source='geo-service'.
+//   - civic_report  → the created civic_cases row is enriched inside
+//                     store.InsertCivicCase (the registered civic enricher);
+//                     the capture layer deliberately does not double-enrich.
+//   - lead_capture  → leads carry lga_id (INTEGER into the synthetic cac
+//                     gazetteer), not lga/ward text; mapping a boundary NAME
+//                     onto a synthetic integer id is a data-model decision
+//                     deferred to a later wave — documented gap, not a stub.
+//
+// The enrichment HTTP call is synchronous but bounded by the client's 3s
+// timeout (geo.EnrichTimeout); per-item latency on a batch stays additive
+// only for freshly applied GPS items.
+
+// CaptureEnriched serves POST /v1/field/capture with SPEC-W52 geo
+// enrichment on top of Handlers.Capture: the batch applies with identical
+// exactly-once semantics, then freshly applied GPS items are enriched
+// (fail-open). httpapi wires this variant only when a geo enricher is
+// configured; otherwise the plain Capture path runs unchanged. The decode /
+// batch-limit prologue mirrors Handlers.Capture (handlers.go) — keep in
+// sync.
+func (h *Handlers) CaptureEnriched(w http.ResponseWriter, r *http.Request, tenant bookingops.TenantInfo, enr store.GeoEnricher) {
+	if enr == nil {
+		h.Capture(w, r, tenant)
+		return
+	}
+	var req captureRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if len(req.Items) == 0 {
+		writeError(w, http.StatusBadRequest, "items is required (non-empty array)")
+		return
+	}
+	limit := h.BatchLimit
+	if limit <= 0 {
+		limit = 100
+	}
+	if len(req.Items) > limit {
+		writeError(w, http.StatusBadRequest, "too many items (max per batch)")
+		return
+	}
+	results := h.Svc.Capture(r.Context(), tenant, req.Items)
+	h.enrichApplied(r.Context(), tenant, req.Items, results, enr)
+	writeJSON(w, http.StatusOK, captureResponse{Results: results})
+}
+
+// enrichApplied post-enriches freshly applied GPS items (see section
+// comment). Fail-open per item: errors are logged, never surfaced — the
+// item result the client reconciles against is already final.
+func (h *Handlers) enrichApplied(ctx context.Context, tenant bookingops.TenantInfo, items []CaptureItem, results []ItemResult, enr store.GeoEnricher) {
+	for i := range items {
+		if i >= len(results) || results[i].Status != StatusApplied || items[i].GPS == nil {
+			continue
+		}
+		if items[i].Kind != KindCheckin || results[i].CheckinID == nil {
+			continue // civic_report: enriched at the civic insert; lead_capture: no lga/ward text columns
+		}
+		// The geo-service parses X-Tenant-Slug as the tenant uuid (RLS GUC
+		// app.tenant_id) — forward tenant.ID, never the slug.
+		res := enr.Enrich(ctx, tenant.ID.String(), items[i].GPS.Lat, items[i].GPS.Lng)
+		if res == nil || (res.LGA == "" && res.Ward == "") {
+			continue
+		}
+		if err := h.Svc.Store.SetCheckinGeoEnrichment(ctx, tenant.ID, *results[i].CheckinID, res.LGA, res.Ward); err != nil {
+			h.log().Warn("field check-in geo enrichment failed (fail-open)",
+				zap.String("tenant_id", tenant.ID.String()), zap.Error(err))
+		}
+	}
+}
+
+// fcGeoEnsured tracks the per-store lazy migration state for the
+// field_checkins enrichment columns (Store's struct lives in store.go,
+// outside the W52 file scope, so the once-state rides a registry keyed by
+// *Store — same idiom as the civic enricher registry).
+var fcGeoEnsured sync.Map // *Store → struct{}
+
+// ensureGeoEnrichmentColumns applies the SPEC-W52 provenance columns to
+// field_checkins idempotently (ALTER … IF NOT EXISTS, same guards as the
+// boot-time ensure* DDL). Boot-time coverage: store.ensureGeoTables already
+// carries these ALTERs for existing deployments; this lazy path covers the
+// fresh-cluster ordering gap (field_checkins is created by THIS package's
+// ensureSchema, dialled after store.New) and the package's own tests.
+//
+// NOTE (RLS): bootstrap DDL is a superuser migration path, not a tenant
+// query — it intentionally runs outside withTenant.
+func (s *Store) ensureGeoEnrichmentColumns(ctx context.Context) error {
+	const ddl = `
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS lga TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS ward TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS geo_enriched_at TIMESTAMPTZ;
+ALTER TABLE IF EXISTS field_checkins ADD COLUMN IF NOT EXISTS geo_enrichment_source TEXT;
+ALTER TABLE IF EXISTS field_checkins DROP CONSTRAINT IF EXISTS field_checkins_geo_enrichment_source_check;
+ALTER TABLE IF EXISTS field_checkins ADD CONSTRAINT field_checkins_geo_enrichment_source_check
+    CHECK (geo_enrichment_source IS NULL OR geo_enrichment_source IN ('geo-service'));`
+	if _, err := s.pool.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("ensure field_checkins enrichment columns: %w", err)
+	}
+	return nil
+}
+
+// SetCheckinGeoEnrichment fills a check-in row's lga/ward ONLY where empty
+// (the SQL CASE re-checks under the writer so a concurrent human/agent edit
+// is never clobbered) and stamps geo_enriched_at/geo_enrichment_source. The
+// WHERE clause skips the write entirely when nothing empty can be filled
+// (no provenance stamp without machine-filled data). Tenant-scoped via
+// withTenant (RLS intact). Fail-open is the caller's posture; this method
+// reports its error honestly.
+func (s *Store) SetCheckinGeoEnrichment(ctx context.Context, tenantID, checkinID uuid.UUID, lga, ward string) error {
+	if _, done := fcGeoEnsured.Load(s); !done {
+		if err := s.ensureGeoEnrichmentColumns(ctx); err != nil {
+			return err
+		}
+		fcGeoEnsured.Store(s, struct{}{})
+	}
+	const q = `UPDATE field_checkins SET
+		ward = CASE WHEN ward = '' AND $4 <> '' THEN $4 ELSE ward END,
+		lga  = CASE WHEN lga  = '' AND $3 <> '' THEN $3 ELSE lga  END,
+		geo_enriched_at = now(),
+		geo_enrichment_source = $5
+		WHERE tenant_id = $1 AND id = $2
+		  AND ((ward = '' AND $4 <> '') OR (lga = '' AND $3 <> ''))`
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, q, tenantID, checkinID, lga, ward, store.GeoEnrichmentSource)
+		return err
+	})
 }

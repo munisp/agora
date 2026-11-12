@@ -1,0 +1,31 @@
+{
+  "type": "FeatureCollection",
+  "name": "test_only_boundaries_4326",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Test State Alpha", "code": "TS-A"},
+      "geometry": {"type": "Polygon", "coordinates": [[[3.30, 6.40], [3.50, 6.40], [3.50, 6.60], [3.30, 6.60], [3.30, 6.40]]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Test Lga Alpha", "code": "TL-A"},
+      "geometry": {"type": "Polygon", "coordinates": [[[3.32, 6.42], [3.40, 6.42], [3.40, 6.50], [3.32, 6.50], [3.32, 6.42]]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Test Ward Alpha", "code": "TW-A"},
+      "geometry": {"type": "Polygon", "coordinates": [[[3.33, 6.43], [3.36, 6.43], [3.36, 6.46], [3.33, 6.46], [3.33, 6.43]]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Missing Code (skipped)", "code": ""},
+      "geometry": {"type": "Polygon", "coordinates": [[[3.41, 6.51], [3.42, 6.51], [3.42, 6.52], [3.41, 6.52], [3.41, 6.51]]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"name": "Not A Polygon (skipped)", "code": "PT-1"},
+      "geometry": {"type": "Point", "coordinates": [3.45, 6.55]}
+    }
+  ]
+}

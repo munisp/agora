@@ -8,6 +8,7 @@ import {
   PenLine,
   RefreshCw,
   Trash2,
+  Upload,
 } from "lucide-react";
 import type { MultiPolygon, Polygon } from "geojson";
 import { api, ApiError } from "@/lib/api";
@@ -26,6 +27,7 @@ import {
 import { Input, Label, Select } from "@/components/ui/input";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/toast";
+import { BoundaryImportDialog } from "./boundary-import";
 import type {
   ListResponse,
   LocationCluster,
@@ -72,6 +74,7 @@ export function LocationsClient({ orgSlug }: { orgSlug: string }) {
   const [selectedAreaId, setSelectedAreaId] = React.useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = React.useState<ServiceArea | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [showImport, setShowImport] = React.useState(false);
 
   // ---- draw-new-area flow ----
   const [drawMode, setDrawMode] = React.useState(false);
@@ -227,16 +230,32 @@ export function LocationsClient({ orgSlug }: { orgSlug: string }) {
         title="Locations"
         description="Where your bookings and contacts are — clustered on the map, filterable by date and offering, with service areas you can draw yourself."
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void loadSummary()}
-            disabled={loading}
-          >
-            <RefreshCw className="h-3.5 w-3.5" />
-            {loading ? "Loading…" : "Refresh"}
-          </Button>
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowImport(true)}
+            >
+              <Upload className="h-3.5 w-3.5" />
+              Import boundaries
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void loadSummary()}
+              disabled={loading}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              {loading ? "Loading…" : "Refresh"}
+            </Button>
+          </>
         }
+      />
+
+      <BoundaryImportDialog
+        orgSlug={orgSlug}
+        open={showImport}
+        onOpenChange={setShowImport}
       />
 
       {error ? <ErrorNote message={error} /> : null}
@@ -293,8 +312,8 @@ export function LocationsClient({ orgSlug }: { orgSlug: string }) {
           <div>
             <CardTitle>Demand map</CardTitle>
             <CardDescription>
-              OpenStreetMap basemap · points cluster as you zoom out; click a
-              cluster to zoom in.
+              Self-hosted basemap (geo-service) · points cluster as you zoom
+              out; click a cluster to zoom in.
             </CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-2">

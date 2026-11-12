@@ -7,6 +7,7 @@
  * (hashed only, SPEC-W28 §3) — the view shows the hash, never PII.
  */
 import { Badge } from "@/components/ui/badge";
+import { GeoAutoBadge } from "@/components/geo-auto-badge";
 import {
   Card,
   CardContent,
@@ -79,18 +80,32 @@ export function Person360View({ person }: { person: Person360 }) {
                 <TableHead>Lead</TableHead>
                 <TableHead>First touch</TableHead>
                 <TableHead>Source</TableHead>
+                <TableHead>LGA</TableHead>
+                <TableHead>Ward</TableHead>
                 <TableHead>Captured</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {person.contacts.length === 0 ? (
-                <TableEmpty colSpan={4}>No contacts recorded.</TableEmpty>
+                <TableEmpty colSpan={6}>No contacts recorded.</TableEmpty>
               ) : (
                 person.contacts.map((c, i) => (
                   <TableRow key={c.lead_id ?? i}>
                     <TableCell className="font-mono text-xs">{dash(c.lead_id)}</TableCell>
                     <TableCell>{dash(c.channel_of_first_touch)}</TableCell>
                     <TableCell>{dash(c.source)}</TableCell>
+                    <TableCell>
+                      {dash(c.lga)}
+                      {c.lga ? (
+                        <GeoAutoBadge source={c.geo_enrichment_source} />
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      {dash(c.ward)}
+                      {c.ward ? (
+                        <GeoAutoBadge source={c.geo_enrichment_source} />
+                      ) : null}
+                    </TableCell>
                     <TableCell>{ts(c.captured_at)}</TableCell>
                   </TableRow>
                 ))

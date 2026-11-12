@@ -82,6 +82,16 @@ type Service struct {
 	// the loyalty package does not expose AccrueOnBookingCompleted yet —
 	// see the CONTRACT NOTE on the interface.
 	Loyalty BookingCompletedAccruer
+	// GeoEnforce enables the SPEC-W52 coverage-zone gate on the PUBLIC
+	// booking create path (BOOKING_GEO_ENFORCE, default false). False keeps
+	// every create path byte-identical to pre-W52 behavior. See coverage.go
+	// for the full semantics (public-marker gating, no-zones pass, no-fix
+	// pass, PostGIS-absent 503).
+	GeoEnforce bool
+	// Coverage executes the coverage-zone count queries (SPEC-W52). Nil →
+	// Store is used (production posture); tests substitute a fake to drive
+	// the enforcement matrix without a PostGIS database.
+	Coverage CoverageCounter
 }
 
 // ContactInput carries inline contact data for a new booking.
@@ -177,6 +187,14 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (store.Booking, er
 		} else if !errors.Is(err, store.ErrNotFound) {
 			return store.Booking{}, err
 		}
+	}
+
+	// SPEC-W52: coverage-zone gate — public create path only, inert unless
+	// GeoEnforce. Runs after the idempotency replay so a legitimately
+	// replayed create returns its original booking even if the tenant has
+	// since redrawn its zones.
+	if err := s.checkGeoCoverage(ctx, in.TenantID, contact.ID); err != nil {
+		return store.Booking{}, err
 	}
 
 	endsAt := in.StartsAt.Add(time.Duration(offering.DurationMin) * time.Minute)

@@ -112,12 +112,32 @@ async function proxy(
   }
 
   const hasBody = !["GET", "HEAD"].includes(req.method);
+  // W52-D: binary uploads (e.g. .gpkg/.zip boundary imports to
+  // /api/geo/v1/geo/boundaries/import) must be forwarded as raw bytes —
+  // req.text() decodes the payload as UTF-8 and corrupts non-UTF-8 bytes.
+  // Known-textual content types keep the existing text() path; anything
+  // else goes through arrayBuffer(). Content-Length is hop-by-hop (stripped
+  // above) so fetch recomputes it from the forwarded body; Content-Type is
+  // forwarded verbatim either way.
+  const mediaType = (req.headers.get("content-type") ?? "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  const isTextual =
+    mediaType === "" ||
+    mediaType.startsWith("text/") ||
+    mediaType === "application/json" ||
+    mediaType === "application/x-www-form-urlencoded";
   let upstream: Response;
   try {
     upstream = await fetch(target, {
       method: req.method,
       headers,
-      body: hasBody ? await req.text() : undefined,
+      body: hasBody
+        ? isTextual
+          ? await req.text()
+          : await req.arrayBuffer()
+        : undefined,
       cache: "no-store",
       // @ts-expect-error -- Node fetch supports duplex for streaming bodies
       duplex: hasBody ? "half" : undefined,

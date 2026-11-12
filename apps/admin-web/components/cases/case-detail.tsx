@@ -23,6 +23,7 @@ import * as React from "react";
 import { GitMerge, Loader2, MapPin, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
+import { GeoAutoBadge } from "@/components/geo-auto-badge";
 import { Button } from "@/components/ui/button";
 import { Input, Label, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
@@ -345,8 +346,18 @@ export function CaseDetail({
               <MapPin className="h-3.5 w-3.5" /> Location
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <Field label="Ward">{c.ward ?? "—"}</Field>
-              <Field label="LGA">{c.lga ?? "—"}</Field>
+              <Field label="Ward">
+                {c.ward ?? "—"}
+                {c.ward ? (
+                  <GeoAutoBadge source={c.geo_enrichment_source} />
+                ) : null}
+              </Field>
+              <Field label="LGA">
+                {c.lga ?? "—"}
+                {c.lga ? (
+                  <GeoAutoBadge source={c.geo_enrichment_source} />
+                ) : null}
+              </Field>
               <Field label="Coordinates">
                 {c.lat !== null && c.lon !== null ? (
                   <a

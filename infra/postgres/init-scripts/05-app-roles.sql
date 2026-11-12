@@ -49,6 +49,15 @@ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_knowledge_login') THEN
         CREATE ROLE app_knowledge_login LOGIN PASSWORD 'app_knowledge_dev_password' IN ROLE app_knowledge;
     END IF;
+    -- Wave 52 (SPEC-W52 Scope A): geo-service roles (booking database below).
+    -- Passwords MUST stay in sync with the pg_roles-guarded copy in
+    -- services/geo-service/migrations/0001_geo.sql (payments 0001 idiom).
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_geo') THEN
+        CREATE ROLE app_geo NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_geo_login') THEN
+        CREATE ROLE app_geo_login LOGIN PASSWORD 'app_geo_dev_password' IN ROLE app_geo;
+    END IF;
 END
 $$;
 
@@ -73,6 +82,32 @@ ALTER DEFAULT PRIVILEGES FOR ROLE app_booking_login IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_booking;
 ALTER DEFAULT PRIVILEGES FOR ROLE app_booking_login IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO app_booking;
+
+-- W52-A (SPEC-W52 Scope A): geo-service reads/writes geo_boundaries in the
+-- BOOKING database (09-geo-boundaries.sql / the service's own
+-- migrations/0001_geo.sql applied at boot).
+GRANT CONNECT ON DATABASE booking TO app_geo;
+GRANT USAGE ON SCHEMA public TO app_geo;
+-- BOOTSTRAP EXCEPTION (documented, payments idiom): geo-service has no
+-- separate migration runner — migrations/0001_geo.sql (CREATE TABLE IF NOT
+-- EXISTS + RLS) runs at boot on the runtime DSN, so the role needs CREATE
+-- on a fresh database (a no-op on an already-provisioned one). Revoke once
+-- a migration-runner split lands.
+GRANT CREATE ON SCHEMA public TO app_geo;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_geo;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_geo;
+-- Future tables created by the bootstrap superuser stay reachable.
+ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_geo;
+ALTER DEFAULT PRIVILEGES FOR ROLE opendesk IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_geo;
+-- W51-C: geo-service applies its migration at boot on the runtime DSN
+-- (app_geo_login owns geo_boundaries on a fresh database) — extend default
+-- privileges to that migration-owner role too.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_geo_login IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_geo;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_geo_login IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_geo;
 
 -- ---------------------------------------------------------------------------
 -- conversation database
