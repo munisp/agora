@@ -36,6 +36,13 @@ Inputs (ALL optional — graceful degradation, cac_analytics.py pattern):
     Person endpoint ids carry the SAME W28 hash as the node stream so the
     two exports join).
     Path: env GRAPH_EXPORT_EDGES_PATH (default s3://lake/extracts/graph_edges/).
+    NOTE (SPEC-W54 Scope A, contract note only — NO behavior change): the
+    same graph-service internal export is also serialized to RDF (Turtle +
+    JSON-LD, per-tenant named graphs) by services/rdf-export, landing at the
+    SIBLING location s3://lake/extracts/graph_rdf/{tenant_id}/{snapshot_date}/
+    graph.ttl|graph.jsonld. This job does NOT consume the RDF extracts; the
+    parquet contract above is unchanged. RDF extracts are ephemeral derived
+    snapshots (delete-on-erasure — see services/rdf-export/README.md).
     Columns:
       snapshot_date date, tenant_id string, edge_type string,
       src_label string, src_id string, dst_label string, dst_id string,

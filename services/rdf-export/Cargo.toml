@@ -1,0 +1,48 @@
+[package]
+name = "rdf-export"
+version = "0.1.0"
+edition = "2021"
+description = "OpenDesk rdf-export: tenant knowledge-graph -> RDF linked-data batch export (Turtle + JSON-LD via oxirs) landed to the MinIO lake bucket (SPEC-W54 Scope A)"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Shared outbound HTTP client idiom (payments RS-006): rustls, explicit
+# timeouts at the call sites. `stream` for the bounded-memory NDJSON export
+# consumption (graph-service /v1/graph/internal/export/*).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1"
+# chrono is used ONLY for SigV4 amz-date/date-stamp formatting and
+# snapshot_date shape validation (no serde).
+chrono = "0.4"
+# Hand-rolled SigV4 PUT (src/storage.rs — the notification-worker s3.go
+# logic translated to Rust; see README "MinIO client choice"). sha2/hmac/hex
+# are tiny, pure-Rust, and keep the tree slim vs. an S3 SDK.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+# SPEC-W54: oxirs RDF stack pinned EXACTLY. RECON §5.1: oxirs is a very
+# young project (first public crate 2025-09) whose 0.4.1 release closed a
+# full oxirs-fuseki auth bypass and a SPARQL parser bug that silently
+# dropped FILTER clauses — floating a version range on a crate with that
+# track record is not acceptable, so both crates are `=` pinned with
+# default-features OFF (oxirs-core default features pull serde/parallel/
+# rdf-12/rdf-star/sparql-12 surface we never call; oxirs-ttl default pulls
+# rdf-12). Bump = deliberate, reviewed change (see README).
+oxirs-core = { version = "=0.4.1", default-features = false }
+oxirs-ttl = { version = "=0.4.1", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.4", features = ["util"] }
+
+# oxirs-core 0.4.1 is a very large crate; the default dev profile
+# (debuginfo=2) OOMs rustc on the CI sandbox (geo-service/terrio precedent).
+# debug=0 keeps `cargo test` buildable; test behavior is unchanged.
+[profile.dev]
+debug = 0

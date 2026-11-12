@@ -722,6 +722,55 @@ services:
     depends_on:
     - postgres
     - permify
+  # SPEC-W54 Scope A: rdf-export (:7021 — next free after ocr:7020;
+  # credit-bureau holds 7022). Rust/oxirs batch service: graph-service
+  # internal NDJSON export -> Turtle + JSON-LD -> MinIO `lake` bucket
+  # extracts/graph_rdf/{tenant_id}/{snapshot_date}/ (sibling of the parquet
+  # extracts consumed by infra/lakehouse/spark/jobs/graph_export.py).
+  # MESH-INTERNAL ONLY: NO APISIX route (kyc-service precedent) and no
+  # published host port — reachable only on the opendesk network. Needs the
+  # graph overlay for its upstream: -f infra/docker-compose.graph.yml.
+  rdf-export:
+    logging: *default-logging
+    deploy: *default-limits
+    build:
+      context: ./services/rdf-export
+    # Optional: secrets/dev overrides (compose still boots without it —
+    # every ${VAR} below carries a dev fallback). cp .env.example .env
+    env_file:
+    - path: .env
+      required: false
+    environment:
+      RDF_EXPORT_BIND: ${RDF_EXPORT_BIND:-0.0.0.0:7021}
+      # Upstream NDJSON producer (graph overlay service :7014).
+      GRAPH_SERVICE_URL: ${GRAPH_SERVICE_URL:-http://graph-service:7014}
+      # Outbound X-Internal-Token for /v1/graph/internal/export/*. MUST equal
+      # graph-service's INTERNAL_TOKEN (infra/docker-compose.graph.yml —
+      # REQUIRED there, no repo-known default; dev value in .env.example).
+      # The dev fallback below matches .env.example's INTERNAL_TOKEN so the
+      # dev overlay works out of the box; prod sets GRAPH_INTERNAL_TOKEN via
+      # the secrets store (docs/runbooks/secrets.md) — -change-in-prod
+      # posture, rotate per environment.
+      GRAPH_INTERNAL_TOKEN: ${GRAPH_INTERNAL_TOKEN:-opendesk-dev-internal-token}
+      # Inbound X-Internal-Token guard for /v1/rdf-export/* (constant-time,
+      # fail-closed: unset in the SERVICE env = 503 posture; compose dev
+      # default below mirrors OCR_INTERNAL_TOKEN/FRAUD_INTERNAL_TOKEN).
+      # DEV ONLY default; prod MUST set via the secrets store.
+      RDF_EXPORT_INTERNAL_TOKEN: ${RDF_EXPORT_INTERNAL_TOKEN:-opendesk-dev-rdf-export-internal-token-change-in-prod}
+      # MinIO `lake` bucket — credentials via the shared indirection
+      # (OOS-18), must match the minio block in
+      # infra/docker-compose.lakehouse.yml.
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      RDF_MINIO_BUCKET: ${RDF_MINIO_BUCKET:-lake}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      # Synchronous batch run budget (generous on purpose — batch tool).
+      RDF_EXPORT_TIMEOUT_S: ${RDF_EXPORT_TIMEOUT_S:-300}
+    networks:
+    - opendesk
+    depends_on:
+    - minio
   edge:
     logging: *default-logging
     deploy: *default-limits

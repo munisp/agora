@@ -303,3 +303,42 @@ memory (`redis_memory_used_bytes`) against the container limit.
   reward) populated from `opendesk.usage.events` trajectory logging.
 - **Neo4j drop-in:** all access is Cypher via graph-service; an adapter
   remains a drop-in if an enterprise tenant mandates it.
+
+## 8. Export formats
+
+The graph leaves the platform in three serializations, all derived and
+rebuildable — **none is ever authoritative** (the graph itself rebuilds from
+Kafka replay, §5.3):
+
+- **NDJSON (existing, internal).** graph-service
+  `GET /v1/graph/internal/export/{nodes,edges}` streams node/edge rows as
+  NDJSON with `X-Row-Count`/`X-Snapshot-Date` headers, `snapshot_date`
+  partitioning and deterministic row order; `X-Internal-Token` gated, mesh
+  only. Consumed by spark `graph_export.py` (→ `iceberg.gold.*`) and by
+  rdf-export below.
+- **Turtle / JSON-LD RDF extracts (SPEC-W54).** `services/rdf-export`
+  (mesh-internal, `POST /v1/rdf-export/run`, no APISIX route) converts one
+  tenant's NDJSON snapshot to **Turtle + JSON-LD 1.1** via oxirs and lands
+  `graph.ttl` + `graph.jsonld` at
+  `s3://lake/extracts/graph_rdf/{tenant}/{snapshot_date}/`, next to the
+  parquet extracts. Cadence: on-demand batch, one tenant per run, per-tenant
+  named graphs (never a shared default graph). Terms come from the platform
+  ontology `ontology/agora.ttl` (`agora:` = `https://agora.example/ontology#`,
+  placeholder namespace, versioned via its `owl:Ontology` version IRI).
+  **PII posture:** Person IRIs reuse the source `w28_hash` values
+  (SHA-256(salt|tenant|phone)); no name literals, no raw phone/id strings in
+  any RDF output. **Erasure lifecycle:** an RDF dump is a snapshot — dumps
+  containing an erased subject MUST be deleted with the snapshot lifecycle
+  (never retained past the subject's erasure SLA); they are batch-derived and
+  re-runnable, so deletion loses nothing.
+- **GDPR bundle with JSON-LD `@context` (SPEC-W54).** The
+  notification-worker `GdprExportWorkflow` bundle
+  (`exports/{tenant_id}/{ts}-{uuid}.json`, MinIO `exports` bucket) carries a
+  top-level, inline `@context` object — versioned
+  `https://agora.example/context/v1` (machine-readable as the
+  `context_version` term; bump the `/vN` suffix on any mapping change). It
+  maps every top-level bundle key onto ontology/schema.org terms
+  (`subject` → `schema:Person`, `bookings` → `schema:Reservation`,
+  `conversations` → `agora:Conversation`, `ledger_balance` →
+  `agora:LedgerBalance`, `crm_person` → `schema:Person`). Additive only: all
+  pre-existing bundle fields are unchanged in name, type and semantics.

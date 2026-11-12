@@ -50,11 +50,65 @@ const (
 	ActivityGdprPublishErase         = "GdprPublishEraseTombstone"
 )
 
+// JSON-LD context versioning (SPEC-W54 scope B):
+//
+//   - GdprExportContextIRI identifies the versioned inline @context of the
+//     export bundle. Bump the /vN suffix on ANY change to the term mapping
+//     below (same discipline as ontology/agora.ttl's version IRI).
+//   - AgoraOntologyNamespace is the agora ontology term namespace — the same
+//     `agora:` namespace as ontology/agora.ttl (SPEC-W54 scope A; placeholder
+//     namespace). Terms referenced here MUST exist in agora.ttl.
+const (
+	GdprExportContextIRI   = "https://agora.example/context/v1"
+	AgoraOntologyNamespace = "https://agora.example/ontology#"
+)
+
+// GdprContextTerm is one JSON-LD term definition in the bundle @context.
+type GdprContextTerm struct {
+	ID        string `json:"@id"`
+	Container string `json:"@container,omitempty"`
+}
+
+// GdprBundleContext is the inline JSON-LD @context object of the export
+// bundle: every top-level bundle key is mapped onto an ontology/agora.ttl or
+// schema.org term so the export is self-describing linked data. Field order
+// here is the marshal order (struct → deterministic bytes).
+type GdprBundleContext struct {
+	// ContextVersion carries GdprExportContextIRI as a term definition so
+	// the context version is machine-readable from the bundle itself.
+	ContextVersion string          `json:"context_version"`
+	Agora          string          `json:"agora"`
+	Schema         string          `json:"schema"`
+	Subject        GdprContextTerm `json:"subject"`
+	Bookings       GdprContextTerm `json:"bookings"`
+	Conversations  GdprContextTerm `json:"conversations"`
+	LedgerBalance  GdprContextTerm `json:"ledger_balance"`
+	CrmPerson      GdprContextTerm `json:"crm_person"`
+}
+
+// GdprJSONLDContext returns the current (v1) inline @context for the export
+// bundle. Pure constant — safe for Temporal workflow determinism.
+func GdprJSONLDContext() GdprBundleContext {
+	return GdprBundleContext{
+		ContextVersion: GdprExportContextIRI,
+		Agora:          AgoraOntologyNamespace,
+		Schema:         "https://schema.org/",
+		Subject:        GdprContextTerm{ID: "schema:Person"},
+		Bookings:       GdprContextTerm{ID: "schema:Reservation", Container: "@set"},
+		Conversations:  GdprContextTerm{ID: "agora:Conversation", Container: "@set"},
+		LedgerBalance:  GdprContextTerm{ID: "agora:LedgerBalance"},
+		CrmPerson:      GdprContextTerm{ID: "schema:Person"},
+	}
+}
+
 // GdprExportBundle is the JSON document uploaded to MinIO.
 type GdprExportBundle struct {
-	Subject       GdprInput        `json:"subject"`
-	Bookings      json.RawMessage `json:"bookings"`
-	Conversations json.RawMessage `json:"conversations"`
+	// Context is the JSON-LD @context key (SPEC-W54 scope B — additive:
+	// every other field is unchanged in name/type/semantics).
+	Context       GdprBundleContext `json:"@context"`
+	Subject       GdprInput         `json:"subject"`
+	Bookings      json.RawMessage   `json:"bookings"`
+	Conversations json.RawMessage   `json:"conversations"`
 	// Knowledge is intentionally absent: knowledge documents are tenant
 	// content, not data-subject PII (SPEC-W3 §2: "knowledge n/a").
 	LedgerBalance json.RawMessage `json:"ledger_balance"`
@@ -70,6 +124,7 @@ func GdprExportWorkflow(ctx workflow.Context, in GdprInput) (string, error) {
 	ctx = workflow.WithActivityOptions(ctx, ao)
 
 	var bundle GdprExportBundle
+	bundle.Context = GdprJSONLDContext() // constant value — deterministic
 	bundle.Subject = in
 	if err := workflow.ExecuteActivity(ctx, ActivityGdprCollectBookings, in).Get(ctx, &bundle.Bookings); err != nil {
 		return "", err

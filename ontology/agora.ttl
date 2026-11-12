@@ -1,0 +1,247 @@
+# =============================================================================
+# Agora platform ontology (SPEC-W54 Scope A, recon item R1)
+#
+# Source of truth: docs/graph.md section 2 "Graph schema (v1)" (canonical property-
+# graph schema) - the edge-type enumeration is mirrored from
+# services/graph-sync/internal/graph/queries.go (11 write-path edge types)
+# plus ALERTED (SPEC-W54 enumeration for the fraud-engine alert linkage,
+# services/fraud-engine/fraud_engine/alerts.py - emitted today as edge type
+# FLAGGED; see services/rdf-export/README.md "not-yet-mapped edge types").
+#
+# NAMESPACE: `agora:` is https://agora.example/ontology# - a PLACEHOLDER
+# namespace (no dereferenceable host; agora.example is reserved
+# documentation DNS). It exists to give exports stable IRIs; do not treat it
+# as a published vocabulary.
+#
+# Coherence: services/rdf-export/src/mapping.rs implements EXACTLY the
+# classes and predicates below (test-enforced both directions,
+# services/rdf-export/tests/w54_pipeline.rs::ontology_mapping_coherence).
+# Adding a class/predicate here without a mapping.rs row (or vice versa)
+# breaks that test by design.
+#
+# PII posture (W28): Person identifiers in exports are salted SHA-256 hashes
+# (sha256(salt|tenant|value)); this ontology deliberately defines NO name /
+# phone / address properties. `quarantine` and `consentMarketing` are
+# compliance-relevant flags and are part of the export vocabulary.
+# =============================================================================
+
+@prefix agora:  <https://agora.example/ontology#> .
+@prefix owl:    <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:   <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix schema: <https://schema.org/> .
+@prefix xsd:    <http://www.w3.org/2001/XMLSchema#> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+
+# (The ontology resource is addressed by its full IRI, not the bare `agora:`
+# prefix - some Turtle parsers reject an empty PN_LOCAL.)
+<https://agora.example/ontology#> a owl:Ontology ;
+    # Version IRI discipline: bump the version IRI on ANY term change; never
+    # silently repurpose an existing term (README "Ontology versioning").
+    owl:versionIRI <https://agora.example/ontology/1.1.0> ;
+    owl:versionInfo "1.1.0" ;
+    rdfs:label "Agora platform ontology" ;
+    rdfs:comment "Linked-data vocabulary for the per-tenant knowledge graph. Canonical schema: docs/graph.md section 2. Namespace https://agora.example/ontology# is a placeholder (reserved documentation domain)." ;
+    dcterms:source <https://github.com/munisp/agora/blob/main/docs/graph.md> .
+
+# ---------------------------------------------------------------------------
+# Classes (node labels - docs/graph.md section 2 "Nodes")
+# ---------------------------------------------------------------------------
+
+agora:Person a owl:Class ;
+    rdfs:subClassOf schema:Person ;
+    rdfs:label "Person" ;
+    rdfs:comment "CRM person. Export IRIs carry ONLY the W28 salted hash (sha256(salt|tenant|person_id)) - never a name or phone (docs/graph.md section 2; graph.go PhoneHash)." .
+
+agora:Contact a owl:Class ;
+    rdfs:label "Contact" ;
+    rdfs:comment "Lead-capture record (lead_id, channel_of_first_touch, captured_at, source). No schema.org equivalent is close enough; intentionally unaligned." .
+
+agora:Consent a owl:Class ;
+    rdfs:label "Consent" ;
+    rdfs:comment "Consent registry entry (purpose, granted_at, revoked_at?, proof_ref?). Compliance-relevant (NDPA); no schema.org alignment." .
+
+agora:Booking a owl:Class ;
+    rdfs:subClassOf schema:Reservation ;
+    rdfs:label "Booking" ;
+    rdfs:comment "Transactional booking record (status, offering_id, created_at, showed?)." .
+
+agora:Case a owl:Class ;
+    rdfs:label "Case" ;
+    rdfs:comment "PII-free civic issue report (SPEC-W32; category, status, ward)." .
+
+agora:Location a owl:Class ;
+    rdfs:subClassOf schema:Place ;
+    rdfs:label "Location" ;
+    rdfs:comment "Capture/case geography (lga, ward, lat, lon) - the same LGA/ward vocabulary as geo-service/PostGIS boundaries." .
+
+agora:Tenant a owl:Class ;
+    rdfs:subClassOf schema:Organization ;
+    rdfs:label "Tenant" ;
+    rdfs:comment "Tenant anchor node (tenant_id, slug) - the isolation boundary (compliance gate 1)." .
+
+agora:Offering a owl:Class ;
+    rdfs:subClassOf schema:Offer ;
+    rdfs:label "Offering" ;
+    rdfs:comment "Bookable offering (offering_id, name, price_cents?)." .
+
+agora:Campaign a owl:Class ;
+    rdfs:label "Campaign" ;
+    rdfs:comment "Outreach campaign (campaign_id, kind)." .
+
+agora:Alert a owl:Class ;
+    rdfs:label "Alert" ;
+    rdfs:comment "Fraud/trust alert written by fraud-engine (SPEC-W30; type, severity, status, evidence). Not part of the graph-service node export contract today; reachable via ALERTED edge endpoints." .
+
+# Metadata class - NOT a property-graph label: types the per-tenant snapshot
+# resource (the named graph itself) inside the export's named graph.
+agora:GraphSnapshot a owl:Class ;
+    rdfs:label "Graph snapshot" ;
+    rdfs:comment "One tenant-scoped export snapshot (the named graph resource); carries agora:tenantId and agora:snapshotDate. Derived/rebuildable - never authoritative." .
+
+# ---------------------------------------------------------------------------
+# GDPR export-bundle classes (SPEC-W54 scope B) - NOT property-graph labels:
+# like agora:GraphSnapshot, these type resources inside the notification-
+# worker GdprExportWorkflow JSON-LD bundle (inline @context
+# https://agora.example/context/v1; GdprBundleContext in
+# services/notification-worker/internal/workflows/gdpr.go), not FalkorDB
+# nodes, so they carry NO mapping.rs CLASS_TABLE row (same documented
+# metadata-exception category as agora:GraphSnapshot).
+# ---------------------------------------------------------------------------
+
+agora:Conversation a owl:Class ;
+    rdfs:subClassOf schema:Conversation ;
+    rdfs:label "Conversation" ;
+    rdfs:comment "GDPR export-bundle term (GdprExportBundle field conversations): the data subject's conversation-service transcripts with turns, collected by GdprCollectConversations (internal/gdpr/conversations). Bundle-only class - never a FalkorDB node label." .
+
+agora:LedgerBalance a owl:Class ;
+    rdfs:label "Ledger balance" ;
+    rdfs:comment "GDPR export-bundle term (GdprExportBundle field ledger_balance): tenant-scoped payments-service account balance (GdprCollectLedger, GET /v1/accounts/{tenant_id}/balance), included as account context; carries no per-contact PII. Platform-specific - no schema.org alignment exists, intentionally agora:-only. Bundle-only class - never a FalkorDB node label." .
+
+# ---------------------------------------------------------------------------
+# Predicates (edge types - queries.go; docs/graph.md section 2 "Edges")
+# Property-chain note: ranges/domains are informative (RDFS), not enforced.
+# ---------------------------------------------------------------------------
+
+agora:hasContact a owl:ObjectProperty ;
+    rdfs:label "has contact" ;
+    rdfs:comment "(Person)-[:HAS_CONTACT]->(Contact) - queries.go upsertContactQuery." ;
+    rdfs:domain agora:Person ;
+    rdfs:range agora:Contact .
+
+agora:consented a owl:ObjectProperty ;
+    rdfs:label "consented" ;
+    rdfs:comment "(Person)-[:CONSENTED {purpose, at}]->(Consent) - queries.go linkConsentQuery. Compliance-relevant (consent gating)." ;
+    rdfs:domain agora:Person ;
+    rdfs:range agora:Consent .
+
+agora:booked a owl:ObjectProperty ;
+    rdfs:label "booked" ;
+    rdfs:comment "(Person)-[:BOOKED {at}]->(Booking) - queries.go upsertBookingQuery." ;
+    rdfs:domain agora:Person ;
+    rdfs:range agora:Booking .
+
+agora:for a owl:ObjectProperty ;
+    rdfs:label "for" ;
+    rdfs:comment "(Booking)-[:FOR]->(Offering) - queries.go upsertBookingQuery." ;
+    rdfs:domain agora:Booking ;
+    rdfs:range agora:Offering .
+
+agora:referred a owl:ObjectProperty ;
+    rdfs:label "referred" ;
+    rdfs:comment "(Person)-[:REFERRED {at, program}]->(Person) - referral tree (W14), queries.go linkReferralQuery." ;
+    rdfs:domain agora:Person ;
+    rdfs:range agora:Person .
+
+agora:capturedAt a owl:ObjectProperty ;
+    rdfs:label "captured at" ;
+    rdfs:comment "(Contact)-[:CAPTURED_AT]->(Location) - queries.go captureLocationQuery." ;
+    rdfs:domain agora:Contact ;
+    rdfs:range agora:Location .
+
+agora:partOf a owl:ObjectProperty ;
+    rdfs:label "part of" ;
+    rdfs:comment "(Contact)-[:PART_OF]->(Tenant) - tenant anchor edge (queries.go upsertContactQuery); every node also carries tenant_id and every export sits in the tenant named graph (belt and braces, compliance gate 1)." ;
+    rdfs:range agora:Tenant .
+
+agora:mergeCandidate a owl:ObjectProperty ;
+    rdfs:label "merge candidate" ;
+    rdfs:comment "(Person)-[:MERGE_CANDIDATE]->(Person) - entity-resolution PROPOSAL, never a merge (queries.go addMergeCandidateQuery). owl:sameAs is deliberately NOT used: no identity claim is made." ;
+    rdfs:domain agora:Person ;
+    rdfs:range agora:Person .
+
+agora:reported a owl:ObjectProperty ;
+    rdfs:label "reported" ;
+    rdfs:comment "(Person)-[:REPORTED]->(Case) - civic case authorship (SPEC-W32), queries.go upsertCaseQuery." ;
+    rdfs:domain agora:Person ;
+    rdfs:range agora:Case .
+
+agora:at a owl:ObjectProperty ;
+    rdfs:label "at" ;
+    rdfs:comment "(Case)-[:AT]->(Location) - queries.go caseLocationQuery." ;
+    rdfs:domain agora:Case ;
+    rdfs:range agora:Location .
+
+agora:mergedInto a owl:ObjectProperty ;
+    rdfs:label "merged into" ;
+    rdfs:comment "(Case)-[:MERGED_INTO]->(Case canonical) - duplicate-case consolidation (queries.go linkCaseMergedQuery)." ;
+    rdfs:domain agora:Case ;
+    rdfs:range agora:Case .
+
+agora:alerted a owl:ObjectProperty ;
+    rdfs:label "alerted" ;
+    rdfs:comment "(Alert)-[:ALERTED]->(Person) - fraud-engine alert linkage (SPEC-W54 enumeration; SPEC-W30 Alert nodes). NOTE: fraud-engine today writes this linkage as edge type FLAGGED (alerts.py FLAGGED_EDGE_CYPHER) - such rows are skipped+counted by rdf-export until docs/graph.md adopts ALERTED." ;
+    rdfs:domain agora:Alert ;
+    rdfs:range agora:Person .
+
+# ---------------------------------------------------------------------------
+# Datatype properties (export node-row fields - graph-service export.py
+# contract; datatype-mapped in rdf-export mapping.rs)
+# ---------------------------------------------------------------------------
+
+agora:inDegree a owl:DatatypeProperty ;
+    rdfs:label "in degree" ; rdfs:range xsd:integer ;
+    rdfs:comment "Export contract: inbound edge count." .
+
+agora:outDegree a owl:DatatypeProperty ;
+    rdfs:label "out degree" ; rdfs:range xsd:integer ;
+    rdfs:comment "Export contract: outbound edge count." .
+
+agora:consentMarketing a owl:DatatypeProperty ;
+    rdfs:label "consent marketing" ; rdfs:range xsd:boolean ;
+    rdfs:comment "Unrevoked marketing-consent flag (compliance-relevant)." .
+
+agora:quarantine a owl:DatatypeProperty ;
+    rdfs:label "quarantine" ; rdfs:range xsd:boolean ;
+    rdfs:comment "Fraud quarantine flag, monotonic once set (compliance-relevant; SPEC section 5 gate 4)." .
+
+agora:bookingsTotal a owl:DatatypeProperty ;
+    rdfs:label "bookings total" ; rdfs:range xsd:integer .
+
+agora:ltvCents a owl:DatatypeProperty ;
+    rdfs:label "lifetime value (cents)" ; rdfs:range xsd:integer .
+
+agora:noShowRate a owl:DatatypeProperty ;
+    rdfs:label "no-show rate" ; rdfs:range xsd:double .
+
+agora:propensityShow a owl:DatatypeProperty ;
+    rdfs:label "propensity show" ; rdfs:range xsd:double ;
+    rdfs:comment "graph-ml score (SPEC-W29)." .
+
+agora:propensityConvert a owl:DatatypeProperty ;
+    rdfs:label "propensity convert" ; rdfs:range xsd:double ;
+    rdfs:comment "graph-ml score (SPEC-W29)." .
+
+agora:channelOfFirstTouch a owl:DatatypeProperty ;
+    rdfs:label "channel of first touch" ; rdfs:range xsd:string .
+
+agora:lastActiveAt a owl:DatatypeProperty ;
+    rdfs:label "last active at" ; rdfs:range xsd:dateTime .
+
+agora:tenantId a owl:DatatypeProperty ;
+    rdfs:label "tenant id" ; rdfs:range xsd:string ;
+    rdfs:comment "Tenant identifier literal (mirrors the named-graph IRI tail); tenant isolation is carried structurally by the named graph." .
+
+agora:snapshotDate a owl:DatatypeProperty ;
+    rdfs:label "snapshot date" ; rdfs:range xsd:date ;
+    rdfs:comment "Export partition date (X-Snapshot-Date contract)." .

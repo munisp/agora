@@ -113,6 +113,12 @@ func (a *Activities) GdprCollectCrmPerson(ctx context.Context, in workflows.Gdpr
 // bucket via a SigV4-signed plain HTTP PUT. Returns the object path
 // (bucket/key) — dev hand-off is the path; prod can layer presigned GET URLs.
 func (a *Activities) GdprUploadExport(ctx context.Context, bundle workflows.GdprExportBundle) (string, error) {
+	// SPEC-W54: the bundle always ships its JSON-LD @context — the workflow
+	// sets it, but fill it here too so a zero-value bundle never uploads
+	// without the versioned context.
+	if bundle.Context.ContextVersion == "" {
+		bundle.Context = workflows.GdprJSONLDContext()
+	}
 	body, err := json.MarshalIndent(bundle, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal export bundle: %w", err)
