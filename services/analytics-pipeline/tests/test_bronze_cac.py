@@ -135,13 +135,18 @@ def test_cac_events_registered_in_bronze_tables():
 def test_topic_registry_maps_cac_events_topic():
     settings = load_settings()
     registry = topic_registry(settings)
-    table, mapper = registry["cac.events"]
+    table, router = registry["cac.events"]
     assert table == "cac_events"
-    assert mapper is map_cac_event
-    # the four pre-existing bronze topics are untouched
+    # W62: registry values are (default_table, router); the cac router must
+    # produce exactly the row map_cac_event produces, tagged for cac_events.
+    msg = _cloudevent()
+    assert router(msg) == ("cac_events", map_cac_event(msg))
+    # the pre-existing bronze topics are untouched
     assert registry["opendesk.booking.events"][0] == "booking_events"
     assert registry["opendesk.payments.events"][0][0:7] == "payment"
-    assert len(registry) == 5
+    # W62: opendesk.ocr.events -> bronze.receipt_documents joined the registry
+    assert registry["opendesk.ocr.events"][0] == "receipt_documents"
+    assert len(registry) == 6
 
 
 class _FakeSink:

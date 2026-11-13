@@ -13,13 +13,22 @@ import pyarrow as pa
 from pyiceberg.catalog import Catalog, load_catalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, TableAlreadyExistsError
 from pyiceberg.schema import Schema
-from pyiceberg.types import DoubleType, LongType, NestedField, StringType, TimestampType
+from pyiceberg.types import (
+    DoubleType,
+    IntegerType,
+    LongType,
+    NestedField,
+    StringType,
+    TimestampType,
+)
 
 from .config import Settings
 from .mapping import (
     BOOKING_EVENT_COLUMNS,
     CAC_EVENT_COLUMNS,
     PAYMENT_EVENT_COLUMNS,
+    RECEIPT_DOCUMENT_COLUMNS,
+    RECEIPT_RECON_FINDING_COLUMNS,
     TRANSCRIPT_COLUMNS,
     USAGE_EVENT_COLUMNS,
 )
@@ -27,6 +36,7 @@ from .mapping import (
 BRONZE_NAMESPACE = "bronze"
 
 _STR = StringType()
+_INT = IntegerType()
 _LONG = LongType()
 _DOUBLE = DoubleType()
 _TS = TimestampType()  # timestamp WITHOUT timezone (naive UTC) — see mapping.py
@@ -64,6 +74,27 @@ _COLUMN_TYPES: dict[str, Any] = {
     "lga_id": _LONG,
     "amount_ngn": _DOUBLE,
     "idempotency_key": _STR,
+    # SPEC-W62 §bronze.receipt_documents (G1: kind='receipt' only, kyc_*
+    # dropped, extracted_fields whitelist = amount_minor/currency/receipt_date).
+    "document_id": _STR,
+    "kind": _STR,
+    "page_count": _INT,
+    "sha256": _STR,
+    "phash": _STR,
+    "model_version": _STR,
+    "amount_minor": _LONG,
+    "receipt_date": _STR,
+    # SPEC-W62 §bronze.receipt_recon_findings (G2: ReceiptReconFinding events
+    # routed off booking.events into their own table, full finding payload).
+    "run_id": _STR,
+    "finding_kind": _STR,
+    "confidence": _STR,
+    "capture_client_id": _STR,
+    "attempt_tx_ref": _STR,
+    "expected_amount_minor": _LONG,
+    "captured_amount_minor": _LONG,
+    "receipt_amount_major": _DOUBLE,
+    "receipt_currency": _STR,
 }
 
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -73,6 +104,10 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "usage_events": USAGE_EVENT_COLUMNS,
     # SPEC-W33 §2 A2: closes the cac_analytics.py TODO producer.
     "cac_events": CAC_EVENT_COLUMNS,
+    # SPEC-W62: opendesk.ocr.events DocumentExtracted (receipts only).
+    "receipt_documents": RECEIPT_DOCUMENT_COLUMNS,
+    # SPEC-W62 G2: ReceiptReconFinding routed off opendesk.booking.events.
+    "receipt_recon_findings": RECEIPT_RECON_FINDING_COLUMNS,
 }
 
 
@@ -89,6 +124,8 @@ def iceberg_schema(table: str) -> Schema:
 def _pa_type(iceberg_type: Any) -> pa.DataType:
     if isinstance(iceberg_type, LongType):
         return pa.int64()
+    if isinstance(iceberg_type, IntegerType):
+        return pa.int32()
     if isinstance(iceberg_type, DoubleType):
         return pa.float64()
     if isinstance(iceberg_type, TimestampType):
@@ -162,9 +199,30 @@ class IcebergSink:
         return self._tables[name]
 
     def append(self, table: str, rows: Iterable[Mapping[str, Any]]) -> int:
-        rows = list(rows)
+        rows = _dedupe_on_event_id(table, list(rows))
         if not rows:
             return 0
         arrow = pa.Table.from_pylist(list(rows), schema=arrow_schema(table))
         self._table(table).append(arrow)
         return len(rows)
+
+
+def _dedupe_on_event_id(table: str, rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """In-batch idempotency (SPEC-W62: event_id dedupe on append): for tables
+    keyed by event_id, keep the FIRST row per non-null event_id within the
+    append batch (first wins — redelivered duplicates are byte-identical).
+    Cross-batch duplicates from at-least-once redelivery are still removed
+    downstream by the Spark silver jobs, as before. Tables without an
+    event_id column (transcripts) are untouched."""
+    if "event_id" not in TABLE_COLUMNS.get(table, ()):
+        return rows
+    seen: set[Any] = set()
+    out: list[Mapping[str, Any]] = []
+    for row in rows:
+        event_id = row.get("event_id")
+        if event_id is not None:
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+        out.append(row)
+    return out

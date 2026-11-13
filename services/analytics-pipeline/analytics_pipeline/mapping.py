@@ -100,6 +100,53 @@ CAC_EVENT_COLUMNS = (
     "idempotency_key",
 )
 
+# SPEC-W62 §bronze.receipt_documents (G1): one row per
+# com.opendesk.ocr.DocumentExtracted on opendesk.ocr.events with
+# kind='receipt' ONLY. kyc_* kinds (and every other non-receipt kind) are
+# DROPPED ENTIRELY — a hash-only kyc row in the lake would still be a
+# processing record with no TTL mechanism (RECON Q4). From extracted_fields
+# EXACTLY three keys are whitelisted — amount_minor, currency, receipt_date;
+# vendor/note/items/raw text NEVER land (PII posture: hash-only + scalars).
+# Storage pointers (storage_bucket/storage_key) are intentionally NOT
+# columns: the lake holds hashes + ids, not object locations.
+RECEIPT_DOCUMENT_COLUMNS = (
+    "event_id",
+    "tenant_id",
+    "document_id",
+    "kind",
+    "status",
+    "page_count",
+    "sha256",
+    "phash",
+    "model_version",
+    "amount_minor",
+    "currency",
+    "receipt_date",
+    "occurred_at",
+)
+
+# SPEC-W62 §bronze.receipt_recon_findings (G2): com.opendesk.booking.
+# ReceiptReconFinding rides opendesk.booking.events (booking-service
+# internal/recon/recon.go findingEventPayload) but is NOT a booking event —
+# it gets its own bronze table with the full finding payload. booking_id is
+# taken from data ONLY (never the CloudEvent subject: that subject is the
+# TENANT SLUG — stuffing it into booking_id was the pre-existing G2 break).
+RECEIPT_RECON_FINDING_COLUMNS = (
+    "event_id",
+    "tenant_id",
+    "run_id",
+    "finding_kind",
+    "confidence",
+    "capture_client_id",
+    "booking_id",
+    "attempt_tx_ref",
+    "expected_amount_minor",
+    "captured_amount_minor",
+    "receipt_amount_major",
+    "receipt_currency",
+    "occurred_at",
+)
+
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 
@@ -180,7 +227,55 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
-def map_booking_event(message: Mapping[str, Any]) -> dict[str, Any]:
+_ISO3_RE = re.compile(r"^[A-Z]{3}$")
+_RECEIPT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _as_iso3(value: Any) -> Optional[str]:
+    """ISO-4217 alpha-3 currency code, normalised upper-case; else None."""
+    if not isinstance(value, str):
+        return None
+    code = value.strip().upper()
+    return code if _ISO3_RE.match(code) else None
+
+
+def _as_receipt_date(value: Any) -> Optional[str]:
+    """Strict YYYY-MM-DD calendar date string; anything else -> None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not _RECEIPT_DATE_RE.match(text):
+        return None
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return text
+
+
+# SPEC-W56 / SPEC-W62 G2: ReceiptReconFinding events share the
+# opendesk.booking.events topic but are NOT booking events.
+RECEIPT_RECON_FINDING_TYPE = "ReceiptReconFinding"
+
+
+def is_receipt_recon_finding(message: Mapping[str, Any]) -> bool:
+    """True for ReceiptReconFinding-typed messages (CloudEvent ``type`` or a
+    bare payload's event_type), matched case-insensitively on the short name."""
+    envelope, data = split_envelope(message)
+    raw = envelope.get("type") or _get(data, "event_type", "eventType")
+    short = short_event_type(raw if isinstance(raw, str) else None)
+    return (short or "").lower() == RECEIPT_RECON_FINDING_TYPE.lower()
+
+
+def map_booking_event(message: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    # SPEC-W62 G2: ReceiptReconFinding-typed messages never land in
+    # bronze.booking_events (they used to — sparsely — breaking the dbt
+    # accepted_values test on stg_booking_events.event_type and stuffing the
+    # tenant-slug subject into booking_id). They are routed to
+    # bronze.receipt_recon_findings by route_booking_event; here they are
+    # SKIPPED entirely.
+    if is_receipt_recon_finding(message):
+        return None
     envelope, data = split_envelope(message)
     return {
         "event_id": _as_str(envelope.get("id") or _get(data, "event_id", "eventId")),
@@ -287,3 +382,114 @@ def map_cac_event(message: Mapping[str, Any]) -> dict[str, Any]:
         "amount_ngn": _as_float(_get(data, "amount_ngn", "amountNgn")),
         "idempotency_key": _as_str(_get(data, "idempotency_key", "idempotencyKey")),
     }
+
+
+def map_ocr_document(message: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """com.opendesk.ocr.DocumentExtracted (opendesk.ocr.events)
+    -> bronze.receipt_documents.
+
+    SPEC-W62 G1 (PII exclusion): ONLY kind='receipt' documents land. kyc_*
+    kinds are DROPPED ENTIRELY (belt-and-braces — W58 R1 already emits
+    extracted_fields={} for them, and a hash-only kyc row in the TTL-less
+    lake is still a processing record); every other non-receipt kind
+    (document, knowledge_scan, ...) is dropped too. Returns None for dropped
+    messages (the consumer skips None).
+
+    From ``extracted_fields`` EXACTLY three whitelisted scalars are read —
+    amount_minor (int), currency (ISO-3), receipt_date (YYYY-MM-DD). No
+    vendor, no note, no items, no free text, no other key is ever touched.
+    """
+    envelope, data = split_envelope(message)
+    kind = _as_str(_get(data, "kind"))
+    if kind != "receipt":
+        return None
+    fields = _get(data, "extracted_fields", "extractedFields")
+    if not isinstance(fields, Mapping):
+        fields = {}
+    return {
+        "event_id": _as_str(envelope.get("id") or _get(data, "event_id", "eventId")),
+        "tenant_id": _as_str(
+            envelope.get("tenantid") or _get(data, "tenant_id", "tenantId")
+        ),
+        "document_id": _as_str(
+            _get(data, "document_id", "documentId") or envelope.get("subject")
+        ),
+        "kind": kind,
+        "status": _as_str(_get(data, "status")),
+        "page_count": _as_int(_get(data, "page_count", "pageCount")),
+        "sha256": _as_str(_get(data, "sha256")),
+        "phash": _as_str(_get(data, "phash")),
+        "model_version": _as_str(_get(data, "model_version", "modelVersion")),
+        # G1 whitelist — the ONLY keys read out of extracted_fields.
+        "amount_minor": _as_int(_get(fields, "amount_minor", "amountMinor")),
+        "currency": _as_iso3(_get(fields, "currency")),
+        "receipt_date": _as_receipt_date(_get(fields, "receipt_date", "receiptDate")),
+        "occurred_at": parse_ts(envelope.get("time"))
+        or parse_ts(_get(data, "occurred_at", "occurredAt")),
+    }
+
+
+def map_receipt_recon_finding(message: Mapping[str, Any]) -> dict[str, Any]:
+    """com.opendesk.booking.ReceiptReconFinding -> bronze.receipt_recon_findings
+    (SPEC-W62 G2; full finding payload per SPEC §bronze.receipt_recon_findings).
+
+    Emitted by booking-service internal/recon (recon.go findingEventPayload):
+    data = {tenant_id, kind, confidence, capture_client_id?, booking_id?,
+    attempt_tx_ref?, expected_amount_minor?, captured_amount_minor?,
+    receipt_amount_major?, detail, finding_id}. ``run_id`` is on the finding
+    row but not in today's event payload (mapped when present, else NULL);
+    ``receipt_currency`` rides inside ``detail`` today (fallback lookup).
+    booking_id comes from data ONLY — the CloudEvent subject is the tenant
+    slug, never a booking id (the G2 stuffing bug).
+    """
+    envelope, data = split_envelope(message)
+    detail = data.get("detail")
+    if not isinstance(detail, Mapping):
+        detail = {}
+    return {
+        "event_id": _as_str(
+            envelope.get("id")
+            or _get(data, "event_id", "eventId")
+            or _get(data, "finding_id", "findingId")
+        ),
+        "tenant_id": _as_str(
+            envelope.get("tenantid") or _get(data, "tenant_id", "tenantId")
+        ),
+        "run_id": _as_str(_get(data, "run_id", "runId")),
+        "finding_kind": _as_str(_get(data, "kind", "finding_kind", "findingKind")),
+        "confidence": _as_str(_get(data, "confidence")),
+        "capture_client_id": _as_str(_get(data, "capture_client_id", "captureClientId")),
+        # NO envelope-subject fallback: subject is the tenant slug (G2).
+        "booking_id": _as_str(_get(data, "booking_id", "bookingId")),
+        "attempt_tx_ref": _as_str(_get(data, "attempt_tx_ref", "attemptTxRef")),
+        "expected_amount_minor": _as_int(
+            _get(data, "expected_amount_minor", "expectedAmountMinor")
+        ),
+        "captured_amount_minor": _as_int(
+            _get(data, "captured_amount_minor", "capturedAmountMinor")
+        ),
+        "receipt_amount_major": _as_float(
+            _get(data, "receipt_amount_major", "receiptAmountMajor")
+        ),
+        "receipt_currency": _as_str(_get(data, "receipt_currency", "receiptCurrency"))
+        or _as_str(_get(detail, "receipt_currency", "receiptCurrency")),
+        "occurred_at": parse_ts(envelope.get("time"))
+        or parse_ts(_get(data, "occurred_at", "occurredAt")),
+    }
+
+
+def route_booking_event(message: Mapping[str, Any]) -> Optional[tuple[str, dict[str, Any]]]:
+    """Router for opendesk.booking.events (SPEC-W62 G2).
+
+    Returns (bronze_table, row) or None to drop. ReceiptReconFinding-typed
+    messages route to receipt_recon_findings; everything else maps as a
+    booking event. (map_booking_event ALSO skips findings on its own, so a
+    finding can never reach bronze.booking_events even if this router is
+    bypassed.)
+    """
+    if is_receipt_recon_finding(message):
+        return ("receipt_recon_findings", map_receipt_recon_finding(message))
+    row = map_booking_event(message)
+    if row is None:
+        return None
+    return ("booking_events", row)

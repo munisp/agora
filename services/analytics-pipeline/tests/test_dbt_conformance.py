@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from analytics_pipeline.mapping import (  # noqa: E402
     BOOKING_EVENT_COLUMNS,
     PAYMENT_EVENT_COLUMNS,
+    RECEIPT_DOCUMENT_COLUMNS,
+    RECEIPT_RECON_FINDING_COLUMNS,
     TRANSCRIPT_COLUMNS,
     USAGE_EVENT_COLUMNS,
 )
@@ -61,11 +63,37 @@ def test_transcripts_columns_match_dbt():
     assert list(TRANSCRIPT_COLUMNS) == _dbt_source_columns("transcripts")
 
 
+def _dbt_source_columns_or_none(table: str) -> list[str] | None:
+    """None when the table has no dbt source block yet (e.g. SPEC-W62 tables
+    land in schema.yml with coder C's dbt delta — until then these tests skip
+    honestly instead of failing an unrelated half of the wave)."""
+    try:
+        return _dbt_source_columns(table)
+    except (ValueError, FileNotFoundError):
+        return None
+
+
 def test_usage_events_columns_match_dbt():
     if not os.path.exists(DBT_SCHEMA):
         print("SKIP: dbt schema.yml not present in this checkout")
         return
     assert list(USAGE_EVENT_COLUMNS) == _dbt_source_columns("usage_events")
+
+
+def test_receipt_documents_columns_match_dbt():
+    cols = _dbt_source_columns_or_none("receipt_documents")
+    if cols is None:
+        print("SKIP: dbt bronze.receipt_documents source not in schema.yml yet (coder C)")
+        return
+    assert list(RECEIPT_DOCUMENT_COLUMNS) == cols
+
+
+def test_receipt_recon_findings_columns_match_dbt():
+    cols = _dbt_source_columns_or_none("receipt_recon_findings")
+    if cols is None:
+        print("SKIP: dbt bronze.receipt_recon_findings source not in schema.yml yet (coder C)")
+        return
+    assert list(RECEIPT_RECON_FINDING_COLUMNS) == cols
 
 
 if __name__ == "__main__":

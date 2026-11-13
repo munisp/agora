@@ -3,8 +3,8 @@
 Delivery semantics: at-least-once. Offsets are committed only AFTER a
 successful Iceberg append; on append failure the batch is kept, the error is
 counted, and the consumer retries on the next flush tick. Duplicates on
-redelivery are expected and removed downstream by the Spark silver jobs
-(infra/lakehouse/spark/jobs).
+redelivery are deduped per append batch on event_id (IcebergSink) and
+removed downstream by the Spark silver jobs (infra/lakehouse/spark/jobs).
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import structlog
 from aiokafka import AIOKafkaConsumer, TopicPartition
@@ -21,31 +21,51 @@ from . import metrics
 from .config import Settings
 from .iceberg_tables import IcebergSink
 from .mapping import (
-    map_booking_event,
     map_cac_event,
+    map_ocr_document,
     map_payment_event,
     map_transcript,
     map_usage_event,
+    route_booking_event,
 )
 
 log = structlog.get_logger()
 
-# topic -> (bronze table, row mapper)
-Mapper = Callable[[Mapping[str, Any]], dict[str, Any]]
+# topic -> (default bronze table, router). A router maps one message to
+# (bronze_table, row) or None (message dropped — e.g. SPEC-W62 G1 kyc_*
+# OCR documents and G2 ReceiptReconFinding misroutes). Most topics are
+# single-table; opendesk.booking.events routes ReceiptReconFinding-typed
+# messages to bronze.receipt_recon_findings (G2).
+Router = Callable[[Mapping[str, Any]], Optional[tuple[str, dict[str, Any]]]]
 
 
-def topic_registry(settings: Settings) -> dict[str, tuple[str, Mapper]]:
+def _fixed(table: str, mapper: Callable[[Mapping[str, Any]], Optional[dict[str, Any]]]) -> Router:
+    """Adapt a single-table mapper (None = drop) to the Router shape."""
+
+    def route(message: Mapping[str, Any]) -> Optional[tuple[str, dict[str, Any]]]:
+        row = mapper(message)
+        return None if row is None else (table, row)
+
+    return route
+
+
+def topic_registry(settings: Settings) -> dict[str, tuple[str, Router]]:
     return {
-        settings.topic_booking_events: ("booking_events", map_booking_event),
-        settings.topic_payment_events: ("payment_events", map_payment_event),
-        settings.topic_transcripts: ("transcripts", map_transcript),
+        # SPEC-W62 G2: booking.events also carries ReceiptReconFinding —
+        # routed to its own bronze table, never to bronze.booking_events.
+        settings.topic_booking_events: ("booking_events", route_booking_event),
+        settings.topic_payment_events: ("payment_events", _fixed("payment_events", map_payment_event)),
+        settings.topic_transcripts: ("transcripts", _fixed("transcripts", map_transcript)),
         # Wave 5 #9: usage metering records -> bronze.usage_events.
-        settings.topic_usage_events: ("usage_events", map_usage_event),
+        settings.topic_usage_events: ("usage_events", _fixed("usage_events", map_usage_event)),
         # SPEC-W33 §2 A2: CAC funnel events -> bronze.cac_events. Same
         # consumer group (kafka_group_id) and commit-after-append semantics
         # as the other bronze topics; the realtime rollup path keeps its own
         # group (cac_events_group) in cac_consumer.py.
-        settings.cac_events_topic: ("cac_events", map_cac_event),
+        settings.cac_events_topic: ("cac_events", _fixed("cac_events", map_cac_event)),
+        # SPEC-W62 G1: OCR DocumentExtracted -> bronze.receipt_documents
+        # (kind='receipt' only; kyc_* and other kinds dropped by the mapper).
+        settings.topic_ocr_events: ("receipt_documents", _fixed("receipt_documents", map_ocr_document)),
     }
 
 
@@ -152,29 +172,44 @@ class BronzeConsumer:
         buffer = self._buffers[topic]
         if not buffer:
             return
-        table, mapper = self._registry[topic]
+        default_table, router = self._registry[topic]
         batch, self._buffers[topic] = buffer, []
         metrics.BUFFER_SIZE.labels(topic=topic).set(0)
         started = time.monotonic()
         try:
-            rows = [mapper(value) for value in batch]
-            written = await asyncio.to_thread(self._sink.append, table, rows)
+            # Route each message to its bronze table (None = dropped, e.g.
+            # W62 G1 kyc_* documents). One topic may feed several tables
+            # (booking.events -> booking_events + receipt_recon_findings).
+            by_table: dict[str, list[dict[str, Any]]] = {}
+            for value in batch:
+                routed = router(value)
+                if routed is None:
+                    continue
+                table, row = routed
+                by_table.setdefault(table, []).append(row)
+            written_by_table: dict[str, int] = {}
+            for table, rows in by_table.items():
+                written_by_table[table] = await asyncio.to_thread(
+                    self._sink.append, table, rows
+                )
+            written = sum(written_by_table.values())
         except Exception as exc:  # keep the batch; retry next tick
             self._buffers[topic] = batch + self._buffers[topic]
             self._buffer_since[topic] = time.monotonic()
             metrics.BUFFER_SIZE.labels(topic=topic).set(len(self._buffers[topic]))
-            metrics.FLUSHES.labels(table=table, outcome="error").inc()
+            metrics.FLUSHES.labels(table=default_table, outcome="error").inc()
             self.last_error = f"{type(exc).__name__}: {exc}"
-            log.error("sink.flush_failed", table=table, error=self.last_error)
+            log.error("sink.flush_failed", table=default_table, error=self.last_error)
             return
         elapsed = time.monotonic() - started
-        metrics.FLUSHES.labels(table=table, outcome="ok").inc()
-        metrics.FLUSH_DURATION.labels(table=table).observe(elapsed)
-        metrics.ROWS_WRITTEN.labels(table=table).inc(written)
+        metrics.FLUSHES.labels(table=default_table, outcome="ok").inc()
+        metrics.FLUSH_DURATION.labels(table=default_table).observe(elapsed)
+        for table, n in written_by_table.items():
+            metrics.ROWS_WRITTEN.labels(table=table).inc(n)
         self.last_error = None
         if self._consumer is not None:
             await self._consumer.commit()  # at-least-once: commit only after append
-        log.info("sink.flushed", table=table, rows=written, seconds=round(elapsed, 3))
+        log.info("sink.flushed", table=default_table, rows=written, seconds=round(elapsed, 3))
 
     # -- health ------------------------------------------------------------
     def _update_lag_metrics(self) -> None:

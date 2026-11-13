@@ -173,3 +173,57 @@ models:
         tests: [not_null]
       - name: h3_cell_str
       - name: bookings
+
+  - name: receipt_recon_daily
+    description: >
+      Receipt-reconciliation findings per tenant per day per
+      finding_kind/confidence (SPEC-W62): counts, resolved count, and
+      expected/captured/absolute-mismatch amount sums in minor units.
+      Written by the Spark receipt_recon_gold job from
+      bronze.receipt_recon_findings; this model is a passthrough view
+      (reco_pricing precedent: Spark writes, dbt exposes).
+    tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "findings_count >= 0 and resolved_count >= 0 and mismatch_abs_sum_minor >= 0"
+    columns:
+      - name: tenant_id
+        tests: [not_null]
+      - name: day
+        tests: [not_null]
+      - name: finding_kind
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['receipt_without_payment', 'payment_without_receipt', 'amount_mismatch', 'currency_unknown']
+      - name: confidence
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['exact', 'heuristic', 'none']
+      - name: findings_count
+      - name: resolved_count
+      - name: expected_sum_minor
+      - name: captured_sum_minor
+      - name: mismatch_abs_sum_minor
+
+  - name: receipt_ingest_daily
+    description: >
+      OCR receipt ingest volume per tenant per day (SPEC-W62): documents,
+      pages, receipts (kind='receipt') and receipts with a parsed amount.
+      Built from bronze.receipt_documents (hash-only identifiers +
+      whitelisted scalars, no free text — G1). Written by the Spark
+      receipt_recon_gold job; passthrough view.
+    tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "documents >= 0 and pages >= 0 and receipts >= 0 and receipts_with_amount >= 0"
+    columns:
+      - name: tenant_id
+        tests: [not_null]
+      - name: day
+        tests: [not_null]
+      - name: documents
+      - name: pages
+      - name: receipts
+      - name: receipts_with_amount

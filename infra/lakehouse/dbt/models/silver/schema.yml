@@ -79,6 +79,68 @@ sources:
             tests: [not_null]
           - name: meta
             description: Free-form JSON metadata (stringified).
+      - name: receipt_documents
+        description: >
+          One row per OCR'd receipt document (W62; analytics-pipeline consumes
+          opendesk.ocr.events). PII posture (G1): kyc_* kinds are dropped
+          entirely and only whitelisted scalars from extracted_fields
+          (amount_minor/currency/receipt_date) plus hash-only identifiers
+          (sha256/phash) land — NO free text (vendor/note/items).
+        columns:
+          - name: event_id
+            description: CloudEvents envelope id.
+            tests: [not_null]
+          - name: tenant_id
+            tests: [not_null]
+          - name: document_id
+            tests: [not_null]
+          - name: kind
+            description: OCR document kind; mapper lands kind='receipt' only.
+          - name: status
+          - name: page_count
+          - name: sha256
+            description: Hash-only document identifier.
+          - name: phash
+            description: Hash-only perceptual hash.
+          - name: model_version
+          - name: amount_minor
+            description: Whitelisted scalar from extracted_fields (nullable).
+          - name: currency
+            description: ISO-3 (nullable).
+          - name: receipt_date
+            description: YYYY-MM-DD string (nullable).
+          - name: occurred_at
+            tests: [not_null]
+      - name: receipt_recon_findings
+        description: >
+          One row per ReceiptReconFinding event (W62 G2: routed to this
+          dedicated table instead of bronze.booking_events). Full finding
+          payload — kind, confidence, expected/captured amounts, currency;
+          booking_id is nullable (payment_without_receipt may lack one).
+        columns:
+          - name: event_id
+            description: CloudEvents envelope id.
+            tests: [not_null]
+          - name: tenant_id
+            tests: [not_null]
+          - name: run_id
+            # run_id NULL until booking-service enriches findingEventPayload (follow-up)
+            description: Recon sweep run id (nullable on live payloads).
+          - name: finding_kind
+            description: receipt_without_payment|payment_without_receipt|amount_mismatch|currency_unknown
+          - name: confidence
+            description: exact|heuristic|none
+          - name: capture_client_id
+            description: Field-capture client id (nullable).
+          - name: booking_id
+            description: Nullable uuid string.
+          - name: attempt_tx_ref
+          - name: expected_amount_minor
+          - name: captured_amount_minor
+          - name: receipt_amount_major
+          - name: receipt_currency
+          - name: occurred_at
+            tests: [not_null]
 
 models:
   - name: stg_booking_events
@@ -115,3 +177,58 @@ models:
           - accepted_values:
               arguments:
                 values: ['user', 'agent', 'human_agent', 'system', 'tool']
+
+  - name: stg_receipt_documents
+    description: >
+      Standardized OCR receipt documents (silver view, W62). Only
+      kind='receipt' documents land in bronze (kyc_* dropped, G1); hash-only
+      identifiers + whitelisted scalars, no free text.
+    columns:
+      - name: event_id
+        tests:
+          - not_null
+          - unique
+      - name: tenant_id
+        tests: [not_null]
+      - name: document_id
+        tests: [not_null]
+      - name: kind
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['receipt']
+      - name: event_day
+        tests: [not_null]
+
+  - name: stg_receipt_recon_findings
+    description: >
+      Standardized receipt-reconciliation findings (silver view, W62 G2) —
+      one row per ReceiptReconFinding routed to its own bronze table.
+      finding_kind/confidence are lowercased closed enums; booking_id stays
+      nullable (payment_without_receipt findings may have no booking).
+    columns:
+      - name: event_id
+        tests:
+          - not_null
+          - unique
+      - name: tenant_id
+        tests: [not_null]
+      - name: run_id
+        # run_id NULL until booking-service enriches findingEventPayload (follow-up)
+        description: Recon sweep run id (nullable on live payloads).
+      - name: finding_kind
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['receipt_without_payment', 'payment_without_receipt', 'amount_mismatch', 'currency_unknown']
+      - name: confidence
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['exact', 'heuristic', 'none']
+      - name: booking_id
+        description: Nullable — payment_without_receipt findings may lack one.
+      - name: finding_day
+        tests: [not_null]

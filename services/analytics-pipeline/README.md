@@ -6,24 +6,33 @@ plus a FastAPI sidecar exposing health and Prometheus metrics.
 ```
 Kafka topics (CloudEvents 1.0)                     Iceberg REST catalog :8181
   opendesk.booking.events  ─┐   micro-batch          warehouse s3://lake/warehouse (MinIO)
-  opendesk.payments.events ─┼─ (BATCH_SIZE / ──▶  bronze.booking_events
-  opendesk.conversation.   ─┘   FLUSH_INTERVAL)   bronze.payment_events
-    transcripts                                   bronze.transcripts
+  opendesk.payments.events ─┤   (BATCH_SIZE / ──▶  bronze.booking_events
+  opendesk.conversation.   ─┤   FLUSH_INTERVAL)   bronze.payment_events
+    transcripts             ┤                     bronze.transcripts
+  opendesk.usage.events    ─┤                     bronze.usage_events
+  cac.events               ─┤                     bronze.cac_events
+  opendesk.ocr.events      ─┘                     bronze.receipt_documents
+                                                  bronze.receipt_recon_findings
 ```
+
+`opendesk.booking.events` feeds **two** tables: `ReceiptReconFinding`-typed
+messages are routed to `bronze.receipt_recon_findings` (SPEC-W62 G2);
+everything else lands in `bronze.booking_events`.
 
 ## How it works
 
 1. One `aiokafka` consumer (group `analytics-pipeline`, `enable_auto_commit=False`)
-   subscribes to the four topics and buffers messages **per topic**.
+   subscribes to the six topics and buffers messages **per topic**.
 2. A buffer flushes when it reaches `BATCH_SIZE` messages **or** ages past
    `FLUSH_INTERVAL` seconds (checked every 1 s).
-3. Flush = map payloads to bronze rows → `pyarrow.Table` → `pyiceberg` `table.append()`
-   against the REST catalog. Offsets are committed **only after** a successful append:
-   delivery is **at-least-once**; duplicates are removed downstream by the Spark silver
-   jobs (`infra/lakehouse/spark/jobs`, dedupe on `event_id` / `(conversation_id, ts, role)`).
-4. On startup the service retries until Kafka and the REST catalog are reachable, and
-   auto-creates namespace `bronze` + the four tables with explicit pyiceberg schemas
-   (`AUTO_CREATE_TABLES=true`).
+3. Flush = route/map payloads to bronze rows → `pyarrow.Table` → `pyiceberg`
+   `table.append()` against the REST catalog. Offsets are committed **only
+   after** a successful append: delivery is **at-least-once**; duplicates are
+   deduped per append batch on `event_id` (`IcebergSink`) and removed
+   downstream by the Spark silver jobs (`infra/lakehouse/spark/jobs`).
+4. On startup the service retries until Kafka and the REST catalog are
+   reachable, and auto-creates namespace `bronze` + the tables with explicit
+   pyiceberg schemas (`AUTO_CREATE_TABLES=true`).
 
 ## Bronze schema contract (consumed by dbt — do not drift)
 
@@ -36,6 +45,24 @@ guarded by `tests/test_dbt_conformance.py`:
 | `bronze.payment_events` | `event_id` string, `event_type` string, `tenant_id` string, `booking_id` string, `amount_cents` long, `currency` string, `transfer_code` long, `ledger_ref` string, `occurred_at` timestamp |
 | `bronze.transcripts` | `conversation_id` string, `tenant_id` string, `role` string, `text` string, `ts` timestamp, `audio_url` string |
 | `bronze.usage_events` | `event_id` string, `tenant_id` string, `metric` string, `value` double, `occurred_at` timestamp, `meta` string *(Wave 5 #9; `value` is a double because call-minutes are fractional; `meta` is stringified JSON)* |
+| `bronze.receipt_documents` | `event_id` string, `tenant_id` string, `document_id` string, `kind` string, `status` string, `page_count` int, `sha256` string, `phash` string, `model_version` string, `amount_minor` long (nullable), `currency` string (nullable), `receipt_date` string (nullable), `occurred_at` timestamp *(SPEC-W62; from `com.opendesk.ocr.DocumentExtracted`, kind=`receipt` only)* |
+| `bronze.receipt_recon_findings` | `event_id` string, `tenant_id` string, `run_id` string, `finding_kind` string, `confidence` string, `capture_client_id` string (nullable), `booking_id` string (nullable, uuid), `attempt_tx_ref` string (nullable), `expected_amount_minor` long (nullable), `captured_amount_minor` long (nullable), `receipt_amount_major` double (nullable), `receipt_currency` string (nullable), `occurred_at` timestamp *(SPEC-W62 G2; `com.opendesk.booking.ReceiptReconFinding` routed off `opendesk.booking.events`)* |
+
+## PII posture (SPEC-W62 G1 — hash-only, kyc dropped, whitelist)
+
+- **Receipts**: only `kind='receipt'` OCR documents land. From
+  `extracted_fields` EXACTLY three whitelisted scalars are read —
+  `amount_minor` (int), `currency` (ISO-3), `receipt_date` (YYYY-MM-DD).
+  No vendor, no note, no items, no raw/free text, no storage pointers.
+- **kyc_* kinds are DROPPED ENTIRELY** (zero rows) — belt-and-braces on top of
+  W58 R1 (which already emits `extracted_fields={}` for them); a hash-only kyc
+  row in the TTL-less lake would still be a processing record (NDPA).
+- What the lake may hold for receipts: hash-only identifiers
+  (`sha256`/`phash`), document/booking UUIDs, scalar amounts/currencies/dates,
+  `tenant_id`. Source erasure therefore leaves an already-anonymous stub (W58
+  audit-stub precedent) — no cascade consumer is required.
+- The transcripts precedent is unchanged: bronze holds Fluvio-PII-redacted
+  text only.
 
 Mapping rules (`analytics_pipeline/mapping.py`):
 
@@ -51,6 +78,20 @@ Mapping rules (`analytics_pipeline/mapping.py`):
   `{tenant_id, metric, value, ts, meta}` (CloudEvent envelopes tolerated);
   `occurred_at ← ts` with the envelope `time` as fallback. This service only
   *consumes* usage records — it never emits them itself.
+- **OCR documents** (SPEC-W62): `map_ocr_document` returns a row only for
+  `kind='receipt'`; every other kind (`kyc_*`, `document`, `knowledge_scan`)
+  returns `None` and the consumer drops the message. `document_id` falls back
+  to the CloudEvent `subject` (ocr-service sets subject = document id).
+- **Receipt recon findings** (SPEC-W62 G2): `ReceiptReconFinding`-typed
+  messages on `opendesk.booking.events` are routed to
+  `bronze.receipt_recon_findings` with the full finding payload
+  (`map_receipt_recon_finding`); `map_booking_event` skips them outright, so
+  they can never land in `bronze.booking_events` again — and the finding
+  mapper takes `booking_id` from `data` ONLY (the CloudEvent `subject` on
+  these events is the **tenant slug**, which used to be stuffed into
+  `booking_id`). `receipt_currency` falls back to `data.detail.receipt_currency`
+  (today's payload carries it inside `detail`); `run_id` maps when present
+  (today's payload omits it → NULL).
 - **Timestamps** are naive UTC (Iceberg `timestamp` without timezone), consistent with the
   Spark jobs' `spark.sql.iceberg.handle-timestamp-without-timezone=true`. ISO-8601,
   epoch seconds and epoch millis inputs are accepted.
@@ -65,7 +106,10 @@ contained when it has zero `role = 'human_agent'` turns), and `usage_daily`
 (Wave 5 #9: `{tenant_id, date, metric, total_value}` from `bronze.usage_events`). The Spark silver jobs also read
 bronze directly to produce deduplicated `silver.*` Iceberg tables. Because dbt tests
 assert `accepted_values` on lowercased `event_type`/`source`/`role`, the sink preserves
-raw casing and lets dbt normalize.
+raw casing and lets dbt normalize. SPEC-W62 G2: `ReceiptReconFinding` no longer reaches
+`stg_booking_events` at all (its `event_type` was never in that model's accepted_values —
+the pre-existing latent dbt test break); the two new bronze tables get their own silver
+sources/staging in `infra/lakehouse/dbt` (coder C).
 
 ## Sidecar API (port 7009)
 
@@ -78,7 +122,8 @@ raw casing and lets dbt normalize.
 > `?tenant=` query for the UUID-style endpoints), **ignoring caller-supplied
 > tenant values**. Treat `X-Tenant-Slug` / `?tenant=` as trusted in-network
 > input only — never publish the port, and never rely on these endpoints being
-> safe to expose directly.
+> safe to expose directly. SPEC-W62 (receipt ingest) changes nothing here:
+> same internal-only sidecar, same endpoints, no new surface.
 
 | Endpoint | Description |
 |---|---|
@@ -120,6 +165,7 @@ already in place).
 | `TOPIC_PAYMENT_EVENTS` | `opendesk.payments.events` | Source topic → `bronze.payment_events`. |
 | `TOPIC_TRANSCRIPTS` | `opendesk.conversation.transcripts` | Source topic → `bronze.transcripts`. |
 | `TOPIC_USAGE_EVENTS` | `opendesk.usage.events` | Source topic → `bronze.usage_events` (Wave 5 #9). |
+| `TOPIC_OCR_EVENTS` | `opendesk.ocr.events` | SPEC-W62: source topic → `bronze.receipt_documents` (kind=`receipt` only). |
 | `BATCH_SIZE` | `500` | Flush threshold per topic buffer. |
 | `FLUSH_INTERVAL` | `15` (seconds) | Max buffer age before flush. |
 | `ICEBERG_REST_URI` | `http://iceberg-rest:8181` | Iceberg REST catalog. |

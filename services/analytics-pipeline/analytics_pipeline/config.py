@@ -73,6 +73,12 @@ class Settings:
     topic_usage_events: str = field(
         default_factory=lambda: os.getenv("TOPIC_USAGE_EVENTS", "opendesk.usage.events")
     )
+    # SPEC-W62: OCR DocumentExtracted events -> bronze.receipt_documents
+    # (kind='receipt' only; topic already provisioned in
+    # infra/kafka/create-topics.sh).
+    topic_ocr_events: str = field(
+        default_factory=lambda: os.getenv("TOPIC_OCR_EVENTS", "opendesk.ocr.events")
+    )
 
     # Micro-batching
     batch_size: int = field(default_factory=lambda: _int("BATCH_SIZE", 500))

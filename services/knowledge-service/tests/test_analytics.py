@@ -75,3 +75,17 @@ async def test_success_response_has_no_bound_sql(monkeypatch):
     assert payload["columns"] == ["day"]
     assert payload["rows"] == [["2026-08-01"]]
     assert payload["truncated"] is False
+
+
+async def test_gold_schema_prompt_covers_allowlist():
+    """SPEC-W62: sqlguard.py and analytics.py move together — every allowlisted
+    gold table (including the two new receipt tables) appears in the LLM schema
+    prompt, and the new tables carry the W62 enum hints."""
+    from app import sqlguard
+
+    prompt = analytics.GOLD_SCHEMA_PROMPT
+    assert "gold.receipt_recon_daily" in prompt
+    assert "gold.receipt_ingest_daily" in prompt
+    assert "receipt_without_payment" in prompt
+    for name in sqlguard.ALLOWED_TABLES:
+        assert f"gold.{name}" in prompt

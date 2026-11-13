@@ -58,12 +58,28 @@ gold.agent_containment_rate(
   tenant_id varchar, day date, conversations_total bigint,
   contained_conversations bigint, containment_rate double)
 
+Receipt-recon findings per tenant/day/kind/confidence (SPEC-W62); amount sums
+in integer minor units. finding_kind is one of receipt_without_payment,
+payment_without_receipt, amount_mismatch, currency_unknown; confidence is one
+of exact, heuristic, none:
+gold.receipt_recon_daily(
+  tenant_id varchar, day date, finding_kind varchar, confidence varchar,
+  findings_count bigint, resolved_count bigint,
+  expected_sum_minor bigint, captured_sum_minor bigint, mismatch_abs_sum_minor bigint)
+
+OCR receipt ingest volume per tenant/day (SPEC-W62); receipts counts rows with
+kind='receipt', receipts_with_amount those with a parsed amount:
+gold.receipt_ingest_daily(
+  tenant_id varchar, day date,
+  documents bigint, pages bigint, receipts bigint, receipts_with_amount bigint)
+
 Rules:
 - Output ONLY the SQL, no markdown fences, no explanation, no semicolon.
 - Exactly ONE SELECT statement; never INSERT/UPDATE/DELETE/DDL, never WITH.
-- Only the four tables above; joins between them on (tenant_id, day) are fine.
+- Only the six tables above; joins between them on (tenant_id, day) are fine.
 - Do NOT filter on tenant_id yourself; the platform injects the tenant predicate.
-- Monetary amounts are integer cents; day is a DATE (use date_trunc, current_date, interval).
+- Monetary amounts are integer minor units (cents); day is a DATE (use
+  date_trunc, current_date, interval).
 """
 
 

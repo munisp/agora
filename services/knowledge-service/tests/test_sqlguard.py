@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.sqlguard import SqlGuardError, validate_and_bind
+from app.sqlguard import ALLOWED_TABLES, SqlGuardError, validate_and_bind
 
 TENANT = "11111111-2222-3333-4444-555555555555"
 
@@ -86,6 +86,40 @@ def test_table_allowlist_enforced():
     # catalog-qualified allowlisted table is fine
     out = validate_and_bind("SELECT day FROM iceberg.gold.agent_containment_rate", TENANT)
     assert "iceberg.gold.agent_containment_rate" in out
+
+
+def test_w62_receipt_gold_tables_allowed():
+    """SPEC-W62: the two new receipt gold tables are allowlisted (bare and
+    catalog-qualified) and still get the tenant predicate + LIMIT."""
+    assert {"receipt_recon_daily", "receipt_ingest_daily"} <= ALLOWED_TABLES
+    assert len(ALLOWED_TABLES) == 6
+
+    out = validate_and_bind(
+        "SELECT day, finding_kind, findings_count FROM gold.receipt_recon_daily",
+        TENANT,
+    )
+    assert f"WHERE tenant_id = '{TENANT}'" in out
+    assert out.endswith("LIMIT 500")
+
+    out = validate_and_bind(
+        "SELECT day, receipts, receipts_with_amount FROM iceberg.gold.receipt_ingest_daily",
+        TENANT,
+    )
+    assert "iceberg.gold.receipt_ingest_daily" in out
+    assert f"WHERE tenant_id = '{TENANT}'" in out
+
+
+def test_w62_non_allowlisted_receipt_tables_rejected():
+    """Only the gold aggregates are exposed — bronze/silver receipt tables and
+    any non-allowlisted lookalike stay rejected."""
+    for bad in (
+        "SELECT * FROM bronze.receipt_documents",
+        "SELECT * FROM silver.stg_receipt_recon_findings",
+        "SELECT * FROM gold.receipt_recon_findings",
+        "SELECT * FROM gold.receipt_ingest_daily JOIN bronze.receipt_documents ON true",
+    ):
+        with pytest.raises(SqlGuardError, match="allowlist"):
+            validate_and_bind(bad, TENANT)
 
 
 def test_keywords_inside_strings_are_allowed():

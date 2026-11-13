@@ -32,7 +32,9 @@ JOBS_DIR="${SPARK_JOBS_DIR:-/opt/spark-jobs}"
 INTERVAL="${BATCH_INTERVAL_SECONDS:-3600}"
 SPARK_PACKAGES="${SPARK_PACKAGES:-org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1}"
 # Order matters: silver first, then the gold/CAC/Sedona consumers of silver.
-BATCH_JOBS="${BATCH_JOBS:-silver_clean_bookings.py silver_clean_transcripts.py cac_analytics.py revenue_intelligence.py geo_analytics.py}"
+# receipt_recon_gold.py (SPEC-W62) reads bronze directly; it degrades
+# gracefully (log + skip, exit 0) until the receipt bronze producers land.
+BATCH_JOBS="${BATCH_JOBS:-silver_clean_bookings.py silver_clean_transcripts.py cac_analytics.py revenue_intelligence.py geo_analytics.py receipt_recon_gold.py}"
 
 log() { echo "[spark-scheduler $(date -u +%FT%TZ)] $*"; }
 

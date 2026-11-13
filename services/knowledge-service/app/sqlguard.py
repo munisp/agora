@@ -12,8 +12,8 @@ AST-lite SQL hardening without a parser dependency:
 * rejects subselects that lack their own ``tenant_id =`` predicate — the
   platform predicate is injected at the TOP level only, so every
   parenthesized SELECT must filter the tenant itself (SPEC-W43 Y-02);
-* table allowlist — only the four gold analytics tables may be referenced
-  (bare, ``gold.``- or ``iceberg.gold.``-qualified);
+* table allowlist — only the allowlisted gold analytics tables may be
+  referenced (bare, ``gold.``- or ``iceberg.gold.``-qualified);
 * injects the tenant predicate ``tenant_id = '<tenant>'`` (WHERE ... or AND)
   at the top level so cross-tenant reads are impossible;
 * enforces ``LIMIT 500`` (appends when missing, clamps when larger).
@@ -35,6 +35,10 @@ ALLOWED_TABLES = frozenset(
         "revenue_daily",
         "no_show_rate",
         "agent_containment_rate",
+        # SPEC-W62: receipt ingest + reconciliation gold tables (Spark
+        # receipt_recon_gold job writes them; dbt exposes passthrough views).
+        "receipt_recon_daily",
+        "receipt_ingest_daily",
     }
 )
 
