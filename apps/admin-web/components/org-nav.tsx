@@ -28,6 +28,7 @@ import {
   Settings,
   Filter,
   Shield,
+  ShieldCheck,
   FileWarning,
   Bell,
   Hourglass,
@@ -41,6 +42,7 @@ import {
   canViewAnalytics,
   canViewBilling,
   canViewGeoCampaigns,
+  canViewKycReview,
   canViewLocations,
   canViewVoices,
 } from "@/lib/roles";
@@ -82,6 +84,9 @@ const items: NavItem[] = [
   { segment: "segments", label: "Segments", icon: Filter },
   // SPEC-W30: fraud & trust alert queue — same gate as segments.
   { segment: "alerts", label: "Alerts", icon: Shield },
+  // SPEC-W58: KYC document review queue — owner/admin only (extracted KYC
+  // PII; RECON §5 R4); the page enforces the same rule server-side.
+  { segment: "kyc", label: "KYC review", icon: ShieldCheck },
   // SPEC-W47 UIWEB-13: IoT/civic incident ops surface.
   { segment: "incidents", label: "Incidents", icon: Siren },
   // SPEC-W45 ORPH O15: platform ops alerts read-back — admin/platform-admin.
@@ -151,6 +156,10 @@ export function OrgNav({
     // owner/admin gate as segments; the page enforces it server-side too.
     if ("segment" in item && item.segment === "alerts")
       return canViewGeoCampaigns(roles);
+    // SPEC-W58: KYC document review serves extracted KYC PII — owner/admin
+    // only (RECON §5 R4); the page redirects everyone else server-side.
+    if ("segment" in item && item.segment === "kyc")
+      return canViewKycReview(roles);
     // SPEC-W32: civic cases are operational — owner/admin/staff, same gate
     // as locations; the page enforces it server-side too.
     if ("segment" in item && item.segment === "cases")

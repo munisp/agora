@@ -30,6 +30,7 @@ import (
 	"github.com/opendesk/booking-service/internal/helpdesk" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/httpapi"
 	"github.com/opendesk/booking-service/internal/incidents"
+	"github.com/opendesk/booking-service/internal/kycclient" // SPEC-W58 Scope C (additive import)
 	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/lending" // SPEC-W20 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/loyalty" // SPEC-W19 integrator (additive import)
@@ -895,6 +896,21 @@ func run() error {
 		// PUBLIC_PAY_REDIRECT_ALLOW_HOSTS is unset/empty.
 		PayRedirectAllowHosts: cfg.PayRedirectAllowHosts,
 		Recon:                 reconHandlers, // SPEC-W56 Scope A (additive): /v1/recon/receipts + /v1/internal/recon/receipts
+		// SPEC-W58 Scope C (additive): KYC document surface (owner/admin
+		// only, P5) -> kyc-service passthrough. BOOKING_KYC_SERVICE_URL +
+		// the shared KYC_INTERNAL_TOKEN (the same env the lending
+		// integration reads above — SPEC-W45 K22 precedent). Fail-CLOSED:
+		// either unset -> the /v1/kyc/documents routes answer 503; never a
+		// startup error, never an unauthenticated call.
+		KYC: kycclient.New(os.Getenv("BOOKING_KYC_SERVICE_URL"), os.Getenv("KYC_INTERNAL_TOKEN"), logger),
+	}
+	// SPEC-W58 Scope C (additive): KYC surface posture WARN at boot (the
+	// endpoints own the 503; the upload route's 150s+30s timeout carve-out
+	// lives in httpapi/server.go).
+	if os.Getenv("BOOKING_KYC_SERVICE_URL") == "" || os.Getenv("KYC_INTERNAL_TOKEN") == "" {
+		logger.Warn("BOOKING_KYC_SERVICE_URL/KYC_INTERNAL_TOKEN unset — /v1/kyc/documents* fails closed (503)",
+			zap.Bool("booking_kyc_service_url_set", os.Getenv("BOOKING_KYC_SERVICE_URL") != ""),
+			zap.Bool("kyc_internal_token_set", os.Getenv("KYC_INTERNAL_TOKEN") != ""))
 	}
 	if len(cfg.PayRedirectAllowHosts) == 0 {
 		logger.Warn("PUBLIC_PAY_REDIRECT_ALLOW_HOSTS unset — every custom pay-leg redirect_url is rejected (fail closed); empty redirect_url still uses the provider default")

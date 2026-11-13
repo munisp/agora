@@ -68,6 +68,54 @@ MOCK_RECEIPT_FIELDS: dict[str, Any] = {
     ],
 }
 
+# SPEC-W58 A3: per-kind KYC mock fixtures (synthetic values only — the
+# passport MRZ is a fabricated specimen whose check digits VALIDATE, so the
+# mock pipeline exercises the code-side ICAO 9303 path end to end).
+MOCK_KYC_TEXT = (
+    "# KYC Document\n\n"
+    "FEDERAL REPUBLIC OF NIGERIA\n\n"
+    "Synthetic OCR_MOCK fixture transcription (dev/e2e only).\n"
+)
+MOCK_KYC_PASSPORT_MRZ = (
+    "P<NGADOE<<JANE<CHIDINMA<<<<<<<<<<<<<<<<<<<<<\n"
+    "A012345690NGA9004126F3012316<<<<<<<<<<<<<<00"
+)
+MOCK_KYC_FIELDS: dict[str, dict[str, Any]] = {
+    "kyc_nin_slip": {
+        "full_name": "ADAEZE CHINWE OKAFOR",
+        "dob": "1990-04-12",
+        "nin": "12345678901",
+        "address": "12 Marina Road, Lagos",
+    },
+    "kyc_drivers_license": {
+        "full_name": "ADAEZE CHINWE OKAFOR",
+        "dob": "1990-04-12",
+        "license_no": "FKJ12345AB",
+        "expiry": "2027-06-30",
+    },
+    "kyc_passport": {
+        "full_name": "JANE CHIDINMA DOE",
+        "dob": "1990-04-12",
+        "passport_no": "A01234569",
+        "nationality": "NGA",
+        "expiry": "2030-12-31",
+        "mrz": MOCK_KYC_PASSPORT_MRZ,
+    },
+    "kyc_voters_card": {
+        "full_name": "ADAEZE CHINWE OKAFOR",
+        "vin": "90F5B12345678901234",
+        "dob": "1990-04-12",
+    },
+    "kyc_cac_document": {
+        "company_name": "ACME STORES LTD",
+        "rc_number": "RC1234567",
+        "registration_date": "2015-03-20",
+        "address": "12 Marina Road, Lagos",
+    },
+}
+
+# Receipt prompt BYTE-PRESERVED from SPEC-W53 (P14: receipt/knowledge_scan
+# behaviour is unchanged — all three legacy kinds use this exact prompt).
 _EXTRACTION_PROMPT = (
     "You are an OCR engine. Transcribe the document page image(s) into "
     "markdown. Then, on the LAST line, emit ONLY a JSON object with the "
@@ -79,13 +127,71 @@ _EXTRACTION_PROMPT = (
     "Use null for any field you cannot read. Never invent values."
 )
 
+_KYC_PROMPT_HEADER = (
+    "You are an OCR engine. Transcribe the Nigerian identity document page "
+    "image(s) into markdown. Then, on the LAST line, emit ONLY a JSON object "
+    "with the structured fields "
+)
+
+# SPEC-W58 A3/P9: kind -> prompt. The extraction model only transcribes; MRZ
+# check-digit VALIDATION is deterministic code (parse layer, P7), never the
+# model — the passport prompt asks for the raw MRZ lines, not a verdict.
+EXTRACTION_PROMPTS: dict[str, str] = {
+    "receipt": _EXTRACTION_PROMPT,
+    "document": _EXTRACTION_PROMPT,
+    "knowledge_scan": _EXTRACTION_PROMPT,
+    "kyc_nin_slip": (
+        _KYC_PROMPT_HEADER
+        + '{"full_name": str|null, "dob": "YYYY-MM-DD"|null, "nin": str|null, '
+        + '"address": str|null}. Use null for any field you cannot read. '
+        + "Never invent values."
+    ),
+    "kyc_drivers_license": (
+        _KYC_PROMPT_HEADER
+        + '{"full_name": str|null, "dob": "YYYY-MM-DD"|null, '
+        + '"license_no": str|null, "expiry": "YYYY-MM-DD"|null}. '
+        + "Use null for any field you cannot read. Never invent values."
+    ),
+    "kyc_passport": (
+        _KYC_PROMPT_HEADER
+        + '{"full_name": str|null, "dob": "YYYY-MM-DD"|null, '
+        + '"passport_no": str|null, "nationality": str|null, '
+        + '"expiry": "YYYY-MM-DD"|null, "mrz": str|null}. For "mrz" '
+        + "transcribe the two 44-character machine-readable zone lines "
+        + "verbatim, joined by a newline. Use null for any field you cannot "
+        + "read. Never invent values."
+    ),
+    "kyc_voters_card": (
+        _KYC_PROMPT_HEADER
+        + '{"full_name": str|null, "vin": str|null, "dob": "YYYY-MM-DD"|null}. '
+        + "Use null for any field you cannot read. Never invent values."
+    ),
+    "kyc_cac_document": (
+        _KYC_PROMPT_HEADER
+        + '{"company_name": str|null, "rc_number": str|null, '
+        + '"registration_date": "YYYY-MM-DD"|null, "address": str|null}. '
+        + "Use null for any field you cannot read. Never invent values."
+    ),
+}
+
+
+def prompt_for_kind(kind: str) -> str:
+    return EXTRACTION_PROMPTS.get(kind, _EXTRACTION_PROMPT)
+
 
 def mock_extraction(kind: str, data: bytes, mime: str, model: str) -> Extraction:
     """Deterministic fixture (fixed vendor/amount/date) — e2e/dev only."""
     page_count = pdf_page_count(data) if mime == "application/pdf" else 1
     fields: dict[str, Any]
+    text = MOCK_TEXT
     if kind == "receipt":
         fields = dict(MOCK_RECEIPT_FIELDS)
+    elif kind in MOCK_KYC_FIELDS:
+        text = MOCK_KYC_TEXT
+        fields = dict(MOCK_KYC_FIELDS[kind])
+        if kind == "kyc_passport":
+            # MRZ validity is CODE, never claimed from the fixture (P7).
+            fields["mrz_valid"] = validate_mrz(fields.pop("mrz", None))
     else:
         fields = {
             "title": "Mock Document",
@@ -93,7 +199,7 @@ def mock_extraction(kind: str, data: bytes, mime: str, model: str) -> Extraction
             "summary": "Deterministic OCR_MOCK fixture extraction.",
         }
     return Extraction(
-        text=MOCK_TEXT,
+        text=text,
         fields=fields,
         page_count=page_count,
         model_version=f"{model}+mock",
@@ -149,9 +255,11 @@ def _image_part(data: bytes, mime: str) -> dict[str, Any]:
     }
 
 
-def build_chat_request(model: str, pages: list[tuple[bytes, str]]) -> dict[str, Any]:
+def build_chat_request(
+    model: str, pages: list[tuple[bytes, str]], kind: str = "receipt"
+) -> dict[str, Any]:
     """Request body for POST {base}/chat/completions (vision parts)."""
-    content: list[dict[str, Any]] = [{"type": "text", "text": _EXTRACTION_PROMPT}]
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt_for_kind(kind)}]
     content.extend(_image_part(data, mime) for data, mime in pages)
     return {
         "model": model,
@@ -162,6 +270,102 @@ def build_chat_request(model: str, pages: list[tuple[bytes, str]]) -> dict[str, 
 
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+# SPEC-W58 P9: per-kind KYC field whitelists. Tolerant parse, null-fallback;
+# the whitelist DROPS everything else the model emits. `mrz_valid` for
+# kyc_passport is code-computed (never taken from the model), so it is not
+# listed here — it is attached after validation.
+KYC_FIELD_WHITELISTS: dict[str, tuple[str, ...]] = {
+    "kyc_nin_slip": ("full_name", "dob", "nin", "address"),
+    "kyc_drivers_license": ("full_name", "dob", "license_no", "expiry"),
+    "kyc_passport": ("full_name", "dob", "passport_no", "nationality", "expiry"),
+    "kyc_voters_card": ("full_name", "vin", "dob"),
+    "kyc_cac_document": ("company_name", "rc_number", "registration_date", "address"),
+}
+
+
+# --- ICAO 9303 MRZ check-digit validation (deterministic code, P7) ----------
+_MRZ_WEIGHTS = (7, 3, 1)
+
+
+def _mrz_char_value(ch: str) -> int:
+    if "0" <= ch <= "9":
+        return ord(ch) - ord("0")
+    if "A" <= ch <= "Z":
+        return ord(ch) - ord("A") + 10
+    if ch == "<":
+        return 0
+    return -1
+
+
+def _mrz_check_digits_ok(field: str, digit: str) -> bool:
+    """One ICAO 9303 check digit: sum(char_value * 7/3/1 cycling) mod 10."""
+    if len(digit) != 1 or not digit.isdigit():
+        return False
+    total = 0
+    for i, ch in enumerate(field):
+        value = _mrz_char_value(ch)
+        if value < 0:
+            return False
+        total += value * _MRZ_WEIGHTS[i % 3]
+    return total % 10 == int(digit)
+
+
+def _mrz_check(field: str, digit: str) -> bool:
+    if not field.strip("<"):
+        # Optional field left entirely as filler: ICAO permits the check
+        # position to be filler OR the computed digit — accept either.
+        return digit == "<" or digit.isdigit()
+    return _mrz_check_digits_ok(field, digit)
+
+
+def validate_mrz(mrz: Any) -> bool | None:
+    """ICAO 9303 TD3 (passport) check-digit validation, in CODE (P7).
+
+    Returns None when no MRZ was transcribed (no claim either way), False
+    when a supplied MRZ is malformed or any check digit fails, True only
+    when every applicable check digit validates. Never raises.
+    """
+    if not isinstance(mrz, str) or not mrz.strip():
+        return None
+    try:
+        lines = [
+            "".join(ch for ch in ln.strip().upper() if ch != " ")
+            for ln in mrz.strip().splitlines()
+            if ln.strip()
+        ]
+        if len(lines) != 2 or any(len(ln) != 44 for ln in lines):
+            return False
+        line1, line2 = lines
+        if not line1.startswith("P"):
+            return False
+        # passport number + check digit (chars 1-9 / 10)
+        if not _mrz_check(line2[0:9], line2[9]):
+            return False
+        # date of birth + check digit (chars 14-19 / 20)
+        if not _mrz_check(line2[13:19], line2[19]):
+            return False
+        # expiry + check digit (chars 22-27 / 28)
+        if not _mrz_check(line2[21:27], line2[27]):
+            return False
+        # personal number + check digit (chars 29-42 / 43) when present
+        if not _mrz_check(line2[28:42], line2[42]):
+            return False
+        # composite check digit (char 44) over 1-10, 14-20, 22-43
+        composite = line2[0:10] + line2[13:20] + line2[21:43]
+        if not _mrz_check_digits_ok(composite, line2[43]):
+            return False
+        return True
+    except Exception:  # tolerant: a malformed MRZ is invalid, never a crash
+        return False
+
+
+def _as_str_field(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return None
 
 
 def parse_model_answer(answer: str, kind: str) -> tuple[str, dict[str, Any]]:
@@ -193,7 +397,17 @@ def parse_model_answer(answer: str, kind: str) -> tuple[str, dict[str, Any]]:
             fields = None
     if fields is None:
         fields = {}
-    if kind == "receipt":
+    if kind in KYC_FIELD_WHITELISTS:
+        # SPEC-W58 P9: tolerant whitelist parse — whitelisted string fields
+        # with null fallback; EVERYTHING else the model emitted is dropped.
+        whitelist = KYC_FIELD_WHITELISTS[kind]
+        parsed_kyc = {name: _as_str_field(fields.get(name)) for name in whitelist}
+        if kind == "kyc_passport":
+            # MRZ check digits validated in CODE (ICAO 9303, P7); the raw
+            # MRZ itself is NOT retained in the fields payload.
+            parsed_kyc["mrz_valid"] = validate_mrz(fields.get("mrz"))
+        fields = parsed_kyc
+    elif kind == "receipt":
         items = fields.get("items")
         fields = {
             "vendor": fields.get("vendor") or None,
@@ -247,7 +461,7 @@ class OcrClient:
             pages: list[tuple[bytes, str]] = [(p, "image/png") for p in pngs]
         else:
             pages = [(data, mime)]
-        body = build_chat_request(self._model, pages)
+        body = build_chat_request(self._model, pages, kind)
         try:
             resp = await self._client.post(
                 f"{self._base}/chat/completions", json=body

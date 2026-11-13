@@ -55,15 +55,30 @@ func (f *fakeAuditStore) IDHashOwner(_ context.Context, tenantID uuid.UUID, idTy
 
 func (f *fakeAuditStore) Ping(context.Context) error { return nil }
 
+// SPEC-W58 document methods — the resolve tests never exercise them;
+// documents_test.go uses a full fakeDocStore.
+func (f *fakeAuditStore) InsertDocument(context.Context, *store.Document) error {
+	return errors.New("fakeAuditStore: InsertDocument not supported")
+}
+func (f *fakeAuditStore) DocumentIDHashOwner(context.Context, uuid.UUID, string, string) (string, error) {
+	return "", errors.New("fakeAuditStore: DocumentIDHashOwner not supported")
+}
+func (f *fakeAuditStore) GetDocument(context.Context, uuid.UUID, uuid.UUID) (*store.Document, error) {
+	return nil, errors.New("fakeAuditStore: GetDocument not supported")
+}
+func (f *fakeAuditStore) ReviewDocument(context.Context, uuid.UUID, uuid.UUID, string, string) (*store.Document, error) {
+	return nil, errors.New("fakeAuditStore: ReviewDocument not supported")
+}
+
 type fakeConsent struct {
 	tenantID uuid.UUID
 	err      error
 	// captured last call (K22 binding context forwarded to the gate).
-	gotSubject, gotIDType, gotIDHash string
+	gotSubject, gotPurpose, gotIDType, gotIDHash string
 }
 
 func (f *fakeConsent) CheckConsent(_ context.Context, tenantRef, subject, purpose, idType, idHash string) (uuid.UUID, error) {
-	f.gotSubject, f.gotIDType, f.gotIDHash = subject, idType, idHash
+	f.gotSubject, f.gotPurpose, f.gotIDType, f.gotIDHash = subject, purpose, idType, idHash
 	return f.tenantID, f.err
 }
 

@@ -27,6 +27,7 @@ import (
 	"github.com/opendesk/booking-service/internal/geo"
 	"github.com/opendesk/booking-service/internal/helpdesk"
 	"github.com/opendesk/booking-service/internal/incidents"
+	"github.com/opendesk/booking-service/internal/kycclient" // SPEC-W58 Scope C (additive import)
 	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/lending"
 	"github.com/opendesk/booking-service/internal/loyalty"
@@ -196,6 +197,15 @@ type Deps struct {
 	// service_areas coverage zones (config.Config.BookingGeoEnforce;
 	// bookingops has the full semantics). Injected by cmd/server/main.go.
 	BookingGeoEnforce bool
+
+	// KYC serves the SPEC-W58 Scope C KYC document surface (P1 Option A
+	// staff leg): POST /v1/kyc/documents (multipart upload passthrough to
+	// kyc-service), GET /v1/kyc/documents/{id} (review read — emits the P5
+	// view-audit log line), POST /v1/kyc/documents/{id}/review. ALL three
+	// are owner/admin ONLY (P5: require(manage_bookings) + the
+	// requireOwnerAdmin realm-role gate — members get 403). Nil/unconfigured
+	// -> the routes fail closed with 503.
+	KYC *kycclient.Client
 }
 
 type ctxKey string
@@ -213,8 +223,16 @@ const (
 // multi-second per page) plus headroom for the persist + response write.
 const receiptOCRTimeout = fieldcapture.OCRTimeout + 30*time.Second
 
+// kycUploadTimeout bounds ONLY POST /v1/kyc/documents (SPEC-W58 Scope C):
+// kycclient.Timeout (150s — the kyc-service forwards to ocr-service
+// synchronously, so the upload leg inherits the receipt OCR latency
+// envelope) plus headroom for the response write. The review GET/POST are
+// fast JSON calls and stay on the global 60s bound.
+const kycUploadTimeout = kycclient.Timeout + 30*time.Second
+
 // requestTimeoutMiddleware applies the global 60s request timeout to every
-// route EXCEPT the receipt-OCR upload, which gets receiptOCRTimeout.
+// route EXCEPT the receipt-OCR upload and the KYC document upload, which
+// get receiptOCRTimeout / kycUploadTimeout respectively.
 // chi's middleware.Timeout derives a context deadline, so a longer
 // per-route Timeout INSIDE the group could never extend past an outer 60s
 // one — the exemption must live here, at the outermost layer (smallest
@@ -224,11 +242,18 @@ const receiptOCRTimeout = fieldcapture.OCRTimeout + 30*time.Second
 func requestTimeoutMiddleware(next http.Handler) http.Handler {
 	global := middleware.Timeout(60 * time.Second)(next)
 	receipt := middleware.Timeout(receiptOCRTimeout)(next)
+	kyc := middleware.Timeout(kycUploadTimeout)(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost &&
 			strings.HasPrefix(r.URL.Path, "/v1/field/captures/") &&
 			strings.HasSuffix(r.URL.Path, "/receipt") {
 			receipt.ServeHTTP(w, r)
+			return
+		}
+		// SPEC-W58 Scope C: exact-path match — /v1/kyc/documents/{id}/review
+		// POSTs stay on the global bound.
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/kyc/documents" {
+			kyc.ServeHTTP(w, r)
 			return
 		}
 		global.ServeHTTP(w, r)
@@ -491,6 +516,20 @@ func NewRouter(d Deps) http.Handler {
 		// manage_bookings). Doubles as the FIRST read path serving
 		// receipt_fields for the linked captures (R4).
 		r.With(s.require("manage_bookings")).Get("/recon/receipts", s.reconListHandler)
+		// SPEC-W58 Scope C (additive): KYC document surface — the staff leg
+		// of booking -> kyc-service -> ocr-service (P1 Option A). Owner/admin
+		// ONLY (P5, GATE R4): manage_bookings includes field agents holding
+		// the member role (docs/security/roles.md:62-64), so the Permify
+		// perm is necessary but NOT sufficient — requireOwnerAdmin applies
+		// the existing realm-role gate (referrals admin-only precedent;
+		// civic.CanViewReporterRole). A member gets 403 on all three routes.
+		// The upload POST is exempt from the global 60s timeout (see
+		// requestTimeoutMiddleware).
+		r.Route("/kyc", func(r chi.Router) {
+			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/documents", s.kycUploadDocument)
+			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Get("/documents/{id}", s.kycGetDocument)
+			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/documents/{id}/review", s.kycReviewDocument)
+		})
 		// SPEC-W19 integrator (additive): loyalty self-mounts "/loyalty"
 		// INSIDE this /v1 group (chi panics on a second Mount("/v1"), and
 		// this way the group inherits the tenant middleware for free);

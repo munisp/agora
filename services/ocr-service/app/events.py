@@ -13,10 +13,18 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from .config import is_kyc_kind
+
 SOURCE = "ocr-service"
 
 TYPE_USAGE_RECORD = "com.opendesk.usage.UsageRecord"
 TYPE_DOCUMENT_EXTRACTED = "com.opendesk.ocr.DocumentExtracted"
+
+# SPEC-W58 P3: inbound topics consumed via Dapr programmatic subscriptions.
+TYPE_CONSENT_ERASURE = "com.opendesk.consent.ErasureRequested"
+TOPIC_CONSENT_ERASURE = "opendesk.consent.erasure.v1"
+TYPE_TENANT_DELETED = "com.opendesk.identity.TenantDeleted"
+TOPIC_IDENTITY_EVENTS = "opendesk.identity.events"
 
 
 def cloud_event(
@@ -85,6 +93,11 @@ def document_extracted_event(
 
     Carries hashes + storage pointers (fraud D9 duplicate-detection prep);
     NEVER carries document bytes or full extracted text.
+
+    SPEC-W58 GATE R1 (P2): for any `kyc_*` kind, `extracted_fields` is
+    emitted as {} — KYC PII (names, DOB, ID numbers) NEVER rides the bus;
+    downstream consumers (graph-sync hash-only stub, fraud D9) only need
+    the hashes/pointers, which are retained.
     """
     return cloud_event(
         TYPE_DOCUMENT_EXTRACTED,
@@ -101,6 +114,6 @@ def document_extracted_event(
             "model_version": model_version,
             "storage_bucket": storage_bucket,
             "storage_key": storage_key,
-            "extracted_fields": extracted_fields,
+            "extracted_fields": {} if is_kyc_kind(kind) else extracted_fields,
         },
     )

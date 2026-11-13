@@ -103,6 +103,11 @@ class FakeDB:
     async def tenant_conn(self, tenant_id):
         yield _TenantScope(self, tenant_id)
 
+    @asynccontextmanager
+    async def sweep_conn(self):
+        """SPEC-W58: cross-tenant scope for the retention sweeper."""
+        yield _TenantScope(self, None)
+
     async def ping(self) -> bool:
         return True
 
@@ -116,6 +121,7 @@ class FakeDB:
             "model_version": "",
             "extracted_text": None,
             "extracted_fields": None,
+            "expires_at": doc.get("expires_at"),
             "error": None,
             "created_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
@@ -137,6 +143,84 @@ class FakeDB:
 
     async def get_document(self, scope, document_id):
         return self._owned(scope, document_id, missing_ok=True)
+
+    # SPEC-W58 retention/erasure helper fakes ---------------------------------
+    async def list_expired(self, scope, *, limit: int = 500):
+        """Cross-tenant: scope.tenant_id is None (sweep_conn)."""
+        assert scope.tenant_id is None, "list_expired must use sweep_conn"
+        now = datetime.now(timezone.utc)
+        rows = [
+            r
+            for r in self.rows.values()
+            if r.get("expires_at") is not None
+            and r["expires_at"] <= now
+            and r["status"] != "erased"
+        ]
+        rows.sort(key=lambda r: r["expires_at"])
+        return [
+            {
+                "id": r["id"],
+                "tenant_id": r["tenant_id"],
+                "storage_bucket": r["storage_bucket"],
+                "storage_key": r["storage_key"],
+            }
+            for r in rows[:limit]
+        ]
+
+    async def delete_document(self, scope, document_id) -> None:
+        assert scope.tenant_id is None, "delete_document must use sweep_conn"
+        self.rows.pop(str(document_id), None)
+        self.transitions.append((str(document_id), "deleted"))
+
+    async def list_kyc_rows_matching_subject(self, scope, subject: str):
+        out = []
+        for r in self.rows.values():
+            if r["tenant_id"] != scope.tenant_id:
+                continue
+            if not r["kind"].startswith("kyc_") or r["status"] == "erased":
+                continue
+            fields = r.get("extracted_fields")
+            if isinstance(fields, str):
+                fields = json.loads(fields)
+            if isinstance(fields, dict) and any(
+                isinstance(v, str) and v == subject for v in fields.values()
+            ):
+                out.append(
+                    {
+                        "id": r["id"],
+                        "storage_bucket": r["storage_bucket"],
+                        "storage_key": r["storage_key"],
+                    }
+                )
+        return out
+
+    async def mark_erased(self, scope, document_id) -> None:
+        row = self._owned(scope, document_id)
+        row["extracted_text"] = None
+        row["extracted_fields"] = None
+        row["status"] = "erased"
+        row["error"] = None
+        self.transitions.append((str(document_id), "erased"))
+
+    async def list_tenant_documents(self, scope):
+        return [
+            {
+                "id": r["id"],
+                "storage_bucket": r["storage_bucket"],
+                "storage_key": r["storage_key"],
+            }
+            for r in self.rows.values()
+            if r["tenant_id"] == scope.tenant_id
+        ]
+
+    async def delete_tenant_documents(self, scope) -> int:
+        doomed = [
+            k for k, r in self.rows.items() if r["tenant_id"] == scope.tenant_id
+        ]
+        for k in doomed:
+            self.transitions.append((k, "deleted"))
+            del self.rows[k]
+        return len(doomed)
 
     def _owned(self, scope, document_id, missing_ok=False):
         row = self.rows.get(str(document_id))
@@ -164,6 +248,10 @@ class FakeMinio:
     async def put(self, key: str, data: bytes, mime: str) -> None:
         self.objects[(self.bucket, key)] = data
 
+    async def delete(self, key: str) -> None:
+        # SPEC-W58: S3 DELETE on a missing key is a success (idempotent).
+        self.objects.pop((self.bucket, key), None)
+
 
 class FakeDapr:
     """Captures published messages: [(pubsub, topic, payload)]."""
@@ -182,11 +270,14 @@ class FakeDapr:
 
 
 class FakeDeps:
-    def __init__(self, db=None, documents=None, dapr=None, ocr=None):
+    def __init__(self, db=None, documents=None, dapr=None, ocr=None, objects=None):
         self.db = db or FakeDB()
         self.documents = documents or FakeMinio()
         self.dapr = dapr or FakeDapr()
         self.ocr = ocr  # only used when OCR_MOCK is false
+        # SPEC-W58: object deleter for erasure consumers + the TTL sweeper;
+        # the FakeMinio doubles as the deleter unless one is supplied.
+        self.objects = objects or self.documents
 
 
 @pytest.fixture

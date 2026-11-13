@@ -20,23 +20,31 @@ const EnvDevInsecure = "OPENDESK_DEV_INSECURE"
 
 // Config holds all runtime configuration for kyc-service.
 type Config struct {
-	Port            int           // HTTP listen port (PORT, default 7013, SPEC-W12 §5)
-	DatabaseURL     string        // postgres DSN for the kyc DB (DATABASE_URL)
-	DaprHost        string        // daprd host (default daprd-kyc)
-	DaprHTTPPort    int           // daprd HTTP port (default 3500)
-	PubSubName      string        // Dapr pubsub component (default pubsub-kafka)
-	KYCEventsTopic  string        // Kafka topic for kyc Resolved CloudEvents (SPEC-W12 §5)
-	IdentityAppID   string        // Dapr app-id of identity-service (consent gate)
-	IdentityBaseURL string        // optional direct base URL of identity-service (tests / no-Dapr dev); when set, Dapr invoke is bypassed
-	IdentityInternalToken string  // X-Internal-Token sent on consent-gate calls (SPEC-W44 K2): identity's /internal/* is token-gated (503 fail-closed when unset)
-	InternalToken   string        // KYC_INTERNAL_TOKEN (SPEC-W45 K22): X-Internal-Token gate on /v1/kyc/* — 503 fail-closed when unset, 401 missing/wrong
-	HashSecret      string        // KYC_HASH_SECRET (SPEC-W45 K22): HMAC-SHA256 key for id_value_hash; fail-closed when unset outside an explicit dev opt-in
-	DevInsecure     bool          // OPENDESK_DEV_INSECURE=1 — the only escape that permits DevHashSecretDefault
-	Mock            bool          // KYC_MOCK (default false, SPEC-W34 GF8): deterministic mock resolver — auto-verifies fabricated IDs, dev only
-	ProviderURL     string        // live provider base URL (KYC_PROVIDER_URL, ASSUMPTION — see docs/kyc.md)
-	ProviderAPIKey  string        // live provider API key (KYC_PROVIDER_API_KEY, ASSUMPTION)
-	ResolveTimeout  time.Duration // per-resolution budget (p95 target <= 8s, docs/kyc.md)
-	ShutdownTimeout time.Duration // graceful shutdown budget
+	Port                  int    // HTTP listen port (PORT, default 7013, SPEC-W12 §5)
+	DatabaseURL           string // postgres DSN for the kyc DB (DATABASE_URL)
+	DaprHost              string // daprd host (default daprd-kyc)
+	DaprHTTPPort          int    // daprd HTTP port (default 3500)
+	PubSubName            string // Dapr pubsub component (default pubsub-kafka)
+	KYCEventsTopic        string // Kafka topic for kyc Resolved CloudEvents (SPEC-W12 §5)
+	IdentityAppID         string // Dapr app-id of identity-service (consent gate)
+	IdentityBaseURL       string // optional direct base URL of identity-service (tests / no-Dapr dev); when set, Dapr invoke is bypassed
+	IdentityInternalToken string // X-Internal-Token sent on consent-gate calls (SPEC-W44 K2): identity's /internal/* is token-gated (503 fail-closed when unset)
+	InternalToken         string // KYC_INTERNAL_TOKEN (SPEC-W45 K22): X-Internal-Token gate on /v1/kyc/* — 503 fail-closed when unset, 401 missing/wrong
+	HashSecret            string // KYC_HASH_SECRET (SPEC-W45 K22): HMAC-SHA256 key for id_value_hash; fail-closed when unset outside an explicit dev opt-in
+	DevInsecure           bool   // OPENDESK_DEV_INSECURE=1 — the only escape that permits DevHashSecretDefault
+	Mock                  bool   // KYC_MOCK (default false, SPEC-W34 GF8): deterministic mock resolver — auto-verifies fabricated IDs, dev only
+	ProviderURL           string // live provider base URL (KYC_PROVIDER_URL, ASSUMPTION — see docs/kyc.md)
+	ProviderAPIKey        string // live provider API key (KYC_PROVIDER_API_KEY, ASSUMPTION)
+	// OCRBaseURL (KYC_OCR_BASE_URL, SPEC-W58 P12): ocr-service base URL for
+	// the KYC document pipeline (POST /v1/kyc/documents -> ocr extract).
+	// Empty => document endpoints fail closed 503.
+	OCRBaseURL string
+	// OCRInternalToken (OCR_INTERNAL_TOKEN, SPEC-W58 P12 "reuses existing
+	// internal-token"): the SAME shared secret var the booking block sends
+	// to ocr-service — X-Internal-Token on the kyc -> ocr hop.
+	OCRInternalToken string
+	ResolveTimeout   time.Duration // per-resolution budget (p95 target <= 8s, docs/kyc.md)
+	ShutdownTimeout  time.Duration // graceful shutdown budget
 }
 
 // Load reads configuration from the environment, applying defaults and
@@ -60,11 +68,16 @@ func Load() (Config, error) {
 		// SPEC-W34 GF8: mock defaults OFF. The MockResolver auto-verifies any
 		// all-digits id with length >= 10, so a default deployment must never
 		// silently verify fabricated BVN/NIN — mock is explicit opt-in only.
-		Mock:            envBool("KYC_MOCK", false),
-		ProviderURL:     os.Getenv("KYC_PROVIDER_URL"),
-		ProviderAPIKey:  os.Getenv("KYC_PROVIDER_API_KEY"),
-		ResolveTimeout:  time.Duration(envInt("KYC_RESOLVE_TIMEOUT_SECONDS", 8)) * time.Second,
-		ShutdownTimeout: time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 15)) * time.Second,
+		Mock:           envBool("KYC_MOCK", false),
+		ProviderURL:    os.Getenv("KYC_PROVIDER_URL"),
+		ProviderAPIKey: os.Getenv("KYC_PROVIDER_API_KEY"),
+		// SPEC-W58 P12 (env parity): ocr-service upstream for the KYC
+		// document pipeline. OCR_INTERNAL_TOKEN is the existing shared
+		// secret var (booking block precedent) — no new token env.
+		OCRBaseURL:       os.Getenv("KYC_OCR_BASE_URL"),
+		OCRInternalToken: os.Getenv("OCR_INTERNAL_TOKEN"),
+		ResolveTimeout:   time.Duration(envInt("KYC_RESOLVE_TIMEOUT_SECONDS", 8)) * time.Second,
+		ShutdownTimeout:  time.Duration(envInt("SHUTDOWN_TIMEOUT_SECONDS", 15)) * time.Second,
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")

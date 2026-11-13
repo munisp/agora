@@ -306,6 +306,12 @@ services:
       # carries X-Internal-Token matching the kyc block's KYC_INTERNAL_TOKEN
       # (SAME shared secret var — one .env entry wires both sides).
       KYC_INTERNAL_TOKEN: ${KYC_INTERNAL_TOKEN:-opendesk-dev-kyc-internal-token-change-in-prod}
+      # SPEC-W58: staff-facing KYC document surface (owner/admin) —
+      # booking proxies /v1/kyc/documents* to kyc-service (consent gate +
+      # hash-only record + review). Reuses the SAME KYC_INTERNAL_TOKEN
+      # above for the call. Empty URL disables the KYC document routes
+      # (fail-closed).
+      BOOKING_KYC_SERVICE_URL: ${BOOKING_KYC_SERVICE_URL:-http://kyc:7013}
       # U6/K23 (SPEC-W45): campaignstudio A/B variant selection calls
       # model-registry (:7019 — profile-gated `model-registry`; fail-open to
       # control when unreachable). The call carries X-Internal-Token matching
@@ -1460,6 +1466,14 @@ services:
       # never read (the default below happens to equal the old value, which
       # is why nothing noticed).
       KYC_EVENTS_TOPIC: ${KYC_EVENTS_TOPIC:-opendesk.kyc.resolved.v1}
+      # SPEC-W58: kyc-service document pipeline (POST /v1/kyc/documents)
+      # forwards document bytes to ocr-service for extraction. The call
+      # carries X-Internal-Token matching the ocr block's OCR_INTERNAL_TOKEN
+      # (SAME shared secret var — one .env entry wires both sides; DEV ONLY
+      # default, prod via the secrets store). Empty URL disables the
+      # document endpoint (fail-closed).
+      KYC_OCR_BASE_URL: ${KYC_OCR_BASE_URL:-http://ocr:7020}
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:-opendesk-dev-ocr-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -1532,6 +1546,13 @@ services:
       OCR_MINIO_BUCKET: ${OCR_MINIO_BUCKET:-documents}
       OCR_USAGE_TOPIC: ${OCR_USAGE_TOPIC:-opendesk.usage.events}
       OCR_EVENTS_TOPIC: ${OCR_EVENTS_TOPIC:-opendesk.ocr.events}
+      # SPEC-W58 GATE R3 (KYC retention): kyc_* documents are inserted with
+      # expires_at = now() + OCR_KYC_TTL_HOURS; the periodic sweeper
+      # (interval OCR_KYC_SWEEP_MINUTES) deletes expired rows + MinIO
+      # objects. ENV PARITY: defaults MUST equal the code reads in
+      # services/ocr-service/app/config.py.
+      OCR_KYC_TTL_HOURS: ${OCR_KYC_TTL_HOURS:-72}
+      OCR_KYC_SWEEP_MINUTES: ${OCR_KYC_SWEEP_MINUTES:-15}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     networks:

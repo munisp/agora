@@ -10,6 +10,10 @@ Routes:
   GET  /v1/ocr/documents/{id}    metadata + extracted fields (NO bytes).
   GET  /healthz
   GET  /metrics
+  GET  /dapr/subscribe           Dapr programmatic subscriptions (W58 P3):
+                                 consent erasure + TenantDeleted topics.
+  POST /v1/ocr/events/consent-erasure   GATE R2 erasure consumer (kyc_*).
+  POST /v1/ocr/events/tenant-deleted    GATE R2 tenant cascade (all kinds).
 
 Auth: two caller shapes —
   * service-to-service: X-Internal-Token (constant-time compare, FAIL-CLOSED
@@ -33,9 +37,11 @@ vendor/amount/date), CRITICAL-logged at startup, NEVER the default.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -43,8 +49,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import events
-from .config import ALLOWED_MIMES, DOCUMENT_KINDS, settings
+from . import erasure, events, sweeper
+from .config import ALLOWED_MIMES, DOCUMENT_KINDS, is_kyc_kind, settings
 from .dapr_client import DaprClient
 from .llm import OcrClient, OcrUpstreamError, mock_extraction
 from .logging import configure_logging, get_logger
@@ -72,6 +78,7 @@ log = get_logger("ocr-service")
 class AppState:
     db: Database
     documents: DocumentStore
+    objects: sweeper.MinioObjectDeleter
     ocr: OcrClient
     dapr: DaprClient
 
@@ -104,23 +111,45 @@ async def lifespan(app: FastAPI):
         timeout_s=settings.ocr_timeout_s,
     )
     deps.dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
+    # SPEC-W58 P3/P4: object deletion for the erasure consumers + TTL
+    # sweeper (storage.py is upload-only by design).
+    deps.objects = sweeper.MinioObjectDeleter(
+        endpoint=settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        bucket=settings.minio_bucket,
+        secure=settings.minio_secure,
+    )
     await deps.db.connect()
     try:
         await deps.db.ensure_ocr_documents_table()
     except Exception as exc:
         log.error("ocr_documents.bootstrap_failed", error=str(exc))
     app.state.deps = deps
+    # GATE R3: periodic TTL sweeper (kind-generic; only kyc_* rows carry
+    # expires_at today). Task is cancelled in the lifespan shutdown path.
+    sweep_task: asyncio.Task | None = None
+    if settings.kyc_sweep_minutes > 0:
+        sweep_task = asyncio.create_task(
+            sweeper.sweeper_loop(
+                deps.db, deps.objects, interval_minutes=settings.kyc_sweep_minutes
+            )
+        )
     log.info(
         "service.started",
         port=settings.port,
         mock=settings.ocr_mock,
         llm_base_url=settings.llm_base_url,
         bucket=settings.minio_bucket,
+        kyc_ttl_hours=settings.kyc_ttl_hours,
+        kyc_sweep_minutes=settings.kyc_sweep_minutes,
     )
     try:
         yield
     finally:
         log.info("service.shutting_down")
+        if sweep_task is not None:
+            sweep_task.cancel()
         await deps.dapr.aclose()
         await deps.ocr.aclose()
         await deps.db.aclose()
@@ -327,6 +356,12 @@ async def _run_extraction(
     phash = perceptual_hash(data, mime)
     document_id = uuid.uuid4()
     storage_key = f"{tenant_id}/{document_id}{ext}"
+    kyc = is_kyc_kind(kind)
+    # SPEC-W58 P4 (GATE R3): expires_at set ONLY for kyc_* kinds; the
+    # periodic sweeper deletes the row + MinIO object once reached.
+    expires_at = (
+        datetime.now(UTC) + timedelta(hours=settings.kyc_ttl_hours) if kyc else None
+    )
 
     # 1) PII bytes -> MinIO `documents` (tenant-prefixed key).
     await deps.documents.put(storage_key, data, mime)
@@ -347,6 +382,7 @@ async def _run_extraction(
                 "sha256": digest,
                 "phash": phash,
                 "page_count": page_count_hint,
+                "expires_at": expires_at,
             },
         )
 
@@ -377,13 +413,17 @@ async def _run_extraction(
         )
 
     # 4) persist extraction + 5) meter/emit.
+    # SPEC-W58 A5 (GATES R2/R3 minimization): kyc_* kinds never persist the
+    # full transcript — it is pure PII with no downstream consumer (the
+    # knowledge-scan flow is the only extracted_text consumer). Fields stay
+    # persisted (TTL-bound) so the consent-gated review surface works.
     async with deps.db.tenant_conn(tenant_id) as conn:
         await deps.db.mark_extracted(
             conn,
             document_id,
             page_count=extraction.page_count,
             model_version=extraction.model_version,
-            extracted_text=extraction.text,
+            extracted_text=None if kyc else extraction.text,
             extracted_fields=extraction.fields,
         )
     log.info(
@@ -413,8 +453,10 @@ async def _run_extraction(
         "extracted_fields": extraction.fields,
         "page_count": extraction.page_count,
         # W53-D additive key: the full markdown/text body (C's knowledge
-        # flow POSTs it to knowledge-service /v1/documents).
-        "extracted_text": extraction.text,
+        # flow POSTs it to knowledge-service /v1/documents). SPEC-W58 A5:
+        # suppressed ("") for kyc_* kinds — transcript is never persisted
+        # nor echoed for KYC PII.
+        "extracted_text": "" if kyc else extraction.text,
     }
 
 
@@ -476,6 +518,61 @@ async def get_document(
         "error": row["error"],
         "extracted_text": row["extracted_text"],
         "extracted_fields": row["extracted_fields"],
+        "expires_at": row["expires_at"].isoformat() if row.get("expires_at") else None,
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W58 GATE R2 (P3): Dapr pubsub consumers (consent erasure + tenant
+# delete). Programmatic subscription via /dapr/subscribe; Dapr POSTs the
+# CloudEvent envelope to each route. Handler failure => 500 => Dapr
+# redelivers (handlers are idempotent); malformed/foreign events => DROP.
+# These routes are sidecar-facing only (not in the APISIX api-ocr route).
+# ---------------------------------------------------------------------------
+@app.get("/dapr/subscribe")
+async def dapr_subscriptions():
+    return [
+        {
+            "pubsubname": settings.dapr_pubsub_name,
+            "topic": events.TOPIC_CONSENT_ERASURE,
+            "route": "/v1/ocr/events/consent-erasure",
+        },
+        {
+            "pubsubname": settings.dapr_pubsub_name,
+            "topic": events.TOPIC_IDENTITY_EVENTS,
+            "route": "/v1/ocr/events/tenant-deleted",
+        },
+    ]
+
+
+@app.post("/v1/ocr/events/consent-erasure")
+async def consent_erasure_event(request: Request, deps: AppState = Depends(get_state)):
+    event = await request.json()
+    if isinstance(event, dict) and event.get("type") != events.TYPE_CONSENT_ERASURE:
+        # Another event type on the topic is not ours to process.
+        return {"status": "DROP"}
+    try:
+        result = await erasure.handle_erasure_event(deps.db, deps.objects, event)
+    except Exception as exc:
+        log.error("consent_erasure.handler_failed", error=str(exc))
+        raise HTTPException(status_code=500, detail="erasure handler failed") from exc
+    return {"status": "SUCCESS", **result}
+
+
+@app.post("/v1/ocr/events/tenant-deleted")
+async def tenant_deleted_event(request: Request, deps: AppState = Depends(get_state)):
+    event = await request.json()
+    if isinstance(event, dict) and event.get("type") not in (
+        None,
+        events.TYPE_TENANT_DELETED,
+    ):
+        # opendesk.identity.events carries other identity lifecycle events.
+        return {"status": "DROP"}
+    try:
+        result = await erasure.handle_tenant_deleted(deps.db, deps.objects, event)
+    except Exception as exc:
+        log.error("tenant_deleted.handler_failed", error=str(exc))
+        raise HTTPException(status_code=500, detail="tenant-delete handler failed") from exc
+    return {"status": "SUCCESS", **result}

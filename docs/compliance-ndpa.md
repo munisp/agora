@@ -93,7 +93,31 @@ consent erasure topic is the NDPA-scoped companion.
 
 kyc-service refuses resolution without an active consent (`purpose=kyc`) —
 see `docs/kyc.md`. Notification DND/quiet-hours guards (Agent B) and channel
-captures (Agent A) record/honor the same registry.
+captures (Agent A) record/honor the same registry. KYC **document** uploads
+use the distinct purpose `kyc_document` (see below).
+
+## KYC document lifecycle (SPEC-W58)
+
+KYC document OCR (NIN slip, driver's license, international passport,
+voter's card, CAC document) is an assistive pre-fill for human review —
+extraction never auto-verifies. NDPA 2023 principle mapping:
+
+| NDPA principle | Gate | Mechanism |
+|---|---|---|
+| **Purpose limitation** | R5 | Upload requires active consent under the distinct free-form purpose **`kyc_document`** via the existing identity consent gate: denied → `403`, gate down → `502`. Onboarding consent (`kyc`) never silently authorizes document retention. `consent_id`/subject are recorded in `kyc_audit`. |
+| **Data minimization** | P8 / R7 | The durable kyc-service record (`kyc_documents`) is **hash-only**: HMAC-SHA256 (`KYC_HASH_SECRET`) per-field hashes + `id_value_hash`; raw values are never stored in kyc-service and never emitted. The full OCR transcript (`extracted_text`) is suppressed for kyc_* kinds. Cleartext fields exist only in the ocr DB, TTL-bound. |
+| **Storage limitation / retention** | R3 | kyc_* ocr rows carry `expires_at = now() + OCR_KYC_TTL_HOURS` (default **72h**); a sweeper (`OCR_KYC_SWEEP_MINUTES`, default 15) deletes expired rows **and** MinIO objects. A MinIO bucket lifecycle rule on `documents` is the documented belt-and-braces layer (operator-set; cannot be provisioned from this repo). |
+| **Erasure** | R2 | ocr-service consumes `ErasureRequested` (`opendesk.consent.erasure.v1`) and `TenantDeleted`: kyc_* rows are blanked (`extracted_fields`/`extracted_text`), set `status='erased'`, and the MinIO object is deleted; `sha256`/`phash` are retained for audit. TenantDeleted hard-deletes ALL of the tenant's ocr rows + objects (all kinds). The kyc-side audit trail survives as hashes — tombstone idiom, accountability preserved. |
+| **Access scoping** | R4 | All KYC document routes are gated **owner/admin** (NOT `manage_bookings` — field agents hold member); the review GET serves fields only through that gate; the admin-web KYC review tab is role-hidden for everyone else (`canViewKycReview`). |
+| **Auditability / accountability** | R8 | Every upload and every review decision writes an append-only `kyc_audit` row (REVOKE UPDATE/DELETE + BEFORE trigger); every review-field VIEW emits a structlog view-audit line (actor, document_id, tenant). |
+| **Bus redaction** | R1 | `com.opendesk.ocr.DocumentExtracted` emits `extracted_fields: {}` for kyc_* kinds — KYC PII never rides Kafka. |
+| **Human oversight** | P7 | `review_state` defaults to `pending_review`; only an owner/admin approve/reject (with reason, audited) is terminal. MRZ check digits for passports are validated by deterministic ICAO 9303 code — never claimed from the model. |
+
+**Backup-window note (R12):** backups may retain erased/expired document
+PII until rotation — `BACKUP_KEEP` must be sized to the NDPA erasure window
+and erased subjects must never be restored without re-applying tombstones
+(docs/data-residency.md). The 72h KYC TTL shrinks live exposure regardless
+of the backup window.
 
 ## Data minimization notes
 

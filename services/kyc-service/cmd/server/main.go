@@ -75,6 +75,16 @@ func run() error {
 		logger.Error("KYC_INTERNAL_TOKEN unset — /v1/kyc/* will refuse all requests (503 fail-closed, SPEC-W45 K22)")
 	}
 
+	// SPEC-W58 (P12): ocr-service upstream for the KYC document pipeline.
+	// Fail-closed posture: with the URL or shared internal token unset the
+	// /v1/kyc/documents* endpoints refuse with 503 — logged loudly at boot.
+	ocrClient := httpapi.NewOCRClient(cfg.OCRBaseURL, cfg.OCRInternalToken, logger)
+	if !ocrClient.Configured() {
+		logger.Error("KYC document pipeline fail-closed: " + ocrClient.String() + " — /v1/kyc/documents* will refuse all requests (503)")
+	} else {
+		logger.Info("kyc document pipeline configured", zap.String("ocr", ocrClient.String()))
+	}
+
 	deps := httpapi.Deps{
 		Store:         st,
 		Consent:       httpapi.NewConsentClient(daprClient, cfg.IdentityAppID, cfg.IdentityBaseURL, cfg.IdentityInternalToken),
@@ -84,6 +94,7 @@ func run() error {
 		EventsTopic:   cfg.KYCEventsTopic,
 		InternalToken: cfg.InternalToken,
 		HashSecret:    cfg.HashSecret,
+		OCR:           ocrClient,
 		Logger:        logger,
 	}
 

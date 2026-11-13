@@ -100,3 +100,17 @@ export function canViewAgents(
 ): boolean {
   return hasAnyRole(roles, AGENTS_ROLES);
 }
+
+/**
+ * KYC document review (SPEC-W58) — extracted KYC PII (names, ID numbers)
+ * is served ONLY through the owner/admin gate (RECON §5 R4); member-level
+ * field agents must never see the review queue.
+ */
+export const KYC_REVIEW_ROLES: readonly RealmRole[] = ["owner", "admin"];
+
+/** owner/admin — members, staff, viewers, analysts and billing never see KYC review. */
+export function canViewKycReview(
+  roles: readonly string[] | undefined | null,
+): boolean {
+  return hasAnyRole(roles, KYC_REVIEW_ROLES);
+}

@@ -108,3 +108,36 @@ func TestLoadReadsInternalTokenAndEventsTopic(t *testing.T) {
 		t.Errorf("KYCEventsTopic = %q (KYC_EVENTS_TOPIC, ORPH O12)", cfg.KYCEventsTopic)
 	}
 }
+
+// SPEC-W58 P12 (env parity): the document pipeline reads KYC_OCR_BASE_URL
+// and reuses the existing shared OCR_INTERNAL_TOKEN — no new token env.
+func TestLoadReadsOCRUpstream(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("KYC_OCR_BASE_URL", "http://ocr:7020")
+	t.Setenv("OCR_INTERNAL_TOKEN", "tok-ocr")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OCRBaseURL != "http://ocr:7020" {
+		t.Errorf("OCRBaseURL = %q (KYC_OCR_BASE_URL)", cfg.OCRBaseURL)
+	}
+	if cfg.OCRInternalToken != "tok-ocr" {
+		t.Errorf("OCRInternalToken = %q (OCR_INTERNAL_TOKEN)", cfg.OCRInternalToken)
+	}
+}
+
+// Unset document-pipeline envs are legal (resolve keeps working); the
+// /v1/kyc/documents* endpoints then fail closed 503 at request time.
+func TestLoadOCRUpstreamDefaultsEmpty(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("KYC_OCR_BASE_URL", "")
+	t.Setenv("OCR_INTERNAL_TOKEN", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OCRBaseURL != "" || cfg.OCRInternalToken != "" {
+		t.Errorf("OCR upstream must default empty: %q / %q", cfg.OCRBaseURL, cfg.OCRInternalToken)
+	}
+}

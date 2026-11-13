@@ -184,7 +184,17 @@ components:
   schemas:
     DocumentKind:
       type: string
-      enum: [receipt, document, knowledge_scan]
+      enum:
+        - receipt
+        - document
+        - knowledge_scan
+        # SPEC-W58: KYC kinds — reached via kyc-service (consent-gated),
+        # fields TTL-bound (72h), redacted from events, human-review only.
+        - kyc_nin_slip
+        - kyc_drivers_license
+        - kyc_passport
+        - kyc_voters_card
+        - kyc_cac_document
     ExtractResponse:
       type: object
       required: [document_id, status, extracted_fields, page_count, extracted_text]
@@ -203,8 +213,14 @@ components:
       type: object
       description: |
         Tolerant parse — every field may be null. Receipts:
-        {vendor, amount, currency, date, items[]}; other kinds:
-        {title, date, summary}.
+        {vendor, amount, currency, date, items[]}; other generic kinds:
+        {title, date, summary}. KYC kinds (SPEC-W58) use per-kind
+        whitelists: kyc_nin_slip {full_name, dob, nin, address?};
+        kyc_drivers_license {full_name, dob, license_no, expiry};
+        kyc_passport {full_name, dob, passport_no, nationality, expiry,
+        mrz_valid — ICAO 9303 check digits validated in CODE, not by the
+        model}; kyc_voters_card {full_name, vin, dob?}; kyc_cac_document
+        {company_name, rc_number, registration_date, address?}.
       properties:
         vendor: {type: [string, "null"]}
         amount: {type: [number, "null"]}
@@ -220,6 +236,21 @@ components:
               price: {type: [number, "null"]}
         title: {type: [string, "null"]}
         summary: {type: [string, "null"]}
+        full_name: {type: [string, "null"]}
+        dob: {type: [string, "null"]}
+        nin: {type: [string, "null"]}
+        address: {type: [string, "null"]}
+        license_no: {type: [string, "null"]}
+        expiry: {type: [string, "null"]}
+        passport_no: {type: [string, "null"]}
+        nationality: {type: [string, "null"]}
+        mrz_valid:
+          type: [boolean, "null"]
+          description: ICAO 9303 check-digit result, computed in code.
+        vin: {type: [string, "null"]}
+        company_name: {type: [string, "null"]}
+        rc_number: {type: [string, "null"]}
+        registration_date: {type: [string, "null"]}
     DocumentMetadata:
       type: object
       properties:
@@ -240,11 +271,19 @@ components:
           description: Tenant-prefixed MinIO key {tenant_id}/{uuid}.<ext>
         status:
           type: string
-          enum: [uploaded, extracted, failed]
+          # erased: SPEC-W58 erasure consumer terminal state (fields blanked,
+          # MinIO object deleted, hashes retained for audit).
+          enum: [uploaded, extracted, failed, erased]
         error: {type: [string, "null"]}
         extracted_text: {type: [string, "null"]}
         extracted_fields:
           $ref: "#/components/schemas/ExtractedFields"
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          description: Set ONLY for kyc_* kinds (SPEC-W58 R3 retention,
+            OCR_KYC_TTL_HOURS default 72h); the sweeper deletes the row and
+            the MinIO object after this time. Null for other kinds.
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
     Health:

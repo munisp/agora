@@ -44,7 +44,11 @@ type Deps struct {
 	// id_value_hash. Config fails closed when unset outside dev, so this
 	// is never empty in a wired deployment.
 	HashSecret string
-	Logger     *zap.Logger
+	// OCR (SPEC-W58 B2/B3): ocr-service backend for the KYC document
+	// pipeline (KYC_OCR_BASE_URL + OCR_INTERNAL_TOKEN). nil or
+	// !Configured() => the /v1/kyc/documents* endpoints fail closed 503.
+	OCR    OCRBackend
+	Logger *zap.Logger
 }
 
 // NewRouter builds the chi router with all routes (booking-service shape).
@@ -53,14 +57,21 @@ func NewRouter(d Deps) http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(30 * time.Second))
 
 	s := &server{d: d}
 
-	r.Get("/healthz", s.healthz)
+	r.With(middleware.Timeout(30*time.Second)).Get("/healthz", s.healthz)
 	r.Route("/v1/kyc", func(r chi.Router) {
 		r.Use(s.internauth)
-		r.Post("/resolve", s.resolve)
+		// SPEC-W58 B3: the document upload forwards to ocr-service with a
+		// 150s extraction budget (OCR model is multi-second per page on
+		// CPU), so it needs a wider timeout than the 30s default — the
+		// booking-service receipt 150s+30s carve-out precedent
+		// (booking httpapi/server.go). GET/review are cheap and keep 30s.
+		r.With(middleware.Timeout(OCRTimeout+30*time.Second)).Post("/documents", s.createDocument)
+		r.With(middleware.Timeout(30*time.Second)).Get("/documents/{id}", s.getDocument)
+		r.With(middleware.Timeout(30*time.Second)).Post("/documents/{id}/review", s.reviewDocument)
+		r.With(middleware.Timeout(30*time.Second)).Post("/resolve", s.resolve)
 	})
 	return r
 }

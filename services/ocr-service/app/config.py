@@ -10,11 +10,40 @@ from __future__ import annotations
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .logging import get_logger
+
+log = get_logger(__name__)
+
 #: MIME allow-list (magic-byte validated, RECON §4): images + PDF only.
 ALLOWED_MIMES = ("image/jpeg", "image/png", "image/webp", "application/pdf")
 
+#: KYC document kinds (SPEC-W58 P9). The single `kyc_` prefix keeps the
+#: NDPA redaction/retention branching a one-`startswith` check (RECON §3).
+KYC_DOCUMENT_KINDS = (
+    "kyc_nin_slip",
+    "kyc_drivers_license",
+    "kyc_passport",
+    "kyc_voters_card",
+    "kyc_cac_document",
+)
+
 #: Document kinds accepted by POST /v1/ocr/extract (CHECK constraint mirrors).
-DOCUMENT_KINDS = ("receipt", "document", "knowledge_scan")
+DOCUMENT_KINDS = ("receipt", "document", "knowledge_scan") + KYC_DOCUMENT_KINDS
+
+
+def is_kyc_kind(kind: str) -> bool:
+    """True for the KYC document kinds (NDPA gates R1-R3 key off this)."""
+    return kind.startswith("kyc_")
+
+
+def _int_or_default(key: str, raw: str, default: int) -> int:
+    """voice-agent _env_int idiom: invalid value warns + falls back to the
+    default instead of hard-failing boot (SPEC-W58 A1)."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("config.invalid_int_env", key=key, value=raw, default=default)
+        return default
 
 
 class Settings(BaseSettings):
@@ -55,6 +84,20 @@ class Settings(BaseSettings):
     ocr_max_bytes: int = Field(
         default=25 * 1024 * 1024, validation_alias=AliasChoices("OCR_MAX_BYTES")
     )
+
+    # SPEC-W58 P4/P12: kyc_* retention. Read as RAW STRINGS so an invalid
+    # value warns + falls back to the default (voice-agent _env_int idiom)
+    # instead of hard-failing boot; the derived int fields below are what
+    # the code reads. (The int fields are named so their auto-derived env
+    # names do NOT collide with the pinned OCR_* envs.)
+    ocr_kyc_ttl_hours_raw: str = Field(
+        default="72", validation_alias=AliasChoices("OCR_KYC_TTL_HOURS")
+    )
+    ocr_kyc_sweep_minutes_raw: str = Field(
+        default="15", validation_alias=AliasChoices("OCR_KYC_SWEEP_MINUTES")
+    )
+    kyc_ttl_hours: int = 72
+    kyc_sweep_minutes: int = 15
 
     # Service-to-service auth (SPEC-W44 K2): X-Internal-Token, constant-time
     # compare, FAIL-CLOSED (503) when unset. Callers (booking-service
@@ -103,6 +146,16 @@ class Settings(BaseSettings):
     identity_internal_token: str = Field(
         default="", validation_alias=AliasChoices("IDENTITY_INTERNAL_TOKEN")
     )
+
+    @model_validator(mode="after")
+    def _derive_kyc_settings(self) -> "Settings":
+        self.kyc_ttl_hours = _int_or_default(
+            "OCR_KYC_TTL_HOURS", self.ocr_kyc_ttl_hours_raw, 72
+        )
+        self.kyc_sweep_minutes = _int_or_default(
+            "OCR_KYC_SWEEP_MINUTES", self.ocr_kyc_sweep_minutes_raw, 15
+        )
+        return self
 
     @model_validator(mode="after")
     def _compose_database_url(self) -> "Settings":
