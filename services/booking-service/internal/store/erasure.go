@@ -58,6 +58,19 @@ var subjectPiiSteps = []subjectPiiStep{
 	{"civic_cases",
 		`UPDATE civic_cases SET reporter_phone_e164=$3, reporter_name=NULL, updated_at=now()
 		 WHERE tenant_id=$1 AND reporter_phone_e164=$2`},
+	// SPEC-W61 (G1): media_inbox binds document_id ↔ sender phone, so the
+	// subject tombstone must reach it. Keyed on the subject's phone DIGITS
+	// (the pinned G3 normalization applied to $2 SQL-side, identical to the
+	// ingest match): sender_phone gets the same salted 'sha256:' tombstone
+	// as the sibling steps, sender_phone_digits is blanked, and the anchor
+	// columns (document_id, booking_id, contact_id, linked_by, state) are
+	// preserved for audit. The sender_phone_digits <> '' guard keeps the
+	// step idempotent and prevents an all-non-digit needle from matching
+	// already-tombstoned rows.
+	{"media_inbox",
+		`UPDATE media_inbox SET sender_phone=$3, sender_phone_digits=''
+		 WHERE tenant_id=$1 AND sender_phone_digits <> ''
+		   AND sender_phone_digits = regexp_replace(regexp_replace($2,'\D','','g'),'^00','')`},
 }
 
 // AnonymizeSubject applies the GDPR right-to-erasure tombstone for ONE data

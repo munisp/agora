@@ -530,6 +530,15 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Get("/documents/{id}", s.kycGetDocument)
 			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/documents/{id}/review", s.kycReviewDocument)
 		})
+		// SPEC-W61 Scope C (additive): media inbox staff review surface —
+		// the human half of the WhatsApp media booking anchor. Owner/admin
+		// ONLY, EXACTLY the KYC P5 posture above (require(manage_bookings)
+		// + requireOwnerAdmin): members get 403 on all three routes. The
+		// machine ingest route is NOT here — it is internauth-gated and
+		// registered below next to the civic sla-breach callback.
+		r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Get("/media/inbox", s.mediaInboxList)
+		r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/media/inbox/{id}/link", s.mediaInboxLink)
+		r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/media/inbox/{id}/discard", s.mediaInboxDiscard)
 		// SPEC-W19 integrator (additive): loyalty self-mounts "/loyalty"
 		// INSIDE this /v1 group (chi panics on a second Mount("/v1"), and
 		// this way the group inherits the tenant middleware for free);
@@ -803,6 +812,18 @@ func NewRouter(d Deps) http.Handler {
 	// 401 on missing/wrong) but WITHOUT the tenant middleware: the sweep
 	// enumerates the receipt-bearing tenants itself (pinned decision 4).
 	r.With(s.internAuth).Post("/v1/internal/recon/receipts", s.reconTriggerHandler)
+
+	// SPEC-W61 Scope C (additive): WhatsApp media booking-anchor ingest
+	// (messaging-gateway → booking, after OCR success). internauth-guarded
+	// EXACTLY like the civic sla-breach callback (X-Internal-Token vs
+	// BOOKING_INTERNAL_TOKEN, constant-time, 503 fail-closed when unset,
+	// 401 on missing/wrong) and edge-denied in APISIX (D's
+	// block-bookings-media-inbox-ingest rule). WITHOUT the tenant
+	// middleware: the tenant is resolved in-handler from the body
+	// tenant_id/tenant_slug or the X-Tenant-Slug header (incidents ingest
+	// precedent) because the gateway addresses the tenant it resolved from
+	// the channel site map.
+	r.With(s.internAuth).Post("/v1/media/inbox/ingest", s.mediaInboxIngest)
 
 	return r
 }

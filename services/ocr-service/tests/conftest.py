@@ -174,6 +174,19 @@ class FakeDB:
         self.rows.pop(str(document_id), None)
         self.transitions.append((str(document_id), "deleted"))
 
+    # SPEC-W61 G2: per-document internauth erase fakes (sweep-scope only).
+    async def get_document_for_erase(self, scope, document_id):
+        assert scope.tenant_id is None, "get_document_for_erase must use sweep_conn"
+        return self.rows.get(str(document_id))
+
+    async def erase_document(self, scope, document_id) -> bool:
+        assert scope.tenant_id is None, "erase_document must use sweep_conn"
+        existed = str(document_id) in self.rows
+        self.rows.pop(str(document_id), None)
+        if existed:
+            self.transitions.append((str(document_id), "erased-row-deleted"))
+        return existed
+
     async def list_kyc_rows_matching_subject(self, scope, subject: str):
         out = []
         for r in self.rows.values():

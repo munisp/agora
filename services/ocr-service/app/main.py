@@ -8,6 +8,8 @@ Routes:
                                  row (uploaded->extracted|failed), ocr_page
                                  UsageRecord + DocumentExtracted CloudEvent.
   GET  /v1/ocr/documents/{id}    metadata + extracted fields (NO bytes).
+  POST /v1/ocr/documents/{id}/erase  internauth per-document hard erase
+                                 (SPEC-W61 G2; booking PrivacyConsumer).
   GET  /healthz
   GET  /metrics
   GET  /dapr/subscribe           Dapr programmatic subscriptions (W58 P3):
@@ -45,7 +47,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
@@ -259,13 +261,15 @@ async def _authenticate(request: Request, explicit_tenant: str | None, deps: App
 # ---------------------------------------------------------------------------
 # upload acquisition
 # ---------------------------------------------------------------------------
-async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | None]:
-    """Extract (filename, data, kind, tenant) from multipart OR JSON body.
+async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | None, Any]:
+    """Extract (filename, data, kind, tenant, expires_in_hours raw) from
+    multipart OR JSON body.
 
     The tenant selector is `tenant_id` (A<->B contract; the booking-service
     fieldcapture client sends it as a form field alongside X-Tenant-Slug);
     the legacy `tenant` key stays accepted. Enforces the 25 MB hard cap
-    while reading.
+    while reading. `expires_in_hours` (SPEC-W61 G2) is returned RAW and
+    validated by the caller (_parse_expires_in_hours).
     """
     ctype = request.headers.get("content-type", "")
     if ctype.startswith("multipart/form-data"):
@@ -273,10 +277,11 @@ async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | 
         upload = form.get("file")
         kind = form.get("kind")
         tenant = _as_str(form.get("tenant_id")) or _as_str(form.get("tenant"))
+        expires_raw = form.get("expires_in_hours")
         if upload is None or not getattr(upload, "filename", None):
             raise HTTPException(status_code=400, detail="multipart field 'file' required")
         data = await upload.read()
-        return upload.filename, data, _as_str(kind), tenant
+        return upload.filename, data, _as_str(kind), tenant, expires_raw
     try:
         body = await request.json()
     except Exception:
@@ -289,10 +294,36 @@ async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | 
     url = body.get("document_url")
     kind = body.get("kind")
     tenant = _as_str(body.get("tenant_id")) or _as_str(body.get("tenant"))
+    expires_raw = body.get("expires_in_hours")
     if not url or not isinstance(url, str):
         raise HTTPException(status_code=400, detail="document_url required")
     filename, data = await _fetch_document_url(url)
-    return filename, data, _as_str(kind), tenant
+    return filename, data, _as_str(kind), tenant, expires_raw
+
+
+def _parse_expires_in_hours(raw: Any) -> int | None:
+    """SPEC-W61 G2: optional `expires_in_hours` (int 1..8760) on
+    POST /v1/ocr/extract. Absent => None (byte-identical legacy behavior —
+    the kyc TTL path is untouched). Present but invalid => 400."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or isinstance(raw, float):
+        # JSON true/false must never coerce to 1/0; fractional floats are
+        # not integer hours (a form field always arrives as str).
+        raise HTTPException(
+            status_code=400, detail="expires_in_hours must be an integer in 1..8760"
+        )
+    try:
+        hours = int(raw.strip()) if isinstance(raw, str) else int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail="expires_in_hours must be an integer in 1..8760"
+        ) from None
+    if not 1 <= hours <= 8760:
+        raise HTTPException(
+            status_code=400, detail="expires_in_hours must be an integer in 1..8760"
+        )
+    return hours
 
 
 def _as_str(value: Any) -> str | None:
@@ -455,6 +486,7 @@ async def _run_extraction(
     kind: str,
     filename: str,
     data: bytes,
+    expires_in_hours: int | None = None,
 ) -> dict[str, Any]:
     ext, mime = validate_upload(filename, data, max_bytes=settings.ocr_max_bytes)
     digest = sha256_hex(data)
@@ -462,11 +494,17 @@ async def _run_extraction(
     document_id = uuid.uuid4()
     storage_key = f"{tenant_id}/{document_id}{ext}"
     kyc = is_kyc_kind(kind)
-    # SPEC-W58 P4 (GATE R3): expires_at set ONLY for kyc_* kinds; the
-    # periodic sweeper deletes the row + MinIO object once reached.
-    expires_at = (
-        datetime.now(UTC) + timedelta(hours=settings.kyc_ttl_hours) if kyc else None
-    )
+    # SPEC-W61 G2: a caller-pinned expires_in_hours sets expires_at for ANY
+    # kind (whatsapp media anchor flow) and overrides the kyc default.
+    # SPEC-W58 P4 (GATE R3), UNCHANGED when the field is absent: expires_at
+    # is set ONLY for kyc_* kinds; the periodic sweeper deletes the row +
+    # MinIO object once reached.
+    if expires_in_hours is not None:
+        expires_at = datetime.now(UTC) + timedelta(hours=expires_in_hours)
+    else:
+        expires_at = (
+            datetime.now(UTC) + timedelta(hours=settings.kyc_ttl_hours) if kyc else None
+        )
 
     # SPEC-W59: AV scan AFTER validation+hashing (never spend a scan on a
     # 415; sha256 feeds the ops alert) and strictly BEFORE any bytes touch
@@ -574,15 +612,18 @@ async def _run_extraction(
 @app.post("/v1/ocr/extract", status_code=200)
 async def extract_document(request: Request, deps: AppState = Depends(get_state)):
     try:
-        filename, data, kind, tenant = await _read_upload(request)
+        filename, data, kind, tenant, expires_raw = await _read_upload(request)
         if kind not in DOCUMENT_KINDS:
             raise HTTPException(
                 status_code=400,
                 detail=f"kind must be one of {list(DOCUMENT_KINDS)}",
             )
+        # SPEC-W61 G2: optional TTL field, validated BEFORE any side effect.
+        expires_in_hours = _parse_expires_in_hours(expires_raw)
         tenant_id = await _authenticate(request, tenant, deps)
         return await _run_extraction(
-            deps, tenant_id=tenant_id, kind=kind, filename=filename, data=data
+            deps, tenant_id=tenant_id, kind=kind, filename=filename, data=data,
+            expires_in_hours=expires_in_hours,
         )
     except ValidationError as exc:
         msg = str(exc)
@@ -649,6 +690,58 @@ async def get_document(
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W61 G2: internauth per-document hard erase. Invoked from booking's
+# PrivacyConsumer for media_inbox-linked documents after a subject anonymize
+# (the row tombstone is authoritative; this deletes the BYTES + row here).
+# Internauth ONLY (K2 fail-closed, W58 ruling): X-Internal-Token vs
+# OCR_INTERNAL_TOKEN, constant-time; unset => 503, missing/wrong => 401.
+# Never takes the gateway tenant-binding path. Idempotent: a missing or
+# already-erased document answers 204. Byte delete precedes row delete
+# (sweeper idiom); an object-store failure keeps the row for retry (502).
+# ---------------------------------------------------------------------------
+@app.post("/v1/ocr/documents/{document_id}/erase")
+async def erase_document_endpoint(
+    document_id: str,
+    request: Request,
+    deps: AppState = Depends(get_state),
+):
+    if not settings.internal_token:
+        log.error("document_erase.unconfigured", msg="OCR_INTERNAL_TOKEN unset (fail closed)")
+        raise HTTPException(
+            status_code=503,
+            detail="internal auth not configured (OCR_INTERNAL_TOKEN unset)",
+        )
+    token = request.headers.get("x-internal-token")
+    if token is None or not hmac.compare_digest(token, settings.internal_token):
+        raise HTTPException(status_code=401, detail="invalid internal token")
+    try:
+        doc_uuid = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid document id")
+    # Cross-tenant sweep scope (app.ocr_internal_sweep escape): the caller
+    # is a token-authenticated machine addressing the document by uuid only
+    # — the booking consumer does not hold the ocr tenant id.
+    async with deps.db.sweep_conn() as conn:
+        row = await deps.db.get_document_for_erase(conn, doc_uuid)
+    if row is None:
+        # Idempotent (SPEC-W61): already-erased / never-existed => 204.
+        return Response(status_code=204)
+    try:
+        await deps.objects.delete(row["storage_key"])
+    except Exception as exc:
+        log.error("document_erase.object_delete_failed", document_id=document_id, error=str(exc))
+        raise HTTPException(status_code=502, detail="object storage delete failed") from exc
+    async with deps.db.sweep_conn() as conn:
+        await deps.db.erase_document(conn, doc_uuid)
+    log.info(
+        "document_erase.erased",
+        document_id=document_id,
+        tenant_id=str(row["tenant_id"]),
+    )
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

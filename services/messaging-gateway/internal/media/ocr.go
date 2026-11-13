@@ -11,7 +11,10 @@
 //	                                constant-time-compares it and fails
 //	                                closed when unset)
 //	X-Tenant-Slug: <tenant uuid>             (also the tenant_id form field)
-//	multipart form: kind=receipt|document, tenant_id=<uuid>, file=<bytes>
+//	multipart form: kind=receipt|document, tenant_id=<uuid>, file=<bytes>,
+//	expires_in_hours=<n>                     (OPTIONAL, SPEC-W61 — see
+//	                                SetExpiresInHours; absent = byte-identical
+//	                                pre-W61 behavior)
 //
 //	200 {"document_id": uuid, "status": ..., "extracted_fields": ..., "page_count": int}
 //
@@ -43,6 +46,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,6 +113,13 @@ type OCRClient struct {
 	token   string
 	client  *http.Client
 	log     *zap.Logger
+	// expiresInHours (MEDIA_INBOX_TTL_HOURS, SPEC-W61 G2): when >0 the
+	// extract call carries the OPTIONAL expires_in_hours form field so the
+	// ocr row gets expires_at = now()+hours and the kind-generic sweeper
+	// reaps bytes+row — TTL bounds parked media PII retention. Zero (the
+	// default) omits the field: byte-identical pre-W61 behavior, and the
+	// kyc path (its own TTL is ocr-side) is untouched.
+	expiresInHours int
 }
 
 // NewOCRClient builds the client for an ocr-service base URL
@@ -136,6 +147,18 @@ func (c *OCRClient) Enabled() bool { return c != nil && c.baseURL != "" }
 // Configured reports whether the client may place calls: URL AND internal
 // token both set (fail-closed mirror of the kyc-service internauth posture).
 func (c *OCRClient) Configured() bool { return c.Enabled() && c.token != "" }
+
+// SetExpiresInHours sets the optional expires_in_hours form field sent on
+// extract calls (MEDIA_INBOX_TTL_HOURS; SPEC-W61: wired only when the
+// media anchor flag is on). Values outside 1..8760 are ignored (config
+// already clamps to the default; this is the belt to its braces). 0 resets
+// to the byte-identical field-less form.
+func (c *OCRClient) SetExpiresInHours(hours int) {
+	if hours < 1 || hours > 8760 {
+		hours = 0
+	}
+	c.expiresInHours = hours
+}
 
 // ValidateMime enforces the allow-list client-side: the declared mime must
 // be one of image/jpeg|png|webp / application/pdf AND the payload's magic
@@ -203,6 +226,15 @@ func (c *OCRClient) Extract(ctx context.Context, tenantID uuid.UUID, declaredMim
 	// (geo-enrich precedent: the uuid form, never the slug).
 	if err := mw.WriteField("tenant_id", tenantID.String()); err != nil {
 		return "", fmt.Errorf("build ocr request: %w", err)
+	}
+	// SPEC-W61 G2: optional TTL for the ingested row. Sent only when the
+	// media anchor rollout wired it (SetExpiresInHours > 0); absent =
+	// byte-identical pre-W61 request (kyc/fieldcapture callers unaffected —
+	// they use their own clients).
+	if c.expiresInHours > 0 {
+		if err := mw.WriteField("expires_in_hours", strconv.Itoa(c.expiresInHours)); err != nil {
+			return "", fmt.Errorf("build ocr request: %w", err)
+		}
 	}
 	fh := textproto.MIMEHeader{}
 	fh.Set("Content-Disposition", `form-data; name="file"; filename="`+safeFilename(filename, declared)+`"`)

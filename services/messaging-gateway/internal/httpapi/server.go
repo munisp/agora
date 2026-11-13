@@ -64,6 +64,17 @@ type Server struct {
 	MediaRate            *PhoneRateLimiter
 	MediaDedupe          *MediaDeduper // nil: Router() initializes one
 
+	// WhatsApp media -> booking anchor (SPEC-W61, Option B).
+	// WhatsAppMediaAnchorEnabled (WHATSAPP_MEDIA_ANCHOR_ENABLED, default
+	// false) gates the post-OCR anchor step: false => the W60 path is
+	// byte-identical (no ledger-anchor step, 200 after mark as today).
+	// MediaAnchor is the booking-service /v1/media/inbox/ingest internauth
+	// client — nil or unconfigured (MESSAGING_BOOKING_INTERNAL_TOKEN
+	// unset) => fail-closed per-message drop + error log (the media was
+	// already OCR'd; a deterministic misconfig must not redelivery-storm).
+	WhatsAppMediaAnchorEnabled bool
+	MediaAnchor                *AnchorClient
+
 	// Upstreams are the resolved internal bases (conversation / voice /
 	// booking / ocr) probed by /healthz (SPEC-W45 ORPH O2): reachability is
 	// REPORTED (warn-level) but never changes the 200 — the gateway itself

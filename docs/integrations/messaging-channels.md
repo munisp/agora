@@ -181,6 +181,24 @@ wave together with outbound media.
   compose default `WHATSAPP_MOCK=1` (DEV ONLY) is the only bypass;
   production overlays must leave the mock unset/0.
 
+### Booking anchor + media inbox (SPEC-W61)
+
+With `WHATSAPP_MEDIA_ANCHOR_ENABLED` on, the gateway POSTs a metadata row
+to booking-service `POST /v1/media/inbox/ingest` (internauth, edge-DENIED
+in APISIX) after OCR success. Booking resolves the sender phone
+(digits-only, both-sides normalized) against tenant contacts: a unique
+recent candidate booking anchors the media; anything else is **parked** for
+staff review in `/app/[orgSlug]/media-inbox` — the ingest path NEVER
+creates contacts or leads. Parked rows are capped at 500 per tenant
+(oldest excess auto-discarded) and bounded in time by the media TTL below.
+Full doc: [docs/media-inbox.md](../media-inbox.md).
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `WHATSAPP_MEDIA_ANCHOR_ENABLED` | `false` | Anchor rollout flag — off = the W60 path is byte-identical |
+| `MEDIA_INBOX_TTL_HOURS` | `168` | Sent as `expires_in_hours` on the OCR extract call (1..8760); bounds parked PII retention |
+| `MESSAGING_BOOKING_INTERNAL_TOKEN` | mapped from `BOOKING_INTERNAL_TOKEN` | Ingest internauth token (X-Internal-Token); compose wires the mapping |
+
 ### Multi-tenancy model
 
 **One Meta app, one WABA phone number per tenant.** Inbound routing keys on
@@ -199,8 +217,12 @@ review the map on every change.
   `receipt`/`document` rows are not subject-bound (no subject column by
   design), so a consent `ErasureRequested` does **not** reach them — only
   `kyc_*` rows are erased that way. Tenant deletion still hard-deletes all
-  rows + MinIO objects. The fix belongs to a retention wave (a future
-  subject anchor would make WhatsApp-ingested receipts erasable).
+  rows + MinIO objects. **SPEC-W61 closes this for WhatsApp-ingested
+  media** when the anchor flag is on: the `media_inbox` row binds
+  `document_id ↔ sender phone`, so subject erasure tombstones the inbox row
+  AND hard-erases the OCR bytes (per-document erase + TTL backstop) — see
+  [docs/media-inbox.md](../media-inbox.md). Receipts uploaded through other
+  paths remain subject to the original gap.
 - **Kind misclassification:** a KYC slip photographed and sent as an image
   lands as `kind=receipt`, bypassing the kyc TTL/consent machinery. The
   bytes are still AV-scanned and tenant-bucketed; **escalation is a tenant

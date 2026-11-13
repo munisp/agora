@@ -169,6 +169,12 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W61 (Scope 2): media_inbox — WhatsApp media booking anchor +
+	// staff review queue (idempotent bootstrap, RLS-enabled).
+	if err := s.ensureMediaInboxDDL(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// SPEC-W45 CODER-A item 7: referral_agents registry (STK O10).
 	if err := s.ensureReferralAgentTables(ctx); err != nil {
 		pool.Close()

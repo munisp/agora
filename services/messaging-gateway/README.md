@@ -63,6 +63,9 @@ callbacks per minute (default 30, in-memory sliding window — per-replica).
 | `OCR_SERVICE_URL` | — | ocr-service base URL for the media funnel (SAME shared var as booking/kyc — one `.env` entry wires all callers; empty with the flag on = boot CRITICAL + per-message drop, fail-visible) |
 | `OCR_INTERNAL_TOKEN` | — | `X-Internal-Token` for ocr-service calls (SAME shared secret var; constant-time compared server-side) |
 | `WHATSAPP_MEDIA_RATE_PER_MINUTE` | `10` | Per-sender inbound-media cap (sliding window, in-memory per replica — USSD precedent); tripped sender gets `200` + drop-log |
+| `WHATSAPP_MEDIA_ANCHOR_ENABLED` | `false` | SPEC-W61: after OCR success, idempotent internauth anchor `POST {booking}/v1/media/inbox/ingest` (resolve-or-park booking-side; anchor failure ⇒ `500` and the N-05 redelivery retries ONLY the anchor via the ingest ledger — no re-OCR); off = byte-identical W60 path |
+| `MEDIA_INBOX_TTL_HOURS` | `168` | SPEC-W61: optional `expires_in_hours` form field on the OCR extract call, sent only when the anchor flag is on (range `1..8760`, invalid ⇒ default) — TTL bounds parked media PII retention |
+| `MESSAGING_BOOKING_INTERNAL_TOKEN` | — | K2 machine token (`X-Internal-Token`) for booking-service internauth: USSD menu-action dispatch (W47) + the W61 media anchor; unset with the anchor flag on = boot CRITICAL + per-message fail-closed drop |
 | `AT_CALLBACK_SECRET` | — | USSD callback path secret (K14); unset = every callback `503` (fail-closed) |
 | `USSD_RATE_LIMIT_PER_MINUTE` | `30` | Per-phone USSD callback cap (sliding window, in-memory) |
 | `CONVERSATION_URL` / `VOICE_RUNTIME_URL` / `BOOKING_URL` / `IDENTITY_URL` | — | Direct-base overrides for the internal upstreams |

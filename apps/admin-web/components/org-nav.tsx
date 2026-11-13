@@ -35,6 +35,7 @@ import {
   Magnet,
   ContactRound,
   Siren,
+  Inbox,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -44,6 +45,7 @@ import {
   canViewGeoCampaigns,
   canViewKycReview,
   canViewLocations,
+  canViewMediaInbox,
   canViewVoices,
 } from "@/lib/roles";
 
@@ -87,6 +89,10 @@ const items: NavItem[] = [
   // SPEC-W58: KYC document review queue — owner/admin only (extracted KYC
   // PII; RECON §5 R4); the page enforces the same rule server-side.
   { segment: "kyc", label: "KYC review", icon: ShieldCheck },
+  // SPEC-W61: media inbox review queue — owner/admin only (sender phone PII
+  // + OCR document link; KYC review precedent); the page enforces the same
+  // rule server-side.
+  { segment: "media-inbox", label: "Media inbox", icon: Inbox },
   // SPEC-W47 UIWEB-13: IoT/civic incident ops surface.
   { segment: "incidents", label: "Incidents", icon: Siren },
   // SPEC-W45 ORPH O15: platform ops alerts read-back — admin/platform-admin.
@@ -160,6 +166,11 @@ export function OrgNav({
     // only (RECON §5 R4); the page redirects everyone else server-side.
     if ("segment" in item && item.segment === "kyc")
       return canViewKycReview(roles);
+    // SPEC-W61: media inbox rows carry sender phone PII and an OCR document
+    // link — owner/admin only (KYC precedent); the page redirects everyone
+    // else server-side.
+    if ("segment" in item && item.segment === "media-inbox")
+      return canViewMediaInbox(roles);
     // SPEC-W32: civic cases are operational — owner/admin/staff, same gate
     // as locations; the page enforces it server-side too.
     if ("segment" in item && item.segment === "cases")

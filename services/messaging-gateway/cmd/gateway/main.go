@@ -143,6 +143,31 @@ func run() error {
 			zap.Int("media_rate_per_minute", cfg.WhatsAppMediaRatePerMinute))
 		srv.Upstreams = append(srv.Upstreams, httpapi.UpstreamCheck{Name: "ocr", Base: cfg.OCRServiceURL})
 	}
+
+	// SPEC-W61: WhatsApp media -> booking anchor. The client reuses the
+	// already-resolved booking base (ResolveIncidentBase idiom) and the K2
+	// machine token (MESSAGING_BOOKING_INTERNAL_TOKEN). The flag also wires
+	// the OCR expires_in_hours TTL (MEDIA_INBOX_TTL_HOURS — sent only when
+	// the anchor flag is on, so flag-off stays byte-identical W60).
+	srv.WhatsAppMediaAnchorEnabled = cfg.WhatsAppMediaAnchorEnabled
+	srv.MediaAnchor = httpapi.NewAnchorClient(bookingBase, cfg.BookingInternalToken)
+	if cfg.WhatsAppMediaAnchorEnabled {
+		// expires_in_hours rides the extract call whenever the anchor flag
+		// is on (SPEC-W61 §Gateway sequencing) — TTL bounds parked media
+		// PII retention even if the anchor token is misconfigured.
+		srv.Media.SetExpiresInHours(cfg.MediaInboxTTLHours)
+		switch {
+		case !cfg.WhatsAppMediaEnabled:
+			logger.Warn("WHATSAPP_MEDIA_ANCHOR_ENABLED=true but WHATSAPP_MEDIA_ENABLED=false — anchor never fires (media messages drop before OCR)")
+		case !srv.MediaAnchor.Configured():
+			logger.Error("CRITICAL: WHATSAPP_MEDIA_ANCHOR_ENABLED=true but MESSAGING_BOOKING_INTERNAL_TOKEN unset — anchors DROP per-message after OCR (fail-closed)",
+				zap.Bool("booking_internal_token", cfg.BookingInternalToken != ""))
+		default:
+			logger.Info("whatsapp media booking anchor enabled",
+				zap.String("anchor_client", srv.MediaAnchor.String()),
+				zap.Int("media_inbox_ttl_hours", cfg.MediaInboxTTLHours))
+		}
+	}
 	// Boot-time reachability probe: fail-loud (WARN) but never fatal — the
 	// gateway still serves provider webhooks and /healthz keeps reporting.
 	for _, u := range srv.Upstreams {

@@ -31,6 +31,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/opendesk/messaging-gateway/internal/channel"
 	"github.com/opendesk/messaging-gateway/internal/media"
+	"github.com/opendesk/messaging-gateway/internal/phone"
 	"github.com/opendesk/messaging-gateway/internal/provider"
 	"go.uber.org/zap"
 )
@@ -306,22 +307,47 @@ const mediaDedupeMaxEntries = 100_000
 // ingested — ids are remembered, so a redelivery after a FAILED attempt
 // re-runs the whole fetch->OCR pipeline). In-memory and per-replica, like
 // the bridge's dedupe heap.
+//
+// SPEC-W61: the deduper doubles as the INGEST LEDGER (message_id → anchor
+// payload incl. document_id) for the booking-anchor rollout. ledgerMark()
+// records the claim BETWEEN OCR success and the anchor POST, so an
+// anchor-failure redelivery (500, N-05) finds the ledger hit and retries
+// ONLY the anchor POST — no re-fetch, no re-OCR (a re-OCR would double-
+// store PII bytes and double-bill ocr_page). The ledger is in-memory and
+// per-replica (the accepted W60 posture, ratelimit.go precedent); a
+// cross-replica/restart redelivery after an anchor failure re-runs OCR
+// once — the same residual window W60 already accepts for post-commit
+// transport failures. With WHATSAPP_MEDIA_ANCHOR_ENABLED=false (default)
+// the ledger is never written and behavior is byte-identical to W60.
 type MediaDeduper struct {
-	mu   sync.Mutex
-	done map[string]time.Time
-	now  func() time.Time // injectable for tests
+	mu     sync.Mutex
+	done   map[string]time.Time
+	ledger map[string]anchorEntry // SPEC-W61 ingest ledger (flag-gated)
+	now    func() time.Time       // injectable for tests
+}
+
+// anchorEntry is one ledger row: the full anchor payload (so the retry
+// sends byte-identical data — incl. the VERIFIED sha256/byte count from
+// the fetch, not a redelivery's declared values) plus whether the anchor
+// POST already succeeded (a post-success redelivery is then a pure no-op,
+// exactly the W60 semantics).
+type anchorEntry struct {
+	payload  AnchorPayload
+	at       time.Time
+	anchored bool
 }
 
 // NewMediaDeduper builds an empty deduper.
 func NewMediaDeduper() *MediaDeduper {
-	return &MediaDeduper{done: map[string]time.Time{}, now: time.Now}
+	return &MediaDeduper{done: map[string]time.Time{}, ledger: map[string]anchorEntry{}, now: time.Now}
 }
 
 // SetClock injects the clock used by the dedupe window (tests).
 func (d *MediaDeduper) SetClock(now func() time.Time) { d.now = now }
 
-// seen reports whether the message id was fully ingested within the dedupe
-// window. Empty ids cannot dedupe (processed every time).
+// seen reports whether the message id was fully ingested (W60 claim) OR
+// ledger-claimed (W61: OCR done, anchor pending/anchored) within the
+// dedupe window. Empty ids cannot dedupe (processed every time).
 func (d *MediaDeduper) seen(id string) bool {
 	if id == "" {
 		return false
@@ -329,7 +355,10 @@ func (d *MediaDeduper) seen(id string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.sweepLocked(d.now())
-	_, ok := d.done[id]
+	if _, ok := d.done[id]; ok {
+		return true
+	}
+	_, ok := d.ledger[id]
 	return ok
 }
 
@@ -362,14 +391,79 @@ func (d *MediaDeduper) mark(id string) {
 	}
 }
 
+// ledgerMark records the W61 ingest-ledger claim BETWEEN OCR success and
+// the anchor POST (SPEC-W61 §Gateway sequencing). The payload is the exact
+// anchor body (tenant/message/document ids, digits-normalized sender,
+// VERIFIED mime/bytes/sha256-prefix) so an anchor-failure redelivery
+// retries byte-identical data. Capacity/TTL bounds mirror mark().
+func (d *MediaDeduper) ledgerMark(id string, payload AnchorPayload) {
+	if id == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := d.now()
+	d.sweepLocked(now)
+	d.ledger[id] = anchorEntry{payload: payload, at: now}
+	if len(d.ledger) > mediaDedupeMaxEntries {
+		var oldest string
+		var oldestAt time.Time
+		first := true
+		for k, e := range d.ledger {
+			if first || e.at.Before(oldestAt) {
+				oldest, oldestAt, first = k, e.at, false
+			}
+		}
+		if oldest != "" {
+			delete(d.ledger, oldest)
+		}
+	}
+}
+
+// anchorPending reports the stored anchor payload for a ledger-claimed
+// message whose anchor POST has NOT yet succeeded — the redelivery retries
+// ONLY that POST (no re-fetch, no re-OCR).
+func (d *MediaDeduper) anchorPending(id string) (AnchorPayload, bool) {
+	if id == "" {
+		return AnchorPayload{}, false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.sweepLocked(d.now())
+	e, ok := d.ledger[id]
+	if !ok || e.anchored {
+		return AnchorPayload{}, false
+	}
+	return e.payload, true
+}
+
+// markAnchored flips a ledger entry to anchored after the anchor POST
+// succeeded; a further redelivery is then the W60 pure no-op.
+func (d *MediaDeduper) markAnchored(id string) {
+	if id == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e, ok := d.ledger[id]; ok {
+		e.anchored = true
+		d.ledger[id] = e
+	}
+}
+
 // sweepLocked expires completions past the TTL. Caller holds d.mu.
 func (d *MediaDeduper) sweepLocked(now time.Time) {
-	if len(d.done) < 1024 {
+	if len(d.done)+len(d.ledger) < 1024 {
 		return // tiny maps: TTL is enforced on read anyway via seen(); sweep lazily
 	}
 	for k, at := range d.done {
 		if now.Sub(at) > mediaDedupeTTL {
 			delete(d.done, k)
+		}
+	}
+	for k, e := range d.ledger {
+		if now.Sub(e.at) > mediaDedupeTTL {
+			delete(d.ledger, k)
 		}
 	}
 }
@@ -379,6 +473,16 @@ func (d *MediaDeduper) sweepLocked(now time.Time) {
 func sha256Prefix(sum string) string {
 	if len(sum) > 12 {
 		return sum[:12]
+	}
+	return sum
+}
+
+// sha256Prefix16 is the W61 anchor-payload form: the FIRST 16 hex chars of
+// the content sha256 (PII-light — enough to spot duplicate bytes at review
+// time, never the full value).
+func sha256Prefix16(sum string) string {
+	if len(sum) > 16 {
+		return sum[:16]
 	}
 	return sum
 }
@@ -437,6 +541,13 @@ func (s *Server) ingestWhatsAppMedia(ctx context.Context, phoneNumberID string, 
 		deduper = NewMediaDeduper() // defensive; Router() always initializes
 	}
 	if deduper.seen(m.ID) {
+		// SPEC-W61: an anchor-failure redelivery finds the ingest-ledger hit
+		// and retries ONLY the anchor POST — no re-fetch, no re-OCR (R4).
+		if s.WhatsAppMediaAnchorEnabled {
+			if payload, pending := deduper.anchorPending(m.ID); pending {
+				return s.retryMediaAnchor(ctx, deduper, tenantID, payload)
+			}
+		}
 		s.Log.Info("whatsapp media redelivery skipped (already ingested)",
 			zap.String("message_id", m.ID))
 		return nil
@@ -485,7 +596,6 @@ func (s *Server) ingestWhatsAppMedia(ctx context.Context, phoneNumberID string, 
 			zap.String("message_id", m.ID), zap.String("tenant_id", tenantID.String()), zap.Error(err))
 		return err
 	}
-	deduper.mark(m.ID) // claim recorded on SUCCESS only
 	// P9 audit record (structured log; the ocr_documents row is the durable
 	// record). P8: ids/byte-counts/sha256-prefix only.
 	s.Log.Info("whatsapp.media.ingested",
@@ -494,6 +604,59 @@ func (s *Server) ingestWhatsAppMedia(ctx context.Context, phoneNumberID string, 
 		zap.String("document_id", docID),
 		zap.Int("bytes", len(mediaBlob.Data)),
 		zap.String("sha256_prefix", sha256Prefix(mediaBlob.SHA256)))
+	if !s.WhatsAppMediaAnchorEnabled {
+		deduper.mark(m.ID) // claim recorded on SUCCESS only (byte-identical W60 path)
+		return nil
+	}
+	// SPEC-W61: ledger claim BEFORE the anchor POST so an anchor failure
+	// (500, N-05) redelivers into the anchorPending branch above and retries
+	// ONLY the anchor. The payload carries the VERIFIED fetch facts
+	// (mime/bytes/sha256) and the pinned digits-normalized sender (G3) —
+	// never the caption (P8).
+	payload := AnchorPayload{
+		TenantID:          tenantID.String(),
+		Channel:           "whatsapp",
+		MessageID:         m.ID,
+		DocumentID:        docID,
+		SenderPhone:       m.From,
+		SenderPhoneDigits: phone.Digits(m.From),
+		Mime:              mediaBlob.MimeType,
+		Bytes:             len(mediaBlob.Data),
+		SHA256Prefix:      sha256Prefix16(mediaBlob.SHA256),
+	}
+	deduper.ledgerMark(m.ID, payload)
+	return s.retryMediaAnchor(ctx, deduper, tenantID, payload)
+}
+
+// retryMediaAnchor places the single-attempt anchor POST for a
+// ledger-claimed message (fresh path after OCR, or an anchor-failure
+// redelivery) and flips the ledger entry on success. A failed POST returns
+// the error => webhook 500 (N-05); a fail-closed client (token unset —
+// deterministic misconfiguration, P6 philosophy) drops 200 and completes
+// the ledger so Meta never redelivery-storms it.
+func (s *Server) retryMediaAnchor(ctx context.Context, deduper *MediaDeduper, tenantID uuid.UUID, payload AnchorPayload) error {
+	if s.MediaAnchor == nil || !s.MediaAnchor.Configured() {
+		s.Log.Error("whatsapp media anchor dropped: MESSAGING_BOOKING_INTERNAL_TOKEN unset — fail-closed",
+			zap.String("message_id", payload.MessageID),
+			zap.String("tenant_id", tenantID.String()))
+		deduper.markAnchored(payload.MessageID) // deterministic: no storm, no re-OCR
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, webhookTimeout)
+	defer cancel()
+	if err := s.MediaAnchor.Anchor(ctx, payload); err != nil {
+		s.Log.Warn("whatsapp media anchor failed (redelivery retries anchor only)",
+			zap.String("message_id", payload.MessageID),
+			zap.String("tenant_id", tenantID.String()),
+			zap.String("document_id", payload.DocumentID),
+			zap.Error(err))
+		return err
+	}
+	deduper.markAnchored(payload.MessageID)
+	s.Log.Info("whatsapp.media.anchored",
+		zap.String("tenant_id", tenantID.String()),
+		zap.String("message_id", payload.MessageID),
+		zap.String("document_id", payload.DocumentID))
 	return nil
 }
 

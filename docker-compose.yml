@@ -573,6 +573,24 @@ services:
       # BOOKING_URL empty = forward via Dapr invoke app-id booking.
       INCIDENT_WEBHOOK_SECRETS: ${INCIDENT_WEBHOOK_SECRETS:-}
       BOOKING_URL: ${BOOKING_URL:-}
+      # SPEC-W61: WhatsApp media booking anchor. After OCR success the
+      # gateway POSTs booking-service /v1/media/inbox/ingest with
+      # X-Internal-Token matching the BOOKING block's BOOKING_INTERNAL_TOKEN
+      # (SAME shared secret var — the VOICE_/CONVERSATION_ mapping idiom;
+      # booking-side K2 fail-closed: 503 unset, 401 constant-time mismatch).
+      # config.go:163 reads MESSAGING_BOOKING_INTERNAL_TOKEN but NO compose
+      # line wired it pre-W61 (dead without this entry). DEV ONLY default;
+      # prod MUST set BOOKING_INTERNAL_TOKEN via the secrets store.
+      MESSAGING_BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-change-me-internal}
+      # SPEC-W61: anchor rollout flag, default OFF — when false the W60
+      # media path is byte-identical (no ledger-anchor step, 200 after mark
+      # as today). Enable together with WHATSAPP_MEDIA_ENABLED.
+      WHATSAPP_MEDIA_ANCHOR_ENABLED: ${WHATSAPP_MEDIA_ANCHOR_ENABLED:-false}
+      # SPEC-W61: parked-media retention bound in hours — sent as
+      # expires_in_hours on the OCR extract call for WhatsApp media
+      # (1..8760; invalid falls back to the code default). Bounds parked PII
+      # retention; the ocr sweeper reaps bytes+rows after expiry.
+      MEDIA_INBOX_TTL_HOURS: ${MEDIA_INBOX_TTL_HOURS:-168}
       # W39 mock-rail contract — dev has no Meta app secret, so unsigned
       # inbound WhatsApp posts are opted in EXPLICITLY here (messaging-gateway
       # logs CRITICAL at startup). Code default OFF (fail-closed, unsigned =

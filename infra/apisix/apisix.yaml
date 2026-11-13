@@ -1,11 +1,14 @@
 # APISIX standalone declarative config (file-driven data plane) — OpenDesk edge routes.
 # Contract: SPEC §3 (ports) and SPEC §12 (routes & plugins). Hot-reloaded ~1s after save.
 #
-# Route inventory: 50 routes (45 pre-W48-D + 3 W48-D public booking legs
+# Route inventory: 51 routes (45 pre-W48-D + 3 W48-D public booking legs
 # + 1 W52-A geo-service: api-geo. geo-service exposes NO /internal/* surface, so
 # no new block-* deny is required — the existing generic denies stand;
 # + 1 W53-A ocr-service: api-ocr. Same posture: no /internal/* path, no
-# new block-* deny):
+# new block-* deny;
+# + 1 W61-D block-bookings-media-inbox-ingest: edge-deny for the SPEC-W61
+# machine ingest route — the staff media-inbox routes stay on the
+# api-bookings OIDC wildcard):
 # api-bookings-public-pay, api-bookings-public-review,
 # api-bookings-public-reviews). Update this count when adding/removing routes.
 #
@@ -619,6 +622,31 @@ routes:
     uris:
       - /api/bookings/v1/leads/resolve
       - /api/bookings/v1/leads/resolve/
+    methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    priority: 10
+    plugins:
+      uri-blocker:
+        block_rules: [".*"]
+        rejected_code: 404
+        rejected_msg: "not found"
+
+  # SPEC-W61 (R6): POST /v1/media/inbox/ingest is a machine-to-machine
+  # surface by design — its ONLY caller is the messaging-gateway
+  # (internauth: X-Internal-Token == BOOKING_INTERNAL_TOKEN, K2 fail-closed
+  # 503 when unset / 401 constant-time on mismatch). Through the gateway it
+  # would ride the api-bookings OIDC wildcard, reachable by ANY valid user
+  # JWT (any tenant member could then forge media-inbox rows — a PII
+  # injection surface). The gateway caller reaches booking-service
+  # in-cluster directly, so the edge path is closed outright — 404 like the
+  # internal blockers above. The STAFF review routes (GET
+  # /v1/media/inbox, POST /v1/media/inbox/{id}/link, POST
+  # /v1/media/inbox/{id}/discard) stay on the OIDC api-bookings wildcard —
+  # only the exact ingest URI is denied here (radix exact match wins over
+  # the wildcard at priority 10, same as the incidents-ingest precedent).
+  - id: block-bookings-media-inbox-ingest
+    uris:
+      - /api/bookings/v1/media/inbox/ingest
+      - /api/bookings/v1/media/inbox/ingest/
     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     priority: 10
     plugins:

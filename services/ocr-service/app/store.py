@@ -245,6 +245,32 @@ class Database:
         """Hard-delete one row (TTL sweeper, TenantDeleted cascade)."""
         await conn.execute("DELETE FROM ocr_documents WHERE id = $1", document_id)
 
+    # --- SPEC-W61 G2: per-document internauth erase ----------------------
+    @staticmethod
+    async def get_document_for_erase(conn, document_id: uuid.UUID) -> dict[str, Any] | None:
+        """Cross-tenant row fetch for the internauth per-document erase
+        (POST /v1/ocr/documents/{id}/erase). Call on sweep_conn() ONLY —
+        the caller authenticates by machine token and addresses the
+        document by uuid, not by tenant."""
+        row = await conn.fetchrow(
+            """
+            SELECT id, tenant_id, storage_bucket, storage_key
+              FROM ocr_documents
+             WHERE id = $1
+            """,
+            document_id,
+        )
+        return dict(row) if row else None
+
+    @staticmethod
+    async def erase_document(conn, document_id: uuid.UUID) -> bool:
+        """Hard-delete one row by id (per-document internauth erase).
+        Returns True when a row was removed. Call on sweep_conn() only."""
+        result = await conn.execute(
+            "DELETE FROM ocr_documents WHERE id = $1", document_id
+        )
+        return result.split()[-1] == "1"
+
     @staticmethod
     async def list_kyc_rows_matching_subject(
         conn, subject: str

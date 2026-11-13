@@ -116,6 +116,11 @@ var tenantPIIPurgeSteps = []piiPurgeStep{
 	// SPEC-W48 A4: reviews carry reviewer PII (reviewer_name) and have no
 	// owner after tenant deletion — hard-deleted like the other PII rows.
 	{"booking_reviews", "delete reviews (reviewer PII)", `DELETE FROM booking_reviews WHERE tenant_id=$1`},
+	// SPEC-W61 (G1/G2): media_inbox rows are sender-PII + ocr anchor
+	// pointers with no owner after tenant deletion — hard-deleted like the
+	// other PII/capability rows (the ocr bytes themselves are hard-deleted
+	// ocr-side by the existing W58 TenantDeleted erasure).
+	{"media_inbox", "delete media inbox rows (sender PII + anchors)", `DELETE FROM media_inbox WHERE tenant_id=$1`},
 	// The outbox has no tenant_id column (A-DB DB-13) and no RLS by design
 	// (cross-tenant dispatcher); payload->>'tenant_id' is the only handle.
 	// Rows whose payloads lack the key are untouched (documented limit).

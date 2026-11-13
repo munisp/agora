@@ -52,6 +52,17 @@ type Config struct {
 	// limit-count keys Meta's egress IPs, not senders). Default 10.
 	WhatsAppMediaRatePerMinute int
 
+	// WhatsApp media -> booking anchor (SPEC-W61, Option B).
+	// WhatsAppMediaAnchorEnabled (WHATSAPP_MEDIA_ANCHOR_ENABLED, default
+	// false) gates the post-OCR booking anchor; false => byte-identical
+	// W60 behavior. MediaInboxTTLHours (MEDIA_INBOX_TTL_HOURS, default 168,
+	// valid range 1..8760, invalid => default) is sent as the optional
+	// expires_in_hours form field on the OCR extract call — wired ONLY
+	// when the anchor flag is on (SPEC-W61 §Gateway sequencing), so a
+	// flag-off deployment stays byte-identical.
+	WhatsAppMediaAnchorEnabled bool
+	MediaInboxTTLHours         int
+
 	// Internal upstreams for the inbound bridge (SPEC-W45 ORPH O2).
 	// Direct-base overrides win; with a Dapr sidecar (DaprSidecar) the
 	// invoke API is used; without one the direct-base defaults
@@ -134,6 +145,11 @@ func Load() Config {
 		// opts media ingest in.
 		WhatsAppMediaEnabled:       envBool("WHATSAPP_MEDIA_ENABLED", false),
 		WhatsAppMediaRatePerMinute: envInt("WHATSAPP_MEDIA_RATE_PER_MINUTE", 10),
+		// WHATSAPP_MEDIA_ANCHOR_ENABLED defaults OFF (SPEC-W61 rollout flag,
+		// same envBool idiom): only an explicit truthy value opts the
+		// booking anchor in.
+		WhatsAppMediaAnchorEnabled: envBool("WHATSAPP_MEDIA_ANCHOR_ENABLED", false),
+		MediaInboxTTLHours:         envIntRange("MEDIA_INBOX_TTL_HOURS", 168, 1, 8760),
 		TelegramBotToken:           os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramBotUsername:        os.Getenv("TELEGRAM_BOT_USERNAME"),
 		TelegramWebhookSecret:      os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
@@ -175,6 +191,18 @@ func envStr(key, def string) string {
 func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// envIntRange is envInt plus a validity range: an unparsable OR
+// out-of-range value falls back to the default (SPEC-W61
+// MEDIA_INBOX_TTL_HOURS: 1..8760, invalid => 168).
+func envIntRange(key string, def, min, max int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= min && n <= max {
 			return n
 		}
 	}

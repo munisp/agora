@@ -114,3 +114,22 @@ export function canViewKycReview(
 ): boolean {
   return hasAnyRole(roles, KYC_REVIEW_ROLES);
 }
+
+/**
+ * Media inbox review (SPEC-W61) — inbound WhatsApp media rows carry sender
+ * phone PII and a link to the OCR-extracted document, so the review queue is
+ * served ONLY through the owner/admin gate (KYC_REVIEW_ROLES precedent);
+ * member-level field agents must never see it. The booking-service media
+ * inbox routes enforce the same owner/admin rule independently.
+ */
+export const MEDIA_INBOX_REVIEW_ROLES: readonly RealmRole[] = [
+  "owner",
+  "admin",
+];
+
+/** owner/admin — members, staff, viewers, analysts and billing never see the media inbox. */
+export function canViewMediaInbox(
+  roles: readonly string[] | undefined | null,
+): boolean {
+  return hasAnyRole(roles, MEDIA_INBOX_REVIEW_ROLES);
+}
