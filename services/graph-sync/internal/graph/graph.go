@@ -105,6 +105,15 @@ type Client interface {
 	// node is MERGEd so an out-of-order Merged event is safe.
 	LinkCaseMerged(ctx context.Context, tenantID, ref, canonicalRef string) error
 
+	// UpsertDocument upserts a hash-only OCR Document stub node
+	// (SPEC-W55 Scope A; PII-free: ids, kind/status, sha256/phash,
+	// page_count, model_version, created_at only — extracted_fields /
+	// extracted_text / storage pointers NEVER touch the graph). There is
+	// deliberately NO person linkage: person erasure never needs to touch
+	// Document stubs, and the tenant wipe (DeleteTenantSubgraph) removes
+	// them via tenant_id (RECON-W55 §5.4).
+	UpsertDocument(ctx context.Context, d Document) error
+
 	// FindPersonByPhoneHash resolves the person_id of an exact phone_hash
 	// match within the tenant ("" when none) — used by phone-only erasure
 	// tombstones.
@@ -203,9 +212,27 @@ type Case struct {
 	Ward      string
 	CreatedAt time.Time
 	// Geo (AT Location): optional. HasGeo=false skips the Location.
-	LGA     string // optional; ward already lives on the Case node itself
+	LGA      string // optional; ward already lives on the Case node itself
 	Lat, Lon float64
-	HasGeo  bool
+	HasGeo   bool
+}
+
+// Document mirrors the SPEC-W55 hash-only OCR Document stub node projected
+// from com.opendesk.ocr.DocumentExtracted (opendesk.ocr.events). Hash-only
+// by contract: ids + sha256/phash + metadata only — extracted_fields,
+// extracted_text and the storage pointers are NEVER projected (PII
+// minimization). Consumed by fraud detector D9 (duplicate/tamper
+// detection); no person linkage, so erasure stays tenant-scoped.
+type Document struct {
+	DocumentID   string
+	TenantID     string
+	Kind         string // receipt|document|knowledge_scan
+	Status       string // extracted (only successful extractions are projected)
+	SHA256       string // lowercase hex of the full bytes
+	PHash        string // 64-bit dHash, 16-char lowercase hex (may be empty)
+	ModelVersion string
+	PageCount    int
+	CreatedAt    time.Time
 }
 
 // PhoneHash computes the salted SHA-256 phone hash (SPEC-W28 §3: "same

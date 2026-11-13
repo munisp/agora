@@ -20,3 +20,29 @@ func TestLoadFalkorDBPassword(t *testing.T) {
 		}
 	})
 }
+
+// SPEC-W55 Scope A: GRAPH_SYNC_OCR_TOPIC follows the civic pattern
+// (envStrExplicit) — an unset variable falls back to the default topic
+// while an explicitly-set EMPTY value disables the OCR consumer.
+func TestLoadOCRTopic(t *testing.T) {
+	t.Run("unset defaults to opendesk.ocr.events", func(t *testing.T) {
+		cfg := Load()
+		if cfg.OCRTopic != "opendesk.ocr.events" {
+			t.Fatalf("OCRTopic = %q, want %q when GRAPH_SYNC_OCR_TOPIC unset", cfg.OCRTopic, "opendesk.ocr.events")
+		}
+	})
+	t.Run("explicit empty disables the OCR consumer", func(t *testing.T) {
+		t.Setenv("GRAPH_SYNC_OCR_TOPIC", "")
+		cfg := Load()
+		if cfg.OCRTopic != "" {
+			t.Fatalf("OCRTopic = %q, want empty when GRAPH_SYNC_OCR_TOPIC explicitly empty", cfg.OCRTopic)
+		}
+	})
+	t.Run("explicit value honored", func(t *testing.T) {
+		t.Setenv("GRAPH_SYNC_OCR_TOPIC", "custom.ocr.events")
+		cfg := Load()
+		if cfg.OCRTopic != "custom.ocr.events" {
+			t.Fatalf("OCRTopic = %q, want %q", cfg.OCRTopic, "custom.ocr.events")
+		}
+	})
+}

@@ -62,6 +62,7 @@ func TestQueries_TenantIDOnEveryStatement(t *testing.T) {
 		personExistsQuery("t1", "p1"),
 		erasePersonQuery("t1", "p1"),
 		applyEnrichmentQuery("t1", "p1", map[string]any{"ltv_cents": 1000}, "2026-08-06", now),
+		upsertDocumentQuery(Document{DocumentID: "d1", TenantID: "t1", Kind: "receipt", Status: "extracted", SHA256: "ab", PHash: "cd", PageCount: 2, ModelVersion: "v1", CreatedAt: now}),
 	}
 	for i, stmt := range stmts {
 		require.Contains(t, stmt.text, "tenant_id", "statement %d must be tenant-scoped", i)
@@ -98,6 +99,35 @@ func TestCivicQueries_TenantScoped(t *testing.T) {
 	merged := linkCaseMergedQuery("t1", "GOV-X-1", "GOV-X-0", now)
 	require.Contains(t, merged.text, "MERGED_INTO")
 	require.Contains(t, merged.text, "m.tenant_id = $tenant_id")
+}
+
+// TestDocumentQuery_HashOnly pins the SPEC-W55 Scope A static side for the
+// OCR Document stub: MERGE keyed (tenant_id, document_id) and the exact
+// hash-only property set — no extracted/storage/PII keys can exist.
+func TestDocumentQuery_HashOnly(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	d := Document{DocumentID: "d1", TenantID: "t1", Kind: "receipt", Status: "extracted",
+		SHA256: "9f86", PHash: "a1b2", PageCount: 3, ModelVersion: "ocr-v1.3", CreatedAt: now}
+	stmt := upsertDocumentQuery(d)
+	require.Contains(t, stmt.text, "MERGE (doc:Document {tenant_id: $tenant_id, document_id: $document_id})")
+	require.Equal(t, "t1", stmt.params["tenant_id"], "tenant-scoped (gate 1)")
+	require.Equal(t, "d1", stmt.params["document_id"])
+	require.Equal(t, 3, stmt.params["page_count"])
+	require.Equal(t, "2026-08-05T12:00:00Z", stmt.params["created_at"])
+	require.ElementsMatch(t, []string{
+		"tenant_id", "document_id", "kind", "status", "sha256", "phash",
+		"page_count", "model_version", "created_at",
+	}, paramKeys(stmt.params), "exactly the pinned hash-only parameter set")
+	require.NotContains(t, stmt.text, "storage", "storage pointers never projected")
+	require.NotContains(t, stmt.text, "extracted_fields", "extracted fields never projected")
+}
+
+func paramKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // TestEraseQuery_DetachDelete pins the erasure shape (SPEC §4: DETACH

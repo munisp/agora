@@ -72,6 +72,10 @@ const (
 	TypeCivicReportReceived = "com.opendesk.civic.ReportReceived"
 	TypeCivicStatusChanged  = "com.opendesk.civic.StatusChanged"
 	TypeCivicMerged         = "com.opendesk.civic.Merged"
+
+	// OCR extraction events (opendesk.ocr.events, SPEC-W55 Scope A): the
+	// W53 ocr-service emits DocumentExtracted after a successful extraction.
+	TypeOCRDocumentExtracted = "com.opendesk.ocr.DocumentExtracted"
 )
 
 // BookingData mirrors booking-service bookingops.marshalEvent payloads
@@ -192,6 +196,25 @@ type CivicStatusData struct {
 type CivicMergedData struct {
 	Ref          string `json:"ref"`
 	CanonicalRef string `json:"canonical_ref"`
+}
+
+// OCRDocumentData mirrors the ocr-service DocumentExtracted data payload
+// (ocr-service app/events.py document_extracted_event; SPEC-W55 Scope A).
+// HASH-ONLY STUB POSTURE (SPEC-W55 sacred constraint): this struct
+// deliberately declares ONLY the id/hash/metadata fields — the payload's
+// extracted_fields, storage_bucket and storage_key are NEVER declared,
+// decoded, persisted, or logged in the graph-sync Document path (PII
+// minimization; hash-only stubs keep person erasure out of the Document
+// path and leave tenant erasure to the tenant-scoped wipe, RECON §5.4).
+type OCRDocumentData struct {
+	DocumentID   string `json:"document_id"`
+	TenantID     string `json:"tenant_id"`
+	Kind         string `json:"kind"`   // receipt|document|knowledge_scan
+	Status       string `json:"status"` // "extracted" (producer emits only on success)
+	PageCount    int    `json:"page_count"`
+	SHA256       string `json:"sha256"` // lowercase hex of the full bytes
+	PHash        string `json:"phash"`  // 64-bit dHash, 16-char lowercase hex (may be empty)
+	ModelVersion string `json:"model_version"`
 }
 
 // Data decodes the event's data payload into v.

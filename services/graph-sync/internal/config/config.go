@@ -34,6 +34,12 @@ type Config struct {
 	// GRAPH_SYNC_CIVIC_TOPIC, default opendesk.civic.events.v1; empty =
 	// the civic consumer is skipped (same pattern as the CAC topic).
 	CivicTopic string
+	// OCRTopic carries the W53 OCR extraction events
+	// (com.opendesk.ocr.DocumentExtracted) projected as hash-only Document
+	// stub nodes for fraud detector D9 (SPEC-W55 Scope A).
+	// GRAPH_SYNC_OCR_TOPIC, default opendesk.ocr.events; empty = the OCR
+	// consumer is skipped, logged (same pattern as the civic/CAC topics).
+	OCRTopic string
 	// DLQTopic receives poison messages after 3 attempts (GRAPH_SYNC_DLQ_TOPIC,
 	// default opendesk.dlq).
 	DLQTopic string
@@ -82,6 +88,7 @@ func Load() Config {
 		CACTopic:         envStr("GRAPH_SYNC_CAC_TOPIC", ""),
 		EnrichmentTopic:  envStr("GRAPH_SYNC_ENRICHMENT_TOPIC", "opendesk.graph.enrichment.v1"),
 		CivicTopic:       envStrExplicit("GRAPH_SYNC_CIVIC_TOPIC", "opendesk.civic.events.v1"),
+		OCRTopic:         envStrExplicit("GRAPH_SYNC_OCR_TOPIC", "opendesk.ocr.events"),
 		DLQTopic:         envStr("GRAPH_SYNC_DLQ_TOPIC", "opendesk.dlq"),
 		ErasureDoneTopic: envStr("GRAPH_ERASURE_DONE_TOPIC", "opendesk.graph.erasure.done.v1"),
 		FalkorDBAddr:     envStr("FALKORDB_ADDR", "graph-db:6379"),

@@ -57,6 +57,8 @@ string unescaped). Tests run against an in-memory fake.
 | `GRAPH_SYNC_ERASURE_TOPIC` | `opendesk.consent.erasure.v1` | erasure tombstones |
 | `GRAPH_SYNC_ENRICHMENT_TOPIC` | `opendesk.graph.enrichment.v1` | nightly gold→graph Person property rows (spark `graph_enrichment.py`); empty = skip |
 | `GRAPH_SYNC_CAC_TOPIC` | _(empty = skip)_ | optional funnel/CAC lead events (W13) |
+| `GRAPH_SYNC_CIVIC_TOPIC` | `opendesk.civic.events.v1` | civic case events (W32); empty = skip |
+| `GRAPH_SYNC_OCR_TOPIC` | `opendesk.ocr.events` | OCR `DocumentExtracted` → hash-only `Document` stubs (W55); empty = skip |
 | `GRAPH_SYNC_DLQ_TOPIC` | `opendesk.dlq` | poison messages (after 3 attempts) |
 | `GRAPH_ERASURE_DONE_TOPIC` | `opendesk.graph.erasure.done.v1` | erasure audit events |
 | `FALKORDB_ADDR` | `graph-db:6379` | FalkorDB Redis-protocol address |
@@ -79,6 +81,12 @@ string unescaped). Tests run against an in-memory fake.
   via tenant-scoped `MATCH`+`SET p += $props` — rows for unknown/erased
   persons are dropped, never resurrected: metric
   `enrichment_dropped_unknown_person` + debug log)
+- `com.opendesk.ocr.DocumentExtracted` (OCR topic, W55): projects a
+  **hash-only** `(:Document)` stub `{tenant_id, document_id, kind, status,
+  sha256, phash, page_count, model_version, created_at}` for fraud detector
+  D9 (duplicate/tamper detection). `extracted_fields`/`extracted_text` and
+  the storage pointers are NEVER decoded, persisted, or logged (PII
+  minimization); no person linkage — tenant wipe removes the stubs.
 
 Unknown types on a consumed topic are acknowledged and skipped
 (forward-compatible). Emits `com.opendesk.graph.ErasureDone`.

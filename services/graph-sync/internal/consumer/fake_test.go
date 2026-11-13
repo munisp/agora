@@ -26,6 +26,7 @@ type fakeGraph struct {
 	bookings  map[string]*graph.Booking
 	cases     map[string]*graph.Case
 	caseExtra map[string]map[string]string // tenant|ref -> extra props (acked_at/resolved_at/merged_into)
+	documents map[string]*graph.Document   // tenant|document_id -> hash-only Document stub
 
 	// edges: person_id -> set of ids (all tenant-scoped by construction:
 	// nodes are keyed tenant|id and lookups always pass tenantID).
@@ -60,6 +61,7 @@ func newFakeGraph() *fakeGraph {
 		bookings:   map[string]*graph.Booking{},
 		cases:      map[string]*graph.Case{},
 		caseExtra:  map[string]map[string]string{},
+		documents:  map[string]*graph.Document{},
 		hasContact: map[string]map[string]bool{},
 		consented:  map[string]map[string]bool{},
 		booked:     map[string]map[string]bool{},
@@ -348,6 +350,21 @@ func (f *fakeGraph) LinkCaseMerged(_ context.Context, tenantID, ref, canonicalRe
 	return nil
 }
 
+// UpsertDocument mirrors upsertDocumentQuery: MERGE by
+// (tenant, document_id) with a full property SET on re-delivery (MERGE
+// idempotency). Hash-only by contract (SPEC-W55 Scope A) — no PII, no
+// person linkage.
+func (f *fakeGraph) UpsertDocument(_ context.Context, d graph.Document) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if d.TenantID == "" {
+		return graph.ErrTenantRequired
+	}
+	cp := d
+	f.documents[key(d.TenantID, d.DocumentID)] = &cp
+	return nil
+}
+
 func (f *fakeGraph) FindPersonByPhoneHash(_ context.Context, tenantID, phoneHash string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -439,6 +456,12 @@ func (f *fakeGraph) DeleteTenantSubgraph(_ context.Context, tenantID string) (bo
 			delete(f.caseExtra, id)
 			delete(f.caseAt, id)
 			delete(f.caseMerged, id)
+			found = true
+		}
+	}
+	for id := range f.documents {
+		if strings.HasPrefix(id, prefix) {
+			delete(f.documents, id)
 			found = true
 		}
 	}

@@ -62,10 +62,13 @@ class Settings:
     # booking events on opendesk.booking.events, identity events on
     # opendesk.identity.events, civic case events on
     # opendesk.civic.events.v1 (booking-service civic.go TopicCivicEvents).
+    # SPEC-W55: opendesk.ocr.events added — com.opendesk.ocr.DocumentExtracted
+    # triggers D9 document_abuse (EVENT_TRIGGERS, main.py); the topic was
+    # already registered in infra/kafka/create-topics.sh:103.
     kafka_trigger_topics: str = field(
         default_factory=lambda: os.getenv(
             "FRAUD_KAFKA_TOPICS",
-            "cac.events,opendesk.booking.events,opendesk.identity.events,opendesk.civic.events.v1",
+            "cac.events,opendesk.booking.events,opendesk.identity.events,opendesk.civic.events.v1,opendesk.ocr.events",
         )
     )
     alerts_topic: str = field(
@@ -126,6 +129,23 @@ class Settings:
     )
     civic_coord_window_hours: int = field(
         default_factory=lambda: _int("CIVIC_COORD_WINDOW_HOURS", 24)
+    )
+
+    # D9 document_abuse (SPEC-W55 Scope B): same-tenant duplicate /
+    # near-duplicate / tamper-suspect over hash-only (:Document) stubs
+    # projected by graph-sync from opendesk.ocr.events. D9 NEVER
+    # auto-quarantines — operator triage only.
+    # Lookback window over Document.created_at.
+    d9_lookback_days: int = field(default_factory=lambda: _int("D9_LOOKBACK_DAYS", 30))
+    # S1 exact sha256 duplicate: count >= min => medium; count >= high => high
+    # (count-based escalation ONLY — person linkage is a SPEC-W55 NO-GO).
+    d9_dup_min_count: int = field(default_factory=lambda: _int("D9_DUP_MIN_COUNT", 2))
+    d9_dup_high_count: int = field(default_factory=lambda: _int("D9_DUP_HIGH_COUNT", 3))
+    # S2 near-duplicate: 64-bit dHash hamming distance at/below this => medium.
+    # Conservative single threshold: the W53 event carries no mime field and
+    # non-PNG phashes are a byte-grid fallback (ocr validate.py:179-194).
+    d9_phash_hamming_max: int = field(
+        default_factory=lambda: _int("D9_PHASH_HAMMING_MAX", 6)
     )
 
     # D7 gnn_anomaly (SPEC-W30 §3: consume risk_score >= 0.9 from the W29 sweep).

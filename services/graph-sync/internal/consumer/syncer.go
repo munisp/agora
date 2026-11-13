@@ -613,6 +613,69 @@ func (s *Syncer) civicMerged(ctx context.Context, evt events.CloudEvent, tenantI
 }
 
 // ---------------------------------------------------------------------------
+// OCR document events (opendesk.ocr.events, SPEC-W55 Scope A)
+// ---------------------------------------------------------------------------
+
+// HandleOCR consumes opendesk.ocr.events: the hash-only Document stub
+// projection for fraud detector D9. Document nodes carry ids + hashes +
+// metadata ONLY (tenant_id, document_id, kind, status, sha256, phash,
+// page_count, model_version, created_at) — extracted_fields, extracted_text
+// and the storage pointers are NEVER decoded, persisted, or logged here
+// (PII minimization, SPEC-W55 sacred constraint). No person linkage:
+// person erasure never touches Document stubs; the tenant wipe removes
+// them via tenant_id (RECON-W55 §5.4).
+func (s *Syncer) HandleOCR(ctx context.Context, evt events.CloudEvent) error {
+	switch evt.Type {
+	case events.TypeOCRDocumentExtracted:
+	default:
+		return nil // forward-compatible: ack unknown types on the topic
+	}
+	tenantID, err := s.tenantOf(evt)
+	if err != nil {
+		return err
+	}
+	if dup, err := s.processed(ctx, evt, tenantID); err != nil {
+		return err
+	} else if dup {
+		return nil
+	}
+	var d events.OCRDocumentData
+	if err := evt.DecodeData(&d); err != nil {
+		return Permanent(fmt.Errorf("malformed OCR document data: %v", err))
+	}
+	// Defensive: the producer emits only successful extractions
+	// (status="extracted", ocr-service app/main.py); anything else is
+	// acknowledged and skipped, never projected.
+	if strings.TrimSpace(d.Status) != "extracted" {
+		s.log().Info("OCR document event skipped (status != extracted)",
+			zap.String("event_id", evt.ID), zap.String("document_id", d.DocumentID))
+		return nil
+	}
+	if strings.TrimSpace(d.DocumentID) == "" || strings.TrimSpace(d.SHA256) == "" {
+		return Permanent(errors.New("OCR document event requires document_id and sha256"))
+	}
+	if err := s.Graph.UpsertTenant(ctx, tenantID, evt.Subject, s.now()); err != nil {
+		return err
+	}
+	doc := graph.Document{
+		DocumentID:   strings.TrimSpace(d.DocumentID),
+		TenantID:     tenantID,
+		Kind:         strings.TrimSpace(d.Kind),
+		Status:       strings.TrimSpace(d.Status),
+		SHA256:       strings.TrimSpace(d.SHA256),
+		PHash:        strings.TrimSpace(d.PHash),
+		ModelVersion: strings.TrimSpace(d.ModelVersion),
+		PageCount:    d.PageCount,
+		CreatedAt:    orEventTime(time.Time{}, evt, s.now()),
+	}
+	if err := s.Graph.UpsertDocument(ctx, doc); err != nil {
+		return err
+	}
+	s.metrics().Inc("ocr_documents_projected")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // graph enrichment (opendesk.graph.enrichment.v1, nightly spark job)
 // ---------------------------------------------------------------------------
 

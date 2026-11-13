@@ -141,6 +141,15 @@ func run() error {
 		} else {
 			logger.Info("GRAPH_SYNC_CIVIC_TOPIC is empty; civic consumer skipped")
 		}
+		// W55 OCR hash-only Document stub projection (SPEC-W55 Scope A;
+		// consumed by fraud detector D9). Empty topic = skipped (logged) —
+		// same pattern as the CAC/civic topics.
+		if cfg.OCRTopic != "" {
+			consumers = append(consumers,
+				consumer.New(brokers, cfg.OCRTopic, cfg.ConsumerGroup, cfg.DLQTopic, syncer.HandleOCR, reg, logger))
+		} else {
+			logger.Info("GRAPH_SYNC_OCR_TOPIC is empty; OCR consumer skipped")
+		}
 		for _, c := range consumers {
 			c := c
 			g.Go(func() error { return c.Run(gctx) })

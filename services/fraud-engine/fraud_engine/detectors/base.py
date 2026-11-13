@@ -497,6 +497,7 @@ from .d5_consent import ConsentBackdatingDetector  # noqa: E402
 from .d6_ghost import GhostBookingDetector  # noqa: E402
 from .d7_anomaly import AnomalyDetector  # noqa: E402
 from .d8_civic import ReportSpamDetector  # noqa: E402
+from .d9_document import DocumentAbuseDetector  # noqa: E402
 
 ALL_DETECTORS: tuple[Detector, ...] = (
     ReferralCycleDetector(),
@@ -509,6 +510,11 @@ ALL_DETECTORS: tuple[Detector, ...] = (
     # SPEC-W32 §3 WS-D: report_spam is medium-only and NEVER auto-quarantines
     # (citizens are never banned from reporting) — see d8_civic/quarantine.
     ReportSpamDetector(),
+    # SPEC-W55: document_abuse NEVER auto-quarantines (person_id is always
+    # None and document_abuse stays out of AUTO_QUARANTINE_TYPES) — alerts
+    # inform operator triage only; the ML blend auto-skips personless
+    # findings.
+    DocumentAbuseDetector(),
 )
 
 DETECTORS_BY_NAME: dict[str, Detector] = {d.name: d for d in ALL_DETECTORS}

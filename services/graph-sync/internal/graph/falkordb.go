@@ -344,6 +344,18 @@ func (f *FalkorDB) LinkCaseMerged(ctx context.Context, tenantID, ref, canonicalR
 	return f.exec(ctx, linkCaseMergedQuery(tenantID, ref, canonicalRef, time.Now()))
 }
 
+// UpsertDocument implements Client (hash-only OCR Document stub projection,
+// SPEC-W55 Scope A).
+func (f *FalkorDB) UpsertDocument(ctx context.Context, d Document) error {
+	if d.TenantID == "" {
+		return ErrTenantRequired
+	}
+	if d.DocumentID == "" {
+		return fmt.Errorf("document_id is required")
+	}
+	return f.exec(ctx, upsertDocumentQuery(d))
+}
+
 // FindPersonByPhoneHash implements Client.
 func (f *FalkorDB) FindPersonByPhoneHash(ctx context.Context, tenantID, phoneHash string) (string, error) {
 	if tenantID == "" {

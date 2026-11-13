@@ -61,6 +61,15 @@ class PropertyGraph:
     def add_case(self, tenant_id: str, ref: str, **props: Any) -> str:
         return self.add_node({"Case"}, tenant_id=tenant_id, case_id=ref, **props)
 
+    def add_document(self, tenant_id: str, document_id: str, **props: Any) -> str:
+        """SPEC-W55 hash-only (:Document) stub: tenant_id, document_id, kind,
+        status, sha256, phash, page_count, model_version, created_at — never
+        document text, extracted field payloads, or storage locations
+        (PII minimization)."""
+        return self.add_node(
+            {"Document"}, tenant_id=tenant_id, document_id=document_id, **props
+        )
+
     def add_campaign(self, tenant_id: str, campaign_id: str) -> str:
         return self.add_node(
             {"Campaign"}, tenant_id=tenant_id, campaign_id=campaign_id, kind="outreach"
@@ -418,6 +427,32 @@ class FakeGraphClient:
                     "lat": loc.get("lat"),
                     "lon": loc.get("lon"),
                     "reporter_id": reporter,
+                }
+            )
+        return rows
+
+    def _h_detector_d9_documents(self, cypher, params):
+        """SPEC-W55 D9: tenant-scoped (:Document) rows in the lookback window
+        (mirrors the D8 handlers' tenant + since filtering)."""
+        tenant = params["tenant_id"]
+        since = params.get("since")
+        rows = []
+        for node in self.g.nodes.values():
+            if "Document" not in node["labels"]:
+                continue
+            d = node["props"]
+            if d.get("tenant_id") != tenant:
+                continue
+            if since is not None and not _ge(d.get("created_at"), since):
+                continue
+            rows.append(
+                {
+                    "document_id": d.get("document_id"),
+                    "sha256": d.get("sha256"),
+                    "phash": d.get("phash"),
+                    "kind": d.get("kind"),
+                    "status": d.get("status"),
+                    "created_at": d.get("created_at"),
                 }
             )
         return rows

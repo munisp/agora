@@ -397,6 +397,36 @@ SET m.tenant_id = $tenant_id, m.at = $now,
 	}
 }
 
+// upsertDocumentQuery upserts the hash-only OCR Document stub (SPEC-W55
+// Scope A): MERGE by (tenant_id, document_id), SET the metadata + hash
+// properties on every delivery (MERGE idempotency — redelivery refreshes,
+// never duplicates). PII-free by contract: extracted_fields/extracted_text/
+// storage_* are never projected, so no CASE-guards are needed — the field
+// set is fixed.
+func upsertDocumentQuery(d Document) q {
+	return q{
+		text: `MERGE (doc:Document {tenant_id: $tenant_id, document_id: $document_id})
+SET doc.kind = $kind,
+    doc.status = $status,
+    doc.sha256 = $sha256,
+    doc.phash = $phash,
+    doc.page_count = $page_count,
+    doc.model_version = $model_version,
+    doc.created_at = $created_at`,
+		params: map[string]any{
+			"tenant_id":     d.TenantID,
+			"document_id":   d.DocumentID,
+			"kind":          d.Kind,
+			"status":        d.Status,
+			"sha256":        d.SHA256,
+			"phash":         d.PHash,
+			"page_count":    d.PageCount,
+			"model_version": d.ModelVersion,
+			"created_at":    FormatTime(d.CreatedAt),
+		},
+	}
+}
+
 // personExistsQuery is the pre-delete check (erasure must be idempotent and
 // report found/not-found for the audit event).
 func personExistsQuery(tenantID, personID string) q {
@@ -431,9 +461,9 @@ func tenantNodeCountQuery(tenantID string) q {
 }
 
 // deleteTenantSubgraphQuery DETACH DELETEs every node of the tenant — the
-// Tenant anchor plus Person/Contact/Consent/Booking/Offering/Case/Location
-// and every processed-marker for the tenant. Edges die with their nodes.
-// Idempotent by construction: a second run matches nothing.
+// Tenant anchor plus Person/Contact/Consent/Booking/Offering/Case/Location/
+// Document and every processed-marker for the tenant. Edges die with their
+// nodes. Idempotent by construction: a second run matches nothing.
 func deleteTenantSubgraphQuery(tenantID string) q {
 	return q{
 		text: `MATCH (n {tenant_id: $tenant_id})

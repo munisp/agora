@@ -59,7 +59,7 @@ def test_detect_run_full_sweep_for_tenant(api, client, graph):
     assert set(body["detectors"]) == {
         "d1_referral_cycle", "d2_sybil_cluster", "d3_capture_velocity",
         "d4_geo_impossibility", "d5_consent_backdating", "d6_ghost_booking",
-        "d7_gnn_anomaly", "d8_report_spam",
+        "d7_gnn_anomaly", "d8_report_spam", "d9_document_abuse",
     }
 
 
@@ -75,8 +75,8 @@ def test_detect_status(api):
     body = resp.json()
     assert body["sweep_enabled"] is False  # fixture disables the sweep loop
     assert body["alerts_topic"] == "opendesk.fraud.alerts.v1"
-    assert len(body["detectors"]) == 8
-    assert body["detector_count"] == 8
+    assert len(body["detectors"]) == 9
+    assert body["detector_count"] == 9
     # SPEC-W45 K23 (OOS-20): status must NOT leak evasion thresholds.
     assert "thresholds" not in body
     assert "sweep_minutes" not in body

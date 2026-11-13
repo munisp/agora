@@ -66,8 +66,10 @@ Scores rank *within* already-eligible populations. They never override consent, 
 | D5 | `consent_backdating` | CONSENTED.granted_at after first MESSAGED.at for that purpose | **always high** | **never** — compliance queue |
 | D6 | `ghost_booking` | ≥3 create→cancel cycles ≤10 min apart by same staff/day | medium | never |
 | D7 | `gnn_anomaly` | `risk_score` ≥ 0.9 from the W29 sweep | low/medium | never |
+| D8 | `report_spam` | Civic report velocity (> `CIVIC_REPORT_MAX_PER_DAY` (5) cases/UTC-day by one reporter) + coordinated spam (> `CIVIC_COORD_CASE_THRESHOLD` (3) open same-category cases within `CIVIC_COORD_RADIUS_M` (500 m) and `CIVIC_COORD_WINDOW_HOURS` (24 h) across different reporters) over the W32 Case projection | **always medium** | **never** — citizens are never banned from reporting; triage hints only |
+| D9 | `document_abuse` | Duplicate/tampered OCR documents over hash-only `(:Document)` stubs projected by graph-sync from `opendesk.ocr.events`: sha256 exact-duplicates (≥ `D9_DUP_MIN_COUNT` (2)), phash hamming ≤ `D9_PHASH_HAMMING_MAX` (6) near-duplicates, phash-identical + different-sha256 tamper-suspect pairs | medium; high at ≥ `D9_DUP_HIGH_COUNT` (3) exact duplicates | **never** |
 
-Thresholds are env-tunable on fraud-engine (see compose). Cadence: event-driven triggers for D3/D5 plus a full sweep every `FRAUD_SWEEP_MINUTES` (default 15). Dedup: one open alert per (type, person) — re-sweeps merge, never duplicate.
+Thresholds are env-tunable on fraud-engine (see compose). Cadence: event-driven triggers for D3/D5/D8/D9 (capture/lead, consent/messaging, civic, and ocr `DocumentExtracted` events) plus a full sweep every `FRAUD_SWEEP_MINUTES` (default 15). Dedup: one open alert per (type, person) — re-sweeps merge, never duplicate (D9 alerts are personless; they dedup per document/pair key).
 
 ### 3.2 Alert lifecycle
 

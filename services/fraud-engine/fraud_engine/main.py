@@ -38,11 +38,13 @@ log = logging.getLogger("fraud_engine")
 # events, D5 on consent/messaging events; SPEC-W32 §3 WS-D: D8 on civic
 # case events). "funnel" covers com.opendesk.cac.FunnelEvent, the REAL type
 # produced on cac.events by booking-service leads.go (EventTypeFunnel);
-# "capture"/"lead" are kept for legacy-type compatibility.
+# "capture"/"lead" are kept for legacy-type compatibility. SPEC-W55: D9 on
+# ocr events (com.opendesk.ocr.DocumentExtracted -> "documentextracted").
 EVENT_TRIGGERS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("capture", "lead", "funnel"), ("d3_capture_velocity",)),
     (("consent", "messag"), ("d5_consent_backdating",)),
     (("civic",), ("d8_report_spam",)),
+    (("documentextracted", "ocr"), ("d9_document_abuse",)),
 )
 
 

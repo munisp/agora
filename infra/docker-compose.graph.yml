@@ -245,6 +245,10 @@ services:
       GRAPH_SYNC_TRANSCRIPTS_TOPIC: ${GRAPH_SYNC_TRANSCRIPTS_TOPIC:-opendesk.conversation.transcripts}
       GRAPH_SYNC_ERASURE_TOPIC: ${GRAPH_SYNC_ERASURE_TOPIC:-opendesk.consent.erasure.v1}
       GRAPH_SYNC_ENRICHMENT_TOPIC: ${GRAPH_SYNC_ENRICHMENT_TOPIC:-opendesk.graph.enrichment.v1}
+      # SPEC-W55: OCR consumer (hash-only (:Document) stubs for fraud D9;
+      # empty = consumer skipped, civic/CAC pattern). Name matches
+      # graph-sync config.go GRAPH_SYNC_OCR_TOPIC exactly.
+      GRAPH_SYNC_OCR_TOPIC: ${GRAPH_SYNC_OCR_TOPIC:-opendesk.ocr.events}
       # graph-sync config reads GRAPH_ERASURE_DONE_TOPIC (no _SYNC_ infix).
       GRAPH_ERASURE_DONE_TOPIC: ${GRAPH_ERASURE_DONE_TOPIC:-opendesk.graph.erasure.done.v1}
       GRAPH_SYNC_DLQ_TOPIC: ${GRAPH_SYNC_DLQ_TOPIC:-opendesk.dlq}
@@ -459,7 +463,9 @@ services:
       # (fraud_engine/config.py) — `cac.events` is the UNPREFIXED funnel
       # topic booking-service leads actually publish (`opendesk.cac.events`
       # was dead — no producer writes it); plus the live civic stream.
-      FRAUD_KAFKA_TOPICS: ${FRAUD_KAFKA_TOPICS:-cac.events,opendesk.booking.events,opendesk.identity.events,opendesk.civic.events.v1}
+      # SPEC-W55: opendesk.ocr.events added — com.opendesk.ocr.DocumentExtracted
+      # triggers D9 document_abuse (matches the config.py code default exactly).
+      FRAUD_KAFKA_TOPICS: ${FRAUD_KAFKA_TOPICS:-cac.events,opendesk.booking.events,opendesk.identity.events,opendesk.civic.events.v1,opendesk.ocr.events}
       CAPTURE_VELOCITY_MAX: ${CAPTURE_VELOCITY_MAX:-30}
       SYBIL_WINDOW_MIN: ${SYBIL_WINDOW_MIN:-60}
       SYBIL_SIM_THRESHOLD: ${SYBIL_SIM_THRESHOLD:-0.98}
@@ -467,6 +473,12 @@ services:
       GHOST_MIN: ${GHOST_MIN:-3}
       GHOST_WINDOW_MIN: ${GHOST_WINDOW_MIN:-10}
       ANOMALY_ALERT_THRESHOLD: ${ANOMALY_ALERT_THRESHOLD:-0.9}
+      # SPEC-W55 D9 document_abuse thresholds — defaults match
+      # fraud_engine/config.py EXACTLY (ORPH O3/O11 parity rule).
+      D9_LOOKBACK_DAYS: ${D9_LOOKBACK_DAYS:-30}
+      D9_DUP_MIN_COUNT: ${D9_DUP_MIN_COUNT:-2}
+      D9_DUP_HIGH_COUNT: ${D9_DUP_HIGH_COUNT:-3}
+      D9_PHASH_HAMMING_MAX: ${D9_PHASH_HAMMING_MAX:-6}
     ports:
       - "7017:7017/tcp"   # dev/e2e reachability; not routed through APISIX
     networks:

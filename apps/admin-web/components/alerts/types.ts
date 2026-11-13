@@ -30,6 +30,8 @@ export const ALERT_TYPES = [
   { value: "consent_backdating", label: "Consent backdating" },
   { value: "ghost_booking", label: "Ghost bookings" },
   { value: "gnn_anomaly", label: "Anomalous actor" },
+  { value: "report_spam", label: "Report spam" },
+  { value: "document_abuse", label: "Duplicate document" },
 ] as const;
 
 export const ALERT_STATUSES = [

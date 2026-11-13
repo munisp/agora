@@ -40,6 +40,8 @@ graph-sync) + a full sweep every `FRAUD_SWEEP_MINUTES` (15).
 | D5 `d5_consent_backdating` | `consent_backdating` | CONSENTED `granted_at` AFTER first MESSAGED `at` for same person+purpose | **high always** (compliance-critical) |
 | D6 `d6_ghost_booking` | `ghost_booking` | ≥ `GHOST_MIN` (3) create→cancel flash cycles ≤ `GHOST_WINDOW_MIN` (10) by same staff in a day | medium |
 | D7 `d7_gnn_anomaly` | `gnn_anomaly` | consumes `Person.risk_score` ≥ `ANOMALY_ALERT_THRESHOLD` (0.9), written by the W29 sweep | low; ≥ `ANOMALY_MEDIUM_THRESHOLD` (0.97) → medium |
+| D8 `d8_report_spam` | `report_spam` | W32 civic Case projection: one reporter > `CIVIC_REPORT_MAX_PER_DAY` (5) cases/UTC-day, or > `CIVIC_COORD_CASE_THRESHOLD` (3) open same-category cases within `CIVIC_COORD_RADIUS_M` (500 m) / `CIVIC_COORD_WINDOW_HOURS` (24 h) across different reporters | **medium always**; never auto-quarantines (citizens are never banned from reporting — triage hints only) |
+| D9 `d9_document_abuse` | `document_abuse` | hash-only `(:Document)` stubs (graph-sync, `opendesk.ocr.events`): sha256 exact-dups ≥ `D9_DUP_MIN_COUNT` (2) in `D9_LOOKBACK_DAYS` (30); phash hamming ≤ `D9_PHASH_HAMMING_MAX` (6) near-dups; phash-identical + different-sha256 tamper-suspect pairs | medium; ≥ `D9_DUP_HIGH_COUNT` (3) exact dups → high; **never auto-quarantines** (personless findings) |
 
 Dedup/idempotency: `alert_id = type:tenant:person:dedup_key`, MERGEed
 (SPEC §5 gate 5: N sweeps → ≤1 open alert per (type,person)). CloudEvents

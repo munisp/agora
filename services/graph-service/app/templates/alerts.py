@@ -21,6 +21,8 @@ ALERT_TYPES: frozenset[str] = frozenset(
         "consent_backdating",
         "ghost_booking",
         "gnn_anomaly",
+        "report_spam",
+        "document_abuse",
     }
 )
 ALERT_SEVERITIES: frozenset[str] = frozenset({"low", "medium", "high"})

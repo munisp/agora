@@ -77,6 +77,18 @@ Nodes:
 - `Location {tenant_id, lga?, ward?, lat?, lon?}`
 - `Campaign {campaign_id, tenant_id, kind}`
 - `Tenant {tenant_id, slug}` — single node per tenant; anchor for isolation checks
+- `Document {tenant_id, document_id, kind, status, sha256, phash, page_count, model_version, created_at}` — hash-only OCR stub (SPEC-W55, see note below)
+
+**Document stubs (SPEC-W55):** `Document` nodes are hash-only OCR stubs
+projected by graph-sync (env `GRAPH_SYNC_OCR_TOPIC`, default
+`opendesk.ocr.events`) from `com.opendesk.ocr.DocumentExtracted` events,
+MERGEd on `(tenant_id, document_id)`. They carry hashes + metadata only —
+never `extracted_text`/`extracted_fields` or storage locations (PII
+minimization). The sole consumer is fraud detector D9 (`document_abuse`).
+They have **no person linkage by design** (erasure gate) and, per the
+isolation ruling above, never cross tenants — no cross-tenant duplicate
+detection in v1. Erasure: tenant-wipe only (`DeleteTenantSubgraph` removes
+every node with the tenant's `tenant_id`); person erasure never touches them.
 
 Edges:
 
