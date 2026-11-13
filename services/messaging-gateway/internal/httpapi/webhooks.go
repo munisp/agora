@@ -20,13 +20,18 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/opendesk/messaging-gateway/internal/channel"
+	"github.com/opendesk/messaging-gateway/internal/media"
+	"github.com/opendesk/messaging-gateway/internal/provider"
 	"go.uber.org/zap"
 )
 
@@ -63,7 +68,7 @@ func (s *Server) handleWhatsAppVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 // waWebhook is the Meta Cloud API webhook payload shape (only the fields
-// the bridge needs).
+// the bridge and the SPEC-W60 media funnel need).
 type waWebhook struct {
 	Entry []struct {
 		Changes []struct {
@@ -71,19 +76,37 @@ type waWebhook struct {
 				Metadata struct {
 					PhoneNumberID string `json:"phone_number_id"`
 				} `json:"metadata"`
-				Messages []struct {
-					From      string `json:"from"` // E.164 without '+'
-					ID        string `json:"id"`
-					Timestamp string `json:"timestamp"` // unix seconds, string-typed by Meta
-					Type      string `json:"type"`
-					Text      struct {
-						Body string `json:"body"`
-					} `json:"text"`
-				} `json:"messages"`
+				Messages []waMessage       `json:"messages"`
 				Statuses []json.RawMessage `json:"statuses"`
 			} `json:"value"`
 		} `json:"changes"`
 	} `json:"entry"`
+}
+
+// waMessage is one inbound WhatsApp message. Text carries the text body;
+// image/document (SPEC-W60 A1) carry the media block Meta fetches by id.
+// The caption is PII — it is parsed (so the payload is well-formed) but
+// NEVER logged and NEVER sent to OCR (P8).
+type waMessage struct {
+	From      string `json:"from"` // E.164 without '+'
+	ID        string `json:"id"`
+	Timestamp string `json:"timestamp"` // unix seconds, string-typed by Meta
+	Type      string `json:"type"`
+	Text      struct {
+		Body string `json:"body"`
+	} `json:"text"`
+	Image    *waMediaBlock `json:"image"`
+	Document *waMediaBlock `json:"document"`
+}
+
+// waMediaBlock is the image/document block of a waMessage (snake_case per
+// the Meta wire format).
+type waMediaBlock struct {
+	ID       string `json:"id"`
+	MimeType string `json:"mime_type"`
+	SHA256   string `json:"sha256"`
+	Caption  string `json:"caption"`  // PII — never logged, never forwarded (P8)
+	Filename string `json:"filename"` // passed to OCR for extension validation only
 }
 
 // verifyWhatsAppSignature enforces the Meta WhatsApp webhook signature
@@ -122,10 +145,12 @@ func (s *Server) verifyWhatsAppSignature(w http.ResponseWriter, r *http.Request)
 }
 
 // handleWhatsAppWebhook ingests inbound WhatsApp messages. Text messages
-// are normalized and bridged; statuses[] delivery receipts and non-text
-// message types are ignored. Always 200 (SPEC-W6 §A1) except 401 for a
-// missing/invalid X-Hub-Signature-256 (authentication failure — Meta does
-// not retry-storm on those).
+// are normalized and bridged; image/document messages go through the
+// SPEC-W60 media->OCR funnel (behind WHATSAPP_MEDIA_ENABLED); statuses[]
+// delivery receipts and every other message type are ignored. Always 200
+// (SPEC-W6 §A1) except 401 for a missing/invalid X-Hub-Signature-256
+// (authentication failure — Meta does not retry-storm on those) and 500 for
+// a transient bridge/fetch/OCR failure (N-05: Meta redelivers).
 func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 	body, ok := s.verifyWhatsAppSignature(w, r)
 	if !ok {
@@ -143,27 +168,39 @@ func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 		for _, change := range entry.Changes {
 			v := change.Value
 			// v.Statuses (delivery receipts) are ignored silently — only
-			// messages[] below produce bridge work.
-			for _, m := range v.Messages {
-				if m.Type != "text" {
-					s.Log.Info("whatsapp webhook: ignoring non-text message",
+			// messages[] below produce bridge/media work.
+			for i := range v.Messages {
+				m := &v.Messages[i]
+				switch m.Type {
+				case "text":
+					ts, _ := strconv.ParseInt(m.Timestamp, 10, 64)
+					err := s.bridge(r.Context(), channel.InboundMessage{
+						Channel:   "whatsapp",
+						From:      m.From,
+						MessageID: m.ID,
+						Text:      m.Text.Body,
+						Timestamp: ts,
+					}, v.Metadata.PhoneNumberID)
+					if err != nil {
+						// N-05 fail-loud: 500 → Meta redelivers; the bridge
+						// dedupes on MessageID so the redelivery skips the
+						// already-completed steps.
+						writeError(w, http.StatusInternalServerError, "bridge processing failed")
+						return
+					}
+				case "image", "document":
+					// SPEC-W60: media -> OCR funnel. Transient failures
+					// answer 500 (N-05 redelivery; the media dedupe claims
+					// only on success); deterministic rejects (mime /
+					// oversize / checksum / OCR 415) answer 200 (P6).
+					if err := s.ingestWhatsAppMedia(r.Context(), v.Metadata.PhoneNumberID, m); err != nil {
+						writeError(w, http.StatusInternalServerError, "media processing failed")
+						return
+					}
+				default:
+					s.Log.Info("whatsapp webhook: ignoring unsupported message type",
 						zap.String("type", m.Type), zap.String("message_id", m.ID))
 					continue
-				}
-				ts, _ := strconv.ParseInt(m.Timestamp, 10, 64)
-				err := s.bridge(r.Context(), channel.InboundMessage{
-					Channel:   "whatsapp",
-					From:      m.From,
-					MessageID: m.ID,
-					Text:      m.Text.Body,
-					Timestamp: ts,
-				}, v.Metadata.PhoneNumberID)
-				if err != nil {
-					// N-05 fail-loud: 500 → Meta redelivers; the bridge
-					// dedupes on MessageID so the redelivery skips the
-					// already-completed steps.
-					writeError(w, http.StatusInternalServerError, "bridge processing failed")
-					return
 				}
 			}
 		}
@@ -249,6 +286,214 @@ func (s *Server) bridge(parent context.Context, msg channel.InboundMessage, rout
 			zap.String("channel", msg.Channel), zap.Error(err))
 		return err
 	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// WhatsApp inbound media -> OCR funnel (SPEC-W60, Option A)
+// ---------------------------------------------------------------------------
+
+// mediaDedupeTTL bounds how long a completed media message id is remembered
+// (mirrors bridge.go: provider redelivery storms are minutes, not days).
+const mediaDedupeTTL = 24 * time.Hour
+
+// mediaDedupeMaxEntries bounds the dedupe map (every cache needs a bound;
+// mirrors bridge.go bridgeDedupeMaxEntries).
+const mediaDedupeMaxEntries = 100_000
+
+// MediaDeduper dedupes completed media ingestions on the provider message
+// id (N-05 idiom, claim-on-success-only: only mark()ed — i.e. fully
+// ingested — ids are remembered, so a redelivery after a FAILED attempt
+// re-runs the whole fetch->OCR pipeline). In-memory and per-replica, like
+// the bridge's dedupe heap.
+type MediaDeduper struct {
+	mu   sync.Mutex
+	done map[string]time.Time
+	now  func() time.Time // injectable for tests
+}
+
+// NewMediaDeduper builds an empty deduper.
+func NewMediaDeduper() *MediaDeduper {
+	return &MediaDeduper{done: map[string]time.Time{}, now: time.Now}
+}
+
+// SetClock injects the clock used by the dedupe window (tests).
+func (d *MediaDeduper) SetClock(now func() time.Time) { d.now = now }
+
+// seen reports whether the message id was fully ingested within the dedupe
+// window. Empty ids cannot dedupe (processed every time).
+func (d *MediaDeduper) seen(id string) bool {
+	if id == "" {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.sweepLocked(d.now())
+	_, ok := d.done[id]
+	return ok
+}
+
+// mark records a completed ingestion (call on SUCCESS only — a failure must
+// release the claim so the redelivery retries).
+func (d *MediaDeduper) mark(id string) {
+	if id == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := d.now()
+	d.sweepLocked(now)
+	d.done[id] = now
+	// Capacity bound: at the cap, drop expired entries first, then the
+	// oldest survivors (a capacity eviction at 100k ids ≈ a full day of
+	// traffic cannot open a realistic replay window).
+	if len(d.done) > mediaDedupeMaxEntries {
+		var oldest string
+		var oldestAt time.Time
+		first := true
+		for k, at := range d.done {
+			if first || at.Before(oldestAt) {
+				oldest, oldestAt, first = k, at, false
+			}
+		}
+		if oldest != "" {
+			delete(d.done, oldest)
+		}
+	}
+}
+
+// sweepLocked expires completions past the TTL. Caller holds d.mu.
+func (d *MediaDeduper) sweepLocked(now time.Time) {
+	if len(d.done) < 1024 {
+		return // tiny maps: TTL is enforced on read anyway via seen(); sweep lazily
+	}
+	for k, at := range d.done {
+		if now.Sub(at) > mediaDedupeTTL {
+			delete(d.done, k)
+		}
+	}
+}
+
+// sha256Prefix is the P8 log form of a hash: prefix only, never the value
+// (and never the bytes/caption it summarizes).
+func sha256Prefix(sum string) string {
+	if len(sum) > 12 {
+		return sum[:12]
+	}
+	return sum
+}
+
+// ingestWhatsAppMedia runs the SPEC-W60 media funnel for one image/document
+// message. P3 cost-gate order: site-map resolve FIRST (unmapped
+// phone_number_id drops BEFORE any fetch) → dedupe BEFORE fetch
+// (claim-on-success) → per-sender throttle (P4) → Meta 2-GET fetch (P5) →
+// OCR POST. A returned error answers 500 (N-05 redelivery); deterministic
+// rejects (P6: mime / oversize / checksum / OCR 415) return nil after a
+// drop-log so Meta never redelivers them. P8: logs carry ids, byte counts
+// and sha256 prefixes ONLY — never the caption, never the bytes.
+func (s *Server) ingestWhatsAppMedia(ctx context.Context, phoneNumberID string, m *waMessage) error {
+	block := m.Image
+	if block == nil {
+		block = m.Document
+	}
+	// P7 rollout flag: off => drop + log exactly like the pre-W60 posture
+	// (zero behavior change on upgrade).
+	if !s.WhatsAppMediaEnabled {
+		s.Log.Info("whatsapp webhook: ignoring non-text message",
+			zap.String("type", m.Type), zap.String("message_id", m.ID))
+		return nil
+	}
+	if block == nil || block.ID == "" {
+		s.Log.Info("whatsapp media: empty media block, dropping",
+			zap.String("type", m.Type), zap.String("message_id", m.ID))
+		return nil
+	}
+	// P6/P5 mime allow-list on the DECLARED mime BEFORE any fetch: audio /
+	// video / stickers / gif are structurally excluded (and cost nothing).
+	if !provider.AllowedWhatsAppMime(block.MimeType) {
+		s.Log.Info("whatsapp media: mime not allowed, dropping (no fetch)",
+			zap.String("mime_type", block.MimeType), zap.String("message_id", m.ID))
+		return nil
+	}
+	// P3 cost gate 1: tenant resolve via the EXISTING CHANNEL_SITE_MAP
+	// before any byte is fetched (unmapped route = unroutable, drop).
+	site, ok := s.Sites["whatsapp:"+phoneNumberID]
+	if !ok {
+		s.Log.Info("whatsapp media dropped: no CHANNEL_SITE_MAP entry",
+			zap.String("route_id", phoneNumberID), zap.String("message_id", m.ID))
+		return nil
+	}
+	tenantID, err := uuid.Parse(site.TenantID)
+	if err != nil {
+		// Misconfigured site map (R9): deterministic, redelivery cannot fix.
+		s.Log.Error("whatsapp media dropped: CHANNEL_SITE_MAP tenant_id is not a uuid",
+			zap.String("route_id", phoneNumberID), zap.String("message_id", m.ID))
+		return nil
+	}
+	// P3 cost gate 2: dedupe BEFORE fetch (redelivery after success = no-op;
+	// claim recorded on success only, bridge.go:200-204 idiom).
+	deduper := s.MediaDedupe
+	if deduper == nil {
+		deduper = NewMediaDeduper() // defensive; Router() always initializes
+	}
+	if deduper.seen(m.ID) {
+		s.Log.Info("whatsapp media redelivery skipped (already ingested)",
+			zap.String("message_id", m.ID))
+		return nil
+	}
+	// P4: per-sender sliding-window throttle (R3 — APISIX limit-count keys
+	// Meta's egress IPs, NOT senders, so this service-side per-phone limit
+	// is REQUIRED). A tripped throttle is a 200 drop: redelivery cannot
+	// help and must not storm.
+	if s.MediaRate != nil && !s.MediaRate.Allow(m.From) {
+		s.Log.Warn("whatsapp media dropped: per-sender throttle tripped",
+			zap.String("message_id", m.ID),
+			zap.String("tenant_id", tenantID.String()))
+		return nil
+	}
+	// P7 fail-closed: flag on but OCR unconfigured => per-message drop
+	// (fail-visible error log; boot already logged CRITICAL).
+	if s.Media == nil || !s.Media.Configured() {
+		s.Log.Error("whatsapp media dropped: OCR not configured (OCR_SERVICE_URL / OCR_INTERNAL_TOKEN unset) — fail-closed",
+			zap.String("message_id", m.ID), zap.String("tenant_id", tenantID.String()))
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, webhookTimeout)
+	defer cancel()
+	mediaBlob, err := s.WhatsApp.FetchMedia(ctx, block.ID)
+	if err != nil {
+		if provider.DeterministicMediaError(err) {
+			// P6: mime/oversize/checksum rejects never redelivery-storm.
+			s.Log.Warn("whatsapp media dropped: deterministic fetch reject",
+				zap.String("message_id", m.ID), zap.String("tenant_id", tenantID.String()), zap.Error(err))
+			return nil
+		}
+		s.Log.Warn("whatsapp media fetch failed (redelivery will retry)",
+			zap.String("message_id", m.ID), zap.String("tenant_id", tenantID.String()), zap.Error(err))
+		return err
+	}
+	docID, err := s.Media.Extract(ctx, tenantID, mediaBlob.MimeType, block.Filename, mediaBlob.Data)
+	if err != nil {
+		if errors.Is(err, media.ErrRejectedMedia) {
+			// P6: OCR 415 (AV-infected / failed validation) => 200 + log.
+			s.Log.Warn("whatsapp media dropped: ocr rejected (415)",
+				zap.String("message_id", m.ID), zap.String("tenant_id", tenantID.String()))
+			return nil
+		}
+		s.Log.Warn("whatsapp media ocr failed (redelivery will retry)",
+			zap.String("message_id", m.ID), zap.String("tenant_id", tenantID.String()), zap.Error(err))
+		return err
+	}
+	deduper.mark(m.ID) // claim recorded on SUCCESS only
+	// P9 audit record (structured log; the ocr_documents row is the durable
+	// record). P8: ids/byte-counts/sha256-prefix only.
+	s.Log.Info("whatsapp.media.ingested",
+		zap.String("tenant_id", tenantID.String()),
+		zap.String("message_id", m.ID),
+		zap.String("document_id", docID),
+		zap.Int("bytes", len(mediaBlob.Data)),
+		zap.String("sha256_prefix", sha256Prefix(mediaBlob.SHA256)))
 	return nil
 }
 

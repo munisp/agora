@@ -23,8 +23,8 @@ for provider setup and channel routing.
 | POST | `/ussd/callback/{secret}` | form `sessionId/serviceCode/phoneNumber/text` | Africa's Talking USSD session callback (SPEC-W12 §1 + SPEC-W45 K14) |
 
 `/healthz` also reports the reachability of the resolved internal bases
-(`upstreams`: conversation / voice / booking) — warn-level only, liveness
-stays 200.
+(`upstreams`: conversation / voice / booking / ocr) — warn-level only,
+liveness stays 200.
 
 The USSD callback is authenticated by a shared secret **in the path** (the
 AT dashboard configures a bare callback URL, no custom headers):
@@ -58,6 +58,11 @@ callbacks per minute (default 30, in-memory sliding window — per-replica).
 | `WHATSAPP_TOKEN` | — | WhatsApp Cloud API access token |
 | `WHATSAPP_PHONE_NUMBER_ID` | — | WhatsApp Business phone number id |
 | `WHATSAPP_BASE_URL` | `https://graph.facebook.com/v21.0` | Override (tests / mock) |
+| `WHATSAPP_APP_SECRET` | — | Meta app secret — verifies the `X-Hub-Signature-256` HMAC on inbound posts; **production-required**, fail-closed `401` on every post when unset and `WHATSAPP_MOCK` is off (SPEC-W60 P10) |
+| `WHATSAPP_MEDIA_ENABLED` | `false` | SPEC-W60: inbound WhatsApp image/PDF → ocr-service funnel; off = media dropped + logged exactly as pre-W60 |
+| `OCR_SERVICE_URL` | — | ocr-service base URL for the media funnel (SAME shared var as booking/kyc — one `.env` entry wires all callers; empty with the flag on = boot CRITICAL + per-message drop, fail-visible) |
+| `OCR_INTERNAL_TOKEN` | — | `X-Internal-Token` for ocr-service calls (SAME shared secret var; constant-time compared server-side) |
+| `WHATSAPP_MEDIA_RATE_PER_MINUTE` | `10` | Per-sender inbound-media cap (sliding window, in-memory per replica — USSD precedent); tripped sender gets `200` + drop-log |
 | `AT_CALLBACK_SECRET` | — | USSD callback path secret (K14); unset = every callback `503` (fail-closed) |
 | `USSD_RATE_LIMIT_PER_MINUTE` | `30` | Per-phone USSD callback cap (sliding window, in-memory) |
 | `CONVERSATION_URL` / `VOICE_RUNTIME_URL` / `BOOKING_URL` / `IDENTITY_URL` | — | Direct-base overrides for the internal upstreams |

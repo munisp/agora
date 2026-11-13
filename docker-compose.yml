@@ -532,6 +532,11 @@ services:
       # Omnichannel inbound (SPEC-W6 Part A): provider webhooks terminate on
       # /webhooks/* (public via the APISIX webhooks-messaging route).
       WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+      # SPEC-W60 (P10): Meta app secret for the X-Hub-Signature-256 HMAC on
+      # inbound WhatsApp posts — fail-closed 401 on every post when unset
+      # and WHATSAPP_MOCK is off. PRODUCTION REQUIRED; the empty default is
+      # only tolerable alongside the DEV ONLY mock below.
+      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
       TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
@@ -539,6 +544,23 @@ services:
       # {"whatsapp:<phone_number_id>":{"site_slug":"...","tenant_id":"<uuid>"},
       #  "telegram:<bot_username>":{"site_slug":"...","tenant_id":"<uuid>"}}
       CHANNEL_SITE_MAP: ${CHANNEL_SITE_MAP:-}
+      # SPEC-W60 (P10): inbound WhatsApp media (image/document) -> ocr-service
+      # /v1/ocr/extract funnel. Caller side of the internal-auth contract
+      # (W44 K2): the call carries X-Internal-Token matching the ocr block's
+      # OCR_INTERNAL_TOKEN (SAME shared secret var — one .env entry wires
+      # booking, kyc AND the gateway). Same DEV ONLY default; prod via the
+      # secrets store. WHATSAPP_MEDIA_ENABLED defaults false — media drops +
+      # logs exactly as pre-W60 (zero behavior change on upgrade); with the
+      # flag on and the OCR envs unset the gateway logs CRITICAL at boot and
+      # drops media per-message (fail-visible, receipt.go:50-55 posture).
+      OCR_SERVICE_URL: ${OCR_SERVICE_URL:-http://ocr:7020}
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:-opendesk-dev-ocr-internal-token-change-in-prod}
+      WHATSAPP_MEDIA_ENABLED: ${WHATSAPP_MEDIA_ENABLED:-false}
+      # Per-sender inbound-media throttle (per-minute sliding window,
+      # in-memory per replica — mirrors the USSD ratelimit.go precedent).
+      # REQUIRED because the APISIX limit-count keys Meta's egress IPs, not
+      # individual senders (R3); a tripped sender gets 200 + drop-log.
+      WHATSAPP_MEDIA_RATE_PER_MINUTE: ${WHATSAPP_MEDIA_RATE_PER_MINUTE:-10}
       # Inbound bridge upstreams. Empty = via the Dapr sidecar invoke API on
       # DAPR_HTTP_PORT (requires a daprd sidecar for app-id
       # messaging-gateway). For sidecar-less dev, uncomment the direct bases:

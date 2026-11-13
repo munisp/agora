@@ -13,6 +13,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/opendesk/messaging-gateway/internal/channel"
+	"github.com/opendesk/messaging-gateway/internal/media"
 	"github.com/opendesk/messaging-gateway/internal/metrics"
 	"github.com/opendesk/messaging-gateway/internal/provider"
 	"go.uber.org/zap"
@@ -46,8 +48,24 @@ type Server struct {
 	// /ussd/callback/{secret}.
 	USSD *USSDConfig // nil/empty secret: USSD disabled, callbacks fail-closed 503
 
+	// WhatsApp inbound media -> OCR funnel (SPEC-W60). When
+	// WhatsAppMediaEnabled is false (WHATSAPP_MEDIA_ENABLED, default false)
+	// image/document messages drop + log exactly like the pre-W60 posture
+	// (P7). Sites is the parsed CHANNEL_SITE_MAP used to resolve the tenant
+	// BEFORE any Meta fetch (P3 cost gate; the bridge resolves its own copy
+	// for the text path). Media is the ocr-service client — nil or
+	// unconfigured => fail-closed per-message drop + error log (P7).
+	// MediaRate is the per-sender sliding-window throttle (P4, mirrors the
+	// ratelimit.go USSD precedent). MediaDedupe dedupes redeliveries on the
+	// provider message id, claim-on-success (P3).
+	WhatsAppMediaEnabled bool
+	Sites                map[string]channel.Site
+	Media                *media.OCRClient
+	MediaRate            *PhoneRateLimiter
+	MediaDedupe          *MediaDeduper // nil: Router() initializes one
+
 	// Upstreams are the resolved internal bases (conversation / voice /
-	// booking) probed by /healthz (SPEC-W45 ORPH O2): reachability is
+	// booking / ocr) probed by /healthz (SPEC-W45 ORPH O2): reachability is
 	// REPORTED (warn-level) but never changes the 200 — the gateway itself
 	// is healthy and serving provider webhooks regardless.
 	Upstreams []UpstreamCheck
@@ -61,6 +79,9 @@ type Server struct {
 
 // Router builds the chi router.
 func (s *Server) Router() http.Handler {
+	if s.MediaDedupe == nil {
+		s.MediaDedupe = NewMediaDeduper()
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
@@ -109,7 +130,7 @@ func (s *Server) Router() http.Handler {
 
 // UpstreamCheck is one resolved internal base reported by /healthz.
 type UpstreamCheck struct {
-	Name string // "conversation" | "voice" | "booking"
+	Name string // "conversation" | "voice" | "booking" | "ocr"
 	Base string // fully resolved base (direct or Dapr invoke)
 }
 

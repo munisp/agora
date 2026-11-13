@@ -18,6 +18,7 @@ import (
 	"github.com/opendesk/messaging-gateway/internal/channel"
 	"github.com/opendesk/messaging-gateway/internal/config"
 	"github.com/opendesk/messaging-gateway/internal/httpapi"
+	"github.com/opendesk/messaging-gateway/internal/media"
 	"github.com/opendesk/messaging-gateway/internal/metrics"
 	"github.com/opendesk/messaging-gateway/internal/provider"
 	"go.uber.org/zap"
@@ -116,6 +117,31 @@ func run() error {
 		{Name: "conversation", Base: convBase},
 		{Name: "voice", Base: voiceBase},
 		{Name: "booking", Base: bookingBase},
+	}
+
+	// SPEC-W60: WhatsApp inbound media -> OCR funnel. The site map is shared
+	// with the bridge (media resolves the tenant BEFORE any Meta fetch — the
+	// P3 cost gate); the per-sender throttle mirrors the USSD
+	// ratelimit.go precedent (P4/R3: APISIX limit-count keys Meta's egress
+	// IPs, not senders). P7: flag off => media drops + logs exactly like
+	// pre-W60; flag on with OCR envs unset => boot CRITICAL + fail-closed
+	// per-message drop (receipt.go fail-visible posture).
+	srv.Sites = siteMap
+	srv.WhatsAppMediaEnabled = cfg.WhatsAppMediaEnabled
+	srv.MediaRate = httpapi.NewPhoneRateLimiter(cfg.WhatsAppMediaRatePerMinute, time.Minute)
+	srv.Media = media.NewOCRClient(cfg.OCRServiceURL, cfg.OCRInternalToken, logger)
+	switch {
+	case !cfg.WhatsAppMediaEnabled:
+		logger.Info("whatsapp media ingest disabled (WHATSAPP_MEDIA_ENABLED=false) — media messages drop like pre-W60")
+	case !srv.Media.Configured():
+		logger.Error("CRITICAL: WHATSAPP_MEDIA_ENABLED=true but OCR_SERVICE_URL / OCR_INTERNAL_TOKEN unset — media messages will be DROPPED per-message (fail-closed)",
+			zap.Bool("ocr_service_url", cfg.OCRServiceURL != ""),
+			zap.Bool("ocr_internal_token", cfg.OCRInternalToken != ""))
+	default:
+		logger.Info("whatsapp media ingest enabled",
+			zap.String("ocr_client", srv.Media.String()),
+			zap.Int("media_rate_per_minute", cfg.WhatsAppMediaRatePerMinute))
+		srv.Upstreams = append(srv.Upstreams, httpapi.UpstreamCheck{Name: "ocr", Base: cfg.OCRServiceURL})
 	}
 	// Boot-time reachability probe: fail-loud (WARN) but never fatal — the
 	// gateway still serves provider webhooks and /healthz keeps reporting.

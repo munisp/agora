@@ -37,6 +37,21 @@ type Config struct {
 	TelegramBaseURL       string // TELEGRAM_BASE_URL override (tests), default https://api.telegram.org
 	ChannelSiteMap        string // CHANNEL_SITE_MAP raw JSON (channel identity → site/tenant)
 
+	// WhatsApp inbound media -> OCR funnel (SPEC-W60, Option A).
+	// OCRServiceURL / OCRInternalToken reuse the SAME shared env vars as
+	// booking/kyc (one .env entry wires all three callers).
+	OCRServiceURL    string // OCR_SERVICE_URL (e.g. http://ocr:7020); empty = media funnel fail-closed
+	OCRInternalToken string // OCR_INTERNAL_TOKEN (X-Internal-Token machine auth, shared)
+	// WhatsAppMediaEnabled (WHATSAPP_MEDIA_ENABLED, default false) is the
+	// upgrade-safe rollout flag: false => image/document messages drop + log
+	// exactly like the pre-W60 posture.
+	WhatsAppMediaEnabled bool
+	// WhatsAppMediaRatePerMinute (WHATSAPP_MEDIA_RATE_PER_MINUTE) bounds
+	// media ingestions per sender phone (sliding window, in-memory,
+	// per-replica — the httpapi/ratelimit.go USSD idiom; P4/R3: APISIX
+	// limit-count keys Meta's egress IPs, not senders). Default 10.
+	WhatsAppMediaRatePerMinute int
+
 	// Internal upstreams for the inbound bridge (SPEC-W45 ORPH O2).
 	// Direct-base overrides win; with a Dapr sidecar (DaprSidecar) the
 	// invoke API is used; without one the direct-base defaults
@@ -111,15 +126,22 @@ func Load() Config {
 		WhatsAppAppSecret:     os.Getenv("WHATSAPP_APP_SECRET"),
 		// WHATSAPP_MOCK defaults OFF (SIM-007/SIM-008 fail-closed posture,
 		// KYC_MOCK idiom): only an explicit truthy value opts in.
-		WhatsAppMock:          envBool("WHATSAPP_MOCK", false),
-		TelegramBotToken:      os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramBotUsername:   os.Getenv("TELEGRAM_BOT_USERNAME"),
-		TelegramWebhookSecret: os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
-		TelegramBaseURL:       envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
-		ChannelSiteMap:        os.Getenv("CHANNEL_SITE_MAP"),
-		ConversationURL:       os.Getenv("CONVERSATION_URL"),
-		VoiceRuntimeURL:       os.Getenv("VOICE_RUNTIME_URL"),
-		DaprHTTPPort:          envInt("DAPR_HTTP_PORT", 3500),
+		WhatsAppMock:     envBool("WHATSAPP_MOCK", false),
+		OCRServiceURL:    os.Getenv("OCR_SERVICE_URL"),
+		OCRInternalToken: os.Getenv("OCR_INTERNAL_TOKEN"),
+		// WHATSAPP_MEDIA_ENABLED defaults OFF (P7 rollout flag; same
+		// envBool idiom as WHATSAPP_MOCK): only an explicit truthy value
+		// opts media ingest in.
+		WhatsAppMediaEnabled:       envBool("WHATSAPP_MEDIA_ENABLED", false),
+		WhatsAppMediaRatePerMinute: envInt("WHATSAPP_MEDIA_RATE_PER_MINUTE", 10),
+		TelegramBotToken:           os.Getenv("TELEGRAM_BOT_TOKEN"),
+		TelegramBotUsername:        os.Getenv("TELEGRAM_BOT_USERNAME"),
+		TelegramWebhookSecret:      os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
+		TelegramBaseURL:            envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
+		ChannelSiteMap:             os.Getenv("CHANNEL_SITE_MAP"),
+		ConversationURL:            os.Getenv("CONVERSATION_URL"),
+		VoiceRuntimeURL:            os.Getenv("VOICE_RUNTIME_URL"),
+		DaprHTTPPort:               envInt("DAPR_HTTP_PORT", 3500),
 		// A sidecar is present only when dapr injected its env — compose
 		// runs messaging-gateway WITHOUT one, so the bridge/ingest bases
 		// default to the direct service URLs (ORPH O2).

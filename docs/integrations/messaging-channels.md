@@ -113,6 +113,101 @@ as the request body to the gateway URL.
   no-show, waitlist claims, industry-pack messages) because all of them flow
   through the paced `NotifyPaced` → `notify` path with the tenant slug.
 
+## Inbound media (WhatsApp → OCR)
+
+SPEC-W60: inbound WhatsApp **images and PDF documents** posted to
+`POST /webhooks/whatsapp` are no longer dropped — the gateway fetches the
+bytes from Meta and funnels them into the same ocr-service pipeline
+(`POST /v1/ocr/extract`) that booking receipt uploads use, inheriting its
+magic-byte validation, 25 MB cap, ClamAV scan (W59), MinIO PII bucket and
+tenant-delete erasure.
+
+### Fetch flow (Meta 2-GET)
+
+The webhook message carries a media **id** (plus `mime_type`, `sha256`,
+`caption`, `filename`) — never the bytes. The gateway fetches with the same
+`WHATSAPP_TOKEN` bearer, in two GETs:
+
+1. `GET {WHATSAPP_BASE_URL}/{media-id}` → JSON `{url, mime_type, sha256,
+   file_size}` (retriable — idempotent).
+2. `GET {url}` (Meta lookaside host) → the bytes, streamed through a
+   25 MB + 1 `io.LimitReader` cap with a dedicated 30s HTTP client (the 10s
+   send client is too tight). Single attempt: a failure answers the webhook
+   `500`, Meta redelivers, and the redelivery re-mints a fresh URL (the
+   lookaside URL expires in ~5 minutes; the media id does not).
+
+Before **any** fetch, the gateway (in order): resolves the tenant via
+`CHANNEL_SITE_MAP` (unmapped `phone_number_id` ⇒ `200` drop — the cost
+gate), checks the 24h redelivery dedupe heap (claimed on success only), and
+applies a per-sender sliding-window throttle
+(`WHATSAPP_MEDIA_RATE_PER_MINUTE`, default `10`, in-memory per replica —
+mirroring the USSD `ratelimit.go` precedent; required because the APISIX
+`limit-count` keys Meta's egress IPs, not individual senders, and a tripped
+sender gets `200` + drop-log). Deterministic rejects
+(disallowed mime, oversize, AV-infected OCR `415`) answer `200` + drop-log
+so Meta never redelivery-storms them.
+
+### Kind mapping (hard-coded)
+
+| WhatsApp media | ocr `kind` |
+|---|---|
+| `image/*` (jpeg/png/webp) | `receipt` |
+| `application/pdf` | `document` |
+
+Nothing else is emittable — audio/video/stickers/gif are ignored, and the
+mapping table above is the whole policy. The caption is **not** sent to OCR
+(no field for it) and is never logged; logs carry ids, byte counts and
+sha256 prefixes only (PII discipline).
+
+### Why kyc_* kinds are excluded
+
+The ocr-service `kyc_*` kinds sit behind the W58 consent gate: a
+pre-existing `purpose=kyc_document` consent on the subject's phone is
+required before any byte leaves for OCR, and a WhatsApp message cannot
+bootstrap that consent (the public consent endpoint is a web surface;
+in-chat consent capture is its own UX + legal design). KYC-over-WhatsApp is
+therefore structurally closed this wave and deferred to a future "Option C"
+wave together with outbound media.
+
+### Rollout flag + fail-closed posture
+
+- `WHATSAPP_MEDIA_ENABLED` (default `false`): when off, media messages drop
+  + log exactly as pre-W60 — zero behavior change on upgrade.
+- With the flag on but `OCR_SERVICE_URL` / `OCR_INTERNAL_TOKEN` unset, the
+  gateway logs CRITICAL at boot and drops media per-message (fail-visible,
+  never fail-silent).
+- `WHATSAPP_APP_SECRET` is **production-required**: without it (and
+  `WHATSAPP_MOCK` off) every inbound post fails closed with `401`. The dev
+  compose default `WHATSAPP_MOCK=1` (DEV ONLY) is the only bypass;
+  production overlays must leave the mock unset/0.
+
+### Multi-tenancy model
+
+**One Meta app, one WABA phone number per tenant.** Inbound routing keys on
+`metadata.phone_number_id` via `CHANNEL_SITE_MAP`
+(`whatsapp:<phone_number_id> → {tenant_id, site_slug}`) — it is the only
+tenant key present in the webhook payload. A single number shared across
+tenants is therefore **unroutable** today; cross-tenant shared-number
+routing (e.g. by keyword) is a future product decision, not a config
+option. A `CHANNEL_SITE_MAP` typo misroutes media into the wrong tenant
+bucket (cross-tenant PII leak) — the blast radius already exists for text;
+review the map on every change.
+
+### Known limitations (stated honestly)
+
+- **Erasure gap (pre-existing, inherited — not a regression):** ocr
+  `receipt`/`document` rows are not subject-bound (no subject column by
+  design), so a consent `ErasureRequested` does **not** reach them — only
+  `kyc_*` rows are erased that way. Tenant deletion still hard-deletes all
+  rows + MinIO objects. The fix belongs to a retention wave (a future
+  subject anchor would make WhatsApp-ingested receipts erasable).
+- **Kind misclassification:** a KYC slip photographed and sent as an image
+  lands as `kind=receipt`, bypassing the kyc TTL/consent machinery. The
+  bytes are still AV-scanned and tenant-bucketed; **escalation is a tenant
+  staff workflow decision**, not something the pipeline can detect. True
+  `kyc_*` intake over WhatsApp stays closed until the Option C consent
+  flow.
+
 ## Nigeria notes
 
 - **DND (Do-Not-Disturb)**: Nigerian carriers block generic-route SMS to DND
