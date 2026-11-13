@@ -356,11 +356,11 @@ func (s *Store) claimWaitlistOnce(ctx context.Context, tenantID, entryID uuid.UU
 		}
 		booking.PublicRef = ref
 		const ins = `INSERT INTO bookings (` + bookingCols + `)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,now(),now())
+		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12,now(),now())
 		             RETURNING created_at, updated_at`
 		err = tx.QueryRow(ctx, ins, booking.ID, booking.TenantID, booking.OfferingID, booking.TeamMemberID,
 			booking.ContactID, booking.StartsAt, booking.EndsAt, booking.Status, booking.Source,
-			booking.IdempotencyKey, booking.PublicRef).Scan(&booking.CreatedAt, &booking.UpdatedAt)
+			booking.IdempotencyKey, booking.PublicRef, booking.PaymentStatus).Scan(&booking.CreatedAt, &booking.UpdatedAt)
 		if err != nil {
 			if isPublicRefUniqueViolation(err) {
 				// Concurrent insert won this ref — retried by the outer loop.

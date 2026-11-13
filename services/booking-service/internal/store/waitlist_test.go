@@ -126,6 +126,12 @@ func newTestStore(t *testing.T) *Store {
 	if err := st.ensureBookingPublicRef(ctx); err != nil {
 		t.Fatalf("bookings public_ref: %v", err)
 	}
+	// Same re-run for the SPEC-W48 bookings payment_ref/payment_status
+	// columns — bookingCols now names payment_status (SPEC-W57 A8/P8), so
+	// the bare fixture table needs the bootstrap ALTER.
+	if err := st.ensureBookingPaymentColumns(ctx); err != nil {
+		t.Fatalf("bookings payment columns: %v", err)
+	}
 	return st
 }
 

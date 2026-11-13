@@ -22,6 +22,10 @@ type receiptView struct {
 	AmountMajor *float64   // receipt_fields.amount — MAJOR units as printed
 	DateRaw     string     // receipt_fields.date verbatim ("" when absent)
 	Date        *time.Time // parsed receipt date; nil when absent/unparseable
+	// Currency (SPEC-W57 §3.5): receipt_fields.currency verbatim (""
+	// when absent). The OCR service has always extracted it; only the
+	// parse/display sites dropped it (R2 fold-in — NO DDL).
+	Currency string
 }
 
 // receiptDateLayouts are the unambiguous date layouts accepted for the
@@ -45,13 +49,17 @@ func parseReceiptFields(raw json.RawMessage) receiptView {
 		return v
 	}
 	var fields struct {
-		Amount *float64 `json:"amount"`
-		Date   *string  `json:"date"`
+		Amount   *float64 `json:"amount"`
+		Date     *string  `json:"date"`
+		Currency *string  `json:"currency"`
 	}
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return v
 	}
 	v.AmountMajor = fields.Amount
+	if fields.Currency != nil {
+		v.Currency = strings.TrimSpace(*fields.Currency)
+	}
 	if fields.Date != nil {
 		v.DateRaw = strings.TrimSpace(*fields.Date)
 		if v.DateRaw != "" {
@@ -103,6 +111,23 @@ func captureContactID(c ReceiptCapture) (uuid.UUID, bool) {
 	return *p.ContactID, true
 }
 
+// captureBookingID extracts rung 0's anchor (SPEC-W57 P4):
+// payload->>'booking_id'. Same gating posture as captureContactID — ONLY a
+// payment_receipt capture enters rung 0, even if another kind's payload
+// happens to carry a booking_id key.
+func captureBookingID(c ReceiptCapture) (uuid.UUID, bool) {
+	if c.Kind != "payment_receipt" {
+		return uuid.Nil, false
+	}
+	var p struct {
+		BookingID *uuid.UUID `json:"booking_id"`
+	}
+	if err := json.Unmarshal(c.Payload, &p); err != nil || p.BookingID == nil || *p.BookingID == uuid.Nil {
+		return uuid.Nil, false
+	}
+	return *p.BookingID, true
+}
+
 // captureLeadID extracts rung 2's anchor: result->>'lead_id' (the capture
 // outcome of a lead_capture item).
 func captureLeadID(c ReceiptCapture) (uuid.UUID, bool) {
@@ -147,7 +172,13 @@ type LadderOutcome struct {
 	Confidence string
 	// Candidate is the single winning candidate (nil when Confidence none).
 	Candidate *PaymentCandidate
-	// WinningRung: 1/2/3 when any rung produced candidates, 0 otherwise.
+	// WinningRung: 1/2/3 for the classic ladder rungs; SPEC-W57 P4 adds
+	// rung 0 (payload booking_id direct link, payment_receipt only) — a
+	// rung-0 hit reports WinningRung 0 WITH Candidate set (ConfidenceExact).
+	// WinningRung 0 with Candidate nil still means no rung produced
+	// candidates. Rung 0 short-circuits in matchCapture (it can never be
+	// ambiguous — one booking id dedupes to one candidate), so
+	// decideLadder's 1-based semantics are unchanged.
 	WinningRung int
 	// Ambiguous carries the winning rung's candidate list when >1
 	// (confidence 'none' + candidates in detail, per pinned decision 1).

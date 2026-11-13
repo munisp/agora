@@ -11,7 +11,7 @@
  */
 "use strict";
 
-var OPENDESK_SW_V = "field-pwa-v3";
+var OPENDESK_SW_V = "field-pwa-v4"; // SPEC-W57 P6: mandatory bump (receipt capture app.js/index.html changes)
 var SHELL = "opendesk-field-" + OPENDESK_SW_V;
 
 var PRECACHE = [

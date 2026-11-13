@@ -95,10 +95,14 @@ type ReceiptItem struct {
 // nulls allowed). The capture row persists the RAW jsonb verbatim — this
 // struct documents/validates the shape without constraining storage.
 type ReceiptFields struct {
-	Vendor *string       `json:"vendor"`
-	Amount *float64      `json:"amount"`
-	Date   *string       `json:"date"`
-	Items  []ReceiptItem `json:"items"`
+	Vendor *string  `json:"vendor"`
+	Amount *float64 `json:"amount"`
+	Date   *string  `json:"date"`
+	// Currency (SPEC-W57 Scope A, A7): the ocr-service has ALWAYS extracted
+	// it (llm.py) and the raw jsonb is persisted verbatim — this field only
+	// documents the shape; storage was never constrained.
+	Currency *string       `json:"currency"`
+	Items    []ReceiptItem `json:"items"`
 }
 
 // OCRExtractResponse mirrors the ocr-service POST /v1/ocr/extract response

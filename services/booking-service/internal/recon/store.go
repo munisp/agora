@@ -7,14 +7,18 @@
 // CloudEvent through the transactional outbox (same tx as the finding
 // insert) onto opendesk.booking.events.
 //
-// Honesty posture (SPEC pinned decisions): receipts carry NO currency and
-// amounts are float MAJOR units read off paper — every finding's detail
-// carries currency_unknown:true and amount comparisons convert with
+// Honesty posture (SPEC pinned decisions): receipt amounts are float MAJOR
+// units read off paper — amount comparisons convert with
 // int64(math.Round(amount*100)) at the comparison site ONLY. Matches are
-// confidence-tagged (exact = checkin contact chain only; heuristic = lead
-// phone chain or amount+date); ambiguity at the winning rung yields
-// confidence='none' with the candidate list in detail. Null receipt amounts
-// never guess (R5).
+// confidence-tagged (exact = rung 0 payload booking_id link [SPEC-W57 P4]
+// or the rung-1 checkin contact chain; heuristic = lead phone chain or
+// amount+date); ambiguity at the winning rung yields confidence='none'
+// with the candidate list in detail. Null receipt amounts never guess
+// (R5). Currency (SPEC-W57 §3.5): receipt_fields has ALWAYS carried the
+// OCR-extracted currency (stored verbatim); currency_unknown:true is now
+// CONDITIONAL (only when the receipt currency is absent), and a
+// both-present-but-different pair is NOT comparable — detail
+// currency_mismatch:true, never an FX conversion (P7).
 package recon
 
 import (
@@ -53,7 +57,7 @@ const (
 
 // Confidence levels (the §3.3 ladder outcome).
 const (
-	ConfidenceExact     = "exact"     // rung 1: checkin contact chain
+	ConfidenceExact     = "exact"     // rung 0 (payload booking_id link, SPEC-W57) / rung 1 (checkin contact chain)
 	ConfidenceHeuristic = "heuristic" // rungs 2 (lead phone) / 3 (amount+date)
 	ConfidenceNone      = "none"      // no candidate, or ambiguous winning rung
 )
@@ -72,7 +76,7 @@ type Finding struct {
 	ExpectedAmountMinor *int64          `json:"expected_amount_minor,omitempty"`
 	CapturedAmountMinor *int64          `json:"captured_amount_minor,omitempty"`
 	ReceiptAmountMajor  *float64        `json:"receipt_amount_major,omitempty"`
-	ReceiptCurrency     string          `json:"receipt_currency"` // always "" today (R2 — receipts carry no currency)
+	ReceiptCurrency     string          `json:"receipt_currency"` // receipt_fields.currency (SPEC-W57 §3.5; "" when the receipt has none)
 	Confidence          string          `json:"confidence"`
 	Detail              json.RawMessage `json:"detail"`
 	CreatedAt           time.Time       `json:"created_at"`
@@ -117,6 +121,12 @@ type PaymentCandidate struct {
 	PaidAt             time.Time // attempt.updated_at — the transition stamp
 	AttemptStatus      string    // paid | amount_mismatch
 	OfferingPriceMinor *int64    // offerings.price_cents context for detail
+	// BookingFound (SPEC-W57 A5, rung 0 only): true when the candidate's
+	// booking row EXISTS regardless of paid-attempt presence. A rung-0
+	// candidate with BookingFound=true and AttemptStatus="" is the
+	// linked-booking-unpaid cash-collection signal (P4). Classic-rung
+	// loaders (which INNER JOIN a paid attempt) leave it false.
+	BookingFound bool
 }
 
 // Store persists receipt_recon_findings and runs the recon reads. Same
@@ -330,6 +340,52 @@ func candidatesByContact(ctx context.Context, tx pgx.Tx, tenantID, contactID uui
 		return nil, err
 	}
 	return scanCandidates(rows)
+}
+
+// candidatesByBookingID (rung 0, SPEC-W57 P4/A5): the booking the agent
+// asserted via payload->>'booking_id', LEFT JOINed to its
+// paid/amount_mismatch attempts (latest first). TWO deliberate differences
+// from candidatesByContact: (a) NO starts_at window — the agent asserted
+// the booking, so staleness is a finding, not a filter (R5); (b) the LEFT
+// JOIN returns the booking even with NO paid attempt (BookingFound=true,
+// AttemptStatus="", TxRef="") so the cash-collection case produces
+// receipt_without_payment at confidence exact — the signal the heuristic
+// ladder cannot produce. READS bookings+attempts only (P10).
+func candidatesByBookingID(ctx context.Context, tx pgx.Tx, tenantID, bookingID uuid.UUID) ([]PaymentCandidate, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT b.id, a.tx_ref, a.amount_minor, COALESCE(a.currency, ''), a.updated_at, a.status, o.price_cents
+		 FROM bookings b
+		 LEFT JOIN booking_payment_attempts a
+		   ON a.tenant_id=b.tenant_id AND a.booking_id=b.id AND a.status IN ('paid','amount_mismatch')
+		 LEFT JOIN offerings o ON o.tenant_id=b.tenant_id AND o.id=b.offering_id
+		 WHERE b.tenant_id=$1 AND b.id=$2
+		 ORDER BY a.updated_at DESC NULLS LAST`, tenantID, bookingID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PaymentCandidate
+	for rows.Next() {
+		var c PaymentCandidate
+		var txRef, status *string
+		var paidAt *time.Time
+		if err := rows.Scan(&c.BookingID, &txRef, &c.AmountMinor, &c.Currency,
+			&paidAt, &status, &c.OfferingPriceMinor); err != nil {
+			return nil, err
+		}
+		c.BookingFound = true
+		if txRef != nil {
+			c.TxRef = *txRef
+		}
+		if status != nil {
+			c.AttemptStatus = *status
+		}
+		if paidAt != nil {
+			c.PaidAt = *paidAt
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // leadPhone resolves rung 2's first hop: result->>'lead_id' →

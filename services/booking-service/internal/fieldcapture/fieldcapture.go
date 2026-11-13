@@ -14,6 +14,10 @@
 //     UPSERT keyed (tenant_id, contact_id) — it exposes NO history — so
 //     check-ins persist in the new field_checkins table per the spec's
 //     fallback clause.
+//   - payment_receipt (SPEC-W57) → the anchor row + payload IS the
+//     record: an optional booking_id (tenant-scoped existence-checked)
+//     gives recon its rung-0 exact link; the receipt bytes attach later
+//     via POST /v1/field/captures/{id}/receipt (W53).
 //
 // Persistence mirrors the W13 leads idiom (idempotent bootstrap DDL, RLS
 // enabled + forced, tenant_isolation policy) packaged like the W14
@@ -45,6 +49,10 @@ const (
 	// on behalf of a citizen — payload = the public report body; the civic
 	// module creates a case with channel=pwa.
 	KindCivicReport = "civic_report"
+	// KindPaymentReceipt (SPEC-W57 Scope A, P1/P2): an agent anchors a
+	// payment receipt against an optional booking_id (recon rung-0 exact
+	// link); the receipt bytes attach later via the W53 receipt endpoint.
+	KindPaymentReceipt = "payment_receipt"
 )
 
 // Item result statuses.
@@ -106,9 +114,9 @@ func (it *CaptureItem) Validate() error {
 		return fmt.Errorf("%w: client_id exceeds %d bytes", ErrInvalidInput, maxClientIDLen)
 	}
 	switch it.Kind {
-	case KindLeadCapture, KindCheckin, KindCivicReport:
+	case KindLeadCapture, KindCheckin, KindCivicReport, KindPaymentReceipt:
 	default:
-		return fmt.Errorf("%w: kind %q (want lead_capture|checkin|civic_report)", ErrInvalidInput, it.Kind)
+		return fmt.Errorf("%w: kind %q (want lead_capture|checkin|civic_report|payment_receipt)", ErrInvalidInput, it.Kind)
 	}
 	if len(it.Payload) == 0 {
 		it.Payload = json.RawMessage(`{}`)
@@ -161,9 +169,23 @@ type CivicReportPayload struct {
 	PhotoURL          string `json:"photo_url,omitempty"`
 }
 
+// PaymentReceiptPayload is the kind=payment_receipt payload schema
+// (SPEC-W57 Scope A, A1). ALL fields are optional: an empty payload is a
+// legal "unlinked receipt" that falls back to the recon heuristic ladder.
+// BookingID is the exact-match anchor (recon rung 0); TeamMemberID is a
+// client HINT only — the server re-resolves the caller's team member from
+// the request identity and a disagreeing hint is a deterministic error
+// (P3); Note is preserved verbatim on the anchor row.
+type PaymentReceiptPayload struct {
+	BookingID    *uuid.UUID `json:"booking_id,omitempty"`
+	TeamMemberID *uuid.UUID `json:"team_member_id,omitempty"` // hint only — server re-resolves (P3)
+	Note         string     `json:"note,omitempty"`
+}
+
 // ItemResult is the per-item outcome of a batch. On a deduped replay the
-// ORIGINAL result (lead_id / checkin_id / case_ref / error) is returned
-// unchanged so the client can reconcile its outbox without side effects.
+// ORIGINAL result (lead_id / checkin_id / case_ref / booking_id /
+// team_member_id / error) is returned unchanged so the client can
+// reconcile its outbox without side effects.
 type ItemResult struct {
 	ClientID  string     `json:"client_id"`
 	Kind      string     `json:"kind"`
@@ -172,7 +194,12 @@ type ItemResult struct {
 	CheckinID *uuid.UUID `json:"checkin_id,omitempty"`
 	CaseID    *uuid.UUID `json:"case_id,omitempty"`  // SPEC-W32: civic_report outcome
 	CaseRef   string     `json:"case_ref,omitempty"` // SPEC-W32: GOV-... reference
-	Error     string     `json:"error,omitempty"`
+	// SPEC-W57 Scope A (payment_receipt): BookingID echoes the accepted
+	// payload booking link; TeamMemberID is the SERVER-RESOLVED team
+	// member of the caller (P3 — never the client hint).
+	BookingID    *uuid.UUID `json:"booking_id,omitempty"`
+	TeamMemberID *uuid.UUID `json:"team_member_id,omitempty"`
+	Error        string     `json:"error,omitempty"`
 }
 
 // ClockSkewThreshold (SPEC-W45 OOS-21): when the client-claimed captured_at
@@ -267,7 +294,7 @@ func (h *Handlers) CaptureEnriched(w http.ResponseWriter, r *http.Request, tenan
 		writeError(w, http.StatusBadRequest, "too many items (max per batch)")
 		return
 	}
-	results := h.Svc.Capture(r.Context(), tenant, req.Items)
+	results := h.Svc.CaptureWithCaller(r.Context(), tenant, req.Items, callerEmail(r))
 	h.enrichApplied(r.Context(), tenant, req.Items, results, enr)
 	writeJSON(w, http.StatusOK, captureResponse{Results: results})
 }

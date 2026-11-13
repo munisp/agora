@@ -82,7 +82,9 @@ function setMode(m) { if (m) lsSet(LS.mode, m); else lsDel(LS.mode); renderMode(
 
 function openDb() {
   return new Promise(function (resolve, reject) {
-    var req = indexedDB.open("opendesk-field", 1);
+    // SPEC-W57 B2: v1 -> v2 adds the `receipts` store ONLY — existing
+    // outbox/meta data is untouched by the upgrade.
+    var req = indexedDB.open("opendesk-field", 2);
     req.onupgradeneeded = function () {
       var db = req.result;
       if (!db.objectStoreNames.contains("outbox")) {
@@ -90,6 +92,11 @@ function openDb() {
       }
       if (!db.objectStoreNames.contains("meta")) {
         db.createObjectStore("meta", { keyPath: "k" });
+      }
+      if (!db.objectStoreNames.contains("receipts")) {
+        // Out-of-line keys: outbox item id -> photo Blob. The photo is
+        // non-secret business data; tokens never touch IDB (TS-003, B6).
+        db.createObjectStore("receipts");
       }
     };
     req.onsuccess = function () { resolve(req.result); };
@@ -125,6 +132,37 @@ function outboxDel(id) {
   return openDb().then(function (db) {
     return tx(db, "outbox", "readwrite", function (s) { s.delete(id); });
   });
+}
+
+/* SPEC-W57 B2: photo blobs for queued payment_receipt items, keyed by the
+ * SAME outbox item id (one photo per client_id — P5). */
+function receiptPut(id, blob) {
+  return openDb().then(function (db) {
+    return tx(db, "receipts", "readwrite", function (s) { s.put(blob, id); });
+  });
+}
+function receiptGet(id) {
+  return openDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var req = db.transaction("receipts").objectStore("receipts").get(id);
+      req.onsuccess = function () { resolve(req.result || null); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).catch(function () { return null; }); // unreadable store => treat as "no photo"
+}
+function receiptDel(id) {
+  return openDb().then(function (db) {
+    return tx(db, "receipts", "readwrite", function (s) { s.delete(id); });
+  }).catch(function () {}); // discarding stays safe even if the store is absent
+}
+function receiptKeys() {
+  return openDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var req = db.transaction("receipts").objectStore("receipts").getAllKeys();
+      req.onsuccess = function () { resolve(req.result || []); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).catch(function () { return []; });
 }
 
 /* Mirror NON-SECRET context (tenant slug, endpoints config, mode) into IDB
@@ -268,7 +306,11 @@ function getGps() {
 
 /* ---------------- capture & queue ---------------- */
 
-function enqueue(kind, payload, gps) {
+/* Resolves the queued item (callers like captureReceipt need its id to key
+ * sidecar data). opts.deferFlush skips the immediate best-effort flush so a
+ * caller can finish staging sidecar data first (P5: a receipt photo must be
+ * stashed BEFORE the anchor can sync, or the ack path would find no blob). */
+function enqueue(kind, payload, gps, opts) {
   var item = {
     id: crypto.randomUUID(),
     kind: kind,
@@ -280,7 +322,8 @@ function enqueue(kind, payload, gps) {
   return outboxPut(item).then(function () {
     renderOutbox();
     registerBgSync();
-    flush(); // best effort; failures stay queued
+    if (!(opts && opts.deferFlush)) flush(); // best effort; failures stay queued
+    return item;
   });
 }
 
@@ -330,6 +373,100 @@ function checkin() {
   });
 }
 
+/* ---------------- payment receipt (SPEC-W57 Scope B) ---------------- */
+
+/* Client-side mirror of the server's receipt mime allow-list
+ * (fieldcapture/receipt.go): a deterministic 415 should be caught before
+ * enqueue, not discovered after the bytes upload. */
+var RECEIPT_MIMES = { "image/jpeg": 1, "image/png": 1, "image/webp": 1 };
+
+/* B2: GET the caller's own bookings (mine=true, ±7 days) for the picker,
+ * with the SAME Bearer + x-tenant-slug headers as flushChunk. 403 means the
+ * caller is authenticated but matches no team member of this tenant — the
+ * picker is disabled with an honest message and an unlinked receipt stays
+ * legal. payment_status only arrives with the W57 server build, so it is
+ * read defensively and the badge omitted when absent. */
+function loadMyBookings() {
+  var sel = $("f-receipt-booking"), msg = $("receipt-booking-msg");
+  if (mode() !== "live") {
+    msg.textContent = "Sign in to load your bookings — you can still save an unlinked receipt.";
+    return;
+  }
+  msg.textContent = "Loading…";
+  refreshIfNeeded().then(function (t) {
+    if (!t) { msg.textContent = "Session expired — sign in again to load bookings."; return; }
+    var day = 24 * 3600 * 1000, now = Date.now();
+    var q = new URLSearchParams({
+      mine: "true",
+      from: new Date(now - 7 * day).toISOString(),
+      to: new Date(now + 7 * day).toISOString(),
+    });
+    return fetch(cfg().apiBase.replace(/\/+$/, "") + "/v1/bookings?" + q.toString(), {
+      headers: {
+        authorization: "Bearer " + t.access_token,
+        "x-tenant-slug": lsGet(LS.slug) || "",
+      },
+    }).then(function (res) {
+      if (res.status === 403) {
+        sel.disabled = true;
+        msg.textContent = "Your account is not linked to a team member of this tenant, so your bookings cannot be listed. You can still save an unlinked receipt.";
+        return;
+      }
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json().then(function (body) {
+        var list = body && Array.isArray(body.bookings) ? body.bookings : [];
+        sel.length = 1; // keep only the "unlinked" placeholder option
+        list.forEach(function (b) {
+          var opt = document.createElement("option");
+          opt.value = b.id;
+          var when = b.starts_at ? new Date(b.starts_at).toLocaleString() : "";
+          var badge = b.payment_status ? " · " + b.payment_status : "";
+          opt.textContent = (b.public_ref || b.id) + (when ? " · " + when : "") + badge;
+          sel.appendChild(opt);
+        });
+        msg.textContent = list.length ? "" : "No bookings of yours within the past/next 7 days.";
+      });
+    }).catch(function (err) {
+      msg.textContent = "Could not load bookings (" + err.message + ") — you can still save an unlinked receipt.";
+    });
+  });
+}
+
+/* B2/B3: one photo per client_id (P5) — every submit creates a NEW capture
+ * item with a fresh id, never reuses one. The photo blob is stashed in the
+ * IDB `receipts` store under that same id BEFORE any flush can ack the
+ * anchor (deferFlush), and uploads only after the applied/deduped ack. */
+function captureReceipt() {
+  var fileEl = $("f-receipt-photo");
+  var photo = fileEl.files && fileEl.files[0];
+  if (!photo) { toast("Take or choose a receipt photo first."); return; }
+  if (photo.type && !RECEIPT_MIMES[photo.type]) {
+    toast("Receipt photo must be JPEG, PNG or WebP.");
+    return;
+  }
+  var bookingId = $("f-receipt-booking").value || "";
+  var note = $("f-receipt-note").value.trim();
+  var payload = {};
+  if (bookingId) payload.booking_id = bookingId;
+  if (note) payload.note = note;
+  enqueue("payment_receipt", payload, null, { deferFlush: true }).then(function (item) {
+    return receiptPut(item.id, photo).catch(function (err) {
+      // Photo could not be stashed — do not leave an anchor-only receipt
+      // queued behind the user's back: roll the item back and say so.
+      return outboxDel(item.id).then(function () { throw err; });
+    });
+  }).then(function () {
+    fileEl.value = "";
+    $("f-receipt-note").value = "";
+    renderOutbox();
+    flush(); // staged completely now — safe to sync
+    toast("Receipt queued" + (navigator.onLine ? " — syncing…" : " (offline)."));
+  }, function () {
+    renderOutbox();
+    toast("Could not store the photo on this device — receipt NOT queued.");
+  });
+}
+
 /* ---------------- sync ---------------- */
 
 var flushing = false;
@@ -356,6 +493,101 @@ function fetchWithTimeout(url, opts) {
     clearTimeout(timer);
     if (ctrl.signal.aborted) throw new Error("request timed out after " + (FETCH_TIMEOUT_MS / 1000) + "s");
     throw err;
+  });
+}
+
+/* SPEC-W57 P5/R8: the receipt upload gets its OWN ~180s timeout — OCR
+ * extraction can take up to ~150s server-side and the route is exempt from
+ * the 60s middleware, so the 15s flush budget (FETCH_TIMEOUT_MS) cannot
+ * cover it. This fetch is deliberately NOT part of flushChunk's budget. */
+var RECEIPT_TIMEOUT_MS = 180000;
+
+/* POST the photo bytes to the capture anchor
+ * ({apiBase}/v1/field/captures/{client_id}/receipt) with the same auth
+ * headers as flushChunk. Resolves an outcome object, never rejects for an
+ * expected HTTP/network outcome:
+ *   {ok:true, amount} — 200: bytes stored + OCR fields extracted
+ *   {ok:false, status:"receipt upload pending (…)"} — transient; retry
+ *   {ok:false, status:"failed: …"} — deterministic; user may discard
+ * Retry is safe: AttachReceipt is an unconditional UPDATE keyed by the same
+ * client_id, so re-POSTing the same bytes overwrites, never duplicates. */
+function uploadReceipt(item, blob, accessToken) {
+  var ctrl = new AbortController();
+  var timer = setTimeout(function () { ctrl.abort(); }, RECEIPT_TIMEOUT_MS);
+  var url = cfg().apiBase.replace(/\/+$/, "") + "/v1/field/captures/" +
+    encodeURIComponent(item.id) + "/receipt";
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": blob.type || "application/octet-stream",
+      authorization: "Bearer " + accessToken,
+      "x-tenant-slug": lsGet(LS.slug) || "",
+    },
+    body: blob,
+    signal: ctrl.signal,
+  }).then(function (res) {
+    clearTimeout(timer);
+    if (res.status === 200) {
+      return res.json().catch(function () { return null; }).then(function (body) {
+        var ef = body && body.extracted_fields;
+        var amount = ef && ef.amount != null && ef.amount !== ""
+          ? String(ef.amount) + (ef.currency ? " " + ef.currency : "")
+          : null;
+        return { ok: true, amount: amount };
+      });
+    }
+    if (res.status === 415) {
+      return { ok: false, status: "failed: receipt photo rejected (HTTP 415 unsupported media) — discard or retake" };
+    }
+    if (res.status === 404) {
+      // Anchor race: the ack said applied/deduped yet the anchor is missing.
+      // Treat as failed and keep BOTH queued — the retry reports 404 again
+      // honestly rather than dropping anything.
+      return { ok: false, status: "failed: capture anchor missing on server (HTTP 404)" };
+    }
+    if (res.status === 401 || res.status === 403) {
+      // Session problem: keep everything queued; the next flush's capture
+      // fetch hits the same status and runs the inherited auth-failure path.
+      return { ok: false, status: "receipt upload pending (HTTP " + res.status + " — sign in again)" };
+    }
+    // 502/503/other transient: keep BOTH item and blob queued.
+    return { ok: false, status: "receipt upload pending (HTTP " + res.status + ")" };
+  }, function (err) {
+    clearTimeout(timer);
+    var why = ctrl.signal.aborted
+      ? "timed out after " + (RECEIPT_TIMEOUT_MS / 1000) + "s"
+      : (err && err.message ? err.message : "network error");
+    return { ok: false, status: "receipt upload pending (" + why + ")" };
+  });
+}
+
+/* P5 two-phase sequencing: invoked ONLY after the server acked this item
+ * applied/deduped (or accepted its whole batch). A payment_receipt item
+ * with a stashed photo uploads its bytes FIRST; the outbox entry is removed
+ * only after a 200. Resolves true when the item was removed, false when it
+ * stays queued with an honest status. Never rejects for an expected
+ * outcome. */
+function settleAppliedItem(item, accessToken) {
+  if (item.kind !== "payment_receipt") {
+    return outboxDel(item.id).then(function () { return true; });
+  }
+  return receiptGet(item.id).then(function (blob) {
+    if (!blob) {
+      // No photo stashed on this device (captured by a pre-W57 build, or
+      // site data was partially cleared): nothing left to upload — the
+      // anchor is durable server-side, so remove the queue entry.
+      return outboxDel(item.id).then(function () { return true; });
+    }
+    return uploadReceipt(item, blob, accessToken).then(function (outcome) {
+      if (outcome.ok) {
+        return receiptDel(item.id).then(function () { return outboxDel(item.id); }).then(function () {
+          toast("Receipt uploaded" + (outcome.amount ? " — extracted " + outcome.amount : "") + ".");
+          return true;
+        });
+      }
+      item.status = outcome.status; // keep BOTH item and blob queued
+      return outboxPut(item).then(function () { return false; });
+    });
   });
 }
 
@@ -393,21 +625,27 @@ function flushChunk(chunk, accessToken) {
       var delivered = 0, rejected = 0;
       if (!Array.isArray(results)) {
         // No per-item detail but the batch was accepted (HTTP 200): every
-        // item in this chunk was processed — remove just this chunk.
-        return Promise.all(chunk.map(function (i) { return outboxDel(i.id); }))
-          .then(function () { return { delivered: chunk.length, rejected: 0 }; });
+        // item in this chunk was processed — remove just this chunk
+        // (receipt items still upload their stashed photo FIRST, P5).
+        return Promise.all(chunk.map(function (i) {
+          return settleAppliedItem(i, accessToken).then(function (removed) {
+            if (removed) delivered += 1; else rejected += 1;
+          });
+        })).then(function () { return { delivered: delivered, rejected: rejected }; });
       }
       // Per-item outcomes (fieldcapture.ItemResult): applied | deduped are
-      // exactly-once successes → remove; error is a deterministic server
-      // rejection → keep queued with the server's reason, never silently
-      // dropped.
+      // exactly-once successes → remove (a payment_receipt with a stashed
+      // photo uploads its bytes first and is removed only on a 200 — P5);
+      // error is a deterministic server rejection → keep queued with the
+      // server's reason, never silently dropped.
       var byId = {};
       results.forEach(function (r) { byId[r.client_id] = r; });
       return Promise.all(chunk.map(function (i) {
         var r = byId[i.id];
         if (r && (r.status === "applied" || r.status === "deduped")) {
-          delivered += 1;
-          return outboxDel(i.id);
+          return settleAppliedItem(i, accessToken).then(function (removed) {
+            if (removed) delivered += 1; else rejected += 1;
+          });
         }
         rejected += 1;
         i.status = "failed: " + (r && r.error ? r.error : (r ? r.status : "not acknowledged"));
@@ -517,7 +755,12 @@ function renderMode() {
 }
 
 function renderOutbox(syncingLabel) {
-  outboxAll().then(function (items) {
+  // B4: receipt photo presence is read alongside the outbox so a
+  // payment_receipt row can honestly show "photo attached" vs "photo
+  // pending" (receiptKeys degrades to [] if the store is unreadable).
+  Promise.all([outboxAll(), receiptKeys()]).then(function (both) {
+    var items = both[0], photoIds = {};
+    both[1].forEach(function (k) { photoIds[k] = true; });
     var ul = $("outbox-list");
     $("outbox-count").textContent = items.length ? "(" + items.length + ")" : "";
     if (!items.length) { ul.innerHTML = '<li class="muted">Nothing queued.</li>'; return; }
@@ -525,17 +768,27 @@ function renderOutbox(syncingLabel) {
     items.sort(function (a, b) { return a.captured_at < b.captured_at ? -1 : 1; });
     items.forEach(function (i) {
       var li = document.createElement("li");
+      var isReceipt = i.kind === "payment_receipt";
       var kind = document.createElement("span");
       kind.className = "kind" + (i.kind === "checkin" ? " checkin" : "");
-      kind.textContent = i.kind === "checkin" ? "check-in" : "lead";
+      kind.textContent = i.kind === "checkin" ? "check-in" : isReceipt ? "receipt" : "lead";
       var body = document.createElement("span");
       var when = new Date(i.captured_at);
-      var summary = i.kind === "checkin"
-        ? (i.gps ? i.gps.lat.toFixed(4) + ", " + i.gps.lng.toFixed(4) : "no gps")
-        : ((i.payload.name || "—") +
-           (i.payload.phone_e164 || i.payload.phone
-             ? " · " + (i.payload.phone_e164 || i.payload.phone)
-             : ""));
+      var summary;
+      if (i.kind === "checkin") {
+        summary = i.gps ? i.gps.lat.toFixed(4) + ", " + i.gps.lng.toFixed(4) : "no gps";
+      } else if (isReceipt) {
+        summary = (i.payload && i.payload.note ? i.payload.note : "payment receipt") +
+          (i.payload && i.payload.booking_id
+            ? " · booking " + String(i.payload.booking_id).slice(0, 8) + "…"
+            : " · unlinked") +
+          (photoIds[i.id] ? " · photo attached" : " · photo pending");
+      } else {
+        summary = (i.payload.name || "—") +
+          (i.payload.phone_e164 || i.payload.phone
+            ? " · " + (i.payload.phone_e164 || i.payload.phone)
+            : "");
+      }
       body.textContent = summary + " · " + when.toLocaleString();
       var st = document.createElement("span");
       st.className = "st" + (i.status && i.status.indexOf("failed") === 0 ? " failed" : "");
@@ -544,7 +797,11 @@ function renderOutbox(syncingLabel) {
       del.className = "del";
       del.title = "Discard";
       del.textContent = "✕";
-      del.onclick = function () { outboxDel(i.id).then(renderOutbox); };
+      // Discarding a receipt also drops its stashed photo (the deterministic
+      // 415 "let the user discard" path of P5) — never leaves an orphan blob.
+      del.onclick = function () {
+        receiptDel(i.id).then(function () { return outboxDel(i.id); }).then(renderOutbox);
+      };
       li.appendChild(kind); li.appendChild(body); li.appendChild(st); li.appendChild(del);
       ul.appendChild(li);
     });
@@ -575,6 +832,8 @@ function boot() {
   $("btn-logout").onclick = logout;
   $("btn-capture").onclick = captureLead;
   $("btn-checkin").onclick = checkin;
+  $("btn-receipt").onclick = captureReceipt;
+  $("btn-load-bookings").onclick = loadMyBookings;
   $("btn-sync").onclick = function () { flush().then(function () { toast(navigator.onLine ? "Sync attempted." : "Still offline."); }); };
 
   window.addEventListener("online", function () { renderNet(); flush(); });

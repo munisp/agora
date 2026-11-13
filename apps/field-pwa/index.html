@@ -29,9 +29,10 @@ main{max-width:560px;margin:0 auto;padding:16px}
   padding:16px;margin-bottom:14px}
 h2{font-size:14px;margin:0 0 10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft)}
 label{display:block;font-size:13px;color:var(--ink-soft);margin:10px 0 4px}
-input,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:9px;
+input,textarea,select{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:9px;
   background:#fff;color:var(--ink);font:inherit}
-input:focus,textarea:focus{outline:2px solid var(--terra);outline-offset:-1px}
+input:focus,textarea:focus,select:focus{outline:2px solid var(--terra);outline-offset:-1px}
+select:disabled{background:var(--cream-deep);color:var(--ink-soft)}
 button{font:inherit;cursor:pointer;border:0;border-radius:10px;padding:10px 14px;font-weight:600}
 .btn-primary{background:var(--terra);color:#fff;width:100%;margin-top:12px}
 .btn-primary:active{background:var(--terra-dark)}
@@ -99,6 +100,27 @@ summary{cursor:pointer}
       </div>
       <button id="btn-capture" class="btn-primary">Save lead</button>
       <button id="btn-checkin" class="btn-olive">Geo check-in</button>
+    </div>
+
+    <!-- SPEC-W57 B1: payment receipt capture. The photo stays on-device in
+         IndexedDB until the capture anchor has synced (two-phase upload);
+         one photo per capture — a new photo always queues a new item. -->
+    <div class="card">
+      <h2>Payment receipt</h2>
+      <p class="muted">Photograph a payment receipt and link it to one of your
+        bookings (or leave it unlinked). The photo uploads right after the
+        capture syncs.</p>
+      <label for="f-receipt-booking">Booking (optional)</label>
+      <select id="f-receipt-booking">
+        <option value="">— Unlinked receipt (no booking) —</option>
+      </select>
+      <button id="btn-load-bookings" class="btn-ghost">Load my bookings</button>
+      <p id="receipt-booking-msg" class="muted"></p>
+      <label for="f-receipt-note">Note (optional)</label>
+      <input id="f-receipt-note" autocomplete="off" placeholder="e.g. cash payment, deposit">
+      <label for="f-receipt-photo">Receipt photo (required)</label>
+      <input id="f-receipt-photo" type="file" accept="image/jpeg,image/png,image/webp" capture="environment">
+      <button id="btn-receipt" class="btn-primary">Save receipt</button>
     </div>
 
     <div class="card">

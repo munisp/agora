@@ -46,18 +46,27 @@ func (s *Service) log() *zap.Logger {
 // Capture applies a batch of queue items, returning one result per item in
 // request order. Item failures never fail the batch: the client drops
 // applied/deduped items from its outbox and keeps/inspects error items
-// (docs/field-capture.md §Client contract).
+// (docs/field-capture.md §Client contract). Capture is the no-caller-
+// identity form (SPEC-W57: equivalent to CaptureWithCaller with "").
 func (s *Service) Capture(ctx context.Context, tenant bookingops.TenantInfo, items []CaptureItem) []ItemResult {
+	return s.CaptureWithCaller(ctx, tenant, items, "")
+}
+
+// CaptureWithCaller is Capture plus the caller's email identity (SPEC-W57
+// Scope A, P3): kind=payment_receipt uses it to SERVER-RESOLVE the
+// team_member_id attribution (the client-supplied value is a hint only).
+// An empty email simply skips the resolution (the capture still applies).
+func (s *Service) CaptureWithCaller(ctx context.Context, tenant bookingops.TenantInfo, items []CaptureItem, callerEmail string) []ItemResult {
 	results := make([]ItemResult, 0, len(items))
 	for i := range items {
-		results = append(results, s.apply(ctx, tenant, items[i]))
+		results = append(results, s.apply(ctx, tenant, items[i], callerEmail))
 	}
 	return results
 }
 
 // apply processes one item behind its field_capture:{client_id}
 // idempotency anchor.
-func (s *Service) apply(ctx context.Context, tenant bookingops.TenantInfo, it CaptureItem) (res ItemResult) {
+func (s *Service) apply(ctx context.Context, tenant bookingops.TenantInfo, it CaptureItem, callerEmail string) (res ItemResult) {
 	res = ItemResult{ClientID: it.ClientID, Kind: it.Kind, Status: StatusError}
 	if err := it.Validate(); err != nil {
 		// Not anchored: the failure is deterministic, a replay fails the
@@ -89,13 +98,19 @@ func (s *Service) apply(ctx context.Context, tenant bookingops.TenantInfo, it Ca
 				res.CheckinID = stored.CheckinID
 				res.CaseID = stored.CaseID
 				res.CaseRef = stored.CaseRef
+				res.BookingID = stored.BookingID
+				res.TeamMemberID = stored.TeamMemberID
 				res.Error = stored.Error
 			}
 		}
 		return res
 	}
 
-	// Fresh anchor: apply the side effect.
+	// Fresh anchor: apply the side effect. SPEC-W57 P2: the
+	// KindPaymentReceipt case MUST ship in the same build as the Validate
+	// allow-list + kind CHECK — this switch has no default branch, so
+	// without the case a validated payment_receipt would "apply" with zero
+	// side effects (silent swallow).
 	var applyErr error
 	switch it.Kind {
 	case KindLeadCapture:
@@ -104,6 +119,8 @@ func (s *Service) apply(ctx context.Context, tenant bookingops.TenantInfo, it Ca
 		applyErr = s.applyCheckin(ctx, tenant, it, &res)
 	case KindCivicReport:
 		applyErr = s.applyCivicReport(ctx, tenant, it, &res)
+	case KindPaymentReceipt:
+		applyErr = s.applyPaymentReceipt(ctx, tenant, it, &res, callerEmail)
 	}
 	switch {
 	case applyErr == nil:
@@ -232,6 +249,53 @@ func (s *Service) applyCivicReport(ctx context.Context, tenant bookingops.Tenant
 	}
 	res.CaseID = &c.ID
 	res.CaseRef = c.Ref
+	return nil
+}
+
+// applyPaymentReceipt anchors a kind=payment_receipt item (SPEC-W57 Scope
+// A, A3 — mirrors applyCheckin). NO side-effect row is needed: the anchor
+// row + verbatim payload IS the record and the receipt bytes attach later
+// via the W53 receipt endpoint. Behavior:
+//   - tolerant payload decode (unknown keys ignored and preserved);
+//   - payload.booking_id, when present, is existence-checked TENANT-SCOPED
+//     (P9: an existence check, not an authorization boundary) — an unknown
+//     booking is a deterministic ErrInvalidInput (replays dedupe onto it);
+//     success echoes the accepted link in res.BookingID;
+//   - team-member attribution (P3) is SERVER-RESOLVED from the caller's
+//     email identity, never client-trusted: a client team_member_id hint
+//     that DISAGREES with the resolved member is a deterministic
+//     ErrInvalidInput; a caller matching no team member still applies
+//     (walk-in supervisors exist) with the resolution absent from the
+//     result.
+func (s *Service) applyPaymentReceipt(ctx context.Context, tenant bookingops.TenantInfo, it CaptureItem, res *ItemResult, callerEmail string) error {
+	var p PaymentReceiptPayload
+	if err := json.Unmarshal(it.Payload, &p); err != nil {
+		return errInvalidPayload("payment_receipt payload: " + err.Error())
+	}
+	if p.BookingID != nil {
+		exists, err := s.Store.BookingExists(ctx, tenant.ID, *p.BookingID)
+		if err != nil {
+			return err // transient (DB) — the anchor is released for retry
+		}
+		if !exists {
+			return errInvalidPayload("payment_receipt payload: booking_id not found in tenant")
+		}
+		res.BookingID = p.BookingID
+	}
+	if email := strings.TrimSpace(callerEmail); email != "" {
+		memberID, found, err := s.Store.TeamMemberIDByEmail(ctx, tenant.ID, email)
+		if err != nil {
+			return err // transient (DB) — the anchor is released for retry
+		}
+		if found {
+			if p.TeamMemberID != nil && *p.TeamMemberID != memberID {
+				return errInvalidPayload("payment_receipt payload: team_member_id hint disagrees with the caller's resolved team member")
+			}
+			res.TeamMemberID = &memberID
+		}
+		// !found: the caller matches no team member (walk-in supervisor) —
+		// the capture applies with no resolved attribution (P3).
+	}
 	return nil
 }
 

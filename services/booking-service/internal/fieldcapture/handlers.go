@@ -1,8 +1,10 @@
 package fieldcapture
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"go.uber.org/zap"
@@ -63,8 +65,35 @@ func (h *Handlers) Capture(w http.ResponseWriter, r *http.Request, tenant bookin
 		writeError(w, http.StatusBadRequest, "too many items (max per batch)")
 		return
 	}
-	results := h.Svc.Capture(r.Context(), tenant, req.Items)
+	results := h.Svc.CaptureWithCaller(r.Context(), tenant, req.Items, callerEmail(r))
 	writeJSON(w, http.StatusOK, captureResponse{Results: results})
+}
+
+// callerEmail resolves the caller's email identity at the handler boundary
+// (SPEC-W57 Scope A, P3 — the same mechanism as GET /v1/bookings?mine=true
+// at httpapi/bookings.go): the JWT email claim wins, X-User-Email is the
+// trusted-internal/test fallback. The token was verified upstream (APISIX /
+// tenant middleware); inside the cluster we parse the payload only — the
+// same trust posture as httpapi.parseBearerClaims. Any decode failure is
+// error-closed (""), which simply skips team-member resolution. NOTE: the
+// ctxUser context key is unexported in httpapi and unreadable here; the
+// JWT-claim + header paths cover the mine=true identity sources.
+func callerEmail(r *http.Request) string {
+	const prefix = "Bearer "
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, prefix) {
+		parts := strings.Split(strings.TrimPrefix(h, prefix), ".")
+		if len(parts) == 3 {
+			if payload, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
+				var claims struct {
+					Email string `json:"email"`
+				}
+				if json.Unmarshal(payload, &claims) == nil && claims.Email != "" {
+					return claims.Email
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("X-User-Email"))
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

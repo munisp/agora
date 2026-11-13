@@ -38,12 +38,16 @@ type Booking struct {
 	// PublicRef is the human-readable booking reference BK-XXXXXXXX
 	// (SPEC-W51 B1), unique per tenant; "" only for rows written by a
 	// pre-W51 binary before the mandatory backfill ran.
-	PublicRef string    `json:"public_ref"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	PublicRef string `json:"public_ref"`
+	// PaymentStatus (SPEC-W57 A8, P8 — additive read of the W48 bootstrap
+	// column, TEXT NOT NULL DEFAULT '') lets the field-pwa booking picker
+	// badge paid/unpaid honestly.
+	PaymentStatus string    `json:"payment_status"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-const bookingCols = `id, tenant_id, offering_id, team_member_id, contact_id, starts_at, ends_at, status, source, idempotency_key, public_ref, created_at, updated_at`
+const bookingCols = `id, tenant_id, offering_id, team_member_id, contact_id, starts_at, ends_at, status, source, idempotency_key, public_ref, payment_status, created_at, updated_at`
 
 func scanBooking(row pgx.Row) (Booking, error) {
 	var b Booking
@@ -51,7 +55,7 @@ func scanBooking(row pgx.Row) (Booking, error) {
 	// SPEC-W43 K-02) — scan through a pointer so NULL decodes to "".
 	var key *string
 	err := row.Scan(&b.ID, &b.TenantID, &b.OfferingID, &b.TeamMemberID, &b.ContactID,
-		&b.StartsAt, &b.EndsAt, &b.Status, &b.Source, &key, &b.PublicRef, &b.CreatedAt, &b.UpdatedAt)
+		&b.StartsAt, &b.EndsAt, &b.Status, &b.Source, &key, &b.PublicRef, &b.PaymentStatus, &b.CreatedAt, &b.UpdatedAt)
 	if key != nil {
 		b.IdempotencyKey = *key
 	}
@@ -185,10 +189,10 @@ func (s *Store) CreateBookingTx(ctx context.Context, b *Booking, guard SlotGuard
 			}
 			b.PublicRef = ref
 			const ins = `INSERT INTO bookings (` + bookingCols + `)
-			             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,now(),now())
+			             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12,now(),now())
 			             RETURNING created_at, updated_at`
 			err = tx.QueryRow(ctx, ins, b.ID, b.TenantID, b.OfferingID, b.TeamMemberID, b.ContactID,
-				b.StartsAt, b.EndsAt, b.Status, b.Source, b.IdempotencyKey, b.PublicRef).Scan(&b.CreatedAt, &b.UpdatedAt)
+				b.StartsAt, b.EndsAt, b.Status, b.Source, b.IdempotencyKey, b.PublicRef, b.PaymentStatus).Scan(&b.CreatedAt, &b.UpdatedAt)
 			if err != nil {
 				if isPublicRefUniqueViolation(err) {
 					// Concurrent insert won this ref between the EXISTS scan

@@ -2,9 +2,15 @@
  * SPEC-W53 Scope C: display-only surface for receipt/invoice OCR results.
  *
  * Scope B (booking-service fieldcapture) stores the ocr-service extraction on
- * a field capture as `receipt_fields jsonb` ({vendor, amount, date, items})
- * plus `receipt_document_id`. This module renders that payload wherever a
- * capture row is shown (today: the Person-360 "Lead captures" surface).
+ * a field capture as `receipt_fields jsonb` ({vendor, amount, currency, date,
+ * items}) plus `receipt_document_id`. This module renders that payload
+ * wherever a capture row is shown (today: the Person-360 "Lead captures"
+ * surface).
+ *
+ * SPEC-W57: `currency` was always extracted by the ocr-service and stored
+ * verbatim — only the parse/display sites dropped it. It is now parsed and
+ * rendered next to the amount, defensively optional (absent on receipts
+ * uploaded against older/mock OCR builds).
  *
  * Everything is defensively optional: older API responses carry neither
  * field, the extraction itself is tolerant (any sub-field may be null), and
@@ -21,6 +27,8 @@ import { Badge } from "@/components/ui/badge";
 export interface ReceiptFieldsData {
   vendor?: string | null;
   amount?: number | string | null;
+  /** ISO-ish currency code as read off the paper by OCR (e.g. "NGN"). */
+  currency?: string | null;
   date?: string | null;
   items?: ReceiptItem[] | null;
 }
@@ -66,10 +74,13 @@ export function parseReceiptFields(v: unknown): ReceiptFieldsData | null {
   const data: ReceiptFieldsData = {
     vendor: asText(o.vendor ?? o.merchant ?? o.store),
     amount: asText(o.amount ?? o.total),
+    currency: asText(o.currency),
     date: asText(o.date ?? o.receipt_date),
     items: items.length > 0 ? items : null,
   };
-  return data.vendor || data.amount || data.date || data.items ? data : null;
+  return data.vendor || data.amount || data.currency || data.date || data.items
+    ? data
+    : null;
 }
 
 /** "Receipt OCR" marker — shown wherever a capture carries OCR results. */
@@ -81,9 +92,10 @@ export function ReceiptOcrBadge() {
   );
 }
 
-/** One-line summary for dense table cells (vendor · amount · date). */
+/** One-line summary for dense table cells (vendor · amount CCY · date). */
 export function ReceiptSummary({ fields }: { fields: ReceiptFieldsData }) {
-  const parts = [fields.vendor, fields.amount, fields.date].filter(
+  const amount = formatAmountWithCurrency(fields.amount, fields.currency);
+  const parts = [fields.vendor, amount, fields.date].filter(
     (p): p is string => typeof p === "string" && p !== "",
   );
   if (parts.length === 0) return null;
@@ -92,8 +104,20 @@ export function ReceiptSummary({ fields }: { fields: ReceiptFieldsData }) {
   );
 }
 
+/** Amount with the OCR-read currency code appended when known. */
+function formatAmountWithCurrency(
+  amount?: number | string | null,
+  currency?: string | null,
+): string | null {
+  const a = asText(amount);
+  if (!a) return null;
+  const c = asText(currency);
+  return c ? `${a} ${c}` : a;
+}
+
 /** Full panel: vendor/amount/date header plus the itemized lines. */
 export function ReceiptFields({ fields }: { fields: ReceiptFieldsData }) {
+  const amount = formatAmountWithCurrency(fields.amount, fields.currency);
   return (
     <div className="rounded-md border border-border bg-muted/40 p-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -101,9 +125,7 @@ export function ReceiptFields({ fields }: { fields: ReceiptFieldsData }) {
         {fields.vendor ? (
           <span className="text-sm font-medium">{fields.vendor}</span>
         ) : null}
-        {fields.amount ? (
-          <span className="text-sm">{fields.amount}</span>
-        ) : null}
+        {amount ? <span className="text-sm">{amount}</span> : null}
         {fields.date ? (
           <span className="text-xs text-muted-foreground">{fields.date}</span>
         ) : null}

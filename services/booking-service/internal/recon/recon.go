@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -227,16 +228,32 @@ func (s *Service) loadPaidAttempts(ctx context.Context, tenantID uuid.UUID, sinc
 	return out, err
 }
 
-// matchCapture runs the §3.3 ladder for one receipt-bearing capture:
-// rung 1 exact (checkin contact chain ONLY) → rung 2 heuristic (lead phone
-// chain) → rung 3 heuristic (amount+date, skipped entirely on a null
-// receipt amount). The highest rung with ≥1 candidate decides (see
-// decideLadder).
+// matchCapture runs the §3.3 ladder for one receipt-bearing capture,
+// prepended by SPEC-W57 rung 0 (P4): payload booking_id → direct booking
+// link (payment_receipt captures only, NO time window — staleness is a
+// finding, not a filter). A rung-0 hit is exact and short-circuits the
+// classic ladder (it can never be ambiguous: one booking id dedupes to one
+// candidate); a rung-0 booking with NO paid attempt still "hits" so
+// findingForCapture can emit the linked_booking_unpaid signal. Then the
+// classic ladder: rung 1 exact (checkin contact chain ONLY) → rung 2
+// heuristic (lead phone chain) → rung 3 heuristic (amount+date, skipped
+// entirely on a null receipt amount). The highest rung with ≥1 candidate
+// decides (see decideLadder).
 func (s *Service) matchCapture(ctx context.Context, tenantID uuid.UUID, cap ReceiptCapture) (LadderOutcome, receiptView, error) {
 	rv := parseReceiptFields(cap.ReceiptFields)
 	anchor := cap.anchorTime()
+	var rung0 []PaymentCandidate
 	rungs := make([][]PaymentCandidate, 3)
 	err := s.Store.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		// Rung 0 — exact: payload booking_id direct link (payment_receipt
+		// only). Returns the booking even with NO paid attempt.
+		if bookingID, ok := captureBookingID(cap); ok {
+			cands, err := candidatesByBookingID(ctx, tx, tenantID, bookingID)
+			if err != nil {
+				return fmt.Errorf("rung 0 (booking_id link): %w", err)
+			}
+			rung0 = dedupeCandidates(cands)
+		}
 		// Rung 1 — exact: checkin contact chain ONLY.
 		if contactID, ok := captureContactID(cap); ok {
 			cands, err := candidatesByContact(ctx, tx, tenantID, contactID, anchor, s.matchWindowDays())
@@ -280,24 +297,38 @@ func (s *Service) matchCapture(ctx context.Context, tenantID uuid.UUID, cap Rece
 	if err != nil {
 		return LadderOutcome{}, rv, err
 	}
+	// Rung 0 decides first (P4): single candidate → ConfidenceExact with
+	// WinningRung 0; >1 is defensive-only (a single booking id cannot
+	// dedupe to >1 candidate) and degrades to an honest ambiguity.
+	switch {
+	case len(rung0) == 1:
+		c := rung0[0]
+		return LadderOutcome{Confidence: ConfidenceExact, Candidate: &c, WinningRung: 0}, rv, nil
+	case len(rung0) > 1:
+		return LadderOutcome{Confidence: ConfidenceNone, WinningRung: 0, Ambiguous: rung0}, rv, nil
+	}
 	return decideLadder(rungs), rv, nil
 }
 
 // findingForCapture maps a ladder outcome to a finding (nil when the pair
-// is clean — matched, amounts verified equal). detail ALWAYS carries
-// currency_unknown:true (R2 honesty): receipts carry no currency, so every
-// amount comparison assumes the attempt's currency and says so.
+// is clean — matched, amounts verified equal). SPEC-W57 §3.5 (P7):
+// currency_unknown:true is now CONDITIONAL — carried only when the receipt
+// itself has no currency (pre-fold-in behavior); when receipt_fields
+// carries a currency the detail says so honestly instead.
 func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCapture, o LadderOutcome, rv receiptView) *Finding {
 	base := Finding{
 		TenantID:           tenantID,
 		RunID:              runID,
 		CaptureClientID:    &cap.ClientID,
 		ReceiptAmountMajor: rv.AmountMajor,
-		ReceiptCurrency:    "", // receipts carry no currency (R2)
+		ReceiptCurrency:    rv.Currency, // "" when the receipt has none (P7)
 	}
 	detail := map[string]any{
-		"currency_unknown": true,
+		"currency_unknown": rv.Currency == "",
 		"lookback_days":    s.lookbackDays(),
+	}
+	if rv.Currency != "" {
+		detail["receipt_currency"] = rv.Currency
 	}
 	if rv.DateRaw != "" {
 		detail["receipt_date"] = rv.DateRaw
@@ -332,20 +363,49 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 	// Single winning candidate — verify the amount.
 	c := o.Candidate
 	base.BookingID = &c.BookingID
-	base.AttemptTxRef = &c.TxRef
 	base.Confidence = o.Confidence
 	detail["winning_rung"] = o.WinningRung
+
+	// SPEC-W57 P4: a rung-0 hit whose booking has NO paid attempt is the
+	// cash-collection signal — receipt_without_payment at confidence exact
+	// with the booking linked. No amount verification is possible (there is
+	// no rail capture to compare against).
+	if o.WinningRung == 0 && c.AttemptStatus == "" {
+		base.Kind = KindReceiptWithoutPayment
+		base.Confidence = ConfidenceExact
+		detail["reason"] = "linked_booking_unpaid"
+		base.Detail = mustJSON(detail)
+		return &base
+	}
+
+	if c.TxRef != "" {
+		base.AttemptTxRef = &c.TxRef
+	}
 	detail["attempt_status"] = c.AttemptStatus
 	if c.Currency != "" {
-		// R2 honesty: the receipt has no currency; the comparison ASSUMES
-		// the rail/offering currency and the detail says so.
-		detail["assumed_currency"] = c.Currency
+		if rv.Currency == "" {
+			// R2 honesty: the receipt has no currency; the comparison
+			// ASSUMES the rail/offering currency and the detail says so.
+			detail["assumed_currency"] = c.Currency
+		} else {
+			detail["rail_currency"] = c.Currency
+		}
 	}
 	if c.OfferingPriceMinor != nil {
 		detail["offering_price_minor"] = *c.OfferingPriceMinor
 	}
 
 	divergent, comparable := amountDivergence(rv.AmountMajor, c.AmountMinor)
+	// SPEC-W57 §3.5 (P7): when BOTH currencies are present and DIFFER the
+	// amounts are NOT comparable — NEVER convert (no FX rates exist in the
+	// platform). The pair degrades to the not-comparable path with an
+	// explicit currency_mismatch detail.
+	currencyMismatch := rv.Currency != "" && c.Currency != "" && !strings.EqualFold(rv.Currency, c.Currency)
+	if currencyMismatch {
+		comparable = false
+		divergent = false
+		detail["currency_mismatch"] = true
+	}
 	switch {
 	case !comparable:
 		// The amount cannot be verified. A standalone currency_unknown
@@ -356,7 +416,11 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 			return nil
 		}
 		base.Kind = KindCurrencyUnknown
-		detail["reason"] = "receipt_amount_or_currency_unreadable"
+		if currencyMismatch {
+			detail["reason"] = "currency_mismatch"
+		} else {
+			detail["reason"] = "receipt_amount_or_currency_unreadable"
+		}
 		if c.AmountMinor != nil {
 			detail["rail_amount_minor"] = *c.AmountMinor
 		}

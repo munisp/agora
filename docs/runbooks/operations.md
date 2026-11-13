@@ -411,7 +411,7 @@ Limitations (dev topology): per-DB dumps, not WAL archiving — production HA
 3-node TigerBeetle cluster back up a replica instead of pausing the leader;
 ship snapshots off-box for anything beyond dev.
 
-## 9. Receipt reconciliation (SPEC-W56)
+## 9. Receipt reconciliation (SPEC-W56, W57)
 
 The booking-service internal reconciler (`internal/recon`) matches
 field-captured receipts (`field_captures.receipt_document_id` /
@@ -431,18 +431,24 @@ reconciliation" on the ops-alerts page).
 
 | kind | severity | meaning |
 |---|---|---|
-| `receipt_without_payment` | high | a receipt-bearing capture with no matching paid booking/attempt in the window |
+| `receipt_without_payment` | high | a receipt-bearing capture with no matching paid booking/attempt. W57: a rung-0 hit whose linked booking has NO paid attempt lands here at confidence **`exact`** with `detail.reason = "linked_booking_unpaid"` — the cash-collection detector (agent collected against a booking that was never paid on the rail) |
 | `amount_mismatch` | high | a matched pair whose receipt amount diverges from the captured/expected amount — **paper-vs-rail**, DISTINCT from the W49 rail-vs-price payment mismatch |
 | `payment_without_receipt` | info | a paid booking/attempt with no linked receipt — generated ONLY for tenants with ≥1 receipt-bearing capture in the window (gated by data, not flags, so card-online tenants are not spammed) |
 
 (`currency_unknown` appears as a standalone finding kind ONLY when it blocks
 an otherwise-exact amount match; otherwise it rides in `detail` — see the
-honesty note below.)
+currency note below.)
 
-### Confidence ladder (SPEC-W56 pinned decision 1)
+### Confidence ladder (SPEC-W56 pinned decision 1, W57 rung 0)
 
 Highest rung with EXACTLY ONE candidate wins:
 
+0. **exact** (W57) — `payment_receipt` capture `payload->>'booking_id'` →
+   the booking directly. Rung 0 has **no time window** — the agent asserted
+   the booking, so staleness is a finding, not a filter. A rung-0 hit whose
+   booking has no paid attempt yields `receipt_without_payment` at
+   confidence `exact` with `detail {reason:"linked_booking_unpaid",
+   winning_rung:0}`.
 1. **exact** — capture `payload->>'contact_id'` → bookings with
    `payment_status IN ('paid','paid_amount_mismatch')` within
    ±`RECON_MATCH_WINDOW_DAYS` (7) of the capture.
@@ -455,15 +461,40 @@ Ambiguity (>1 candidate at the winning rung) → finding with
 `confidence='none'` + the candidate list in `detail`. Null receipt amounts
 never enter the amount rung — no guessing (RECON R5).
 
-### Currency honesty (RECON R2)
+### Currency fold-in (W57; was "currency honesty", RECON R2)
 
-Receipts carry **no currency** (the OCR contract extracts
-vendor/amount/date/items; amount is whatever the LLM read off the paper, in
-major units). Every finding's `detail` therefore carries
-`currency_unknown: true`, and amount comparisons assume the offering
-currency — the admin page renders amounts without a currency symbol for
-this reason. Multi-currency tenants should treat amount findings as
-indicative only.
+The ocr-service has ALWAYS extracted `currency` (with vendor/amount/date/
+items) and booking-side storage keeps the extraction verbatim in
+`receipt_fields` — only the parse/display sites dropped it. W57 folds it in
+with NO DDL:
+
+- recon parses `receipt_fields.currency` tolerantly and populates the
+  existing `receipt_currency` findings column;
+- `detail.currency_unknown: true` is now **conditional** — present only when
+  the receipt currency is absent. When it is known, the admin page appends
+  the currency code to the rendered amounts (bare number otherwise);
+- when BOTH receipt currency and attempt (rail) currency are present and
+  DIFFER, the pair is **not comparable**: `detail` carries
+  `{currency_mismatch: true, receipt_currency, rail_currency}` and amounts
+  are **never converted** — no FX rates exist anywhere in the platform;
+- the fold-in is retroactive for free: receipts uploaded before W57 already
+  carry `currency` in `receipt_fields`, so the next sweep parses them too.
+
+**One-time operator note (SPEC-W57 P7):** findings are deduped by
+`(tenant_id, kind, capture_client_id, booking_id)`, so pre-W57
+`currency_unknown` findings are NOT re-emitted in cleaner form — they stay
+as historical record. Resolve the stale open `currency_unknown` findings
+once after the W57 deploy:
+
+```bash
+docker exec postgres psql -U opendesk -d booking -c \
+  "SELECT id, tenant_id, created_at FROM receipt_recon_findings
+    WHERE kind = 'currency_unknown' AND resolved_at IS NULL
+    ORDER BY created_at;"
+```
+
+(resolve them via the admin page or `resolved_at`; do NOT delete the rows —
+the dedupe key would treat a re-finding as new).
 
 ### Where to look
 
@@ -490,18 +521,30 @@ docker exec postgres psql -U opendesk -d booking -c \
     WHERE resolved_at IS NULL GROUP BY 1,2 ORDER BY 1;"
 ```
 
-### Pinned FOLLOW-UP (not in W56)
+### W56 pinned follow-up — LANDED in W57
 
-The structural fix for match recall is the capture-contract change: optional
-`booking_id` / `team_member_id` on capture payloads plus a `payment_receipt`
-capture kind → receipts link directly to bookings and matching becomes exact
-instead of heuristic (RECON §5 R1). Until it lands, recon recall is
-structurally capped and `exact` matches exist only via the contact chain.
+The structural fix for match recall shipped in W57: the `payment_receipt`
+capture kind with optional `booking_id` / `team_member_id` payload fields
+(`docs/field-capture.md` §3) plus recon rung 0 → receipts link directly to
+bookings and matching becomes exact instead of heuristic. Notes:
 
-### Adoption caveat (RECON R4)
+- `team_member_id` is server-RESOLVED from the caller identity (JWT email →
+  team member), never client-trusted; a disagreeing client hint is a
+  deterministic item error. Attribution audit trail = resolved
+  `team_member_id` + `client_id` + `server_received_at`.
+- **Documented limitation (not a boundary):** `booking_id` is
+  tenant-scoped-existence-checked only — any `manage_bookings` holder can
+  link ANY tenant booking; no per-agent booking ACL exists anywhere in the
+  platform. A per-agent ACL is a platform authz decision, out of scope.
+- Deploy ordering is server first, PWA second: the kind allow-list, kind
+  CHECK constraint, and apply-switch case ship in one booking-service
+  build, or validated `payment_receipt` items would "apply" with zero side
+  effects (silent swallow).
 
-field-pwa has **no receipt upload UI yet** — the receipt endpoint
-(`POST /v1/field/captures/{id}/receipt`) exists but has no real client.
-Findings depend on staff actually uploading receipts through the API; an
-empty reconciliation report today means no receipts were captured, not that
-nothing is wrong.
+### Adoption caveat (RECON R4, updated W57)
+
+field-pwa now HAS a receipt capture flow (W57): booking picker +
+camera-photo upload, offline-first with the photo bytes uploading strictly
+after the capture flush ack. Findings still depend on staff actually
+capturing receipts — an empty reconciliation report means no receipts were
+captured, not that nothing is wrong.

@@ -16,7 +16,7 @@ The field client keeps an IndexedDB outbox of items captured while offline:
 ```json
 {
   "id": "client-side row id",
-  "kind": "lead_capture | checkin",
+  "kind": "lead_capture | checkin | payment_receipt",
   "payload": { "…": "kind-specific" },
   "captured_at": "2025-01-15T10:30:00Z",
   "gps": { "lat": 6.5244, "lng": 3.3792, "accuracy": 12.5 }
@@ -116,6 +116,38 @@ W8 store (`internal/store/geolocations.go`, `contact_locations`) is a
 last-known-position UPSERT keyed `(tenant_id, contact_id)` and exposes **no
 history** — so per the spec's fallback clause, check-in history persists in
 the new `field_checkins` table (RLS-enabled, tenant-scoped).
+
+### payment_receipt → receipt linked to a booking (SPEC-W57)
+
+| payload field | required | notes |
+|---|---|---|
+| `booking_id` | — | exact-match anchor: recon rung 0 links the receipt directly to this booking. Tenant-scoped existence check at apply time; an unknown booking is a **deterministic item error** (replays dedupe to it). |
+| `team_member_id` | — | **hint only** — the server re-resolves the collecting agent from the caller identity (JWT email claim → `team_members.email`, the same mechanism as `GET /v1/bookings?mine=true`). A hint that DISAGREES with the resolved member is a deterministic item error; when the caller matches no team member the capture still applies (walk-in supervisors exist) with attribution absent. |
+| `note` | — | free text |
+
+An **empty payload is legal** — an "unlinked receipt" that falls back to the
+heuristic recon ladder. The per-item result echoes the accepted link
+(`booking_id`) and the RESOLVED `team_member_id` (`omitempty` — absent on
+unlinked/unresolved applies). No side-effect row is written: the anchor row
+plus payload IS the record; the receipt photo attaches via
+`POST /v1/field/captures/{id}/receipt` (W53).
+
+**Two-phase upload sequencing (pinned, SPEC-W57 P5):** receipt bytes upload
+**strictly after** the per-item flush ack (`applied`/`deduped`) — the receipt
+endpoint 404s before the anchor exists. **One photo per `client_id`:** the
+attach is an unconditional UPDATE, so re-uploading the SAME photo to the
+same `client_id` is a safe retry, but a NEW photo MUST get a NEW `client_id`
+(reusing an id silently overwrites the previous receipt). Use a dedicated
+upload request with a ~180s timeout — OCR can take up to 150s (the route is
+exempt from the global 60s middleware timeout) and the 15s flush budget
+cannot cover it.
+
+**Deploy ordering (pinned, SPEC-W57 P2):** server first, PWA second. The
+kind allow-list, the kind CHECK constraint, and the apply-switch case land
+in ONE booking-service build; a PWA ahead of the server gets an honest,
+retryable per-item validation error (the item stays queued, nothing is
+lost), while a server missing the apply case would "apply" the item with
+zero side effects — forbidden by construction.
 
 ## 4. Auth & permissions
 

@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS field_captures (
     tenant_id   UUID NOT NULL,
     client_id   TEXT NOT NULL,
     kind        TEXT NOT NULL
-                CHECK (kind IN ('lead_capture','checkin')),
+                CHECK (kind IN ('lead_capture','checkin','civic_report','payment_receipt')),
     payload     JSONB NOT NULL DEFAULT '{}',
     gps         JSONB,
     captured_at TIMESTAMPTZ,
@@ -94,9 +94,11 @@ ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS server_received_at TIMESTAMP
 -- SPEC-W32 WS-A: the kind enum gains 'civic_report'. CREATE TABLE IF NOT
 -- EXISTS never updates an existing CHECK constraint, so it is rebuilt
 -- idempotently (drop + re-add with the full enum).
+-- SPEC-W57 Scope A: the enum gains 'payment_receipt' the same way (a
+-- metadata-only widening — existing rows cannot violate it).
 ALTER TABLE field_captures DROP CONSTRAINT IF EXISTS field_captures_kind_check;
 ALTER TABLE field_captures ADD CONSTRAINT field_captures_kind_check
-    CHECK (kind IN ('lead_capture','checkin','civic_report'));
+    CHECK (kind IN ('lead_capture','checkin','civic_report','payment_receipt'));
 -- SPEC-W53 Scope B (additive): receipt OCR attachment pointers, filled by
 -- POST /v1/field/captures/{id}/receipt after a successful ocr-service
 -- extraction. Both NULLable with no defaults, so every pre-W53 insert path
@@ -266,6 +268,46 @@ func (s *Store) AttachReceipt(ctx context.Context, tenantID uuid.UUID, clientID 
 		}
 		return nil
 	})
+}
+
+// BookingExists reports tenant-scoped booking existence (SPEC-W57 Scope A,
+// A3/P9): kind=payment_receipt existence-checks its payload booking_id
+// before accepting the link. This is an EXISTENCE check only — it is not
+// an authorization boundary (any manage_bookings holder can link any
+// tenant booking; no per-agent ACL exists anywhere in the platform).
+// Tenant-scoped via withTenant (RLS intact); READS bookings only (P10).
+func (s *Store) BookingExists(ctx context.Context, tenantID, bookingID uuid.UUID) (bool, error) {
+	var exists bool
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM bookings WHERE tenant_id=$1 AND id=$2)`,
+			tenantID, bookingID).Scan(&exists)
+	})
+	return exists, err
+}
+
+// TeamMemberIDByEmail resolves the caller's team_members.id by email
+// (case-insensitive — the same predicate as
+// store.Store.GetTeamMemberByEmail, reimplemented here because this
+// package's Store owns its own pool and the httpapi/main wiring that would
+// inject the main store is out of scope). found=false when no member
+// matches (a walk-in supervisor — NOT an error; P3). Read-only.
+func (s *Store) TeamMemberIDByEmail(ctx context.Context, tenantID uuid.UUID, email string) (id uuid.UUID, found bool, err error) {
+	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		scanErr := tx.QueryRow(ctx,
+			`SELECT id FROM team_members
+			 WHERE tenant_id=$1 AND lower(email)=lower($2) ORDER BY name LIMIT 1`,
+			tenantID, email).Scan(&id)
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return nil
+		}
+		if scanErr != nil {
+			return scanErr
+		}
+		found = true
+		return nil
+	})
+	return id, found, err
 }
 
 // checkinReadCols is the SELECT column list (SPEC-W45 OOS-21: includes the

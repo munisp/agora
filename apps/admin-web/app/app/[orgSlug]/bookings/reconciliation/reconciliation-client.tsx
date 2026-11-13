@@ -11,18 +11,25 @@
  *                    captured_amount_minor?, receipt_amount_major?,
  *                    receipt_currency?, detail, created_at, resolved_at? }] }
  *
- * Honesty notes carried from RECON §5 / SPEC-W56 pinned decisions:
- *  - R1: `exact` matches come ONLY from the checkin contact chain;
+ * Honesty notes carried from RECON §5 / SPEC-W56+W57 pinned decisions:
+ *  - R1: `exact` matches come from rung 0 (payment_receipt payload
+ *    booking_id → direct booking link, W57) or the checkin contact chain;
  *    `heuristic` from the lead-phone chain or amount+date; an ambiguous
  *    match (>1 candidate at the winning rung) lands as confidence='none'
  *    with the candidate list in `detail`.
- *  - R2: receipts carry NO currency — amounts below are rendered WITHOUT a
- *    currency symbol and comparisons assumed the offering currency
- *    (`detail.currency_unknown` is true on every finding).
+ *  - R2 (W57 currency fold-in): the ocr-service always extracted `currency`
+ *    and it is stored verbatim in receipt_fields; recon now parses it.
+ *    `detail.currency_unknown` is true ONLY when the receipt currency is
+ *    absent — when known, the currency code is appended to the rendered
+ *    amounts. When receipt and rail currencies both exist and DIFFER, the
+ *    pair is not comparable (`detail.currency_mismatch`) and amounts are
+ *    NEVER converted (no FX rates exist). Pre-W57 findings keep
+ *    `currency_unknown: true` as historical record.
  *  - `amount_mismatch` here is paper-vs-rail (receipt vs captured amount),
  *    DISTINCT from the W49 rail-vs-price payment mismatch.
  */
 import * as React from "react";
+import Link from "next/link";
 import { RefreshCw } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
@@ -107,23 +114,54 @@ function confidenceVariant(
 }
 
 /**
- * R2 honesty: receipts carry no currency and minor-unit columns assume the
- * offering currency — format as a bare number, never with a currency symbol.
+ * R2 honesty (post-W57 fold-in): minor-unit columns assume the rail/offering
+ * currency and are formatted as a bare number UNLESS the finding's currency
+ * is known — then the currency CODE (never a symbol) is appended. When
+ * `detail.currency_unknown` is true the bare number is kept, so an unknown
+ * currency is never implied.
  */
-function formatMinor(minor?: number | null): string {
+function formatMinor(minor?: number | null, currency?: string | null): string {
   if (minor === null || minor === undefined) return "—";
-  return new Intl.NumberFormat("en-US", {
+  const n = new Intl.NumberFormat("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(minor / 100);
+  return currency ? `${n} ${currency}` : n;
 }
 
-function formatMajor(major?: number | null): string {
+function formatMajor(major?: number | null, currency?: string | null): string {
   if (major === null || major === undefined) return "—";
-  return new Intl.NumberFormat("en-US", {
+  const n = new Intl.NumberFormat("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(major);
+  return currency ? `${n} ${currency}` : n;
+}
+
+function asCode(v: unknown): string | null {
+  return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
+}
+
+/**
+ * Per-finding display currencies, derived from detail (P7):
+ *  - `currency_unknown: true` (receipt currency absent) => both null, bare
+ *    numbers everywhere.
+ *  - receipt currency known => receipt column takes `receipt_currency`;
+ *    rail columns take the same code UNLESS `currency_mismatch` marks a
+ *    divergence, in which case rail columns take `rail_currency` and the two
+ *    columns honestly show their own (never converted) currencies.
+ */
+function findingCurrencies(f: ReconFinding): {
+  receipt: string | null;
+  rail: string | null;
+} {
+  const d = detailObject(f.detail);
+  if (d.currency_unknown === true) return { receipt: null, rail: null };
+  const receipt = asCode(d.receipt_currency) ?? asCode(f.receipt_currency);
+  if (!receipt) return { receipt: null, rail: null };
+  const rail =
+    d.currency_mismatch === true ? (asCode(d.rail_currency) ?? receipt) : receipt;
+  return { receipt, rail };
 }
 
 /** detail is JSONB; tolerate a pre-parsed object or JSON text. */
@@ -205,7 +243,7 @@ export function ReconciliationClient({
     <div>
       <PageHeader
         title="Receipt reconciliation"
-        description="Field-captured receipts matched against payment state. Receipts carry no currency — amounts assume the offering currency and are shown without a currency symbol."
+        description="Field-captured receipts matched against payment state — payment_receipt captures link to their booking exactly (rung 0); the rest match heuristically. Receipts now carry an OCR-extracted currency: the code is shown next to amounts when known, and amounts stay bare (never converted) when it is absent or mismatched."
         actions={
           <Button
             variant="outline"
@@ -250,6 +288,7 @@ export function ReconciliationClient({
             <TableRow>
               <TableHead className="pl-5">Kind</TableHead>
               <TableHead>Confidence</TableHead>
+              <TableHead>Booking</TableHead>
               <TableHead className="text-right">Expected</TableHead>
               <TableHead className="text-right">Captured</TableHead>
               <TableHead className="text-right">Receipt</TableHead>
@@ -259,7 +298,7 @@ export function ReconciliationClient({
           </TableHeader>
           <TableBody>
             {findings.length === 0 ? (
-              <TableEmpty colSpan={7}>
+              <TableEmpty colSpan={8}>
                 {loading
                   ? "Loading…"
                   : "No reconciliation findings. Findings appear once staff upload receipts via the capture API and a sweep runs."}
@@ -267,6 +306,7 @@ export function ReconciliationClient({
             ) : (
               findings.map((f) => {
                 const km = kindMeta(f.kind);
+                const cur = findingCurrencies(f);
                 return (
                   <TableRow key={f.id}>
                     <TableCell className="pl-5">
@@ -280,14 +320,27 @@ export function ReconciliationClient({
                         {f.confidence || "—"}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-right text-sm tabular-nums">
-                      {formatMinor(f.expected_amount_minor)}
+                    <TableCell className="text-sm">
+                      {f.booking_id ? (
+                        <Link
+                          href={`/app/${orgSlug}/bookings/${f.booking_id}`}
+                          className="font-mono text-xs text-primary underline-offset-2 hover:underline"
+                          title={f.booking_id}
+                        >
+                          {f.booking_id.slice(0, 8)}…
+                        </Link>
+                      ) : (
+                        "—"
+                      )}
                     </TableCell>
                     <TableCell className="text-right text-sm tabular-nums">
-                      {formatMinor(f.captured_amount_minor)}
+                      {formatMinor(f.expected_amount_minor, cur.rail)}
                     </TableCell>
                     <TableCell className="text-right text-sm tabular-nums">
-                      {formatMajor(f.receipt_amount_major)}
+                      {formatMinor(f.captured_amount_minor, cur.rail)}
+                    </TableCell>
+                    <TableCell className="text-right text-sm tabular-nums">
+                      {formatMajor(f.receipt_amount_major, cur.receipt)}
                     </TableCell>
                     <TableCell className="text-sm">
                       {formatDateTime(f.created_at)}
