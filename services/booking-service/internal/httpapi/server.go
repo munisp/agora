@@ -31,6 +31,7 @@ import (
 	"github.com/opendesk/booking-service/internal/lending"
 	"github.com/opendesk/booking-service/internal/loyalty"
 	"github.com/opendesk/booking-service/internal/permify"
+	"github.com/opendesk/booking-service/internal/recon" // SPEC-W56 Scope A (additive import)
 	"github.com/opendesk/booking-service/internal/referrals"
 	"github.com/opendesk/booking-service/internal/socialpub"
 	"github.com/opendesk/booking-service/internal/store"
@@ -177,6 +178,13 @@ type Deps struct {
 	// non-empty redirect_url is rejected 400 redirect_url_not_allowed; the
 	// empty value (provider default) stays allowed.
 	PayRedirectAllowHosts []string
+
+	// Recon serves the SPEC-W56 Scope A receipt↔payment reconciliation
+	// endpoints: GET /v1/recon/receipts (manage_bookings — findings + the
+	// linked captures' receipt_fields, the first receipt read path) and
+	// POST /v1/internal/recon/receipts (internauth-guarded manual sweep
+	// trigger). Nil → both routes answer 503.
+	Recon *recon.Handlers
 
 	// SPEC-W52 Scope B: geospatial foundation wiring.
 	// GeoEnrich is the geo-service point-in-polygon enrichment client
@@ -478,6 +486,11 @@ func NewRouter(d Deps) http.Handler {
 		// the same perm as the capture flush it attaches to. This route is
 		// exempt from the global 60s timeout (see requestTimeoutMiddleware).
 		r.With(s.require("manage_bookings")).Post("/field/captures/{id}/receipt", s.fieldCaptureReceiptHandler)
+		// SPEC-W56 Scope A (additive): receipt↔payment reconciliation
+		// findings read path (receipt.go:14-20 perm precedent —
+		// manage_bookings). Doubles as the FIRST read path serving
+		// receipt_fields for the linked captures (R4).
+		r.With(s.require("manage_bookings")).Get("/recon/receipts", s.reconListHandler)
 		// SPEC-W19 integrator (additive): loyalty self-mounts "/loyalty"
 		// INSIDE this /v1 group (chi panics on a second Mount("/v1"), and
 		// this way the group inherits the tenant middleware for free);
@@ -743,6 +756,14 @@ func NewRouter(d Deps) http.Handler {
 	// BOOKING_INTERNAL_TOKEN (constant-time; 503 fail-closed when unset, 401
 	// on missing/wrong) BEFORE the tenant middleware resolves the tenant.
 	r.With(s.internAuth, s.tenantMiddleware).Post("/v1/civic/internal/cases/{ref}/sla-breach", s.civicSLABreach)
+
+	// SPEC-W56 Scope A (additive): manual receipt↔payment reconciliation
+	// sweep trigger (pinned decision 6 — ticker + manual). internauth-
+	// guarded EXACTLY like the civic sla-breach callback (X-Internal-Token
+	// vs BOOKING_INTERNAL_TOKEN, constant-time, 503 fail-closed when unset,
+	// 401 on missing/wrong) but WITHOUT the tenant middleware: the sweep
+	// enumerates the receipt-bearing tenants itself (pinned decision 4).
+	r.With(s.internAuth).Post("/v1/internal/recon/receipts", s.reconTriggerHandler)
 
 	return r
 }
@@ -1054,6 +1075,27 @@ func (s *server) fieldCaptureReceiptHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.d.FieldCapture.Receipt(w, r, tenantFrom(r.Context()))
+}
+
+// reconListHandler adapts GET /v1/recon/receipts (SPEC-W56 Scope A).
+// Answers 503 when the recon service is not configured.
+func (s *server) reconListHandler(w http.ResponseWriter, r *http.Request) {
+	if s.d.Recon == nil {
+		writeError(w, http.StatusServiceUnavailable, "receipt recon unavailable")
+		return
+	}
+	s.d.Recon.ListFindings(w, r, tenantFrom(r.Context()))
+}
+
+// reconTriggerHandler adapts POST /v1/internal/recon/receipts (SPEC-W56
+// Scope A). The internauth middleware owns the fail-closed token posture;
+// a nil recon service answers 503.
+func (s *server) reconTriggerHandler(w http.ResponseWriter, r *http.Request) {
+	if s.d.Recon == nil {
+		writeError(w, http.StatusServiceUnavailable, "receipt recon unavailable")
+		return
+	}
+	s.d.Recon.Trigger(w, r)
 }
 
 // publicCreateBookingMarked wraps the public booking create with the

@@ -66,6 +66,33 @@ Temporal saga activity callbacks (invoked by notification-worker via Dapr):
 
 Internal: `POST /internal/sites` (seeded by `TenantOnboardingWorkflow`).
 
+Receipt ↔ payment reconciliation (SPEC-W56 Scope A):
+
+- `GET /v1/recon/receipts?status=open|resolved|all&limit=` — `manage_bookings`.
+  Returns `{findings: [...], count, status}`: `receipt_recon_findings` rows
+  newest-first, each carrying the linked capture's `receipt_fields` verbatim
+  (the first read path for receipt data). `status` defaults to `open`
+  (unresolved); `limit` defaults to 100, capped at 500.
+- `POST /v1/internal/recon/receipts` — manual sweep trigger, guarded by
+  `X-Internal-Token` vs `BOOKING_INTERNAL_TOKEN` (constant-time; 503 when
+  unset — fail closed, 401 on missing/wrong). Runs one sweep synchronously
+  and returns `{run_id, tenants_scanned, tenants_failed, findings_new,
+  findings_deduped}`.
+
+A finding's `kind` is one of `receipt_without_payment` (no candidate, or
+ambiguous winning rung — candidates listed in `detail`),
+`payment_without_receipt` (only for tenants with ≥1 receipt-bearing capture
+in the window), `amount_mismatch` (paper-vs-rail; DISTINCT from the W49
+rail-vs-price mismatch), `currency_unknown` (standalone ONLY when the
+missing receipt amount/currency blocks an otherwise-exact pair).
+`confidence` is `exact` (checkin contact chain), `heuristic` (lead-phone
+chain or amount+date) or `none`. Receipts carry no currency: every
+finding's `detail` carries `currency_unknown: true` and amount comparisons
+assume the rail/offering currency (`assumed_currency` in `detail`). Each
+NEW finding emits one `com.opendesk.booking.ReceiptReconFinding` CloudEvent
+to `opendesk.booking.events` in the same transaction (dedupe key
+`(tenant_id, kind, capture_client_id, booking_id)`; replays emit nothing).
+
 Reverse CRM sync (invoked by crm-sync-service via Dapr, tenant via
 `X-Tenant-Slug`, no Permify — internal only; **no outbox events**, so the
 Twenty → OpenDesk direction can never loop):
@@ -126,6 +153,10 @@ Twenty → OpenDesk direction can never loop):
 | `SHUTDOWN_TIMEOUT_SECONDS` | `20` | Graceful shutdown budget |
 | `PORTAL_SECRET` | dev fallback | HMAC secret signing 15-min portal JWTs — override in prod |
 | `NOTIFICATIONS_TOPIC` | `opendesk.notifications.outbox` | Topic for `SendPortalCode` delivery |
+| `RECON_SWEEP_MINUTES` | `60` | Receipt↔payment reconciliation sweep cadence (SPEC-W56); `0` disables the ticker (manual trigger stays) |
+| `RECON_LOOKBACK_DAYS` | `30` | Trailing sweep window |
+| `RECON_MATCH_WINDOW_DAYS` | `7` | ± contact-chain appointment match window |
+| `RECON_AMOUNT_WINDOW_DAYS` | `3` | ± amount+date rung window |
 
 ## Schema notes
 
@@ -144,6 +175,14 @@ Twenty → OpenDesk direction can never loop):
   attempts, expires_at, consumed_at, created_at`) backs the customer portal
   (Wave 5 #7); bootstrapped idempotently at startup with the same RLS
   `tenant_isolation` policy as `waitlist`.
+- **`receipt_recon_findings`** (SPEC-W56): recon findings (`kind`,
+  confidence ladder, amounts, `detail JSONB`, `resolved_at`), bootstrapped
+  idempotently by `internal/recon` with RLS ENABLE+FORCE `tenant_isolation`;
+  dedupe `UNIQUE(tenant_id, kind, capture_client_id, booking_id)` plus a
+  COALESCE expression unique index so NULL halves dedupe too. The W56
+  additive `booking_payment_attempts.amount_minor BIGINT` / `currency TEXT`
+  columns are filled at capture-transition time (`paymentTransitionLocked`)
+  and are NULL on pre-W56 rows.
 
 ## Auth trust boundary
 

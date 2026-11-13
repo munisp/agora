@@ -148,6 +148,12 @@ func run() error {
 	// registration the started workflow would queue forever on a worker
 	// that does not host the type.
 	w.RegisterWorkflowWithOptions(workflows.PaymentMismatchAlertWorkflow, workflow.RegisterOptions{Name: "PaymentMismatchAlertWorkflow"})
+	// SPEC-W56-B: receipt↔payment recon finding ops alert, started by the
+	// signals bridge on com.opendesk.booking.ReceiptReconFinding
+	// (deterministic ID receipt-recon-<finding_id>). Without this
+	// registration the started workflow would queue forever on a worker
+	// that does not host the type.
+	w.RegisterWorkflowWithOptions(workflows.ReceiptReconAlertWorkflow, workflow.RegisterOptions{Name: "ReceiptReconAlertWorkflow"})
 	// SPEC-W19 integrator (additive): fire-and-forget paced sends from the
 	// notifications outbox (notifyoutbox consumer starts one per PacedSend
 	// command — e.g. field-service dispatch push).
@@ -222,6 +228,14 @@ func run() error {
 	// BookingPaymentAmountMismatch). SYSTEM/TRANSACTIONAL — never
 	// DND-suppressed; routes to the ops-alerts topic, never the customer.
 	w.RegisterActivityWithOptions(acts.SendPaymentMismatchAlert, activity.RegisterOptions{Name: workflows.ActivitySendPaymentMismatchAlert})
+	// SPEC-W56-B: receipt↔payment recon finding OPS/STAFF alert (executed
+	// DIRECTLY by ReceiptReconAlertWorkflow, mirroring the saga's
+	// EmitOpsAlert ops-alert precedent — not via NotifyPaced; the paced
+	// dispatch table is outside this wave's ownership). SYSTEM/
+	// TRANSACTIONAL — never DND-suppressed; routes to the ops-alerts
+	// topic, never the customer. Without this registration the activity
+	// task would fail unregistered on the worker.
+	w.RegisterActivityWithOptions(acts.SendReceiptReconAlert, activity.RegisterOptions{Name: workflows.ActivitySendReceiptReconAlert})
 	// Digital-twin cleanup activity (SPEC-W3 §3 innovation 12)
 	w.RegisterActivityWithOptions(acts.DeleteTwinTenant, activity.RegisterOptions{Name: workflows.ActivityDeleteTwinTenant})
 

@@ -98,6 +98,14 @@ CREATE TABLE IF NOT EXISTS booking_payment_attempts (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_booking_payment_attempts_booking ON booking_payment_attempts (booking_id);
+-- SPEC-W56 Scope A (additive): persist the captured amount (MINOR units) +
+-- currency on the attempt row, filled by paymentTransitionLocked where
+-- capturedMinor/currency are already in scope. Closes the "captured amount
+-- never persisted booking-side" gap (RECON R3) so the receipt↔payment
+-- reconciler can compare paper-vs-rail. NULL on pre-W56 rows — the
+-- reconciler treats NULL as unknown, never a guess.
+ALTER TABLE booking_payment_attempts ADD COLUMN IF NOT EXISTS amount_minor BIGINT;
+ALTER TABLE booking_payment_attempts ADD COLUMN IF NOT EXISTS currency TEXT;
 ALTER TABLE booking_payment_attempts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE booking_payment_attempts FORCE ROW LEVEL SECURITY;
 DO $$
@@ -485,10 +493,15 @@ func (s *Store) paymentTransitionLocked(ctx context.Context, tx pgx.Tx, tenantID
 			return "", false, fmt.Errorf("mark booking payment %s: %w", newStatus, err)
 		}
 	}
+	// SPEC-W56 Scope A (additive): the same UPDATE also fills the W56
+	// amount_minor/currency columns with the captured values already in
+	// scope above (capturedMinor = round(amountMajor*100), same conversion
+	// the amount check uses) — same statement, same tx; the transition
+	// semantics, tolerance and outbox behavior are unchanged.
 	if _, err := tx.Exec(ctx,
-		`UPDATE booking_payment_attempts SET status=$3, updated_at=now()
+		`UPDATE booking_payment_attempts SET status=$3, updated_at=now(), amount_minor=$4, currency=$5
 		 WHERE tenant_id=$1 AND tx_ref=$2`,
-		tenantID, txRef, attemptStatus); err != nil {
+		tenantID, txRef, attemptStatus, capturedMinor, currency); err != nil {
 		return "", false, fmt.Errorf("mark payment attempt %s: %w", attemptStatus, err)
 	}
 	outboxWritten := false

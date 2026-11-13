@@ -147,6 +147,12 @@ func (b *Bridge) Process(ctx context.Context, raw []byte) error {
 		// the booking-scoped gate so a fail-closed ack (missing
 		// booking_id/tx_ref) is logged loudly, never silently dropped.
 		return b.startPaymentMismatchAlert(ctx, env)
+	case eventTypeBookingReceiptReconFinding, eventTypeBookingReceiptReconFindingBare:
+		// SPEC-W56-B: receipt↔payment recon finding OPS alert — handled
+		// BEFORE the booking-scoped gate (a receipt_without_payment finding
+		// may carry NO booking_id) so a fail-closed ack (missing
+		// finding_id/kind) is logged loudly, never silently dropped.
+		return b.startReceiptReconAlert(ctx, env)
 	case eventTypeWaitlistEntryExpired:
 		// Audit-only lifecycle event: paced sends are single-shot (no
 		// pending future send for an entry exists), so an expiry has
@@ -231,6 +237,13 @@ const (
 	// are accepted (mirroring the BookingPaymentConfirmed tolerance).
 	eventTypeBookingPaymentAmountMismatch     = "com.opendesk.booking.BookingPaymentAmountMismatch"
 	eventTypeBookingPaymentAmountMismatchBare = "BookingPaymentAmountMismatch"
+
+	// SPEC-W56-B: booking-service's reconciler emits ReceiptReconFinding for
+	// each NEW persisted receipt↔payment finding. Both the CloudEvents
+	// type-prefix form and the bare form are accepted (mirroring the
+	// BookingPaymentAmountMismatch tolerance).
+	eventTypeBookingReceiptReconFinding     = "com.opendesk.booking.ReceiptReconFinding"
+	eventTypeBookingReceiptReconFindingBare = "ReceiptReconFinding"
 )
 
 // startWaitlistNotify starts one WaitlistNotifyWorkflow per
@@ -410,6 +423,64 @@ func (b *Bridge) startPaymentMismatchAlert(ctx context.Context, env eventEnvelop
 		zap.String("booking_id", send.BookingID), zap.String("tx_ref", send.TxRef),
 		zap.Int64("expected_amount_minor", send.ExpectedAmountMinor),
 		zap.Int64("captured_amount_minor", send.AmountMinor))
+	return nil
+}
+
+// startReceiptReconAlert starts one ReceiptReconAlertWorkflow per
+// ReceiptReconFinding event (SPEC-W56-B). The payload is the W56
+// cross-scope contract: finding_id, tenant_id, kind, confidence, plus the
+// optional reconciliation anchors capture_client_id / booking_id /
+// attempt_tx_ref / expected_amount_minor / captured_amount_minor /
+// receipt_amount_major / detail. Decoding is tolerant: absent optional
+// fields decode to zero values, never an error.
+//
+// GUARD: the alert is OPS/STAFF-only — the payload carries no customer
+// contact fields and the send path never touches a customer-facing binding.
+//
+// Fail-closed: an event without finding_id/kind is acknowledged WITHOUT
+// starting a workflow — a malformed event must never produce an alert with
+// no reconciliation anchors. Redelivered events dedupe on the deterministic
+// workflow ID (receipt-recon-<finding_id>, WorkflowExecutionAlreadyStarted →
+// ack), so a Kafka redelivery can never double-alert.
+func (b *Bridge) startReceiptReconAlert(ctx context.Context, env eventEnvelope) error {
+	if b.starter == nil {
+		return nil
+	}
+	var send workflows.ReceiptReconAlertSend
+	raw, err := json.Marshal(env.Data)
+	if err != nil {
+		return fmt.Errorf("marshal ReceiptReconFinding data: %w", err)
+	}
+	if err := json.Unmarshal(raw, &send); err != nil {
+		b.log.Warn("malformed ReceiptReconFinding payload; acknowledged without alert", zap.Error(err))
+		return nil
+	}
+	if send.FindingID == "" || send.Kind == "" {
+		b.log.Warn("ReceiptReconFinding missing finding_id/kind; acknowledged without alert",
+			zap.String("finding_id", send.FindingID), zap.String("kind", send.Kind))
+		return nil
+	}
+	// Envelope defaults when the payload omits addressing fields.
+	if send.TenantID == "" {
+		send.TenantID = env.TenantID
+	}
+	send.TenantSlug = env.Subject
+	_, err = b.starter.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        "receipt-recon-" + send.FindingID,
+		TaskQueue: b.taskQueue,
+	}, "ReceiptReconAlertWorkflow", send)
+	if err != nil {
+		var alreadyStarted *serviceerror.WorkflowExecutionAlreadyStarted
+		if errors.As(err, &alreadyStarted) || strings.Contains(err.Error(), "already started") {
+			b.log.Info("ReceiptReconAlertWorkflow already running; event acknowledged (no double-alert)",
+				zap.String("finding_id", send.FindingID))
+			return nil
+		}
+		return fmt.Errorf("start ReceiptReconAlertWorkflow: %w", err)
+	}
+	b.log.Info("ReceiptReconAlertWorkflow started",
+		zap.String("finding_id", send.FindingID), zap.String("kind", send.Kind),
+		zap.String("confidence", send.Confidence))
 	return nil
 }
 

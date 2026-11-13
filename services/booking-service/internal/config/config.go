@@ -97,6 +97,14 @@ type Config struct {
 	// (OCR_INTERNAL_TOKEN; NO default — unset fails the receipt endpoint
 	// closed with 503, the kyc-service internauth posture).
 	OCRInternalToken string
+	// Receipt ↔ payment reconciliation sweep (SPEC-W56 Scope A). The manual
+	// trigger (POST /v1/internal/recon/receipts, X-Internal-Token) works
+	// regardless; RECON_SWEEP_MINUTES=0 disables the ticker (log line at
+	// boot) — defaults make the feature work unwired.
+	ReconSweepMinutes     int // RECON_SWEEP_MINUTES (default 60; 0 disables the sweep ticker)
+	ReconLookbackDays     int // RECON_LOOKBACK_DAYS (default 30 — trailing sweep window)
+	ReconMatchWindowDays  int // RECON_MATCH_WINDOW_DAYS (default 7 — ± contact-chain appointment window)
+	ReconAmountWindowDays int // RECON_AMOUNT_WINDOW_DAYS (default 3 — ± amount+date rung window)
 	// Incidents (SPEC-W11 Part B)
 	IncidentsTopic       string // opendesk.incidents (IDP ingestion)
 	IncidentsGroup       string // consumer group booking-incidents
@@ -229,13 +237,13 @@ func Load() (Config, error) {
 		WaitlistSweepInterval: envDur("WAITLIST_SWEEP_INTERVAL", 5*time.Minute),
 		// Dev fallback keeps the portal bootable locally under
 		// OPENDESK_DEV_INSECURE=1; prod MUST override (fail-closed below).
-		PortalSecret:                  envStr("PORTAL_SECRET", DevPortalSecretDefault),
-		NotificationsTopic:            envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
-		InternalToken:                 os.Getenv("BOOKING_INTERNAL_TOKEN"),
-		IdentityInternalToken:         os.Getenv("IDENTITY_INTERNAL_TOKEN"),
-		GeocodeEnabled:                envStr("GEOCODE_ENABLED", "false") == "true",
-		GeocodeBaseURL:                envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
-		GeoCampaignBatch:              envInt("GEO_CAMPAIGN_BATCH", 50),
+		PortalSecret:          envStr("PORTAL_SECRET", DevPortalSecretDefault),
+		NotificationsTopic:    envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		InternalToken:         os.Getenv("BOOKING_INTERNAL_TOKEN"),
+		IdentityInternalToken: os.Getenv("IDENTITY_INTERNAL_TOKEN"),
+		GeocodeEnabled:        envStr("GEOCODE_ENABLED", "false") == "true",
+		GeocodeBaseURL:        envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),
+		GeoCampaignBatch:      envInt("GEO_CAMPAIGN_BATCH", 50),
 		// SPEC-W52 Scope B: geo-service enrichment (fail-open; empty disables)
 		// + public-booking coverage-zone enforcement (default off = inert).
 		GeoServiceURL:     envStr("GEO_SERVICE_URL", ""),
@@ -245,6 +253,11 @@ func Load() (Config, error) {
 		// unauthenticated call).
 		OCRServiceURL:    envStr("OCR_SERVICE_URL", ""),
 		OCRInternalToken: envStr("OCR_INTERNAL_TOKEN", ""),
+		// SPEC-W56 Scope A (additive): receipt↔payment reconciliation sweep.
+		ReconSweepMinutes:             envInt("RECON_SWEEP_MINUTES", 60),
+		ReconLookbackDays:             envInt("RECON_LOOKBACK_DAYS", 30),
+		ReconMatchWindowDays:          envInt("RECON_MATCH_WINDOW_DAYS", 7),
+		ReconAmountWindowDays:         envInt("RECON_AMOUNT_WINDOW_DAYS", 3),
 		IncidentsTopic:                envStr("INCIDENTS_TOPIC", "opendesk.incidents"),
 		IncidentsGroup:                envStr("INCIDENTS_GROUP", "booking-incidents"),
 		IncidentAutoDispatch:          envStr("INCIDENT_AUTO_DISPATCH", "true") == "true",

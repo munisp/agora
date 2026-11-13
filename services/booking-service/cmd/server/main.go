@@ -35,6 +35,7 @@ import (
 	"github.com/opendesk/booking-service/internal/loyalty" // SPEC-W19 integrator (additive import)
 	"github.com/opendesk/booking-service/internal/outbox"
 	"github.com/opendesk/booking-service/internal/permify"
+	"github.com/opendesk/booking-service/internal/recon"     // SPEC-W56 Scope A (additive import)
 	"github.com/opendesk/booking-service/internal/referrals" // SPEC-W14 Agent B (additive import)
 	"github.com/opendesk/booking-service/internal/socialpub"
 	"github.com/opendesk/booking-service/internal/socialpub/provider" // SPEC-W21 integrator (additive imports)
@@ -396,6 +397,45 @@ func run() error {
 			zap.Bool("ocr_service_url_set", cfg.OCRServiceURL != ""),
 			zap.Bool("ocr_internal_token_set", cfg.OCRInternalToken != ""))
 	}
+
+	// SPEC-W56 Scope A — BEGIN (additive): receipt↔payment reconciliation.
+	// Small dedicated pool (fieldcapture DialStore idiom); a dial failure
+	// disables only the recon endpoints (503), never the rest of the
+	// service. Trigger = ticker (RECON_SWEEP_MINUTES, default 60; 0
+	// disables with a log line) PLUS the internauth-guarded manual route.
+	var reconHandlers *recon.Handlers
+	if rs, rsErr := recon.DialStore(ctx, cfg.DatabaseURL); rsErr != nil {
+		logger.Error("receipt recon store unavailable; /v1/recon/receipts + /v1/internal/recon/receipts disabled", zap.Error(rsErr))
+	} else {
+		defer rs.Close()
+		reconSvc := &recon.Service{
+			Store:            rs,
+			Log:              logger,
+			EventsTopic:      cfg.BookingEventsTopic,
+			LookbackDays:     cfg.ReconLookbackDays,
+			MatchWindowDays:  cfg.ReconMatchWindowDays,
+			AmountWindowDays: cfg.ReconAmountWindowDays,
+			ResolveSlug: func(ctx context.Context, tenantID uuid.UUID) string {
+				site, err := st.GetSiteByTenant(ctx, tenantID)
+				if err != nil {
+					return "" // slug unknown — emit with an empty subject, never drop the finding
+				}
+				return site.TenantSlug
+			},
+		}
+		reconHandlers = &recon.Handlers{Svc: reconSvc, Log: logger}
+		if cfg.ReconSweepMinutes > 0 {
+			go reconSvc.RunTicker(ctx, time.Duration(cfg.ReconSweepMinutes)*time.Minute)
+			logger.Info("receipt recon sweep enabled",
+				zap.Int("sweep_minutes", cfg.ReconSweepMinutes),
+				zap.Int("lookback_days", cfg.ReconLookbackDays),
+				zap.Int("match_window_days", cfg.ReconMatchWindowDays),
+				zap.Int("amount_window_days", cfg.ReconAmountWindowDays))
+		} else {
+			logger.Info("receipt recon sweep ticker disabled (RECON_SWEEP_MINUTES=0); manual trigger POST /v1/internal/recon/receipts remains")
+		}
+	}
+	// SPEC-W56 Scope A — END
 
 	// SPEC-W19 integrator — BEGIN (additive): the helpdesk, field-service
 	// and loyalty app stores (campaign-studio is hoisted above for the
@@ -854,6 +894,7 @@ func run() error {
 		// SPEC-W49 B2: pay-leg redirect_url allow-list — fail-closed when
 		// PUBLIC_PAY_REDIRECT_ALLOW_HOSTS is unset/empty.
 		PayRedirectAllowHosts: cfg.PayRedirectAllowHosts,
+		Recon:                 reconHandlers, // SPEC-W56 Scope A (additive): /v1/recon/receipts + /v1/internal/recon/receipts
 	}
 	if len(cfg.PayRedirectAllowHosts) == 0 {
 		logger.Warn("PUBLIC_PAY_REDIRECT_ALLOW_HOSTS unset — every custom pay-leg redirect_url is rejected (fail closed); empty redirect_url still uses the provider default")

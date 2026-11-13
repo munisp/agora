@@ -66,6 +66,19 @@ function alertMessage(a: OpsAlert): string {
   return "";
 }
 
+/**
+ * SPEC-W56 Scope C: display labels for known ops-alert CloudEvent types.
+ * Additive — unknown/future types degrade to the raw type string, so new
+ * producers never require a client change.
+ */
+const OPS_ALERT_TYPE_LABELS: Record<string, string> = {
+  "com.opendesk.ops.ReceiptReconFinding": "Receipt reconciliation",
+};
+
+function opsAlertTypeLabel(type: string): string {
+  return OPS_ALERT_TYPE_LABELS[type] ?? type;
+}
+
 function severityVariant(
   s: string,
 ): "destructive" | "warning" | "secondary" {
@@ -177,7 +190,7 @@ export function OpsAlertsClient({
                   <TableCell className="text-sm">
                     {a.source || "—"}
                     <span className="block text-xs text-muted-foreground">
-                      {a.type}
+                      {opsAlertTypeLabel(a.type)}
                     </span>
                   </TableCell>
                   <TableCell className="max-w-md truncate text-sm">

@@ -410,3 +410,98 @@ Limitations (dev topology): per-DB dumps, not WAL archiving — production HA
 (Patroni, ADR-0008) should use WAL-G/pgBackRest to object storage; on a
 3-node TigerBeetle cluster back up a replica instead of pausing the leader;
 ship snapshots off-box for anything beyond dev.
+
+## 9. Receipt reconciliation (SPEC-W56)
+
+The booking-service internal reconciler (`internal/recon`) matches
+field-captured receipts (`field_captures.receipt_document_id` /
+`receipt_fields`, SPEC-W53) against payment state (`bookings.payment_*`,
+`booking_payment_attempts.amount_minor/currency`) on a ticker sweep
+(`RECON_SWEEP_MINUTES`, default 60, `0` disables) over a trailing
+`RECON_LOOKBACK_DAYS` (30) window, persists confidence-tagged findings in
+`receipt_recon_findings` (RLS ENABLE+FORCE, `UNIQUE(tenant_id, kind,
+capture_client_id, booking_id)` + `ON CONFLICT DO NOTHING` — reruns are
+idempotent), and emits an ops alert per NEW finding through the existing
+outbox → notification-worker → `opendesk.ops.alerts` pipeline
+(`com.opendesk.booking.ReceiptReconFinding` →
+`com.opendesk.ops.ReceiptReconFinding`, rendered as "Receipt
+reconciliation" on the ops-alerts page).
+
+### What it detects (3 kinds + severity)
+
+| kind | severity | meaning |
+|---|---|---|
+| `receipt_without_payment` | high | a receipt-bearing capture with no matching paid booking/attempt in the window |
+| `amount_mismatch` | high | a matched pair whose receipt amount diverges from the captured/expected amount — **paper-vs-rail**, DISTINCT from the W49 rail-vs-price payment mismatch |
+| `payment_without_receipt` | info | a paid booking/attempt with no linked receipt — generated ONLY for tenants with ≥1 receipt-bearing capture in the window (gated by data, not flags, so card-online tenants are not spammed) |
+
+(`currency_unknown` appears as a standalone finding kind ONLY when it blocks
+an otherwise-exact amount match; otherwise it rides in `detail` — see the
+honesty note below.)
+
+### Confidence ladder (SPEC-W56 pinned decision 1)
+
+Highest rung with EXACTLY ONE candidate wins:
+
+1. **exact** — capture `payload->>'contact_id'` → bookings with
+   `payment_status IN ('paid','paid_amount_mismatch')` within
+   ±`RECON_MATCH_WINDOW_DAYS` (7) of the capture.
+2. **heuristic** — capture `result->>'lead_id'` → `leads.phone_e164` →
+   `contacts.phone` → bookings.
+3. **heuristic** — `round(receipt_fields.amount * 100) == amount_minor` AND
+   |receipt date − paid_at| ≤ `RECON_AMOUNT_WINDOW_DAYS` (3).
+
+Ambiguity (>1 candidate at the winning rung) → finding with
+`confidence='none'` + the candidate list in `detail`. Null receipt amounts
+never enter the amount rung — no guessing (RECON R5).
+
+### Currency honesty (RECON R2)
+
+Receipts carry **no currency** (the OCR contract extracts
+vendor/amount/date/items; amount is whatever the LLM read off the paper, in
+major units). Every finding's `detail` therefore carries
+`currency_unknown: true`, and amount comparisons assume the offering
+currency — the admin page renders amounts without a currency symbol for
+this reason. Multi-currency tenants should treat amount findings as
+indicative only.
+
+### Where to look
+
+- Admin page: `/app/[orgSlug]/bookings/reconciliation` (status filter
+  open/resolved/all, detail JSON per finding) — backed by
+  `GET /api/bookings/v1/recon/receipts?status=&limit=` (manage_bookings;
+  rides the existing `/api/bookings/*` APISIX OIDC wildcard, no new gateway
+  route).
+- Ops alerts: `/app/[orgSlug]/ops-alerts` — type
+  `com.opendesk.ops.ReceiptReconFinding`.
+- Manual sweep (ops/test runs):
+
+```bash
+docker exec booking sh -c 'curl -s -X POST \
+  -H "X-Internal-Token: $BOOKING_INTERNAL_TOKEN" \
+  http://localhost:7002/v1/internal/recon/receipts'
+```
+
+- Inspect findings directly:
+
+```bash
+docker exec postgres psql -U opendesk -d booking -c \
+  "SELECT kind, confidence, count(*) FROM receipt_recon_findings
+    WHERE resolved_at IS NULL GROUP BY 1,2 ORDER BY 1;"
+```
+
+### Pinned FOLLOW-UP (not in W56)
+
+The structural fix for match recall is the capture-contract change: optional
+`booking_id` / `team_member_id` on capture payloads plus a `payment_receipt`
+capture kind → receipts link directly to bookings and matching becomes exact
+instead of heuristic (RECON §5 R1). Until it lands, recon recall is
+structurally capped and `exact` matches exist only via the contact chain.
+
+### Adoption caveat (RECON R4)
+
+field-pwa has **no receipt upload UI yet** — the receipt endpoint
+(`POST /v1/field/captures/{id}/receipt`) exists but has no real client.
+Findings depend on staff actually uploading receipts through the API; an
+empty reconciliation report today means no receipts were captured, not that
+nothing is wrong.

@@ -8,6 +8,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// ReceiptReconFindingEventType (SPEC-W56 Scope A) is the CloudEvent type
+// emitted on opendesk.booking.events for each NEW receipt ↔ payment
+// reconciliation finding (same transaction as the finding insert; deduped
+// findings emit nothing). Consumed by the notification-worker signals
+// bridge → ops-alerts pipeline.
+const ReceiptReconFindingEventType = "com.opendesk.booking.ReceiptReconFinding"
+
 // CloudEvent is the canonical envelope used on every Kafka topic.
 type CloudEvent struct {
 	SpecVersion string         `json:"specversion"`

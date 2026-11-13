@@ -312,6 +312,22 @@ services:
       # the model-registry block's MODEL_REGISTRY_INTERNAL_TOKEN.
       MODEL_REGISTRY_URL: ${MODEL_REGISTRY_URL:-http://model-registry:7019}
       MODEL_REGISTRY_INTERNAL_TOKEN: ${MODEL_REGISTRY_INTERNAL_TOKEN:-opendesk-dev-model-registry-internal-token-change-in-prod}
+      # SPEC-W56: receipt ↔ payment reconciliation sweep (booking-service
+      # internal/recon). ENV PARITY (ORPH O3/O11 lesson): names + defaults
+      # below MUST equal the code reads in
+      # services/booking-service/internal/config/config.go exactly:
+      #   RECON_SWEEP_MINUTES       sweep ticker interval (minutes); 0 disables
+      #                             the goroutine (manual trigger endpoint
+      #                             stays live)
+      #   RECON_LOOKBACK_DAYS       trailing days swept per run
+      #   RECON_MATCH_WINDOW_DAYS   exact rung: paid booking within ±N days of
+      #                             the capture
+      #   RECON_AMOUNT_WINDOW_DAYS  heuristic rung: |receipt date − paid_at|
+      #                             ≤ N days
+      RECON_SWEEP_MINUTES: ${RECON_SWEEP_MINUTES:-60}
+      RECON_LOOKBACK_DAYS: ${RECON_LOOKBACK_DAYS:-30}
+      RECON_MATCH_WINDOW_DAYS: ${RECON_MATCH_WINDOW_DAYS:-7}
+      RECON_AMOUNT_WINDOW_DAYS: ${RECON_AMOUNT_WINDOW_DAYS:-3}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
