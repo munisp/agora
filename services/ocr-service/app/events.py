@@ -5,6 +5,8 @@ Two streams, both via Dapr pubsub (pubsub-kafka):
     {tenant_id, metric, value, ts, meta} (bookingops/usage.go contract;
     metric "ocr_page", analytics-pipeline consumes with zero changes).
   * topic opendesk.ocr.events  — com.opendesk.ocr.DocumentExtracted.
+  * topic opendesk.ops.alerts  — com.opendesk.ocr.AvScanAlert (SPEC-W59 P5:
+    infected uploads / fail-open scan skips; severity critical/warning).
 """
 
 from __future__ import annotations
@@ -25,6 +27,13 @@ TYPE_CONSENT_ERASURE = "com.opendesk.consent.ErasureRequested"
 TOPIC_CONSENT_ERASURE = "opendesk.consent.erasure.v1"
 TYPE_TENANT_DELETED = "com.opendesk.identity.TenantDeleted"
 TOPIC_IDENTITY_EVENTS = "opendesk.identity.events"
+
+# SPEC-W59 P5/P2: outbound ops alerts (notification-worker opsalerts
+# consumer persists every alert; NOT opendesk.usage.events, NOT
+# opendesk.ocr.events — an infected upload consumed no extraction and no
+# document exists).
+TYPE_AV_ALERT = "com.opendesk.ocr.AvScanAlert"
+TOPIC_OPS_ALERTS = "opendesk.ops.alerts"
 
 
 def cloud_event(
@@ -115,5 +124,56 @@ def document_extracted_event(
             "storage_bucket": storage_bucket,
             "storage_key": storage_key,
             "extracted_fields": {} if is_kyc_kind(kind) else extracted_fields,
+        },
+    )
+
+
+def av_alert_event(
+    *,
+    tenant_id: str,
+    kind: str,
+    sha256: str,
+    signature: str,
+) -> dict[str, Any]:
+    """SPEC-W59 P5: infected upload -> opendesk.ops.alerts, severity critical.
+
+    Payload keys are EXACTLY severity/tenant_id/kind/sha256/signature —
+    never document bytes, filename, or PII (PII logging ban, kyc
+    documents.go idiom).
+    """
+    return cloud_event(
+        TYPE_AV_ALERT,
+        subject=tenant_id,
+        tenant_id=tenant_id,
+        data={
+            "severity": "critical",
+            "tenant_id": tenant_id,
+            "kind": kind,
+            "sha256": sha256,
+            "signature": signature,
+        },
+    )
+
+
+def av_scan_skipped_event(
+    *,
+    tenant_id: str,
+    kind: str,
+    sha256: str,
+    reason: str,
+) -> dict[str, Any]:
+    """SPEC-W59 P2/R4: a fail-open skip (clamd down + CLAMAV_REQUIRED=false)
+    is never silent — metric + this ops alert (warning severity; an
+    infected scan is the critical one). Same no-PII payload discipline."""
+    return cloud_event(
+        TYPE_AV_ALERT,
+        subject=tenant_id,
+        tenant_id=tenant_id,
+        data={
+            "severity": "warning",
+            "tenant_id": tenant_id,
+            "kind": kind,
+            "sha256": sha256,
+            "reason": reason,
         },
     )

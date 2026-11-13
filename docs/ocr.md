@@ -33,6 +33,8 @@ fieldcapture (booking-service) ──X-Internal-Token──▶ ocr-service
                                                    ├─▶ llama-ocr sidecar (llama.cpp llama-server,
                                                    │    OpenAI-compatible /v1/chat/completions,
                                                    │    MiniCPM-OCR GGUF + mmproj on `ocr-models` volume)
+                                                   ├─▶ clamav sidecar (clamd zINSTREAM :3310,
+                                                   │    scan-before-store; infected ⇒ 415)
                                                    ├─▶ MinIO `documents` bucket (tenant-prefixed keys)
                                                    ├─▶ Postgres `ocr` DB (`ocr_documents`, FORCE RLS)
                                                    └─▶ Dapr pubsub: opendesk.usage.events (ocr_page)
@@ -140,14 +142,12 @@ Uploaded bytes are **PII** (receipts, IDs, scanned letters). Posture:
   admin-web BFF (binary passthrough); service-to-service callers
   (fieldcapture) authenticate with `X-Internal-Token`, constant-time,
   fail-closed.
-- **No antivirus scanner — documented gap.** There is no ClamAV anywhere in
-  the platform; OCR upload is the first user-content binary surface. The
-  allow-list + byte cap + rasterize-then-infer pipeline limits the blast
-  radius (payloads are decoded to pixels, never executed or served back),
-  but this is an accepted residual risk that matters MORE now that KYC
-  identity documents ride this surface (RECON §5 R9). **Follow-up (do not
-  drop again):** add a ClamAV sidecar to `infra/compose/ocr.compose.yml`
-  and scan before storage.
+- **Antivirus**: every upload is scanned by a ClamAV `clamd` sidecar
+  (base-compose `clamav` service, SPEC-W59) between validation and the
+  MinIO put — infected ⇒ deterministic 415, nothing stored. Fail-closed
+  by default. See [Antivirus scanning](#antivirus-scanning-spec-w59). The
+  rasterize-then-infer pipeline still limits the residual blast radius
+  (payloads are decoded to pixels, never executed or served back).
 - **NDPA note**: storing document *images* (not just extracted text) is a
   deliberate policy change relative to kyc-service's never-store-raw-IDs
   posture. Deployments must cover document storage in their privacy notice,
@@ -155,6 +155,92 @@ Uploaded bytes are **PII** (receipts, IDs, scanned letters). Posture:
   document objects. For **kyc_* kinds** retention and erasure are
   enforced in-service (see below); receipt/knowledge_scan documents remain
   residual until the sweeper is extended to them.
+
+## Antivirus scanning (SPEC-W59)
+
+Every upload — all kinds funnel through the single `_run_extraction` path
+of `POST /v1/ocr/extract` — is scanned by a **ClamAV `clamd` sidecar**
+(base `docker-compose.yml` `clamav` service, image `clamav/clamav:1.4.3`,
+TCP :3310 on the internal opendesk network only, **no host port**) via a
+small stdlib zINSTREAM client (`app/av.py`, zero new dependencies). The
+scan runs after validation and hashing, strictly **before** any bytes
+touch MinIO or the `pdftoppm` rasterizer. An infected upload ⇒
+deterministic **415** whose detail names the signature (false-positive
+triage aid; no bytes logged), and **nothing is stored** — no MinIO object,
+no `ocr_documents` row, no quarantine to sweep.
+
+### Fail posture (`CLAMAV_*` env)
+
+| Upload kind | clamd unreachable | Infected |
+|---|---|---|
+| `kyc_*` | **503 `av_unavailable` — ALWAYS fail-closed** (hard-coded on the kind; ignores `CLAMAV_REQUIRED`) | 415 |
+| `receipt` | 503 when `CLAMAV_REQUIRED=true` (default). Fail-open **only** when `CLAMAV_REQUIRED=false` — every skipped scan emits the `skipped` metric **and** an ops alert; never silent | 415 |
+| `document`, `knowledge_scan` | honor `CLAMAV_REQUIRED` (default: closed) | 415 |
+
+`CLAMAV_HOST` set **empty** disables scanning entirely with a **CRITICAL**
+startup log plus the `skipped` metric (`OCR_MOCK` loud-default idiom) —
+a dev-sandbox escape hatch, never for production. `CLAMAV_TIMEOUT_S`
+(default 30 s) is the whole connect+scan+reply budget and leaves >110 s
+of headroom in the 150 s caller budgets.
+
+### clamd sizing pins (StreamMaxLength trap)
+
+The upload cap is exactly 25 MiB (`OCR_MAX_BYTES`) and clamd's
+`StreamMaxLength` default has been exactly `25M` on some releases — zero
+framing margin. Compose therefore pins `StreamMaxLength 30M` (plus
+`MaxFileSize 30M` / `MaxScanSize 100M`, both above the cap) via the
+image's official `CLAMD_CONF_*` env injection — no config-file mount. An
+`INSTREAM size limit exceeded` reply is treated as a scan **error**
+(the posture rules above apply), never as clean. clamd + the full
+signature DB holds ~1-2 GB RSS, so the service carries a 2G memory
+override (ollama/llama-ocr precedent). Upstream warns a daily DB reload
+transiently doubles RSS with the default `ConcurrentDatabaseReload yes`;
+if the 2G cap bites, set `CLAMD_CONF_ConcurrentDatabaseReload=no` on the
+`clamav` service (scans briefly block during reload instead).
+
+### Offline DB seeding (one-time per environment)
+
+freshclam downloads ~250 MB of signatures on first boot — that needs
+internet **once**, which offline-first (Nigeria) deployments must
+provision ahead. Seed the `clamav-db` volume on a connected box
+(`ocr-models` runbook idiom):
+
+1. On a machine with network access, populate the named volume:
+   ```sh
+   docker run --rm -v agora_clamav-db:/var/lib/clamav \
+     clamav/clamav:1.4.3 freshclam --foreground --stdout
+   ```
+   (Simply starting the stack once while connected works too — first boot
+   downloads the DB into the same volume.)
+2. Move the volume to the offline host if it differs — docker volumes are
+   host-local, so tar/untar between machines:
+   ```sh
+   # connected box:
+   docker run --rm -v agora_clamav-db:/var/lib/clamav -v "$PWD:/host" \
+     alpine:3.20 tar -C /var/lib/clamav -cf /host/clamav-db.tar .
+   # offline target (volume pre-created by compose):
+   docker run --rm -v agora_clamav-db:/var/lib/clamav -v "$PWD:/host" \
+     alpine:3.20 tar -C /var/lib/clamav -xf /host/clamav-db.tar
+   ```
+3. Start the stack. The image's clamd-PING healthcheck plus the service's
+   fail-closed posture make a missing/empty DB a **clean boot-fail**
+   (clamd refuses to start), never a silent unscanned window.
+4. Signatures age — re-seed periodically. On a permanently offline host
+   you may set `CLAMAV_NO_FRESHCLAMD=true` on the `clamav` service to stop
+   the (failing) updater daemon; the seeded DB keeps working.
+
+### Signals
+
+- **Ops alert** — an infected upload (and every fail-open skip) publishes
+  a CloudEvent to **`opendesk.ops.alerts`** (severity `critical`;
+  `tenant_id`, `kind`, `sha256`, signature name ONLY — never bytes,
+  filename, or other PII), persisted by notification-worker's opsalerts
+  consumer. Nothing is emitted to `opendesk.usage.events` (no extraction
+  was consumed) or `opendesk.ocr.events` (no document exists).
+- **Metric** — `opendesk_ocr_av_scans_total{result="clean|infected|error|skipped"}`
+  on the existing `/metrics` endpoint.
+- **Logs** — `av.infected` (warning) / `av.unavailable` (error),
+  sha256-only.
 
 ## API summary
 

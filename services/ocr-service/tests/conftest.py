@@ -8,9 +8,11 @@ production code has no mock paths other than the OCR_MOCK gate.
 from __future__ import annotations
 
 import json
+import socketserver
 import struct
 import sys
 import threading
+import time
 import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -270,7 +272,7 @@ class FakeDapr:
 
 
 class FakeDeps:
-    def __init__(self, db=None, documents=None, dapr=None, ocr=None, objects=None):
+    def __init__(self, db=None, documents=None, dapr=None, ocr=None, objects=None, av=None):
         self.db = db or FakeDB()
         self.documents = documents or FakeMinio()
         self.dapr = dapr or FakeDapr()
@@ -278,6 +280,9 @@ class FakeDeps:
         # SPEC-W58: object deleter for erasure consumers + the TTL sweeper;
         # the FakeMinio doubles as the deleter unless one is supplied.
         self.objects = objects or self.documents
+        # SPEC-W59: AvClient wired ONLY in test_av.py; default None keeps
+        # the rest of the suite on the AV-disabled skip path (P10).
+        self.av = av
 
 
 @pytest.fixture
@@ -382,3 +387,113 @@ def make_download_stub(data: bytes, filename_ok: bool = True) -> StubServer:
             pass
 
     return StubServer(Handler)
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W59 P8: fake clamd (zINSTREAM over TCP) — TEST-ONLY in-process stub,
+# same pattern as the StubServer HTTP fakes above. Never on any prod path.
+# ---------------------------------------------------------------------------
+#: 68-byte EICAR standard test string (NEVER a real sample). Raw EICAR is a
+#: .txt and dies at the magic-byte gate — wrap it in make_png() for the
+#: route-level tests.
+EICAR = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+EICAR_SIGNATURE = "Eicar-Test-Signature"
+
+
+class _ClamdHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        fake: "FakeClamd" = self.server.fake  # type: ignore[attr-defined]
+        rfile = self.request.makefile("rb")
+        cmd = b""
+        while not cmd.endswith(b"\0"):
+            ch = rfile.read(1)
+            if not ch:
+                return
+            cmd += ch
+        if cmd != b"zINSTREAM\0":
+            self.request.sendall(b"UNKNOWN COMMAND\n")
+            return
+        data = bytearray()
+        chunk_sizes: list[int] = []
+        while True:
+            hdr = rfile.read(4)
+            if len(hdr) < 4:
+                return
+            (n,) = struct.unpack(">I", hdr)
+            if n == 0:
+                break
+            chunk = rfile.read(n)
+            if len(chunk) < n:
+                return
+            chunk_sizes.append(n)
+            data += chunk
+        fake.scans.append((bytes(data), chunk_sizes))
+        if fake.hang_s:
+            time.sleep(fake.hang_s)
+        if fake.forced_reply is not None:
+            reply = fake.forced_reply
+        elif EICAR in data:
+            reply = f"stream: {EICAR_SIGNATURE} FOUND\n".encode()
+        else:
+            reply = b"stream: OK\n"
+        self.request.sendall(reply)
+
+
+class _QuietThreadingTCPServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        # A timeout test abandons the connection mid-hang; the subsequent
+        # sendall then raises BrokenPipeError. Expected — keep logs clean.
+        pass
+
+
+class FakeClamd:
+    """In-process ThreadingTCPServer speaking zINSTREAM. Controls:
+    forced_reply (raw reply bytes, for ERROR/garbage parse tests),
+    hang_s (sleep before replying, for timeout tests)."""
+
+    def __init__(self):
+        self.scans: list[tuple[bytes, list[int]]] = []
+        self.forced_reply: bytes | None = None
+        self.hang_s: float = 0.0
+        self._server = _QuietThreadingTCPServer(("127.0.0.1", 0), _ClamdHandler)
+        self._server.fake = self  # type: ignore[attr-defined]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def address(self) -> tuple[str, int]:
+        host, port = self._server.server_address
+        return str(host), int(port)
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+def fake_clamd():
+    fake = FakeClamd()
+    yield fake
+    fake.close()
+
+
+@pytest.fixture
+def av_client(fake_clamd):
+    from app.av import AvClient
+
+    host, port = fake_clamd.address
+    return AvClient(host=host, port=port, timeout_s=5.0)
+
+
+def closed_port() -> int:
+    """A loopback port that is guaranteed CLOSED (clamd-down tests)."""
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port

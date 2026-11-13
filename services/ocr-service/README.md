@@ -88,9 +88,13 @@ by poppler-utils (~35 MB, see Dockerfile comment), not this client.
   `image/png`, `image/webp`, `application/pdf`; the extension and sniffed
   magic MUST agree), 25 MB hard cap (`OCR_MAX_BYTES`), APISIX
   `limit-count` on the public route.
-- **No AV scanner exists anywhere in the platform** — this upload surface
-  is the first user-content binary ingress. Documented-acceptance for
-  W53; ClamAV sidecar is a follow-up (RECON §5).
+- **ClamAV AV scan on every upload (SPEC-W59).** A `clamav` sidecar in the
+  base compose stack (`clamav/clamav:1.4.3`) scans bytes via clamd
+  zINSTREAM between validation/hashing and the MinIO put — an infected
+  upload gets a deterministic 415 naming the signature and is NEVER
+  stored (no MinIO object, no `ocr_documents` row). Fail-closed by
+  default (`CLAMAV_REQUIRED=true`); kyc_* kinds are fail-closed always.
+  Fail-posture table + offline DB-seeding runbook: `docs/ocr.md`.
 - Internal callers: `X-Internal-Token`, constant-time compare,
   fail-closed 503 when `OCR_INTERNAL_TOKEN` is unset. APISIX global rules
   strip client-supplied `x-internal-token`, so gateway calls can never

@@ -85,6 +85,22 @@ class Settings(BaseSettings):
         default=25 * 1024 * 1024, validation_alias=AliasChoices("OCR_MAX_BYTES")
     )
 
+    # --- ClamAV sidecar (SPEC-W59 P1/P9; bare CLAMAV_ prefix, MINIO_* ---
+    # shared-indirection precedent; `_S` suffix matches OCR_TIMEOUT_S).
+    # Env parity: compose names == these reads, defaults identical,
+    # .env.example mirrors (docker-compose.yml ocr block).
+    # clamd zINSTREAM TCP host; EMPTY disables scanning entirely (CRITICAL
+    # startup log + skipped metric — P10, never a silent gap).
+    clamav_host: str = Field(default="clamav", validation_alias=AliasChoices("CLAMAV_HOST"))
+    clamav_port: int = Field(default=3310, validation_alias=AliasChoices("CLAMAV_PORT"))
+    # Connect + stream + reply total budget (<< the 150s caller budgets).
+    clamav_timeout_s: float = Field(default=30.0, validation_alias=AliasChoices("CLAMAV_TIMEOUT_S"))
+    # Fail-closed when clamd is unreachable. kyc_* kinds are fail-closed
+    # ALWAYS (hard-coded on is_kyc_kind, regardless of this knob — P2);
+    # receipt may fail-open ONLY when this is false (never silent: every
+    # skipped scan emits the metric + an ops alert).
+    clamav_required: bool = Field(default=True, validation_alias=AliasChoices("CLAMAV_REQUIRED"))
+
     # SPEC-W58 P4/P12: kyc_* retention. Read as RAW STRINGS so an invalid
     # value warns + falls back to the default (voice-agent _env_int idiom)
     # instead of hard-failing boot; the derived int fields below are what

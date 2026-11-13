@@ -1553,6 +1553,16 @@ services:
       # services/ocr-service/app/config.py.
       OCR_KYC_TTL_HOURS: ${OCR_KYC_TTL_HOURS:-72}
       OCR_KYC_SWEEP_MINUTES: ${OCR_KYC_SWEEP_MINUTES:-15}
+      # SPEC-W59: ClamAV scan of every upload between validation/hashing
+      # and the MinIO put (fail-closed default). ENV PARITY: defaults MUST
+      # equal the code reads in services/ocr-service/app/config.py.
+      # CLAMAV_HOST EMPTY disables scanning with a CRITICAL startup log
+      # (dev sandbox only — NEVER in production). kyc_* kinds are
+      # fail-closed ALWAYS, regardless of CLAMAV_REQUIRED.
+      CLAMAV_HOST: ${CLAMAV_HOST:-clamav}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      CLAMAV_TIMEOUT_S: ${CLAMAV_TIMEOUT_S:-30}
+      CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-true}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     networks:
@@ -1561,6 +1571,7 @@ services:
     - postgres
     - minio
     - daprd-ocr
+    - clamav
   daprd-ocr:
     logging: *default-logging
     deploy: *default-limits
@@ -1571,6 +1582,43 @@ services:
     environment:
       DAPR_APP_ID: ocr
       DAPR_APP_PORT: '7020'
+  # SPEC-W59: ClamAV AV sidecar for ocr-service uploads (BASE stack — a
+  # fail-closed security control must not depend on the opt-in ocr
+  # overlay). clamd speaks zINSTREAM over TCP :3310 on the opendesk
+  # network only (GF4: NO host port). The image runs freshclam + clamd;
+  # the ~250MB signature DB lives on the clamav-db volume — offline-first:
+  # seed it once on a connected box (runbook in docs/ocr.md); a missing DB
+  # is a clean boot-fail (clamd refuses to start), never a silent
+  # unscanned window. The image ships a clamd-PING healthcheck; ocr fails
+  # closed (CLAMAV_REQUIRED=true, kyc_* always) while clamd is unreachable.
+  clamav:
+    logging: *default-logging
+    # Sized above the 1G/1.0 default (see anchor comment): clamd + the full
+    # signature DB holds ~1-2G RSS (ollama/llama-ocr override precedent).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    # Pinned ClamAV image (1.4 LTS). Re-verify the newest 1.4.x patch tag
+    # against clamav.net releases at provisioning (house exact-tag pinning).
+    image: clamav/clamav:1.4.3
+    restart: unless-stopped
+    environment:
+      # SPEC-W59 P3: the upload cap is EXACTLY 25 MiB (OCR_MAX_BYTES) and
+      # clamd's StreamMaxLength default has been exactly 25M on some
+      # releases — zero margin. Pin above it; an "INSTREAM size limit
+      # exceeded" reply is treated as a scan ERROR, never clean.
+      # MaxFileSize/MaxScanSize pinned above 25M for the same reason. Set
+      # via the image's official CLAMD_CONF_* env injection (the
+      # entrypoint edits /etc/clamav/clamd.conf — no config mount needed).
+      CLAMD_CONF_StreamMaxLength: 30M
+      CLAMD_CONF_MaxFileSize: 30M
+      CLAMD_CONF_MaxScanSize: 100M
+    volumes:
+    - clamav-db:/var/lib/clamav
+    networks:
+    - opendesk
   # SPEC-W33 §3 B2 credit-bureau (:7022) — F16-1: this service was an ORPHAN
   # (no compose entry, no gateway route). It is NOT part of the default
   # stack: profile-gated `experimental` (booking-service lending falls back
@@ -1596,3 +1644,4 @@ services:
     - opendesk
 volumes:
   ollama-models: null
+  clamav-db: null

@@ -47,9 +47,10 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
 from . import erasure, events, sweeper
+from .av import AvClient, AvUnavailable, Infected, InfectedError
 from .config import ALLOWED_MIMES, DOCUMENT_KINDS, is_kyc_kind, settings
 from .dapr_client import DaprClient
 from .llm import OcrClient, OcrUpstreamError, mock_extraction
@@ -68,6 +69,15 @@ from .validate import (
 configure_logging(settings.log_level)
 log = get_logger("ocr-service")
 
+# SPEC-W59 P6: first custom Prometheus metric in the service (zero new
+# deps — prometheus-client already pinned). result: clean|infected|
+# error|skipped.
+AV_SCANS = Counter(
+    "opendesk_ocr_av_scans_total",
+    "Document-upload malware scans (clamd zINSTREAM) by result.",
+    ("result",),
+)
+
 # Response schema shared with booking-service (A<->B) and admin-web (A<->C):
 # POST /v1/ocr/extract -> {document_id, status, extracted_fields, page_count,
 #                          extracted_text}
@@ -81,10 +91,29 @@ class AppState:
     objects: sweeper.MinioObjectDeleter
     ocr: OcrClient
     dapr: DaprClient
+    av: AvClient | None  # SPEC-W59: None == AV disabled (CLAMAV_HOST empty)
 
 
 def get_state(request: Request) -> AppState:
     return request.app.state.deps
+
+
+def _build_av_client() -> AvClient | None:
+    """SPEC-W59 P10: CLAMAV_HOST empty disables scanning — CRITICAL, loud
+    (XTTS_MOCK/OCR_MOCK loud-default idiom), never a silent unscanned
+    window. Default is `clamav`; disabling requires explicit emptying."""
+    if not settings.clamav_host:
+        log.critical(
+            "clamav.disabled",
+            msg="CLAMAV_HOST is empty — upload malware scanning DISABLED. "
+            "DEV SANDBOX ONLY. NEVER ship this to production.",
+        )
+        return None
+    return AvClient(
+        host=settings.clamav_host,
+        port=settings.clamav_port,
+        timeout_s=settings.clamav_timeout_s,
+    )
 
 
 @asynccontextmanager
@@ -111,6 +140,8 @@ async def lifespan(app: FastAPI):
         timeout_s=settings.ocr_timeout_s,
     )
     deps.dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
+    # SPEC-W59 P1: clamd zINSTREAM sidecar client (None == disabled).
+    deps.av = _build_av_client()
     # SPEC-W58 P3/P4: object deletion for the erasure consumers + TTL
     # sweeper (storage.py is upload-only by design).
     deps.objects = sweeper.MinioObjectDeleter(
@@ -143,6 +174,7 @@ async def lifespan(app: FastAPI):
         bucket=settings.minio_bucket,
         kyc_ttl_hours=settings.kyc_ttl_hours,
         kyc_sweep_minutes=settings.kyc_sweep_minutes,
+        av_enabled=deps.av is not None,
     )
     try:
         yield
@@ -150,6 +182,8 @@ async def lifespan(app: FastAPI):
         log.info("service.shutting_down")
         if sweep_task is not None:
             sweep_task.cancel()
+        if deps.av is not None:
+            await deps.av.aclose()
         await deps.dapr.aclose()
         await deps.ocr.aclose()
         await deps.db.aclose()
@@ -343,6 +377,77 @@ async def _emit_events(
         )
 
 
+async def _publish_av_alert(deps: AppState, event: dict[str, Any]) -> None:
+    """SPEC-W59 P5: best-effort ops alert via the existing DaprClient —
+    publishing NEVER blocks the 415/503 (the block is the primary signal)."""
+    try:
+        await deps.dapr.publish(
+            settings.dapr_pubsub_name, events.TOPIC_OPS_ALERTS, event
+        )
+    except Exception as exc:
+        log.warning("av.alert_publish_failed", error=str(exc))
+
+
+async def _scan_upload(
+    deps: AppState, *, tenant_id: str, kind: str, data: bytes, digest: str
+) -> None:
+    """SPEC-W59 P1/P2: clamd zINSTREAM scan, gating the FIRST durable side
+    effect (MinIO put). Infected => InfectedError (415); clamd down =>
+    AvUnavailable (503) unless the fail posture allows a loud skip."""
+    if deps.av is None:
+        # CLAMAV_HOST empty (P10): skip + metric; the CRITICAL boot log
+        # fired at startup.
+        AV_SCANS.labels(result="skipped").inc()
+        return
+    try:
+        result = await deps.av.scan(data)
+    except AvUnavailable as exc:
+        log.error(
+            "av.unavailable",
+            tenant_id=tenant_id,
+            kind=kind,
+            sha256=digest,
+            error=str(exc),
+        )
+        # P2: kyc_* fail-closed ALWAYS (hard-coded, regardless of
+        # CLAMAV_REQUIRED); receipt may fail-open ONLY when
+        # CLAMAV_REQUIRED=false — and a skip is never silent (metric+alert).
+        if is_kyc_kind(kind) or settings.clamav_required:
+            AV_SCANS.labels(result="error").inc()
+            raise
+        AV_SCANS.labels(result="skipped").inc()
+        await _publish_av_alert(
+            deps,
+            events.av_scan_skipped_event(
+                tenant_id=tenant_id,
+                kind=kind,
+                sha256=digest,
+                reason="av_unavailable",
+            ),
+        )
+        return
+    if isinstance(result, Infected):
+        AV_SCANS.labels(result="infected").inc()
+        log.warning(
+            "av.infected",
+            tenant_id=tenant_id,
+            kind=kind,
+            sha256=digest,
+            signature=result.signature,
+        )
+        await _publish_av_alert(
+            deps,
+            events.av_alert_event(
+                tenant_id=tenant_id,
+                kind=kind,
+                sha256=digest,
+                signature=result.signature,
+            ),
+        )
+        raise InfectedError(result.signature)
+    AV_SCANS.labels(result="clean").inc()
+
+
 async def _run_extraction(
     deps: AppState,
     *,
@@ -362,6 +467,12 @@ async def _run_extraction(
     expires_at = (
         datetime.now(UTC) + timedelta(hours=settings.kyc_ttl_hours) if kyc else None
     )
+
+    # SPEC-W59: AV scan AFTER validation+hashing (never spend a scan on a
+    # 415; sha256 feeds the ops alert) and strictly BEFORE any bytes touch
+    # MinIO or the pdftoppm rasterizer. Infected => nothing stored: no
+    # MinIO object, no ocr_documents row, no quarantine problem.
+    await _scan_upload(deps, tenant_id=tenant_id, kind=kind, data=data, digest=digest)
 
     # 1) PII bytes -> MinIO `documents` (tenant-prefixed key).
     await deps.documents.put(storage_key, data, mime)
@@ -480,6 +591,22 @@ async def extract_document(request: Request, deps: AppState = Depends(get_state)
             status_code=code,
             detail=f"{msg} (allowed mime types: {list(ALLOWED_MIMES)})",
         )
+    except InfectedError as exc:
+        # SPEC-W59 P7: 415 sibling of the ValidationError mapping. The
+        # signature name aids false-positive triage; no bytes are logged
+        # or echoed. Nothing was stored (scan gates the MinIO put).
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "error": "av_infected",
+                "detail": f"rejected by malware scan: {exc.signature}",
+                "signature": exc.signature,
+            },
+        )
+    except AvUnavailable:
+        # SPEC-W59 P2/P7: fail-closed posture (kyc_* always; others per
+        # CLAMAV_REQUIRED) — 503 mirrors the internauth fail-closed idiom.
+        raise HTTPException(status_code=503, detail={"error": "av_unavailable"})
     except StorageError as exc:
         log.error("document.store_failed", error=str(exc))
         raise HTTPException(status_code=502, detail="document storage failed")
