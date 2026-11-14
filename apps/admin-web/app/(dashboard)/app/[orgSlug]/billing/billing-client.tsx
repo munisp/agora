@@ -84,8 +84,9 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
       const bal = await api.get<AccountBalance>(
         `/api/payments/v1/accounts/${orgSlug}/balance`,
       );
-      setBalance(bal);
-      setAmount((bal.revenue_cents / 100).toFixed(2));
+      const b = toBalance(bal, orgSlug);
+      setBalance(b);
+      setAmount((b.revenue_cents / 100).toFixed(2));
     } catch (e) {
       setError(
         e instanceof ApiError ? e.message : "Failed to load billing data.",
@@ -607,4 +608,25 @@ function RecommendationsCard({ orgSlug }: { orgSlug: string }) {
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * payments-service answers the ledger accounts ({tenant_id, accounts: [{account: "tenant:x:deposits", posted_net,
+ * pending_net}, …]}); the cards need three totals. Deposit holds are pending deposit credits, revenue is posted revenue,
+ * paid out is the posted payouts account (absent = nothing paid out yet). Already-flat answers pass through.
+ */
+function toBalance(raw: unknown, tenant: string): AccountBalance {
+  const r = (raw ?? {}) as Partial<AccountBalance> & {
+    accounts?: { account: string; posted_net?: number; pending_net?: number }[];
+  };
+  if (!Array.isArray(r.accounts)) return r as AccountBalance;
+  const find = (suffix: string) => r.accounts!.find((a) => a.account.endsWith(`:${suffix}`));
+  const deposits = find("deposits"), revenue = find("revenue"), payouts = find("payouts") ?? find("paid_out");
+  return {
+    ...(r as AccountBalance),
+    tenant_id: r.tenant_id ?? tenant,
+    deposits_cents: (deposits?.pending_net ?? 0) + (deposits?.posted_net ?? 0),
+    revenue_cents: revenue?.posted_net ?? 0,
+    paid_out_cents: payouts?.posted_net ?? 0,
+  };
 }

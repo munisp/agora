@@ -277,6 +277,27 @@ func (c *Client) SendExecuteActionsEmail(ctx context.Context, userID string, act
 	return expectStatus(resp, "execute-actions-email", http.StatusNoContent, http.StatusOK)
 }
 
+// UserSummary returns a user's email and display name (for the dashboard's member list).
+func (c *Client) UserSummary(ctx context.Context, userID string) (email, name string, err error) {
+	resp, err := c.do(ctx, http.MethodGet, "/admin/realms/"+c.realm+"/users/"+url.PathEscape(userID), nil)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("get user %s: status %d", userID, resp.StatusCode)
+	}
+	var u struct {
+		Email     string `json:"email"`
+		FirstName string `json:"firstName"`
+		LastName  string `json:"lastName"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		return "", "", err
+	}
+	return u.Email, strings.TrimSpace(u.FirstName + " " + u.LastName), nil
+}
+
 // DisableUser sets enabled=false on the user (SPEC-W45 K16 member removal:
 // the account is disabled, never hard-deleted, so audit history survives).
 func (c *Client) DisableUser(ctx context.Context, userID string) error {

@@ -477,7 +477,25 @@ func (s *server) listMembers(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+	// Names and emails for the dashboard (it showed bare user ids); best effort — a lookup failure leaves them out.
+	type summarizer interface {
+		UserSummary(ctx context.Context, userID string) (string, string, error)
+	}
+	out := make([]map[string]any, 0, len(members))
+	for _, m := range members {
+		raw, _ := json.Marshal(m)
+		row := map[string]any{}
+		_ = json.Unmarshal(raw, &row)
+		if kc, ok := s.d.Keycloak.(summarizer); ok {
+			if id, _ := row["user_id"].(string); id != "" {
+				if email, name, err := kc.UserSummary(r.Context(), id); err == nil {
+					row["email"], row["name"] = email, name
+				}
+			}
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": out})
 }
 
 // requireOrgAccess resolves the caller and authorizes them against the

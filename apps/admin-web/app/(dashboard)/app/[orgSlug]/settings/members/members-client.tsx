@@ -45,6 +45,9 @@ import { titleCase } from "@/lib/utils";
 export interface IdentityMember {
   tenant_id: string;
   user_id: string;
+  /** filled by identity from the user's account when available */
+  email?: string;
+  name?: string;
   role: string;
 }
 
@@ -178,7 +181,7 @@ export function MembersClient({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="pl-5">User ID</TableHead>
+              <TableHead className="pl-5">Member</TableHead>
               <TableHead>Role</TableHead>
               <TableHead>Change role</TableHead>
               <TableHead className="pr-5 text-right">Actions</TableHead>
@@ -190,8 +193,15 @@ export function MembersClient({
             ) : (
               pagedMembers.map((m) => (
                 <TableRow key={m.user_id}>
-                  <TableCell className="pl-5 font-mono text-xs">
-                    {m.user_id}
+                  <TableCell className="pl-5 text-sm">
+                    {m.name || m.email ? (
+                      <>
+                        <div className="font-medium">{m.name || m.email}</div>
+                        {m.name && m.email ? <div className="text-xs text-muted-foreground">{m.email}</div> : null}
+                      </>
+                    ) : (
+                      m.user_id
+                    )}
                   </TableCell>
                   <TableCell>
                     <Badge variant="secondary">{titleCase(m.role)}</Badge>
@@ -199,7 +209,7 @@ export function MembersClient({
                   <TableCell>
                     <div className="flex items-center gap-2">
                       <Select
-                        aria-label={`Role for ${m.user_id}`}
+                        aria-label={`Role for ${m.name || m.email || m.user_id}`}
                         value={roleEdits[m.user_id] ?? m.role}
                         onChange={(e) =>
                           setRoleEdits((prev) => ({

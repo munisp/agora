@@ -60,7 +60,7 @@ export default async function OverviewPage({
   const { orgSlug } = await params;
   const today = toISODate(new Date());
   const tomorrow = toISODate(addDays(new Date(), 1));
-  const nextWeek = toISODate(addDays(new Date(), 7));
+  const nextWeek = toISODate(addDays(new Date(), 8)); // exclusive end: tomorrow through day 7
 
   let todayBookings: Booking[] = [];
   let upcoming: Booking[] = [];
