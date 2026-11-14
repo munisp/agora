@@ -1,35 +1,36 @@
 "use client";
 
 /**
- * SPEC-W58 Scope D: KYC document review queue (owner/admin only — the page
- * redirects other roles server-side; the booking-service KYC routes enforce
- * the same gate, RECON §5 R4/P5).
+ * SPEC-W65 Scope 2 (D): KYC document review queue (owner/admin only — the
+ * page redirects other roles server-side; the booking-service KYC routes
+ * enforce the same gate, SPEC-W58 P5).
  *
  * API surface (booking-service staff proxy → kyc-service, riding the
  * EXISTING /api/bookings/* APISIX OIDC wildcard — no new gateway route):
  *
+ *   GET  /api/bookings/v1/kyc/documents?review_state=&limit=&offset=
+ *     → {items: [hash-only Document projections incl. subject_phone],
+ *        limit, offset} — newest-first paginated queue (W65; the W58
+ *    session-local list is REPLACED by this real server-side queue).
  *   GET  /api/bookings/v1/kyc/documents/{id}
  *     → {document_id, reference, status, review_state, fields?, fields_available}
  *   POST /api/bookings/v1/kyc/documents/{id}/review
  *     {decision: "approved"|"rejected", reason: string}
  *
- * Honesty notes (SPEC-W58 cross-scope contract + pinned decisions):
- *  - NO list endpoint exists in the W58 contract (kyc-service exposes
- *    GET-by-id only, P13: the review queue polls). This page therefore
- *    works as a lookup-by-id: paste a document_id or reference (both are
- *    returned by POST /v1/kyc/documents at upload). Documents opened this
- *    session are kept in a local list below — every entry is a real API
- *    response, nothing is invented. A list endpoint is a follow-up gap.
+ * Honesty notes (SPEC-W58/W65 cross-scope contract + pinned decisions):
+ *  - The queue rows are the hash-only durable projections (P8) — extracted
+ *    field VALUES are only on the detail GET while inside the 72h OCR TTL
+ *    (P4). After expiry the API returns fields_available:false and this
+ *    page renders "expired — hashes only" instead of field values.
  *  - Extracted fields are PRE-FILL for human review only — OCR never
- *    auto-verifies (P7). The durable kyc-service record is hash-only (P8);
- *    raw fields live in the ocr DB under a 72h TTL (P4). After expiry the
- *    API returns fields_available:false and this page renders
- *    "expired — hashes only" instead of field values.
+ *    auto-verifies (P7).
  *  - Document BYTES are never served by any API — reviewers compare the
  *    extracted fields against the physical/original document.
  *  - mrz_valid (kyc_passport) is an ICAO 9303 check-digit result computed
  *    in deterministic code by ocr-service — it is NOT a model claim and
  *    NOT an authenticity verdict.
+ *  - Lookup-by-id is kept as a fallback (paste a document_id or reference
+ *    returned at upload) — useful for deep links; the queue is primary.
  */
 import * as React from "react";
 import { Check, RefreshCw, Search, ShieldCheck, X } from "lucide-react";
@@ -65,7 +66,7 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { formatDateTime } from "@/lib/utils";
 
-/** Shared response envelope (SPEC-W58 cross-scope contract). */
+/** Shared detail response envelope (SPEC-W58 cross-scope contract). */
 export interface KycDocumentDetail {
   document_id: string;
   reference?: string | null;
@@ -77,10 +78,38 @@ export interface KycDocumentDetail {
   fields_available: boolean;
   /** Tolerated extras (doc_type, subject_phone, timestamps, ...). */
   doc_type?: string | null;
+  subject_phone?: string | null;
   created_at?: string | null;
   reviewed_at?: string | null;
   reviewer_actor?: string | null;
 }
+
+/**
+ * Queue row: the hash-only kyc-service Document projection (SPEC-W65
+ * pinned contract — subject_phone included; NO extracted field values).
+ */
+interface KycDocumentListItem {
+  document_id: string;
+  subject_phone?: string | null;
+  doc_type?: string | null;
+  status?: string | null;
+  review_state?: string | null;
+  reviewer_actor?: string | null;
+  reviewed_at?: string | null;
+  created_at?: string | null;
+}
+
+type ReviewStateFilter = "" | "pending_review" | "approved" | "rejected";
+
+const REVIEW_STATE_FILTERS: { value: ReviewStateFilter; label: string }[] = [
+  { value: "", label: "All" },
+  { value: "pending_review", label: "Pending review" },
+  { value: "approved", label: "Approved" },
+  { value: "rejected", label: "Rejected" },
+];
+
+/** Offset pagination (media-inbox PAGE_SIZE precedent). */
+const PAGE_SIZE = 50;
 
 /** Display labels for the P9 per-kind field whitelists. */
 const FIELD_LABELS: Record<string, string> = {
@@ -150,29 +179,82 @@ function fieldRows(
   return rows;
 }
 
+/** Tolerant unwrap — the endpoint returns {items: [...]} or a bare array. */
+function unwrapItems(data: unknown): KycDocumentListItem[] {
+  if (Array.isArray(data)) return data as KycDocumentListItem[];
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    Array.isArray((data as { items?: unknown }).items)
+  ) {
+    return (data as { items: KycDocumentListItem[] }).items;
+  }
+  return [];
+}
+
 export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
   const { toast } = useToast();
+  // Server-fetched queue (SPEC-W65).
+  const [filter, setFilter] = React.useState<ReviewStateFilter>("pending_review");
+  const [queue, setQueue] = React.useState<KycDocumentListItem[]>([]);
+  const [queueLoading, setQueueLoading] = React.useState(true);
+  const [queueError, setQueueError] = React.useState<string | null>(null);
+  const [hasMore, setHasMore] = React.useState(false);
+  // Lookup-by-id fallback + selected document detail.
   const [lookup, setLookup] = React.useState("");
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [selected, setSelected] = React.useState<KycDocumentDetail | null>(null);
-  /**
-   * Session-local list of documents actually opened via the API this
-   * session (keyed by document_id). This is NOT a server-side listing —
-   * no list endpoint exists in the W58 contract (see header comment).
-   */
-  const [opened, setOpened] = React.useState<KycDocumentDetail[]>([]);
   const [reviewing, setReviewing] = React.useState<{
     decision: "approved" | "rejected";
   } | null>(null);
   const [busy, setBusy] = React.useState(false);
 
-  const remember = React.useCallback((doc: KycDocumentDetail) => {
-    setOpened((prev) => {
-      const rest = prev.filter((d) => d.document_id !== doc.document_id);
-      return [doc, ...rest];
-    });
-  }, []);
+  /**
+   * Fetch one queue page. offset=0 replaces the queue; any other offset
+   * appends (load-more). hasMore is inferred from a full page coming back.
+   */
+  const loadQueue = React.useCallback(
+    async (state: ReviewStateFilter, offset: number, initial = false) => {
+      if (initial) setQueueLoading(true);
+      setQueueError(null);
+      try {
+        const data = await api.get<
+          { items: KycDocumentListItem[] } | KycDocumentListItem[]
+        >("/api/bookings/v1/kyc/documents", {
+          tenant: orgSlug,
+          review_state: state || undefined,
+          limit: PAGE_SIZE,
+          offset,
+        });
+        const page = unwrapItems(data);
+        setQueue((prev) => (offset === 0 ? page : [...prev, ...page]));
+        setHasMore(page.length >= PAGE_SIZE);
+      } catch (err) {
+        setQueueError(
+          err instanceof ApiError && err.status === 403
+            ? "KYC document review requires the owner or admin role."
+            : err instanceof ApiError
+              ? err.message
+              : "Failed to load the KYC document queue.",
+        );
+        if (initial) {
+          setQueue([]);
+          setHasMore(false);
+        }
+      } finally {
+        setQueueLoading(false);
+      }
+    },
+    [orgSlug],
+  );
+
+  React.useEffect(() => {
+    void loadQueue(filter, 0, true);
+  }, [filter, loadQueue]);
+
+  const refreshQueue = () => void loadQueue(filter, 0, true);
+  const loadMore = () => void loadQueue(filter, queue.length);
 
   const fetchDocument = React.useCallback(
     async (id: string) => {
@@ -185,16 +267,15 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
     [orgSlug],
   );
 
-  const search = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const id = lookup.trim();
-    if (!id || loading) return;
+  /** Open a document detail from the queue or the lookup fallback. */
+  const openDocument = async (id: string) => {
+    const trimmed = id.trim();
+    if (!trimmed || loading) return;
     setLoading(true);
     setError(null);
     try {
-      const doc = await fetchDocument(id);
+      const doc = await fetchDocument(trimmed);
       setSelected(doc);
-      remember(doc);
     } catch (err) {
       setSelected(null);
       setError(
@@ -211,21 +292,14 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
     }
   };
 
+  const search = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await openDocument(lookup);
+  };
+
   const refresh = async () => {
     if (!selected || loading) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const doc = await fetchDocument(selected.document_id);
-      setSelected(doc);
-      remember(doc);
-    } catch (err) {
-      setError(
-        err instanceof ApiError ? err.message : "Failed to refresh the document.",
-      );
-    } finally {
-      setLoading(false);
-    }
+    await openDocument(selected.document_id);
   };
 
   const review = async (decision: "approved" | "rejected", reason: string) => {
@@ -243,10 +317,11 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
         variant: "success",
       });
       setReviewing(null);
-      // Re-fetch so the card + session list show the authoritative state.
+      // Re-fetch so the card shows the authoritative state, and refresh
+      // the queue so the row leaves/enters the filter bucket.
       const doc = await fetchDocument(selected.document_id);
       setSelected(doc);
-      remember(doc);
+      refreshQueue();
     } catch (err) {
       toast({
         title: "Review failed",
@@ -271,25 +346,129 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => void refresh()}
-            disabled={!selected || loading}
+            onClick={refreshQueue}
+            disabled={queueLoading}
           >
-            <RefreshCw className="h-4 w-4" />
-            {loading ? "Loading…" : "Refresh"}
+            <RefreshCw
+              className={queueLoading ? "h-4 w-4 animate-spin" : "h-4 w-4"}
+            />
+            {queueLoading ? "Loading…" : "Refresh"}
           </Button>
         }
       />
-      {error ? <ErrorNote message={error} /> : null}
+
+      {/* Review-state filter — pending_review is the default queue. */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        {REVIEW_STATE_FILTERS.map((f) => (
+          <Button
+            key={f.value || "all"}
+            variant={filter === f.value ? "default" : "outline"}
+            size="sm"
+            onClick={() => setFilter(f.value)}
+            disabled={queueLoading}
+          >
+            {f.label}
+          </Button>
+        ))}
+      </div>
+
+      {queueError ? <ErrorNote message={queueError} /> : null}
 
       <Card className="mb-6">
         <CardHeader>
-          <CardTitle>Open a document</CardTitle>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldCheck className="h-5 w-5" />
+            Review queue
+          </CardTitle>
           <CardDescription>
-            There is no list endpoint in the KYC document contract (W58) —
-            documents are opened one at a time by the{" "}
+            Server-side queue from kyc-service via the booking proxy — newest
+            first. Rows are the hash-only durable records; open one to see
+            the OCR-extracted fields (while inside the 72-hour retention
+            window).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="pl-5">Uploaded</TableHead>
+                <TableHead>Document</TableHead>
+                <TableHead>Subject</TableHead>
+                <TableHead>Type</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="pr-5">Review</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {queue.length === 0 && !queueLoading ? (
+                <TableEmpty colSpan={6}>
+                  {queueError
+                    ? "Could not load the review queue."
+                    : `No ${filter ? REVIEW_STATE_FILTERS.find((f) => f.value === filter)?.label.toLowerCase() : ""} KYC documents.`}
+                </TableEmpty>
+              ) : (
+                queue.map((d) => (
+                  <TableRow
+                    key={d.document_id}
+                    className="cursor-pointer"
+                    onClick={() => void openDocument(d.document_id)}
+                  >
+                    <TableCell className="pl-5 text-sm text-muted-foreground">
+                      {d.created_at ? formatDateTime(d.created_at) : "—"}
+                    </TableCell>
+                    <TableCell>
+                      <span
+                        className="font-mono text-xs text-primary underline-offset-2 hover:underline"
+                        title={d.document_id}
+                      >
+                        {d.document_id}
+                      </span>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {d.subject_phone ?? "—"}
+                    </TableCell>
+                    <TableCell className="text-sm">
+                      {DOC_TYPE_LABELS[d.doc_type ?? ""] ??
+                        (d.doc_type ? d.doc_type.replace(/_/g, " ") : "—")}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={statusVariant(d.status)}>
+                        {d.status ?? "—"}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="pr-5">
+                      <Badge variant={reviewVariant(d.review_state)}>
+                        {(d.review_state ?? "pending_review").replace(/_/g, " ")}
+                      </Badge>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+          {hasMore ? (
+            <div className="my-4 flex justify-center">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={loadMore}
+                disabled={queueLoading}
+              >
+                {queueLoading ? "Loading…" : "Load more"}
+              </Button>
+            </div>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      <Card className="mb-6">
+        <CardHeader>
+          <CardTitle>Open by id or reference</CardTitle>
+          <CardDescription>
+            Fallback lookup — paste the{" "}
             <span className="font-mono">document_id</span> or{" "}
-            <span className="font-mono">reference</span> returned at upload.
-            Documents you open this session are listed below.
+            <span className="font-mono">reference</span> returned at upload
+            (e.g. from a deep link outside the queue).
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -309,6 +488,8 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
         </CardContent>
       </Card>
 
+      {error ? <ErrorNote message={error} /> : null}
+
       {selected ? (
         <Card className="mb-6">
           <CardHeader className="flex-row items-start justify-between space-y-0">
@@ -325,9 +506,23 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
                     <span className="font-mono">{selected.reference}</span>
                   </>
                 ) : null}
+                {selected.subject_phone
+                  ? ` · subject ${selected.subject_phone}`
+                  : ""}
                 {selected.created_at
                   ? ` · uploaded ${formatDateTime(selected.created_at)}`
                   : ""}
+                {" · "}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2"
+                  onClick={() => void refresh()}
+                  disabled={loading}
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Refresh
+                </Button>
               </CardDescription>
             </div>
             <div className="flex shrink-0 gap-2">
@@ -386,73 +581,6 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
           </CardContent>
         </Card>
       ) : null}
-
-      <Card>
-        <CardHeader className="flex-row items-center justify-between space-y-0">
-          <div>
-            <CardTitle>Opened this session</CardTitle>
-            <CardDescription>
-              Documents fetched from the API during this session — not a
-              server-side queue.
-            </CardDescription>
-          </div>
-          <Badge variant="secondary">{opened.length}</Badge>
-        </CardHeader>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="pl-5">Document</TableHead>
-                <TableHead>Type</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Review</TableHead>
-                <TableHead className="pr-5">Fields</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {opened.length === 0 ? (
-                <TableEmpty colSpan={5}>
-                  No documents opened yet — use the lookup above.
-                </TableEmpty>
-              ) : (
-                opened.map((d) => (
-                  <TableRow
-                    key={d.document_id}
-                    className="cursor-pointer"
-                    onClick={() => setSelected(d)}
-                  >
-                    <TableCell className="pl-5">
-                      <span
-                        className="font-mono text-xs text-primary underline-offset-2 hover:underline"
-                        title={d.document_id}
-                      >
-                        {d.reference ?? d.document_id}
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-sm">
-                      {DOC_TYPE_LABELS[d.doc_type ?? ""] ??
-                        (d.doc_type ? d.doc_type.replace(/_/g, " ") : "—")}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={statusVariant(d.status)}>
-                        {d.status ?? "—"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={reviewVariant(d.review_state)}>
-                        {(d.review_state ?? "pending_review").replace(/_/g, " ")}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="pr-5 text-sm text-muted-foreground">
-                      {d.fields_available ? "available" : "expired — hashes only"}
-                    </TableCell>
-                  </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
 
       <ReviewDialog
         review={reviewing}

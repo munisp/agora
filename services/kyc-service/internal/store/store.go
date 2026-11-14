@@ -80,6 +80,15 @@ type Repository interface {
 	DocumentIDHashOwner(ctx context.Context, tenantID uuid.UUID, docType, idValueHash string) (string, error)
 	// GetDocument returns one kyc_documents row (nil, nil when absent).
 	GetDocument(ctx context.Context, tenantID, documentID uuid.UUID) (*Document, error)
+	// ListDocuments returns the tenant's kyc_documents rows newest-first
+	// (created_at DESC, document_id DESC — the idx_kyc_documents_tenant
+	// order) for the admin review queue (SPEC-W65 pinned contract).
+	// reviewState "" lists all states; otherwise it filters on the exact
+	// review_state. limit is validated by the handler (1..200, default
+	// 50); the store clamps defensively. Read-only: kyc_documents rows
+	// are immutable except the review columns (kyc_documents_review_only
+	// trigger), so a list SELECT is safe by construction.
+	ListDocuments(ctx context.Context, tenantID uuid.UUID, reviewState string, limit, offset int) ([]Document, error)
 	// ReviewDocument performs the ONLY mutation kyc_documents allows:
 	// review_state + reviewer_actor + reviewed_at (enforced at the
 	// database layer by the kyc_documents_review_only trigger). Returns
@@ -437,6 +446,47 @@ func (s *Store) GetDocument(ctx context.Context, tenantID, documentID uuid.UUID)
 		return nil
 	})
 	return d, err
+}
+
+// ListDocuments implements the SPEC-W65 admin review queue read: the
+// tenant's kyc_documents rows newest-first (created_at DESC, document_id
+// DESC — served by idx_kyc_documents_tenant), optionally filtered to one
+// review_state. Read-only, RLS-scoped via withTenant.
+func (s *Store) ListDocuments(ctx context.Context, tenantID uuid.UUID, reviewState string, limit, offset int) ([]Document, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	out := []Document{}
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		q := `SELECT ` + documentColumns + ` FROM kyc_documents WHERE tenant_id = $1`
+		args := []any{tenantID}
+		if reviewState != "" {
+			q += ` AND review_state = $2`
+			args = append(args, reviewState)
+		}
+		q += fmt.Sprintf(` ORDER BY created_at DESC, document_id DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+		args = append(args, limit, offset)
+		rows, err := tx.Query(ctx, q, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d Document
+			if err := scanDocument(rows, &d); err != nil {
+				return fmt.Errorf("list kyc documents: %w", err)
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	return out, err
 }
 
 // ReviewDocument performs the only mutation kyc_documents allows

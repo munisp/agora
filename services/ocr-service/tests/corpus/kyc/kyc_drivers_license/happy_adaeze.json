@@ -1,0 +1,22 @@
+{
+  "kind": "kyc_drivers_license",
+  "doc": {
+    "title": "Driver's licence (front)",
+    "issuer": "Federal Road Safety Corps (synthetic)",
+    "layout": "Landscape card: crest, name/dob/licence-no/expiry lines.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": false,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# Driver's Licence\n\nFEDERAL REPUBLIC OF NIGERIA\n\nName: ADAEZE CHINWE OKAFOR\nDOB: 1990-04-12\nLicence No: FKJ12345AB\nExpiry: 2027-06-30\n\n```json\n{\"full_name\": \"ADAEZE CHINWE OKAFOR\", \"dob\": \"1990-04-12\", \"license_no\": \"FKJ12345AB\", \"expiry\": \"2027-06-30\"}\n```",
+  "expected_fields": {
+    "full_name": "ADAEZE CHINWE OKAFOR",
+    "dob": "1990-04-12",
+    "license_no": "FKJ12345AB",
+    "expiry": "2027-06-30"
+  },
+  "expected_mrz_valid": null
+}

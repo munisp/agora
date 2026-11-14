@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -62,12 +63,54 @@ func (f *fakeDocStore) InsertDocument(_ context.Context, d *store.Document) erro
 	if d.DocumentID == uuid.Nil {
 		d.DocumentID = uuid.New()
 	}
-	d.ReviewState = "pending_review"
-	d.CreatedAt = time.Now()
+	if d.ReviewState == "" {
+		d.ReviewState = "pending_review"
+	}
+	if d.CreatedAt.IsZero() {
+		d.CreatedAt = time.Now()
+	}
 	cp := *d
 	f.docs = append(f.docs, &cp)
 	*d = cp
 	return nil
+}
+
+// ListDocuments mirrors the store contract (SPEC-W65): tenant-scoped,
+// reviewState "" lists all states, newest-first (created_at DESC,
+// document_id DESC), then limit/offset windowing.
+func (f *fakeDocStore) ListDocuments(_ context.Context, tenantID uuid.UUID, reviewState string, limit, offset int) ([]store.Document, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	matched := []store.Document{}
+	for _, d := range f.docs {
+		if d.TenantID != tenantID {
+			continue
+		}
+		if reviewState != "" && d.ReviewState != reviewState {
+			continue
+		}
+		matched = append(matched, *d)
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.After(matched[j].CreatedAt)
+		}
+		return bytes.Compare(matched[i].DocumentID[:], matched[j].DocumentID[:]) > 0
+	})
+	if offset > len(matched) {
+		offset = len(matched)
+	}
+	end := offset + limit
+	if end > len(matched) {
+		end = len(matched)
+	}
+	return matched[offset:end], nil
 }
 
 // DocumentIDHashOwner mirrors the store contract: the subject_phone of the
@@ -123,6 +166,7 @@ type fakeOCR struct {
 	gotKind     string
 	gotMime     string
 	gotTenant   uuid.UUID
+	gotSubject  string
 	gotBytes    []byte
 
 	getStatus   string // "" => "extracted"; "erased" simulates the erasure blank
@@ -134,11 +178,11 @@ type fakeOCR struct {
 
 func (f *fakeOCR) Configured() bool { return true }
 
-func (f *fakeOCR) Extract(_ context.Context, tenantID uuid.UUID, kind, mime string, data []byte) (*OCRExtractResult, error) {
+func (f *fakeOCR) Extract(_ context.Context, tenantID uuid.UUID, subject, kind, mime string, data []byte) (*OCRExtractResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.extractCall++
-	f.gotKind, f.gotMime, f.gotTenant = kind, mime, tenantID
+	f.gotKind, f.gotMime, f.gotTenant, f.gotSubject = kind, mime, tenantID, subject
 	f.gotBytes = append([]byte(nil), data...)
 	if f.extractErr != nil {
 		return nil, f.extractErr
@@ -316,9 +360,13 @@ func TestDocumentUploadHappyPath(t *testing.T) {
 		t.Errorf("consent id_hash must be empty pre-extraction, got %q", h.consent.gotIDHash)
 	}
 
-	// ocr got the bytes unchanged, kind = doc_type verbatim (contract).
+	// ocr got the bytes unchanged, kind = doc_type verbatim (contract),
+	// and the validated E.164 subject_phone (SPEC-W65 G2 passthrough).
 	if h.ocr.extractCall != 1 || h.ocr.gotKind != "kyc_nin_slip" || h.ocr.gotMime != "image/png" {
 		t.Errorf("ocr extract: calls=%d kind=%q mime=%q", h.ocr.extractCall, h.ocr.gotKind, h.ocr.gotMime)
+	}
+	if h.ocr.gotSubject != "+2348012345678" {
+		t.Errorf("ocr extract subject = %q, want the validated subject_phone", h.ocr.gotSubject)
 	}
 	if h.ocr.gotTenant != h.tid || !bytes.Equal(h.ocr.gotBytes, pngBytes()) {
 		t.Errorf("ocr extract tenant/bytes mismatch")
@@ -790,13 +838,14 @@ func TestDocumentReviewValidation(t *testing.T) {
 func TestOCRClientAgainstStub(t *testing.T) {
 	tid := uuid.New()
 	docID := uuid.New()
-	var gotToken, gotSlug, gotKind, gotTenantForm string
+	var gotToken, gotSlug, gotKind, gotTenantForm, gotSubjectForm string
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotToken = r.Header.Get("X-Internal-Token")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/ocr/extract":
 			gotTenantForm = r.FormValue("tenant_id")
 			gotKind = r.FormValue("kind")
+			gotSubjectForm = r.FormValue("subject_phone")
 			if r.Header.Get("X-Tenant-Slug") != tid.String() {
 				w.WriteHeader(http.StatusBadRequest)
 				return
@@ -821,7 +870,7 @@ func TestOCRClientAgainstStub(t *testing.T) {
 	if !c.Configured() {
 		t.Fatal("configured client expected")
 	}
-	res, err := c.Extract(context.Background(), tid, "kyc_nin_slip", "image/png", pngBytes())
+	res, err := c.Extract(context.Background(), tid, "+2348012345678", "kyc_nin_slip", "image/png", pngBytes())
 	if err != nil {
 		t.Fatalf("extract: %v", err)
 	}
@@ -830,6 +879,11 @@ func TestOCRClientAgainstStub(t *testing.T) {
 	}
 	if gotToken != "tok" || gotKind != "kyc_nin_slip" || gotTenantForm != tid.String() || gotSlug != "" {
 		t.Errorf("contract: token=%q kind=%q tenant_form=%q", gotToken, gotKind, gotTenantForm)
+	}
+	// SPEC-W65 G2: the outgoing multipart carries the validated E.164
+	// subject_phone form field so ocr can persist the subject column.
+	if gotSubjectForm != "+2348012345678" {
+		t.Errorf("subject_phone form field = %q, want +2348012345678", gotSubjectForm)
 	}
 
 	info, err := c.GetDocument(context.Background(), tid, docID)
@@ -843,7 +897,194 @@ func TestOCRClientAgainstStub(t *testing.T) {
 	}
 	// unconfigured client fails closed
 	nc := NewOCRClient("", "", nil)
-	if _, err := nc.Extract(context.Background(), tid, "kyc_nin_slip", "image/png", pngBytes()); !errors.Is(err, errOCRNotConfigured) {
+	if _, err := nc.Extract(context.Background(), tid, "+2348012345678", "kyc_nin_slip", "image/png", pngBytes()); !errors.Is(err, errOCRNotConfigured) {
 		t.Errorf("unconfigured extract: %v, want errOCRNotConfigured", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/kyc/documents (SPEC-W65 pinned list contract)
+// ---------------------------------------------------------------------------
+
+func (h *docHarness) list(t *testing.T, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v1/kyc/documents?"+query, nil)
+	req.Header.Set("X-Internal-Token", testInternalToken)
+	req.Header.Set("X-Actor", "reviewer-1")
+	rec := httptest.NewRecorder()
+	h.http.ServeHTTP(rec, req)
+	return rec
+}
+
+// seedDocs inserts documents with explicit ascending created_at (1s apart)
+// so the newest-first ordering is deterministic, and returns them in
+// insertion (oldest-first) order. states carries one review_state per doc
+// ("" defaults to pending_review in the fake, like the DB default).
+func (h *docHarness) seedDocs(t *testing.T, states ...string) []*store.Document {
+	t.Helper()
+	base := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	out := make([]*store.Document, 0, len(states))
+	for i, state := range states {
+		d := &store.Document{
+			TenantID:      h.tid,
+			SubjectPhone:  "+2348012345678",
+			DocType:       "kyc_nin_slip",
+			OCRDocumentID: uuid.New(),
+			SHA256:        strings.Repeat("ab", 32),
+			IDValueHash:   strings.Repeat("cd", 32),
+			FieldHashes:   map[string]string{"nin": strings.Repeat("ef", 32)},
+			Status:        "extracted",
+			ReviewState:   state,
+			CreatedAt:     base.Add(time.Duration(i) * time.Second),
+		}
+		if err := h.store.InsertDocument(context.Background(), d); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func decodeListResponse(t *testing.T, rec *httptest.ResponseRecorder) documentListResponse {
+	t.Helper()
+	var out documentListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode list response: %v (body %s)", err, rec.Body)
+	}
+	return out
+}
+
+func TestDocumentListPagination(t *testing.T) {
+	h := newDocHarness(nil)
+	seeded := h.seedDocs(t, "", "", "", "", "") // 5 docs, oldest-first
+
+	// Page 1: default ordering is newest-first on created_at DESC.
+	rec := h.list(t, "tenant_id="+h.tid.String()+"&limit=2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	page1 := decodeListResponse(t, rec)
+	if page1.Limit != 2 || page1.Offset != 0 || len(page1.Items) != 2 {
+		t.Fatalf("page1: %+v", page1)
+	}
+	if page1.Items[0].DocumentID != seeded[4].DocumentID || page1.Items[1].DocumentID != seeded[3].DocumentID {
+		t.Errorf("page1 order = %v, want newest-first", page1.Items)
+	}
+	// Hash-only projection incl. subject_phone (pinned contract).
+	if page1.Items[0].SubjectPhone != "+2348012345678" || page1.Items[0].IDValueHash == "" || page1.Items[0].FieldHashes["nin"] == "" {
+		t.Errorf("projection must be the hash-only row incl. subject_phone: %+v", page1.Items[0])
+	}
+
+	// Page 2 + 3: the offset window walks the queue without repeats.
+	page2 := decodeListResponse(t, h.list(t, "tenant_id="+h.tid.String()+"&limit=2&offset=2"))
+	if len(page2.Items) != 2 || page2.Items[0].DocumentID != seeded[2].DocumentID || page2.Items[1].DocumentID != seeded[1].DocumentID {
+		t.Errorf("page2: %+v", page2)
+	}
+	page3 := decodeListResponse(t, h.list(t, "tenant_id="+h.tid.String()+"&limit=2&offset=4"))
+	if len(page3.Items) != 1 || page3.Items[0].DocumentID != seeded[0].DocumentID {
+		t.Errorf("page3: %+v", page3)
+	}
+
+	// Past the end: empty page, items is a JSON array (never null).
+	past := h.list(t, "tenant_id="+h.tid.String()+"&limit=2&offset=10")
+	out := decodeListResponse(t, past)
+	if len(out.Items) != 0 {
+		t.Errorf("past-end page: %+v", out)
+	}
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(past.Body.Bytes(), &raw)
+	if string(raw["items"]) != "[]" {
+		t.Errorf("items must serialize as [] (contract), got %s", raw["items"])
+	}
+
+	// Cross-tenant: another tenant sees nothing.
+	other := decodeListResponse(t, h.list(t, "tenant_id="+uuid.New().String()))
+	if len(other.Items) != 0 {
+		t.Errorf("cross-tenant list must be empty: %+v", other)
+	}
+}
+
+func TestDocumentListFilter(t *testing.T) {
+	h := newDocHarness(nil)
+	seeded := h.seedDocs(t, "approved", "", "rejected", "", "approved")
+
+	all := decodeListResponse(t, h.list(t, "tenant_id="+h.tid.String()))
+	if len(all.Items) != 5 || all.Limit != 50 || all.Offset != 0 {
+		t.Errorf("default window: limit=%d offset=%d items=%d, want 50/0/5", all.Limit, all.Offset, len(all.Items))
+	}
+	approved := decodeListResponse(t, h.list(t, "tenant_id="+h.tid.String()+"&review_state=approved"))
+	if len(approved.Items) != 2 || approved.Items[0].DocumentID != seeded[4].DocumentID || approved.Items[1].DocumentID != seeded[0].DocumentID {
+		t.Errorf("approved filter: %+v", approved.Items)
+	}
+	for _, d := range approved.Items {
+		if d.ReviewState != "approved" {
+			t.Errorf("filter leaked %q", d.ReviewState)
+		}
+	}
+	pending := decodeListResponse(t, h.list(t, "tenant_id="+h.tid.String()+"&review_state=pending_review"))
+	if len(pending.Items) != 2 {
+		t.Errorf("pending filter: %+v", pending.Items)
+	}
+	none := decodeListResponse(t, h.list(t, "tenant_id="+h.tid.String()+"&review_state=rejected&offset=1"))
+	if len(none.Items) != 0 {
+		t.Errorf("rejected offset past end: %+v", none.Items)
+	}
+}
+
+func TestDocumentListEmpty(t *testing.T) {
+	h := newDocHarness(nil)
+	rec := h.list(t, "tenant_id="+h.tid.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	out := decodeListResponse(t, rec)
+	if len(out.Items) != 0 || out.Limit != 50 || out.Offset != 0 {
+		t.Errorf("empty list: %+v, want items=[] limit=50 offset=0", out)
+	}
+	// X-Tenant-ID header is an accepted tenant selector (detail-GET parity).
+	req := httptest.NewRequest(http.MethodGet, "/v1/kyc/documents", nil)
+	req.Header.Set("X-Internal-Token", testInternalToken)
+	req.Header.Set("X-Tenant-ID", h.tid.String())
+	rec2 := httptest.NewRecorder()
+	h.http.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusOK {
+		t.Errorf("X-Tenant-ID selector: status = %d, want 200", rec2.Code)
+	}
+}
+
+func TestDocumentListValidation(t *testing.T) {
+	h := newDocHarness(nil)
+	tid := h.tid.String()
+	cases := []struct {
+		name  string
+		query string
+	}{
+		{"missing tenant", ""},
+		{"bad tenant uuid", "tenant_id=nope"},
+		{"bad review_state", "tenant_id=" + tid + "&review_state=maybe"},
+		{"limit zero", "tenant_id=" + tid + "&limit=0"},
+		{"limit over cap", "tenant_id=" + tid + "&limit=201"},
+		{"limit not a number", "tenant_id=" + tid + "&limit=abc"},
+		{"negative offset", "tenant_id=" + tid + "&offset=-1"},
+		{"offset not a number", "tenant_id=" + tid + "&offset=abc"},
+	}
+	for _, tc := range cases {
+		if rec := h.list(t, tc.query); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 (body %s)", tc.name, rec.Code, rec.Body)
+		}
+	}
+	// Boundary values are accepted.
+	if rec := h.list(t, "tenant_id="+tid+"&limit=1&offset=0"); rec.Code != http.StatusOK {
+		t.Errorf("limit=1: status = %d, want 200", rec.Code)
+	}
+	if rec := h.list(t, "tenant_id="+tid+"&limit=200"); rec.Code != http.StatusOK {
+		t.Errorf("limit=200: status = %d, want 200", rec.Code)
+	}
+	// Internauth gates the list too (K22 fail-closed).
+	req := httptest.NewRequest(http.MethodGet, "/v1/kyc/documents?tenant_id="+tid, nil)
+	rec := httptest.NewRecorder()
+	h.http.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing token: status = %d, want 401", rec.Code)
 	}
 }

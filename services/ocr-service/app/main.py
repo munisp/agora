@@ -261,15 +261,20 @@ async def _authenticate(request: Request, explicit_tenant: str | None, deps: App
 # ---------------------------------------------------------------------------
 # upload acquisition
 # ---------------------------------------------------------------------------
-async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | None, Any]:
-    """Extract (filename, data, kind, tenant, expires_in_hours raw) from
-    multipart OR JSON body.
+async def _read_upload(
+    request: Request,
+) -> tuple[str, bytes, str | None, str | None, Any, str | None]:
+    """Extract (filename, data, kind, tenant, expires_in_hours raw,
+    subject_phone) from multipart OR JSON body.
 
     The tenant selector is `tenant_id` (A<->B contract; the booking-service
     fieldcapture client sends it as a form field alongside X-Tenant-Slug);
     the legacy `tenant` key stays accepted. Enforces the 25 MB hard cap
     while reading. `expires_in_hours` (SPEC-W61 G2) is returned RAW and
-    validated by the caller (_parse_expires_in_hours).
+    validated by the caller (_parse_expires_in_hours). `subject_phone`
+    (SPEC-W65 G2) is the OPTIONAL E.164 consent subject forwarded by
+    kyc-service; it is persisted ONLY for kyc_* kinds (dropped + logged
+    otherwise) and never appears in any response.
     """
     ctype = request.headers.get("content-type", "")
     if ctype.startswith("multipart/form-data"):
@@ -278,10 +283,11 @@ async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | 
         kind = form.get("kind")
         tenant = _as_str(form.get("tenant_id")) or _as_str(form.get("tenant"))
         expires_raw = form.get("expires_in_hours")
+        subject_phone = _as_str(form.get("subject_phone"))
         if upload is None or not getattr(upload, "filename", None):
             raise HTTPException(status_code=400, detail="multipart field 'file' required")
         data = await upload.read()
-        return upload.filename, data, _as_str(kind), tenant, expires_raw
+        return upload.filename, data, _as_str(kind), tenant, expires_raw, subject_phone
     try:
         body = await request.json()
     except Exception:
@@ -295,10 +301,11 @@ async def _read_upload(request: Request) -> tuple[str, bytes, str | None, str | 
     kind = body.get("kind")
     tenant = _as_str(body.get("tenant_id")) or _as_str(body.get("tenant"))
     expires_raw = body.get("expires_in_hours")
+    subject_phone = _as_str(body.get("subject_phone"))
     if not url or not isinstance(url, str):
         raise HTTPException(status_code=400, detail="document_url required")
     filename, data = await _fetch_document_url(url)
-    return filename, data, _as_str(kind), tenant, expires_raw
+    return filename, data, _as_str(kind), tenant, expires_raw, subject_phone
 
 
 def _parse_expires_in_hours(raw: Any) -> int | None:
@@ -490,6 +497,7 @@ async def _run_extraction(
     filename: str,
     data: bytes,
     expires_in_hours: int | None = None,
+    subject_phone: str | None = None,
 ) -> dict[str, Any]:
     ext, mime = validate_upload(filename, data, max_bytes=settings.ocr_max_bytes)
     digest = sha256_hex(data)
@@ -497,6 +505,17 @@ async def _run_extraction(
     document_id = uuid.uuid4()
     storage_key = f"{tenant_id}/{document_id}{ext}"
     kyc = is_kyc_kind(kind)
+    # SPEC-W65 G2: subject_phone (the consent-registry subject key) is
+    # persisted ONLY for kyc_* kinds — PII minimization. For non-kyc kinds
+    # it is silently dropped + logged (compat: a 400 would break old
+    # callers during rolling deploys). It is NEVER echoed in responses.
+    if subject_phone is not None and not kyc:
+        log.info(
+            "ocr.subject_phone_dropped_non_kyc",
+            tenant_id=tenant_id,
+            kind=kind,
+        )
+        subject_phone = None
     # SPEC-W61 G2: a caller-pinned expires_in_hours sets expires_at for ANY
     # kind (whatsapp media anchor flow) and overrides the kyc default.
     # SPEC-W58 P4 (GATE R3), UNCHANGED when the field is absent: expires_at
@@ -535,6 +554,7 @@ async def _run_extraction(
                 "phash": phash,
                 "page_count": page_count_hint,
                 "expires_at": expires_at,
+                "subject_phone": subject_phone,  # kyc_* only (SPEC-W65 G2)
             },
         )
 
@@ -618,7 +638,7 @@ async def _run_extraction(
 @app.post("/v1/ocr/extract", status_code=200)
 async def extract_document(request: Request, deps: AppState = Depends(get_state)):
     try:
-        filename, data, kind, tenant, expires_raw = await _read_upload(request)
+        filename, data, kind, tenant, expires_raw, subject_phone = await _read_upload(request)
         if kind not in DOCUMENT_KINDS:
             raise HTTPException(
                 status_code=400,
@@ -629,7 +649,7 @@ async def extract_document(request: Request, deps: AppState = Depends(get_state)
         tenant_id = await _authenticate(request, tenant, deps)
         return await _run_extraction(
             deps, tenant_id=tenant_id, kind=kind, filename=filename, data=data,
-            expires_in_hours=expires_in_hours,
+            expires_in_hours=expires_in_hours, subject_phone=subject_phone,
         )
     except ValidationError as exc:
         msg = str(exc)

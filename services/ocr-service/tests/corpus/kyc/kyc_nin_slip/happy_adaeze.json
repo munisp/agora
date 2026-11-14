@@ -1,0 +1,22 @@
+{
+  "kind": "kyc_nin_slip",
+  "doc": {
+    "title": "National Identity Number slip",
+    "issuer": "National Identity Management Commission (synthetic)",
+    "layout": "Portrait slip: header, photo box left, name/dob/nin lines, address footer.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": false,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# NIN Slip\n\nFEDERAL REPUBLIC OF NIGERIA\nNational Identity Number Slip\n\nName: ADAEZE CHINWE OKAFOR\nDate of Birth: 1990-04-12\nNIN: 12345678901\nAddress: 12 Marina Road, Lagos\n\n```json\n{\"full_name\": \"ADAEZE CHINWE OKAFOR\", \"dob\": \"1990-04-12\", \"nin\": \"12345678901\", \"address\": \"12 Marina Road, Lagos\"}\n```",
+  "expected_fields": {
+    "full_name": "ADAEZE CHINWE OKAFOR",
+    "dob": "1990-04-12",
+    "nin": "12345678901",
+    "address": "12 Marina Road, Lagos"
+  },
+  "expected_mrz_valid": null
+}

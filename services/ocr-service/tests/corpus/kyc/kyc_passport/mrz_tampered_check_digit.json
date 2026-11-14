@@ -1,0 +1,24 @@
+{
+  "kind": "kyc_passport",
+  "doc": {
+    "title": "International passport data page (MRZ failure)",
+    "issuer": "Nigeria Immigration Service (synthetic)",
+    "layout": "Composite MRZ check digit flipped; the code validator MUST return false even though the model claims validity.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": false,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# Passport\n\nSurname: OKONKWO\nGiven names: CHUKWUEMEKA ADAMU\n\nP<NGAOKONKWO<<CHUKWUEMEKA<ADAMU<<<<<<<<<<<<<\nB774120385NGA8506232M2809159<<<<<<<<<<<<<<<1\n\n```json\n{\"full_name\": \"CHUKWUEMEKA ADAMU OKONKWO\", \"dob\": \"1985-06-23\", \"passport_no\": \"B77412038\", \"nationality\": \"NGA\", \"expiry\": \"2028-09-15\", \"mrz\": \"P<NGAOKONKWO<<CHUKWUEMEKA<ADAMU<<<<<<<<<<<<<\\nB774120385NGA8506232M2809159<<<<<<<<<<<<<<<1\", \"mrz_valid\": true}\n```",
+  "expected_fields": {
+    "full_name": "CHUKWUEMEKA ADAMU OKONKWO",
+    "dob": "1985-06-23",
+    "passport_no": "B77412038",
+    "nationality": "NGA",
+    "expiry": "2028-09-15",
+    "mrz_valid": false
+  },
+  "expected_mrz_valid": false
+}

@@ -535,6 +535,10 @@ func NewRouter(d Deps) http.Handler {
 		// requestTimeoutMiddleware).
 		r.Route("/kyc", func(r chi.Router) {
 			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/documents", s.kycUploadDocument)
+			// SPEC-W65 Scope 2 (additive): the owner/admin review queue —
+			// newest-first paginated list proxied from kyc-service. Same P5
+			// gate as the rest of the kyc group (member => 403).
+			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Get("/documents", s.kycListDocuments)
 			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Get("/documents/{id}", s.kycGetDocument)
 			r.With(s.require("manage_bookings"), s.requireOwnerAdmin()).Post("/documents/{id}/review", s.kycReviewDocument)
 		})

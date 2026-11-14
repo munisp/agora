@@ -124,6 +124,8 @@ class FakeDB:
             "extracted_text": None,
             "extracted_fields": None,
             "expires_at": doc.get("expires_at"),
+            # SPEC-W65 G2: nullable subject column (kyc_* kinds only).
+            "subject_phone": doc.get("subject_phone"),
             "error": None,
             "created_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
@@ -188,18 +190,25 @@ class FakeDB:
         return existed
 
     async def list_kyc_rows_matching_subject(self, scope, subject: str):
+        """SPEC-W65 G2 — replicates the SQL dual-match in lockstep:
+        subject_phone column match OR (subject_phone IS NULL AND legacy
+        extracted_fields exact-value match)."""
         out = []
         for r in self.rows.values():
             if r["tenant_id"] != scope.tenant_id:
                 continue
             if not r["kind"].startswith("kyc_") or r["status"] == "erased":
                 continue
-            fields = r.get("extracted_fields")
-            if isinstance(fields, str):
-                fields = json.loads(fields)
-            if isinstance(fields, dict) and any(
-                isinstance(v, str) and v == subject for v in fields.values()
-            ):
+            if r.get("subject_phone") is not None:
+                matched = r["subject_phone"] == subject
+            else:
+                fields = r.get("extracted_fields")
+                if isinstance(fields, str):
+                    fields = json.loads(fields)
+                matched = isinstance(fields, dict) and any(
+                    isinstance(v, str) and v == subject for v in fields.values()
+                )
+            if matched:
                 out.append(
                     {
                         "id": r["id"],
@@ -213,6 +222,8 @@ class FakeDB:
         row = self._owned(scope, document_id)
         row["extracted_text"] = None
         row["extracted_fields"] = None
+        # SPEC-W65 G2 tombstone hygiene: NULL the PII locator too.
+        row["subject_phone"] = None
         row["status"] = "erased"
         row["error"] = None
         self.transitions.append((str(document_id), "erased"))

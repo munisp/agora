@@ -8,10 +8,13 @@ main.py:
     purpose, erased_records, erasure_ts, synthetic}) — for matching kyc_*
     rows: blank extracted_fields/extracted_text, status='erased', DELETE
     the MinIO object; sha256/phash are RETAINED as the hash-only audit
-    stub. Subject matching is by exact top-level extracted_fields string
-    value (ocr_documents has no subject column; the authoritative
-    subject_phone <-> ocr_document_id binding lives in kyc-service, P8) —
-    best-effort belt-and-braces.
+    stub. Subject matching (SPEC-W65 G2, implemented in
+    store.list_kyc_rows_matching_subject): the subject_phone COLUMN match
+    is primary (data_subject_id IS the E.164 phone); rows ingested before
+    the column existed (subject_phone IS NULL) fall back to the legacy
+    exact top-level extracted_fields string match, and the 72h TTL
+    sweeper bounds that fallback window. mark_erased also NULLs
+    subject_phone — the tombstone must not retain the PII locator.
 
   * com.opendesk.identity.TenantDeleted on opendesk.identity.events
     (payload: {tenant_slug, tenant_id, deleted_at, actor}) — HARD-DELETE

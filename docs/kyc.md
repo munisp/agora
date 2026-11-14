@@ -54,6 +54,32 @@ id_binding_violation** (same document number under a different phone, K22)
 · `413` over 25 MB · `415` mime/magic rejection · `502` consent gate or
 ocr-service down · `503` OCR upstream not configured (fail-closed).
 
+**`GET /v1/kyc/documents?tenant_id=<uuid>&review_state=&limit=&offset=`**
+(SPEC-W65 — the admin review queue; `tenant_id` also accepted as the
+`X-Tenant-ID` header) → newest-first (`created_at DESC, document_id DESC`
+on `idx_kyc_documents_tenant`) hash-only `Document` projections **incl.
+`subject_phone`** (the owner/admin surface already exposes it in the
+detail GET). `review_state` filters to
+`pending_review|approved|rejected` (`""`/absent = all); `limit` is 1..200
+(default 50), `offset` ≥ 0 (default 0). → `200`:
+
+```json
+{ "items": [ { "document_id": "<uuid>", "tenant_id": "<uuid>",
+               "subject_phone": "+2348012345678", "doc_type": "kyc_nin_slip",
+               "ocr_document_id": "<uuid>", "sha256": "…", "phash": "…",
+               "id_value_hash": "…", "field_hashes": {"nin": "…"},
+               "status": "extracted", "review_state": "pending_review",
+               "reviewer_actor": "", "created_at": "…" } ],
+  "limit": 50, "offset": 0 }
+```
+
+`items` is always a JSON array (never `null`). Read-only — rows are
+immutable except the review columns, so the list SELECT is safe by
+construction. Errors: `400` validation · `401/503` internauth. Every call
+emits a view-audit log line (actor, tenant, page window — R8). The
+booking-service proxies this route (`GET /v1/kyc/documents`, owner/admin
+gate) for the admin-web paginated queue.
+
 **`GET /v1/kyc/documents/{id}?tenant_id=<uuid>`** (or `X-Tenant-ID`
 header) → the hash-only row (`document_id, reference, tenant_id,
 subject_phone, doc_type, ocr_document_id, sha256, phash, id_value_hash,
@@ -82,6 +108,11 @@ envelope. Re-review (correction) is allowed and audited.
 3. **Extract** — bytes forwarded unchanged to ocr-service
    `POST /v1/ocr/extract` with `kind = doc_type` verbatim
    (`KYC_OCR_BASE_URL` + `X-Internal-Token`, 150 s bounded, NO retries).
+   **SPEC-W65:** the validated E.164 `subject_phone` rides the multipart
+   as the `subject_phone` form field, so ocr persists it on the kyc row's
+   new `subject_phone` column (kyc kinds only). Deploy-order safe both
+   directions: old ocr ignores unknown form fields; new ocr treats the
+   absent field as NULL.
    Failure ⇒ one audit row (`status=failed, detail=ocr_unavailable`) +
    `502`.
 4. **Hash (P8)** — per-field HMAC-SHA256 (`KYC_HASH_SECRET`) digests into
@@ -113,6 +144,15 @@ ocr-service (MinIO + ocr DB) under `OCR_KYC_TTL_HOURS`. Mutable ONLY on
 append-only trigger); DELETE is forbidden. Erasure wipes the ocr row +
 MinIO object and leaves the hash tombstone — NDPA accountability preserved
 without retaining PII.
+
+**Erasure matching (SPEC-W65 G2):** the consent `data_subject_id` is the
+E.164 phone, and ocr now receives it at extract time (step 3) and persists
+it as `ocr_documents.subject_phone` on kyc rows. Consent erasure in
+ocr-service therefore matches the **subject_phone column** directly, with
+a legacy fallback for pre-W65 rows (`subject_phone IS NULL` AND the old
+JSONB extracted-value match); those legacy rows self-expire via the 72 h
+TTL sweeper, so the fallback window is naturally bounded. `mark_erased`
+also NULLs the column so the tombstone retains no PII locator.
 
 `kyc_audit` is reused for document actions (GF7 append-only preserved):
 the `id_type` CHECK is widened to the `kyc_*` doc types, `status` accepts
@@ -217,3 +257,13 @@ stored rows or POST/review responses; the OCR client is contract-tested
 against an httptest stub. Store tests cover the kyc_documents DDL (RLS,
 review-only-mutable trigger, DELETE ban, binding lookup, CHECK enums,
 bootstrap idempotency).
+
+SPEC-W65: the list endpoint is covered by httptest tests (newest-first
+pagination incl. past-end empty page, `review_state` filter, empty queue,
+`items: []` never null, cross-tenant invisibility, 1..200/default-50 limit
+and offset validation, internauth 401) plus an embedded-Postgres store
+test (ordering on `idx_kyc_documents_tenant`, filter, windowing, RLS
+isolation). The subject_phone passthrough is pinned twice: the handler
+test asserts the fake OCR backend receives the validated E.164 subject,
+and the OCR client stub test asserts the outgoing multipart carries the
+`subject_phone` form field.

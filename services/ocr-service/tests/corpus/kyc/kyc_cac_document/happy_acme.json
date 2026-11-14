@@ -1,0 +1,22 @@
+{
+  "kind": "kyc_cac_document",
+  "doc": {
+    "title": "Certificate of incorporation",
+    "issuer": "Corporate Affairs Commission (synthetic)",
+    "layout": "A4 certificate: company name, RC number, registration date, address.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": false,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# Certificate of Incorporation\n\nCORPORATE AFFAIRS COMMISSION\n\nACME STORES LTD\nRC Number: RC1234567\nDate of Registration: 2015-03-20\nRegistered Address: 12 Marina Road, Lagos\n\n```json\n{\"company_name\": \"ACME STORES LTD\", \"rc_number\": \"RC1234567\", \"registration_date\": \"2015-03-20\", \"address\": \"12 Marina Road, Lagos\"}\n```",
+  "expected_fields": {
+    "company_name": "ACME STORES LTD",
+    "rc_number": "RC1234567",
+    "registration_date": "2015-03-20",
+    "address": "12 Marina Road, Lagos"
+  },
+  "expected_mrz_valid": null
+}

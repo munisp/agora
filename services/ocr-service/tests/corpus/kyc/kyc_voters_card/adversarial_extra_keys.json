@@ -1,0 +1,21 @@
+{
+  "kind": "kyc_voters_card",
+  "doc": {
+    "title": "Permanent voter's card (adversarial model answer)",
+    "issuer": "Independent National Electoral Commission (synthetic)",
+    "layout": "Model omits dob (null fallback) and over-emits non-whitelisted keys.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": true,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# Permanent Voter's Card\n\nName: ADAEZE CHINWE OKAFOR\nVIN: 90F5B12345678901234\n\n```json\n{\"full_name\": \"ADAEZE CHINWE OKAFOR\", \"vin\": \"90F5B12345678901234\", \"polling_unit\": \"PU-04-12-003\", \"phone_number\": \"+2348012345678\", \"occupation\": \"TRADER\"}\n```",
+  "expected_fields": {
+    "full_name": "ADAEZE CHINWE OKAFOR",
+    "vin": "90F5B12345678901234",
+    "dob": null
+  },
+  "expected_mrz_valid": null
+}

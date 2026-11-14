@@ -83,6 +83,15 @@ paths:
                   type: string
                   deprecated: true
                   description: Legacy alias for tenant_id; still accepted.
+                subject_phone:
+                  type: string
+                  description: SPEC-W65 (G2) — OPTIONAL E.164 subject phone
+                    (the consent-registry data_subject_id), forwarded by
+                    kyc-service so consent ErasureRequested can match the
+                    ocr_documents.subject_phone column. Persisted ONLY for
+                    kyc_* kinds (dropped + logged otherwise — never a 400),
+                    excluded from all responses, and NULLed by the erasure
+                    tombstone.
           application/json:
             schema:
               type: object
@@ -103,6 +112,10 @@ paths:
                   type: string
                   deprecated: true
                   description: Legacy alias for tenant_id; still accepted.
+                subject_phone:
+                  type: string
+                  description: OPTIONAL E.164 subject phone (SPEC-W65 G2);
+                    kyc_* kinds only — see the multipart schema.
       responses:
         "200":
           description: Extraction succeeded

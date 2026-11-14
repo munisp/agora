@@ -372,3 +372,77 @@ func TestStoreBootstrapIdempotent(t *testing.T) {
 		t.Fatalf("second bootstrap: %v", err)
 	}
 }
+
+// SPEC-W65: ListDocuments — newest-first on idx_kyc_documents_tenant,
+// review_state filter, limit/offset windowing, RLS tenant isolation.
+func TestStoreListDocuments(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	tid := uuid.New()
+
+	// Three rows for tid + one decoy in another tenant.
+	var ids []uuid.UUID
+	for i := 0; i < 3; i++ {
+		d := newTestDocument(tid)
+		d.IDValueHash = strings.Repeat(string(rune('a'+i)), 2) // distinct binding hashes
+		if err := st.InsertDocument(ctx, d); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		ids = append(ids, d.DocumentID)
+	}
+	other := newTestDocument(uuid.New())
+	if err := st.InsertDocument(ctx, other); err != nil {
+		t.Fatalf("insert decoy: %v", err)
+	}
+	// Review the oldest row so the filter has a non-default state.
+	if _, err := st.ReviewDocument(ctx, tid, ids[0], "approved", "reviewer-1"); err != nil {
+		t.Fatalf("review: %v", err)
+	}
+
+	// Newest-first, unfiltered.
+	all, err := st.ListDocuments(ctx, tid, "", 50, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("list len = %d, want 3", len(all))
+	}
+	if all[0].DocumentID != ids[2] || all[2].DocumentID != ids[0] {
+		t.Errorf("order = %v, want newest-first", all)
+	}
+	for i := 1; i < len(all); i++ {
+		if all[i-1].CreatedAt.Before(all[i].CreatedAt) {
+			t.Errorf("not newest-first at %d", i)
+		}
+	}
+
+	// review_state filter.
+	approved, err := st.ListDocuments(ctx, tid, "approved", 50, 0)
+	if err != nil || len(approved) != 1 || approved[0].DocumentID != ids[0] {
+		t.Errorf("approved filter: %v %v", approved, err)
+	}
+	pending, err := st.ListDocuments(ctx, tid, "pending_review", 50, 0)
+	if err != nil || len(pending) != 2 {
+		t.Errorf("pending filter: len=%d err=%v, want 2", len(pending), err)
+	}
+
+	// Windowing: pages stitch to the full queue without repeats.
+	p1, err := st.ListDocuments(ctx, tid, "", 2, 0)
+	if err != nil || len(p1) != 2 || p1[0].DocumentID != ids[2] {
+		t.Errorf("page1: %v %v", p1, err)
+	}
+	p2, err := st.ListDocuments(ctx, tid, "", 2, 2)
+	if err != nil || len(p2) != 1 || p2[0].DocumentID != ids[0] {
+		t.Errorf("page2: %v %v", p2, err)
+	}
+	past, err := st.ListDocuments(ctx, tid, "", 2, 10)
+	if err != nil || len(past) != 0 {
+		t.Errorf("past-end page: %v %v, want empty", past, err)
+	}
+
+	// Cross-tenant reads are invisible (RLS enforced).
+	cross, err := st.ListDocuments(ctx, uuid.New(), "", 50, 0)
+	if err != nil || len(cross) != 0 {
+		t.Errorf("cross-tenant list: %v %v, want empty", cross, err)
+	}
+}

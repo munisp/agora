@@ -61,12 +61,22 @@ ALTER TABLE ocr_documents ADD CONSTRAINT ocr_documents_status_check
 -- (OCR_KYC_TTL_HOURS, default 72h). Additive nullable column.
 ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 
+-- SPEC-W65 (G2): the consent registry's data_subject_id is the E.164
+-- subject phone; kyc-service now forwards it at extract time so consent
+-- ErasureRequested can match on a real column instead of the legacy
+-- extracted_fields JSONB value match (kept as fallback for pre-column
+-- rows). Additive nullable column; set ONLY for kyc_* kinds; NULLed by
+-- mark_erased (the tombstone must not retain the PII locator).
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS subject_phone TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_ocr_documents_tenant_sha256
     ON ocr_documents (tenant_id, sha256);
 CREATE INDEX IF NOT EXISTS idx_ocr_documents_tenant_created
     ON ocr_documents (tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ocr_documents_expires
     ON ocr_documents (expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ocr_documents_kyc_subject
+    ON ocr_documents (tenant_id, subject_phone) WHERE subject_phone IS NOT NULL;
 
 ALTER TABLE ocr_documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ocr_documents FORCE ROW LEVEL SECURITY;
@@ -148,8 +158,10 @@ class Database:
             """
             INSERT INTO ocr_documents
                 (id, tenant_id, kind, storage_bucket, storage_key, mime,
-                 bytes, sha256, phash, page_count, status, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'uploaded', $11)
+                 bytes, sha256, phash, page_count, status, expires_at,
+                 subject_phone)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'uploaded', $11,
+                    $12)
             """,
             doc["id"],
             uuid.UUID(doc["tenant_id"]),
@@ -162,6 +174,9 @@ class Database:
             doc.get("phash"),
             doc.get("page_count", 1),
             doc.get("expires_at"),  # SPEC-W58 P4: set ONLY for kyc_* kinds
+            # SPEC-W65 G2: set ONLY for kyc_* kinds (caller-enforced);
+            # the erasure tombstone NULLs it again.
+            doc.get("subject_phone"),
         )
 
     @staticmethod
@@ -275,13 +290,24 @@ class Database:
     async def list_kyc_rows_matching_subject(
         conn, subject: str
     ) -> list[dict[str, Any]]:
-        """kyc_* rows whose extracted_fields carry the erasure subject as an
-        exact top-level string value (consent ErasureRequested, P3).
+        """kyc_* rows matching the erasure subject (consent
+        ErasureRequested, P3). SPEC-W65 G2 DUAL-MATCH:
 
-        CAVEAT: ocr_documents has no subject column — the authoritative
-        subject_phone <-> ocr_document_id binding lives in kyc-service
-        (P8); this match covers subjects that ARE document field values
-        (e.g. the NIN itself) and is a best-effort belt-and-braces sweep.
+          1. subject_phone column match — the consent registry's
+             data_subject_id IS the E.164 phone (identity consent keys on
+             (tenant, subject, purpose); the kyc gate checks
+             subject_phone), and kyc-service now forwards it at extract
+             time. This is the primary, indexed match
+             (idx_ocr_documents_kyc_subject).
+          2. LEGACY fallback, ONLY for pre-column rows
+             (subject_phone IS NULL): exact top-level extracted_fields
+             string value match (jsonb_each_text). Keeps rows ingested
+             before the column existed erasable; the 72h TTL sweeper
+             bounds that fallback window (no cross-DB backfill is
+             possible — the authoritative binding lives in kyc-service).
+
+        A row WITH a subject_phone is matched on the column alone — the
+        JSONB value match must not shadow it.
         """
         rows = await conn.fetch(
             r"""
@@ -289,10 +315,17 @@ class Database:
               FROM ocr_documents
              WHERE kind LIKE 'kyc\_%' ESCAPE '\'
                AND status <> 'erased'
-               AND extracted_fields IS NOT NULL
-               AND EXISTS (
-                   SELECT 1 FROM jsonb_each_text(extracted_fields) AS f(val)
-                    WHERE f.val = $1
+               AND (
+                   subject_phone = $1
+                   OR (
+                       subject_phone IS NULL
+                       AND extracted_fields IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1
+                             FROM jsonb_each_text(extracted_fields) AS f(val)
+                            WHERE f.val = $1
+                       )
+                   )
                )
             """,
             subject,
@@ -301,11 +334,14 @@ class Database:
 
     @staticmethod
     async def mark_erased(conn, document_id: uuid.UUID) -> None:
-        """P3 erasure tombstone: blank PII, keep sha256/phash for audit."""
+        """P3 erasure tombstone: blank PII, keep sha256/phash for audit.
+        SPEC-W65 G2: subject_phone is NULLed too — the tombstone must not
+        retain the very PII locator it erased."""
         await conn.execute(
             """
             UPDATE ocr_documents
                SET extracted_text = NULL, extracted_fields = NULL,
+                   subject_phone = NULL,
                    status = 'erased', error = NULL, updated_at = now()
              WHERE id = $1
             """,

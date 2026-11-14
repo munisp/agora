@@ -1,0 +1,24 @@
+{
+  "kind": "kyc_passport",
+  "doc": {
+    "title": "International passport data page (adversarial model answer)",
+    "issuer": "Nigeria Immigration Service (synthetic)",
+    "layout": "Model claims mrz_valid:false for a VALID synthetic MRZ and emits non-whitelisted keys; code verdict must win.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": true,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# Passport\n\nSurname: OKONKWO\nGiven names: CHUKWUEMEKA ADAMU\n\nP<NGAOKONKWO<<CHUKWUEMEKA<ADAMU<<<<<<<<<<<<<\nB774120385NGA8506232M2809159<<<<<<<<<<<<<<<4\n\n```json\n{\"full_name\": \"CHUKWUEMEKA ADAMU OKONKWO\", \"dob\": \"1985-06-23\", \"passport_no\": \"B77412038\", \"nationality\": \"NGA\", \"expiry\": \"2028-09-15\", \"mrz\": \"P<NGAOKONKWO<<CHUKWUEMEKA<ADAMU<<<<<<<<<<<<<\\nB774120385NGA8506232M2809159<<<<<<<<<<<<<<<4\", \"mrz_valid\": false, \"bvn\": \"22334455667\", \"portrait_base64\": \"cG9ydHJhaXQtc3ludGhldGlj\"}\n```",
+  "expected_fields": {
+    "full_name": "CHUKWUEMEKA ADAMU OKONKWO",
+    "dob": "1985-06-23",
+    "passport_no": "B77412038",
+    "nationality": "NGA",
+    "expiry": "2028-09-15",
+    "mrz_valid": true
+  },
+  "expected_mrz_valid": true
+}

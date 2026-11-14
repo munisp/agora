@@ -22,6 +22,12 @@
 //	  -> envelope {document_id, reference, status, review_state,
 //	               fields?, fields_available}
 //
+//	GET  /v1/kyc/documents?review_state=&limit=&offset=
+//	                                       (SPEC-W65: newest-first paginated
+//	                                       review queue, hash-only Document
+//	                                       projections incl. subject_phone;
+//	                                       limit 1..200 default 50;
+//	                                       {items, limit, offset} envelope)
 //	GET  /v1/kyc/documents/{id}            (same auth headers; fields may be
 //	                                       absent post-TTL — kyc-service
 //	                                       returns fields_available:false)
@@ -48,6 +54,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -255,6 +262,43 @@ func (c *Client) UploadDocument(ctx context.Context, tenantID uuid.UUID, declare
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("Accept", "application/json")
 	return c.do(req, tenantID, "upload")
+}
+
+// ListDocuments fetches the newest-first paginated document review queue
+// (GET /v1/kyc/documents?review_state=&limit=&offset= — SPEC-W65 Scope 2,
+// the admin list surface G1 routed through this booking proxy). The query
+// is a faithful passthrough: reviewState is the optional filter ("", or a
+// kyc_documents.review_state enum value — the handler validates the enum
+// fail-fast and kyc-service validates it authoritatively), limit/offset
+// are sent only when > 0 so kyc-service's own defaults (limit 50) apply.
+// The {items, limit, offset} envelope is NOT decoded here — it passes
+// through verbatim like every other response (kyc-service owns the
+// shape). Single bounded attempt; errors are ErrNotConfigured /
+// ErrUnavailable only — downstream statuses pass through.
+func (c *Client) ListDocuments(ctx context.Context, tenantID uuid.UUID, reviewState string, limit, offset int) (*Response, error) {
+	if !c.Configured() {
+		return nil, ErrNotConfigured
+	}
+	q := url.Values{}
+	if rs := strings.TrimSpace(reviewState); rs != "" {
+		q.Set("review_state", rs)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	if offset > 0 {
+		q.Set("offset", strconv.Itoa(offset))
+	}
+	u := c.baseURL + "/v1/kyc/documents"
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: request build: %v", ErrUnavailable, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	return c.do(req, tenantID, "list")
 }
 
 // GetDocument fetches the review surface for one KYC document

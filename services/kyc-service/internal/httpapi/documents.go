@@ -9,6 +9,8 @@
 //	                                  subject_phone + doc_type +
 //	                                  consent_id? -> 200 {document_id,
 //	                                  reference, status, review_state}
+//	GET  /v1/kyc/documents            ?tenant_id=&review_state=&limit=&offset=
+//	                                  (SPEC-W65) -> 200 {items, limit, offset}
 //	GET  /v1/kyc/documents/{id}       ?tenant_id=<uuid> (or X-Tenant-ID)
 //	                                  -> row + fields proxied from ocr
 //	POST /v1/kyc/documents/{id}/review {tenant_id, decision, reason?}
@@ -32,6 +34,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,6 +97,21 @@ const (
 	ReviewRejected = "rejected"
 )
 
+// ReviewStatePending is the default review_state (P7: human review is the
+// terminal state — OCR never auto-verifies).
+const ReviewPending = "pending_review"
+
+// reviewStates is the kyc_documents.review_state CHECK domain — the list
+// filter (SPEC-W65) accepts "" (all states) or exactly one of these.
+var reviewStates = map[string]bool{ReviewPending: true, ReviewApproved: true, ReviewRejected: true}
+
+// List window (SPEC-W65 PINNED CONTRACT — the booking proxy and admin-web
+// queue code against these verbatim): limit 1..200, default 50.
+const (
+	listDefaultLimit = 50
+	listMaxLimit     = 200
+)
+
 // ErrOCRUnavailable marks any ocr-service failure (transport, timeout,
 // non-2xx, contract-violating 2xx body) — mapped to 502 by the handler
 // (booking fieldcapture ErrOCRUnavailable precedent).
@@ -137,8 +155,11 @@ type OCRBackend interface {
 	// token both set — fail-closed mirror of the internauth posture).
 	Configured() bool
 	// Extract forwards document bytes to POST /v1/ocr/extract with
-	// kind = doc_type verbatim (cross-scope contract). Bounded, no retries.
-	Extract(ctx context.Context, tenantID uuid.UUID, kind, mime string, data []byte) (*OCRExtractResult, error)
+	// kind = doc_type verbatim (cross-scope contract). subject is the
+	// validated E.164 subject_phone, forwarded as the subject_phone form
+	// field (SPEC-W65 G2: ocr persists it on kyc_* rows so consent
+	// erasure matches the subject column directly). Bounded, no retries.
+	Extract(ctx context.Context, tenantID uuid.UUID, subject, kind, mime string, data []byte) (*OCRExtractResult, error)
 	// GetDocument proxies GET /v1/ocr/documents/{id}. (nil, nil) when the
 	// ocr row is gone (404 — TTL sweep or TenantDeleted cascade).
 	GetDocument(ctx context.Context, tenantID, documentID uuid.UUID) (*OCRDocumentInfo, error)
@@ -179,7 +200,7 @@ func (c *OCRClient) Configured() bool { return c.Enabled() && c.token != "" }
 
 // Extract implements OCRBackend. Uploaded bytes are PII: they are never
 // logged (only sizes/statuses). Exactly ONE attempt by contract.
-func (c *OCRClient) Extract(ctx context.Context, tenantID uuid.UUID, kind, mime string, data []byte) (*OCRExtractResult, error) {
+func (c *OCRClient) Extract(ctx context.Context, tenantID uuid.UUID, subject, kind, mime string, data []byte) (*OCRExtractResult, error) {
 	if !c.Configured() {
 		return nil, errOCRNotConfigured
 	}
@@ -192,6 +213,14 @@ func (c *OCRClient) Extract(ctx context.Context, tenantID uuid.UUID, kind, mime 
 		return nil, fmt.Errorf("build ocr request: %w", err)
 	}
 	if err := mw.WriteField("tenant_id", tenantID.String()); err != nil {
+		return nil, fmt.Errorf("build ocr request: %w", err)
+	}
+	// SPEC-W65 G2: the validated E.164 subject_phone rides the form so
+	// ocr can persist it on the kyc row — consent erasure then matches
+	// the subject_phone column directly (dual-match with the legacy
+	// JSONB fallback for pre-column rows). Additive: old ocr ignores
+	// unknown form fields, so this is deploy-order safe both directions.
+	if err := mw.WriteField("subject_phone", subject); err != nil {
 		return nil, fmt.Errorf("build ocr request: %w", err)
 	}
 	fh := textproto.MIMEHeader{}
@@ -530,8 +559,10 @@ func (s *server) createDocument(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Forward to ocr-service (bounded, no retry, kind = doc_type verbatim).
-	res, err := s.d.OCR.Extract(r.Context(), tenantID, docType, mime, data)
+	// Forward to ocr-service (bounded, no retry, kind = doc_type verbatim;
+	// subject_phone rides the form so ocr persists the subject column —
+	// SPEC-W65 G2 erasure column-match).
+	res, err := s.d.OCR.Extract(r.Context(), tenantID, subject, docType, mime, data)
 	if err != nil {
 		s.d.Logger.Warn("ocr extract failed for kyc document",
 			zap.String("tenant_id", tenantID.String()), zap.String("doc_type", docType), zap.Error(err))
@@ -625,6 +656,82 @@ func (s *server) createDocument(w http.ResponseWriter, r *http.Request) {
 		ReviewState:     doc.ReviewState,
 		FieldsAvailable: len(res.Fields) > 0,
 	})
+}
+
+// documentListResponse is the SPEC-W65 PINNED list contract (the booking
+// kycclient and the admin-web queue code against it verbatim): hash-only
+// Document projections (incl. subject_phone — the owner/admin surface
+// already exposes it in the detail GET), newest first. items is always a
+// JSON array (never null).
+type documentListResponse struct {
+	Items  []store.Document `json:"items"`
+	Limit  int              `json:"limit"`
+	Offset int              `json:"offset"`
+}
+
+// listDocuments (GET /v1/kyc/documents?tenant_id=&review_state=&limit=
+// &offset=) — SPEC-W65: the admin review queue read. Newest-first
+// (created_at DESC, document_id DESC on idx_kyc_documents_tenant);
+// review_state "" lists all states; limit 1..200 default 50; offset >= 0.
+// tenant_id must be the canonical uuid on this hop (no identity lookup in
+// kyc-service; the booking proxy knows the uuid). Read-only and cheap
+// (30s route timeout); every call emits a view-audit log line (R8: actor
+// + tenant + page window — never raw PII).
+func (s *server) listDocuments(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	tenantRef := strings.TrimSpace(q.Get("tenant_id"))
+	if tenantRef == "" {
+		tenantRef = strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
+	}
+	tenantID, err := uuid.Parse(tenantRef)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "tenant_id (uuid) is required as query param or X-Tenant-ID header")
+		return
+	}
+	reviewState := strings.ToLower(strings.TrimSpace(q.Get("review_state")))
+	if reviewState != "" && !reviewStates[reviewState] {
+		writeError(w, http.StatusBadRequest, "review_state must be one of pending_review|approved|rejected")
+		return
+	}
+	limit := listDefaultLimit
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > listMaxLimit {
+			writeError(w, http.StatusBadRequest, "limit must be an integer in 1..200")
+			return
+		}
+		limit = n
+	}
+	offset := 0
+	if v := strings.TrimSpace(q.Get("offset")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		offset = n
+	}
+
+	docs, err := s.d.Store.ListDocuments(r.Context(), tenantID, reviewState, limit, offset)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+
+	// View audit (R8) — structlog line minimum; actor + tenant + window,
+	// never raw field values.
+	s.d.Logger.Info("kyc documents listed",
+		zap.String("actor", strings.TrimSpace(r.Header.Get("X-Actor"))),
+		zap.String("tenant_id", tenantID.String()),
+		zap.String("review_state", reviewState),
+		zap.Int("limit", limit),
+		zap.Int("offset", offset),
+		zap.Int("returned", len(docs)))
+
+	if docs == nil {
+		docs = []store.Document{}
+	}
+	writeJSON(w, http.StatusOK, documentListResponse{Items: docs, Limit: limit, Offset: offset})
 }
 
 // getDocument (GET /v1/kyc/documents/{id}?tenant_id=<uuid>) — SPEC-W58

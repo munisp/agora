@@ -69,6 +69,9 @@ func (f *fakeAuditStore) GetDocument(context.Context, uuid.UUID, uuid.UUID) (*st
 func (f *fakeAuditStore) ReviewDocument(context.Context, uuid.UUID, uuid.UUID, string, string) (*store.Document, error) {
 	return nil, errors.New("fakeAuditStore: ReviewDocument not supported")
 }
+func (f *fakeAuditStore) ListDocuments(context.Context, uuid.UUID, string, int, int) ([]store.Document, error) {
+	return nil, errors.New("fakeAuditStore: ListDocuments not supported")
+}
 
 type fakeConsent struct {
 	tenantID uuid.UUID

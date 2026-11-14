@@ -6,6 +6,7 @@ package httpapi
 // Routes (wired in server.go inside the /v1 tenant group):
 //
 //	POST /v1/kyc/documents                 multipart upload passthrough
+//	GET  /v1/kyc/documents                 paginated review queue (SPEC-W65)
 //	GET  /v1/kyc/documents/{id}            review read (fields via kyc)
 //	POST /v1/kyc/documents/{id}/review     {decision, reason}
 //
@@ -33,6 +34,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -133,6 +135,66 @@ func (s *server) kycUploadDocument(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.kycClientError(w, r, err)
 		return
+	}
+	writePassthrough(w, res)
+}
+
+// kycListDocuments serves GET /v1/kyc/documents — the owner/admin review
+// queue (SPEC-W65 Scope 2 / G1): newest-first paginated list of hash-only
+// document projections proxied from kyc-service ({items, limit, offset} —
+// the envelope is passed through verbatim; kyc-service owns the shape).
+// Param validation mirrors the mediaInboxList idiom: review_state enum
+// ("" = no filter; the set mirrors the kyc_documents CHECK constraint),
+// limit 1..200 default 50, offset >= 0. Every served list emits the P5/R8
+// view-audit log line (actor + tenant + filter — never subject data).
+func (s *server) kycListDocuments(w http.ResponseWriter, r *http.Request) {
+	client := s.kycClientOr503(w, r)
+	if client == nil {
+		return
+	}
+	q := r.URL.Query()
+	reviewState := strings.ToLower(strings.TrimSpace(q.Get("review_state")))
+	switch reviewState {
+	case "", "pending_review", "approved", "rejected":
+	default:
+		writeError(w, http.StatusBadRequest, "review_state must be one of pending_review|approved|rejected")
+		return
+	}
+	limit := 50
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 200 {
+			writeError(w, http.StatusBadRequest, "limit must be an integer in 1..200")
+			return
+		}
+		limit = n
+	}
+	offset := 0
+	if v := strings.TrimSpace(q.Get("offset")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		offset = n
+	}
+
+	res, err := client.ListDocuments(r.Context(), tenantFrom(r.Context()).ID, reviewState, limit, offset)
+	if err != nil {
+		s.kycClientError(w, r, err)
+		return
+	}
+	if res.Status >= 200 && res.Status < 300 {
+		// P5/R8 view audit: actor + tenant + filter on every served queue
+		// view (NDPA accountability for PII reads — the list projections
+		// carry subject_phone, so the read is audited like the detail GET).
+		s.d.Logger.Info("kyc document list view",
+			zap.String("audit", "kyc_document_list"),
+			zap.String("actor", userFrom(r.Context())),
+			zap.String("tenant_id", tenantFrom(r.Context()).ID.String()),
+			zap.String("review_state", reviewState),
+			zap.Int("limit", limit),
+			zap.Int("offset", offset))
 	}
 	writePassthrough(w, res)
 }

@@ -46,12 +46,22 @@ ALTER TABLE ocr_documents ADD CONSTRAINT ocr_documents_status_check
 -- (OCR_KYC_TTL_HOURS, default 72h). Additive nullable column.
 ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 
+-- SPEC-W65 (G2): the consent registry's data_subject_id is the E.164
+-- subject phone; kyc-service now forwards it at extract time so consent
+-- ErasureRequested can match on a real column instead of the legacy
+-- extracted_fields JSONB value match (kept as fallback for pre-column
+-- rows). Additive nullable column; set ONLY for kyc_* kinds; NULLed by
+-- mark_erased (the tombstone must not retain the PII locator).
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS subject_phone TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_ocr_documents_tenant_sha256
     ON ocr_documents (tenant_id, sha256);
 CREATE INDEX IF NOT EXISTS idx_ocr_documents_tenant_created
     ON ocr_documents (tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ocr_documents_expires
     ON ocr_documents (expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ocr_documents_kyc_subject
+    ON ocr_documents (tenant_id, subject_phone) WHERE subject_phone IS NOT NULL;
 
 -- ---------------- Row Level Security (SPEC §7) ----------------
 ALTER TABLE ocr_documents ENABLE ROW LEVEL SECURITY;

@@ -69,6 +69,9 @@ func NewRouter(d Deps) http.Handler {
 		// booking-service receipt 150s+30s carve-out precedent
 		// (booking httpapi/server.go). GET/review are cheap and keep 30s.
 		r.With(middleware.Timeout(OCRTimeout+30*time.Second)).Post("/documents", s.createDocument)
+		// SPEC-W65: the admin review queue list — a cheap indexed read, so
+		// it keeps the 30s default like GET/review.
+		r.With(middleware.Timeout(30*time.Second)).Get("/documents", s.listDocuments)
 		r.With(middleware.Timeout(30*time.Second)).Get("/documents/{id}", s.getDocument)
 		r.With(middleware.Timeout(30*time.Second)).Post("/documents/{id}/review", s.reviewDocument)
 		r.With(middleware.Timeout(30*time.Second)).Post("/resolve", s.resolve)

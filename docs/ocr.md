@@ -367,6 +367,42 @@ claims, and no caller may represent:
   the D9 hash signals are byte-level tamper signals, not forensics.
 - **Face matching or liveness** — no comparator or selfie pipeline exists.
 
-Accuracy on Nigerian document layouts is UNVERIFIED (no golden corpus);
-the human review step is the mitigation, and the review verdict remains
-kyc-service provider resolution plus reviewer sign-off.
+Accuracy on Nigerian document layouts remains UNVERIFIED against the live
+model (environment-blocked: no model in CI); the human review step is the
+mitigation, and the review verdict remains kyc-service provider resolution
+plus reviewer sign-off.
+
+### Golden corpus (SPEC-W65, offline-deterministic ONLY)
+
+`services/ocr-service/tests/corpus/kyc/<kind>/<case>.json` holds synthetic
+golden cases (`{kind, doc, model_answer, expected_fields,
+expected_mrz_valid}`) for all five `kyc_*` kinds — ≥2 cases each: one happy
+case plus one adversarial case whose `model_answer` over-emits
+non-whitelisted keys the parse layer MUST drop, and for `kyc_passport` an
+additional MRZ-failure case (`expected_mrz_valid: false`, composite check
+digit flipped). All identity values are fabricated (same style as the
+existing ADAEZE/JANE fixtures); there is no real PII in the corpus.
+
+`tests/test_kyc_golden.py` replays the corpus four ways:
+
+1. **Parse replay** — `parse_model_answer(case.model_answer, kind)` must
+   reproduce `expected_fields` exactly (whitelist, null fallback, and the
+   code-computed ICAO 9303 `mrz_valid`, which overrides any model-claimed
+   verdict in both directions).
+2. **Stubbed-sidecar e2e** — each case's answer is served by the conftest
+   `make_chat_completion_stub` through the full `POST /v1/ocr/extract`
+   pipeline (OCR_MOCK off): response `extracted_fields` match, GATE R1 event
+   redaction (`extracted_fields: {}` with no corpus canary on the bus),
+   transcript suppression (`extracted_text` empty/NULL), and `expires_at`
+   set per the kyc TTL.
+3. **Prompt pins** — `sha256(prompt_for_kind(kind))` per kyc kind, so prompt
+   edits land as deliberate diffs.
+4. **Schema validation** — every case's expected keys are a subset of
+   `KYC_FIELD_WHITELISTS` (plus the code-computed `mrz_valid`), kinds are
+   fully covered, and each kind carries an adversarial case.
+
+**Honesty note (G3):** the corpus pins parse/whitelist/MRZ/prompt-hash/
+redaction/TTL regression ONLY. It is offline-deterministic by design — it
+does NOT measure, and must not be cited as, live-model extraction accuracy
+on real Nigerian document layouts, which remains UNVERIFIED and
+environment-blocked.

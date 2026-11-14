@@ -1,0 +1,24 @@
+{
+  "kind": "kyc_passport",
+  "doc": {
+    "title": "International passport data page",
+    "issuer": "Nigeria Immigration Service (synthetic)",
+    "layout": "TD3 data page: visual fields + two-line 44-char MRZ band at bottom.",
+    "media": {
+      "mime": "image/png",
+      "generator": "make_png"
+    },
+    "adversarial": false,
+    "synthetic": "Synthetic corpus fixture: every identity value is fabricated for the offline test corpus (existing ADAEZE/JANE fixture style). No real PII."
+  },
+  "model_answer": "# Passport\n\nFEDERAL REPUBLIC OF NIGERIA\n\nSurname: DOE\nGiven names: JANE CHIDINMA\nDOB: 1990-04-12\nPassport No: A01234569\nNationality: NGA\nExpiry: 2030-12-31\n\nP<NGADOE<<JANE<CHIDINMA<<<<<<<<<<<<<<<<<<<<<\nA012345690NGA9004126F3012316<<<<<<<<<<<<<<00\n\n```json\n{\"full_name\": \"JANE CHIDINMA DOE\", \"dob\": \"1990-04-12\", \"passport_no\": \"A01234569\", \"nationality\": \"NGA\", \"expiry\": \"2030-12-31\", \"mrz\": \"P<NGADOE<<JANE<CHIDINMA<<<<<<<<<<<<<<<<<<<<<\\nA012345690NGA9004126F3012316<<<<<<<<<<<<<<00\"}\n```",
+  "expected_fields": {
+    "full_name": "JANE CHIDINMA DOE",
+    "dob": "1990-04-12",
+    "passport_no": "A01234569",
+    "nationality": "NGA",
+    "expiry": "2030-12-31",
+    "mrz_valid": true
+  },
+  "expected_mrz_valid": true
+}
