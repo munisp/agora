@@ -25,6 +25,10 @@
  *    tombstoned to a salted `sha256:…` form and is rendered as-is.
  *  - List pagination mirrors bookings-client (SPEC-W46 AW-4): bounded list,
  *    "load more" refetches with a larger limit up to 500.
+ *  - SPEC-W66 WS2: rows may carry `booking_ref_hint` (the caption-quoted
+ *    BK-XXXXXXXX token) — shown in the Ref hint column, null-tolerant; the
+ *    `anchor_method` badge distinguishes `phone_recency`,
+ *    `phone_recency+ref_hint`, `ref_hint_mismatch` (parked) and `staff`.
  */
 import * as React from "react";
 import { Inbox, Link2, RefreshCw, Trash2 } from "lucide-react";
@@ -72,6 +76,13 @@ export interface MediaInboxItem {
   bytes: number;
   state: string;
   anchor_method?: string | null;
+  /**
+   * SPEC-W66 WS2: the caption-quoted BK-XXXXXXXX hint token (the token
+   * only — the caption itself never leaves the gateway). Absent/null when
+   * the caption carried no/ambiguous/malformed token, and NULLed by
+   * subject erasure.
+   */
+  booking_ref_hint?: string | null;
   booking_id?: string | null;
   contact_id?: string | null;
   linked_by?: string | null;
@@ -299,6 +310,7 @@ export function MediaInboxClient({ orgSlug }: { orgSlug: string }) {
                 <TableHead>Received</TableHead>
                 <TableHead>Channel</TableHead>
                 <TableHead>Sender</TableHead>
+                <TableHead>Ref hint</TableHead>
                 <TableHead>Type</TableHead>
                 <TableHead>Size</TableHead>
                 <TableHead>State</TableHead>
@@ -307,7 +319,7 @@ export function MediaInboxClient({ orgSlug }: { orgSlug: string }) {
             </TableHeader>
             <TableBody>
               {items.length === 0 && !loading ? (
-                <TableEmpty colSpan={7}>
+                <TableEmpty colSpan={8}>
                   {error
                     ? "Could not load the media inbox."
                     : `No ${filter} media inbox items.`}
@@ -324,6 +336,15 @@ export function MediaInboxClient({ orgSlug }: { orgSlug: string }) {
                       <TableCell className="text-sm">{m.channel}</TableCell>
                       <TableCell className="font-mono text-xs">
                         {m.sender_phone}
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {m.booking_ref_hint ? (
+                          <span title="Booking reference quoted in the sender's caption">
+                            {m.booking_ref_hint}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
                       </TableCell>
                       <TableCell className="text-sm text-muted-foreground">
                         {m.mime}

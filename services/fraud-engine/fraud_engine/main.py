@@ -2,7 +2,7 @@
 
 Endpoints:
   GET  /healthz
-  POST /v1/detect/run  {tenant_id?, detector?}   (manual run)
+  POST /v1/detect/run  {tenant_id?, detector?, lookback_days?}   (manual run)
   GET  /v1/detect/status
 
 Cadence (SPEC-W30 §3): event-driven triggers on Kafka where natural (D3 on
@@ -16,6 +16,7 @@ never touch FalkorDB/Kafka.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hmac
 import json
 import logging
@@ -25,7 +26,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import Settings, load_settings
 from .detectors import ALL_DETECTORS, DetectionRunner
@@ -61,6 +62,12 @@ def detectors_for_event(event_type: str) -> list[str]:
 class RunRequest(BaseModel):
     tenant_id: str | None = None
     detector: str | None = None
+    # SPEC-W66 WS1-A: optional per-run D9 lookback override (auditable, no
+    # restart — lead ruling (b)). Applied to a PER-RUN settings copy ONLY;
+    # d9_lookback_days has exactly one reader (d9_document.py), so every
+    # other detector is byte-identical and the global Settings is never
+    # mutated. Absent => D9_LOOKBACK_DAYS default behavior, unchanged.
+    lookback_days: int | None = Field(default=None, gt=0)
 
 
 def create_app(
@@ -89,11 +96,22 @@ def create_app(
             state["publisher"] = publisher_from_settings(settings)
         return state["publisher"]
 
-    def get_runner() -> DetectionRunner:
-        return DetectionRunner(get_client(), get_publisher(), settings)
+    def get_runner(run_settings: Settings | None = None) -> DetectionRunner:
+        return DetectionRunner(get_client(), get_publisher(), run_settings or settings)
 
-    def run_and_record(tenant_id: str | None = None, detector: str | None = None):
-        report = get_runner().run(tenant_id=tenant_id, detector=detector)
+    def run_and_record(
+        tenant_id: str | None = None,
+        detector: str | None = None,
+        lookback_days: int | None = None,
+    ):
+        # SPEC-W66 WS1-A: the lookback override rides a per-run COPY of the
+        # settings (dataclasses.replace) — the app-level Settings object is
+        # never mutated, and only d9_document_abuse reads d9_lookback_days,
+        # so the override is D9-scoped by construction.
+        run_settings = settings
+        if lookback_days is not None:
+            run_settings = dataclasses.replace(settings, d9_lookback_days=lookback_days)
+        report = get_runner(run_settings).run(tenant_id=tenant_id, detector=detector)
         state["last_run"] = report.as_dict()
         return report
 
@@ -192,7 +210,11 @@ def create_app(
     @app.post("/v1/detect/run", dependencies=[Depends(require_internal_token)])
     def detect_run(req: RunRequest) -> dict[str, Any]:
         try:
-            report = run_and_record(tenant_id=req.tenant_id, detector=req.detector)
+            report = run_and_record(
+                tenant_id=req.tenant_id,
+                detector=req.detector,
+                lookback_days=req.lookback_days,
+            )
         except KeyError as exc:
             raise HTTPException(
                 status_code=400,

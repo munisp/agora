@@ -137,6 +137,64 @@ func (s *Service) SweepOnce(ctx context.Context) (Summary, error) {
 	return sum, nil
 }
 
+// SweepOnceSince (SPEC-W66 WS1-B) is SweepOnce with an operator-overridden
+// window and an optional tenant scope — the manual trigger's backfill
+// surface. A zero since falls back to the configured trailing LookbackDays
+// window; a non-nil tenantID restricts the sweep to that one tenant. The
+// pinned-4 gate applies unchanged in every case: tenant enumeration is still
+// "tenants with ≥1 receipt-bearing capture in the window", so a tenant_id
+// naming a tenant with no captures in the window sweeps nothing
+// (tenants_scanned=0 — payment_without_receipt stays data-gated, never
+// operator-forced).
+//
+// Timeout behavior (pinned): when ctx expires (the manual trigger's
+// triggerTimeout on a deep window) the loop stops BETWEEN tenants and
+// returns the PARTIAL Summary — counts cover fully-swept tenants plus any
+// findings the interrupted tenant committed before expiry (findings persist
+// in per-finding transactions) — together with the context error; the
+// trigger maps that to 202 + partial:true instead of a silent 504. A crash
+// or timeout mid-tenant is resumable by simply re-calling: the dedupe index
+// (uq_receipt_recon_findings_dedupe + ON CONFLICT DO NOTHING) is the
+// checkpoint, and a resolved finding can never be reopened (the dedupe key
+// ignores resolved_at and ResolveFinding guards on resolved_at IS NULL).
+func (s *Service) SweepOnceSince(ctx context.Context, since time.Time, tenantID *uuid.UUID) (Summary, error) {
+	sum := Summary{RunID: uuid.New()}
+	if since.IsZero() {
+		since = time.Now().UTC().Add(-s.lookback())
+	}
+	tenants, err := s.Store.TenantsWithReceiptCaptures(ctx, since)
+	if err != nil {
+		return sum, err
+	}
+	for _, id := range tenants {
+		if tenantID != nil && id != *tenantID {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			// Expired between tenants: stop here with partial progress.
+			return sum, err
+		}
+		n, dup, err := s.sweepTenant(ctx, sum.RunID, id, since)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// Expired mid-tenant: the findings it committed are counted
+				// (they persist), the tenant is NOT counted as swept.
+				sum.FindingsNew += n
+				sum.FindingsDuped += dup
+				return sum, ctxErr
+			}
+			sum.TenantsFailed++
+			s.log().Error("receipt recon tenant sweep failed",
+				zap.String("tenant_id", id.String()), zap.Error(err))
+			continue
+		}
+		sum.TenantsScanned++
+		sum.FindingsNew += n
+		sum.FindingsDuped += dup
+	}
+	return sum, nil
+}
+
 // sweepTenant runs all three finding passes for one tenant. Each finding is
 // persisted (+ outbox) in its own transaction so one poison row never rolls
 // back the tenant's other findings.

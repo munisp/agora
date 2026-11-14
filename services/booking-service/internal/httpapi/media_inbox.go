@@ -71,6 +71,10 @@ type mediaInboxIngestRequest struct {
 	Mime              string `json:"mime"`
 	Bytes             int64  `json:"bytes"`
 	SHA256Prefix      string `json:"sha256_prefix"`
+	// BookingRefHint (SPEC-W66 WS2) is the optional caption-extracted
+	// BK-XXXXXXXX token. Best-effort: a malformed hint is treated as
+	// ABSENT, never a 400. The caption itself never crosses the wire (P8).
+	BookingRefHint string `json:"booking_ref_hint,omitempty"`
 }
 
 // mediaInboxItemJSON is the staff-facing/media response projection of a
@@ -91,6 +95,7 @@ type mediaInboxItemJSON struct {
 	BookingID         *uuid.UUID `json:"booking_id,omitempty"`
 	ContactID         *uuid.UUID `json:"contact_id,omitempty"`
 	LinkedBy          string     `json:"linked_by,omitempty"`
+	BookingRefHint    string     `json:"booking_ref_hint,omitempty"` // SPEC-W66 WS2: token only
 	CreatedAt         string     `json:"created_at"`
 	UpdatedAt         string     `json:"updated_at"`
 }
@@ -111,6 +116,7 @@ func mediaInboxItemToJSON(it store.MediaInboxItem) mediaInboxItemJSON {
 		BookingID:         it.BookingID,
 		ContactID:         it.ContactID,
 		LinkedBy:          it.LinkedBy,
+		BookingRefHint:    it.BookingRefHint,
 		CreatedAt:         it.CreatedAt.UTC().Format("2006-01-02T15:04:05.999999Z"),
 		UpdatedAt:         it.UpdatedAt.UTC().Format("2006-01-02T15:04:05.999999Z"),
 	}
@@ -193,6 +199,14 @@ func (s *server) mediaInboxIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SPEC-W66 WS2: booking_ref_hint is best-effort — bounded here and
+	// normalized/validated store-side (BK- + 8 Crockford chars); a
+	// malformed hint is treated as ABSENT, never a 400 (binding ruling).
+	req.BookingRefHint = strings.TrimSpace(req.BookingRefHint)
+	if len(req.BookingRefHint) > 64 {
+		req.BookingRefHint = ""
+	}
+
 	item, err := st.IngestMediaInbox(r.Context(), store.MediaInboxIngest{
 		TenantID:          tenantID,
 		Channel:           req.Channel,
@@ -203,6 +217,7 @@ func (s *server) mediaInboxIngest(w http.ResponseWriter, r *http.Request) {
 		Mime:              req.Mime,
 		Bytes:             req.Bytes,
 		SHA256Prefix:      req.SHA256Prefix,
+		BookingRefHint:    req.BookingRefHint,
 	}, mediaInboxEventsTopic())
 	if err != nil {
 		s.d.Logger.Error("media inbox ingest failed", zap.Error(err),

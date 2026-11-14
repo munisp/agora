@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,6 +63,11 @@ type MediaInboxItem struct {
 	BookingID         *uuid.UUID `json:"booking_id,omitempty"`
 	ContactID         *uuid.UUID `json:"contact_id,omitempty"`
 	LinkedBy          string     `json:"linked_by,omitempty"`
+	// BookingRefHint (SPEC-W66 WS2) is the normalized BK-XXXXXXXX token the
+	// sender quoted in the media caption — the TOKEN ONLY, never the
+	// caption (P8). NULL when the caption carried no/ambiguous/malformed
+	// token; NULLed again by subject erasure (G7).
+	BookingRefHint    string     `json:"booking_ref_hint,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
 }
@@ -69,7 +75,9 @@ type MediaInboxItem struct {
 // MediaInboxIngest is the input of IngestMediaInbox. SenderPhoneDigits is
 // the gateway-computed digits form; the store re-derives the canonical
 // digits SQL-side from SenderPhone (trust-but-verify) and stores ITS OWN
-// derivation.
+// derivation. BookingRefHint (SPEC-W66 WS2) is the optional caption-extracted
+// BK-ref token; it is normalized + validated store-side (trust-but-verify
+// again) and a malformed hint is treated as ABSENT, never an error.
 type MediaInboxIngest struct {
 	TenantID          uuid.UUID
 	Channel           string
@@ -80,11 +88,13 @@ type MediaInboxIngest struct {
 	Mime              string
 	Bytes             int64
 	SHA256Prefix      string
+	BookingRefHint    string
 }
 
 // mediaInboxCols is the media_inbox projection (own column const — the
 // shared bookingCols in bookings.go is HANDS OFF, W57 incident).
-const mediaInboxCols = `id, tenant_id, channel, provider_message_id, document_id, sender_phone, sender_phone_digits, mime, bytes, sha256_prefix, state, anchor_method, booking_id, contact_id, linked_by, created_at, updated_at`
+// booking_ref_hint is the SPEC-W66 WS2 additive column.
+const mediaInboxCols = `id, tenant_id, channel, provider_message_id, document_id, sender_phone, sender_phone_digits, mime, bytes, sha256_prefix, state, anchor_method, booking_id, contact_id, linked_by, booking_ref_hint, created_at, updated_at`
 
 // mediaInboxDigitsSQL renders the pinned G3 digits-only canonical form of
 // a SQL text expression: strip non-digits, then strip ONE leading "00".
@@ -92,17 +102,42 @@ func mediaInboxDigitsSQL(expr string) string {
 	return `regexp_replace(regexp_replace(` + expr + `,'\D','','g'),'^00','')`
 }
 
+// bookingRefHintAlphabet is the SPEC-W51 public_ref alphabet (Crockford
+// base32, uppercase, no I/L/O/U) — mirrored from public_ref.go's
+// publicRefAlphabet for the WS2 hint validation (the hint IS a public_ref).
+const mediaInboxHintAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// normalizeBookingRefHint renders the canonical hint form: trim, uppercase,
+// then validate "BK-" + 8 Crockford-alphabet chars. A malformed hint
+// returns "" (treated as ABSENT — best-effort, never an error/400).
+func normalizeBookingRefHint(raw string) string {
+	h := strings.ToUpper(strings.TrimSpace(raw))
+	if len(h) != 11 || !strings.HasPrefix(h, "BK-") {
+		return ""
+	}
+	for i := 3; i < 11; i++ {
+		c := h[i]
+		if c >= 0x80 || !strings.ContainsRune(mediaInboxHintAlphabet, rune(c)) {
+			return ""
+		}
+	}
+	return h
+}
+
 func scanMediaInbox(row pgx.Row) (MediaInboxItem, error) {
 	var it MediaInboxItem
-	var anchorMethod, linkedBy *string
+	var anchorMethod, linkedBy, bookingRefHint *string
 	err := row.Scan(&it.ID, &it.TenantID, &it.Channel, &it.ProviderMessageID, &it.DocumentID,
 		&it.SenderPhone, &it.SenderPhoneDigits, &it.Mime, &it.Bytes, &it.SHA256Prefix,
-		&it.State, &anchorMethod, &it.BookingID, &it.ContactID, &linkedBy, &it.CreatedAt, &it.UpdatedAt)
+		&it.State, &anchorMethod, &it.BookingID, &it.ContactID, &linkedBy, &bookingRefHint, &it.CreatedAt, &it.UpdatedAt)
 	if anchorMethod != nil {
 		it.AnchorMethod = *anchorMethod
 	}
 	if linkedBy != nil {
 		it.LinkedBy = *linkedBy
+	}
+	if bookingRefHint != nil {
+		it.BookingRefHint = *bookingRefHint
 	}
 	return it, err
 }
@@ -134,10 +169,14 @@ CREATE TABLE IF NOT EXISTS media_inbox (
     booking_id          UUID,
     contact_id          UUID,
     linked_by           TEXT,
+    booking_ref_hint    TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, channel, provider_message_id)
 );
+-- SPEC-W66 WS2: additive nullable caption-hint column (converges tables
+-- created by the pre-W66 CREATE TABLE above — both-sides idempotent).
+ALTER TABLE media_inbox ADD COLUMN IF NOT EXISTS booking_ref_hint TEXT;
 CREATE INDEX IF NOT EXISTS idx_media_inbox_tenant_state_created ON media_inbox (tenant_id, state, created_at DESC);
 ALTER TABLE media_inbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE media_inbox FORCE ROW LEVEL SECURITY;
@@ -173,6 +212,20 @@ END $$;`
 //     [now-7d, now+30d]. EXACTLY ONE candidate => state='anchored',
 //     anchor_method='phone_recency', booking_id + contact_id set. Zero or
 //     >1 => parked. Anchoring NEVER fires on ambiguity.
+//  2b. SPEC-W66 WS2 caption hint: the optional booking_ref_hint token NEVER
+//     anchors without phone corroboration and NEVER creates anything (G6).
+//     It only CORROBORATES or NARROWS within the phone-candidate set:
+//       - 1 candidate AND (hint absent OR hint == that booking's public_ref)
+//         => anchored, anchor_method='phone_recency' (unchanged).
+//       - >1 candidates AND hint matches exactly one => anchored,
+//         anchor_method='phone_recency+ref_hint' (the hint narrowed within
+//         the phone-corroborated set).
+//       - >=1 candidates AND hint matches NONE => PARKED,
+//         anchor_method='ref_hint_mismatch' (lead ruling (c); the booking
+//         row is NOT touched).
+//       - 0 candidates => parked, hint recorded, anchor_method stays NULL.
+//     The normalized hint is recorded on the row in every case (NULL when
+//     absent/malformed).
 //  3. Parked cap: after a parked insert, if the tenant's parked rows exceed
 //     mediaInboxParkedCap, the oldest excess parked rows are auto-discarded
 //     (state='discarded', anchor_method='auto_cap').
@@ -196,11 +249,20 @@ func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest, event
 		// matching contacts naturally yield zero candidates => parked.
 		// The digits needle is re-derived SQL-side from the RAW sender
 		// phone (trust-but-verify), never from in.SenderPhoneDigits.
+		// SPEC-W66 WS2: the hint is normalized+validated Go-side
+		// (trust-but-verify again — a malformed hint is ABSENT); the
+		// candidate query selects b.public_ref so the hint can corroborate
+		// or narrow WITHIN the phone-matched set only.
+		hint := normalizeBookingRefHint(in.BookingRefHint)
+		var hintArg *string
+		if hint != "" {
+			hintArg = &hint
+		}
 		state := "parked"
 		var anchorMethod *string
 		var bookingID, contactID *uuid.UUID
 		rows, err := tx.Query(ctx,
-			`SELECT b.id, b.contact_id
+			`SELECT b.id, b.contact_id, b.public_ref
 			   FROM bookings b
 			   JOIN contacts c ON c.tenant_id = b.tenant_id AND c.id = b.contact_id
 			  WHERE b.tenant_id = $1
@@ -215,10 +277,14 @@ func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest, event
 		var candBooking uuid.UUID
 		var candContact *uuid.UUID
 		candidates := 0
+		var hintBooking uuid.UUID
+		var hintContact *uuid.UUID
+		hintMatches := 0
 		for rows.Next() {
 			var bID uuid.UUID
 			var cID *uuid.UUID
-			if err := rows.Scan(&bID, &cID); err != nil {
+			var ref string
+			if err := rows.Scan(&bID, &cID, &ref); err != nil {
 				rows.Close()
 				return fmt.Errorf("media inbox resolve scan: %w", err)
 			}
@@ -226,31 +292,54 @@ func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest, event
 			if candidates == 1 {
 				candBooking, candContact = bID, cID
 			}
+			if hint != "" && ref == hint {
+				hintMatches++
+				if hintMatches == 1 {
+					hintBooking, hintContact = bID, cID
+				}
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("media inbox resolve: %w", err)
 		}
-		if candidates == 1 {
-			// EXACTLY ONE candidate anchors; zero or >1 stays parked with NO
-			// anchor columns set (ambiguity never anchors).
+		switch {
+		case candidates == 1 && (hint == "" || hintMatches == 1):
+			// EXACTLY ONE candidate, corroborated (or unhinted): anchors as
+			// before — anchor_method 'phone_recency' unchanged (WS2).
 			state = "anchored"
 			method := "phone_recency"
 			anchorMethod = &method
 			b := candBooking
 			bookingID = &b
 			contactID = candContact
+		case candidates > 1 && hintMatches == 1:
+			// The hint NARROWED the ambiguous phone set to exactly one
+			// phone-corroborated booking.
+			state = "anchored"
+			method := "phone_recency+ref_hint"
+			anchorMethod = &method
+			b := hintBooking
+			bookingID = &b
+			contactID = hintContact
+		case candidates >= 1 && hint != "" && hintMatches == 0:
+			// The hint CONTRADICTS every phone candidate: park + flag
+			// (lead ruling (c)); the booking row is NOT touched.
+			method := "ref_hint_mismatch"
+			anchorMethod = &method
 		}
+		// default: parked with NO anchor columns (zero candidates, or
+		// ambiguous with no hint — ambiguity never anchors).
 
 		item, err = scanMediaInbox(tx.QueryRow(ctx,
 			`INSERT INTO media_inbox
 			    (tenant_id, channel, provider_message_id, document_id, sender_phone, sender_phone_digits,
-			     mime, bytes, sha256_prefix, state, anchor_method, booking_id, contact_id)
-			 VALUES ($1,$2,$3,$4,$5,`+mediaInboxDigitsSQL("$5")+`,$6,$7,$8,$9,$10,$11,$12)
+			     mime, bytes, sha256_prefix, state, anchor_method, booking_id, contact_id, booking_ref_hint)
+			 VALUES ($1,$2,$3,$4,$5,`+mediaInboxDigitsSQL("$5")+`,$6,$7,$8,$9,$10,$11,$12,$13)
 			 ON CONFLICT (tenant_id, channel, provider_message_id) DO NOTHING
 			 RETURNING `+mediaInboxCols,
 			in.TenantID, in.Channel, in.ProviderMessageID, in.DocumentID, in.SenderPhone,
-			in.Mime, in.Bytes, in.SHA256Prefix, state, anchorMethod, bookingID, contactID))
+			in.Mime, in.Bytes, in.SHA256Prefix, state, anchorMethod, bookingID, contactID, hintArg))
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Replay (N-05 redelivery): the unique key already exists —
 			// return the EXISTING row unchanged (same state).

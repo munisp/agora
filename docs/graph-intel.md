@@ -91,6 +91,45 @@ Every alert carries a replayable `evidence` JSON (cycle path, cluster members, c
 4. `dismissed` → write the reason (it is the audit trail); quarantine lifts if no other open highs.
 5. Weekly: review detector precision (dismissed/total per type); tune thresholds via env rather than code.
 
+### 3.5 D9 backfill runbook (SPEC-W66)
+
+**Gap closed:** fraud-engine's Kafka trigger uses `auto.offset.reset=latest`
+and ocr-service historically had no list endpoint, so documents extracted
+**before** D9 (or graph-sync's OCR consumer) deployed never produced
+`(:Document)` stubs and were invisible to D9. The W66 reconciler re-emits
+their `DocumentExtracted` events from the durable `ocr_documents` rows.
+
+Sequence:
+
+1. **Backfill events** — drive `POST /v1/internal/ocr/backfill-document-events`
+   on ocr-service to keyset completion (`next_cursor: null`), optionally
+   bounded by `{tenant_id, since, until}`. Use `{"dry_run": true}` first to
+   size the window. Contract details: `docs/ocr.md` §"D9 backfill
+   reconciler".
+2. **graph-sync projection** — the normal consumer projects hash-only
+   `(:Document)` stubs; stub `created_at` = CloudEvent `time` = the
+   document's historical `created_at`. MERGE + processed-marker dedup on
+   the deterministic event id make replays harmless.
+3. **Deep D9 run** — `POST /v1/detect/run
+   {"detector": "d9_document_abuse", "lookback_days": N}` with `N` deep
+   enough to cover the backfilled history. `lookback_days` (optional,
+   int > 0) is threaded to a **per-run settings copy** and honored by D9
+   ONLY — every other detector's window is byte-identical, the app-level
+   `D9_LOOKBACK_DAYS` default (30) is never mutated, and omitting the field
+   is byte-identical to legacy behavior. The override is auditable (it
+   rides the request body) and needs no restart.
+4. **Gold rewrite** — no manual lakehouse step: backfilled receipt events
+   flow to `bronze.receipt_documents`, and the next scheduled
+   `receipt_recon_gold.py` pass rewrites exactly the affected historical
+   day partitions (dynamic partition overwrite). Gold dedup relies on the
+   **deterministic event_id** (`uuid5(URL-ns, "ocr-backfill:{document_id}")`,
+   `partitionBy("event_id")`) — re-running the backfill never double-counts
+   `gold.receipt_ingest_daily`.
+
+Idempotency summary: re-running any step emits zero new graph stubs, zero
+new alerts (MERGE dedup; resolved/dismissed alerts are never reopened), and
+zero gold count drift.
+
 ## 4. Security & compliance notes
 
 - `INTERNAL_TOKEN` guards `/v1/graph/internal/*`. JWTs are never accepted there; the token is constant-time-compared. Rotate per environment; the dev default is obviously not for production.

@@ -13,7 +13,9 @@
 //	                                booking fail-closes 503 when unset,
 //	                                401 constant-time on mismatch)
 //	{"tenant_id","channel","message_id","document_id","sender_phone",
-//	 "sender_phone_digits","mime","bytes","sha256_prefix"}
+//	 "sender_phone_digits","mime","bytes","sha256_prefix",
+//	 "booking_ref_hint"?}                       (SPEC-W66 WS2: additive,
+//	                                             omitted when absent)
 //
 //	200 {"id","state",...} — parked|anchored; idempotent on
 //	(tenant_id, channel, message_id) so an N-05 redelivery is safe.
@@ -59,6 +61,15 @@ var ErrAnchorNotConfigured = errors.New("media anchor client not configured (boo
 // as trust-but-verify. SHA256Prefix is the FIRST 16 hex chars of the
 // content sha256 (PII-light; the W60 log form uses 12 — the anchor row is a
 // durable record so it pins 16). The caption NEVER rides this payload.
+//
+// SPEC-W66 WS2: BookingRefHint carries ONLY the 11-char normalized BK-ref
+// token extracted from the caption (captionHint — parse-then-discard), or
+// is omitted entirely when the caption has no/ambiguous/malformed token
+// (omitempty keeps the no-hint payload byte-identical to W61). There is no
+// caption field and there never will be (P8). The hint rides the W61 ingest
+// ledger, so an anchor-failure redelivery re-sends the SAME hint
+// byte-identically. No new feature flag: the hint only flows when
+// WHATSAPP_MEDIA_ANCHOR_ENABLED is on (lead ruling).
 type AnchorPayload struct {
 	TenantID          string `json:"tenant_id"`
 	Channel           string `json:"channel"` // "whatsapp"
@@ -69,6 +80,7 @@ type AnchorPayload struct {
 	Mime              string `json:"mime"`
 	Bytes             int    `json:"bytes"`
 	SHA256Prefix      string `json:"sha256_prefix"`
+	BookingRefHint    string `json:"booking_ref_hint,omitempty"` // SPEC-W66 WS2: token only, never the caption
 }
 
 // AnchorClient is the bounded, single-attempt internauth client for the

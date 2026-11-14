@@ -10,6 +10,11 @@ Routes:
   GET  /v1/ocr/documents/{id}    metadata + extracted fields (NO bytes).
   POST /v1/ocr/documents/{id}/erase  internauth per-document hard erase
                                  (SPEC-W61 G2; booking PrivacyConsumer).
+  POST /v1/internal/ocr/backfill-document-events
+                                 internauth D9 backfill reconciler —
+                                 deterministic-id, historical-time
+                                 DocumentExtracted re-emission with keyset
+                                 pagination (SPEC-W66 WS1-A).
   GET  /healthz
   GET  /metrics
   GET  /dapr/subscribe           Dapr programmatic subscriptions (W58 P3):
@@ -768,6 +773,211 @@ async def erase_document_endpoint(
         tenant_id=str(row["tenant_id"]),
     )
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W66 WS1-A: D9 backfill reconciler. Re-emits
+# com.opendesk.ocr.DocumentExtracted for historical status='extracted'
+# rows so graph-sync can project the hash-only (:Document) stubs that
+# pre-D9 documents never got (Kafka offset.reset=latest gap, W55 closeout).
+#
+# Internauth ONLY (K2 fail-closed, erase-endpoint idiom): X-Internal-Token
+# vs OCR_INTERNAL_TOKEN, constant-time; unset => 503, missing/wrong => 401.
+# Never takes the gateway tenant-binding path.
+#
+# Idempotency (stateless): event id = uuid5(URL-ns,
+# "ocr-backfill:{document_id}") and event time = document created_at, so a
+# re-run re-emits byte-identical events; graph MERGE + processed-marker
+# dedup + gold partitionBy(event_id) absorb replays. Keyset pagination on
+# (created_at, id) IS the resumability story — pass next_cursor back until
+# it returns null. dry_run=true scans and counts but publishes NOTHING.
+#
+# RLS (G3): tenant enumeration rides the EXISTING sweep_conn() GUC escape;
+# every row read is under tenant_conn(). No new GUC, no superuser reads.
+# ---------------------------------------------------------------------------
+BACKFILL_DEFAULT_LIMIT = 500
+BACKFILL_MAX_LIMIT = 5000
+
+
+def _parse_rfc3339(value: Any, field: str) -> datetime | None:
+    """Optional RFC3339 bound; must be timezone-aware (a naive timestamp is
+    an operator bug, never silently assumed UTC)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(status_code=400, detail=f"{field} must be an RFC3339 timestamp")
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be an RFC3339 timestamp"
+        ) from None
+    if dt.tzinfo is None:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must include a timezone offset"
+        )
+    return dt
+
+
+def _parse_backfill_limit(value: Any) -> int:
+    """limit: default 500, hard max 5000 (clamped, never an error)."""
+    if value is None:
+        return BACKFILL_DEFAULT_LIMIT
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(status_code=400, detail="limit must be an integer in 1..5000")
+    if value < 1:
+        raise HTTPException(status_code=400, detail="limit must be an integer in 1..5000")
+    return min(value, BACKFILL_MAX_LIMIT)
+
+
+def _encode_backfill_cursor(created_at: datetime, document_id: Any) -> str:
+    return f"{created_at.isoformat()}|{document_id}"
+
+
+def _parse_backfill_cursor(raw: Any) -> tuple[datetime, uuid.UUID] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or "|" not in raw:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+    ts_raw, _, id_raw = raw.rpartition("|")
+    try:
+        created = datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
+        doc_id = uuid.UUID(id_raw.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid cursor") from None
+    if created.tzinfo is None:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+    return created, doc_id
+
+
+@app.post("/v1/internal/ocr/backfill-document-events")
+async def backfill_document_events(request: Request, deps: AppState = Depends(get_state)):
+    if not settings.internal_token:
+        log.error("backfill.unconfigured", msg="OCR_INTERNAL_TOKEN unset (fail closed)")
+        raise HTTPException(
+            status_code=503,
+            detail="internal auth not configured (OCR_INTERNAL_TOKEN unset)",
+        )
+    token = request.headers.get("x-internal-token")
+    if token is None or not hmac.compare_digest(token, settings.internal_token):
+        raise HTTPException(status_code=401, detail="invalid internal token")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    tenant_filter = body.get("tenant_id")
+    if tenant_filter is not None:
+        if not isinstance(tenant_filter, str):
+            raise HTTPException(status_code=400, detail="tenant_id must be a uuid string")
+        try:
+            tenant_filter = str(uuid.UUID(tenant_filter))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="tenant_id must be a uuid string"
+            ) from None
+    since = _parse_rfc3339(body.get("since"), "since")
+    until = _parse_rfc3339(body.get("until"), "until")
+    if since is not None and until is not None and since > until:
+        raise HTTPException(status_code=400, detail="since must be <= until")
+    cursor = _parse_backfill_cursor(body.get("cursor"))
+    limit = _parse_backfill_limit(body.get("limit"))
+    dry_run = bool(body.get("dry_run", False))
+
+    # Tenant enumeration: the pinned tenant, or DISTINCT tenants holding
+    # extracted rows in the window via the EXISTING sweep GUC escape.
+    if tenant_filter is not None:
+        tenants = [tenant_filter]
+    else:
+        async with deps.db.sweep_conn() as conn:
+            tenants = await deps.db.list_backfill_tenant_ids(conn, since, until)
+
+    # Merge one globally (created_at, id)-ordered page across tenants. Each
+    # per-tenant read is RLS-scoped (tenant_conn) and already cursor-bound;
+    # fetching up to `limit` per tenant and merge-truncating keeps the
+    # keyset exact when rows interleave across tenants.
+    merged: list[dict[str, Any]] = []
+    exhausted = True
+    for tid in tenants:
+        async with deps.db.tenant_conn(tid) as conn:
+            rows = await deps.db.list_documents_for_backfill(
+                conn, since, until, cursor, limit
+            )
+        if len(rows) >= limit:
+            exhausted = False
+        merged.extend(rows)
+    merged.sort(key=lambda r: (r["created_at"], str(r["id"])))
+    page = merged[:limit]
+    truncated = len(merged) > limit
+
+    scanned = len(page)
+    emitted = 0
+    skipped = 0
+    for row in page:
+        # Defensive skip (keeps emitted + skipped == scanned): sha256 is
+        # NOT NULL and created_at is NOT NULL in the schema, so this should
+        # never trip — but a reconciler must never emit a hash-less stub.
+        if not row.get("sha256") or row.get("created_at") is None:
+            skipped += 1
+            log.warning("backfill.row_skipped", document_id=str(row.get("id")))
+            continue
+        if dry_run:
+            skipped += 1  # counted, never published
+            continue
+        event = events.document_backfill_event(
+            tenant_id=str(row["tenant_id"]),
+            document_id=row["id"],
+            kind=row["kind"],
+            status=row["status"],
+            page_count=row["page_count"],
+            sha256=row["sha256"],
+            phash=row["phash"],
+            model_version=row["model_version"],
+            created_at=row["created_at"],
+            extracted_fields=row.get("extracted_fields"),
+        )
+        try:
+            await deps.dapr.publish(
+                settings.dapr_pubsub_name, settings.ocr_events_topic, event
+            )
+        except Exception as exc:
+            # Re-runs are idempotent (deterministic ids), so failing the
+            # page is safe: retry with the SAME cursor.
+            log.error(
+                "backfill.publish_failed",
+                document_id=str(row["id"]),
+                error=str(exc),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="event publish failed; retry with the same cursor (idempotent)",
+            ) from exc
+        emitted += 1
+
+    next_cursor = None
+    if page and (truncated or not exhausted):
+        last = page[-1]
+        next_cursor = _encode_backfill_cursor(last["created_at"], last["id"])
+    log.info(
+        "backfill.page",
+        tenants=len(tenants),
+        scanned=scanned,
+        emitted=emitted,
+        skipped=skipped,
+        dry_run=dry_run,
+        done=next_cursor is None,
+    )
+    return {
+        "emitted": emitted,
+        "scanned": scanned,
+        "skipped": skipped,
+        "next_cursor": next_cursor,
+    }
 
 
 # ---------------------------------------------------------------------------

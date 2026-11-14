@@ -239,6 +239,57 @@ class FakeDB:
             if r["tenant_id"] == scope.tenant_id
         ]
 
+    # SPEC-W66 WS1-A: D9 backfill reconciler fakes — replicate the SQL
+    # semantics in lockstep (status='extracted' filter, [since, until]
+    # bounds, (created_at, id) keyset, LIMIT).
+    async def list_backfill_tenant_ids(self, scope, since=None, until=None):
+        assert scope.tenant_id is None, "tenant enumeration must use sweep_conn"
+        out = set()
+        for r in self.rows.values():
+            if r["status"] != "extracted":
+                continue
+            if since is not None and r["created_at"] < since:
+                continue
+            if until is not None and r["created_at"] > until:
+                continue
+            out.add(str(r["tenant_id"]))
+        return sorted(out)
+
+    async def list_documents_for_backfill(
+        self, scope, since=None, until=None, cursor=None, limit=500
+    ):
+        rows = []
+        for r in self.rows.values():
+            if str(r["tenant_id"]) != str(scope.tenant_id):
+                continue
+            if r["status"] != "extracted":
+                continue
+            if since is not None and r["created_at"] < since:
+                continue
+            if until is not None and r["created_at"] > until:
+                continue
+            if cursor is not None:
+                cur_created, cur_id = cursor
+                if (r["created_at"], str(r["id"])) <= (cur_created, str(cur_id)):
+                    continue
+            rows.append(r)
+        rows.sort(key=lambda r: (r["created_at"], str(r["id"])))
+        return [
+            {
+                "id": r["id"],
+                "tenant_id": r["tenant_id"],
+                "kind": r["kind"],
+                "status": r["status"],
+                "page_count": r["page_count"],
+                "sha256": r["sha256"],
+                "phash": r.get("phash"),
+                "model_version": r["model_version"],
+                "created_at": r["created_at"],
+                "extracted_fields": r.get("extracted_fields"),
+            }
+            for r in rows[:limit]
+        ]
+
     async def delete_tenant_documents(self, scope) -> int:
         doomed = [
             k for k, r in self.rows.items() if r["tenant_id"] == scope.tenant_id

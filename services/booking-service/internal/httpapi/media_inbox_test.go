@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS media_inbox (
     booking_id           UUID,
     contact_id           UUID,
     linked_by            TEXT,
+    booking_ref_hint     TEXT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, channel, provider_message_id)

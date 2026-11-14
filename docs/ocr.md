@@ -277,6 +277,96 @@ timeouts: sidecar call 120 s.
 Metadata + extracted fields for one document (RLS-scoped). **Never returns
 document bytes.**
 
+## D9 backfill reconciler (SPEC-W66)
+
+**Gap closed:** Kafka consumers use `offset.reset=latest` and ocr-service
+previously had no list endpoint, so documents extracted **before** fraud
+detector D9 (`d9_document_abuse`) or graph-sync's OCR consumer deployed
+were invisible to the fraud graph. This endpoint re-emits their
+`com.opendesk.ocr.DocumentExtracted` events from the durable
+`ocr_documents` rows.
+
+### `POST /v1/internal/ocr/backfill-document-events`
+
+Internal-only (never routed through APISIX). Auth: `X-Internal-Token` vs
+`OCR_INTERNAL_TOKEN`, constant-time, **fail-closed** — `503` when the env
+token is unset, `401` on missing/wrong (same idiom as the erase endpoint).
+
+Request body (all fields optional; empty body = full backfill, first page):
+
+```json
+{
+  "tenant_id": "<uuid> — restrict to one tenant; absent = all tenants",
+  "since": "<RFC3339, tz-aware> — created_at lower bound (inclusive)",
+  "until": "<RFC3339, tz-aware> — created_at upper bound (inclusive)",
+  "cursor": "<opaque — pass the previous response's next_cursor>",
+  "limit": 500,
+  "dry_run": false
+}
+```
+
+`limit` defaults to 500 and is clamped at 5000. Response:
+
+```json
+{"emitted": 17, "scanned": 17, "skipped": 0, "next_cursor": "…|…"}
+```
+
+`next_cursor` is `null` when the window is exhausted; otherwise pass it
+back as `cursor` for the next page. Keyset pagination on
+`(created_at, id)` **is** the resumability story — the endpoint is
+stateless, pages are globally ordered even across tenants, and a crash or
+timeout is recovered by re-issuing the last cursor. Invariant:
+`emitted + skipped == scanned`. `dry_run=true` scans and counts but
+publishes **nothing** (every row is counted under `skipped`) — use it to
+size a window before emitting.
+
+### Emission contract (idempotency — hard requirements)
+
+- **Deterministic event ids:** `uuid5(URL namespace,
+  "ocr-backfill:{document_id}")`. A re-run over the same window re-emits
+  the SAME ids, so the graph MERGE, graph-sync's processed-marker dedup,
+  and gold's `partitionBy("event_id")` absorb replays — re-running is safe
+  and emits zero NEW events downstream. (Non-deterministic ids would
+  double-count `gold.receipt_ingest_daily`.)
+- **Historical event time:** CloudEvent `time` = the document's
+  `created_at`, never `now` — graph stub `created_at` = event time, and
+  bronze/gold day partitions land on the document's historical day.
+- **Scope filter:** `status='extracted'` rows only — `erased` tombstones,
+  `failed`, and never-extracted `uploaded` rows are excluded (mirrors
+  graph-sync's own status filter).
+- **PII minimization (stricter than the live path):** the payload is the
+  hash-only pinned set `{document_id, tenant_id, kind, status, page_count,
+  sha256, phash, model_version, extracted_fields}` — no storage pointers,
+  no mime, no text. `extracted_fields` is EXACTLY `{amount_minor,
+  currency, receipt_date}` for `kind='receipt'` (the bronze mapper
+  whitelist) and `{}` for every other kind.
+- **RLS:** cross-tenant enumeration of candidate tenant ids rides the
+  EXISTING `app.ocr_internal_sweep` GUC escape (`sweep_conn()`); every
+  document row read is under `tenant_conn()`. No new GUC, no superuser
+  data reads.
+
+### Operator sequence
+
+```bash
+# 0. Optional sizing pass — nothing is published.
+curl -X POST :7020/v1/internal/ocr/backfill-document-events \
+  -H "X-Internal-Token: $OCR_INTERNAL_TOKEN" -d '{"dry_run": true}'
+
+# 1. Page to completion (next_cursor null).
+curl -X POST :7020/v1/internal/ocr/backfill-document-events \
+  -H "X-Internal-Token: $OCR_INTERNAL_TOKEN" -d '{"limit": 5000}'
+curl -X POST :7020/v1/internal/ocr/backfill-document-events \
+  -H "X-Internal-Token: $OCR_INTERNAL_TOKEN" -d '{"cursor": "<next_cursor>"}'
+
+# 2. graph-sync projects the (:Document) stubs (normal consumer flow).
+# 3. Run D9 with a lookback deep enough to cover the backfilled history.
+curl -X POST :7017/v1/detect/run -H "X-Internal-Token: $FRAUD_INTERNAL_TOKEN" \
+  -d '{"detector": "d9_document_abuse", "lookback_days": 365}'
+```
+
+See `docs/graph-intel.md` §3.5 for the fraud-side runbook (including the
+`lookback_days` override semantics and the gold-partition rewrite).
+
 ## Receipt OCR via fieldcapture
 
 booking-service fieldcapture owns the staff upload surface:

@@ -361,3 +361,72 @@ class Database:
         """Hard-delete ALL rows for the tenant (TenantDeleted, P3)."""
         result = await conn.execute("DELETE FROM ocr_documents")
         return int(result.split()[-1]) if result else 0
+
+    # --- SPEC-W66 WS1-A: D9 backfill reconciler helpers ---------------------
+    @staticmethod
+    async def list_backfill_tenant_ids(
+        conn, since: Any = None, until: Any = None
+    ) -> list[str]:
+        """DISTINCT tenant_ids holding status='extracted' rows in the
+        [since, until] window. Call on sweep_conn() ONLY — cross-tenant
+        enumeration rides the EXISTING app.ocr_internal_sweep GUC escape
+        (retention-sweeper precedent); NO new GUC, and the per-tenant row
+        reads themselves happen under tenant_conn() below.
+        """
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT tenant_id
+              FROM ocr_documents
+             WHERE status = 'extracted'
+               AND ($1::timestamptz IS NULL OR created_at >= $1)
+               AND ($2::timestamptz IS NULL OR created_at <= $2)
+             ORDER BY tenant_id
+            """,
+            since,
+            until,
+        )
+        return [str(r["tenant_id"]) for r in rows]
+
+    @staticmethod
+    async def list_documents_for_backfill(
+        conn,
+        since: Any = None,
+        until: Any = None,
+        cursor: tuple[Any, Any] | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """One keyset page of status='extracted' rows for the D9 backfill
+        reconciler (SPEC-W66 WS1-A). Call on tenant_conn() — every row read
+        stays RLS-scoped to one tenant.
+
+        Keyset (created_at, id) ASC; `cursor` is the (created_at, id) tuple
+        of the last row of the previous page (None = first page) — stateless
+        resumability. 'erased'/'failed'/'uploaded' rows are EXCLUDED
+        (graph-sync's own status filter, syncer.go:648-653, is mirrored).
+        extracted_fields is selected ONLY so the caller can apply the
+        receipt {amount_minor, currency, receipt_date} whitelist before
+        emission — raw fields never leave the service.
+        """
+        cursor_created, cursor_id = cursor if cursor else (None, None)
+        rows = await conn.fetch(
+            """
+            SELECT id, tenant_id, kind, status, page_count, sha256, phash,
+                   model_version, created_at, extracted_fields
+              FROM ocr_documents
+             WHERE status = 'extracted'
+               AND ($1::timestamptz IS NULL OR created_at >= $1)
+               AND ($2::timestamptz IS NULL OR created_at <= $2)
+               AND (
+                   $3::timestamptz IS NULL
+                   OR (created_at, id) > ($3::timestamptz, $4::uuid)
+               )
+             ORDER BY created_at, id
+             LIMIT $5
+            """,
+            since,
+            until,
+            cursor_created,
+            cursor_id,
+            limit,
+        )
+        return [dict(r) for r in rows]

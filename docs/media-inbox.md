@@ -25,7 +25,7 @@ Meta webhook ──► messaging-gateway /webhooks/whatsapp
               booking-service POST /v1/media/inbox/ingest   (internauth only,
                  {channel, provider_message_id, document_id,  X-Internal-Token;
                   sender_phone, sender_phone_digits, mime,     edge-DENIED in
-                  bytes, sha256_prefix}                        APISIX)
+                  bytes, sha256_prefix, booking_ref_hint?}     APISIX)
                  │
                  ▼  resolve-or-park (single tx)
         digits-matched contact AND exactly ONE recent candidate booking
@@ -78,6 +78,51 @@ index (`idx_contacts_phone_digits`) supports the lookup.
 | `linked` | staff linked the row to a booking (`anchor_method='staff'`) |
 | `discarded` | staff discarded it, or the parked cap auto-discarded it (`anchor_method='auto_cap'`) |
 
+| `anchor_method` | Meaning |
+|---|---|
+| `phone_recency` | exactly one phone-matched candidate (hint absent or corroborating) |
+| `phone_recency+ref_hint` | SPEC-W66: the caption hint narrowed 2+ phone candidates to exactly one |
+| `ref_hint_mismatch` | SPEC-W66: the caption hint matched NONE of the phone candidates — parked, booking NOT touched |
+| `staff` | staff link override |
+| `auto_cap` | parked-cap auto-discard |
+
+## Caption BK-ref hint (SPEC-W66 WS2)
+
+A sender may quote the booking's public ref in the media caption ("receipt
+for BK-7C3X9Q2M"). The messaging-gateway parses the caption **in memory**
+for AT MOST ONE `BK-XXXXXXXX` token (case-insensitive regex
+`BK-[0-9A-HJKMNPQRSTVWXYZ]{8}` — the Crockford alphabet, no I/L/O/U):
+
+- one token (or the same token repeated) ⇒ uppercase-normalized and sent as
+  the optional `booking_ref_hint` field on the anchor payload;
+- ≥2 DISTINCT tokens ⇒ NO hint (ambiguity never narrows);
+- malformed ⇒ treated as absent, never an error/400;
+- **the caption string itself is never logged, stored, or forwarded (P8)** —
+  only the 11-char token crosses the wire.
+
+The hint rides the W61 ingest ledger, so an anchor-failure redelivery
+re-sends the SAME hint byte-identically. Booking-side resolve rules
+(hint NEVER anchors without phone corroboration; NEVER creates
+contacts/leads/bookings):
+
+- 1 phone candidate AND (no hint OR hint == that booking's `public_ref`)
+  ⇒ anchored, `anchor_method='phone_recency'`, hint recorded.
+- >1 candidates AND hint matches exactly one ⇒ anchored,
+  `anchor_method='phone_recency+ref_hint'`.
+- ≥1 candidates AND hint matches none ⇒ parked,
+  `anchor_method='ref_hint_mismatch'`; the booking row is NOT touched.
+- 0 candidates ⇒ parked, hint recorded, nothing anchored or created.
+- Replay (same `provider_message_id`) returns the existing row unchanged;
+  the replayed hint is ignored.
+
+`booking_ref_hint` is an additive nullable column on `media_inbox`
+(`ensureMediaInboxDDL`, both-sides idempotent). There is **no new feature
+flag** — the hint rides the anchor payload, which only flows when
+`WHATSAPP_MEDIA_ANCHOR_ENABLED` is on. The admin-web media-inbox page shows
+the hint (Ref hint column) and the anchor method, both null-tolerant.
+Subject erasure NULLs `booking_ref_hint` (the booking_id stays for audit);
+tenant purge hard-deletes the row as before.
+
 Rows carry: `channel`, `provider_message_id`, `document_id` (ocr-service),
 `sender_phone` (+ `sender_phone_digits`), `mime`, `bytes`,
 `sha256_prefix` (first 16 hex chars of the content sha256 — PII-light),
@@ -125,6 +170,7 @@ closes the gap for WhatsApp-ingested media:
   `subjectPiiSteps` — keyed on the subject's phone digits, the row's
   `sender_phone` is tombstoned to the salted `sha256:…` form and
   `sender_phone_digits` cleared; anchor columns are preserved for audit.
+  SPEC-W66 additionally NULLs `booking_ref_hint`.
 - **Subject erasure (bytes):** after a successful subject anonymize the
   booking privacy consumer looks up `document_id`s via
   `MediaDocumentIDsForSubject` and POSTs each to ocr-service

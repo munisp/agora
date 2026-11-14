@@ -42,15 +42,31 @@ def cloud_event(
     subject: str,
     tenant_id: str,
     data: dict[str, Any],
+    event_time: datetime | str | None = None,
+    event_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any]:
-    """CloudEvents 1.0 envelope per SPEC §4."""
+    """CloudEvents 1.0 envelope per SPEC §4.
+
+    SPEC-W66 WS1-A (additive): optional `event_time` / `event_id` exist ONLY
+    for the backfill reconciler — `event_time` stamps the HISTORICAL
+    document created_at (graph stub created_at = event time; time=now would
+    corrupt gold day partitions) and `event_id` pins the deterministic
+    uuid5 id (gold dedupes by event_id only). Both default to the legacy
+    behavior, so every pre-W66 caller is byte-identical.
+    """
+    if event_time is None:
+        ts = datetime.now(UTC).isoformat()
+    elif isinstance(event_time, datetime):
+        ts = event_time.isoformat()
+    else:
+        ts = str(event_time)
     return {
         "specversion": "1.0",
-        "id": str(uuid.uuid4()),
+        "id": str(event_id) if event_id is not None else str(uuid.uuid4()),
         "source": SOURCE,
         "type": event_type,
         "subject": subject,
-        "time": datetime.now(UTC).isoformat(),
+        "time": ts,
         "tenantid": tenant_id,
         "data": data,
     }
@@ -133,6 +149,84 @@ def document_extracted_event(
             "storage_key": storage_key,
             "mime": mime,
             "extracted_fields": {} if is_kyc_kind(kind) else extracted_fields,
+        },
+    )
+
+
+# SPEC-W66 WS1-A: the ONLY three receipt scalars a backfilled event may
+# carry (bronze map_ocr_document whitelist, mapping.py:475-477). Stricter
+# than the live path: EVERY non-receipt kind emits {} (kyc redaction
+# included), and receipt rows emit exactly this subset — nothing else.
+BACKFILL_RECEIPT_FIELD_WHITELIST = ("amount_minor", "currency", "receipt_date")
+
+
+def backfill_event_id(document_id: uuid.UUID | str) -> uuid.UUID:
+    """Deterministic backfill event id (SPEC-W66 WS1-A, HARD REQUIREMENT).
+
+    uuid5(URL namespace, "ocr-backfill:{document_id}"). Idempotency anchor:
+    gold.receipt_ingest_daily dedupes partitionBy("event_id") only
+    (receipt_recon_gold.py:437-457) and the bronze sink dedupes event_id
+    only within a batch — a re-run MUST re-emit the SAME id or gold
+    double-counts documents/pages/receipts.
+    """
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"ocr-backfill:{document_id}")
+
+
+def document_backfill_event(
+    *,
+    tenant_id: str,
+    document_id: uuid.UUID | str,
+    kind: str,
+    status: str,
+    page_count: int,
+    sha256: str,
+    phash: str | None,
+    model_version: str,
+    created_at: datetime | str,
+    extracted_fields: dict[str, Any] | str | None = None,
+) -> dict[str, Any]:
+    """com.opendesk.ocr.DocumentExtracted re-emission for the D9 backfill
+    reconciler (SPEC-W66 WS1-A; published on opendesk.ocr.events so
+    graph-sync projects the (:Document) stub and bronze maps receipts
+    exactly like the live path).
+
+    Hash-only pinned set (PII minimization, G2): document_id, tenant_id,
+    kind, status, page_count, sha256, phash, model_version + the whitelisted
+    receipt scalars. NO storage_bucket/storage_key/mime/extracted_text.
+    `time` is the HISTORICAL document created_at and `id` is the
+    deterministic backfill_event_id — see cloud_event() for why.
+    """
+    fields: dict[str, Any] = {}
+    if isinstance(extracted_fields, str):
+        # asyncpg returns jsonb as text when no codec is registered.
+        import json as _json
+
+        try:
+            extracted_fields = _json.loads(extracted_fields)
+        except ValueError:
+            extracted_fields = None
+    if kind == "receipt" and isinstance(extracted_fields, dict):
+        fields = {
+            k: extracted_fields[k]
+            for k in BACKFILL_RECEIPT_FIELD_WHITELIST
+            if k in extracted_fields
+        }
+    return cloud_event(
+        TYPE_DOCUMENT_EXTRACTED,
+        subject=str(document_id),
+        tenant_id=tenant_id,
+        event_id=backfill_event_id(document_id),
+        event_time=created_at,
+        data={
+            "document_id": str(document_id),
+            "tenant_id": tenant_id,
+            "kind": kind,
+            "status": status,
+            "page_count": page_count,
+            "sha256": sha256,
+            "phash": phash,
+            "model_version": model_version,
+            "extracted_fields": fields,
         },
     )
 

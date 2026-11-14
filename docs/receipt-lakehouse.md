@@ -121,6 +121,24 @@ true).
 The operational row keeps a free-form `detail` JSONB; only the columns above
 cross into the lake.
 
+**Backfill semantics (SPEC-W66 WS1-B).** `POST /v1/internal/recon/receipts`
+accepts an optional `{since?, lookback_days?, tenant_id?}` body to sweep
+windows older than the configured trailing lookback (empty body = configured
+window, unchanged). Backfilled findings stamp the finding CloudEvent
+`time` = **now** — findings are operational facts created at backfill time,
+not historical receipt facts — so they land in `gold.receipt_recon_daily` on
+the **backfill day**, not the receipt's historical day. No historical day
+partition is rewritten by a recon backfill (the receipts themselves still
+count in `gold.receipt_ingest_daily` under their original ingest event time).
+Re-sweep idempotency is unchanged: the `uq_receipt_recon_findings_dedupe`
+COALESCE expression index + `ON CONFLICT DO NOTHING` dedupe every re-run and
+emit no duplicate events, and because the dedupe key ignores `resolved_at`
+(and `ResolveFinding` guards on `resolved_at IS NULL`), a **resolved finding
+can never be reopened or duplicated by any re-sweep or backfill**. A sweep
+exceeding the 90s trigger timeout answers `202` with partial progress counts
+(`partial: true`) instead of a silent 504; re-calling the endpoint is the
+resume mechanism (per-finding transactions + dedupe are the checkpoint).
+
 ## 3. Gold job — `receipt_recon_gold.py`
 
 `infra/lakehouse/spark/jobs/receipt_recon_gold.py`, run by the

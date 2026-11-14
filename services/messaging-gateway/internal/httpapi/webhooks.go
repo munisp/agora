@@ -612,7 +612,13 @@ func (s *Server) ingestWhatsAppMedia(ctx context.Context, phoneNumberID string, 
 	// (500, N-05) redelivers into the anchorPending branch above and retries
 	// ONLY the anchor. The payload carries the VERIFIED fetch facts
 	// (mime/bytes/sha256) and the pinned digits-normalized sender (G3) —
-	// never the caption (P8).
+	// never the caption (P8). SPEC-W66 WS2: the caption is parsed
+	// in-memory for AT MOST ONE BK-ref hint token (parse-then-discard);
+	// only the normalized 11-char token rides the payload (or nothing at
+	// all when absent/ambiguous/malformed). The ledger stores the whole
+	// payload, so an anchor-failure redelivery re-sends the SAME hint
+	// byte-identically — the caption is never re-parsed from storage
+	// because it is never stored.
 	payload := AnchorPayload{
 		TenantID:          tenantID.String(),
 		Channel:           "whatsapp",
@@ -623,6 +629,7 @@ func (s *Server) ingestWhatsAppMedia(ctx context.Context, phoneNumberID string, 
 		Mime:              mediaBlob.MimeType,
 		Bytes:             len(mediaBlob.Data),
 		SHA256Prefix:      sha256Prefix16(mediaBlob.SHA256),
+		BookingRefHint:    captionHint(block.Caption),
 	}
 	deduper.ledgerMark(m.ID, payload)
 	return s.retryMediaAnchor(ctx, deduper, tenantID, payload)

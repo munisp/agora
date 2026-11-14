@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -20,6 +21,8 @@ import (
 	"github.com/opendesk/messaging-gateway/internal/metrics"
 	"github.com/opendesk/messaging-gateway/internal/provider"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // waMediaTenant is the CHANNEL_SITE_MAP tenant used by the media tests
@@ -29,8 +32,14 @@ const waMediaTenant = "9f1c2a3b-0000-4000-8000-0000000000aa"
 // waMediaPayload builds a signed media webhook body (document when
 // kind=="document", image otherwise).
 func waMediaPayload(kind, msgID, mediaID, mime, sha, filename string) string {
-	block := fmt.Sprintf(`{"id":%q,"mime_type":%q,"sha256":%q,"caption":"do not log me","filename":%q}`,
-		mediaID, mime, sha, filename)
+	return waMediaPayloadCaption(kind, msgID, mediaID, mime, sha, filename, "do not log me")
+}
+
+// waMediaPayloadCaption is waMediaPayload with a caller-chosen caption
+// (SPEC-W66 WS2 tests quote BK-ref tokens in captions).
+func waMediaPayloadCaption(kind, msgID, mediaID, mime, sha, filename, caption string) string {
+	block := fmt.Sprintf(`{"id":%q,"mime_type":%q,"sha256":%q,"caption":%q,"filename":%q}`,
+		mediaID, mime, sha, caption, filename)
 	return fmt.Sprintf(`{"entry":[{"changes":[{"value":{
 		"metadata":{"phone_number_id":"10987654321"},
 		"messages":[{"from":"2348012345678","id":%q,"timestamp":"1733000000","type":%q,%q:%s}]
@@ -540,6 +549,17 @@ type fakeAnchor struct {
 		token string
 		body  map[string]any
 	}
+	mu   sync.Mutex
+	raws []string // SPEC-W66 WS2: every raw request body (redelivery byte-identity)
+}
+
+// rawBodies returns every request body seen, in order.
+func (fa *fakeAnchor) rawBodies() []string {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+	out := make([]string, len(fa.raws))
+	copy(out, fa.raws)
+	return out
 }
 
 func newFakeAnchor(t *testing.T) *fakeAnchor {
@@ -553,6 +573,9 @@ func newFakeAnchor(t *testing.T) *fakeAnchor {
 		}
 		fa.last.token = r.Header.Get("X-Internal-Token")
 		b, _ := io.ReadAll(r.Body)
+		fa.mu.Lock()
+		fa.raws = append(fa.raws, string(b))
+		fa.mu.Unlock()
 		fa.last.body = map[string]any{}
 		_ = json.Unmarshal(b, &fa.last.body)
 		if fa.status != 0 {
@@ -792,5 +815,163 @@ func TestMediaDeduperLedgerUnit(t *testing.T) {
 	d.ledgerMark("", p)
 	if d.seen("") {
 		t.Fatal("empty id must never claim the ledger")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W66 WS2: caption BK-ref hint (token-only, parse-then-discard)
+// ---------------------------------------------------------------------------
+
+// W66: a caption quoting ONE BK-ref token rides the anchor payload as
+// booking_ref_hint — the 11-char normalized token ONLY; the caption string
+// never appears anywhere in the raw request body (P8).
+func TestWAMediaAnchorCaptionHintRidesPayload(t *testing.T) {
+	fm := newFakeMeta(t, jpegBytes, "image/jpeg")
+	fo := newFakeOCR(t)
+	fa := newFakeAnchor(t)
+	s := newMediaAnchorServer(&fakeBridge{}, fm, fo, fa)
+	caption := "hi, receipt for bk-7c3x9q2m — thanks!"
+	body := waMediaPayloadCaption("image", "wamid.Hint1", "m1", "image/jpeg", fm.sha, "receipt.jpg", caption)
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", body, waSignedHeaders(waTestAppSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if n := fa.hits.Load(); n != 1 {
+		t.Fatalf("exactly one anchor POST, got %d", n)
+	}
+	if got := fa.last.body["booking_ref_hint"]; got != "BK-7C3X9Q2M" {
+		t.Fatalf("booking_ref_hint = %v, want uppercase-normalized BK-7C3X9Q2M", got)
+	}
+	raws := fa.rawBodies()
+	if len(raws) != 1 {
+		t.Fatalf("want 1 raw body, got %d", len(raws))
+	}
+	if strings.Contains(raws[0], caption) || strings.Contains(raws[0], "receipt for") {
+		t.Fatalf("P8: caption text must never ride the anchor payload: %s", raws[0])
+	}
+	if strings.Contains(raws[0], "caption") {
+		t.Fatalf("P8: no caption key may ride the anchor payload: %s", raws[0])
+	}
+}
+
+// W66: >=2 DISTINCT caption tokens => NO hint (ambiguity never narrows);
+// the payload is byte-identical to the no-hint W61 form.
+func TestWAMediaAnchorCaptionHintAmbiguousDropped(t *testing.T) {
+	fm := newFakeMeta(t, jpegBytes, "image/jpeg")
+	fo := newFakeOCR(t)
+	fa := newFakeAnchor(t)
+	s := newMediaAnchorServer(&fakeBridge{}, fm, fo, fa)
+	body := waMediaPayloadCaption("image", "wamid.HintAmb", "m1", "image/jpeg", fm.sha, "receipt.jpg",
+		"is it BK-7C3X9Q2M or BK-1A2B3C4D?")
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", body, waSignedHeaders(waTestAppSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if n := fa.hits.Load(); n != 1 {
+		t.Fatalf("exactly one anchor POST, got %d", n)
+	}
+	if _, ok := fa.last.body["booking_ref_hint"]; ok {
+		t.Fatalf("ambiguous caption must carry NO hint, got %v", fa.last.body)
+	}
+	if strings.Contains(fa.rawBodies()[0], "booking_ref_hint") {
+		t.Fatal("ambiguous caption must omit booking_ref_hint entirely (byte-identical no-hint form)")
+	}
+}
+
+// W66: a malformed token (excluded Crockford letters) is treated as
+// ABSENT — no hint, no error, never a 400-class failure.
+func TestWAMediaAnchorCaptionHintMalformedDropped(t *testing.T) {
+	fm := newFakeMeta(t, jpegBytes, "image/jpeg")
+	fo := newFakeOCR(t)
+	fa := newFakeAnchor(t)
+	s := newMediaAnchorServer(&fakeBridge{}, fm, fo, fa)
+	body := waMediaPayloadCaption("image", "wamid.HintBad", "m1", "image/jpeg", fm.sha, "receipt.jpg",
+		"my ref is BK-7C3X9Q2U maybe")
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", body, waSignedHeaders(waTestAppSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("malformed hint must still 200, got %d", rec.Code)
+	}
+	if _, ok := fa.last.body["booking_ref_hint"]; ok {
+		t.Fatalf("malformed token must be treated as absent, got %v", fa.last.body)
+	}
+}
+
+// W66 case 9 (redelivery same-hint): an anchor-failure redelivery re-sends
+// the ledger-stored payload BYTE-IDENTICALLY — including the SAME
+// booking_ref_hint — without re-fetching or re-OCRing (R4) and without
+// re-parsing the caption.
+func TestWAMediaAnchorRedeliverySameHint(t *testing.T) {
+	fm := newFakeMeta(t, jpegBytes, "image/jpeg")
+	fo := newFakeOCR(t)
+	fa := newFakeAnchor(t)
+	s := newMediaAnchorServer(&fakeBridge{}, fm, fo, fa)
+	h := s.Router()
+	body := waMediaPayloadCaption("image", "wamid.HintRedel", "m1", "image/jpeg", fm.sha, "receipt.jpg",
+		"receipt BK-7C3X9Q2M")
+
+	fa.status = http.StatusInternalServerError
+	rec := do(t, h, http.MethodPost, "/webhooks/whatsapp", body, waSignedHeaders(waTestAppSecret, body))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("anchor failure must answer 500, got %d", rec.Code)
+	}
+
+	// Booking recovers; Meta redelivers the SAME webhook body (the caption
+	// is still on the wire from Meta, but the gateway must reuse the
+	// ledger payload — no re-fetch, no re-OCR).
+	fa.status = 0
+	rec = do(t, h, http.MethodPost, "/webhooks/whatsapp", body, waSignedHeaders(waTestAppSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("anchor retry must answer 200, got %d", rec.Code)
+	}
+	if n := fo.hits.Load(); n != 1 {
+		t.Fatalf("R4: redelivery must NOT re-OCR, got %d OCR hits", n)
+	}
+	if n := fm.metaHits.Load(); n != 1 {
+		t.Fatalf("R4: redelivery must NOT re-fetch, got %d Meta hits", n)
+	}
+	raws := fa.rawBodies()
+	if len(raws) != 2 {
+		t.Fatalf("want 2 anchor POSTs (initial + retry), got %d", len(raws))
+	}
+	if raws[0] != raws[1] {
+		t.Fatalf("redelivery must re-send the SAME payload byte-identically:\n%s\nvs\n%s", raws[0], raws[1])
+	}
+	if !strings.Contains(raws[1], `"booking_ref_hint":"BK-7C3X9Q2M"`) {
+		t.Fatalf("redelivered payload must carry the same hint, got %s", raws[1])
+	}
+	if strings.Contains(raws[1], "receipt BK-") {
+		t.Fatalf("P8: caption text must never ride the anchor payload: %s", raws[1])
+	}
+}
+
+// W66 P8 log proof: the caption string never appears in ANY zap log entry
+// emitted by the media ingest path (observer-core capture).
+func TestWAMediaCaptionNeverLogged(t *testing.T) {
+	fm := newFakeMeta(t, jpegBytes, "image/jpeg")
+	fo := newFakeOCR(t)
+	fa := newFakeAnchor(t)
+	s := newMediaAnchorServer(&fakeBridge{}, fm, fo, fa)
+
+	core, logs := observer.New(zapcore.DebugLevel)
+	s.Log = zap.New(core)
+
+	caption := "private caption 9f8d7c6b BK-7C3X9Q2M"
+	body := waMediaPayloadCaption("image", "wamid.HintLogs", "m1", "image/jpeg", fm.sha, "receipt.jpg", caption)
+	rec := do(t, s.Router(), http.MethodPost, "/webhooks/whatsapp", body, waSignedHeaders(waTestAppSecret, body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if n := fa.hits.Load(); n != 1 {
+		t.Fatalf("exactly one anchor POST, got %d", n)
+	}
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, caption) || strings.Contains(e.Message, "9f8d7c6b") {
+			t.Fatalf("P8: caption text leaked into log entry: %s", e.Message)
+		}
+		for _, f := range e.Context {
+			if strings.Contains(f.String, "9f8d7c6b") {
+				t.Fatalf("P8: caption text leaked into log field %q of %q", f.Key, e.Message)
+			}
+		}
 	}
 }

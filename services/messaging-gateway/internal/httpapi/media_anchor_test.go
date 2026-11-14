@@ -95,6 +95,47 @@ func TestAnchorClientContract(t *testing.T) {
 	if _, ok := got.body["caption"]; ok {
 		t.Fatal("caption must never ride the anchor payload")
 	}
+	// SPEC-W66 WS2: no hint on the fixture payload => the key is omitted
+	// entirely (byte-identical W61 wire form). The hint-bearing wire form
+	// is pinned by TestAnchorClientContractWithHint.
+	if _, ok := got.body["booking_ref_hint"]; ok {
+		t.Fatal("no-hint payload must omit booking_ref_hint (byte-identical W61)")
+	}
+}
+
+// TestAnchorClientContractWithHint (SPEC-W66 WS2): a payload with a hint
+// rides the wire with booking_ref_hint = the 11-char token ONLY — the
+// caption string never appears anywhere in the request body.
+func TestAnchorClientContractWithHint(t *testing.T) {
+	var rawBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		rawBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"aaaaaaaa-0000-4000-8000-000000000001","state":"anchored"}`)) //nolint:errcheck
+	}))
+	defer srv.Close()
+
+	p := anchorTestPayload()
+	p.BookingRefHint = "BK-7C3X9Q2M"
+	c := NewAnchorClient(srv.URL, "booking-token")
+	if err := c.Anchor(context.Background(), p); err != nil {
+		t.Fatalf("anchor: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal([]byte(rawBody), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["booking_ref_hint"] != "BK-7C3X9Q2M" {
+		t.Fatalf("booking_ref_hint = %v, want BK-7C3X9Q2M", body["booking_ref_hint"])
+	}
+	// P8: neither a caption key nor any caption text may ride the wire.
+	if _, ok := body["caption"]; ok {
+		t.Fatal("caption must never ride the anchor payload")
+	}
+	if strings.Contains(rawBody, "do not log me") {
+		t.Fatal("caption text must never ride the anchor payload (P8)")
+	}
 }
 
 // TestAnchorClientFailClosed: an unset token (or unset base) never places a

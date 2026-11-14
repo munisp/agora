@@ -67,8 +67,11 @@ var subjectPiiSteps = []subjectPiiStep{
 	// preserved for audit. The sender_phone_digits <> '' guard keeps the
 	// step idempotent and prevents an all-non-digit needle from matching
 	// already-tombstoned rows.
+	// SPEC-W66 WS2 (lead ruling (d)): the step additionally NULLs
+	// booking_ref_hint — the caption-quoted token arrived in a subject's
+	// message and must not survive erasure; booking_id stays for audit.
 	{"media_inbox",
-		`UPDATE media_inbox SET sender_phone=$3, sender_phone_digits=''
+		`UPDATE media_inbox SET sender_phone=$3, sender_phone_digits='', booking_ref_hint=NULL
 		 WHERE tenant_id=$1 AND sender_phone_digits <> ''
 		   AND sender_phone_digits = regexp_replace(regexp_replace($2,'\D','','g'),'^00','')`},
 }
