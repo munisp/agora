@@ -300,6 +300,10 @@ phash EXCLUDED from every cross-tenant artifact.
 7. **HMAC posture.** `OCR_REGISTRY_HMAC_SECRET` fail-closed
    (KYC_HASH_SECRET idiom): unset => registry DISABLED (one startup log
    line; upserts skipped). Rotation = re-key backfill (§7.3).
+   Compose/env wiring landed in SPEC-W68 (G-RES(e)): `docker-compose.yml`
+   ocr block + `.env.example` carry it with an EMPTY default, so the
+   unset => DISABLED posture (and the §7.1 item 8 pre-deploy gate) is
+   preserved.
 8. **Legal sign-off (PRE-DEPLOY gate, not a build gate).** NDPA lawful
    basis (legitimate interest / security of processing) confirmed by
    counsel + DPIA note for the cross-tenant processing registry BEFORE the

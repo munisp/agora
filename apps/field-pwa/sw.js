@@ -1,8 +1,16 @@
-/* OpenDesk Field service worker (SPEC-W16 §3/§4).
+/* OpenDesk Field service worker (SPEC-W16 §3/§4; W68 G-SW1/2/3/4 guards).
  *
  * - App shell (index, app.js, manifest, icons): cache-first.
- * - API calls (/v1/*, token endpoints): network only — writes are queued in
+ * - API calls (any same-origin /api/* path, incl. /v1/*) and cross-origin
+ *   token endpoints: network only — the fetch handler returns early for
+ *   every /api/ GET (G-SW2), so tenant-private data (e.g. /api/bookings)
+ *   is never stored in or served from the Cache API. Writes are queued in
  *   IndexedDB by the page, never replayed from cache.
+ * - Requests with cache:"no-store" (e.g. the W63 gazetteer snapshot, whose
+ *   ETag/304 conditional GET must always reach geo-service) bypass both
+ *   cache-match and cache-put (G-SW1). Defense-in-depth: responses whose
+ *   Cache-Control contains "no-store" are never written to the cache even
+ *   if a caller forgot the request flag (G-SW3).
  * - Background Sync ("od-field-flush"): asks any open page to flush the
  *   IndexedDB outbox. Tokens are session-only and never reach this worker
  *   (TS-003), so the authenticated flush always runs in a page context.
@@ -11,7 +19,7 @@
  */
 "use strict";
 
-var OPENDESK_SW_V = "field-pwa-v5"; // SPEC-W63: mandatory bump (offline gazetteer: IDB v3 + snapshot sync + State/LGA pickers)
+var OPENDESK_SW_V = "field-pwa-v6"; // SPEC-W68: mandatory bump (G-SW4; activation evicts poisoned v5 caches: no-store/API guard for the cache-first GET handler)
 var SHELL = "opendesk-field-" + OPENDESK_SW_V;
 
 var PRECACHE = [
@@ -45,6 +53,13 @@ self.addEventListener("fetch", function (event) {
   var url = new URL(req.url);
   if (url.origin !== self.location.origin) return; // Keycloak/API: network
 
+  // W68 G-SW1: never cache-match or cache-put a no-store request (the W63
+  // gazetteer snapshot's If-None-Match/304 conditional must reach the network).
+  if (req.cache === "no-store") return;
+  // W68 G-SW2: API is network only (header contract above) — tenant-private
+  // GETs like /api/bookings/v1/bookings must not be cached under a shared-origin URL.
+  if (url.pathname.indexOf("/api/") === 0) return;
+
   if (req.mode === "navigate") {
     event.respondWith(
       fetch(req).catch(function () {
@@ -59,8 +74,12 @@ self.addEventListener("fetch", function (event) {
       if (cached) return cached;
       return fetch(req).then(function (res) {
         if (res.ok) {
-          var clone = res.clone();
-          caches.open(SHELL).then(function (c) { c.put(req, clone); });
+          // W68 G-SW3 defense-in-depth: honor response Cache-Control: no-store.
+          var cc = res.headers.get("cache-control");
+          if (!cc || cc.toLowerCase().indexOf("no-store") === -1) {
+            var clone = res.clone();
+            caches.open(SHELL).then(function (c) { c.put(req, clone); });
+          }
         }
         return res;
       });

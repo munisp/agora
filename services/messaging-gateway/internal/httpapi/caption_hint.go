@@ -25,6 +25,10 @@ import (
 // itself already excludes i/l/o/u (Unicode simple folding keeps those
 // letters out even under (?i)); the post-normalization alphabet validation
 // in captionHint is the belt-and-suspenders check for exotic fold matches.
+//
+// SPEC-W68 G-RES(c rider): the pattern itself carries NO word boundaries
+// (Go RE2 has no lookaround) — the token-boundary hardening is INDEX-based
+// in captionHint below, not in this regex.
 var captionBookingRefRe = regexp.MustCompile(`(?i)BK-[0-9A-HJKMNPQRSTVWXYZ]{8}`)
 
 // crockfordAlphabet is the SPEC-W51 public_ref alphabet (Crockford base32,
@@ -43,11 +47,30 @@ const crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 // best-effort, so this function has no error return and the caller never
 // answers 400 because of a caption. The returned string is the token ONLY;
 // the caption is neither returned nor retained.
+//
+// SPEC-W68 G-RES(c rider): token boundaries are enforced INDEX-based
+// around the regexp find (RE2 has no lookaround): a match must NOT be
+// preceded by [0-9A-Z] and the 8-char body must NOT be followed by
+// [0-9A-Z] — an embedded "BK-..." is a substring of a longer alphanumeric
+// token, not a booking ref ("XBK-7C3X9Q2M", "BK-7C3X9Q2MZZ" => absent).
+// Hyphen and lowercase letters are NOT boundary blockers per the ruling
+// ("X-BK-7C3X9Q2M", "(bk-7c3x9q2m)" still hint). Byte comparisons are
+// UTF-8-safe: multi-byte runes never alias [0-9A-Z].
 func captionHint(caption string) string {
 	if caption == "" {
 		return ""
 	}
-	matches := captionBookingRefRe.FindAllString(caption, -1)
+	locs := captionBookingRefRe.FindAllStringIndex(caption, -1)
+	matches := make([]string, 0, len(locs))
+	for _, loc := range locs {
+		if loc[0] > 0 && isRefBoundaryBlocker(caption[loc[0]-1]) {
+			continue // preceded by [0-9A-Z]: substring of a longer token
+		}
+		if loc[1] < len(caption) && isRefBoundaryBlocker(caption[loc[1]]) {
+			continue // body followed by [0-9A-Z]: longer code, not a ref
+		}
+		matches = append(matches, caption[loc[0]:loc[1]])
+	}
 	if len(matches) == 0 {
 		return ""
 	}
@@ -61,6 +84,14 @@ func captionHint(caption string) string {
 		return ""
 	}
 	return hint
+}
+
+// isRefBoundaryBlocker reports whether c is an ASCII [0-9A-Z] byte, which
+// (SPEC-W68 G-RES(c rider)) blocks a BK- token boundary: such a byte means
+// the match is embedded in a longer alphanumeric token. Multi-byte UTF-8
+// lead/continuation bytes (>= 0x80) are never blockers.
+func isRefBoundaryBlocker(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
 }
 
 // isValidBookingRefHint validates the canonical hint form: "BK-" + 8

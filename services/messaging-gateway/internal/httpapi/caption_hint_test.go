@@ -31,10 +31,10 @@ func TestCaptionHintMatrix(t *testing.T) {
 		{"two distinct tokens => absent", "BK-7C3X9Q2M or BK-1A2B3C4D", ""},
 		{"three distinct tokens => absent", "BK-7C3X9Q2M BK-1A2B3C4D bk-zz11zz22", ""},
 		{"7-char code => absent", "BK-7C3X9Q2", ""},
-		// The pinned regex has no word boundaries: a 9-char code yields
-		// the FIRST-8 token (which simply matches no booking public_ref
-		// unless it is one — regex semantics pinned by SPEC-W66).
-		{"9-char code yields first-8 token", "BK-7C3X9Q2M5", "BK-7C3X9Q2M"},
+		// SPEC-W68 G-RES(c rider): the boundary hardening SUPERSEDES the
+		// W66-pinned "9-char code yields first-8 token" behavior — a body
+		// followed by [0-9A-Z] is a longer code, not a booking ref.
+		{"9-char code => absent (W68 boundary rider)", "BK-7C3X9Q2M5", ""},
 		{"excluded letter I => absent", "BK-7C3X9Q2I", ""},
 		{"excluded letter L => absent", "BK-7C3X9Q2L", ""},
 		{"excluded letter O => absent", "BK-7C3X9Q2O", ""},
@@ -48,6 +48,17 @@ func TestCaptionHintMatrix(t *testing.T) {
 		// "token" never matches the regex, so the VALID token still counts
 		// as the single hint.
 		{"one valid + one malformed", "BK-7C3X9Q2M not BK-7C3X9Q2I", "BK-7C3X9Q2M"},
+		// SPEC-W68 G-RES(c rider) boundary cases: a match must NOT be
+		// preceded by [0-9A-Z] and the body must NOT be followed by
+		// [0-9A-Z] (index-based; RE2 has no lookaround).
+		{"preceded by letter => absent", "XBK-7C3X9Q2M", ""},
+		{"preceded by digit => absent", "9BK-7C3X9Q2M", ""},
+		{"followed by letters => absent", "BK-7C3X9Q2MZZ", ""},
+		{"9-char code mid-word => absent", "ref BK-7C3X9Q2M5 received", ""},
+		{"parens are boundaries", "(bk-7c3x9q2m)", "BK-7C3X9Q2M"},
+		{"hyphen is not a blocker", "see X-BK-7C3X9Q2M ok", "BK-7C3X9Q2M"},
+		{"start-of-string boundary", "BK-7C3X9Q2M", "BK-7C3X9Q2M"},
+		{"end-of-string boundary", "receipt bk-7c3x9q2m", "BK-7C3X9Q2M"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

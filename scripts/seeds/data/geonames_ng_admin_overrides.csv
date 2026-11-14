@@ -1,0 +1,14 @@
+# GeoNames NG admin-name -> geo_places code overrides (SPEC-W68 WS2).
+# Consulted FIRST at both levels by geonames_ng_localities.py, before the
+# default slug(asciiname) join against the seeded gazetteer codes.
+# level:        admin1 (state) or admin2 (LGA)
+# geonames_key: the GeoNames admin key ("NG.11" / "NG.11.01") OR the
+#               (ascii)name exactly as it appears in admin1CodesASCII.txt /
+#               admin2Codes.txt (key, name, and asciiname are all tried)
+# geo_places_code: the seeded code from services/geo-service/seeds/
+#               nigeria_gazetteer.csv
+level,geonames_key,geo_places_code
+# GeoNames spells the FCT "Federal Capital Territory"; the seed uses "FCT".
+admin1,Federal Capital Territory,NG-FCT
+# GeoNames spells the state "Nassarawa"; the seed uses "Nasarawa".
+admin1,Nassarawa,NG-NASARAWA

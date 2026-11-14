@@ -244,9 +244,10 @@ State→LGA pickers. It is deliberately a **name/code table**: polygons live in
   NULL-reference RLS variant as `geo_boundaries`. The tenant arm of the
   policy is kept so tenant-private places can be admitted later without a
   policy change.
-- **Locality tier (gate G3):** schema + import support only, seeded EMPTY.
-  A GeoNames NG / GRID3 locality import is a documented follow-up (use the
-  import endpoint below; up to 200k rows per call).
+- **Locality tier (gate G3):** schema + import support only, seeded EMPTY
+  at boot. Localities are imported on demand from GeoNames NG via the
+  offline converter — see "Locality tier import (GeoNames NG, SPEC-W68)"
+  below (up to 200k rows per import call).
 
 ### Boot seeding
 
@@ -298,3 +299,72 @@ scanner unreachable ⇒ **503** `{"error":"av_unavailable"}` when
 `CLAMAV_REQUIRED=true` (default), otherwise logged and skipped. The clamd
 `StreamMaxLength` is raised to 110M (gate G1) so the 100 MB import cap stays
 scannable.
+
+### Locality tier import (GeoNames NG, SPEC-W68)
+
+The locality tier is populated by an **offline, stdlib-only converter**,
+`scripts/seeds/geonames_ng_localities.py` — no service or endpoint change,
+no runtime GeoNames dependency, no network access from the script.
+
+Runbook:
+
+1. **Download inputs** (operator action; these files are NOT committed —
+   third-party CC-BY data, regenerable by download):
+   - `NG.zip` from <https://download.geonames.org/export/dump/NG.zip>
+   - `admin1CodesASCII.txt` and `admin2Codes.txt` from the same dump
+     directory (they map the numeric-ish admin1/admin2 codes to names).
+2. **Run the converter** (paths are CLI args; the defaults below assume the
+   downloads sit in the repo root):
+
+   ```bash
+   python3 scripts/seeds/geonames_ng_localities.py \
+     --ng NG.zip --admin1 admin1CodesASCII.txt --admin2 admin2Codes.txt
+   # writes scripts/seeds/out/nigeria_localities.csv
+   ```
+
+   The converter keeps `feature_class == 'P'` rows only (PPL* uniformly),
+   resolves each row's admin1/admin2 to the seeded state/LGA codes
+   (committed overrides in
+   `scripts/seeds/data/geonames_ng_admin_overrides.csv` are consulted
+   first, then the pinned slug rule on `asciiname`), and derives codes
+   `NG-<STATE>-<LGA>-<slug(asciiname)>` with a `-<geonameid>` suffix on
+   BOTH rows of any collision group.
+3. **Review the completeness report** (stdout): `admin1 resolved 37/37` is
+   a hard gate — the converter exits non-zero and writes nothing
+   otherwise. Every unresolved admin2 key is listed with its row count;
+   those rows are SKIPPED (never state-parented). Fix mapping drift by
+   adding rows to the override CSV and re-running — output is
+   byte-identical for identical inputs.
+4. **Import** the generated CSV through the normal endpoint:
+
+   ```bash
+   curl -X POST "$GEO/v1/geo/gazetteer/import" \
+     -H "Authorization: Bearer $TOKEN" \
+     -F "file=@scripts/seeds/out/nigeria_localities.csv"
+   ```
+
+   Re-imports are idempotent (upsert on the deterministic `(kind, code)`
+   keys).
+
+**Attribution (REQUIRED):** GeoNames data is licensed under a
+[Creative Commons Attribution 4.0 License (CC-BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+Credit "GeoNames" in any product surface that displays this data. Every
+generated row carries the attribution in its `source` field:
+`geonames NG dump <YYYY-MM-DD> (CC-BY 4.0) geonameid=<id>`.
+
+**AV note:** the converter is offline by design and never talks to
+geo-service; its output CSV still reaches the database ONLY through
+`POST /v1/geo/gazetteer/import`, which AV-scans all import bytes with the
+clamd sidecar before parsing (see above). No unscanned bytes reach the DB.
+
+**3-level picker — post-campaign residual:** the field-pwa keeps its
+2-level State→LGA cascade and pins `levels=state,lga` on the snapshot
+request. Pulling the ~40k-row locality tier into the default snapshot
+would add MBs of JSON to every device's IndexedDB and churn the snapshot
+ETag on every locality edit — precisely why localities stay OUT of the
+offline snapshot. Localities are served online via
+`GET /v1/geo/gazetteer?kind=locality&state=...`; a 3-level cascade picker
+(snapshot-size policy, UX, IDB growth) is a documented post-campaign
+residual. The client is already forward-compatible (`gazetteerRows`
+accepts kind `locality`; the IDB `parent_code` index supports a third
+level).

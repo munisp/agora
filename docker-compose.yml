@@ -1620,6 +1620,15 @@ services:
       CLAMAV_PORT: ${CLAMAV_PORT:-3310}
       CLAMAV_TIMEOUT_S: ${CLAMAV_TIMEOUT_S:-30}
       CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-true}
+      # SPEC-W67 G1 (wiring landed SPEC-W68 G-RES(e)): HMAC key for the
+      # cross-tenant document-fraud registry (registry_key =
+      # HMAC-SHA256(secret, sha256)). EMPTY DEFAULT ON PURPOSE — unset =>
+      # registry DISABLED (fail-closed-disabled, KYC_HASH_SECRET idiom);
+      # a dev default would silently enable the registry in dev
+      # (REJECTED). Prod provisioning sits behind the NDPA counsel
+      # pre-deploy gate; rotation = re-key backfill
+      # (docs/runbooks/security.md §7).
+      OCR_REGISTRY_HMAC_SECRET: ${OCR_REGISTRY_HMAC_SECRET:-}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     networks:
