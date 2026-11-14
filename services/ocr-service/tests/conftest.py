@@ -7,6 +7,7 @@ production code has no mock paths other than the OCR_MOCK gate.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socketserver
 import struct
@@ -26,6 +27,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, ".")
 
 from app import main as main_module  # noqa: E402
+from app import registry as registry_module  # noqa: E402  SPEC-W67
 from app.config import settings  # noqa: E402
 
 TENANT_A = "11111111-2222-3333-4444-555555555555"
@@ -100,6 +102,22 @@ class FakeDB:
     def __init__(self):
         self.rows: dict[str, dict[str, Any]] = {}  # str(id) -> row
         self.transitions: list[tuple[str, str]] = []  # (id, new_status)
+        # SPEC-W67: cross-tenant registry state (platform-scoped; reachable
+        # ONLY via registry_conn below — the FakeDB-level RLS posture).
+        self.registry_keys: dict[str, dict[str, Any]] = {}  # registry_key -> row
+        self.registry_members: dict[tuple[str, str], dict[str, Any]] = {}
+        self._registry_locks: dict[str, asyncio.Lock] = {}  # PK row locks
+
+    @asynccontextmanager
+    async def registry_conn(self):
+        """SPEC-W67: the registry GUC scope. The ONLY scope that can reach
+        the registry state (mirrors FORCE RLS + app.ocr_registry policy:
+        tenant_conn/sweep_conn scopes see ZERO registry rows)."""
+        scope = _RegistryScope(self)
+        try:
+            yield scope
+        finally:
+            scope.release()
 
     @asynccontextmanager
     async def tenant_conn(self, tenant_id):
@@ -312,6 +330,141 @@ class _TenantScope:
     def __init__(self, db: FakeDB, tenant_id: str):
         self.db = db
         self.tenant_id = tenant_id
+
+
+def _norm_sql(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+class _RegistryScope:
+    """SPEC-W67: asyncpg-shaped connection for the registry GUC scope.
+
+    Dispatches on the EXACT SQL constants of app.registry and replicates
+    their semantics in lockstep (ON CONFLICT upsert, membership insert
+    dedup, tenant recount, alerted flag, TenantDelete cascade). A per-key
+    asyncio.Lock emulates the ocr_doc_registry PK row lock that serializes
+    concurrent first-uploads of the same hash: the lock is taken by the
+    parent upsert and released when the scope's transaction ends (PG row
+    locks live to COMMIT), so two racing tasks produce exactly one
+    membership set and one match.
+    """
+
+    def __init__(self, db: "FakeDB"):
+        self.db = db
+        self.tenant_id = None  # platform scope, never a tenant
+        self._held: list[asyncio.Lock] = []
+
+    def release(self) -> None:
+        for lock in self._held:
+            if lock.locked():
+                lock.release()
+        self._held = []
+
+    # --- statement handlers (lockstep with app.registry SQL) -------------
+    async def _upsert_parent(self, key: str, first_seen):
+        await asyncio.sleep(0)  # yield point so racing tasks interleave
+        lock = self.db._registry_locks.setdefault(key, asyncio.Lock())
+        await lock.acquire()
+        self._held.append(lock)
+        parent = self.db.registry_keys.get(key)
+        if parent is None:
+            parent = {
+                "registry_key": key,
+                "first_seen": first_seen,
+                "last_seen": first_seen,
+                "tenant_count": 0,
+                "doc_count": 1,
+            }
+            self.db.registry_keys[key] = parent
+        else:
+            parent["first_seen"] = min(parent["first_seen"], first_seen)
+            parent["last_seen"] = max(parent["last_seen"], first_seen)
+            parent["doc_count"] += 1
+        return {"doc_count": parent["doc_count"]}
+
+    def _add_membership(self, key: str, tenant_id, first_seen) -> str:
+        member_key = (key, str(tenant_id))
+        if member_key in self.db.registry_members:
+            return "INSERT 0 0"  # ON CONFLICT DO NOTHING
+        self.db.registry_members[member_key] = {
+            "registry_key": key,
+            "tenant_id": str(tenant_id),
+            "first_seen": first_seen,
+            "alerted": False,
+        }
+        return "INSERT 0 1"
+
+    def _recount(self, key: str) -> str:
+        parent = self.db.registry_keys.get(key)
+        if parent is None:
+            return "UPDATE 0"
+        parent["tenant_count"] = sum(
+            1 for k, _t in self.db.registry_members if k == key
+        )
+        return "UPDATE 1"
+
+    def _other_tenants(self, key: str, tenant_id) -> list[dict[str, Any]]:
+        others = sorted(
+            m["tenant_id"]
+            for (k, _t), m in self.db.registry_members.items()
+            if k == key and m["tenant_id"] != str(tenant_id)
+        )
+        return [{"tenant_id": t} for t in others]
+
+    def _mark_alerted(self, key: str, tenant_id) -> str:
+        member = self.db.registry_members.get((key, str(tenant_id)))
+        if member is None:
+            return "UPDATE 0"
+        member["alerted"] = True
+        return "UPDATE 1"
+
+    def _delete_tenant_memberships(self, tenant_id) -> list[dict[str, Any]]:
+        doomed = [
+            mk for mk, m in self.db.registry_members.items()
+            if m["tenant_id"] == str(tenant_id)
+        ]
+        out = [{"registry_key": self.db.registry_members[mk]["registry_key"]} for mk in doomed]
+        for mk in doomed:
+            del self.db.registry_members[mk]
+        return out
+
+    def _drop_empty_key(self, key: str) -> str:
+        if any(k == key for k, _t in self.db.registry_members):
+            return "DELETE 0"
+        if self.db.registry_keys.pop(key, None) is None:
+            return "DELETE 0"
+        return "DELETE 1"
+
+    # --- asyncpg-shaped verbs, dispatched on the app.registry constants ---
+    async def fetchrow(self, sql: str, *args):
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_UPSERT_PARENT):
+            return await self._upsert_parent(args[0], args[1])
+        raise AssertionError(f"unexpected registry SQL (fetchrow): {sql!r}")
+
+    async def fetchval(self, sql: str, *args):
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_TENANT_COUNT):
+            parent = self.db.registry_keys.get(args[0])
+            return None if parent is None else parent["tenant_count"]
+        raise AssertionError(f"unexpected registry SQL (fetchval): {sql!r}")
+
+    async def fetch(self, sql: str, *args):
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_OTHER_TENANTS):
+            return self._other_tenants(args[0], args[1])
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_DELETE_TENANT_MEMBERSHIPS):
+            return self._delete_tenant_memberships(args[0])
+        raise AssertionError(f"unexpected registry SQL (fetch): {sql!r}")
+
+    async def execute(self, sql: str, *args) -> str:
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_ADD_MEMBERSHIP):
+            return self._add_membership(args[0], args[1], args[2])
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_RECOUNT):
+            return self._recount(args[0])
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_MARK_ALERTED):
+            return self._mark_alerted(args[0], args[1])
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_DROP_EMPTY_KEY):
+            return self._drop_empty_key(args[0])
+        raise AssertionError(f"unexpected registry SQL (execute): {sql!r}")
+
 
 
 class FakeMinio:

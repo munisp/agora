@@ -356,6 +356,21 @@ func (f *FalkorDB) UpsertDocument(ctx context.Context, d Document) error {
 	return f.exec(ctx, upsertDocumentQuery(d))
 }
 
+// SetDocumentSeenElsewhere implements Client (SPEC-W67 G6 cross-tenant
+// match projection; MAX semantics — stale lower counts never regress).
+func (f *FalkorDB) SetDocumentSeenElsewhere(ctx context.Context, tenantID, documentID string, tenantCount int) error {
+	if tenantID == "" {
+		return ErrTenantRequired
+	}
+	if documentID == "" {
+		return fmt.Errorf("document_id is required")
+	}
+	if tenantCount < 1 {
+		return fmt.Errorf("tenant_count must be >= 1")
+	}
+	return f.exec(ctx, setDocumentSeenElsewhereQuery(tenantID, documentID, tenantCount))
+}
+
 // FindPersonByPhoneHash implements Client.
 func (f *FalkorDB) FindPersonByPhoneHash(ctx context.Context, tenantID, phoneHash string) (string, error) {
 	if tenantID == "" {

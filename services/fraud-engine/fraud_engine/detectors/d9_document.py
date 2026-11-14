@@ -23,6 +23,16 @@ pure Python (D8 analyze-in-Python precedent):
       pixels/grid, re-encoded or edited bytes) => medium. PINNED downgrade
       from high: the high call was gated on extracted-field divergence,
       which the hash-only posture excludes; benign re-encode is possible.
+  S4 cross_tenant_exact_duplicate (SPEC-W67 G6) — the tenant's OWN stub
+      carries ``seen_elsewhere_count >= D9_XTENANT_MIN_COUNT (2)``: the
+      platform's ocr registry saw this exact sha256 on that many DISTINCT
+      tenants (graph-sync projects the pinned CrossTenantDocumentMatch
+      event; count, never identity). Exact-byte reuse across tenants is the
+      strongest document-fraud signal the platform can produce => HIGH.
+      Evidence is ZERO-DISCLOSURE: the tenant's own document ids + the
+      count ONLY — no other tenant id, no other document id, no phash
+      anywhere (earlier tenants are never alerted, and this tenant never
+      learns who the others are).
 
 D9 NEVER auto-quarantines (``document_abuse`` stays OUT of
 quarantine.AUTO_QUARANTINE_TYPES) and every finding carries
@@ -44,7 +54,8 @@ DOCUMENTS_CYPHER = """
 // detector:d9_documents
 MATCH (d:Document) WHERE d.tenant_id = $tenant_id AND d.created_at >= $since
 RETURN d.document_id AS document_id, d.sha256 AS sha256, d.phash AS phash,
-       d.kind AS kind, d.status AS status, d.created_at AS created_at
+       d.kind AS kind, d.status AS status, d.created_at AS created_at,
+       d.seen_elsewhere_count AS seen_elsewhere_count
 """
 
 # SPEC-W55 pinned decision 1: non-PNG phashes are a byte-grid fallback and
@@ -103,6 +114,7 @@ class DocumentAbuseDetector(Detector):
         return (
             self._exact_duplicate_findings(rows, settings)
             + self._near_duplicate_findings(rows, settings)
+            + self._cross_tenant_findings(rows, settings)
         )
 
     # -- signal S1: exact sha256 duplicate groups ---------------------------
@@ -238,6 +250,57 @@ class DocumentAbuseDetector(Detector):
                             },
                         )
                     )
+        return findings
+
+    # -- signal S4: cross-tenant exact duplicate (SPEC-W67 G6) ----------------
+    def _cross_tenant_findings(
+        self, rows: list[dict[str, Any]], settings: Settings
+    ) -> list[Finding]:
+        """One HIGH finding per sha256 whose OWN stubs carry
+        ``seen_elsewhere_count >= D9_XTENANT_MIN_COUNT``. The count is the
+        ONLY cross-tenant datum the graph holds (graph-sync MAX-semantics
+        projection of the pinned registry match event), so the evidence is
+        zero-disclosure by construction: this tenant's own document ids +
+        the count. ``dedup_key = xtenant:{sha256}`` =>
+        ``alert_id = document_abuse:{tenant}:none:xtenant:{sha256}`` — the
+        alerts.py MERGE makes replays/re-sweeps free (ON MATCH refreshes
+        only while open). person_id=None; D9 never auto-quarantines."""
+        by_digest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            raw_count = row.get("seen_elsewhere_count")
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                continue  # property absent (never matched elsewhere)
+            if count < settings.d9_xtenant_min_count:
+                continue
+            digest = str(row.get("sha256") or "").strip()
+            doc_id = str(row.get("document_id") or "").strip()
+            if not digest or not doc_id:
+                continue
+            entry = by_digest.setdefault(digest, {"document_ids": set(), "count": 0})
+            entry["document_ids"].add(doc_id)
+            entry["count"] = max(entry["count"], count)
+
+        findings: list[Finding] = []
+        for digest in sorted(by_digest):
+            entry = by_digest[digest]
+            findings.append(
+                Finding(
+                    type=self.alert_type,
+                    severity="high",  # exact-byte reuse across tenants (SPEC-W67)
+                    dedup_key=f"xtenant:{digest}",
+                    person_id=None,  # zero cross-tenant disclosure — no subject
+                    evidence={
+                        "detector": self.name,
+                        "signal": "cross_tenant_exact_duplicate",
+                        # OWN document ids + the count ONLY — no other
+                        # tenant's ids/documents/timestamps, no phash.
+                        "document_ids": sorted(entry["document_ids"]),
+                        "seen_elsewhere_count": entry["count"],
+                    },
+                )
+            )
         return findings
 
     def analyze(self, rows, settings, now):  # pragma: no cover - detect() overrides

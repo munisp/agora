@@ -367,6 +367,121 @@ curl -X POST :7017/v1/detect/run -H "X-Internal-Token: $FRAUD_INTERNAL_TOKEN" \
 See `docs/graph-intel.md` §3.5 for the fraud-side runbook (including the
 `lookback_days` override semantics and the gold-partition rewrite).
 
+## Cross-tenant document-fraud registry (SPEC-W67)
+
+A **platform-scoped, hash-only, HMAC-keyed** fingerprint registry in the ocr
+DB detects the same exact document bytes uploaded at **two or more distinct
+tenants** (a strong fraud-ring signal) with **zero cross-tenant disclosure**.
+
+### Storage + access posture
+
+```sql
+ocr_doc_registry(registry_key TEXT PK, first_seen TIMESTAMPTZ NOT NULL,
+  last_seen TIMESTAMPTZ NOT NULL, tenant_count INT NOT NULL, doc_count INT NOT NULL)
+ocr_doc_registry_tenants(registry_key TEXT REFERENCES ocr_doc_registry ON DELETE CASCADE,
+  tenant_id UUID NOT NULL, first_seen TIMESTAMPTZ NOT NULL,
+  alerted BOOLEAN NOT NULL DEFAULT false, PRIMARY KEY (registry_key, tenant_id))
+```
+
+- `registry_key = HMAC-SHA256(OCR_REGISTRY_HMAC_SECRET, sha256).hexdigest()` —
+  the raw sha256 NEVER enters the registry store (a registry DB dump is
+  useless for dictionary attack or external hash-list correlation; platform
+  KYC_HASH_SECRET precedent).
+- **No other columns. NO document_id, storage_key, phash, kind, fields, or
+  text.** Both DDL copies (`app/store.py` + `31-ocr-schema.sql`) carry ENABLE
+  + **FORCE ROW LEVEL SECURITY** with a single policy pass =
+  `current_setting('app.ocr_registry', true) = 'on'` — a dedicated GUC escape
+  (SEPARATE from the sweeper's `app.ocr_internal_sweep`, for auditability),
+  set ONLY inside the registry module's dedicated connection path, never on
+  request paths. No new login role.
+- **HMAC posture / disabled-when-unset (G1):** when
+  `OCR_REGISTRY_HMAC_SECRET` is unset the registry is **DISABLED** — one
+  startup log line, the upsert is skipped, nothing else changes (fail-closed
+  without breaking existing deployments; KYC_HASH_SECRET idiom). Tests use a
+  test secret. Key rotation = re-key backfill; see
+  `docs/runbooks/security.md` §7.
+
+### Match semantics — first-use-wins, count-not-identity (G5)
+
+The registry upsert runs **post-commit, only after `status='extracted'`
+succeeds** (failed uploads never register), as one atomic unit:
+`INSERT ... ON CONFLICT (registry_key) DO UPDATE ... RETURNING` (the PK row
+lock serializes concurrent first-uploads of the same hash) + membership
+`INSERT ... ON CONFLICT DO NOTHING`. Only "**this added a NEW tenant to an
+EXISTING key with >=1 OTHER member**" emits.
+
+- **First-use-wins:** only the **LATER** tenant is alerted. Earlier tenants
+  NEVER learn anything — alerting them would itself be a cross-tenant
+  information flow.
+- The match event is `com.opendesk.ocr.CrossTenantDocumentMatch` on
+  `opendesk.ocr.events`, CloudEvents `tenantid`/`subject` = the later
+  tenant's own ids, `data` = EXACTLY `{document_id (own), sha256 (own),
+  kind, tenant_count: int}`. `tenant_count` is the ONLY cross-tenant-derived
+  datum — a count, never an identity. No phash, anywhere (sha256-EXACT is
+  the only cross-tenant signal; see `docs/compliance-ndpa.md`).
+- **No read endpoint, no tenant endpoint, no platform-admin page** in v1 —
+  alerts-only design. Platform-side observability is metrics
+  (`registry_keys_total`, `registry_matches_total`) plus platform-only audit
+  log lines (registry_key, both tenant ids, ts — NEVER tenant-visible).
+- **Upload-API invariance:** the extract response (status, body, latency
+  class) MUST NOT differ whether or not a match fired — the only observable
+  is the async alert in the tenant's own queue (timing side-channel gate).
+- graph-sync consumes the match event and SETs `seen_elsewhere_count =
+  tenant_count` on the later tenant's OWN `(:Document)` node (MERGE
+  idempotent); D9's normal tenant-bound sweep then raises S4
+  (`cross_tenant_exact_duplicate`, severity HIGH, dedup_key
+  `xtenant:{sha256}`, `person_id=None`, never auto-quarantine). D9 stays the
+  single alert writer.
+- Erasure interplay (G7): subject erasure leaves the registry untouched (no
+  subject linkage); TenantDelete removes ONLY own memberships and the parent
+  row drops at zero; per-document TTL expiry does not decrement memberships
+  (accepted residual — possible stale-count alert needing human triage,
+  never a disclosure). Full rationale: `docs/compliance-ndpa.md`.
+
+### `POST /v1/internal/ocr/backfill-document-registry`
+
+Backfills/rebuilds the registry from the durable `ocr_documents` rows (first
+deployment, or re-key after HMAC rotation). Internal-only (never routed
+through APISIX). Auth: `X-Internal-Token` vs `OCR_INTERNAL_TOKEN`,
+constant-time, **fail-closed** — `503` when the env token is unset, `401` on
+missing/wrong (the W66 backfill idiom exactly).
+
+Request body (all optional; empty body = full backfill, first page):
+
+```json
+{
+  "tenant_id": "<uuid> — restrict to one tenant; absent = all tenants",
+  "since": "<RFC3339, tz-aware>", "until": "<RFC3339, tz-aware>",
+  "cursor": "<opaque — pass the previous response's next_cursor>",
+  "limit": 500, "dry_run": false
+}
+```
+
+Response:
+
+```json
+{"upserted": 3, "memberships_added": 3, "matches": 1,
+ "scanned": 3, "skipped": 0, "next_cursor": null}
+```
+
+Contract:
+
+- Keyset pagination on `(created_at, id)` **IS first-use-wins order** —
+  backfill reconstructs true chronology (`first_seen` comes from the
+  document row's `created_at`, never wall-clock).
+- Calls the **SAME registry-upsert function as the live path**, so a re-run
+  over an already-registered window adds zero memberships and emits zero new
+  match events (`alerted` flag + D9 MERGE dedup = at-most-one alert per
+  (tenant, hash)). `dry_run=true` scans and counts but writes/emits
+  NOTHING — run it first to size the window.
+- **RLS split:** tenant enumeration rides `sweep_conn()`; document row reads
+  are under `tenant_conn()` (no registry GUC on those reads); registry
+  writes go through the registry module's dedicated GUC connection only.
+- First production run: dry_run, then emit — **expect a one-time alert
+  burst** for pre-existing cross-tenant duplicates (S4 alerts; MERGE dedup
+  keeps re-runs free). Operator sequence + rotation:
+  `docs/runbooks/security.md` §7.
+
 ## Receipt OCR via fieldcapture
 
 booking-service fieldcapture owns the staff upload surface:

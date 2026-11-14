@@ -15,6 +15,12 @@ Routes:
                                  deterministic-id, historical-time
                                  DocumentExtracted re-emission with keyset
                                  pagination (SPEC-W66 WS1-A).
+  POST /v1/internal/ocr/backfill-document-registry
+                                 internauth registry backfill — replays
+                                 historical extracted rows through the
+                                 SPEC-W67 cross-tenant registry upsert
+                                 (same fn as the live path), keyset
+                                 pagination + dry_run (SPEC-W67).
   GET  /healthz
   GET  /metrics
   GET  /dapr/subscribe           Dapr programmatic subscriptions (W58 P3):
@@ -56,7 +62,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
-from . import erasure, events, sweeper
+from . import erasure, events, registry, sweeper
 from .av import AvClient, AvUnavailable, Infected, InfectedError
 from .config import ALLOWED_MIMES, DOCUMENT_KINDS, is_kyc_kind, settings
 from .dapr_client import DaprClient
@@ -149,6 +155,9 @@ async def lifespan(app: FastAPI):
     deps.dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
     # SPEC-W59 P1: clamd zINSTREAM sidecar client (None == disabled).
     deps.av = _build_av_client()
+    # SPEC-W67 G1: registry posture logged ONCE at startup — disabled
+    # (OCR_REGISTRY_HMAC_SECRET unset) is the fail-closed default.
+    registry.log_startup_posture(settings.ocr_registry_hmac_secret)
     # SPEC-W58 P3/P4: object deletion for the erasure consumers + TTL
     # sweeper (storage.py is upload-only by design).
     deps.objects = sweeper.MinioObjectDeleter(
@@ -494,6 +503,91 @@ async def _scan_upload(
     AV_SCANS.labels(result="clean").inc()
 
 
+async def _emit_registry_match(
+    deps: AppState,
+    *,
+    tenant_id: str,
+    document_id: Any,
+    kind: str,
+    sha256: str,
+    result: dict[str, Any],
+) -> None:
+    """SPEC-W67 G5/G6: emit the pinned CrossTenantDocumentMatch for the
+    LATER tenant. The platform-only audit line (registry_key + both sides'
+    tenant ids + ts) NEVER rides a tenant-visible path; the event payload
+    itself carries own-identifiers + one integer only."""
+    registry.REGISTRY_MATCHES.inc()
+    log.info(
+        "ocr_registry.cross_tenant_match",  # platform-only audit (NDPA R8)
+        registry_key=result["registry_key"],
+        later_tenant_id=tenant_id,
+        other_tenant_ids=result["other_tenant_ids"],
+        tenant_count=result["tenant_count"],
+    )
+    event = events.cross_tenant_match_event(
+        tenant_id=tenant_id,
+        document_id=document_id,
+        kind=kind,
+        sha256=sha256,
+        tenant_count=result["tenant_count"],
+    )
+    await deps.dapr.publish(
+        settings.dapr_pubsub_name, settings.ocr_events_topic, event
+    )
+
+
+async def _registry_register_and_alert(
+    deps: AppState,
+    *,
+    tenant_id: str,
+    document_id: uuid.UUID,
+    kind: str,
+    sha256: str,
+    first_seen: Any,
+) -> None:
+    """SPEC-W67 live write path — post-commit registry upsert + at-most-one
+    match emission. BEST-EFFORT: the extract/upload response is INVARIANT
+    whether or not a match fires (G5 timing/disclosure gate), so a registry
+    failure is logged and left for the backfill reconciler, never raised."""
+    if not settings.ocr_registry_hmac_secret:
+        # G1 fail-closed-disabled: the upsert is a no-op, the extract path
+        # is unaffected (the disabled posture logged once at startup).
+        return
+    try:
+        result = await registry.register_document(
+            deps.db,
+            secret=settings.ocr_registry_hmac_secret,
+            tenant_id=tenant_id,
+            sha256=sha256,
+            first_seen=first_seen,
+        )
+    except Exception as exc:
+        log.error(
+            "ocr_registry.upsert_failed",
+            document_id=str(document_id),
+            error=str(exc),
+        )
+        return
+    if result["match"]:
+        try:
+            await _emit_registry_match(
+                deps,
+                tenant_id=tenant_id,
+                document_id=document_id,
+                kind=kind,
+                sha256=sha256,
+                result=result,
+            )
+        except Exception as exc:
+            # At-most-one stands (the alerted flag is already committed);
+            # the audit line above is the platform reconciliation source.
+            log.error(
+                "ocr_registry.match_publish_failed",
+                document_id=str(document_id),
+                error=str(exc),
+            )
+
+
 async def _run_extraction(
     deps: AppState,
     *,
@@ -603,6 +697,9 @@ async def _run_extraction(
             extracted_text=None if kyc else extraction.text,
             extracted_fields=extraction.fields,
         )
+        # SPEC-W67: the registry's first_seen MUST be the document row's
+        # created_at (true chronology for the backfill), never wall-clock.
+        doc_row = await deps.db.get_document(conn, document_id)
     log.info(
         "ocr.extracted",
         document_id=str(document_id),
@@ -626,6 +723,18 @@ async def _run_extraction(
         # SPEC-W64: validated content type (from validate_upload above)
         # rides the DocumentExtracted event.
         mime=mime,
+    )
+    # SPEC-W67: cross-tenant registry hook — strictly POST-COMMIT (the
+    # mark_extracted tenant_conn transaction above has committed; failed
+    # uploads never reach this) and best-effort: the response below is
+    # byte-invariant whether or not a match fires.
+    await _registry_register_and_alert(
+        deps,
+        tenant_id=tenant_id,
+        document_id=document_id,
+        kind=kind,
+        sha256=digest,
+        first_seen=doc_row["created_at"],
     )
     return {
         "document_id": str(document_id),
@@ -974,6 +1083,178 @@ async def backfill_document_events(request: Request, deps: AppState = Depends(ge
     )
     return {
         "emitted": emitted,
+        "scanned": scanned,
+        "skipped": skipped,
+        "next_cursor": next_cursor,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W67: cross-tenant registry backfill. Replays historical
+# status='extracted' rows through the SAME registry upsert fn as the live
+# path (registry.register_document) so pre-existing cross-tenant duplicates
+# register + alert once (the alerted flag makes re-runs free). Separate
+# endpoint — the W66 event endpoint contract above is frozen.
+#
+# Internauth ONLY (W66 idiom exactly): X-Internal-Token vs
+# OCR_INTERNAL_TOKEN, constant-time; unset => 503, missing/wrong => 401.
+# G1 fail-closed: OCR_REGISTRY_HMAC_SECRET unset => 503 (the registry is
+# DISABLED; running a backfill would be a silent no-op).
+#
+# Keyset (created_at, id) IS first-use-wins order; pass next_cursor back
+# until it returns null. dry_run=true scans and counts but writes NOTHING
+# and emits NOTHING. RLS: tenant enumeration rides the EXISTING
+# sweep_conn() GUC escape; row reads stay under tenant_conn() (no registry
+# GUC on those reads); registry writes go through the registry module's
+# dedicated connection only.
+#
+# NOTE on the 502 retry: a match event publish failure after a committed
+# membership is NOT re-emitted on retry (the alerted flag is the
+# at-most-one record per (tenant, hash); the platform audit line is the
+# reconciliation source). Everything else is replay-safe.
+# ---------------------------------------------------------------------------
+@app.post("/v1/internal/ocr/backfill-document-registry")
+async def backfill_document_registry(request: Request, deps: AppState = Depends(get_state)):
+    if not settings.internal_token:
+        log.error("registry_backfill.unconfigured", msg="OCR_INTERNAL_TOKEN unset (fail closed)")
+        raise HTTPException(
+            status_code=503,
+            detail="internal auth not configured (OCR_INTERNAL_TOKEN unset)",
+        )
+    token = request.headers.get("x-internal-token")
+    if token is None or not hmac.compare_digest(token, settings.internal_token):
+        raise HTTPException(status_code=401, detail="invalid internal token")
+    if not settings.ocr_registry_hmac_secret:
+        # G1 fail-closed: the registry is DISABLED — refuse loudly instead
+        # of scanning and writing nothing.
+        log.error(
+            "registry_backfill.disabled",
+            msg="OCR_REGISTRY_HMAC_SECRET unset (fail closed)",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="registry disabled (OCR_REGISTRY_HMAC_SECRET unset)",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    tenant_filter = body.get("tenant_id")
+    if tenant_filter is not None:
+        if not isinstance(tenant_filter, str):
+            raise HTTPException(status_code=400, detail="tenant_id must be a uuid string")
+        try:
+            tenant_filter = str(uuid.UUID(tenant_filter))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="tenant_id must be a uuid string"
+            ) from None
+    since = _parse_rfc3339(body.get("since"), "since")
+    until = _parse_rfc3339(body.get("until"), "until")
+    if since is not None and until is not None and since > until:
+        raise HTTPException(status_code=400, detail="since must be <= until")
+    cursor = _parse_backfill_cursor(body.get("cursor"))
+    limit = _parse_backfill_limit(body.get("limit"))
+    dry_run = bool(body.get("dry_run", False))
+
+    # Tenant enumeration: the pinned tenant, or DISTINCT tenants holding
+    # extracted rows in the window via the EXISTING sweep GUC escape.
+    if tenant_filter is not None:
+        tenants = [tenant_filter]
+    else:
+        async with deps.db.sweep_conn() as conn:
+            tenants = await deps.db.list_backfill_tenant_ids(conn, since, until)
+
+    # Merge one globally (created_at, id)-ordered page across tenants —
+    # identical to the W66 reconciler above; that order IS first-use-wins
+    # order for the registry.
+    merged: list[dict[str, Any]] = []
+    exhausted = True
+    for tid in tenants:
+        async with deps.db.tenant_conn(tid) as conn:
+            rows = await deps.db.list_documents_for_backfill(
+                conn, since, until, cursor, limit
+            )
+        if len(rows) >= limit:
+            exhausted = False
+        merged.extend(rows)
+    merged.sort(key=lambda r: (r["created_at"], str(r["id"])))
+    page = merged[:limit]
+    truncated = len(merged) > limit
+
+    scanned = len(page)
+    upserted = 0
+    memberships_added = 0
+    matches = 0
+    skipped = 0
+    for row in page:
+        # Defensive skip (keeps upserted + skipped == scanned): sha256 and
+        # created_at are NOT NULL in the schema, so this should never trip.
+        if not row.get("sha256") or row.get("created_at") is None:
+            skipped += 1
+            log.warning("registry_backfill.row_skipped", document_id=str(row.get("id")))
+            continue
+        if dry_run:
+            skipped += 1  # counted, never written, never emitted
+            continue
+        result = await registry.register_document(
+            deps.db,
+            secret=settings.ocr_registry_hmac_secret,
+            tenant_id=str(row["tenant_id"]),
+            sha256=row["sha256"],
+            first_seen=row["created_at"],
+        )
+        upserted += 1
+        if result["membership_added"]:
+            memberships_added += 1
+        if result["match"]:
+            try:
+                await _emit_registry_match(
+                    deps,
+                    tenant_id=str(row["tenant_id"]),
+                    document_id=row["id"],
+                    kind=row["kind"],
+                    sha256=row["sha256"],
+                    result=result,
+                )
+            except Exception as exc:
+                log.error(
+                    "registry_backfill.publish_failed",
+                    document_id=str(row["id"]),
+                    error=str(exc),
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail="event publish failed; see endpoint contract note "
+                    "on alerted-flag at-most-one semantics",
+                ) from exc
+            matches += 1
+
+    next_cursor = None
+    if page and (truncated or not exhausted):
+        last = page[-1]
+        next_cursor = _encode_backfill_cursor(last["created_at"], last["id"])
+    log.info(
+        "registry_backfill.page",
+        tenants=len(tenants),
+        scanned=scanned,
+        upserted=upserted,
+        memberships_added=memberships_added,
+        matches=matches,
+        skipped=skipped,
+        dry_run=dry_run,
+        done=next_cursor is None,
+    )
+    return {
+        "upserted": upserted,
+        "memberships_added": memberships_added,
+        "matches": matches,
         "scanned": scanned,
         "skipped": skipped,
         "next_cursor": next_cursor,

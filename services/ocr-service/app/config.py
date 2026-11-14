@@ -122,6 +122,16 @@ class Settings(BaseSettings):
         default="", validation_alias=AliasChoices("OCR_INTERNAL_TOKEN")
     )
 
+    # SPEC-W67 G1/G3: HMAC key for the cross-tenant document-fraud registry
+    # (registry_key = HMAC-SHA256(secret, sha256); raw sha256 never enters
+    # the registry store). EMPTY disables the registry entirely
+    # (fail-closed-disabled, KYC_HASH_SECRET idiom): one startup log line,
+    # extract-path upserts become no-ops, and the backfill endpoint refuses
+    # (503). Rotation = re-key via the registry backfill (runbook).
+    ocr_registry_hmac_secret: str = Field(
+        default="", validation_alias=AliasChoices("OCR_REGISTRY_HMAC_SECRET")
+    )
+
     # MinIO document storage (PII — tenant-prefixed keys, bucket `documents`
     # created by the lakehouse createbucket job).
     minio_endpoint: str = Field(

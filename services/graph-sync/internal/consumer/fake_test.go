@@ -353,15 +353,44 @@ func (f *fakeGraph) LinkCaseMerged(_ context.Context, tenantID, ref, canonicalRe
 // UpsertDocument mirrors upsertDocumentQuery: MERGE by
 // (tenant, document_id) with a full property SET on re-delivery (MERGE
 // idempotency). Hash-only by contract (SPEC-W55 Scope A) — no PII, no
-// person linkage.
+// person linkage. The SPEC-W67 additive seen_elsewhere_count survives
+// re-projection (the Cypher SET list never touches it).
 func (f *fakeGraph) UpsertDocument(_ context.Context, d graph.Document) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if d.TenantID == "" {
 		return graph.ErrTenantRequired
 	}
+	k := key(d.TenantID, d.DocumentID)
+	keep := 0
+	if existing, ok := f.documents[k]; ok {
+		keep = existing.SeenElsewhereCount
+	}
 	cp := d
-	f.documents[key(d.TenantID, d.DocumentID)] = &cp
+	cp.SeenElsewhereCount = keep
+	f.documents[k] = &cp
+	return nil
+}
+
+// SetDocumentSeenElsewhere mirrors setDocumentSeenElsewhereQuery (SPEC-W67
+// G6): MERGE the tenant's own Document stub and apply MAX semantics —
+// redelivery of the same count is a no-op, a higher count updates, a lower
+// (stale) count never regresses the property.
+func (f *fakeGraph) SetDocumentSeenElsewhere(_ context.Context, tenantID, documentID string, tenantCount int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if tenantID == "" {
+		return graph.ErrTenantRequired
+	}
+	k := key(tenantID, documentID)
+	doc, ok := f.documents[k]
+	if !ok {
+		doc = &graph.Document{DocumentID: documentID, TenantID: tenantID}
+		f.documents[k] = doc
+	}
+	if tenantCount > doc.SeenElsewhereCount {
+		doc.SeenElsewhereCount = tenantCount
+	}
 	return nil
 }
 

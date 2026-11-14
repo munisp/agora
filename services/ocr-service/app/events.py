@@ -35,6 +35,13 @@ TOPIC_IDENTITY_EVENTS = "opendesk.identity.events"
 TYPE_AV_ALERT = "com.opendesk.ocr.AvScanAlert"
 TOPIC_OPS_ALERTS = "opendesk.ops.alerts"
 
+# SPEC-W67 (G5/G6, PINNED A<->B contract): cross-tenant exact-duplicate
+# match. Emitted on opendesk.ocr.events ONLY for the LATER tenant when its
+# upload joins a registry key that already has >=1 OTHER tenant; earlier
+# tenants are NEVER alerted. graph-sync projects seen_elsewhere_count onto
+# the later tenant's OWN Document node; D9's tenant-bound sweep raises S4.
+TYPE_CROSS_TENANT_MATCH = "com.opendesk.ocr.CrossTenantDocumentMatch"
+
 
 def cloud_event(
     event_type: str,
@@ -227,6 +234,41 @@ def document_backfill_event(
             "phash": phash,
             "model_version": model_version,
             "extracted_fields": fields,
+        },
+    )
+
+
+def cross_tenant_match_event(
+    *,
+    tenant_id: str,
+    document_id: uuid.UUID | str,
+    kind: str,
+    sha256: str,
+    tenant_count: int,
+) -> dict[str, Any]:
+    """SPEC-W67 PINNED contract — com.opendesk.ocr.CrossTenantDocumentMatch
+    (opendesk.ocr.events), emitted ONLY to the LATER tenant when its
+    membership add joins a registry key with >=1 OTHER tenant.
+
+    CloudEvents tenantid is the LATER tenant's id; subject is the LATER
+    tenant's OWN document_id (document-event precedent — DocumentExtracted
+    live :144 and backfill :223 use subject=str(document_id); only the
+    tenant-scoped UsageRecord/AV events use subject=tenant_id). data is
+    EXACTLY {document_id (the later tenant's OWN), sha256 (its OWN), kind,
+    tenant_count} — own identifiers plus ONE coarse integer (count, never
+    identity). NO other tenant ids, NO other document ids, NO other
+    tenants' timestamps, NO perceptual hash (G2/G5 zero-cross-tenant-
+    disclosure).
+    """
+    return cloud_event(
+        TYPE_CROSS_TENANT_MATCH,
+        subject=str(document_id),
+        tenant_id=tenant_id,
+        data={
+            "document_id": str(document_id),
+            "sha256": sha256,
+            "kind": kind,
+            "tenant_count": int(tenant_count),
         },
     )
 

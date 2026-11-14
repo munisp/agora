@@ -28,6 +28,16 @@ ALERT_TYPES: frozenset[str] = frozenset(
 ALERT_SEVERITIES: frozenset[str] = frozenset({"low", "medium", "high"})
 ALERT_STATUSES: frozenset[str] = frozenset({"open", "confirmed", "dismissed"})
 
+# SPEC-W67 G6: D9 signal S4 — cross-tenant exact-duplicate document reuse.
+# The alert TYPE stays ``document_abuse`` (D9 is the single alert writer;
+# alert_id document_abuse:{tenant}:none:xtenant:{sha256}); the sub-kind rides
+# ``evidence.signal``. This label is what the tenant's ops-alerts UI renders
+# for the signal. The evidence schema is zero-disclosure (own document ids +
+# seen_elsewhere_count ONLY) — the label must never imply otherwise.
+ALERT_SIGNAL_LABELS: dict[str, str] = {
+    "cross_tenant_exact_duplicate": "Cross-tenant document reuse",
+}
+
 _IDENT_RE_ERR = "alert_id must match [A-Za-z0-9_:-]{1,200}"
 
 

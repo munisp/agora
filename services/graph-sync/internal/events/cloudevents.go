@@ -8,6 +8,7 @@ package events
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -76,6 +77,12 @@ const (
 	// OCR extraction events (opendesk.ocr.events, SPEC-W55 Scope A): the
 	// W53 ocr-service emits DocumentExtracted after a successful extraction.
 	TypeOCRDocumentExtracted = "com.opendesk.ocr.DocumentExtracted"
+
+	// SPEC-W67 G6: ocr-service's cross-tenant document registry emits ONE
+	// CrossTenantDocumentMatch per (later tenant, hash) on the same
+	// opendesk.ocr.events topic. CloudEvents tenantid/subject address the
+	// LATER tenant only; earlier tenants never learn anything.
+	TypeOCRCrossTenantMatch = "com.opendesk.ocr.CrossTenantDocumentMatch"
 )
 
 // BookingData mirrors booking-service bookingops.marshalEvent payloads
@@ -224,4 +231,63 @@ func (evt CloudEvent) DecodeData(v any) error {
 		return err
 	}
 	return json.Unmarshal(raw, v)
+}
+
+// OCRCrossTenantMatchData mirrors the PINNED SPEC-W67 match-event payload
+// (the ONLY Coder A <-> Coder B interface; ocr-service emits it). It carries
+// EXACTLY four fields — the LATER tenant's OWN document_id + sha256 + kind
+// plus the cross-tenant tenant_count integer. NO other tenant ids, NO other
+// document ids, NO phash (G2: phash is excluded from every cross-tenant
+// artifact), NO storage pointers, NO extracted fields/text — the hash-only
+// stub posture (SPEC-W55 sacred constraint) is unchanged.
+type OCRCrossTenantMatchData struct {
+	DocumentID  string `json:"document_id"` // the LATER tenant's own document id
+	SHA256      string `json:"sha256"`      // lowercase hex of the tenant's own document bytes
+	Kind        string `json:"kind"`        // receipt|document|kyc_*|...
+	TenantCount int    `json:"tenant_count"`
+}
+
+// crossTenantMatchAllowlist is the PINNED payload key set (SPEC-W67: "data
+// = EXACTLY {document_id, sha256, kind, tenant_count: int}").
+var crossTenantMatchAllowlist = map[string]bool{
+	"document_id":  true,
+	"sha256":       true,
+	"kind":         true,
+	"tenant_count": true,
+}
+
+// DecodeCrossTenantMatch strictly decodes the pinned match payload: any key
+// outside the allowlist REJECTS the event (dead-letter posture — a widened
+// payload could carry cross-tenant disclosure and must never be projected),
+// and every pinned key must be present with a usable value (document_id /
+// sha256 non-empty, tenant_count a positive integer). Callers wrap the
+// error as Permanent; the consumer never crashes on a malformed event.
+func (evt CloudEvent) DecodeCrossTenantMatch() (OCRCrossTenantMatchData, error) {
+	var d OCRCrossTenantMatchData
+	if evt.Data == nil {
+		return d, fmt.Errorf("cross-tenant match event carries no data payload")
+	}
+	for k := range evt.Data {
+		if !crossTenantMatchAllowlist[k] {
+			return d, fmt.Errorf("cross-tenant match payload carries disallowed key %q (pinned allowlist: document_id, sha256, kind, tenant_count)", k)
+		}
+	}
+	for _, k := range []string{"document_id", "sha256", "kind", "tenant_count"} {
+		if _, ok := evt.Data[k]; !ok {
+			return d, fmt.Errorf("cross-tenant match payload misses required key %q", k)
+		}
+	}
+	if err := evt.DecodeData(&d); err != nil {
+		return d, fmt.Errorf("cross-tenant match payload decode: %v", err)
+	}
+	if strings.TrimSpace(d.DocumentID) == "" {
+		return d, fmt.Errorf("cross-tenant match payload requires a non-empty document_id")
+	}
+	if strings.TrimSpace(d.SHA256) == "" {
+		return d, fmt.Errorf("cross-tenant match payload requires a non-empty sha256")
+	}
+	if d.TenantCount < 1 {
+		return d, fmt.Errorf("cross-tenant match payload requires tenant_count >= 1 (got %d)", d.TenantCount)
+	}
+	return d, nil
 }

@@ -40,6 +40,20 @@ export const ALERT_STATUSES = [
   { value: "dismissed", label: "Dismissed" },
 ] as const;
 
+/**
+ * SPEC-W67 G6: D9 signal S4 — cross-tenant exact-duplicate document reuse.
+ * The alert TYPE stays `document_abuse` (D9 is the single alert writer);
+ * `evidence.signal` discriminates the sub-kind. Evidence is zero-disclosure
+ * (own document ids + seen_elsewhere_count only — never other tenant ids).
+ */
+export const ALERT_SIGNALS = [
+  { value: "cross_tenant_exact_duplicate", label: "Cross-tenant document reuse" },
+] as const;
+
+export function alertSignalLabel(signal: string): string {
+  return ALERT_SIGNALS.find((s) => s.value === signal)?.label ?? signal.replace(/_/g, " ");
+}
+
 export type AlertSeverity = "low" | "medium" | "high";
 
 /** Severity ramp: sage → amber → terracotta (brand rule: never red/blue). */

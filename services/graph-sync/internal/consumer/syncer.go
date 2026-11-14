@@ -626,7 +626,7 @@ func (s *Syncer) civicMerged(ctx context.Context, evt events.CloudEvent, tenantI
 // them via tenant_id (RECON-W55 §5.4).
 func (s *Syncer) HandleOCR(ctx context.Context, evt events.CloudEvent) error {
 	switch evt.Type {
-	case events.TypeOCRDocumentExtracted:
+	case events.TypeOCRDocumentExtracted, events.TypeOCRCrossTenantMatch:
 	default:
 		return nil // forward-compatible: ack unknown types on the topic
 	}
@@ -638,6 +638,9 @@ func (s *Syncer) HandleOCR(ctx context.Context, evt events.CloudEvent) error {
 		return err
 	} else if dup {
 		return nil
+	}
+	if evt.Type == events.TypeOCRCrossTenantMatch {
+		return s.crossTenantMatch(ctx, evt, tenantID)
 	}
 	var d events.OCRDocumentData
 	if err := evt.DecodeData(&d); err != nil {
@@ -672,6 +675,38 @@ func (s *Syncer) HandleOCR(ctx context.Context, evt events.CloudEvent) error {
 		return err
 	}
 	s.metrics().Inc("ocr_documents_projected")
+	return nil
+}
+
+// crossTenantMatch projects the PINNED SPEC-W67 match event
+// (com.opendesk.ocr.CrossTenantDocumentMatch) onto the LATER tenant's OWN
+// Document node: SET doc.seen_elsewhere_count = tenant_count with MAX
+// semantics (idempotent under redelivery; stale lower counts never
+// regress). The event is addressed to ONE tenant (CloudEvents tenantid —
+// the pinned payload has no tenant_id key, so a missing extension is
+// poison, never a cross-write) and carries the tenant's own identifiers
+// plus ONE integer — nothing else is decoded, persisted, or logged
+// (zero cross-tenant disclosure; hash-only stub posture unchanged).
+// Fraud detector D9's tenant-bound sweep turns the count into the S4
+// cross_tenant_exact_duplicate alert; graph-sync stays projection-only.
+func (s *Syncer) crossTenantMatch(ctx context.Context, evt events.CloudEvent, tenantID string) error {
+	d, err := evt.DecodeCrossTenantMatch()
+	if err != nil {
+		return Permanent(fmt.Errorf("malformed cross-tenant match data: %v", err))
+	}
+	if err := s.Graph.UpsertTenant(ctx, tenantID, evt.Subject, s.now()); err != nil {
+		return err
+	}
+	if err := s.Graph.SetDocumentSeenElsewhere(ctx, tenantID,
+		strings.TrimSpace(d.DocumentID), d.TenantCount); err != nil {
+		return err
+	}
+	s.metrics().Inc("ocr_cross_tenant_matches_projected")
+	s.log().Info("cross-tenant document match projected",
+		zap.String("tenant_id", tenantID),
+		zap.String("document_id", strings.TrimSpace(d.DocumentID)),
+		zap.Int("tenant_count", d.TenantCount),
+		zap.String("event_id", evt.ID))
 	return nil
 }
 

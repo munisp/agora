@@ -427,6 +427,33 @@ SET doc.kind = $kind,
 	}
 }
 
+// setDocumentSeenElsewhereQuery projects the PINNED SPEC-W67 cross-tenant
+// match event (com.opendesk.ocr.CrossTenantDocumentMatch) onto the LATER
+// tenant's OWN Document node: MERGE by (tenant_id, document_id) — the same
+// key as upsertDocumentQuery, so an out-of-order match arriving before the
+// DocumentExtracted projection still lands — and SET the additive
+// seen_elsewhere_count property with MAX semantics: redelivery of the same
+// tenant_count is a no-op, a HIGHER tenant_count updates, a LOWER (stale)
+// tenant_count NEVER regresses the property. The count is the ONLY
+// cross-tenant-derived datum on the node (count, not identity — SPEC-W67
+// G5/G6); no other Document property is touched (the hash-only
+// DocumentExtracted projection owns kind/status/hashes), and no other
+// tenant's identifiers can exist here.
+func setDocumentSeenElsewhereQuery(tenantID, documentID string, tenantCount int) q {
+	return q{
+		text: `MERGE (doc:Document {tenant_id: $tenant_id, document_id: $document_id})
+SET doc.seen_elsewhere_count = CASE
+    WHEN doc.seen_elsewhere_count IS NULL THEN $tenant_count
+    WHEN $tenant_count > doc.seen_elsewhere_count THEN $tenant_count
+    ELSE doc.seen_elsewhere_count END`,
+		params: map[string]any{
+			"tenant_id":    tenantID,
+			"document_id":  documentID,
+			"tenant_count": tenantCount,
+		},
+	}
+}
+
 // personExistsQuery is the pre-delete check (erasure must be idempotent and
 // report found/not-found for the audit event).
 func personExistsQuery(tenantID, personID string) q {

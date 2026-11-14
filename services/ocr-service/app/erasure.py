@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any
 
 from .logging import get_logger
+from . import registry
 from .sweeper import ObjectDeleter
 
 log = get_logger(__name__)
@@ -109,10 +110,21 @@ async def handle_tenant_deleted(db: Any, deleter: ObjectDeleter, event: Any) -> 
             )
     async with db.tenant_conn(tenant_id) as conn:
         deleted = await db.delete_tenant_documents(conn)
+    # SPEC-W67 G7: remove ONLY the tenant's own cross-tenant registry
+    # memberships (registry module — its dedicated GUC connection is the
+    # only path that can reach those tables; the tenant_conn above cannot).
+    # The parent fingerprint row is dropped when its last membership
+    # leaves; other tenants' memberships/protection are untouched. Subject
+    # erasure (above) NEVER touches the registry — no subject linkage.
+    # Runs even when the registry is disabled (no HMAC needed for a
+    # tenant-keyed delete; memberships could predate a key rotation).
+    reg = await registry.remove_tenant_memberships(db, tenant_id)
     log.info(
         "tenant_deleted.applied",
         tenant_id=tenant_id,
         objects_deleted=objects,
         rows_deleted=deleted,
+        registry_memberships_removed=reg["memberships_removed"],
+        registry_keys_dropped=reg["keys_dropped"],
     )
     return {"objects": objects, "rows": deleted}

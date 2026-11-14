@@ -147,6 +147,15 @@ class Settings:
     d9_phash_hamming_max: int = field(
         default_factory=lambda: _int("D9_PHASH_HAMMING_MAX", 6)
     )
+    # S4 cross_tenant_exact_duplicate (SPEC-W67 G6): the tenant's OWN
+    # (:Document) stub carries seen_elsewhere_count — graph-sync's projection
+    # of the ocr registry's pinned CrossTenantDocumentMatch event (the ONLY
+    # cross-tenant datum: a distinct-tenant count, never an identity). Count
+    # >= this => high. Evidence stays zero-disclosure (own document ids +
+    # count ONLY); D9 still never auto-quarantines.
+    d9_xtenant_min_count: int = field(
+        default_factory=lambda: _int("D9_XTENANT_MIN_COUNT", 2)
+    )
 
     # D7 gnn_anomaly (SPEC-W30 §3: consume risk_score >= 0.9 from the W29 sweep).
     anomaly_alert_threshold: float = field(

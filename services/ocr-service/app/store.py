@@ -90,6 +90,48 @@ DROP POLICY IF EXISTS tenant_isolation ON ocr_documents;
 CREATE POLICY tenant_isolation ON ocr_documents
     USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid
            OR current_setting('app.ocr_internal_sweep', true) = 'on');
+
+-- SPEC-W67 (G1/G4): cross-tenant document-fraud registry. Platform-scoped
+-- tables keyed by registry_key = HMAC-SHA256(OCR_REGISTRY_HMAC_SECRET,
+-- sha256) — the raw sha256 NEVER enters the registry store (G3), and there
+-- is NO document_id, storage_key, perceptual hash, kind, fields, or text
+-- anywhere in these tables (G2 minimization; a perceptual hash is an
+-- invertible-thumbnail disclosure cross-tenant). FORCE RLS both; the
+-- single policy passes ONLY
+-- via the app.ocr_registry GUC escape, which is set exclusively inside
+-- app/registry.py's dedicated connection helper (sweep_conn idiom, kept
+-- SEPARATE from app.ocr_internal_sweep for auditability) — request paths
+-- can never read or write the registry. Membership rows are the minimum
+-- needed for the distinct-tenant count and the at-most-one alert per
+-- (tenant, hash); TenantDelete removes only the tenant's own memberships
+-- and the parent row is dropped when the last membership leaves (G7).
+CREATE TABLE IF NOT EXISTS ocr_doc_registry (
+    registry_key TEXT PRIMARY KEY,
+    first_seen   TIMESTAMPTZ NOT NULL,
+    last_seen    TIMESTAMPTZ NOT NULL,
+    tenant_count INT NOT NULL,
+    doc_count    INT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ocr_doc_registry_tenants (
+    registry_key TEXT NOT NULL REFERENCES ocr_doc_registry ON DELETE CASCADE,
+    tenant_id    UUID NOT NULL,
+    first_seen   TIMESTAMPTZ NOT NULL,
+    alerted      BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (registry_key, tenant_id)
+);
+
+ALTER TABLE ocr_doc_registry ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ocr_doc_registry FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS registry_internal_access ON ocr_doc_registry;
+CREATE POLICY registry_internal_access ON ocr_doc_registry
+    USING (current_setting('app.ocr_registry', true) = 'on');
+
+ALTER TABLE ocr_doc_registry_tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ocr_doc_registry_tenants FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS registry_internal_access ON ocr_doc_registry_tenants;
+CREATE POLICY registry_internal_access ON ocr_doc_registry_tenants
+    USING (current_setting('app.ocr_registry', true) = 'on');
 """
 
 
@@ -358,7 +400,11 @@ class Database:
 
     @staticmethod
     async def delete_tenant_documents(conn) -> int:
-        """Hard-delete ALL rows for the tenant (TenantDeleted, P3)."""
+        """Hard-delete ALL rows for the tenant (TenantDeleted, P3).
+        SPEC-W67 G7: the tenant's registry MEMBERSHIPS are removed by the
+        caller via the registry module (app/registry.py) — they live behind
+        the app.ocr_registry GUC escape and can never be reached from this
+        tenant-scoped connection."""
         result = await conn.execute("DELETE FROM ocr_documents")
         return int(result.split()[-1]) if result else 0
 

@@ -114,6 +114,15 @@ type Client interface {
 	// them via tenant_id (RECON-W55 §5.4).
 	UpsertDocument(ctx context.Context, d Document) error
 
+	// SetDocumentSeenElsewhere projects a SPEC-W67 cross-tenant registry
+	// match (com.opendesk.ocr.CrossTenantDocumentMatch) onto the tenant's
+	// OWN Document node: SET seen_elsewhere_count = tenant_count with MAX
+	// semantics (a stale LOWER count never regresses the property;
+	// redelivery is a no-op). MERGE by (tenant_id, document_id) so an
+	// out-of-order match preceding DocumentExtracted still lands. The
+	// count is the ONLY cross-tenant-derived datum (count, not identity).
+	SetDocumentSeenElsewhere(ctx context.Context, tenantID, documentID string, tenantCount int) error
+
 	// FindPersonByPhoneHash resolves the person_id of an exact phone_hash
 	// match within the tenant ("" when none) — used by phone-only erasure
 	// tombstones.
@@ -233,6 +242,12 @@ type Document struct {
 	ModelVersion string
 	PageCount    int
 	CreatedAt    time.Time
+	// SeenElsewhereCount is the SPEC-W67 additive cross-tenant property: the
+	// number of DISTINCT tenants the platform registry has seen this exact
+	// sha256 on (count, not identity — set ONLY by SetDocumentSeenElsewhere
+	// from the pinned match event; the hash-only DocumentExtracted
+	// projection never touches it). 0 = never seen elsewhere.
+	SeenElsewhereCount int
 }
 
 // PhoneHash computes the salted SHA-256 phone hash (SPEC-W28 §3: "same

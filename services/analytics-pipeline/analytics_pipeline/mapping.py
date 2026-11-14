@@ -304,6 +304,13 @@ def _as_receipt_date(value: Any) -> Optional[str]:
 # opendesk.booking.events topic but are NOT booking events.
 RECEIPT_RECON_FINDING_TYPE = "ReceiptReconFinding"
 
+# SPEC-W67 (gate 9): the ONLY opendesk.ocr.events type that may map into
+# bronze.receipt_documents. The W67 CrossTenantDocumentMatch event carries
+# data.kind ("receipt" for a receipt-kind duplicate), so map_ocr_document
+# must check the CloudEvent envelope TYPE, not just data.kind — an unknown
+# or foreign typed envelope is IGNORED, never mapped.
+OCR_DOCUMENT_EXTRACTED_TYPE = "DocumentExtracted"
+
 # SPEC-W64 (G-B): two more booking.events types that are NOT booking
 # events — each gets its own bronze table and must NEVER fall through to
 # bronze.booking_events (the dbt stg_booking_events.event_type
@@ -477,6 +484,17 @@ def map_ocr_document(message: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     vendor, no note, no items, no free text, no other key is ever touched.
     """
     envelope, data = split_envelope(message)
+    # SPEC-W67 (gate 9): envelope-type guard (short_event_type idiom). The
+    # W67 CrossTenantDocumentMatch event carries data.kind ("receipt" for a
+    # receipt-kind duplicate) and would otherwise pass the kind filter and
+    # be mis-mapped into bronze.receipt_documents. Only a PRESENT-but-
+    # foreign envelope type is rejected; bare payloads (no envelope) and
+    # DocumentExtracted events keep byte-identical legacy behavior.
+    raw_type = envelope.get("type")
+    if isinstance(raw_type, str) and raw_type:
+        short = short_event_type(raw_type) or ""
+        if short.lower() != OCR_DOCUMENT_EXTRACTED_TYPE.lower():
+            return None
     kind = _as_str(_get(data, "kind"))
     if kind != "receipt":
         return None

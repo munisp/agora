@@ -63,6 +63,7 @@ func TestQueries_TenantIDOnEveryStatement(t *testing.T) {
 		erasePersonQuery("t1", "p1"),
 		applyEnrichmentQuery("t1", "p1", map[string]any{"ltv_cents": 1000}, "2026-08-06", now),
 		upsertDocumentQuery(Document{DocumentID: "d1", TenantID: "t1", Kind: "receipt", Status: "extracted", SHA256: "ab", PHash: "cd", PageCount: 2, ModelVersion: "v1", CreatedAt: now}),
+		setDocumentSeenElsewhereQuery("t1", "d1", 3),
 	}
 	for i, stmt := range stmts {
 		require.Contains(t, stmt.text, "tenant_id", "statement %d must be tenant-scoped", i)
@@ -120,6 +121,27 @@ func TestDocumentQuery_HashOnly(t *testing.T) {
 	}, paramKeys(stmt.params), "exactly the pinned hash-only parameter set")
 	require.NotContains(t, stmt.text, "storage", "storage pointers never projected")
 	require.NotContains(t, stmt.text, "extracted_fields", "extracted fields never projected")
+}
+
+// TestDocumentSeenElsewhereQuery_MaxSemantics pins the SPEC-W67 G6 static
+// side: the cross-tenant match projection is MERGE-keyed on the tenant's
+// OWN (tenant_id, document_id), SETs ONLY the additive seen_elsewhere_count
+// with MAX semantics (stale lower counts never regress), and carries the
+// exact three-parameter set — no phash, no storage, no other tenant ids.
+func TestDocumentSeenElsewhereQuery_MaxSemantics(t *testing.T) {
+	stmt := setDocumentSeenElsewhereQuery("t1", "d1", 3)
+	require.Contains(t, stmt.text, "MERGE (doc:Document {tenant_id: $tenant_id, document_id: $document_id})")
+	require.Contains(t, stmt.text, "seen_elsewhere_count")
+	require.Contains(t, stmt.text, "CASE", "MAX semantics: stale lower counts never regress")
+	require.Contains(t, stmt.text, "$tenant_count > doc.seen_elsewhere_count")
+	require.ElementsMatch(t, []string{"tenant_id", "document_id", "tenant_count"},
+		paramKeys(stmt.params), "exactly the pinned W67 parameter set")
+	require.Equal(t, "t1", stmt.params["tenant_id"], "tenant-scoped (gate 1)")
+	require.Equal(t, "d1", stmt.params["document_id"])
+	require.Equal(t, 3, stmt.params["tenant_count"])
+	for _, banned := range []string{"phash", "storage", "extracted", "tenant_ids"} {
+		require.NotContains(t, stmt.text, banned, "cross-tenant projection stays count-only")
+	}
 }
 
 func paramKeys(m map[string]any) []string {

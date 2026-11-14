@@ -453,6 +453,9 @@ class FakeGraphClient:
                     "kind": d.get("kind"),
                     "status": d.get("status"),
                     "created_at": d.get("created_at"),
+                    # SPEC-W67 G6: additive count-only property set by
+                    # graph-sync from the pinned registry match event.
+                    "seen_elsewhere_count": d.get("seen_elsewhere_count"),
                 }
             )
         return rows
