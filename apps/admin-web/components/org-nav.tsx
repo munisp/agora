@@ -118,9 +118,10 @@ const items: NavItem[] = [
 const linkClass = (active: boolean) =>
   cn(
     "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+    // Dark umber sidebar: tan marks the current page.
     active
-      ? "bg-secondary text-secondary-foreground"
-      : "text-muted-foreground hover:bg-accent hover:text-foreground",
+      ? "bg-paper/10 text-paper shadow-[inset_3px_0_0_var(--color-tan)]"
+      : "text-paper/65 hover:bg-paper/5 hover:text-paper",
   );
 
 export function OrgNav({

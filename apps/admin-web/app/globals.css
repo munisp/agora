@@ -1,8 +1,9 @@
 @import "tailwindcss";
 
 /*
- * OpenDesk palette: low-saturation warm neutrals ("reception desk" feel).
- * No gradients anywhere — flat, calm surfaces with warm umber accents.
+ * Agora palette (the app's own): warm umber on cream, low-saturation neutrals ("reception desk" feel), with a deep
+ * brown for dark panels and tan/rust accents. Serif display (Newsreader) over a clean grotesk (Hanken Grotesk); fonts are
+ * loaded in layout.tsx. The page structure follows OAK's (photo hero, woven band, patterned sections).
  */
 @theme {
   --color-background: #faf7f1;
@@ -39,14 +40,22 @@
   --color-info-soft: #dfe5e8;
   --color-danger-soft: #f0ded8;
 
+  /* Brand accents for the marketing pages, sign-in, booking page and sidebar. */
+  --color-umber: #7c5b3e;
+  --color-umber-deep: #2b2119;
+  --color-tan: #c9a574;
+  --color-rust: #9e4a38;
+  --color-ivory: #faf7f1;
+  --color-paper: #fffdf8;
+
   --radius-sm: 0.375rem;
   --radius-md: 0.5rem;
   --radius-lg: 0.75rem;
   --radius-xl: 1rem;
 
   --font-sans:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    var(--font-hanken), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: var(--font-newsreader), Georgia, "Times New Roman", serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
@@ -63,4 +72,40 @@ body {
 
 ::selection {
   background-color: var(--color-secondary);
+}
+
+/* Display headings: the serif voice of the brand. */
+h1, h2, .font-display {
+  font-family: var(--font-display);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+/* Small capitals label above a heading. */
+.eyebrow {
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-rust);
+}
+
+/* A thin woven band (aso-oke-like stripes) used as a section edge. */
+.woven-band {
+  height: 6px;
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--color-tan) 0 10px,
+    var(--color-umber) 10px 14px,
+    var(--color-rust) 14px 18px,
+    var(--color-umber) 18px 22px
+  );
+}
+
+/* Faint diamond pattern on ivory sections. */
+.paper-pattern {
+  background-color: var(--color-background);
+  background-image: radial-gradient(color-mix(in srgb, var(--color-tan) 18%, transparent) 1px, transparent 1.5px);
+  background-size: 28px 28px;
 }

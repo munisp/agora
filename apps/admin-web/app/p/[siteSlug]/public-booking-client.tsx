@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import * as React from "react";
 import { ArrowLeft, ArrowRight, CheckCircle2, Clock, Users } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -139,44 +140,51 @@ export function PublicBookingClient({
 
   return (
     <div className="min-h-screen bg-background">
-      <header className="border-b border-border bg-card">
-        <div className={cn("mx-auto max-w-3xl px-6", compact ? "py-4" : "py-8")}>
-          <div className="flex items-center gap-3">
+      <header className={cn("relative text-paper", compact ? "bg-umber" : "bg-umber-deep")}>
+        <div className={cn("mx-auto max-w-3xl px-6", compact ? "py-5" : "pb-12 pt-10")}>
+          <div className="flex items-center gap-4">
             {logoUrl ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={logoUrl}
                 alt={`${brandName} logo`}
-                className="h-10 w-10 rounded-md border border-border object-contain"
+                className="h-12 w-12 rounded-lg border border-paper/20 bg-paper object-contain"
               />
-            ) : null}
+            ) : (
+              <span className="flex h-12 w-12 items-center justify-center rounded-lg bg-tan font-display text-2xl text-umber-deep">
+                {brandName.slice(0, 1)}
+              </span>
+            )}
             <div>
-              <h1 className={cn("font-bold tracking-tight", compact ? "text-xl" : "text-3xl")}>
+              {!compact ? <p className="eyebrow !text-tan">Book an appointment</p> : null}
+              <h1 className={cn("leading-tight", compact ? "text-2xl" : "mt-1 text-4xl sm:text-5xl")}>
                 {brandName}
               </h1>
               {site.tagline ? (
-                <p className="mt-1 text-muted-foreground">{site.tagline}</p>
+                <p className="mt-1 text-paper/75">{site.tagline}</p>
               ) : null}
             </div>
           </div>
           {heroTitle ? (
-            <p className="mt-3 text-lg font-medium">{heroTitle}</p>
+            <p className="mt-5 font-display text-2xl">{heroTitle}</p>
           ) : null}
           {heroSubtitle ? (
-            <p className="mt-2 max-w-xl text-sm text-muted-foreground">
+            <p className="mt-2 max-w-xl text-paper/75">
               {heroSubtitle}
             </p>
           ) : null}
           {!embed ? (
-            <div className="mt-5">
+            <div className="mt-7 flex flex-wrap items-center gap-4">
               <VoiceSessionButton
                 tenant={site.tenant_slug}
                 siteSlug={site.site_slug}
-                accent={accent}
+                accent="#c9a574"
               />
+              <span className="text-sm text-paper/70">or chat with the receptionist, bottom right</span>
             </div>
           ) : null}
         </div>
+        <div className="woven-band" />
       </header>
 
       <main className="mx-auto max-w-3xl px-6 py-10">
@@ -225,7 +233,7 @@ export function PublicBookingClient({
                   }}
                   className="rounded-lg border border-border bg-card p-5 text-left shadow-sm transition-shadow hover:shadow-md cursor-pointer"
                 >
-                  <p className="font-semibold">{o.name}</p>
+                  <p className="font-display text-xl text-umber">{o.name}</p>
                   {o.description ? (
                     <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">
                       {o.description}
@@ -486,8 +494,8 @@ export function PublicBookingClient({
       </main>
 
       {!embed ? (
-        <footer className="border-t border-border py-6 text-center text-xs text-muted-foreground">
-          {brandName} · Powered by Agora — open-source AI receptionist
+        <footer className="border-t border-border py-8 text-center text-xs text-muted-foreground">
+          {brandName} · Bookings by <Link href="/" className="font-medium text-umber hover:underline">Agora</Link>
         </footer>
       ) : null}
 

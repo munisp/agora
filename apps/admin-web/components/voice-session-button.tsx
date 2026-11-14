@@ -187,8 +187,8 @@ export function VoiceSessionButton({
     <span className="inline-flex flex-col items-start gap-1">
       <button
         onClick={() => void start()}
-        className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium text-white cursor-pointer"
-        style={{ backgroundColor: accent }}
+        className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium cursor-pointer"
+        style={{ backgroundColor: accent, color: readableOn(accent) }}
       >
         <Mic className="h-4 w-4" />
         Talk to receptionist
@@ -198,4 +198,16 @@ export function VoiceSessionButton({
       ) : null}
     </span>
   );
+}
+
+/** Dark text on light accents (e.g. tan), white on dark ones, so the label stays readable. */
+function readableOn(hex: string): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return "#ffffff";
+  const n = parseInt(m[1], 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => {
+    const v = c / 255;
+    return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.3 ? "#2b2119" : "#ffffff";
 }
