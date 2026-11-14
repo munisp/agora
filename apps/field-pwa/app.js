@@ -34,6 +34,10 @@ var DEFAULTS = {
   issuer: BUILD_CONFIG.issuer || "http://localhost:8080/realms/opendesk",
   clientId: "opendesk-field",
   apiBase: BUILD_CONFIG.apiBase || "/api/bookings", // APISIX: /api/bookings/* -> booking-service
+  // SPEC-W63: geo-service rides the SAME APISIX pattern as api-bookings
+  // (route `api-geo`: /api/geo/* -> geo-service, identical openid-connect
+  // bearer_only config — RECON G2). Same-origin, derived exactly like apiBase.
+  geoBase: BUILD_CONFIG.geoBase || "/api/geo", // APISIX: /api/geo/* -> geo-service
 };
 
 function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
@@ -45,6 +49,7 @@ function cfg() {
     issuer: DEFAULTS.issuer,
     clientId: DEFAULTS.clientId,
     apiBase: DEFAULTS.apiBase,
+    geoBase: DEFAULTS.geoBase,
   };
 }
 /* One-time scrub of any pre-K25 user-supplied endpoint override. */
@@ -84,7 +89,12 @@ function openDb() {
   return new Promise(function (resolve, reject) {
     // SPEC-W57 B2: v1 -> v2 adds the `receipts` store ONLY — existing
     // outbox/meta data is untouched by the upgrade.
-    var req = indexedDB.open("opendesk-field", 2);
+    // SPEC-W63: v2 -> v3 adds the `gazetteer` store ONLY (offline copy of
+    // the geo-service reference gazetteer: states + LGAs; etag lives in
+    // `meta`). Every store is behind its own objectStoreNames guard, so the
+    // upgrade is additive-only from ANY prior version (fresh v3, v1->v3 and
+    // v2->v3 all converge on the same schema without touching existing data).
+    var req = indexedDB.open("opendesk-field", 3);
     req.onupgradeneeded = function () {
       var db = req.result;
       if (!db.objectStoreNames.contains("outbox")) {
@@ -97,6 +107,14 @@ function openDb() {
         // Out-of-line keys: outbox item id -> photo Blob. The photo is
         // non-secret business data; tokens never touch IDB (TS-003, B6).
         db.createObjectStore("receipts");
+      }
+      if (!db.objectStoreNames.contains("gazetteer")) {
+        // Public reference geography (state/lga rows keyed by their stable
+        // gazetteer `code`, e.g. NG-LAGOS / NG-LAGOS-IKEJA) — non-secret,
+        // fully replaceable from the server snapshot.
+        var gs = db.createObjectStore("gazetteer", { keyPath: "code" });
+        gs.createIndex("kind", "kind", { unique: false });
+        gs.createIndex("parent_code", "parent_code", { unique: false });
       }
     };
     req.onsuccess = function () { resolve(req.result); };
@@ -177,6 +195,21 @@ function syncMeta() {
       s.put({ k: "ctx", slug: lsGet(LS.slug), cfg: cfg(), mode: mode() });
     });
   }).catch(function () {});
+}
+
+function metaGet(k) {
+  return openDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var req = db.transaction("meta").objectStore("meta").get(k);
+      req.onsuccess = function () { resolve(req.result || null); };
+      req.onerror = function () { reject(req.error); };
+    });
+  });
+}
+function metaPut(obj) {
+  return openDb().then(function (db) {
+    return tx(db, "meta", "readwrite", function (s) { s.put(obj); });
+  });
 }
 
 /* ---------------- PKCE auth (Keycloak public client) ---------------- */
@@ -354,10 +387,20 @@ function captureLead() {
     // `phone` rides along for backward compatibility with older readers of
     // the outbox/anchor payload; the server only consumes phone_e164.
     var payload = { name: name, phone_e164: phoneE164, phone: phoneE164, notes: notes };
+    // SPEC-W63: optional gazetteer place names (state/lga as selected).
+    // R3 spike: fieldcapture decodes the payload with encoding/json into
+    // LeadCapturePayload — unknown keys are ignored, and the raw payload is
+    // preserved verbatim on the field_captures anchor row (JSONB) — so new
+    // keys are additive and safe. lga_id is deliberately NOT wired (it
+    // points into the synthetic cac gazetteer).
+    var place = selectedPlace();
+    if (place.state) payload.state = place.state;
+    if (place.lga) payload.lga = place.lga;
     return enqueue("lead_capture", payload, gps).then(function () {
       document.getElementById("f-name").value = "";
       document.getElementById("f-phone").value = "";
       document.getElementById("f-notes").value = "";
+      resetPlaceFields();
       toast("Lead queued" + (navigator.onLine ? " — syncing…" : " (offline)."));
     });
   });
@@ -465,6 +508,194 @@ function captureReceipt() {
     renderOutbox();
     toast("Could not store the photo on this device — receipt NOT queued.");
   });
+}
+
+/* ---------------- gazetteer (SPEC-W63 Scope C) ----------------
+ *
+ * Offline copy of the geo-service reference gazetteer (states + LGAs) in
+ * the IDB `gazetteer` store; the snapshot ETag rides in `meta` under
+ * GAZ_ETAG_KEY. The download runs ONLY in page context (boot + 'online'
+ * event): the SW holds no tokens and cannot attach Authorization (TS-003),
+ * and the snapshot must NOT be replayed from the SW cache (R4), hence
+ * cache:"no-store" on the fetch. Posture is fail-open at every step — a
+ * sync failure keeps the existing local copy and never blocks capture.
+ */
+var GAZ_ETAG_KEY = "gazetteer_etag";
+
+function byName(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); }
+
+/* Rows read through the `kind` / `parent_code` indexes; an unreadable or
+ * absent store degrades to [] (callers then show the free-text fallback). */
+function gazetteerByKind(kind) {
+  return openDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var req = db.transaction("gazetteer").objectStore("gazetteer")
+        .index("kind").getAll(kind);
+      req.onsuccess = function () { resolve(req.result || []); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).catch(function () { return []; });
+}
+function gazetteerChildren(parentCode) {
+  return openDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var req = db.transaction("gazetteer").objectStore("gazetteer")
+        .index("parent_code").getAll(parentCode);
+      req.onsuccess = function () { resolve(req.result || []); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }).catch(function () { return []; });
+}
+
+/* Full-snapshot replace in ONE transaction: clear + bulk put, so a reader
+ * never sees a half-swapped gazetteer. */
+function gazetteerReplace(rows) {
+  return openDb().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var t = db.transaction("gazetteer", "readwrite");
+      var s = t.objectStore("gazetteer");
+      s.clear();
+      rows.forEach(function (r) { s.put(r); });
+      t.oncomplete = function () { resolve(rows.length); };
+      t.onerror = function () { reject(t.error); };
+      t.onabort = function () { reject(t.error); };
+    });
+  });
+}
+
+/* The snapshot body's envelope is consumed defensively (bare array, or
+ * places/items/rows array property) and every row is validated — the store
+ * keyPath is `code`, so a malformed row would abort the whole replace tx. */
+function gazetteerRows(body) {
+  var rows = Array.isArray(body) ? body
+    : (body && (body.places || body.items || body.rows)) || [];
+  var out = [];
+  rows.forEach(function (r) {
+    if (r && typeof r.code === "string" && r.code &&
+        (r.kind === "state" || r.kind === "lga" || r.kind === "locality") &&
+        typeof r.name === "string" && r.name) {
+      out.push({
+        code: r.code,
+        kind: r.kind,
+        name: r.name,
+        parent_code: typeof r.parent_code === "string" ? r.parent_code : null,
+      });
+    }
+  });
+  return out;
+}
+
+/* Boot/'online' sync: conditional GET {geoBase}/v1/geo/gazetteer/snapshot
+ * with the stored etag. 304 => keep the local copy; 200 => one-tx replace +
+ * save the new etag; anything else (offline, 401/403, 5xx, parse error) =>
+ * keep the existing copy and resolve false. Never rejects, never blocks. */
+function syncGazetteer() {
+  if (mode() !== "live") return Promise.resolve(false); // demo: no token
+  return refreshIfNeeded().then(function (t) {
+    if (!t) return false;
+    return metaGet(GAZ_ETAG_KEY).then(function (cur) {
+      var headers = {
+        authorization: "Bearer " + t.access_token,
+        "x-tenant-slug": lsGet(LS.slug) || "",
+      };
+      if (cur && cur.v) headers["if-none-match"] = cur.v;
+      return fetch(cfg().geoBase.replace(/\/+$/, "") + "/v1/geo/gazetteer/snapshot?levels=state,lga", {
+        headers: headers,
+        cache: "no-store", // R4: never serve the snapshot from cache layers
+      }).then(function (res) {
+        if (res.status === 304) return "unchanged";
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        var etag = res.headers.get("ETag") || null;
+        return res.json().then(function (body) {
+          var rows = gazetteerRows(body);
+          return gazetteerReplace(rows).then(function () {
+            return etag ? metaPut({ k: GAZ_ETAG_KEY, v: etag }) : undefined;
+          }).then(function () { return "updated"; });
+        });
+      });
+    });
+  }).then(function (outcome) {
+    renderPlaceFields(); // reflect the freshest local copy
+    return outcome;
+  }, function () {
+    return false; // fail-open: keep the existing copy
+  });
+}
+
+/* Cascading State -> LGA selects on the lead form, populated from the IDB
+ * gazetteer store. With no snapshot on this device the free-text fallback
+ * shows instead — capture is NEVER blocked by a missing gazetteer. */
+function renderPlaceFields() {
+  var selWrap = $("f-place-selects"), txtWrap = $("f-place-freetext");
+  if (!selWrap || !txtWrap) return;
+  gazetteerByKind("state").then(function (states) {
+    if (!states.length) {
+      selWrap.classList.add("hidden");
+      txtWrap.classList.remove("hidden");
+      return;
+    }
+    var sel = $("f-state");
+    var cur = sel.value;
+    sel.length = 1; // keep the placeholder option
+    states.sort(byName).forEach(function (s) {
+      var opt = document.createElement("option");
+      opt.value = s.code;
+      opt.textContent = s.name;
+      opt.setAttribute("data-name", s.name);
+      sel.appendChild(opt);
+    });
+    sel.value = cur; // reselect if the code is still present
+    txtWrap.classList.add("hidden");
+    selWrap.classList.remove("hidden");
+    renderLgaOptions();
+  });
+}
+
+function renderLgaOptions() {
+  var stateSel = $("f-state"), lgaSel = $("f-lga");
+  var code = stateSel.value, cur = lgaSel.value;
+  lgaSel.length = 1;
+  lgaSel.disabled = !code;
+  if (!code) return;
+  gazetteerChildren(code).then(function (lgas) {
+    lgas.sort(byName).forEach(function (l) {
+      var opt = document.createElement("option");
+      opt.value = l.code;
+      opt.textContent = l.name;
+      opt.setAttribute("data-name", l.name);
+      lgaSel.appendChild(opt);
+    });
+    lgaSel.value = cur;
+  });
+}
+
+/* The place as the user expressed it: NAMES (not codes) from the cascade
+ * when the snapshot is present, free text otherwise. Keys are omitted when
+ * empty so the payload stays additive-only. */
+function selectedPlace() {
+  var out = {};
+  var selWrap = $("f-place-selects");
+  if (selWrap && !selWrap.classList.contains("hidden")) {
+    var si = $("f-state").selectedIndex, li = $("f-lga").selectedIndex;
+    if ($("f-state").value && si >= 0) {
+      out.state = $("f-state").options[si].getAttribute("data-name") || $("f-state").options[si].textContent;
+    }
+    if ($("f-lga").value && li >= 0) {
+      out.lga = $("f-lga").options[li].getAttribute("data-name") || $("f-lga").options[li].textContent;
+    }
+  } else {
+    var st = $("f-state-text").value.trim(), lg = $("f-lga-text").value.trim();
+    if (st) out.state = st;
+    if (lg) out.lga = lg;
+  }
+  return out;
+}
+
+function resetPlaceFields() {
+  $("f-state").value = "";
+  renderLgaOptions();
+  $("f-state-text").value = "";
+  $("f-lga-text").value = "";
 }
 
 /* ---------------- sync ---------------- */
@@ -835,8 +1066,9 @@ function boot() {
   $("btn-receipt").onclick = captureReceipt;
   $("btn-load-bookings").onclick = loadMyBookings;
   $("btn-sync").onclick = function () { flush().then(function () { toast(navigator.onLine ? "Sync attempted." : "Still offline."); }); };
+  if ($("f-state")) $("f-state").onchange = renderLgaOptions;
 
-  window.addEventListener("online", function () { renderNet(); flush(); });
+  window.addEventListener("online", function () { renderNet(); flush(); syncGazetteer(); });
   window.addEventListener("offline", renderNet);
 
   if ("serviceWorker" in navigator) {
@@ -853,6 +1085,8 @@ function boot() {
     if (mode() === "live" && !tokens()) setMode("demo");
     syncMeta(); // rewrites the IDB ctx mirror token-free (TS-003 scrub)
     render();
+    renderPlaceFields(); // from the local IDB copy — works fully offline
+    syncGazetteer();     // best-effort refresh; re-renders when done
     flush();
   });
 }

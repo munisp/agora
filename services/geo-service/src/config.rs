@@ -27,6 +27,69 @@ pub struct Config {
     pub authz_disabled: bool,
 }
 
+
+/// SPEC-W63 section 4: ClamAV zINSTREAM scan settings for import bytes —
+/// the SAME four CLAMAV_* envs and semantics as ocr-service (.env.example
+/// shared block; do not drift). Standalone resolver (NOT a Config field)
+/// so the Config struct literal — mirrored verbatim in the test crates —
+/// is untouched. CLAMAV_HOST unset/empty = scanning DISABLED (boot WARN;
+/// dev sandbox only, NEVER production). Malformed values are fail-closed
+/// boot errors (same posture as GEO_DATABASE_URL).
+#[derive(Debug, Clone)]
+pub struct ClamavConfig {
+    /// clamd host (compose sidecar DNS name `clamav`).
+    pub host: String,
+    /// clamd TCP port (CLAMAV_PORT, default 3310).
+    pub port: u16,
+    /// Connect+stream+reply budget in seconds (CLAMAV_TIMEOUT_S, default 30).
+    pub timeout_s: u64,
+    /// CLAMAV_REQUIRED (default TRUE = fail-closed 503 av_unavailable when
+    /// clamd is unreachable; false = loud structured log + proceed).
+    pub required: bool,
+}
+
+impl ClamavConfig {
+    /// None when CLAMAV_HOST is unset/empty (scanning disabled).
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let host = match env_str("CLAMAV_HOST") {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        let port = match env_str("CLAMAV_PORT") {
+            Some(p) => p
+                .parse::<u16>()
+                .map_err(|e| format!("CLAMAV_PORT must be a TCP port (e.g. 3310): {e}"))?,
+            None => 3310,
+        };
+        let timeout_s = match env_str("CLAMAV_TIMEOUT_S") {
+            Some(t) => t
+                .parse::<u64>()
+                .map_err(|e| format!("CLAMAV_TIMEOUT_S must be whole seconds (e.g. 30): {e}"))?,
+            None => 30,
+        };
+        // REQUIRED defaults TRUE (fail-closed); only an explicit false/0/no
+        // opts out; garbage is a boot error, never a silent fail-open.
+        let required = match env_str("CLAMAV_REQUIRED") {
+            None => true,
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                other => {
+                    return Err(format!(
+                        "CLAMAV_REQUIRED must be true/false, got '{other}'"
+                    ))
+                }
+            },
+        };
+        Ok(Some(Self {
+            host,
+            port,
+            timeout_s,
+            required,
+        }))
+    }
+}
+
 fn env_str(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -85,5 +148,75 @@ mod tests {
         assert!(cfg.tiles_path.is_none());
         assert!(!cfg.authz_disabled);
         std::env::remove_var("GEO_DATABASE_URL");
+    }
+}
+
+
+#[cfg(test)]
+mod clamav_tests {
+    use super::*;
+
+    fn clear() {
+        for k in [
+            "CLAMAV_HOST",
+            "CLAMAV_PORT",
+            "CLAMAV_TIMEOUT_S",
+            "CLAMAV_REQUIRED",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn host_unset_disables_scanning() {
+        clear();
+        assert!(ClamavConfig::from_env().expect("env").is_none());
+    }
+
+    #[test]
+    fn defaults_when_only_host_set() {
+        clear();
+        std::env::set_var("CLAMAV_HOST", "clamav");
+        let c = ClamavConfig::from_env().expect("env").expect("enabled");
+        assert_eq!(c.host, "clamav");
+        assert_eq!(c.port, 3310);
+        assert_eq!(c.timeout_s, 30);
+        assert!(c.required, "CLAMAV_REQUIRED defaults true (fail-closed)");
+        clear();
+    }
+
+    #[test]
+    fn explicit_overrides_parse() {
+        clear();
+        std::env::set_var("CLAMAV_HOST", "clamd.internal");
+        std::env::set_var("CLAMAV_PORT", "3399");
+        std::env::set_var("CLAMAV_TIMEOUT_S", "45");
+        std::env::set_var("CLAMAV_REQUIRED", "false");
+        let c = ClamavConfig::from_env().expect("env").expect("enabled");
+        assert_eq!(c.host, "clamd.internal");
+        assert_eq!(c.port, 3399);
+        assert_eq!(c.timeout_s, 45);
+        assert!(!c.required);
+        clear();
+    }
+
+    #[test]
+    fn invalid_port_is_a_boot_error() {
+        clear();
+        std::env::set_var("CLAMAV_HOST", "clamav");
+        std::env::set_var("CLAMAV_PORT", "not-a-port");
+        let err = ClamavConfig::from_env().expect_err("invalid port must refuse to boot");
+        assert!(err.contains("CLAMAV_PORT"), "{err}");
+        clear();
+    }
+
+    #[test]
+    fn garbage_required_is_a_boot_error_never_silent_fail_open() {
+        clear();
+        std::env::set_var("CLAMAV_HOST", "clamav");
+        std::env::set_var("CLAMAV_REQUIRED", "maybe");
+        let err = ClamavConfig::from_env().expect_err("garbage bool must refuse to boot");
+        assert!(err.contains("CLAMAV_REQUIRED"), "{err}");
+        clear();
     }
 }

@@ -10,9 +10,11 @@
 //! without the RLS policy). GEO_TILES_PATH unset is NOT a boot error — the
 //! tiles endpoints answer fail-closed 503 (src/tiles.rs).
 
+mod av;
 mod auth;
 mod config;
 mod enrich;
+mod gazetteer;
 mod import;
 mod routes;
 mod store;
@@ -41,6 +43,13 @@ pub struct AppState {
     pub permify: auth::PermifyClient,
     /// Shared client for {url} imports.
     pub http: reqwest::Client,
+    /// SPEC-W63 section 4: ClamAV zINSTREAM client for import bytes
+    /// (boundary + gazetteer). None = scanning disabled (CLAMAV_HOST
+    /// unset — dev sandbox only, NEVER production).
+    pub av: Option<av::AvClient>,
+    /// CLAMAV_REQUIRED posture: true = scan failure answers 503
+    /// av_unavailable; false = loud structured log + proceed unscanned.
+    pub av_required: bool,
 }
 
 #[tokio::main]
@@ -71,15 +80,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("PERMIFY_URL unset: boundary import authz gate is OFF (dev escape — billing-engine idiom)");
     }
 
+    // SPEC-W63 section 4: ClamAV zINSTREAM client for import scanning
+    // (same four CLAMAV_* envs as ocr-service). CLAMAV_HOST unset =
+    // scanning DISABLED (boot WARN; dev sandbox only — NEVER production);
+    // a malformed CLAMAV_PORT/TIMEOUT_S/REQUIRED is a fail-closed boot
+    // error (same posture as an invalid Config).
+    let (av_client, av_required) = match config::ClamavConfig::from_env() {
+        Ok(Some(c)) => {
+            info!(host = %c.host, port = c.port, timeout_s = c.timeout_s, required = c.required,
+                  "geo import AV scanning enabled (clamd zINSTREAM)");
+            if !c.required {
+                warn!("CLAMAV_REQUIRED=false: geo imports proceed UNSCANNED when clamd is unreachable (fail-open — never in production)");
+            }
+            (
+                Some(av::AvClient::new(
+                    c.host,
+                    c.port,
+                    std::time::Duration::from_secs(c.timeout_s),
+                )),
+                c.required,
+            )
+        }
+        Ok(None) => {
+            warn!("CLAMAV_HOST unset: geo import bytes are NOT malware-scanned (dev sandbox only — NEVER production)");
+            (None, false)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "invalid ClamAV configuration; refusing to start");
+            return Err(e.into());
+        }
+    };
+
     let pool = store::connect_with_retry(&cfg.database_url).await?;
     // Fail-closed: the RLS migration must apply before we serve anything.
     store::apply_geo_migration(&pool).await?;
+    // SPEC-W63 gazetteer (A owns gazetteer.rs; wiring per the
+    // integration contract): 0002 geo_places migration, then boot
+    // seed — both fail-closed like 0001 above.
+    gazetteer::apply_gazetteer_migration(&pool).await?;
+    gazetteer::seed_boot(&pool).await?;
 
     let state = AppState {
         pool,
         config: Arc::new(cfg.clone()),
         permify: auth::PermifyClient::new(cfg.permify_url.clone()),
         http: http_client(),
+        av: av_client,
+        av_required,
     };
 
     let app = routes::router(state);

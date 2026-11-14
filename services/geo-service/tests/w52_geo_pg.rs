@@ -13,12 +13,16 @@
 //! bootstrap superuser would bypass RLS and make the isolation assertions
 //! meaningless. No network beyond the configured test database.
 
+#[path = "../src/av.rs"]
+mod av;
 #[path = "../src/auth.rs"]
 mod auth;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/enrich.rs"]
 mod enrich;
+#[path = "../src/gazetteer.rs"]
+mod gazetteer;
 #[path = "../src/import.rs"]
 mod import;
 #[path = "../src/routes.rs"]
@@ -53,6 +57,10 @@ pub struct AppState {
     pub config: Arc<config::Config>,
     pub permify: auth::PermifyClient,
     pub http: reqwest::Client,
+    /// SPEC-W63 mirror: AV client (None = scanning disabled in these tests).
+    pub av: Option<av::AvClient>,
+    /// SPEC-W63 mirror: CLAMAV_REQUIRED posture (false = proceed unscanned).
+    pub av_required: bool,
 }
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/boundaries_4326.geojson");
@@ -126,6 +134,9 @@ fn state_with(pool: PgPool) -> AppState {
         }),
         permify: auth::PermifyClient::new(None),
         http: http_client(),
+        // SPEC-W63: no clamd in the test harness — scanning disabled.
+        av: None,
+        av_required: false,
     }
 }
 

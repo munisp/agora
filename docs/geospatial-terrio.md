@@ -33,6 +33,13 @@ database** (the PostGIS one):
   RLS is `ENABLE` + `FORCE` with the house `tenant_isolation` policy extended
   to let reference rows through: `tenant_id IS NULL OR tenant_id =
   NULLIF(current_setting('app.tenant_id', true), '')::uuid`.
+- **`geo_places`** (SPEC-W63) — the offline gazetteer: `id uuid PK`,
+  `tenant_id uuid NULL`, `kind text CHECK IN ('state','lga','locality')`,
+  `name`, `code`, `parent_code NULL`, `lat`/`lng double NULL`, `source`,
+  `updated_at`; UNIQUE on `(kind, code)`; the SAME NULL-reference RLS
+  variant. No geometry (a name/code table — polygons stay in
+  `geo_boundaries`). Boot-seeded with 37 states (incl. FCT) + 774 LGAs (see
+  §7); the locality tier is schema + import support only, seeded EMPTY.
 
 ### terrio's role
 
@@ -61,6 +68,9 @@ strips the `/api/geo` prefix):
 | `GET /v1/geo/enrich?lat=&lng=` | point-in-polygon over reference boundaries, then tenant custom ones; response `{state, lga, ward, boundaries:[{kind,name,code}]}` — nulls when nothing covers the point. |
 | `GET /v1/geo/tiles/{z}/{x}/{y}.mvt` | vector tiles from the PMTiles archive; **503 when `GEO_TILES_PATH` is unset** (fail-closed, not a stub). |
 | `GET /v1/geo/style.json` | MapLibre style document pointing at the tiles/glyph endpoints; **503 when tiles are unprovisioned**. |
+| `GET /v1/geo/gazetteer?kind=&state=&q=&limit=` | search/list reference gazetteer places (§7); `q` = case-insensitive substring, `state` scopes LGAs/localities to a state. |
+| `GET /v1/geo/gazetteer/snapshot?levels=state,lga` | full reference dump as canonical JSON; `ETag` = sha256 of the body, `If-None-Match` ⇒ 304. The field-pwa offline sync path. |
+| `POST /v1/geo/gazetteer/import` | CSV/GeoJSON/JSON places import (multipart file, `{url}`, or raw body); Permify `manage_bookings` + AV-scanned pre-parse; upsert on `(kind, code)`, per-row savepoint. |
 
 Authorization: imports require Permify `manage_bookings` on
 `organization:{tenant_id}` (dev bypass `AUTHZ_DISABLED=true` honored); tenant
@@ -199,6 +209,8 @@ small "auto" badge next to the values.
 | `GEO_BIND` | geo-service | compose-provided | Listen address (e.g. `0.0.0.0:7015`). |
 | `GEO_SERVICE_URL` | booking-service | **empty = disabled** | Internal base URL used by the enrichment client (e.g. `http://geo:7015`). |
 | `BOOKING_GEO_ENFORCE` | booking-service | `false` | Master switch for §4 coverage-zone enforcement. |
+| `GEO_GAZETTEER_SEED` | geo-service | `true` | Boot-seed `geo_places` from the bundled Nigeria gazetteer (idempotent, §7). Read directly in `src/gazetteer.rs`. |
+| `CLAMAV_HOST` / `CLAMAV_PORT` / `CLAMAV_TIMEOUT_S` / `CLAMAV_REQUIRED` | geo-service | compose-provided | clamd sidecar for geo import AV scans (§7; SPEC-W63 Scope B owns the wiring). |
 | `NEXT_PUBLIC_GEO_STYLE_URL` | admin-web | `/api/geo/style.json` | Basemap style URL consumed by MapLibre (via the BFF by default). |
 
 All six are wired through `docker-compose.yml` as `${VAR:-default}` and
@@ -212,3 +224,77 @@ documented in `.env.example`.
 | geo-service down | Admin maps show the same degraded panel (style fetch fails); booking enrichment fails open (writes succeed, no auto-fill); coverage enforcement still applies when enabled (it uses local PostGIS `service_areas`, not geo-service). |
 | PostGIS extension missing | geo tables bootstrap reports `ErrPostGISUnavailable` → 503 on geo routes; non-geo functionality unaffected. |
 | Import of malformed features | Per-feature errors returned in `errors[]`; the valid features of the file commit together in a single transaction, upserted on `(scope-tenant, kind, code)`. |
+
+## 7. Offline gazetteer (SPEC-W63)
+
+`geo_places` is the platform's offline place-name gazetteer — states, LGAs,
+and (schema-ready) localities — consumed by the field-pwa's offline
+State→LGA pickers. It is deliberately a **name/code table**: polygons live in
+`geo_boundaries`, points (when known) on `geo_places.lat/lng`.
+
+### Data model & codes
+
+- `kind IN ('state','lga','locality')`, UNIQUE `(kind, code)`,
+  `parent_code` chains LGA → state and locality → LGA.
+- Codes follow the pinned slug rule (uppercase, spaces/`/` → `-`, strip
+  other punctuation — `src/gazetteer.rs::slug`): states `NG-<STATE>`, LGAs
+  `NG-<STATE>-<LGA>` (e.g. `NG-LAGOS`, `NG-LAGOS-IKEJA`); locality codes are
+  importer-assigned.
+- Reference rows only (`tenant_id IS NULL`), world-visible under the same
+  NULL-reference RLS variant as `geo_boundaries`. The tenant arm of the
+  policy is kept so tenant-private places can be admitted later without a
+  policy change.
+- **Locality tier (gate G3):** schema + import support only, seeded EMPTY.
+  A GeoNames NG / GRID3 locality import is a documented follow-up (use the
+  import endpoint below; up to 200k rows per call).
+
+### Boot seeding
+
+At startup geo-service applies `migrations/0002_gazetteer.sql` (fail-closed,
+same boot idiom as 0001) and then seeds the bundled
+`services/geo-service/seeds/nigeria_gazetteer.csv` — **37 states (incl.
+FCT) + 774 LGAs** derived from `scripts/seeds/data/nigeria_lgas.csv`
+(`source='nigeria_lgas.csv (public)'`) — with `INSERT ... ON CONFLICT DO
+NOTHING`, so restarts are no-ops and operator/imported edits are never
+overwritten. Set `GEO_GAZETTEER_SEED=false` to skip (e.g. when you manage
+the gazetteer exclusively through imports). A seed failure aborts the boot
+when enabled: a silently empty gazetteer would break the field-pwa offline
+contract.
+
+### Snapshot sync (field-pwa contract)
+
+`GET /v1/geo/gazetteer/snapshot?levels=state,lga` returns the full reference
+dump as canonical JSON (`{"levels":[...],"places":[{kind,code,name,
+parent_code,lat,lng,source}, ...]}` — fixed field order, explicit nulls) with
+`ETag: "<sha256 of the exact body>"`. Clients store the snapshot + ETag and
+revalidate with `If-None-Match`; unchanged ⇒ **304 empty**. Responses carry
+`Cache-Control: no-cache`, and the field-pwa fetches in page context with
+`cache: "no-store"` (its service worker is cache-first for same-origin
+GETs — the IDB copy, not the SW cache, is the offline store). Levels are
+canonicalized (order-insensitive), so `levels=lga,state` and
+`levels=state,lga` share an ETag.
+
+### Importing places
+
+`POST /v1/geo/gazetteer/import` (Permify `manage_bookings`, like boundary
+import) accepts:
+
+- **CSV** — header row `kind,code,name,parent_code,lat,lng,source` (`code`
+  optional: derived from name+parent via the slug rule; `parent_code`
+  required to derive LGA/locality codes);
+- **GeoJSON** — FeatureCollection, fields in `properties`, Point geometries
+  fill `lat/lng` (other geometries import coordinate-less);
+- **JSON** — a places array or `{"places": [...]}`.
+
+Multipart `file`/`url`, raw `text/csv` / `application/geo+json` bodies, and
+JSON `{"url": ...}` all work. Insert is one transaction with a per-row
+savepoint (bad rows are reported in `errors[]`, the batch survives) and
+upserts on `(kind, code)`. Caps: 200k rows / 100 MB.
+
+**AV scanning (SPEC-W63 Scope B):** all geo import bytes — boundary AND
+gazetteer — are scanned by the clamd sidecar (zINSTREAM) before parsing.
+Verdict mapping: FOUND ⇒ **415** `{"error":"infected","signature":…}`;
+scanner unreachable ⇒ **503** `{"error":"av_unavailable"}` when
+`CLAMAV_REQUIRED=true` (default), otherwise logged and skipped. The clamd
+`StreamMaxLength` is raised to 110M (gate G1) so the 100 MB import cap stays
+scannable.

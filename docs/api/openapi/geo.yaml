@@ -42,10 +42,27 @@ info:
     403 Permify denial, 404 tile not in the archive,
     409 conflict (reserved; imports UPSERT instead of conflicting),
     413 payload over the 100 MB import cap,
+    415 AV scan verdict INFECTED (`{"error":"infected","signature":...}`) or
+    unsupported gazetteer-import content type,
     422 unparseable/unsupported file or CRS,
     500 internal (DB) error,
     502 upstream failure (Permify or `{url}` fetch),
-    503 disabled/unavailable config (GEO_TILES_PATH unset for tiles/style).
+    503 disabled/unavailable config (GEO_TILES_PATH unset for tiles/style;
+    `{"error":"av_unavailable"}` when the malware scanner is unreachable and
+    CLAMAV_REQUIRED=true).
+
+    ## Gazetteer (SPEC-W63)
+    `geo_places` holds the offline gazetteer: platform reference states /
+    LGAs / localities (locality tier is schema + import support only, seeded
+    EMPTY — gate G3). Same NULL-reference RLS variant as `geo_boundaries`;
+    reads are unauthenticated-tenant (reference rows are world-visible),
+    import is Permify-gated like boundary import and AV-scanned pre-parse
+    (both geo import paths; Infected => 415, scanner unreachable =>
+    503 `av_unavailable` when CLAMAV_REQUIRED=true, else logged + skipped).
+    Codes: states `NG-<STATE>`, LGAs `NG-<STATE>-<LGA>` with the pinned slug
+    rule (uppercase, spaces/'/' -> '-', strip other punctuation); localities
+    importer-assigned. Boot seeds 37 states (incl. FCT) + 774 LGAs from the
+    bundled `nigeria_gazetteer.csv` behind GEO_GAZETTEER_SEED (default true).
 
     ## No-hit behavior (enrich)
     A point covered by no boundary is NOT an error: 200 with
@@ -221,3 +238,148 @@ paths:
               schema: {type: object}
         "404": {description: archive is not MVT}
         "503": {description: GEO_TILES_PATH unset or archive unreadable (plain text)}
+  /v1/geo/gazetteer:
+    get:
+      summary: Search/list reference gazetteer places (SPEC-W63)
+      operationId: searchGazetteer
+      description: |
+        Reference rows only (world-visible under the NULL-reference RLS
+        policy). `q` is a case-insensitive substring on name/code; `state`
+        scopes results to a state — accepts a name ("Lagos"), slug, or code
+        ("NG-LAGOS") — matching the state row itself plus LGAs
+        (`parent_code = NG-<STATE>`) and localities (`parent_code` prefix).
+        Results are capped (`limit`, default 200, max 2000); use the
+        snapshot endpoint for a full dump.
+      parameters:
+        - {in: query, name: kind, required: false, schema: {type: string, enum: [state, lga, locality]}}
+        - {in: query, name: state, required: false, schema: {type: string}, description: state name or code (NG-<STATE>)}
+        - {in: query, name: q, required: false, schema: {type: string}, description: case-insensitive substring on name/code}
+        - {in: query, name: limit, required: false, schema: {type: integer, default: 200, maximum: 2000}}
+      responses:
+        "200":
+          description: Matching places
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  places:
+                    type: array
+                    items: {$ref: "#/components/schemas/Place"}
+                  count: {type: integer}
+                required: [places, count]
+        "400": {description: invalid kind}
+        "500": {description: database error}
+  /v1/geo/gazetteer/snapshot:
+    get:
+      summary: Full reference gazetteer dump with content-hash ETag (SPEC-W63)
+      operationId: gazetteerSnapshot
+      description: |
+        Canonical JSON body (fixed field order, no whitespace, explicit
+        nulls) so the ETag — sha256 of the exact body bytes — is byte-stable
+        for a given row set. `levels` is a comma-separated subset of
+        state,lga,locality (default: all; order-insensitive). Send
+        `If-None-Match` with the stored ETag: a match answers 304 with an
+        empty body (the field-pwa offline-sync revalidation path). Responses
+        carry `Cache-Control: no-cache` (store but revalidate).
+      parameters:
+        - {in: query, name: levels, required: false, schema: {type: string, example: "state,lga"}}
+        - {in: header, name: If-None-Match, required: false, schema: {type: string}}
+      responses:
+        "200":
+          description: The snapshot (ETag header = quoted sha256 of the body)
+          headers:
+            ETag: {schema: {type: string}, description: '"<sha256 hex of body>"'}
+            Cache-Control: {schema: {type: string, example: no-cache}}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  levels:
+                    type: array
+                    items: {type: string, enum: [state, lga, locality]}
+                  places:
+                    type: array
+                    items: {$ref: "#/components/schemas/Place"}
+                required: [levels, places]
+        "304": {description: If-None-Match matched; empty body, ETag header repeated}
+        "400": {description: invalid levels}
+        "500": {description: database error}
+  /v1/geo/gazetteer/import:
+    post:
+      summary: Import gazetteer places from CSV/GeoJSON/JSON (SPEC-W63)
+      operationId: importGazetteer
+      description: |
+        Multipart `file` (`.csv`/`.geojson`/`.json`) or `url` field, raw
+        `text/csv` / `application/geo+json` bodies, or JSON (a places array /
+        `{"places":[...]}` / FeatureCollection / `{"url": ...}`). CSV
+        requires a header row with at least `kind` and `name`; `code` is
+        derived when empty (state -> `NG-<NAME>`, lga/locality ->
+        `<PARENT_CODE>-<NAME>`, parent required). GeoJSON Point geometries
+        fill lat/lng; other geometries import without coordinates. Rows are
+        reference rows (tenant_id NULL); upsert on (kind, code) in one
+        transaction with a per-row savepoint (bad rows land in `errors[]`).
+        Caps: 200k rows / 100 MB. Gated by Permify manage_bookings and
+        AV-scanned pre-parse (Infected => 415; scanner unreachable =>
+        503 `av_unavailable` when CLAMAV_REQUIRED=true, else logged + skipped).
+      parameters:
+        - in: header
+          name: X-Tenant-Slug
+          required: true
+          schema: {type: string, format: uuid}
+          description: Tenant uuid — the Permify organization for the authz check.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: {type: string, format: binary, description: .csv/.geojson/.json payload}
+                url: {type: string, format: uri, description: http(s) URL of the same (mutually exclusive with file)}
+                format: {type: string, enum: [csv, geojson, json], description: explicit format override}
+                source: {type: string, description: default provenance label for rows without one}
+          text/csv:
+            schema: {type: string, description: header row kind,code,name,parent_code,lat,lng,source}
+          application/geo+json:
+            schema: {type: object, description: "FeatureCollection; properties carry kind/code/name/parent_code/source"}
+          application/json:
+            schema: {type: object, description: 'places array / {"places":[...]} / FeatureCollection / {"url": ...}'}
+      responses:
+        "200":
+          description: Import summary (per-row problems are reported, not fatal)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported: {type: integer}
+                  skipped: {type: integer}
+                  errors:
+                    type: array
+                    items: {type: string}
+                    description: advisory per-row messages (capped at 100)
+                required: [imported, skipped, errors]
+        "400": {description: invalid params / missing X-Tenant-Slug}
+        "401": {description: live authz without caller identity (X-User-Id)}
+        "403": {description: Permify manage_bookings denial}
+        "413": {description: payload over the 100 MB cap}
+        "415": {description: 'AV scan verdict infected: {"error":"infected","signature":...}; or unsupported content type'}
+        "422": {description: unparseable payload or no importable rows}
+        "500": {description: database error}
+        "502": {description: "Permify outage (fail-closed) or {url} fetch failure"}
+        "503": {description: 'AV scanner unreachable with CLAMAV_REQUIRED=true: {"error":"av_unavailable"}'}
+components:
+  schemas:
+    Place:
+      type: object
+      properties:
+        kind: {type: string, enum: [state, lga, locality]}
+        code: {type: string, example: NG-LAGOS-IKEJA}
+        name: {type: string, example: Ikeja}
+        parent_code: {type: [string, "null"], example: NG-LAGOS}
+        lat: {type: [number, "null"]}
+        lng: {type: [number, "null"]}
+        source: {type: string, example: "nigeria_lgas.csv (public)"}
+      required: [kind, code, name, parent_code, lat, lng, source]

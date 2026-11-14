@@ -148,6 +148,39 @@ pub async fn handler(
         return Err(err_json(verdict.status(), verdict.message()));
     }
 
+    // SPEC-W63 section 4 AV hook: scan the raw import bytes BEFORE the
+    // terrio parse (pinned handler-side mapping; Infected => 415
+    // {error:"infected",signature}, Err => 503 {error:"av_unavailable"}
+    // when CLAMAV_REQUIRED, else loud log + proceed — av.py semantics:
+    // a scan ERROR is never clean). No metrics idiom exists in
+    // geo-service, so the outcome is a structured `geo_av_scan` log line
+    // (outcome=clean|infected|error|skipped).
+    match &state.av {
+        Some(av) => match av.scan(&bytes).await {
+            Ok(crate::av::AvVerdict::Clean) => {
+                tracing::info!(outcome = "clean", bytes = bytes.len(), file = %file_name, "geo_av_scan");
+            }
+            Ok(crate::av::AvVerdict::Infected(signature)) => {
+                tracing::warn!(outcome = "infected", file = %file_name, "geo_av_scan");
+                return Err((
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    Json(serde_json::json!({ "error": "infected", "signature": signature })),
+                ));
+            }
+            Err(e) if state.av_required => {
+                tracing::error!(outcome = "error", error = %e, av_required = true, "geo_av_scan");
+                return Err(err_json(StatusCode::SERVICE_UNAVAILABLE, "av_unavailable"));
+            }
+            Err(e) => {
+                tracing::warn!(outcome = "error", error = %e, av_required = false,
+                    "geo_av_scan: scan failed; CLAMAV_REQUIRED=false — proceeding UNSCANNED (dev posture)");
+            }
+        },
+        None => {
+            tracing::warn!(outcome = "skipped", reason = "av_disabled", file = %file_name, "geo_av_scan");
+        }
+    }
+
     // Parse + reproject + validate (terrio is sync CPU work — keep it off
     // the async executor threads).
     let name_field = params.name_field.clone();

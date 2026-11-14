@@ -92,6 +92,26 @@ summary{cursor:pointer}
       <input id="f-phone" type="tel" autocomplete="off" placeholder="+2348012345678">
       <label for="f-notes">Notes</label>
       <textarea id="f-notes" rows="3" placeholder="What do they need?"></textarea>
+      <!-- SPEC-W63: optional State -> LGA cascade, populated offline from
+           the IDB gazetteer snapshot. Progressive enhancement only: when no
+           snapshot is on this device the free-text fallback shows instead,
+           and the form submits fine with both left empty. -->
+      <div id="f-place-selects" class="hidden">
+        <label for="f-state">State (optional)</label>
+        <select id="f-state">
+          <option value="">— Select state —</option>
+        </select>
+        <label for="f-lga">LGA (optional)</label>
+        <select id="f-lga" disabled>
+          <option value="">— Select a state first —</option>
+        </select>
+      </div>
+      <div id="f-place-freetext">
+        <label for="f-state-text">State (optional)</label>
+        <input id="f-state-text" autocomplete="off" placeholder="e.g. Lagos">
+        <label for="f-lga-text">LGA (optional)</label>
+        <input id="f-lga-text" autocomplete="off" placeholder="e.g. Ikeja">
+      </div>
       <div class="consent">
         <input id="f-gps" type="checkbox">
         <label for="f-gps" style="margin:0">Attach my current location to this lead.

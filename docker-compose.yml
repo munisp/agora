@@ -774,6 +774,20 @@ services:
       PERMIFY_URL: http://permify:3476
       # DEV bypass only (booking-service idiom); never true in prod.
       AUTHZ_DISABLED: ${AUTHZ_DISABLED:-false}
+      # SPEC-W63 section 4: ClamAV zINSTREAM scan of every boundary/
+      # gazetteer import BEFORE parse — the SAME four CLAMAV_* vars and
+      # semantics as ocr-service (one shared block; fail-closed default).
+      # CLAMAV_HOST EMPTY disables scanning with a boot WARN (dev sandbox
+      # only — NEVER production). ENV PARITY: defaults MUST equal the code
+      # reads in services/geo-service/src/config.rs.
+      CLAMAV_HOST: ${CLAMAV_HOST:-clamav}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      CLAMAV_TIMEOUT_S: ${CLAMAV_TIMEOUT_S:-30}
+      CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-true}
+      # SPEC-W63: boot-time gazetteer seed (37 states + 774 LGAs derived
+      # from the in-tree public nigeria_lgas.csv; idempotent INSERT ON
+      # CONFLICT DO NOTHING; localities seeded EMPTY per G3). false skips.
+      GEO_GAZETTEER_SEED: ${GEO_GAZETTEER_SEED:-true}
     # Drop the PMTiles archive here and set GEO_TILES_PATH=/data/geo/<file>.
     volumes:
     - ./data/geo:/data/geo:ro
@@ -784,6 +798,9 @@ services:
     depends_on:
     - postgres
     - permify
+    # SPEC-W63: geo imports are AV-scanned; start after the clamd sidecar
+    # (same dependency posture as ocr-service).
+    - clamav
   # SPEC-W54 Scope A: rdf-export (:7021 — next free after ocr:7020;
   # credit-bureau holds 7022). Rust/oxirs batch service: graph-service
   # internal NDJSON export -> Turtle + JSON-LD -> MinIO `lake` bucket
@@ -1645,16 +1662,21 @@ services:
     image: clamav/clamav:1.4.3
     restart: unless-stopped
     environment:
-      # SPEC-W59 P3: the upload cap is EXACTLY 25 MiB (OCR_MAX_BYTES) and
-      # clamd's StreamMaxLength default has been exactly 25M on some
+      # SPEC-W59 P3: the OCR upload cap is EXACTLY 25 MiB (OCR_MAX_BYTES)
+      # and clamd's StreamMaxLength default has been exactly 25M on some
       # releases — zero margin. Pin above it; an "INSTREAM size limit
       # exceeded" reply is treated as a scan ERROR, never clean.
-      # MaxFileSize/MaxScanSize pinned above 25M for the same reason. Set
-      # via the image's official CLAMD_CONF_* env injection (the
+      # SPEC-W63 G1 (pinned): geo-service imports allow 100MB payloads, so
+      # StreamMaxLength is raised 30M -> 110M (geo import cap < stream
+      # cap). MaxFileSize MUST track it: a stream over MaxFileSize would be
+      # answered OK WITHOUT being scanned — a silent unscanned window.
+      # MaxScanSize sits above both so members of a 100MB archive import
+      # are still scanned. OCR paths unaffected (25MB upload cap << 110M).
+      # Set via the image's official CLAMD_CONF_* env injection (the
       # entrypoint edits /etc/clamav/clamd.conf — no config mount needed).
-      CLAMD_CONF_StreamMaxLength: 30M
-      CLAMD_CONF_MaxFileSize: 30M
-      CLAMD_CONF_MaxScanSize: 100M
+      CLAMD_CONF_StreamMaxLength: 110M
+      CLAMD_CONF_MaxFileSize: 110M
+      CLAMD_CONF_MaxScanSize: 250M
     volumes:
     - clamav-db:/var/lib/clamav
     networks:

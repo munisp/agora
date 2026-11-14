@@ -10,7 +10,7 @@
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use crate::{enrich, import, tiles, AppState};
+use crate::{enrich, gazetteer, import, tiles, AppState};
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
@@ -20,6 +20,12 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/geo/boundaries/import", post(import::handler))
+        // SPEC-W63 Scope A: offline gazetteer (geo_places). Static
+        // /gazetteer/snapshot + /gazetteer/import are distinct paths from
+        // /gazetteer, so registration order is irrelevant.
+        .route("/v1/geo/gazetteer", get(gazetteer::search))
+        .route("/v1/geo/gazetteer/snapshot", get(gazetteer::snapshot))
+        .route("/v1/geo/gazetteer/import", post(gazetteer::import))
         .route("/v1/geo/enrich", get(enrich::handler))
         .route("/v1/geo/tiles/:z/:x/:y_mvt", get(tiles::tile))
         .route("/v1/geo/style.json", get(tiles::style))

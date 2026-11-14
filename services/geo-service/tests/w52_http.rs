@@ -8,12 +8,16 @@
 //! answer 500, which the authz-gate tests use to prove the request PASSED
 //! the gate and reached the store layer.
 
+#[path = "../src/av.rs"]
+mod av;
 #[path = "../src/auth.rs"]
 mod auth;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/enrich.rs"]
 mod enrich;
+#[path = "../src/gazetteer.rs"]
+mod gazetteer;
 #[path = "../src/import.rs"]
 mod import;
 #[path = "../src/routes.rs"]
@@ -46,6 +50,10 @@ pub struct AppState {
     pub config: Arc<config::Config>,
     pub permify: auth::PermifyClient,
     pub http: reqwest::Client,
+    /// SPEC-W63 mirror: AV client (None = scanning disabled in these tests).
+    pub av: Option<av::AvClient>,
+    /// SPEC-W63 mirror: CLAMAV_REQUIRED posture (false = proceed unscanned).
+    pub av_required: bool,
 }
 
 fn lazy_pool() -> sqlx::PgPool {
@@ -68,6 +76,9 @@ fn test_state(authz_disabled: bool, permify_url: Option<String>) -> AppState {
         }),
         permify: auth::PermifyClient::new(permify_url),
         http: http_client(),
+        // SPEC-W63: no clamd in the test harness — scanning disabled.
+        av: None,
+        av_required: false,
     }
 }
 
