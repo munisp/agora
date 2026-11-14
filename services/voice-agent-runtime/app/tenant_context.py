@@ -271,6 +271,9 @@ async def _fetch_tenant_context_uncached(
                 settings.knowledge_app_id,
                 "v1/context",
                 params={"tenant": tenant_slug, "q": settings.knowledge_query},
+                # knowledge-service binds the tenant from X-Tenant-Slugs (the gateway sets it for user calls and strips
+                # any client-supplied copy); this in-cluster call already resolved the site's tenant, so it names it.
+                headers={"X-Tenant-Slugs": tenant_slug},
             )
             items = []
             if isinstance(kb, dict):

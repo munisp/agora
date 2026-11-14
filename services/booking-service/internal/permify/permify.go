@@ -64,24 +64,25 @@ func (c *HTTPClient) Check(ctx context.Context, tenantID, subject, permission, r
 	if err := c.post(ctx, "/v1/tenants/"+tenantID+"/permissions/check", body, &out); err != nil {
 		return false, err
 	}
-	return out.Can == "RESULT_ALLOWED" || out.Can == "allowed", nil
+	// Permify v1.x answers "CHECK_RESULT_ALLOWED" (the older "RESULT_ALLOWED" is kept for compatibility).
+	return out.Can == "CHECK_RESULT_ALLOWED" || out.Can == "RESULT_ALLOWED" || out.Can == "allowed", nil
 }
 
 // WriteRelationship implements RelationshipWriter via
-// POST /v1/tenants/{t}/data/relationships/write.
+// POST /v1/tenants/{t}/data/write (Permify v1.x).
 // entity and subject are "type:id" references, relation is e.g. "owner".
 func (c *HTTPClient) WriteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error {
 	et, ei := splitRef(entity)
 	st, si := splitRef(subject)
 	body := map[string]any{
 		"metadata": map[string]any{"schema_version": ""},
-		"tuple": map[string]any{
+		"tuples": []map[string]any{{
 			"entity":   map[string]string{"type": et, "id": ei},
 			"relation": relation,
 			"subject":  map[string]string{"type": st, "id": si},
-		},
+		}},
 	}
-	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/relationships/write", body, nil)
+	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/write", body, nil)
 }
 
 // CreateTenant provisions a Permify tenant for relationship isolation.
