@@ -109,7 +109,8 @@ impl PermifyClient {
             .await
             .map_err(|e| format!("permify permissions/check: decode: {e}"))?;
         let can = out.get("can").and_then(|v| v.as_str()).unwrap_or_default();
-        Ok(can == "RESULT_ALLOWED" || can == "allowed")
+        // Permify v1.x answers "CHECK_RESULT_ALLOWED" (older builds "RESULT_ALLOWED").
+        Ok(can == "CHECK_RESULT_ALLOWED" || can == "RESULT_ALLOWED" || can == "allowed")
     }
 }
 
@@ -182,6 +183,33 @@ mod tests {
             .await
             .expect("check ok");
         assert!(allowed, "RESULT_ALLOWED must allow");
+        let (path, body) = last.lock().unwrap().clone().expect("stub hit");
+        assert_eq!(path, format!("/v1/tenants/{tenant}/permissions/check"));
+        assert_eq!(body["entity"], serde_json::json!({"type": "organization", "id": tenant}));
+        assert_eq!(body["permission"], serde_json::json!(PERM_VIEW_BILLING));
+        assert_eq!(body["subject"], serde_json::json!({"type": "user", "id": "user-1"}));
+        assert_eq!(body["metadata"]["depth"], serde_json::json!(20));
+
+        // Denial (and the legacy lowercase alias) are not allows.
+        let (base, _) = spawn_stub("RESULT_DENIED", false).await;
+        let client = PermifyClient::new(Some(base));
+        assert!(!client.check(tenant, "user-1", PERM_MANAGE_BILLING).await.unwrap());
+        let (base, _) = spawn_stub("allowed", false).await;
+        let client = PermifyClient::new(Some(base));
+        assert!(client.check(tenant, "user-1", PERM_VIEW_BILLING).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn check_allow_deny_and_request_shape_permify_v1() {
+        let tenant = "b3b3f6f0-6f6b-4f6b-8f6b-6f6b6f6b6f6b";
+        let (base, last) = spawn_stub("CHECK_RESULT_ALLOWED", false).await;
+        let client = PermifyClient::new(Some(base));
+        assert!(client.configured());
+        let allowed = client
+            .check(tenant, "user-1", PERM_VIEW_BILLING)
+            .await
+            .expect("check ok");
+        assert!(allowed, "CHECK_RESULT_ALLOWED (Permify v1) must allow");
         let (path, body) = last.lock().unwrap().clone().expect("stub hit");
         assert_eq!(path, format!("/v1/tenants/{tenant}/permissions/check"));
         assert_eq!(body["entity"], serde_json::json!({"type": "organization", "id": tenant}));

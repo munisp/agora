@@ -68,6 +68,8 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
       await api.post(
         "/api/knowledge/v1/documents",
         {
+          // knowledge-service requires the tenant in the body (422 without it); it must match the session's tenant.
+          tenant: orgSlug,
           title: form.title.trim(),
           body: form.body.trim(),
           source_url: form.source_url.trim() || undefined,

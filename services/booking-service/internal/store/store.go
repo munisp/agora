@@ -574,7 +574,7 @@ func (s *Store) SetAvailability(ctx context.Context, tenantID, teamMemberID uuid
 			return fmt.Errorf("clear availability rules: %w", err)
 		}
 		const ins = `INSERT INTO availability_rules (id, tenant_id, team_member_id, weekday, start_min, end_min, effective_from, effective_to)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`
+		             VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::date, CURRENT_DATE),$8)` // no effective_from = from today (the column's default)
 		for _, r := range rules {
 			if r.ID == uuid.Nil {
 				r.ID = uuid.New()
