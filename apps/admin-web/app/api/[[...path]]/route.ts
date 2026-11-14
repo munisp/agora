@@ -84,7 +84,8 @@ async function proxy(
   const target = new URL(
     directToAnalytics
       ? `${ANALYTICS_BASE}/${path.slice(1).join("/")}`
-      : `${API_BASE}/${path.join("/")}`,
+      : // The gateway's routes keep the /api prefix (/api/bookings/*, /api/identity/*, …).
+        `${API_BASE}/api/${path.join("/")}`,
   );
   target.search = req.nextUrl.search;
   if (analyticsTenantSlug) {

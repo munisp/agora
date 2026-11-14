@@ -13,7 +13,7 @@ import {
 import type { MultiPolygon, Polygon } from "geojson";
 import { api, ApiError } from "@/lib/api";
 import { serviceAreaToFeature } from "@/lib/geo";
-import { addDays, formatDateTime, toISODate } from "@/lib/utils";
+import { addDays, formatDateTime, toISODate, listFrom } from "@/lib/utils";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Button } from "@/components/ui/button";
@@ -90,7 +90,7 @@ export function LocationsClient({ orgSlug }: { orgSlug: string }) {
           "/api/bookings/v1/offerings",
           { tenant: orgSlug },
         );
-        setOfferings(Array.isArray(data) ? data : (data.items ?? []));
+        setOfferings(listFrom(data));
       } catch {
         // The offering filter is optional — keep "All offerings" on failure.
       }
@@ -145,7 +145,7 @@ export function LocationsClient({ orgSlug }: { orgSlug: string }) {
         "/api/bookings/v1/service-areas",
         { tenant: orgSlug },
       );
-      setAreas(Array.isArray(data) ? data : (data.items ?? []));
+      setAreas(listFrom(data));
     } catch (e) {
       setAreasError(
         e instanceof ApiError

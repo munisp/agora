@@ -19,7 +19,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
-import { formatMoney, titleCase } from "@/lib/utils";
+import { formatMoney, titleCase, listFrom } from "@/lib/utils";
 import type {
   AccountBalance,
   Beneficiary,
@@ -63,7 +63,7 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
       const data = await api.get<Beneficiary[] | { items: Beneficiary[] }>(
         `/api/payments/v1/beneficiaries?tenant_id=${encodeURIComponent(orgSlug)}`,
       );
-      const list = Array.isArray(data) ? data : (data.items ?? []);
+      const list = listFrom(data);
       setBeneficiaries(list);
       setBeneficiaryId((cur) =>
         cur && list.some((b) => b.id === cur) ? cur : (list[0]?.id ?? ""),
@@ -516,7 +516,7 @@ function RecommendationsCard({ orgSlug }: { orgSlug: string }) {
         const data = await api.get<
           PricingRecommendation[] | { items: PricingRecommendation[] }
         >("/api/analytics/v1/recommendations", { tenant: orgSlug });
-        setRecs(Array.isArray(data) ? data : (data.items ?? []));
+        setRecs(listFrom(data));
       } catch (e) {
         setUnavailable(
           e instanceof ApiError

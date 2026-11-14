@@ -51,7 +51,8 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
         });
         setSite(s);
         setForm({
-          site_slug: s.site_slug,
+          // GET /v1/site answers `slug` (the public endpoints say `site_slug`).
+          site_slug: s.site_slug ?? (s as { slug?: string }).slug ?? orgSlug,
           primaryColor: s.theme?.primaryColor ?? s.theme?.accent ?? DEFAULT_COLOR,
           logoUrl: s.theme?.logoUrl ?? s.theme?.logo_url ?? "",
           heroTitle: s.theme?.heroTitle ?? "",
@@ -117,7 +118,11 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
   };
 
   const slugValid = /^[a-z0-9][a-z0-9-]{2,62}$/.test(form.site_slug.trim());
-  const embedSnippet = `<script src="${typeof window !== "undefined" ? window.location.origin : ""}/embed.js" data-site="${form.site_slug.trim() || orgSlug}" async></script>`;
+  // The site's own address, read after mount: rendering window.location on the server made the server and browser
+  // markup differ (React error 418, "Application error").
+  const [origin, setOrigin] = React.useState("");
+  React.useEffect(() => setOrigin(window.location.origin), []);
+  const embedSnippet = `<script src="${origin}/embed.js" data-site="${form.site_slug.trim() || orgSlug}" async></script>`;
 
   const copySnippet = async () => {
     try {

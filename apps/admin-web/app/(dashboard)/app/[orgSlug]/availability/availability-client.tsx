@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Label, Select } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toast";
-import { cn, minutesToTime, timeToMinutes, WEEKDAYS } from "@/lib/utils";
+import { cn, minutesToTime, timeToMinutes, WEEKDAYS, listFrom } from "@/lib/utils";
 import type { AvailabilityRule, TeamMember } from "@/lib/types";
 
 interface DayWindow {
@@ -59,7 +59,7 @@ export function AvailabilityClient({ orgSlug }: { orgSlug: string }) {
           "/api/bookings/v1/team-members",
           { tenant: orgSlug },
         );
-        const items = (Array.isArray(data) ? data : (data.items ?? [])).filter(
+        const items = (listFrom(data)).filter(
           (m) => m.active,
         );
         setMembers(items);
@@ -80,7 +80,7 @@ export function AvailabilityClient({ orgSlug }: { orgSlug: string }) {
           `/api/bookings/v1/team-members/${memberId}/availability`,
           { tenant: orgSlug },
         );
-        const rules = Array.isArray(data) ? data : (data.items ?? []);
+        const rules = listFrom(data);
         setGrid(rules.length > 0 ? rulesToGrid(rules) : defaultWeek());
       } catch (e) {
         setError(

@@ -2,6 +2,7 @@ import { serverApi } from "@/lib/server-api";
 import { ApiError } from "@/lib/api";
 import type { TeamMember } from "@/lib/types";
 import { TeamClient } from "./team-client";
+import { listFrom } from "@/lib/utils";
 
 export const metadata = { title: "Team" };
 
@@ -25,7 +26,7 @@ export default async function TeamPage({
       { query: { tenant: orgSlug } },
     );
     // Same unwrap semantics the client used.
-    initialMembers = Array.isArray(data) ? data : (data.items ?? []);
+    initialMembers = listFrom(data);
   } catch (e) {
     initialError = e instanceof ApiError ? e.message : "Failed to load team.";
   }

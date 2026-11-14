@@ -25,7 +25,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
-import { formatMoney } from "@/lib/utils";
+import { formatMoney, listFrom } from "@/lib/utils";
 import type { Invoice, Tenant } from "@/lib/types";
 
 /**
@@ -105,7 +105,7 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
         undefined,
         { "x-tenant-id": tenantId },
       );
-      return Array.isArray(data) ? data : (data.items ?? []);
+      return listFrom(data);
     },
     [],
   );

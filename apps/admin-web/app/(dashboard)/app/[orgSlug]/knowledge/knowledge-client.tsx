@@ -20,6 +20,7 @@ import { Input, Label, Textarea } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/toast";
 import type { KbSuggestion, KnowledgeDocument, KnowledgeSearchHit } from "@/lib/types";
+import { listFrom } from "@/lib/utils";
 
 export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
   const { toast } = useToast();
@@ -49,7 +50,7 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
         "/api/knowledge/v1/documents",
         { tenant: orgSlug },
       );
-      setDocs(Array.isArray(data) ? data : (data.items ?? []));
+      setDocs(listFrom(data));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load documents.");
     } finally {
@@ -121,7 +122,7 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
         "/api/knowledge/v1/search",
         { tenant: orgSlug, q: query.trim() },
       );
-      setHits(Array.isArray(data) ? data : (data.items ?? []));
+      setHits(listFrom(data));
     } catch (err) {
       toast({
         title: "Search failed",
@@ -394,7 +395,7 @@ function SuggestionsPanel({
         "/api/knowledge/v1/suggestions",
         { tenant: orgSlug, status: "pending" },
       );
-      setSuggestions(Array.isArray(data) ? data : (data.items ?? []));
+      setSuggestions(listFrom(data));
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) {
         setUnsupported(true);

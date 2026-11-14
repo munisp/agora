@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata" // tenant time zones resolve in the distroless image too
 
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/bookingops"
@@ -163,17 +164,17 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 		f.Limit = n
 	}
 	if v := q.Get("from"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRangeBound(v, tenant.Timezone)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid from (RFC3339)")
+			writeError(w, http.StatusBadRequest, "invalid from (RFC3339 or YYYY-MM-DD)")
 			return
 		}
 		f.From = &t
 	}
 	if v := q.Get("to"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRangeBound(v, tenant.Timezone)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid to (RFC3339)")
+			writeError(w, http.StatusBadRequest, "invalid to (RFC3339 or YYYY-MM-DD)")
 			return
 		}
 		f.To = &t
@@ -195,7 +196,23 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"bookings": out})
 		return
 	}
+	if items == nil {
+		items = []store.Booking{} // an empty list, not null, when nothing is booked
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"bookings": items})
+}
+
+// parseRangeBound reads a list filter bound: an RFC3339 instant, or a plain YYYY-MM-DD date meaning the start of that
+// day in the tenant's time zone (the dashboard sends dates; UTC when the zone is unknown).
+func parseRangeBound(v, timezone string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil || timezone == "" {
+		loc = time.UTC
+	}
+	return time.ParseInLocation("2006-01-02", v, loc)
 }
 
 // bookingWithPhone flattens a booking row plus the matched contact phone

@@ -27,7 +27,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
-import { formatMoney } from "@/lib/utils";
+import { formatMoney, listFrom } from "@/lib/utils";
 import type { Offering } from "@/lib/types";
 
 interface OfferingForm {
@@ -79,7 +79,7 @@ export function OfferingsClient({ orgSlug }: { orgSlug: string }) {
         "/api/bookings/v1/offerings",
         { tenant: orgSlug },
       );
-      setOfferings(Array.isArray(data) ? data : (data.items ?? []));
+      setOfferings(listFrom(data));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load offerings.");
     } finally {

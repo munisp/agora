@@ -86,3 +86,17 @@ export function addDays(d: Date, n: number) {
 export function titleCase(s: string) {
   return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
+
+/**
+ * The list in an API response: a bare array, `{items: [...]}`, or one named list such as booking-service's
+ * `{offerings: [...]}` / `{bookings: [...]}` (null or missing lists give []).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- callers type the result through their state
+export function listFrom<T = any>(data: unknown): T[] {
+  if (Array.isArray(data)) return data as T[];
+  if (typeof data !== "object" || data === null) return [];
+  const items = (data as { items?: unknown }).items;
+  if (Array.isArray(items)) return items as T[];
+  const lists = Object.values(data as Record<string, unknown>).filter((v) => Array.isArray(v));
+  return lists.length === 1 ? (lists[0] as T[]) : [];
+}

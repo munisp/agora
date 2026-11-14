@@ -18,7 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { formatDateTime, titleCase } from "@/lib/utils";
+import { formatDateTime, titleCase, listFrom } from "@/lib/utils";
 import type { Booking } from "@/lib/types";
 
 /**
@@ -48,7 +48,7 @@ export function ScheduleClient({
         "/api/bookings/v1/bookings",
         { tenant: orgSlug, mine: true },
       );
-      const items = Array.isArray(data) ? data : (data.items ?? []);
+      const items = listFrom(data);
       setBookings(
         items
           .slice()

@@ -26,7 +26,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
-import { addDays, formatDateTime, minutesToTime, titleCase, toISODate } from "@/lib/utils";
+import { addDays, formatDateTime, minutesToTime, titleCase, toISODate, listFrom } from "@/lib/utils";
 import { type BookingLabels } from "@/lib/terminology";
 import type { Booking, BookingEvent, EscalationRequestedEvent, WsEvent } from "@/lib/types";
 
@@ -93,7 +93,7 @@ export function BookingsClient({
           "/api/bookings/v1/bookings",
           { tenant: orgSlug, ...rangeQuery(r), limit: lim },
         );
-        const items = Array.isArray(data) ? data : (data.items ?? []);
+        const items = listFrom(data);
         setBookings(
           items.slice().sort((a, b) =>
             r === "past"

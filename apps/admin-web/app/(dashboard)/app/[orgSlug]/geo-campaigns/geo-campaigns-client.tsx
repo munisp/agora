@@ -6,7 +6,7 @@ import { Megaphone, RefreshCw, Send, Users } from "lucide-react";
 import type { Feature, Polygon } from "geojson";
 import { api, ApiError } from "@/lib/api";
 import { circlePolygon, formatRadius } from "@/lib/geo";
-import { formatDateTime } from "@/lib/utils";
+import { formatDateTime, listFrom } from "@/lib/utils";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
@@ -199,7 +199,7 @@ export function GeoCampaignsClient({ orgSlug }: { orgSlug: string }) {
           "/api/bookings/v1/geo/campaigns",
           { tenant: orgSlug },
         );
-        const items = Array.isArray(data) ? data : (data.items ?? []);
+        const items = listFrom(data);
         setCampaigns(
           items
             .slice()
