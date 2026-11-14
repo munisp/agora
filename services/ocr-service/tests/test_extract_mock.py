@@ -114,6 +114,8 @@ def test_usage_and_cloudevent_emitted(client, deps):
     assert evt["subject"] == doc_id
     assert evt["data"]["status"] == "extracted"
     assert evt["data"]["storage_key"].startswith(f"{TENANT_A}/")
+    # SPEC-W64: the validated content type rides the event (mime is not PII).
+    assert evt["data"]["mime"] == "image/png"
     assert "text" not in evt["data"]  # event never carries full text/bytes
 
 

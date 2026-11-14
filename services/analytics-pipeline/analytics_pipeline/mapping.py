@@ -131,6 +131,9 @@ RECEIPT_DOCUMENT_COLUMNS = (
 # it gets its own bronze table with the full finding payload. booking_id is
 # taken from data ONLY (never the CloudEvent subject: that subject is the
 # TENANT SLUG — stuffing it into booking_id was the pre-existing G2 break).
+# SPEC-W64: ``finding_id`` appended at the END (stable pyiceberg field ids)
+# so the gold job can join ReceiptReconResolved events back to their finding
+# for a REAL resolved_count.
 RECEIPT_RECON_FINDING_COLUMNS = (
     "event_id",
     "tenant_id",
@@ -144,6 +147,50 @@ RECEIPT_RECON_FINDING_COLUMNS = (
     "captured_amount_minor",
     "receipt_amount_major",
     "receipt_currency",
+    "occurred_at",
+    # SPEC-W64 (appended): durable finding row id — join key to
+    # bronze.recon_resolutions.finding_id.
+    "finding_id",
+)
+
+# SPEC-W64 §6: one row per com.opendesk.booking.ReceiptIngested on
+# opendesk.booking.events (booking-service fieldcapture AttachReceipt =>
+# channel 'field_pwa'; media_inbox IngestMediaInbox fresh-insert branch =>
+# channel 'whatsapp'). Routed to its OWN bronze table (G-B: never
+# bronze.booking_events). PII posture: the producers NEVER emit
+# sender_phone/sender_phone_digits and this mapper reads ONLY the
+# whitelisted keys below. channel attribution closes the W62
+# receipt_ingest_daily gap. booking_id comes from data ONLY (the CloudEvent
+# subject is the tenant slug — the G2 lesson).
+RECEIPT_INGEST_COLUMNS = (
+    "event_id",
+    "tenant_id",
+    "channel",
+    "document_id",
+    "capture_client_id",
+    "media_inbox_id",
+    "booking_id",
+    "mime",
+    "bytes",
+    "sha256_prefix",
+    "state",
+    "occurred_at",
+)
+
+# SPEC-W64 §6: one row per com.opendesk.booking.ReceiptReconResolved on
+# opendesk.booking.events (booking-service Store.ResolveFinding outbox,
+# emitted in the same tx as the resolved_at update). Payload per SPEC §2:
+# {finding_id, tenant_id, run_id, kind, resolved_at, resolved_by}. This is
+# the event that turns gold.receipt_recon_daily.resolved_count from a
+# contractual 0 into a real count (W62 G3 gap closed).
+RECON_RESOLUTION_COLUMNS = (
+    "event_id",
+    "tenant_id",
+    "finding_id",
+    "run_id",
+    "kind",
+    "resolved_at",
+    "resolved_by",
     "occurred_at",
 )
 
@@ -257,14 +304,36 @@ def _as_receipt_date(value: Any) -> Optional[str]:
 # opendesk.booking.events topic but are NOT booking events.
 RECEIPT_RECON_FINDING_TYPE = "ReceiptReconFinding"
 
+# SPEC-W64 (G-B): two more booking.events types that are NOT booking
+# events — each gets its own bronze table and must NEVER fall through to
+# bronze.booking_events (the dbt stg_booking_events.event_type
+# accepted_values test goes red otherwise — the W62 G2 bug class).
+RECEIPT_INGESTED_TYPE = "ReceiptIngested"
+RECEIPT_RECON_RESOLVED_TYPE = "ReceiptReconResolved"
+
+
+def _short_type_is(message: Mapping[str, Any], wanted: str) -> bool:
+    envelope, data = split_envelope(message)
+    raw = envelope.get("type") or _get(data, "event_type", "eventType")
+    short = short_event_type(raw if isinstance(raw, str) else None)
+    return (short or "").lower() == wanted.lower()
+
 
 def is_receipt_recon_finding(message: Mapping[str, Any]) -> bool:
     """True for ReceiptReconFinding-typed messages (CloudEvent ``type`` or a
     bare payload's event_type), matched case-insensitively on the short name."""
-    envelope, data = split_envelope(message)
-    raw = envelope.get("type") or _get(data, "event_type", "eventType")
-    short = short_event_type(raw if isinstance(raw, str) else None)
-    return (short or "").lower() == RECEIPT_RECON_FINDING_TYPE.lower()
+    return _short_type_is(message, RECEIPT_RECON_FINDING_TYPE)
+
+
+def is_receipt_ingested(message: Mapping[str, Any]) -> bool:
+    """SPEC-W64: True for ReceiptIngested-typed messages (same matching
+    idiom as is_receipt_recon_finding)."""
+    return _short_type_is(message, RECEIPT_INGESTED_TYPE)
+
+
+def is_receipt_recon_resolved(message: Mapping[str, Any]) -> bool:
+    """SPEC-W64: True for ReceiptReconResolved-typed messages."""
+    return _short_type_is(message, RECEIPT_RECON_RESOLVED_TYPE)
 
 
 def map_booking_event(message: Mapping[str, Any]) -> Optional[dict[str, Any]]:
@@ -274,7 +343,15 @@ def map_booking_event(message: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     # tenant-slug subject into booking_id). They are routed to
     # bronze.receipt_recon_findings by route_booking_event; here they are
     # SKIPPED entirely.
-    if is_receipt_recon_finding(message):
+    # SPEC-W64 G-B: same treatment for ReceiptIngested (->
+    # bronze.receipt_ingest) and ReceiptReconResolved (->
+    # bronze.recon_resolutions) — belt-and-braces so the new types can
+    # never reach bronze.booking_events even if the router is bypassed.
+    if (
+        is_receipt_recon_finding(message)
+        or is_receipt_ingested(message)
+        or is_receipt_recon_resolved(message)
+    ):
         return None
     envelope, data = split_envelope(message)
     return {
@@ -436,11 +513,12 @@ def map_receipt_recon_finding(message: Mapping[str, Any]) -> dict[str, Any]:
     Emitted by booking-service internal/recon (recon.go findingEventPayload):
     data = {tenant_id, kind, confidence, capture_client_id?, booking_id?,
     attempt_tx_ref?, expected_amount_minor?, captured_amount_minor?,
-    receipt_amount_major?, detail, finding_id}. ``run_id`` is on the finding
-    row but not in today's event payload (mapped when present, else NULL);
-    ``receipt_currency`` rides inside ``detail`` today (fallback lookup).
-    booking_id comes from data ONLY — the CloudEvent subject is the tenant
-    slug, never a booking id (the G2 stuffing bug).
+    receipt_amount_major?, detail, finding_id, run_id (SPEC-W64: booking now
+    enriches the payload with run_id)}. ``receipt_currency`` rides inside
+    ``detail`` today (fallback lookup). booking_id comes from data ONLY —
+    the CloudEvent subject is the tenant slug, never a booking id (the G2
+    stuffing bug). ``finding_id`` (SPEC-W64 appended column) is the join key
+    to bronze.recon_resolutions for the gold resolved_count.
     """
     envelope, data = split_envelope(message)
     detail = data.get("detail")
@@ -475,20 +553,97 @@ def map_receipt_recon_finding(message: Mapping[str, Any]) -> dict[str, Any]:
         or _as_str(_get(detail, "receipt_currency", "receiptCurrency")),
         "occurred_at": parse_ts(envelope.get("time"))
         or parse_ts(_get(data, "occurred_at", "occurredAt")),
+        "finding_id": _as_str(_get(data, "finding_id", "findingId")),
+    }
+
+
+def map_receipt_ingest(message: Mapping[str, Any]) -> dict[str, Any]:
+    """com.opendesk.booking.ReceiptIngested -> bronze.receipt_ingest
+    (SPEC-W64 §6).
+
+    Emitted by booking-service on receipt ingest, one row per fresh ingest:
+      * fieldcapture AttachReceipt — data = {tenant_id, channel:
+        "field_pwa", capture_client_id, document_id, booking_id?}
+      * media_inbox IngestMediaInbox (fresh-INSERT branch ONLY, never the
+        replay branch) — data = {tenant_id, channel, document_id,
+        media_inbox_id, sha256_prefix, mime, bytes, state, booking_id?}
+    PII: the producers NEVER emit sender_phone / sender_phone_digits and
+    this mapper reads ONLY the whitelisted columns below. booking_id comes
+    from data ONLY (subject is the tenant slug — the G2 lesson).
+    """
+    envelope, data = split_envelope(message)
+    return {
+        "event_id": _as_str(envelope.get("id") or _get(data, "event_id", "eventId")),
+        "tenant_id": _as_str(
+            envelope.get("tenantid") or _get(data, "tenant_id", "tenantId")
+        ),
+        "channel": _as_str(_get(data, "channel")),
+        "document_id": _as_str(_get(data, "document_id", "documentId")),
+        "capture_client_id": _as_str(_get(data, "capture_client_id", "captureClientId")),
+        "media_inbox_id": _as_str(_get(data, "media_inbox_id", "mediaInboxId")),
+        # NO envelope-subject fallback: subject is the tenant slug (G2).
+        "booking_id": _as_str(_get(data, "booking_id", "bookingId")),
+        "mime": _as_str(_get(data, "mime")),
+        "bytes": _as_int(_get(data, "bytes")),
+        "sha256_prefix": _as_str(_get(data, "sha256_prefix", "sha256Prefix")),
+        "state": _as_str(_get(data, "state")),
+        "occurred_at": parse_ts(envelope.get("time"))
+        or parse_ts(_get(data, "occurred_at", "occurredAt")),
+    }
+
+
+def map_recon_resolution(message: Mapping[str, Any]) -> dict[str, Any]:
+    """com.opendesk.booking.ReceiptReconResolved -> bronze.recon_resolutions
+    (SPEC-W64 §2/§6).
+
+    Emitted by booking-service Store.ResolveFinding (outbox row in the same
+    withTenant tx as the resolved_at update): data = {finding_id, tenant_id,
+    run_id, kind, resolved_at, resolved_by}. ``resolved_by`` is the caller
+    identity claim (an actor id/role label, never PII free text).
+    occurred_at = CloudEvent time, falling back to data.occurred_at and
+    finally data.resolved_at (bare payloads) so the row is never timeless.
+    """
+    envelope, data = split_envelope(message)
+    resolved_at = parse_ts(_get(data, "resolved_at", "resolvedAt"))
+    return {
+        "event_id": _as_str(
+            envelope.get("id")
+            or _get(data, "event_id", "eventId")
+            or _get(data, "finding_id", "findingId")
+        ),
+        "tenant_id": _as_str(
+            envelope.get("tenantid") or _get(data, "tenant_id", "tenantId")
+        ),
+        "finding_id": _as_str(_get(data, "finding_id", "findingId")),
+        "run_id": _as_str(_get(data, "run_id", "runId")),
+        "kind": _as_str(_get(data, "kind")),
+        "resolved_at": resolved_at,
+        "resolved_by": _as_str(_get(data, "resolved_by", "resolvedBy")),
+        "occurred_at": parse_ts(envelope.get("time"))
+        or parse_ts(_get(data, "occurred_at", "occurredAt"))
+        or resolved_at,
     }
 
 
 def route_booking_event(message: Mapping[str, Any]) -> Optional[tuple[str, dict[str, Any]]]:
-    """Router for opendesk.booking.events (SPEC-W62 G2).
+    """Router for opendesk.booking.events (SPEC-W62 G2, SPEC-W64 G-B).
 
     Returns (bronze_table, row) or None to drop. ReceiptReconFinding-typed
-    messages route to receipt_recon_findings; everything else maps as a
-    booking event. (map_booking_event ALSO skips findings on its own, so a
-    finding can never reach bronze.booking_events even if this router is
-    bypassed.)
+    messages route to receipt_recon_findings; ReceiptIngested-typed to
+    receipt_ingest; ReceiptReconResolved-typed to recon_resolutions
+    (SPEC-W64 — G-B: these types MUST NEVER fall through to
+    bronze.booking_events or the dbt stg_booking_events.event_type
+    accepted_values test goes red); everything else maps as a booking
+    event. (map_booking_event ALSO skips all three types on its own, so
+    none of them can ever reach bronze.booking_events even if this router
+    is bypassed.)
     """
     if is_receipt_recon_finding(message):
         return ("receipt_recon_findings", map_receipt_recon_finding(message))
+    if is_receipt_ingested(message):
+        return ("receipt_ingest", map_receipt_ingest(message))
+    if is_receipt_recon_resolved(message):
+        return ("recon_resolutions", map_recon_resolution(message))
     row = map_booking_event(message)
     if row is None:
         return None

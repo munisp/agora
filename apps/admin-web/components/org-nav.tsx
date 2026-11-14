@@ -36,6 +36,7 @@ import {
   ContactRound,
   Siren,
   Inbox,
+  Scale,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -93,6 +94,10 @@ const items: NavItem[] = [
   // + OCR document link; KYC review precedent); the page enforces the same
   // rule server-side.
   { segment: "media-inbox", label: "Media inbox", icon: Inbox },
+  // SPEC-W64: receipt reconciliation findings — UNGATED in nav: the page is
+  // manage_bookings-permission gated with a 403-note posture and NO
+  // realm-role redirect (page.tsx), so there is no roles gate here.
+  { segment: "bookings/reconciliation", label: "Reconciliation", icon: Scale },
   // SPEC-W47 UIWEB-13: IoT/civic incident ops surface.
   { segment: "incidents", label: "Incidents", icon: Siren },
   // SPEC-W45 ORPH O15: platform ops alerts read-back — admin/platform-admin.

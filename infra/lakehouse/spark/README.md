@@ -20,7 +20,7 @@ the jobs stay schedulable before their producers land). Status:
 | `geo_analytics.py` (SPEC-W8) | `silver.booking_events` | LIVE (via `silver_clean_bookings.py`) |
 | | `contact_locations` + `service_areas` MinIO extracts | PARKED — no producer yet (TODO producer: booking-service Postgres exporter); job degrades to bookings-only output |
 | `revenue_intelligence.py` (SPEC-W3) | `silver.booking_events`, `bronze.payment_events` | LIVE — analytics-pipeline sinks |
-| `receipt_recon_gold.py` (SPEC-W62) | `bronze.receipt_recon_findings`, `bronze.receipt_documents` | LANDING IN-WAVE — analytics-pipeline sinks (`ReceiptReconFinding` events routed off `opendesk.booking.events`, G2 fix; `kind='receipt'` OCR documents from `opendesk.ocr.events`). Until a bronze table exists the job logs a warning, skips that output, and exits 0. `resolved_count` is contractually 0 this wave (resolution is Postgres-only; no resolution event — G3 documented gap). |
+| `receipt_recon_gold.py` (SPEC-W62/W64) | `bronze.receipt_recon_findings`, `bronze.receipt_documents`, `bronze.recon_resolutions`, `bronze.receipt_ingest` | LIVE — analytics-pipeline sinks (`ReceiptReconFinding`/`ReceiptIngested`/`ReceiptReconResolved` events routed off `opendesk.booking.events` to their own tables, G2/G-B; `kind='receipt'` OCR documents from `opendesk.ocr.events`). Missing bronze tables degrade gracefully (warning + skip, or resolved_count=0 / channel NULL, exit 0). W64: `resolved_count` is a REAL count of `bronze.recon_resolutions` joined on finding_id; `receipt_ingest_daily` gains a `channel` column (field_pwa/whatsapp attribution from `bronze.receipt_ingest` — W62 gap closed). |
 | `graph_enrichment.py` (SPEC-W28) | `silver`/`gold` tables (all optional) | LIVE chain; emits `opendesk.graph.enrichment.v1` (graph-sync consumes; topic provisioned) |
 | `graph_export.py` (SPEC-W28) | graph-service internal export API + `bronze.usage_events` | LIVE — seam-only wave by design (no GNN/ART training, SPEC-W28 §6) |
 | `training_snapshot.py` (SPEC-W33) | `gold.graph_*_features` (from `graph_export.py`) + label extracts | LIVE chain for features; label extracts PARKED (optional, degrade) |
@@ -107,8 +107,11 @@ Environment overrides honoured by the jobs: `ICEBERG_REST_URI` (default
 see docs/geospatial-infra.md §1 for the input contracts) and
 `GEO_SERVICE_AREAS_FORMAT` (`parquet`|`geojson`).
 `receipt_recon_gold.py` additionally honours `RECEIPT_RECON_FINDINGS_TABLE`
-(default `iceberg.bronze.receipt_recon_findings`) and
-`RECEIPT_DOCUMENTS_TABLE` (default `iceberg.bronze.receipt_documents`).
+(default `iceberg.bronze.receipt_recon_findings`),
+`RECEIPT_DOCUMENTS_TABLE` (default `iceberg.bronze.receipt_documents`),
+`RECEIPT_RECON_RESOLUTIONS_TABLE` (default `iceberg.bronze.recon_resolutions`,
+SPEC-W64) and `RECEIPT_INGEST_TABLE` (default `iceberg.bronze.receipt_ingest`,
+SPEC-W64).
 
 Verify in Trino afterwards:
 

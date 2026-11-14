@@ -437,6 +437,23 @@ def test_iceberg_schemas_match_spec_columns():
             ("captured_amount_minor", LongType),
             ("receipt_amount_major", DoubleType),
             ("receipt_currency", StringType), ("occurred_at", TimestampType),
+            # SPEC-W64 appended column (join key to recon_resolutions).
+            ("finding_id", StringType),
+        ],
+        # SPEC-W64 §6 (G-B): the two new booking.events bronze tables.
+        "receipt_ingest": [
+            ("event_id", StringType), ("tenant_id", StringType),
+            ("channel", StringType), ("document_id", StringType),
+            ("capture_client_id", StringType), ("media_inbox_id", StringType),
+            ("booking_id", StringType), ("mime", StringType),
+            ("bytes", LongType), ("sha256_prefix", StringType),
+            ("state", StringType), ("occurred_at", TimestampType),
+        ],
+        "recon_resolutions": [
+            ("event_id", StringType), ("tenant_id", StringType),
+            ("finding_id", StringType), ("run_id", StringType),
+            ("kind", StringType), ("resolved_at", TimestampType),
+            ("resolved_by", StringType), ("occurred_at", TimestampType),
         ],
     }
     for table, wanted in spec.items():

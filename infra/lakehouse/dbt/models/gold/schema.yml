@@ -182,6 +182,9 @@ models:
       Written by the Spark receipt_recon_gold job from
       bronze.receipt_recon_findings; this model is a passthrough view
       (reco_pricing precedent: Spark writes, dbt exposes).
+      W64: resolved_count is a REAL count of bronze.recon_resolutions
+      (ReceiptReconResolved) joined to findings on finding_id — no longer
+      the W62 contractual 0.
     tests:
       - dbt_utils.expression_is_true:
           arguments:
@@ -203,17 +206,21 @@ models:
                 values: ['exact', 'heuristic', 'none']
       - name: findings_count
       - name: resolved_count
+        description: W64 — real count of resolution events joined via finding_id.
       - name: expected_sum_minor
       - name: captured_sum_minor
       - name: mismatch_abs_sum_minor
 
   - name: receipt_ingest_daily
     description: >
-      OCR receipt ingest volume per tenant per day (SPEC-W62): documents,
-      pages, receipts (kind='receipt') and receipts with a parsed amount.
-      Built from bronze.receipt_documents (hash-only identifiers +
-      whitelisted scalars, no free text — G1). Written by the Spark
-      receipt_recon_gold job; passthrough view.
+      OCR receipt ingest volume per tenant per day per channel
+      (SPEC-W62/W64): documents, pages, receipts (kind='receipt') and
+      receipts with a parsed amount. Built from bronze.receipt_documents
+      (hash-only identifiers + whitelisted scalars, no free text — G1);
+      channel attributed from bronze.receipt_ingest via document_id (W64 —
+      closes the W62 channel-attribution gap; NULL when no ingest event
+      exists for the document). Written by the Spark receipt_recon_gold
+      job; passthrough view.
     tests:
       - dbt_utils.expression_is_true:
           arguments:
@@ -223,6 +230,12 @@ models:
         tests: [not_null]
       - name: day
         tests: [not_null]
+      - name: channel
+        description: field_pwa|whatsapp; NULL when unattributed (pre-W64 rows / direct uploads).
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['field_pwa', 'whatsapp']
       - name: documents
       - name: pages
       - name: receipts

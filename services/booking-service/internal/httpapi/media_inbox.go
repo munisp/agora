@@ -33,6 +33,7 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -42,6 +43,18 @@ import (
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
 )
+
+// mediaInboxEventsTopic resolves the ReceiptIngested outbox topic
+// (SPEC-W64 Scope 3) for the ingest path: BOOKING_EVENTS_TOPIC, default
+// opendesk.booking.events — mirrors internal/config (config.go:206). Read
+// here instead of via Deps because server.go is single-owner this wave
+// (A: resolve route line only); a later wave may thread cfg through Deps.
+func mediaInboxEventsTopic() string {
+	if v := strings.TrimSpace(os.Getenv("BOOKING_EVENTS_TOPIC")); v != "" {
+		return v
+	}
+	return "opendesk.booking.events"
+}
 
 // mediaInboxIngestRequest is the POST /v1/media/inbox/ingest body
 // (SPEC-W61 pinned contract). tenant_id/tenant_slug are ADDITIVE tenant
@@ -190,7 +203,7 @@ func (s *server) mediaInboxIngest(w http.ResponseWriter, r *http.Request) {
 		Mime:              req.Mime,
 		Bytes:             req.Bytes,
 		SHA256Prefix:      req.SHA256Prefix,
-	})
+	}, mediaInboxEventsTopic())
 	if err != nil {
 		s.d.Logger.Error("media inbox ingest failed", zap.Error(err),
 			zap.String("tenant_id", tenantID.String()), zap.String("channel", req.Channel))

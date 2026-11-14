@@ -15,7 +15,9 @@ from analytics_pipeline.mapping import (  # noqa: E402
     BOOKING_EVENT_COLUMNS,
     PAYMENT_EVENT_COLUMNS,
     RECEIPT_DOCUMENT_COLUMNS,
+    RECEIPT_INGEST_COLUMNS,
     RECEIPT_RECON_FINDING_COLUMNS,
+    RECON_RESOLUTION_COLUMNS,
     TRANSCRIPT_COLUMNS,
     USAGE_EVENT_COLUMNS,
 )
@@ -94,6 +96,23 @@ def test_receipt_recon_findings_columns_match_dbt():
         print("SKIP: dbt bronze.receipt_recon_findings source not in schema.yml yet (coder C)")
         return
     assert list(RECEIPT_RECON_FINDING_COLUMNS) == cols
+
+
+def test_receipt_ingest_columns_match_dbt():
+    # SPEC-W64 G-B: the source lands in the SAME wave as the router arm.
+    cols = _dbt_source_columns_or_none("receipt_ingest")
+    if cols is None:
+        print("SKIP: dbt bronze.receipt_ingest source not in schema.yml yet")
+        return
+    assert list(RECEIPT_INGEST_COLUMNS) == cols
+
+
+def test_recon_resolutions_columns_match_dbt():
+    cols = _dbt_source_columns_or_none("recon_resolutions")
+    if cols is None:
+        print("SKIP: dbt bronze.recon_resolutions source not in schema.yml yet")
+        return
+    assert list(RECON_RESOLUTION_COLUMNS) == cols
 
 
 if __name__ == "__main__":

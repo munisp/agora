@@ -102,7 +102,9 @@ func (h *Handlers) Receipt(w http.ResponseWriter, r *http.Request, tenant bookin
 		return
 	}
 
-	if err := h.Svc.Store.AttachReceipt(r.Context(), tenant.ID, clientID, res.DocumentID, res.ExtractedFields); err != nil {
+	// SPEC-W64 Scope 3: the attach also writes the ReceiptIngested outbox
+	// row in the same tx when Svc.EventsTopic is set (empty disables).
+	if err := h.Svc.Store.AttachReceipt(r.Context(), tenant.ID, clientID, res.DocumentID, res.ExtractedFields, h.Svc.EventsTopic); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			// Race: the anchor vanished between the existence check and the
 			// attach. The OCR document is orphaned at A (documented cost of

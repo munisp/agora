@@ -27,7 +27,13 @@ type Service struct {
 	// channel "pwa" — an agent filing on behalf of a citizen). Nil →
 	// civic_report items fail with a deterministic error.
 	Civic CivicSubmitter
-	Log   *zap.Logger
+	// EventsTopic is the outbox topic for the SPEC-W64 ReceiptIngested
+	// ingest event emitted by AttachReceipt (BOOKING_EVENTS_TOPIC, default
+	// opendesk.booking.events). Empty suppresses emission (the attach
+	// still persists) — the house "empty topic disables emission" idiom
+	// (recon.go).
+	EventsTopic string
+	Log         *zap.Logger
 }
 
 // CivicSubmitter abstracts the civic module's report intake so the capture

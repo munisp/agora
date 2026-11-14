@@ -35,7 +35,10 @@ log = structlog.get_logger()
 # (bronze_table, row) or None (message dropped — e.g. SPEC-W62 G1 kyc_*
 # OCR documents and G2 ReceiptReconFinding misroutes). Most topics are
 # single-table; opendesk.booking.events routes ReceiptReconFinding-typed
-# messages to bronze.receipt_recon_findings (G2).
+# messages to bronze.receipt_recon_findings (G2) and, per SPEC-W64 G-B,
+# ReceiptIngested-typed messages to bronze.receipt_ingest and
+# ReceiptReconResolved-typed messages to bronze.recon_resolutions — none
+# of them ever land in bronze.booking_events.
 Router = Callable[[Mapping[str, Any]], Optional[tuple[str, dict[str, Any]]]]
 
 
@@ -51,8 +54,10 @@ def _fixed(table: str, mapper: Callable[[Mapping[str, Any]], Optional[dict[str, 
 
 def topic_registry(settings: Settings) -> dict[str, tuple[str, Router]]:
     return {
-        # SPEC-W62 G2: booking.events also carries ReceiptReconFinding —
-        # routed to its own bronze table, never to bronze.booking_events.
+        # SPEC-W62 G2 / SPEC-W64 G-B: booking.events also carries
+        # ReceiptReconFinding (G2), ReceiptIngested and ReceiptReconResolved
+        # (W64) — each routed to its own bronze table, never
+        # bronze.booking_events.
         settings.topic_booking_events: ("booking_events", route_booking_event),
         settings.topic_payment_events: ("payment_events", _fixed("payment_events", map_payment_event)),
         settings.topic_transcripts: ("transcripts", _fixed("transcripts", map_transcript)),
@@ -179,7 +184,8 @@ class BronzeConsumer:
         try:
             # Route each message to its bronze table (None = dropped, e.g.
             # W62 G1 kyc_* documents). One topic may feed several tables
-            # (booking.events -> booking_events + receipt_recon_findings).
+            # (booking.events -> booking_events + receipt_recon_findings +
+            # receipt_ingest + recon_resolutions).
             by_table: dict[str, list[dict[str, Any]]] = {}
             for value in batch:
                 routed = router(value)

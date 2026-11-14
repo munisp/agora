@@ -124,8 +124,7 @@ sources:
           - name: tenant_id
             tests: [not_null]
           - name: run_id
-            # run_id NULL until booking-service enriches findingEventPayload (follow-up)
-            description: Recon sweep run id (nullable on live payloads).
+            description: Recon sweep run id (emitted on the finding payload since W64).
           - name: finding_kind
             description: receipt_without_payment|payment_without_receipt|amount_mismatch|currency_unknown
           - name: confidence
@@ -139,6 +138,72 @@ sources:
           - name: captured_amount_minor
           - name: receipt_amount_major
           - name: receipt_currency
+          - name: occurred_at
+            tests: [not_null]
+          - name: finding_id
+            description: >
+              Durable finding row id (W64 appended column) — join key to
+              bronze.recon_resolutions.finding_id for the gold resolved_count.
+      - name: receipt_ingest
+        description: >
+          One row per ReceiptIngested event (W64 G-B: routed to this
+          dedicated table instead of bronze.booking_events). Emitted by
+          booking-service on fresh receipt ingest: fieldcapture
+          AttachReceipt (channel='field_pwa', capture_client_id set) and
+          media_inbox IngestMediaInbox fresh-insert branch (channel
+          'whatsapp', media_inbox_id/sha256_prefix/mime/bytes/state set).
+          PII posture: producers NEVER emit sender_phone — the mapper reads
+          only the whitelisted columns below.
+        columns:
+          - name: event_id
+            description: CloudEvents envelope id.
+            tests: [not_null]
+          - name: tenant_id
+            tests: [not_null]
+          - name: channel
+            description: field_pwa|whatsapp
+          - name: document_id
+            description: OCR document id — join key to bronze.receipt_documents.
+          - name: capture_client_id
+            description: Field-capture client id (field_pwa rows; nullable).
+          - name: media_inbox_id
+            description: Media-inbox row id (whatsapp rows; nullable).
+          - name: booking_id
+            description: Nullable uuid string (from data only, never the slug subject).
+          - name: mime
+            description: Validated content type (nullable; whatsapp rows).
+          - name: bytes
+            description: Object size in bytes (nullable; whatsapp rows).
+          - name: sha256_prefix
+            description: Truncated content hash prefix (nullable; whatsapp rows).
+          - name: state
+            description: Media-inbox state at ingest (nullable; whatsapp rows).
+          - name: occurred_at
+            tests: [not_null]
+      - name: recon_resolutions
+        description: >
+          One row per ReceiptReconResolved event (W64): a finding resolved
+          via POST /v1/recon/receipts/{id}/resolve (manage_bookings).
+          Emitted by booking-service Store.ResolveFinding in the same tx as
+          the resolved_at update. This is the event that turns
+          gold.receipt_recon_daily.resolved_count into a real count.
+        columns:
+          - name: event_id
+            description: CloudEvents envelope id.
+            tests: [not_null]
+          - name: tenant_id
+            tests: [not_null]
+          - name: finding_id
+            description: Resolved finding row id — join key to bronze.receipt_recon_findings.
+            tests: [not_null]
+          - name: run_id
+            description: Recon sweep run id of the finding.
+          - name: kind
+            description: receipt_without_payment|payment_without_receipt|amount_mismatch|currency_unknown
+          - name: resolved_at
+            description: Resolution timestamp (tx now()).
+          - name: resolved_by
+            description: Caller identity claim (actor id; not PII).
           - name: occurred_at
             tests: [not_null]
 
@@ -214,8 +279,7 @@ models:
       - name: tenant_id
         tests: [not_null]
       - name: run_id
-        # run_id NULL until booking-service enriches findingEventPayload (follow-up)
-        description: Recon sweep run id (nullable on live payloads).
+        description: Recon sweep run id (emitted on the finding payload since W64).
       - name: finding_kind
         tests:
           - not_null
@@ -231,4 +295,54 @@ models:
       - name: booking_id
         description: Nullable — payment_without_receipt findings may lack one.
       - name: finding_day
+        tests: [not_null]
+
+  - name: stg_receipt_ingest
+    description: >
+      Standardized receipt ingest events (silver view, W64 G-B) — one row
+      per ReceiptIngested routed to its own bronze table. channel is a
+      lowercased closed enum (field_pwa = fieldcapture AttachReceipt,
+      whatsapp = media_inbox IngestMediaInbox); booking_id stays nullable
+      and never carries the tenant-slug subject.
+    columns:
+      - name: event_id
+        tests:
+          - not_null
+          - unique
+      - name: tenant_id
+        tests: [not_null]
+      - name: channel
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['field_pwa', 'whatsapp']
+      - name: document_id
+        tests: [not_null]
+      - name: booking_id
+        description: Nullable — an ingest may precede booking linkage.
+      - name: event_day
+        tests: [not_null]
+
+  - name: stg_recon_resolutions
+    description: >
+      Standardized recon resolution events (silver view, W64) — one row per
+      ReceiptReconResolved (POST /v1/recon/receipts/{id}/resolve under
+      manage_bookings). finding_id joins to stg_receipt_recon_findings;
+      resolved_by is the caller identity claim.
+    columns:
+      - name: event_id
+        tests:
+          - not_null
+          - unique
+      - name: tenant_id
+        tests: [not_null]
+      - name: finding_id
+        tests: [not_null]
+      - name: kind
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['receipt_without_payment', 'payment_without_receipt', 'amount_mismatch', 'currency_unknown']
+      - name: resolved_day
         tests: [not_null]

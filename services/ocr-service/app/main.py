@@ -372,6 +372,7 @@ async def _emit_events(
     model_version: str,
     storage_key: str,
     extracted_fields: dict[str, Any],
+    mime: str,
 ) -> None:
     """Best-effort Dapr publishes (kyc idiom: the durable DB row is the
     reconciliation source — a publish failure never fails the request)."""
@@ -394,6 +395,8 @@ async def _emit_events(
         storage_bucket=settings.minio_bucket,
         storage_key=storage_key,
         extracted_fields=extracted_fields,
+        # SPEC-W64: the validated content type rides the event (not PII).
+        mime=mime,
     )
     try:
         await deps.dapr.publish(settings.dapr_pubsub_name, settings.usage_topic, usage)
@@ -595,6 +598,9 @@ async def _run_extraction(
         model_version=extraction.model_version,
         storage_key=storage_key,
         extracted_fields=extraction.fields,
+        # SPEC-W64: validated content type (from validate_upload above)
+        # rides the DocumentExtracted event.
+        mime=mime,
     )
     return {
         "document_id": str(document_id),

@@ -5,11 +5,14 @@
  * the booking-service recon sweep (internal/recon) over field-captured
  * receipts (W53 receipt_fields) vs payment state:
  *
- *   GET /api/bookings/v1/recon/receipts[?tenant=<slug>][&status=open|resolved|all][&limit=<n>]
+ *   GET  /api/bookings/v1/recon/receipts[?tenant=<slug>][&status=open|resolved|all][&limit=<n>]
  *   → { findings: [{ id, run_id, kind, confidence, capture_client_id?,
  *                    booking_id?, attempt_tx_ref?, expected_amount_minor?,
  *                    captured_amount_minor?, receipt_amount_major?,
  *                    receipt_currency?, detail, created_at, resolved_at? }] }
+ *   POST /api/bookings/v1/recon/receipts/{id}/resolve   (SPEC-W64: sets
+ *     resolved_at + emits ReceiptReconResolved; 404 not_found_or_resolved on
+ *     an already-resolved/unknown id — treated as "refresh + toast")
  *
  * Honesty notes carried from RECON §5 / SPEC-W56+W57 pinned decisions:
  *  - R1: `exact` matches come from rung 0 (payment_receipt payload
@@ -30,13 +33,20 @@
  */
 import * as React from "react";
 import Link from "next/link";
-import { RefreshCw } from "lucide-react";
+import { CheckCircle2, RefreshCw } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Label, Select } from "@/components/ui/input";
 import {
   Table,
@@ -47,6 +57,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { useToast } from "@/components/ui/toast";
 import { formatDateTime } from "@/lib/utils";
 
 export interface ReconFinding {
@@ -207,6 +218,10 @@ export function ReconciliationClient({
   const [status, setStatus] = React.useState<string>(DEFAULT_STATUS);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(initialError);
+  const { toast } = useToast();
+  // SPEC-W64: resolve mutation state — confirm dialog target + busy flag.
+  const [resolving, setResolving] = React.useState<ReconFinding | null>(null);
+  const [busy, setBusy] = React.useState(false);
 
   // Keep the table in sync when the server props change (router.refresh()).
   React.useEffect(() => {
@@ -238,6 +253,56 @@ export function ReconciliationClient({
     },
     [orgSlug, status],
   );
+
+  /**
+   * SPEC-W64: resolve a finding (POST /v1/recon/receipts/{id}/resolve).
+   * NOT optimistic — the list is refetched on success (media-inbox link /
+   * discard idiom). A 404 (not_found_or_resolved) means the row was already
+   * resolved (or is gone): surface a toast and refresh to converge.
+   */
+  const resolve = async () => {
+    if (!resolving || busy) return;
+    setBusy(true);
+    try {
+      await api.post(
+        `/api/bookings/v1/recon/receipts/${encodeURIComponent(resolving.id)}/resolve`,
+        {},
+        { tenant: orgSlug },
+      );
+      toast({
+        title: "Finding resolved",
+        description:
+          "The finding is marked resolved and a ReceiptReconResolved event was emitted.",
+        variant: "success",
+      });
+      setResolving(null);
+      void load();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        toast({
+          title: "Already resolved",
+          description:
+            "This finding no longer exists or was already resolved — refreshing the list.",
+          variant: "destructive",
+        });
+        setResolving(null);
+        void load();
+      } else {
+        toast({
+          title: "Resolve failed",
+          description:
+            e instanceof ApiError
+              ? e.status === 403
+                ? "Resolving findings requires the manage_bookings permission."
+                : e.message
+              : "Failed to resolve the finding.",
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div>
@@ -293,12 +358,13 @@ export function ReconciliationClient({
               <TableHead className="text-right">Captured</TableHead>
               <TableHead className="text-right">Receipt</TableHead>
               <TableHead>Created</TableHead>
-              <TableHead className="pr-5">Detail</TableHead>
+              <TableHead>Detail</TableHead>
+              <TableHead className="pr-5 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {findings.length === 0 ? (
-              <TableEmpty colSpan={8}>
+              <TableEmpty colSpan={9}>
                 {loading
                   ? "Loading…"
                   : "No reconciliation findings. Findings appear once staff upload receipts via the capture API and a sweep runs."}
@@ -350,7 +416,7 @@ export function ReconciliationClient({
                         </span>
                       ) : null}
                     </TableCell>
-                    <TableCell className="pr-5">
+                    <TableCell>
                       <details className="rounded-md border border-border px-3 py-2 text-xs">
                         <summary className="cursor-pointer font-medium text-muted-foreground">
                           Detail JSON
@@ -360,6 +426,23 @@ export function ReconciliationClient({
                         </pre>
                       </details>
                     </TableCell>
+                    <TableCell className="pr-5 text-right">
+                      {f.resolved_at ? (
+                        // Read-only: resolved_at is rendered in the Created
+                        // column; resolved findings have no action.
+                        <span className="text-xs text-muted-foreground">—</span>
+                      ) : (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          title="Resolve finding"
+                          disabled={busy}
+                          onClick={() => setResolving(f)}
+                        >
+                          <CheckCircle2 className="h-4 w-4" />
+                        </Button>
+                      )}
+                    </TableCell>
                   </TableRow>
                 );
               })
@@ -367,6 +450,54 @@ export function ReconciliationClient({
           </TableBody>
         </Table>
       </Card>
+
+      <ResolveDialog
+        finding={resolving}
+        busy={busy}
+        onClose={() => setResolving(null)}
+        onConfirm={() => void resolve()}
+      />
     </div>
+  );
+}
+
+/**
+ * SPEC-W64: resolve confirmation (media-inbox DiscardDialog idiom) — sets
+ * resolved_at server-side and emits ReceiptReconResolved; irreversible.
+ */
+function ResolveDialog({
+  finding,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  finding: ReconFinding | null;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <Dialog open={finding !== null} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent onClose={onClose} className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Resolve finding</DialogTitle>
+        </DialogHeader>
+        <p className="mb-4 text-sm text-muted-foreground">
+          Mark this{" "}
+          {finding ? kindMeta(finding.kind).label.toLowerCase() : ""} finding
+          as resolved? It will no longer appear in the open queue, the
+          resolution timestamp and your identity are recorded, and a
+          ReceiptReconResolved event is emitted. This cannot be undone.
+        </p>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button onClick={onConfirm} disabled={busy}>
+            {busy ? "Resolving…" : "Resolve finding"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

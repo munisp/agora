@@ -182,9 +182,10 @@ type Deps struct {
 
 	// Recon serves the SPEC-W56 Scope A receipt↔payment reconciliation
 	// endpoints: GET /v1/recon/receipts (manage_bookings — findings + the
-	// linked captures' receipt_fields, the first receipt read path) and
-	// POST /v1/internal/recon/receipts (internauth-guarded manual sweep
-	// trigger). Nil → both routes answer 503.
+	// linked captures' receipt_fields, the first receipt read path),
+	// POST /v1/recon/receipts/{id}/resolve (manage_bookings — SPEC-W64
+	// resolve path) and POST /v1/internal/recon/receipts (internauth-
+	// guarded manual sweep trigger). Nil → all routes answer 503.
 	Recon *recon.Handlers
 
 	// SPEC-W52 Scope B: geospatial foundation wiring.
@@ -516,6 +517,13 @@ func NewRouter(d Deps) http.Handler {
 		// manage_bookings). Doubles as the FIRST read path serving
 		// receipt_fields for the linked captures (R4).
 		r.With(s.require("manage_bookings")).Get("/recon/receipts", s.reconListHandler)
+		// SPEC-W64 (additive): resolve one finding — the ONLY writer of
+		// receipt_recon_findings.resolved_at/resolved_by. Same
+		// manage_bookings guard as the list route it mutates (the recon
+		// routes carry no owner/admin realm-role gate — that posture is
+		// KYC/media-inbox only). resolved_by is the caller identity claim,
+		// resolved server-side (never client-supplied).
+		r.With(s.require("manage_bookings")).Post("/recon/receipts/{id}/resolve", s.reconResolveHandler)
 		// SPEC-W58 Scope C (additive): KYC document surface — the staff leg
 		// of booking -> kyc-service -> ocr-service (P1 Option A). Owner/admin
 		// ONLY (P5, GATE R4): manage_bookings includes field agents holding
@@ -1156,6 +1164,19 @@ func (s *server) reconTriggerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.d.Recon.Trigger(w, r)
+}
+
+// reconResolveHandler adapts POST /v1/recon/receipts/{id}/resolve
+// (SPEC-W64). resolved_by is the caller identity claim (JWT sub, else the
+// X-User-Id header fallback — payment_receipt P3 server-resolved
+// precedent; require() already 401s anonymous callers). A nil recon
+// service answers 503.
+func (s *server) reconResolveHandler(w http.ResponseWriter, r *http.Request) {
+	if s.d.Recon == nil {
+		writeError(w, http.StatusServiceUnavailable, "receipt recon unavailable")
+		return
+	}
+	s.d.Recon.Resolve(w, r, tenantFrom(r.Context()), userFrom(r.Context()))
 }
 
 // publicCreateBookingMarked wraps the public booking create with the

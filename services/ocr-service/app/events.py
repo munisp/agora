@@ -97,6 +97,7 @@ def document_extracted_event(
     storage_bucket: str,
     storage_key: str,
     extracted_fields: dict[str, Any],
+    mime: str,
 ) -> dict[str, Any]:
     """com.opendesk.ocr.DocumentExtracted (opendesk.ocr.events).
 
@@ -107,6 +108,13 @@ def document_extracted_event(
     emitted as {} — KYC PII (names, DOB, ID numbers) NEVER rides the bus;
     downstream consumers (graph-sync hash-only stub, fraud D9) only need
     the hashes/pointers, which are retained.
+
+    SPEC-W64: `mime` rides the payload (the validated content type from
+    validate_upload — e.g. image/png, application/pdf). mime is NOT PII
+    (it describes the file format, never the subject), so the kyc
+    redaction posture is unchanged; consumers that predate the key ignore
+    it (graph-sync's OCRDocumentData silently ignores unknown JSON keys;
+    the W62 bronze mapper's receipt_documents columns are untouched).
     """
     return cloud_event(
         TYPE_DOCUMENT_EXTRACTED,
@@ -123,6 +131,7 @@ def document_extracted_event(
             "model_version": model_version,
             "storage_bucket": storage_bucket,
             "storage_key": storage_key,
+            "mime": mime,
             "extracted_fields": {} if is_kyc_kind(kind) else extracted_fields,
         },
     )

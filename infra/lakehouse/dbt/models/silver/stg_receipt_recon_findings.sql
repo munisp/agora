@@ -13,7 +13,7 @@ standardized as (
     select
         event_id,
         tenant_id,
-        run_id,                                 -- NULL until booking-service enriches findingEventPayload (follow-up)
+        run_id,                                 -- populated since W64 (findingEventPayload emits run_id)
         lower(finding_kind) as finding_kind,    -- receipt_without_payment|payment_without_receipt|amount_mismatch|currency_unknown
         lower(confidence) as confidence,        -- exact|heuristic|none
         capture_client_id,
@@ -24,6 +24,7 @@ standardized as (
         receipt_amount_major,
         upper(receipt_currency) as receipt_currency,
         occurred_at,
+        finding_id,                             -- W64: join key to stg_recon_resolutions
         cast(date_trunc('day', occurred_at) as date) as finding_day
     from source
     where event_id is not null

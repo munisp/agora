@@ -28,7 +28,9 @@ from .mapping import (
     CAC_EVENT_COLUMNS,
     PAYMENT_EVENT_COLUMNS,
     RECEIPT_DOCUMENT_COLUMNS,
+    RECEIPT_INGEST_COLUMNS,
     RECEIPT_RECON_FINDING_COLUMNS,
+    RECON_RESOLUTION_COLUMNS,
     TRANSCRIPT_COLUMNS,
     USAGE_EVENT_COLUMNS,
 )
@@ -95,6 +97,19 @@ _COLUMN_TYPES: dict[str, Any] = {
     "captured_amount_minor": _LONG,
     "receipt_amount_major": _DOUBLE,
     "receipt_currency": _STR,
+    # SPEC-W64 §6: bronze.receipt_ingest (ReceiptIngested, G-B router arm)
+    # + bronze.recon_resolutions (ReceiptReconResolved). finding_id is ALSO
+    # appended to bronze.receipt_recon_findings (W62 table extension —
+    # _evolve_schema ADD COLUMNs it onto pre-existing tables) as the join
+    # key for the gold resolved_count.
+    "finding_id": _STR,
+    "media_inbox_id": _STR,
+    "mime": _STR,
+    "bytes": _LONG,
+    "sha256_prefix": _STR,
+    "state": _STR,
+    "resolved_at": _TS,
+    "resolved_by": _STR,
 }
 
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -108,6 +123,10 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "receipt_documents": RECEIPT_DOCUMENT_COLUMNS,
     # SPEC-W62 G2: ReceiptReconFinding routed off opendesk.booking.events.
     "receipt_recon_findings": RECEIPT_RECON_FINDING_COLUMNS,
+    # SPEC-W64 G-B: ReceiptIngested + ReceiptReconResolved routed off
+    # opendesk.booking.events into their own tables (never booking_events).
+    "receipt_ingest": RECEIPT_INGEST_COLUMNS,
+    "recon_resolutions": RECON_RESOLUTION_COLUMNS,
 }
 
 

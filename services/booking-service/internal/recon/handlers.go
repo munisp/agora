@@ -3,11 +3,14 @@ package recon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"go.uber.org/zap"
 )
@@ -16,6 +19,7 @@ import (
 // centrally in httpapi/server.go (W53 lesson: no self-registration):
 //
 //	GET  /v1/recon/receipts?status=open|resolved|all&limit=  — manage_bookings
+//	POST /v1/recon/receipts/{id}/resolve                     — manage_bookings (SPEC-W64)
 //	POST /v1/internal/recon/receipts                         — X-Internal-Token
 //
 // The tenant context is injected by httpapi's tenant middleware and passed
@@ -82,6 +86,38 @@ func (h *Handlers) ListFindings(w http.ResponseWriter, r *http.Request, tenant b
 		"count":    len(findings),
 		"status":   status,
 	})
+}
+
+// Resolve serves POST /v1/recon/receipts/{id}/resolve (SPEC-W64): marks one
+// finding resolved and emits com.opendesk.booking.ReceiptReconResolved in
+// the same transaction. resolved_by is the caller identity claim resolved
+// by httpapi's tenant middleware (payment_receipt P3 server-resolved
+// precedent) — NEVER read from the request body. Idempotent: an unknown or
+// already-resolved id answers 404 (not_found_or_resolved — the two cases
+// are deliberately indistinguishable) with no event emitted.
+func (h *Handlers) Resolve(w http.ResponseWriter, r *http.Request, tenant bookingops.TenantInfo, actor string) {
+	if h.Svc == nil || h.Svc.Store == nil {
+		writeError(w, http.StatusServiceUnavailable, "receipt recon unavailable")
+		return
+	}
+	findingID, err := uuid.Parse(strings.TrimSpace(chi.URLParam(r, "id")))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid finding id")
+		return
+	}
+	f, err := h.Svc.ResolveFinding(r.Context(), tenant.ID, findingID, actor)
+	if errors.Is(err, ErrFindingNotFoundOrResolved) {
+		writeError(w, http.StatusNotFound, "finding not found or already resolved")
+		return
+	}
+	if err != nil {
+		h.log().Error("receipt recon resolve failed",
+			zap.String("tenant_id", tenant.ID.String()),
+			zap.String("finding_id", findingID.String()), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"finding": f})
 }
 
 // Trigger serves POST /v1/internal/recon/receipts (pinned decision 6: the

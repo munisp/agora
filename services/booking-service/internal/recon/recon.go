@@ -406,6 +406,15 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 		divergent = false
 		detail["currency_mismatch"] = true
 	}
+	// SPEC-W64 field-equality signal: every amount-verification finding
+	// carries the honest comparison outcome so downstream consumers (and
+	// the admin UI) never re-derive it. amount_comparable is the
+	// post-currency-fold comparable; amounts_equal means the pair was
+	// comparable AND agreed (a clean pair produces no finding, so
+	// amounts_equal:true is only observable in theory — the booleans'
+	// value is distinguishing not-comparable from divergent).
+	detail["amount_comparable"] = comparable
+	detail["amounts_equal"] = comparable && !divergent
 	switch {
 	case !comparable:
 		// The amount cannot be verified. A standalone currency_unknown
@@ -517,6 +526,7 @@ func (s *Service) findingEventPayload(ctx context.Context, f *Finding) ([]byte, 
 	}
 	data := map[string]any{
 		"tenant_id":  f.TenantID.String(),
+		"run_id":     f.RunID.String(), // SPEC-W64: the sweep run that raised the finding
 		"kind":       f.Kind,
 		"confidence": f.Confidence,
 	}
@@ -548,6 +558,46 @@ func (s *Service) findingEventPayload(ctx context.Context, f *Finding) ([]byte, 
 		data["finding_id"] = f.ID.String()
 	}
 	return json.Marshal(events.New("booking-service", events.ReceiptReconFindingEventType, subject, f.TenantID.String(), data))
+}
+
+// ResolveFinding (SPEC-W64) marks one finding resolved and emits
+// com.opendesk.booking.ReceiptReconResolved through the outbox in the SAME
+// transaction (Store.ResolveFinding owns the tx). actor is the caller
+// identity claim resolved at the HTTP boundary (payment_receipt P3
+// server-resolved precedent — never client-supplied). A second resolve of
+// the same finding (or an unknown id) returns ErrFindingNotFoundOrResolved
+// with NO outbox row — replay-safe idempotence.
+func (s *Service) ResolveFinding(ctx context.Context, tenantID, findingID uuid.UUID, actor string) (Finding, error) {
+	return s.Store.ResolveFinding(ctx, tenantID, findingID, actor, s.EventsTopic,
+		func(f Finding) ([]byte, error) {
+			return s.resolvedEventPayload(ctx, f)
+		})
+}
+
+// resolvedEventPayload builds the com.opendesk.booking.ReceiptReconResolved
+// CloudEvent (SPEC-W64): {finding_id, tenant_id, run_id, kind, resolved_at,
+// resolved_by}. resolved_at is the database-stamped value from the
+// RETURNING clause (never a client clock).
+func (s *Service) resolvedEventPayload(ctx context.Context, f Finding) ([]byte, error) {
+	subject := ""
+	if s.ResolveSlug != nil {
+		subject = s.ResolveSlug(ctx, f.TenantID)
+	}
+	data := map[string]any{
+		"finding_id": f.ID.String(),
+		"tenant_id":  f.TenantID.String(),
+		"run_id":     f.RunID.String(),
+		"kind":       f.Kind,
+	}
+	if f.ResolvedAt != nil {
+		data["resolved_at"] = f.ResolvedAt.UTC().Format(time.RFC3339Nano)
+	}
+	resolvedBy := ""
+	if f.ResolvedBy != nil {
+		resolvedBy = *f.ResolvedBy
+	}
+	data["resolved_by"] = resolvedBy
+	return json.Marshal(events.New("booking-service", events.ReceiptReconResolvedEventType, subject, f.TenantID.String(), data))
 }
 
 // mustJSON marshals detail; a marshal failure degrades to the minimal

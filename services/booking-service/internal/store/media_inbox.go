@@ -19,13 +19,25 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/opendesk/booking-service/internal/events"
 )
+
+// ReceiptIngestedEventType is the CloudEvent type emitted on
+// opendesk.booking.events for each fresh media-inbox ingest (SPEC-W64
+// Scope 3; the G-C pinned string is free of fraud-engine substring
+// needles). LOCAL const: the canonical const lives in
+// internal/events/cloudevents.go (single-owner A this wave) — defined
+// locally so this package builds before A's hunk lands; the integrator may
+// switch to the shared const (the type STRING is pinned by SPEC-W64 G-C
+// either way).
+const ReceiptIngestedEventType = "com.opendesk.booking.ReceiptIngested"
 
 // mediaInboxParkedCap bounds the per-tenant parked review queue (SPEC-W61
 // pinned constant — NO env knob). On ingest, if parked rows for the tenant
@@ -166,8 +178,17 @@ END $$;`
 //     (state='discarded', anchor_method='auto_cap').
 //
 // The ingest path NEVER inserts into contacts or leads (G4 binding ruling).
-func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest) (MediaInboxItem, error) {
+//
+// SPEC-W64 Scope 3: a FRESH insert also writes one ReceiptIngested
+// CloudEvent {tenant_id, channel, document_id, media_inbox_id,
+// sha256_prefix, mime, bytes, state, booking_id?} to the outbox in the SAME
+// withTenant tx; the replay branch (ON CONFLICT fetch) emits NOTHING so
+// bronze event_id dedupe stays honest. eventsTopic == "" disables emission
+// (house idiom). The payload is PII-safe by construction: it never carries
+// the sender phone in any form (raw or digits).
+func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest, eventsTopic string) (MediaInboxItem, error) {
 	var item MediaInboxItem
+	emitted := false
 	err := s.withTenant(ctx, in.TenantID, func(tx pgx.Tx) error {
 		// Resolve-or-park, decided BEFORE the insert so the row lands with
 		// its final state in one statement. The JOIN folds the contact
@@ -262,8 +283,42 @@ func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest) (Medi
 				return fmt.Errorf("media inbox parked cap: %w", err)
 			}
 		}
+
+		// SPEC-W64 Scope 3: exactly one ReceiptIngested per FRESH ingest,
+		// in the same tx. The replay branch returned above, so reaching
+		// this point implies the row is newly inserted. The fresh row is
+		// the newest parked row, so the cap above never discarded it —
+		// item.State is final.
+		if eventsTopic != "" {
+			data := map[string]any{
+				"tenant_id":      item.TenantID.String(),
+				"channel":        item.Channel,
+				"document_id":    item.DocumentID.String(),
+				"media_inbox_id": item.ID.String(),
+				"sha256_prefix":  item.SHA256Prefix,
+				"mime":           item.Mime,
+				"bytes":          item.Bytes,
+				"state":          item.State,
+			}
+			if item.BookingID != nil {
+				data["booking_id"] = item.BookingID.String()
+			}
+			payload, err := json.Marshal(events.New("booking-service", ReceiptIngestedEventType, "", item.TenantID.String(), data))
+			if err != nil {
+				return fmt.Errorf("marshal receipt ingested event: %w", err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+				item.ID, eventsTopic, payload); err != nil {
+				return fmt.Errorf("insert media inbox outbox: %w", err)
+			}
+			emitted = true
+		}
 		return nil
 	})
+	if err == nil && emitted {
+		s.signalOutboxFlush() // W46-A item 6: flush-on-commit
+	}
 	return item, err
 }
 

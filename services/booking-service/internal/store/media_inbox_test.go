@@ -110,7 +110,7 @@ func TestMediaInboxAnchorsOnUnnormalizedStoredPhones(t *testing.T) {
 			bookingID := miSeedBooking(t, st, tenantID, contactID, "confirmed", time.Now().Add(72*time.Hour))
 			in := miIngestInput(tenantID, "wamid."+tc.name, tc.senderPhone)
 			in.SenderPhoneDigits = "GATEWAY-VALUE-IGNORED" // trust-but-verify: store re-derives SQL-side
-			item, err := st.IngestMediaInbox(ctx, in)
+			item, err := st.IngestMediaInbox(ctx, in, "")
 			if err != nil {
 				t.Fatalf("ingest: %v", err)
 			}
@@ -153,7 +153,7 @@ func TestMediaInboxParksZeroCandidates(t *testing.T) {
 	miSeedBooking(t, st, tenantID, contactID, "confirmed", time.Now().Add(45*24*time.Hour))
 	miSeedBooking(t, st, tenantID, contactID, "pending", time.Now().Add(-10*24*time.Hour))
 
-	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.zero-candidates", "15551230001"))
+	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.zero-candidates", "15551230001"), "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestMediaInboxParksZeroCandidates(t *testing.T) {
 	}
 
 	// No contact at all => parked.
-	item2, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.no-contact", "15559999999"))
+	item2, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.no-contact", "15559999999"), "")
 	if err != nil {
 		t.Fatalf("ingest unknown: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestMediaInboxParksAmbiguousCandidates(t *testing.T) {
 	miSeedBooking(t, st, tenantID, contactID, "pending", time.Now().Add(24*time.Hour))
 	miSeedBooking(t, st, tenantID, contactID, "confirmed", time.Now().Add(48*time.Hour))
 
-	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.ambiguous", "15551230002"))
+	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.ambiguous", "15551230002"), "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestMediaInboxIngestIdempotentReplay(t *testing.T) {
 	contactID := miSeedContact(t, st, tenantID, "+15551230003")
 	miSeedBooking(t, st, tenantID, contactID, "confirmed", time.Now().Add(24*time.Hour))
 
-	first, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.replay", "15551230003"))
+	first, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.replay", "15551230003"), "")
 	if err != nil {
 		t.Fatalf("first ingest: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestMediaInboxIngestIdempotentReplay(t *testing.T) {
 	// Redelivery with a DIFFERENT document_id must still return the
 	// original row untouched.
 	replay := miIngestInput(tenantID, "wamid.replay", "15551230003")
-	second, err := st.IngestMediaInbox(ctx, replay)
+	second, err := st.IngestMediaInbox(ctx, replay, "")
 	if err != nil {
 		t.Fatalf("replay ingest: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestMediaInboxParkedCapAutoDiscard(t *testing.T) {
 		t.Fatalf("seeded parked %s, want 500", got)
 	}
 
-	fresh, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.fresh", "+447700900123"))
+	fresh, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.fresh", "+447700900123"), "")
 	if err != nil {
 		t.Fatalf("ingest over cap: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestMediaInboxLinkAndDiscard(t *testing.T) {
 	otherContact := miSeedContact(t, st, otherTenant, "+15551230005")
 	otherBooking := miSeedBooking(t, st, otherTenant, otherContact, "pending", time.Now().Add(24*time.Hour))
 
-	parked, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.link", "+49666123456"))
+	parked, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.link", "+49666123456"), "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestMediaInboxLinkAndDiscard(t *testing.T) {
 	}
 
 	// Discard a second parked row.
-	parked2, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.discard", "+49666777777"))
+	parked2, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.discard", "+49666777777"), "")
 	if err != nil {
 		t.Fatalf("ingest 2: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestMediaInboxNeverWritesContactsOrLeads(t *testing.T) {
 	before := queryTenant(t, st, tenantID,
 		`SELECT (SELECT count(*) FROM contacts WHERE tenant_id=$1)::text || '|' ||
 		        (SELECT count(*) FROM leads WHERE tenant_id=$1)::text`)
-	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.g4", "+15557770001"))
+	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.g4", "+15557770001"), "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -429,7 +429,7 @@ func TestMediaInboxSubjectErasure(t *testing.T) {
 	bookingID := miSeedBooking(t, st, tenantID, contactID, "confirmed", time.Now().Add(24*time.Hour))
 	// Sender formatting differs from the stored contact phone — the digits
 	// key must still line up.
-	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.erase", "+1 (555) 123-4567"))
+	item, err := st.IngestMediaInbox(ctx, miIngestInput(tenantID, "wamid.erase", "+1 (555) 123-4567"), "")
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestMediaInboxSubjectErasure(t *testing.T) {
 		t.Fatalf("state %q, want anchored (fixture broken)", item.State)
 	}
 	// Same subject, other tenant — must survive.
-	if _, err := st.IngestMediaInbox(ctx, miIngestInput(otherTenant, "wamid.erase-other", "+15551234567")); err != nil {
+	if _, err := st.IngestMediaInbox(ctx, miIngestInput(otherTenant, "wamid.erase-other", "+15551234567"), ""); err != nil {
 		t.Fatalf("ingest other tenant: %v", err)
 	}
 

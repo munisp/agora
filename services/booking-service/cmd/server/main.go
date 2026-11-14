@@ -380,7 +380,9 @@ func run() error {
 	} else {
 		defer fs.Close()
 		fieldCaptureHandlers = &fieldcapture.Handlers{
-			Svc:        &fieldcapture.Service{Store: fs, Leads: leadSvc, Civic: civicSvc, Log: logger},
+			// SPEC-W64 Scope 3 (B): EventsTopic arms the ReceiptIngested
+			// outbox emission on AttachReceipt; empty disables (house idiom).
+			Svc:        &fieldcapture.Service{Store: fs, Leads: leadSvc, Civic: civicSvc, EventsTopic: cfg.BookingEventsTopic, Log: logger},
 			BatchLimit: cfg.FieldCaptureBatchLimit,
 			// SPEC-W53 Scope B (additive): receipt OCR via ocr-service
 			// (POST /v1/field/captures/{id}/receipt). Fail-CLOSED: either

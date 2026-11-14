@@ -387,7 +387,7 @@ func TestW53ReceiptRLSIsolation(t *testing.T) {
 	if err != nil || exists {
 		t.Fatalf("CaptureExists as tenant B = %v, %v — RLS broken", exists, err)
 	}
-	if err := rig.fstore.AttachReceipt(context.Background(), other.ID, clientID, uuid.New(), nil); err != ErrNotFound {
+	if err := rig.fstore.AttachReceipt(context.Background(), other.ID, clientID, uuid.New(), nil, ""); err != ErrNotFound {
 		t.Fatalf("AttachReceipt as tenant B = %v, want ErrNotFound", err)
 	}
 	// Genuine RLS assertion: the harness connects as the postgres SUPERUSER,

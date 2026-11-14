@@ -368,7 +368,7 @@ func (f *w61Fixture) seedInboxRow(t *testing.T, messageID, phone string) store.M
 		Mime:              "image/jpeg",
 		Bytes:             10,
 		SHA256Prefix:      "0123456789abcdef",
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("seed inbox row: %v", err)
 	}

@@ -290,6 +290,9 @@ def test_event_payloads_carry_no_pii_constants():
         storage_bucket="documents",
         storage_key="k",
         extracted_fields={"full_name": "PII", "passport_no": "A1"},
+        mime="image/png",
     )
     assert evt["data"]["extracted_fields"] == {}
     assert "PII" not in json.dumps(evt)
+    # SPEC-W64: mime is not PII — it rides the event for kyc kinds too.
+    assert evt["data"]["mime"] == "image/png"

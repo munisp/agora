@@ -10,10 +10,20 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opendesk/booking-service/internal/config"
+	"github.com/opendesk/booking-service/internal/events"
 )
 
 // ErrNotFound mirrors store.ErrNotFound (404 mapping at the API).
 var ErrNotFound = errors.New("not found")
+
+// ReceiptIngestedEventType is the CloudEvent type emitted on
+// opendesk.booking.events for each receipt ingest (SPEC-W64 Scope 3; the
+// G-C pinned string is free of fraud-engine substring needles).
+// LOCAL const: the canonical const lives in internal/events/cloudevents.go
+// (single-owner A this wave) — defined locally so this package builds
+// before A's hunk lands; the integrator may switch to the shared const
+// (the type STRING is pinned by SPEC-W64 G-C either way).
+const ReceiptIngestedEventType = "com.opendesk.booking.ReceiptIngested"
 
 // Store persists the field_captures idempotency anchors and the
 // field_checkins history. Same packaging idiom as the W14
@@ -250,21 +260,55 @@ func (s *Store) CaptureExists(ctx context.Context, tenantID uuid.UUID, clientID 
 // written; status/result/payload are untouched, so the capture's
 // idempotency semantics are unaffected. ErrNotFound when no anchor matches
 // (tenant_id, client_id) — RLS-scoped via withTenant.
-func (s *Store) AttachReceipt(ctx context.Context, tenantID uuid.UUID, clientID string, docID uuid.UUID, fields json.RawMessage) error {
+//
+// SPEC-W64 Scope 3: on a successful attach, exactly one
+// ReceiptIngested CloudEvent {tenant_id, channel:"field_pwa",
+// capture_client_id, document_id, booking_id?} is written to the outbox in
+// the SAME transaction (pinned decision 7 idiom) — the attach is the only
+// moment document_id (the lakehouse join key) exists. booking_id is read
+// from the payment_receipt payload link (W57) via the UPDATE's RETURNING.
+// eventsTopic == "" disables emission (house idiom, recon.go); the attach
+// itself is unaffected.
+func (s *Store) AttachReceipt(ctx context.Context, tenantID uuid.UUID, clientID string, docID uuid.UUID, fields json.RawMessage, eventsTopic string) error {
 	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var fieldsArg any
 		if len(fields) > 0 && string(fields) != "null" {
 			fieldsArg = []byte(fields)
 		}
-		tag, err := tx.Exec(ctx,
+		var bookingID *string
+		err := tx.QueryRow(ctx,
 			`UPDATE field_captures SET receipt_document_id=$3, receipt_fields=$4
-			 WHERE tenant_id=$1 AND client_id=$2`,
-			tenantID, clientID, docID, fieldsArg)
+			 WHERE tenant_id=$1 AND client_id=$2
+			 RETURNING payload->>'booking_id'`,
+			tenantID, clientID, docID, fieldsArg).Scan(&bookingID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return ErrNotFound
+		if eventsTopic == "" {
+			return nil // emission disabled (house idiom)
+		}
+		data := map[string]any{
+			"tenant_id":         tenantID.String(),
+			"channel":           "field_pwa",
+			"capture_client_id": clientID,
+			"document_id":       docID.String(),
+		}
+		if bookingID != nil {
+			if bid, perr := uuid.Parse(*bookingID); perr == nil {
+				data["booking_id"] = bid.String()
+			}
+		}
+		payload, err := json.Marshal(events.New("booking-service", ReceiptIngestedEventType, "", tenantID.String(), data))
+		if err != nil {
+			return fmt.Errorf("marshal receipt ingested event: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+			docID, eventsTopic, payload); err != nil {
+			return fmt.Errorf("insert receipt ingested outbox: %w", err)
 		}
 		return nil
 	})

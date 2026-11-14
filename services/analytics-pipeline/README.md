@@ -13,10 +13,14 @@ Kafka topics (CloudEvents 1.0)                     Iceberg REST catalog :8181
   cac.events               ─┤                     bronze.cac_events
   opendesk.ocr.events      ─┘                     bronze.receipt_documents
                                                   bronze.receipt_recon_findings
+                                                  bronze.receipt_ingest
+                                                  bronze.recon_resolutions
 ```
 
-`opendesk.booking.events` feeds **two** tables: `ReceiptReconFinding`-typed
-messages are routed to `bronze.receipt_recon_findings` (SPEC-W62 G2);
+`opendesk.booking.events` feeds **four** tables: `ReceiptReconFinding`-typed
+messages are routed to `bronze.receipt_recon_findings` (SPEC-W62 G2),
+`ReceiptIngested`-typed to `bronze.receipt_ingest` and
+`ReceiptReconResolved`-typed to `bronze.recon_resolutions` (SPEC-W64 G-B);
 everything else lands in `bronze.booking_events`.
 
 ## How it works
@@ -46,7 +50,9 @@ guarded by `tests/test_dbt_conformance.py`:
 | `bronze.transcripts` | `conversation_id` string, `tenant_id` string, `role` string, `text` string, `ts` timestamp, `audio_url` string |
 | `bronze.usage_events` | `event_id` string, `tenant_id` string, `metric` string, `value` double, `occurred_at` timestamp, `meta` string *(Wave 5 #9; `value` is a double because call-minutes are fractional; `meta` is stringified JSON)* |
 | `bronze.receipt_documents` | `event_id` string, `tenant_id` string, `document_id` string, `kind` string, `status` string, `page_count` int, `sha256` string, `phash` string, `model_version` string, `amount_minor` long (nullable), `currency` string (nullable), `receipt_date` string (nullable), `occurred_at` timestamp *(SPEC-W62; from `com.opendesk.ocr.DocumentExtracted`, kind=`receipt` only)* |
-| `bronze.receipt_recon_findings` | `event_id` string, `tenant_id` string, `run_id` string, `finding_kind` string, `confidence` string, `capture_client_id` string (nullable), `booking_id` string (nullable, uuid), `attempt_tx_ref` string (nullable), `expected_amount_minor` long (nullable), `captured_amount_minor` long (nullable), `receipt_amount_major` double (nullable), `receipt_currency` string (nullable), `occurred_at` timestamp *(SPEC-W62 G2; `com.opendesk.booking.ReceiptReconFinding` routed off `opendesk.booking.events`)* |
+| `bronze.receipt_recon_findings` | `event_id` string, `tenant_id` string, `run_id` string, `finding_kind` string, `confidence` string, `capture_client_id` string (nullable), `booking_id` string (nullable, uuid), `attempt_tx_ref` string (nullable), `expected_amount_minor` long (nullable), `captured_amount_minor` long (nullable), `receipt_amount_major` double (nullable), `receipt_currency` string (nullable), `occurred_at` timestamp, `finding_id` string (nullable) *(SPEC-W62 G2; `com.opendesk.booking.ReceiptReconFinding` routed off `opendesk.booking.events`. SPEC-W64: `finding_id` appended via schema evolution — join key to `bronze.recon_resolutions` for the gold resolved_count)* |
+| `bronze.receipt_ingest` | `event_id` string, `tenant_id` string, `channel` string (`field_pwa`\|`whatsapp`), `document_id` string, `capture_client_id` string (nullable), `media_inbox_id` string (nullable), `booking_id` string (nullable, uuid — data only, never the slug subject), `mime` string (nullable), `bytes` long (nullable), `sha256_prefix` string (nullable), `state` string (nullable), `occurred_at` timestamp *(SPEC-W64 G-B; `com.opendesk.booking.ReceiptIngested` routed off `opendesk.booking.events`. PII: producers never emit `sender_phone`, the mapper reads only whitelisted keys)* |
+| `bronze.recon_resolutions` | `event_id` string, `tenant_id` string, `finding_id` string, `run_id` string, `kind` string, `resolved_at` timestamp (nullable), `resolved_by` string (nullable), `occurred_at` timestamp *(SPEC-W64 G-B; `com.opendesk.booking.ReceiptReconResolved` routed off `opendesk.booking.events` — emitted by booking-service `ResolveFinding` in the resolve tx)* |
 
 ## PII posture (SPEC-W62 G1 — hash-only, kyc dropped, whitelist)
 

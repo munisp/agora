@@ -81,6 +81,10 @@ type Finding struct {
 	Detail              json.RawMessage `json:"detail"`
 	CreatedAt           time.Time       `json:"created_at"`
 	ResolvedAt          *time.Time      `json:"resolved_at,omitempty"`
+	// ResolvedBy (SPEC-W64) is the caller identity claim stamped by
+	// ResolveFinding (server-resolved, never client-supplied — the
+	// payment_receipt P3 precedent). NULL on unresolved rows.
+	ResolvedBy *string `json:"resolved_by,omitempty"`
 	// ReceiptFields is the linked capture's receipt_fields JSONB verbatim
 	// (nulls allowed) — joined in ListFindings, never stored here.
 	ReceiptFields json.RawMessage `json:"receipt_fields,omitempty"`
@@ -207,8 +211,12 @@ CREATE TABLE IF NOT EXISTS receipt_recon_findings (
     detail                JSONB NOT NULL DEFAULT '{}',
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at           TIMESTAMPTZ,
+    resolved_by           TEXT,
     UNIQUE (tenant_id, kind, capture_client_id, booking_id)
 );
+-- SPEC-W64 (additive): resolved_by for deployments whose table predates the
+-- column above (CREATE TABLE IF NOT EXISTS is a no-op there).
+ALTER TABLE receipt_recon_findings ADD COLUMN IF NOT EXISTS resolved_by TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_receipt_recon_findings_dedupe
     ON receipt_recon_findings (tenant_id, kind, COALESCE(capture_client_id, ''), COALESCE(booking_id::text, ''));
 CREATE INDEX IF NOT EXISTS idx_receipt_recon_findings_tenant_created
@@ -504,6 +512,62 @@ func (s *Store) InsertFindingWithOutbox(ctx context.Context, f *Finding, topic s
 		return nil
 	})
 	return inserted, err
+}
+
+// ErrFindingNotFoundOrResolved (SPEC-W64) is ResolveFinding's outcome when
+// the UPDATE matches no row: the finding does not exist in this tenant OR
+// was already resolved (deliberately indistinguishable — the handler maps
+// it to 404 and a replayed resolve is a harmless no-op).
+var ErrFindingNotFoundOrResolved = errors.New("recon finding not found or already resolved")
+
+// ResolveFinding (SPEC-W64) marks one finding resolved:
+// UPDATE ... SET resolved_at=now(), resolved_by=$actor WHERE tenant_id AND
+// id AND resolved_at IS NULL — the IS NULL guard makes the operation
+// idempotent (a replay resolves nothing and returns
+// ErrFindingNotFoundOrResolved). On success the resolved row is RETURNED
+// and — when topic is non-empty — the pre-built outbox payload for
+// com.opendesk.booking.ReceiptReconResolved is inserted in the SAME
+// withTenant transaction (mirrors InsertFindingWithOutbox, pinned decision
+// 7). payloadFn receives the freshly-resolved row so resolved_at (stamped
+// by the database) lands in the event payload; an empty topic suppresses
+// emission (house "empty topic disables" idiom) while still resolving.
+func (s *Store) ResolveFinding(ctx context.Context, tenantID, findingID uuid.UUID, actor, topic string, payloadFn func(Finding) ([]byte, error)) (Finding, error) {
+	var f Finding
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		scanErr := tx.QueryRow(ctx,
+			`UPDATE receipt_recon_findings
+			    SET resolved_at=now(), resolved_by=$3
+			  WHERE tenant_id=$1 AND id=$2 AND resolved_at IS NULL
+			  RETURNING id, tenant_id, run_id, kind, capture_client_id, booking_id,
+			            attempt_tx_ref, expected_amount_minor, captured_amount_minor,
+			            receipt_amount_major, receipt_currency, confidence, detail,
+			            created_at, resolved_at, resolved_by`,
+			tenantID, findingID, actor).Scan(
+			&f.ID, &f.TenantID, &f.RunID, &f.Kind, &f.CaptureClientID,
+			&f.BookingID, &f.AttemptTxRef, &f.ExpectedAmountMinor, &f.CapturedAmountMinor,
+			&f.ReceiptAmountMajor, &f.ReceiptCurrency, &f.Confidence, &f.Detail,
+			&f.CreatedAt, &f.ResolvedAt, &f.ResolvedBy)
+		if errors.Is(scanErr, pgx.ErrNoRows) {
+			return ErrFindingNotFoundOrResolved
+		}
+		if scanErr != nil {
+			return fmt.Errorf("resolve recon finding: %w", scanErr)
+		}
+		if topic == "" || payloadFn == nil {
+			return nil
+		}
+		payload, err := payloadFn(f)
+		if err != nil {
+			return fmt.Errorf("marshal recon resolved event: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO outbox (aggregate_id, topic, payload) VALUES ($1,$2,$3)`,
+			f.ID, topic, payload); err != nil {
+			return fmt.Errorf("insert recon resolved outbox: %w", err)
+		}
+		return nil
+	})
+	return f, err
 }
 
 // findingReadCols is the ListFindings column list (table-qualified).
