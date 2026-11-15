@@ -74,6 +74,9 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 	// 2. Knowledge seed documents — skipped when the exact title is already
 	// indexed for the tenant (best-effort idempotency; the knowledge service
 	// has no list endpoint).
+	// Tenant context for knowledge-service: in-cluster callers name the tenant in X-Tenant-Slugs (the gateway strips
+	// client copies at the edge). Without it every search/seed answered 401 and the pack never finished applying.
+	knowledgeHeaders := map[string]string{"X-Tenant-Slugs": in.Slug}
 	for _, doc := range pack.KnowledgeSeed {
 		var found struct {
 			Results []struct {
@@ -81,7 +84,7 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 			} `json:"results"`
 		}
 		searchPath := "v1/search?q=" + url.QueryEscape(doc.Title) + "&tenant=" + url.QueryEscape(in.Slug)
-		if err := a.Dapr.InvokeServiceMethod(ctx, http.MethodGet, a.Industry.KnowledgeAppID, searchPath, nil, nil, &found); err != nil {
+		if err := a.Dapr.InvokeServiceMethod(ctx, http.MethodGet, a.Industry.KnowledgeAppID, searchPath, nil, knowledgeHeaders, &found); err != nil {
 			return fmt.Errorf("search knowledge for %q: %w", doc.Title, err)
 		}
 		dup := false
@@ -95,7 +98,7 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 			continue
 		}
 		body := map[string]any{"tenant": in.Slug, "title": doc.Title, "body": doc.Body}
-		if err := a.Dapr.InvokeService(ctx, a.Industry.KnowledgeAppID, "v1/documents", body, nil); err != nil {
+		if err := a.Dapr.InvokeServiceWithHeaders(ctx, a.Industry.KnowledgeAppID, "v1/documents", body, knowledgeHeaders, nil); err != nil {
 			return fmt.Errorf("seed knowledge doc %q: %w", doc.Title, err)
 		}
 		a.Log.Info("pack knowledge doc seeded", zap.String("slug", in.Slug), zap.String("title", doc.Title))
