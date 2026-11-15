@@ -54,6 +54,18 @@ import (
 	"go.uber.org/zap"
 )
 
+
+// NotifyTaskQueue is the notification-worker's task queue, where the "NotifyPaced" activity lives. Set at startup
+// when booking-service runs its worker on its own queue (TEMPORAL_WORKER_TASK_QUEUE); "" = this workflow's queue.
+var NotifyTaskQueue string
+
+func notifyCtx(ctx workflow.Context) workflow.Context {
+	if NotifyTaskQueue == "" {
+		return ctx
+	}
+	return workflow.WithTaskQueue(ctx, NotifyTaskQueue)
+}
+
 const (
 	// WorkflowTypeStudioSend is the registered name of the send workflow.
 	WorkflowTypeStudioSend = "StudioSendWorkflow"
@@ -281,7 +293,7 @@ func guardedPacedSend(ctx workflow.Context, req PacedSendRequest, quiet geo.Quie
 			}
 		}
 	}
-	if err := workflow.ExecuteActivity(ctx, ActivityNotifyPaced, req).Get(ctx, &res); err != nil {
+	if err := workflow.ExecuteActivity(notifyCtx(ctx), ActivityNotifyPaced, req).Get(ctx, &res); err != nil {
 		return res, err
 	}
 	if res.Status == "" {

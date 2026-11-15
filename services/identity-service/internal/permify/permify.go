@@ -145,16 +145,24 @@ func (c *HTTPClient) DeleteTenant(ctx context.Context, tenantID string) error {
 func (c *HTTPClient) CreateTenant(ctx context.Context, tenantID, name string) error {
 	body := map[string]any{"id": tenantID, "name": name}
 	err := c.post(ctx, "/v1/tenants/create", body, nil)
-	if err != nil && !strings.Contains(err.Error(), "status 409") {
+	if err != nil && !alreadyExists(err) {
 		return err
 	}
-	// 409 = already exists — idempotent. The schema is (re)written on every
+	// Already exists — idempotent. The schema is (re)written on every
 	// call so tenants provisioned before GF15 self-heal on the next
 	// ensure-permify / onboarding call (schemas/write versions are additive).
 	if err := c.WriteSchema(ctx, tenantID); err != nil {
 		return fmt.Errorf("write schema for tenant %s: %w", tenantID, err)
 	}
 	return nil
+}
+
+// alreadyExists: Permify answers a duplicate tenant with 409 on some versions and 400 ERROR_CODE_UNIQUE_CONSTRAINT
+// on others (the deployed one). Missing the second made every onboarding fail at its permify step, because tenant
+// creation had already created it.
+func alreadyExists(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "status 409") || strings.Contains(msg, "ERROR_CODE_UNIQUE_CONSTRAINT")
 }
 
 // WriteSchema posts the embedded ReBAC schema to

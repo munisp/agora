@@ -25,7 +25,7 @@ func (c *Client) StartCommissionPayout(ctx context.Context, in referrals.PayoutI
 	id := "commission-payout-" + in.PayoutID
 	opts := client.StartWorkflowOptions{
 		ID:                    id,
-		TaskQueue:             c.taskQueue,
+		TaskQueue:             c.bookingQueue(),
 		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 	}
 	_, err := c.tc.ExecuteWorkflow(ctx, opts, referrals.WorkflowTypePayout, in)
@@ -45,7 +45,7 @@ func (c *Client) StartCommissionPayout(ctx context.Context, in referrals.PayoutI
 func (c *Client) StartCommissionRecon(ctx context.Context, in referrals.ReconInput) (string, error) {
 	opts := client.StartWorkflowOptions{
 		ID:        "commission-recon-manual-" + uuid.NewString(),
-		TaskQueue: c.taskQueue,
+		TaskQueue: c.bookingQueue(),
 	}
 	run, err := c.tc.ExecuteWorkflow(ctx, opts, referrals.WorkflowTypeRecon, in)
 	if err != nil {
@@ -90,7 +90,7 @@ func (c *Client) EnsureCommissionReconSchedule(ctx context.Context, cronExpr str
 			ID:        "commission-recon-nightly-run",
 			Workflow:  referrals.WorkflowTypeRecon,
 			Args:      []interface{}{referrals.ReconInput{}},
-			TaskQueue: c.taskQueue,
+			TaskQueue: c.bookingQueue(),
 		},
 	})
 	if err != nil {
