@@ -109,9 +109,16 @@ class XTTSModel:
     def _load(self):
         with self._lock:
             if self._tts is None:
+                import torch
                 from TTS.api import TTS  # lazy heavy import
 
-                self._tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+                if os.environ.get("XTTS_DISABLE_CUDNN") == "1":
+                    # Some GPUs/driver stacks (e.g. NVIDIA GB10 + CUDA 13) have no cuDNN engine for XTTS's
+                    # transposed convolutions; plain CUDA kernels work.
+                    torch.backends.cudnn.enabled = False
+                # TTS() loads on the CPU: without .to() the "GPU" sidecar synthesised on the CPU (minutes per line).
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
             return self._tts
 
     def synthesize(self, text: str, sample_wav: Path, language: str) -> bytes:
