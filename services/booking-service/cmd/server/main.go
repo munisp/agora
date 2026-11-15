@@ -65,7 +65,11 @@ type tenantDataDeleterBySlug struct {
 	st *store.Store
 }
 
-func (a tenantDataDeleterBySlug) DeleteTenantData(ctx context.Context, slug string) error {
+func (a tenantDataDeleterBySlug) DeleteTenantData(ctx context.Context, slug, tenantID string) error {
+	if id, err := uuid.Parse(tenantID); err == nil {
+		_, err := a.st.DeleteTenantData(ctx, id)
+		return err
+	}
 	_, err := a.st.DeleteTenantDataBySlug(ctx, slug)
 	return err
 }

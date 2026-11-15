@@ -11,14 +11,16 @@ import (
 
 type fakeDeleter struct {
 	slugs []string
+	ids   []string
 	err   error
 }
 
-func (f *fakeDeleter) DeleteTenantData(_ context.Context, slug string) error {
+func (f *fakeDeleter) DeleteTenantData(_ context.Context, slug, tenantID string) error {
 	if f.err != nil {
 		return f.err
 	}
 	f.slugs = append(f.slugs, slug)
+	f.ids = append(f.ids, tenantID)
 	return nil
 }
 
@@ -94,5 +96,24 @@ func TestTenantDeleted_DeleterError_Retries(t *testing.T) {
 	err := c.Process(context.Background(), tenantDeletedRaw(t, env))
 	if err == nil || errors.Is(err, errPermanentTenantDeleted) {
 		t.Fatalf("transient store error must be retryable, got %v", err)
+	}
+}
+
+
+func TestTenantDeletedPurgesTheEventsTenantID(t *testing.T) {
+	// A same-slug re-create left an older site row for the slug; purging by slug hit that old tenant, not the one
+	// just deleted. The event's tenant_id must reach the deleter.
+	del := &fakeDeleter{}
+	c := &TenantDeletedConsumer{deleter: del, log: zap.NewNop()}
+	var env tenantDeletedEnvelope
+	env.Type = "com.opendesk.identity.TenantDeleted"
+	env.Subject = "harbour"
+	env.Data.TenantSlug = "harbour"
+	env.Data.TenantID = "55ec7166-8dfc-4508-a4b7-f703f8e1312f"
+	if err := c.Process(context.Background(), tenantDeletedRaw(t, env)); err != nil {
+		t.Fatal(err)
+	}
+	if len(del.ids) != 1 || del.ids[0] != env.Data.TenantID {
+		t.Fatalf("deleter got tenant ids %v, want [%s]", del.ids, env.Data.TenantID)
 	}
 }
