@@ -158,3 +158,11 @@ async def test_llm_extra_body_is_merged_into_chat_requests():
                                                              httpx.MockTransport(handler)))
     await client.post("http://llm/v1/chat/completions", json={"model": "gemma4:26b", "messages": []})
     assert seen["body"] == {"model": "gemma4:26b", "messages": [], "reasoning_effort": "none"}
+
+
+def test_worker_llm_node_builds():
+    """Built exactly as a job builds it: the plugin raised "OpenAI API key is required" and every call died."""
+    from app.config import Settings
+    from app.livekit_worker import _worker_llm
+
+    assert _worker_llm(Settings(llm_api_key="ollama", llm_extra_body={"reasoning_effort": "none"})) is not None

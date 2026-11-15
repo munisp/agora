@@ -126,6 +126,11 @@ def _openai_client(settings: Settings) -> Any:
     )
 
 
+def _worker_llm(settings: Settings) -> Any:
+    # The plugin refuses to start without api_key even when handed a client.
+    return lk_openai.LLM(model=settings.llm_model, api_key=settings.llm_api_key, client=_openai_client(settings))
+
+
 async def _warmup_then_release(tts: Any) -> None:
     """Warm the sidecars, then drop the HTTP clients. Prewarm runs in its own asyncio.run() loop, which closes
     afterwards; clients kept from it made every later call fail with "Event loop is closed" (piper then fell
@@ -717,10 +722,7 @@ async def build_voice_agent(
         # the worker node relies on the primary endpoint + job-level retry.
         # Own client: the plugin's default read timeout is 5 s, which cut off every reply from a CPU-hosted model
         # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
-        llm=lk_openai.LLM(
-            model=settings.llm_model,
-            client=_openai_client(settings),
-        ),
+        llm=_worker_llm(settings),
         tts=PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
