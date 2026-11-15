@@ -185,6 +185,10 @@ class FallbackTTS:
         lang = (language or "").strip() or self.language
         if provider is not None and provider not in self._providers:
             raise ValueError(f"unknown TTS provider: {provider!r}")
+        # A bare voice id with a provider pin is that provider's voice (the admin preview sends provider="xtts",
+        # voice="<id>"); without this every non-piper provider fell back to its default voice and dropped the id.
+        if provider and spec and split_voice_spec(spec)[0] is None:
+            spec = f"{provider}:{spec}"
         attempts = self._attempt_order(spec, provider)
 
         last_exc: Exception | None = None

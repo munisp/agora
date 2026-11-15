@@ -801,3 +801,16 @@ def test_voice_as_dict_sends_labels_as_strings():
     v = Voice(id="v1", languages=["en"], labels={"tags": ["xtts-v2"], "name": "Front desk", "engine": "xtts"})
     assert v.as_dict()["labels"] == ["xtts-v2", "xtts"] and v.as_dict()["name"] == "Front desk"
     assert Voice(id="en_US", labels={"engine": "piper"}).as_dict()["labels"] == ["piper"]
+
+
+async def test_pinned_provider_keeps_a_bare_voice_id():
+    """Admin preview sends provider="xtts", voice="<id>": the id must reach xtts, not its (empty) default."""
+    xtts = FakeProvider("xtts", default_voice="")
+    piper = FakeProvider("piper")
+    chain = FallbackTTS({"xtts": xtts, "piper": piper}, ["piper", "xtts"])
+    await chain.synthesize("hello", voice="5fc7ac9f", language="en", provider="xtts")
+    assert xtts.calls == [("hello", "5fc7ac9f", "en")]
+    mms = FakeProvider("mms")
+    chain = FallbackTTS({"mms": mms, "piper": piper}, ["piper", "mms"])
+    await chain.synthesize("bawo", voice="yor", language="yo", provider="mms")
+    assert mms.calls[-1][1] == "yor"
