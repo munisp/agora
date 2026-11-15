@@ -446,6 +446,8 @@ export interface VoiceSession {
   signed_url?: string | null;
   /** Optional avatar presence descriptor (SPEC-W9 Part A) */
   avatar?: Record<string, unknown> | null;
+  /** STUN/TURN servers for the browser (per-session relay credentials); absent = browser defaults */
+  ice_servers?: RTCIceServer[] | null;
 }
 
 // ---------- gateway-edge WebSocket events ----------

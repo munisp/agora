@@ -3266,7 +3266,7 @@ routes:
   # (agency staff roles may name any business). The anonymous /voice/voices
   # and /voice/tts-preview paths are closed below.
   - id: api-voice
-    uris: [/api/voice/voices, /api/voice/tts-preview]
+    uris: [/api/voice/voices, /api/voice/tts-preview, /api/voice/ice-servers]
     methods: [GET, POST, OPTIONS]
     upstream_id: voice
     plugins:
@@ -3485,6 +3485,7 @@ routes:
       # Signed-in only (api-voice above): the cloned-voice catalogue and preview.
       - /voice/voices
       - /voice/tts-preview
+      - /voice/ice-servers
     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     priority: 10
     plugins:

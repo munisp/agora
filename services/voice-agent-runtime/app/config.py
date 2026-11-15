@@ -47,6 +47,12 @@ class Settings:
 
     # LiveKit (SPEC §11: dev keys on 7880)
     livekit_url: str = "ws://livekit:7880"
+    # What browsers dial (wss through the public edge); livekit_url stays the in-cluster address for workers.
+    livekit_public_url: str = ""
+    # Cloudflare Realtime TURN (app/ice.py): per-session relay credentials for browsers when LiveKit takes no
+    # inbound UDP. Empty = no TURN offered.
+    cf_turn_key_id: str = ""
+    cf_turn_api_token: str = ""
     livekit_api_key: str = "devkey"
     livekit_api_secret: str = "secret"
 
@@ -272,6 +278,9 @@ def load_settings() -> Settings:
             "CONVERSATION_EVENTS_TOPIC", "opendesk.conversation.events"
         ),
         livekit_url=_env("LIVEKIT_URL", "ws://livekit:7880"),
+        livekit_public_url=_env("LIVEKIT_PUBLIC_URL", ""),
+        cf_turn_key_id=_env("CF_TURN_KEY_ID", ""),
+        cf_turn_api_token=_env("CF_TURN_API_TOKEN", ""),
         livekit_api_key=_env("LIVEKIT_API_KEY", "devkey"),
         livekit_api_secret=_env("LIVEKIT_API_SECRET", "secret"),
         llm_base_url=_env("LLM_BASE_URL", "http://ollama:11434/v1"),

@@ -81,6 +81,7 @@ from .pipeline.stt_stream import (
     StreamingSTTEngine,
 )
 from .session_state import SessionStore
+from .ice import IceServerSource
 from .tts_providers.base import voice_tenant
 from .tts_providers.chain import build_fallback_tts
 
@@ -151,6 +152,8 @@ class VoiceSessionResponse(BaseModel):
     # {"provider": "tavus", "status": "joining"}. None when AVATAR_PROVIDER
     # is `none` (default) — the client renders audio-only in that case.
     avatar: dict | None = None
+    # RTCIceServer list (STUN/TURN) for the browser's rtcConfig; None = client defaults.
+    ice_servers: list[dict] | None = None
 
 
 def create_app(
@@ -189,6 +192,7 @@ def create_app(
     # pre-W10 behavior). Backs the /voice/voices, /voice/tts-preview and
     # /voice/voices/enroll endpoints below.
     tts_chain = build_fallback_tts(settings)
+    ice_source = IceServerSource(settings.cf_turn_key_id, settings.cf_turn_api_token)
     elevenlabs = (
         ElevenLabsBackend(settings=settings, dapr=dapr, sessions=sessions)
         if settings.agent_backend == "elevenlabs"
@@ -292,9 +296,10 @@ def create_app(
         return VoiceSessionResponse(
             backend="livekit",
             room=room,
-            url=settings.livekit_url,
+            url=settings.livekit_public_url or settings.livekit_url,
             token=token,
             avatar=avatar_payload,
+            ice_servers=await ice_source.get(),
         )
 
     # SPEC-W45 K15(c): channels whose provider cryptographically verifies
@@ -657,9 +662,16 @@ def create_app(
         log.info("escalation staff token minted", room=room)
         return {
             "room": room,
-            "url": settings.livekit_url,
+            "url": settings.livekit_public_url or settings.livekit_url,
             "token": token,
+            "ice_servers": await ice_source.get(),
         }
+
+    @app.get("/voice/ice-servers")
+    async def ice_servers() -> dict[str, Any]:
+        """Relay credentials for a browser joining a room it already holds a token for (the staff call page).
+        Reached only through the signed-in /api/voice/* gateway route; the anonymous path is closed."""
+        return {"ice_servers": await ice_source.get()}
 
     if elevenlabs is not None:
 

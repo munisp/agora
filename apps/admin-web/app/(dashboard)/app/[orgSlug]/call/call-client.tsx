@@ -3,6 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { Mic, MicOff, PhoneOff } from "lucide-react";
+import { api } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Button } from "@/components/ui/button";
@@ -89,7 +90,14 @@ export function CallClient({
         lk.on(RoomEvent.TrackUnsubscribed, (track) => {
           if (track.kind === Track.Kind.Video) setAvatarTrack(null);
         });
-        await lk.connect(LIVEKIT_URL, token);
+        // Per-session TURN relay credentials (signed-in route); without them the browser tries direct UDP.
+        let iceServers: RTCIceServer[] | null = null;
+        try {
+          iceServers = (await api.get<{ ice_servers: RTCIceServer[] | null }>("/api/voice/ice-servers")).ice_servers;
+        } catch {
+          iceServers = null;
+        }
+        await lk.connect(LIVEKIT_URL, token, iceServers?.length ? { rtcConfig: { iceServers } } : undefined);
         await lk.localParticipant.setMicrophoneEnabled(true);
         if (!cancelled) setState("connected");
       } catch (e) {

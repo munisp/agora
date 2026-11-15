@@ -147,7 +147,12 @@ export function VoiceSessionButton({
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (track.kind === Track.Kind.Video) setAvatarTrack(null);
       });
-      await room.connect(session.url, session.token);
+      // Relay through TURN when the runtime offers it (LiveKit may take no inbound UDP from the internet).
+      await room.connect(
+        session.url,
+        session.token,
+        session.ice_servers?.length ? { rtcConfig: { iceServers: session.ice_servers } } : undefined,
+      );
       await room.localParticipant.setMicrophoneEnabled(true);
       setState("connected");
     } catch (e) {
