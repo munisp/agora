@@ -68,6 +68,8 @@ type PermifyClient interface {
 type KeycloakClient interface {
 	CreateTenantGroup(ctx context.Context, slug string) (string, error)
 	CreateUser(ctx context.Context, slug string, in keycloak.CreateUserInput) (string, error)
+	// Creator → /tenants/{slug} so the new tenant appears in their token (tenant_slugs).
+	AddUserToTenantGroup(ctx context.Context, userID, slug string) error
 	// SPEC-W45 K8: execute-actions e-mail after invite (fail-soft).
 	SendExecuteActionsEmail(ctx context.Context, userID string, actions []string) error
 	// SPEC-W45 K16 member lifecycle.
@@ -391,6 +393,18 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.d.Keycloak.CreateTenantGroup(r.Context(), t.Slug); err != nil {
 		s.d.Logger.Warn("keycloak group creation deferred to onboarding workflow",
 			zap.String("slug", t.Slug), zap.Error(err))
+	}
+
+	// The owner joins the tenant's Keycloak group (tenant_slugs claim) and gets a membership row. Without this a
+	// self-signed-up owner — or anyone a platform admin provisioned for — saw "No access" to their own business.
+	if req.OwnerUserID != "" {
+		if err := s.d.Keycloak.AddUserToTenantGroup(r.Context(), req.OwnerUserID, t.Slug); err != nil {
+			s.d.Logger.Error("owner could not join the tenant group (sign-in will show no access until fixed)",
+				zap.String("slug", t.Slug), zap.String("owner", req.OwnerUserID), zap.Error(err))
+		}
+		if err := s.d.Store.AddMember(r.Context(), store.Membership{TenantID: t.ID, UserID: req.OwnerUserID, Role: "owner"}); err != nil {
+			s.d.Logger.Error("owner membership row", zap.String("slug", t.Slug), zap.Error(err))
+		}
 	}
 
 	// Permify tenant + owner relationship.

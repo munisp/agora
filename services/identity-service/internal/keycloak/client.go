@@ -250,6 +250,23 @@ func (c *Client) CreateUser(ctx context.Context, slug string, in CreateUserInput
 	return userID, nil
 }
 
+// AddUserToTenantGroup puts an existing user (a tenant's creator) into /tenants/{slug}: the group membership that
+// puts {slug} in the user's tenant_slugs claim, without which the dashboard answers "No access".
+func (c *Client) AddUserToTenantGroup(ctx context.Context, userID, slug string) error {
+	groupID, err := c.findGroupByPath(ctx, "/tenants/"+slug)
+	if err != nil {
+		return err
+	}
+	if groupID == "" {
+		return fmt.Errorf("tenant group /tenants/%s not found", slug)
+	}
+	resp, err := c.do(ctx, http.MethodPut, "/admin/realms/"+c.realm+"/users/"+userID+"/groups/"+groupID, nil)
+	if err != nil {
+		return err
+	}
+	return expectStatus(resp, "join tenant group", http.StatusNoContent)
+}
+
 // expectStatus reads + closes resp and errors unless the status is one of the
 // accepted codes (Keycloak admin writes answer 204; a few answer 200).
 func expectStatus(resp *http.Response, op string, accepted ...int) error {
