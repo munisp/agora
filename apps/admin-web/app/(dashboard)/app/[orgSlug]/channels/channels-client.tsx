@@ -197,7 +197,11 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
 
   const whatsappWebhookUrl = `${gatewayBase || "https://<gateway-host>"}/webhooks/whatsapp`;
   const telegramWebhookUrl = `${gatewayBase || "https://<gateway-host>"}/webhooks/telegram`;
-  const embedSnippet = `<script src="${typeof window !== "undefined" ? window.location.origin : ""}/embed.js" data-site="${orgSlug}" async></script>`;
+  // Read the site's address after mount: during server rendering there is no window, and rendering "" there but the
+  // origin in the browser made React throw #418 (hydration text mismatch).
+  const [origin, setOrigin] = React.useState("");
+  React.useEffect(() => setOrigin(window.location.origin), []);
+  const embedSnippet = `<script src="${origin}/embed.js" data-site="${orgSlug}" async></script>`;
 
   const copy = async (value: string, label: string) => {
     try {

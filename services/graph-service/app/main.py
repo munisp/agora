@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import ValidationError
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, ValidationError
@@ -214,10 +215,20 @@ def create_app(
 
     @app.post("/v1/graph/segments/count")
     async def preview_segment_count(
-        payload: SegmentCreate,
+        body: dict[str, Any] = Body(...),
         tenant_id: str = Depends(current_tenant),
         deps: Deps = Depends(get_deps),
     ) -> dict[str, Any]:
+        # The Segment Builder previews UNSAVED filters: it sends the filter fields at the top level, with no name yet
+        # (has_consent is its purpose). Accept that shape as well as the full create body; the consent purpose stays
+        # mandatory either way.
+        if "filter" not in body:
+            body = {"name": "preview", "purpose": body.get("purpose") or body.get("has_consent") or "",
+                    "filter": {k: v for k, v in body.items() if k not in ("name", "purpose", "description")}}
+        try:
+            payload = SegmentCreate.model_validate({"name": "preview", **body})
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors(include_url=False, include_context=False)) from exc
         """Live count preview for UNSAVED segment DSL (admin-web Segment
         Builder). Accepts the same DSL body as POST /v1/graph/segments,
         compiles it through the identical mandatory gates (tenant filter,
