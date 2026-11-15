@@ -2,7 +2,8 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci --no-audit --no-fund
+# No lockfile is committed, so npm ci cannot run.
+RUN npm install --no-audit --no-fund
 
 # ---------- build ----------
 FROM node:20-alpine AS builder
