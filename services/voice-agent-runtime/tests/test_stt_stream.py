@@ -276,3 +276,8 @@ def test_ws_backpressure_closes_1008_on_overflow():
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason
+
+
+def test_faster_whisper_imports():
+    """The receptionist's ears: the STT backend must import in the shipped image (it lacked `requests`)."""
+    import faster_whisper  # noqa: F401
