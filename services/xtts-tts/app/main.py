@@ -116,6 +116,18 @@ class XTTSModel:
                     # Some GPUs/driver stacks (e.g. NVIDIA GB10 + CUDA 13) have no cuDNN engine for XTTS's
                     # transposed convolutions; plain CUDA kernels work.
                     torch.backends.cudnn.enabled = False
+                import torchaudio
+
+                if os.environ.get("XTTS_SOUNDFILE_LOAD", "1") == "1":
+                    # torchaudio >= 2.9 reads audio only through TorchCodec (FFmpeg-linked, torch-ABI-bound). XTTS
+                    # only loads the reference wav, so read it with soundfile instead.
+                    import soundfile as sf
+
+                    def _load(path, *_args, **_kwargs):
+                        data, rate = sf.read(str(path), dtype="float32", always_2d=True)
+                        return torch.from_numpy(data.T.copy()), rate
+
+                    torchaudio.load = _load
                 # TTS() loads on the CPU: without .to() the "GPU" sidecar synthesised on the CPU (minutes per line).
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 self._tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
