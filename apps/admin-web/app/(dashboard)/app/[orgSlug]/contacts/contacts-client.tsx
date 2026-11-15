@@ -4,6 +4,7 @@ import * as React from "react";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
+import { useNavLabels } from "@/components/terminology-provider";
 import { ErrorNote } from "@/components/error-note";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -39,6 +40,7 @@ export function ContactsClient({
   initialContacts: Contact[];
   initialError: string | null;
 }) {
+  const labels = useNavLabels();
   const { toast } = useToast();
   const [contacts, setContacts] = React.useState<Contact[]>(initialContacts);
   const [error, setError] = React.useState<string | null>(initialError);
@@ -215,7 +217,7 @@ export function ContactsClient({
   return (
     <div>
       <PageHeader
-        title="Contacts"
+        title={labels.contacts}
         description="Your customer directory — the people bookings, leads and conversations resolve against."
         actions={
           <>

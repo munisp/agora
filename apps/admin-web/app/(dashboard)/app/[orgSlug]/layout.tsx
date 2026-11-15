@@ -7,6 +7,8 @@ import { OrgNav } from "@/components/org-nav";
 import { AgoraMark } from "@/components/brand";
 import { Button } from "@/components/ui/button";
 import type { Tenant } from "@/lib/types";
+import { resolveNavLabels } from "@/lib/terminology";
+import { TerminologyProvider } from "@/components/terminology-provider";
 
 export default async function OrgLayout({
   children,
@@ -54,6 +56,7 @@ export default async function OrgLayout({
     tenant = null;
   }
 
+  const labels = resolveNavLabels(tenant);
   return (
     <div className="flex min-h-screen">
       <aside className="flex w-64 shrink-0 flex-col bg-umber-deep text-paper">
@@ -70,7 +73,7 @@ export default async function OrgLayout({
         </div>
         <div className="woven-band opacity-80" />
         <div className="flex-1 overflow-y-auto py-3">
-          <OrgNav orgSlug={orgSlug} roles={session.realmRoles ?? []} />
+          <OrgNav orgSlug={orgSlug} roles={session.realmRoles ?? []} labels={labels} />
         </div>
         <div className="space-y-1 border-t border-paper/10 p-3">
           <Link
@@ -101,7 +104,9 @@ export default async function OrgLayout({
           </p>
         </div>
       </aside>
-      <main className="paper-pattern min-w-0 flex-1 px-8 py-8">{children}</main>
+      <main className="paper-pattern min-w-0 flex-1 px-8 py-8">
+        <TerminologyProvider labels={labels}>{children}</TerminologyProvider>
+      </main>
     </div>
   );
 }

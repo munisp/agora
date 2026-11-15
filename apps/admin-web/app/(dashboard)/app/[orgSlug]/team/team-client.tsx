@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Plus, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
+import { useNavLabels } from "@/components/terminology-provider";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -59,6 +60,7 @@ export function TeamClient({
   initialMembers: TeamMember[];
   initialError: string | null;
 }) {
+  const labels = useNavLabels();
   const { toast } = useToast();
   const router = useRouter();
   const [members, setMembers] = React.useState<TeamMember[]>(initialMembers);
@@ -155,7 +157,7 @@ export function TeamClient({
   return (
     <div>
       <PageHeader
-        title="Team"
+        title={labels.team}
         description="People the receptionist can book time with."
         actions={
           <Button size="sm" onClick={() => setAdding(true)}>

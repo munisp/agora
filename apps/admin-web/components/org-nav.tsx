@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { DEFAULT_NAV_LABELS, type NavLabels } from "@/lib/terminology";
 import {
   LayoutDashboard,
   LayoutGrid,
@@ -127,8 +128,11 @@ const linkClass = (active: boolean) =>
 export function OrgNav({
   orgSlug,
   roles = [],
+  labels = DEFAULT_NAV_LABELS,
 }: {
   orgSlug: string;
+  /** the tenant's pack wording for the core entries (bookings, contacts, team, offerings) */
+  labels?: NavLabels;
   /** caller's Keycloak realm roles (session.realmRoles) — gates nav entries */
   roles?: string[];
 }) {
@@ -224,7 +228,9 @@ export function OrgNav({
         return (
           <Link key={href} href={href} className={linkClass(active)}>
             <Icon className="h-4 w-4 shrink-0" />
-            {item.label}
+            {item.segment === "bookings" || item.segment === "contacts" || item.segment === "team" || item.segment === "offerings"
+              ? labels[item.segment]
+              : item.label}
           </Link>
         );
       })}

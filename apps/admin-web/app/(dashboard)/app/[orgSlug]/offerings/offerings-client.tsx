@@ -4,6 +4,7 @@ import * as React from "react";
 import { Plus, Pencil, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
+import { useNavLabels } from "@/components/terminology-provider";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,6 +64,7 @@ function toForm(o: Offering): OfferingForm {
 }
 
 export function OfferingsClient({ orgSlug }: { orgSlug: string }) {
+  const labels = useNavLabels();
   const { toast } = useToast();
   const [offerings, setOfferings] = React.useState<Offering[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -179,7 +181,7 @@ export function OfferingsClient({ orgSlug }: { orgSlug: string }) {
   return (
     <div>
       <PageHeader
-        title="Offerings"
+        title={labels.offerings}
         description="The services your receptionist can book: duration, buffer, price and capacity."
         actions={
           <Button size="sm" onClick={() => setEditing("new")}>
