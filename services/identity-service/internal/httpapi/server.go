@@ -425,7 +425,7 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, t)
 }
 
-// triggerOnboarding invokes notification-worker's POST /dev/trigger-onboarding
+// triggerOnboarding invokes notification-worker's POST /internal/tenants/onboard
 // via Dapr service invocation with a fresh context (the request context dies
 // with the response).
 func (s *server) triggerOnboarding(t store.Tenant) {
@@ -433,7 +433,7 @@ func (s *server) triggerOnboarding(t store.Tenant) {
 	defer cancel()
 	// SPEC-W44 K2: notification-worker gates its /dev/* triggers behind
 	// X-Internal-Token == NOTIFICATION_INTERNAL_TOKEN (401/503 fail-closed).
-	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "dev/trigger-onboarding", map[string]any{
+	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "internal/tenants/onboard", map[string]any{
 		"tenant_id":   t.ID.String(),
 		"tenant_slug": t.Slug,
 		"slug":        t.Slug,

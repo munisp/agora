@@ -105,7 +105,7 @@ func (s *server) triggerTwinCleanup(t store.Tenant, twinOf string) {
 	defer cancel()
 	// SPEC-W44 K2: notification-worker gates /dev/* behind X-Internal-Token
 	// == NOTIFICATION_INTERNAL_TOKEN (see notificationInternalHeaders).
-	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "dev/trigger-twin-cleanup", map[string]any{
+	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "internal/tenants/twin-cleanup", map[string]any{
 		"tenant_id": t.ID.String(),
 		"slug":      t.Slug,
 		"twin_of":   twinOf,

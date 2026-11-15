@@ -228,3 +228,17 @@ func TestMetricsRouteMounted(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Contains(t, rec.Body.String(), "go_goroutines") // promhttp default registry
 }
+
+func TestInternalOnboardingRouteWithoutDevFlag(t *testing.T) {
+	// Production provisioning: identity-service starts TenantOnboardingWorkflow (ApplyIndustryPack) through
+	// /internal/tenants/onboard, which exists without OPENDESK_DEV_ENDPOINTS and is gated on the K2 token.
+	s, ft := newAuthedServer()
+	rec := devReq(s, "/internal/tenants/onboard", `{"slug":"acme","industry":"insurance"}`, nil)
+	require.Equal(t, http.StatusUnauthorized, rec.Code, rec.Body.String())
+	require.Empty(t, ft.executed)
+
+	rec = devReq(s, "/internal/tenants/onboard", `{"slug":"acme","industry":"insurance"}`,
+		map[string]string{"X-Internal-Token": "tok-1"})
+	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+	require.Equal(t, []string{"onboarding-acme"}, ft.executed)
+}
