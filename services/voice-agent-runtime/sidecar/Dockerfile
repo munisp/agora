@@ -1,7 +1,7 @@
 # Piper HTTP sidecar for voice-agent-runtime (TTS).
 FROM python:3.12-slim AS base
 
-RUN pip install --no-cache-dir piper-tts==1.2.* fastapi==0.115.* uvicorn==0.30.*
+RUN pip install --no-cache-dir piper-tts==1.3.* fastapi==0.115.* uvicorn==0.30.*
 
 # Voice models are downloaded at container start (see compose fragment /
 # README), not baked into the image:
