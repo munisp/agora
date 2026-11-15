@@ -29,6 +29,7 @@ app/pipeline/ are version-agnostic.
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 import uuid
 from typing import Any, AsyncIterable, Optional
@@ -108,6 +109,29 @@ async def _warmup_tts(tts: Any) -> None:
         await tts.synthesize_pcm(PREWARM_PHRASE)
 
 
+def _prewarm(settings: Settings, proc) -> None:  # noqa: ARG001 - proc userdata unused; module cache suffices
+    if not settings.preload_models:
+        return
+    try:
+        stt = _build_stt(settings)
+        stt.preload_sync()
+        _PREWARMED["stt"] = stt
+        log.info("prewarm: whisper model loaded", model=settings.whisper_model)
+    except Exception as exc:  # noqa: BLE001 - degrade to lazy load
+        log.warning("prewarm: whisper load failed (lazy fallback)", error=str(exc)[:200])
+    try:
+        tts = _build_tts(settings)
+        asyncio.run(_warmup_tts(tts))
+        _PREWARMED["tts"] = tts
+        log.info(
+            "prewarm: tts warmup synthesis done",
+            chain=settings.tts_provider_chain,
+            voice=settings.piper_voice,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to lazy load
+        log.warning("prewarm: tts warmup failed (lazy fallback)", error=str(exc)[:200])
+
+
 def make_prewarm_fnc(settings: Settings):
     """WorkerOptions.prewarm_fnc (livekit-agents 0.10.x: runs synchronously in
     each warm job process before it accepts jobs).
@@ -117,30 +141,9 @@ def make_prewarm_fnc(settings: Settings):
     multi-provider chains) so a warm process' first call has no dead air.
     Failures degrade to the old lazy-load behaviour (logged, never fatal).
     """
-
-    def _prewarm(proc) -> None:  # noqa: ARG001 - proc userdata unused; module cache suffices
-        if not settings.preload_models:
-            return
-        try:
-            stt = _build_stt(settings)
-            stt.preload_sync()
-            _PREWARMED["stt"] = stt
-            log.info("prewarm: whisper model loaded", model=settings.whisper_model)
-        except Exception as exc:  # noqa: BLE001 - degrade to lazy load
-            log.warning("prewarm: whisper load failed (lazy fallback)", error=str(exc)[:200])
-        try:
-            tts = _build_tts(settings)
-            asyncio.run(_warmup_tts(tts))
-            _PREWARMED["tts"] = tts
-            log.info(
-                "prewarm: tts warmup synthesis done",
-                chain=settings.tts_provider_chain,
-                voice=settings.piper_voice,
-            )
-        except Exception as exc:  # noqa: BLE001 - degrade to lazy load
-            log.warning("prewarm: tts warmup failed (lazy fallback)", error=str(exc)[:200])
-
-    return _prewarm
+    # A module-level function bound with functools.partial: job processes start with "spawn", which pickles the
+    # prewarm function, and a nested closure can't be pickled (every job failed with "Can't get local object").
+    return functools.partial(_prewarm, settings)
 
 
 def cpu_load_fnc() -> float:

@@ -98,3 +98,14 @@ def test_prewarm_failure_degrades_to_lazy(monkeypatch, _clean_prewarm_cache):
 
     assert "stt" not in lw._PREWARMED
     assert "tts" in lw._PREWARMED
+
+
+def test_prewarm_fnc_survives_spawn_pickling():
+    """Job processes start with "spawn", which pickles prewarm_fnc: a nested closure failed every job."""
+    import pickle
+
+    from app.config import Settings
+    from app.livekit_worker import make_prewarm_fnc
+
+    fn = pickle.loads(pickle.dumps(make_prewarm_fnc(Settings(preload_models=False))))
+    assert fn(None) is None  # preload off: returns without loading anything
