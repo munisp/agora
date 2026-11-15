@@ -19,7 +19,8 @@
  */
 "use strict";
 
-var OPENDESK_SW_V = "field-pwa-v6"; // SPEC-W68: mandatory bump (G-SW4; activation evicts poisoned v5 caches: no-store/API guard for the cache-first GET handler)
+var OPENDESK_SW_V = "field-pwa-v7"; // v7: persistent "Last receipt read" line (OCR result stays on screen).
+// v6: // SPEC-W68: mandatory bump (G-SW4; activation evicts poisoned v5 caches: no-store/API guard for the cache-first GET handler)
 var SHELL = "opendesk-field-" + OPENDESK_SW_V;
 
 var PRECACHE = [
