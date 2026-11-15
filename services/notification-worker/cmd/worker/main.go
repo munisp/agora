@@ -446,7 +446,7 @@ func run() error {
 					Slug string `json:"slug"`
 				}
 				// identity serves GET /v1/tenants/{slug}; InvokeService always POSTs (405), so name the method.
-				if err := daprClient.InvokeServiceMethod(ctx, http.MethodGet, cfg.IdentityAppID, "v1/tenants/"+slug, nil, nil, &out); err != nil {
+				if err := daprClient.InvokeServiceMethod(ctx, http.MethodGet, cfg.IdentityAppID, "v1/tenants/"+slug, nil, httpapi.ForwardedAuth(ctx), &out); err != nil {
 					return httpapi.TenantRef{}, err
 				}
 				id, err := uuid.Parse(out.ID)

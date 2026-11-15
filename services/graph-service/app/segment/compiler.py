@@ -43,17 +43,19 @@ def compile_segment_query(
 
     params: dict[str, object] = {"consent_purpose": consent_purpose}
     conditions: list[str] = []
+    # Existence filters as counted CALL subqueries: FalkorDB rejects Neo4j 5's EXISTS { MATCH ... } (and pattern
+    # comprehensions with WHERE), but supports CALL { WITH p ... RETURN count(*) }. (match + where, must_exist)
+    exists: list[tuple[str, bool]] = []
 
     # Mandatory consent gate (purpose-matching, unrevoked) — by construction.
-    conditions.append(
-        "EXISTS {\n"
-        "    MATCH (p)-[ce:CONSENTED]->(c:Consent)\n"
+    exists.append((
+        "MATCH (p)-[ce:CONSENTED]->(c:Consent)\n"
         "    WHERE ce.purpose = $consent_purpose\n"
         "      AND c.tenant_id = $tenant_id\n"
         "      AND c.purpose = $consent_purpose\n"
-        "      AND c.revoked_at IS NULL\n"
-        "  }"
-    )
+        "      AND c.revoked_at IS NULL",
+        True,
+    ))
 
     plan_kwargs: dict[str, object] = {"consent_purpose": consent_purpose}
 
@@ -61,41 +63,29 @@ def compile_segment_query(
         # Lapsed customers: booked at least once, nothing since the cutoff.
         cutoff = _as_utc(f.last_booking_before)
         params["last_booking_before"] = cutoff.isoformat()
-        conditions.append(
-            "EXISTS {\n"
-            "    MATCH (p)-[:BOOKED]->(b0:Booking)\n"
-            "    WHERE b0.tenant_id = $tenant_id\n"
-            "  }"
-        )
-        conditions.append(
-            "NOT EXISTS {\n"
-            "    MATCH (p)-[:BOOKED]->(b:Booking)\n"
+        exists.append(("MATCH (p)-[:BOOKED]->(b0:Booking)\n    WHERE b0.tenant_id = $tenant_id", True))
+        exists.append((
+            "MATCH (p)-[:BOOKED]->(b:Booking)\n"
             "    WHERE b.tenant_id = $tenant_id\n"
-            "      AND b.created_at >= $last_booking_before\n"
-            "  }"
-        )
+            "      AND b.created_at >= $last_booking_before",
+            False,
+        ))
         plan_kwargs["last_booking_before"] = cutoff
 
     if f.lga:
         params["lga"] = f.lga
-        conditions.append(
-            "EXISTS {\n"
-            "    MATCH (p)-[:HAS_CONTACT]->(:Contact)-[:CAPTURED_AT]->(l:Location)\n"
+        exists.append((
+            "MATCH (p)-[:HAS_CONTACT]->(:Contact)-[:CAPTURED_AT]->(l:Location)\n"
             "    WHERE l.tenant_id = $tenant_id\n"
-            "      AND l.lga = $lga\n"
-            "  }"
-        )
+            "      AND l.lga = $lga",
+            True,
+        ))
         plan_kwargs["lga"] = f.lga
 
     if f.not_messaged_since_days is not None:
         since = now - timedelta(days=f.not_messaged_since_days)
         params["not_messaged_since"] = since.isoformat()
-        conditions.append(
-            "NOT EXISTS {\n"
-            "    MATCH (p)-[m:MESSAGED]->(:Campaign)\n"
-            "    WHERE m.at >= $not_messaged_since\n"
-            "  }"
-        )
+        exists.append(("MATCH (p)-[m:MESSAGED]->(:Campaign)\n    WHERE m.at >= $not_messaged_since", False))
         plan_kwargs["not_messaged_since"] = since
 
     # SPEC-W29 §3 WS-B: numeric score filters. Every bound is a parameter
@@ -125,15 +115,20 @@ def compile_segment_query(
     if score_specs:
         plan_kwargs["score_filters"] = tuple(score_specs)
 
-    where = "\n  AND ".join(conditions)
+    where = "".join(f"\n  AND {c}" for c in conditions)
+    calls = "".join(
+        f"CALL {{\n  WITH p\n  {body}\n  RETURN count(*) AS e{i}\n}}\n"
+        f"WITH p, e{i} WHERE e{i} {'> 0' if must else '= 0'}\n"
+        for i, (body, must) in enumerate(exists)
+    )
+    head = (
+        "MATCH (p:Person)\n"
+        "WHERE p.tenant_id = $tenant_id\n"
+        f"  AND coalesce(p.quarantine, false) = false{where}\n"
+        f"{calls}"
+    )
     if projection == "count":
-        cypher = (
-            "MATCH (p:Person)\n"
-            "WHERE p.tenant_id = $tenant_id\n"
-            "  AND coalesce(p.quarantine, false) = false\n"
-            f"  AND {where}\n"
-            "RETURN count(p) AS count"
-        )
+        cypher = head + "RETURN count(p) AS count"
     else:
         # Audience member shape (orchestrator contract):
         # {person_id, phone_hash, lead_id}. lead_id is resolved from the
@@ -141,11 +136,7 @@ def compile_segment_query(
         # Contact (by captured_at) with a non-null lead_id wins; null when
         # the person has no such Contact. The graph stays raw-PII-free —
         # phone resolution happens downstream in notification-worker.
-        cypher = (
-            "MATCH (p:Person)\n"
-            "WHERE p.tenant_id = $tenant_id\n"
-            "  AND coalesce(p.quarantine, false) = false\n"
-            f"  AND {where}\n"
+        cypher = head + (
             "OPTIONAL MATCH (p)-[:HAS_CONTACT]->(ct:Contact)\n"
             "WHERE ct.tenant_id = $tenant_id AND ct.lead_id IS NOT NULL\n"
             "WITH p, ct ORDER BY ct.captured_at DESC\n"

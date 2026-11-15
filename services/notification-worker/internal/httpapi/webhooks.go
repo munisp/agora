@@ -67,7 +67,9 @@ func (s *Server) tenantMiddleware(next http.Handler) http.Handler {
 			http.Error(w, `{"error":"tenant is not bound to the caller"}`, http.StatusForbidden)
 			return
 		}
-		ref, err := s.ResolveTenant(r.Context(), slug)
+		// identity's GET /v1/tenants/{slug} answers only an authenticated caller: resolve the tenant AS the person
+		// calling (their token / the gateway's identity headers), so identity's own membership check applies.
+		ref, err := s.ResolveTenant(WithForwardedAuth(r.Context(), r.Header), slug)
 		if err != nil {
 			s.Log.Warn("webhook tenant resolution failed", zap.String("slug", slug), zap.Error(err))
 			http.Error(w, `{"error":"tenant not found"}`, http.StatusNotFound)
@@ -240,4 +242,30 @@ func generateSecret() string {
 		panic(err) // crypto/rand failure is unrecoverable
 	}
 	return hex.EncodeToString(b[:])
+}
+
+type forwardedAuthKey struct{}
+
+// forwardedAuthHeaders are the caller-identity headers passed on when notification-worker asks identity on a
+// person's behalf (APISIX injects X-User-* from the verified JWT; the BFF/gateway send Authorization).
+var forwardedAuthHeaders = []string{"Authorization", "X-User-Id", "X-User-Roles", "X-Tenant-Slugs", "X-User-Email"}
+
+// WithForwardedAuth keeps the caller's identity headers on the context for an onward call.
+func WithForwardedAuth(ctx context.Context, h http.Header) context.Context {
+	out := map[string]string{}
+	for _, name := range forwardedAuthHeaders {
+		if v := h.Get(name); v != "" {
+			out[name] = v
+		}
+	}
+	return context.WithValue(ctx, forwardedAuthKey{}, out)
+}
+
+// ForwardedAuth returns the headers WithForwardedAuth kept (nil when none).
+func ForwardedAuth(ctx context.Context) map[string]string {
+	h, _ := ctx.Value(forwardedAuthKey{}).(map[string]string)
+	if len(h) == 0 {
+		return nil
+	}
+	return h
 }

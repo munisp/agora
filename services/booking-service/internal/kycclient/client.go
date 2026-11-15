@@ -350,6 +350,9 @@ func (c *Client) ReviewDocument(ctx context.Context, tenantID uuid.UUID, documen
 func (c *Client) do(req *http.Request, tenantID uuid.UUID, op string) (*Response, error) {
 	req.Header.Set("X-Internal-Token", c.token)
 	req.Header.Set("X-Tenant-Slug", tenantID.String())
+	// kyc-service's GET routes read the tenant from ?tenant_id= or X-Tenant-ID (not X-Tenant-Slug): without this the
+	// review queue answered 400 "tenant_id required".
+	req.Header.Set("X-Tenant-ID", tenantID.String())
 
 	resp, err := c.client.Do(req) // single attempt — NO retry loop by contract
 	if err != nil {
