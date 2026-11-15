@@ -166,3 +166,18 @@ def test_worker_llm_node_builds():
     from app.livekit_worker import _worker_llm
 
     assert _worker_llm(Settings(llm_api_key="ollama", llm_extra_body={"reasoning_effort": "none"})) is not None
+
+
+async def test_tts_node_ships_short_frames():
+    """A whole sentence in one frame overflowed LiveKit's ~1 s AudioSource buffer (answers cut off)."""
+    from app.livekit_worker import PiperTTSNode
+
+    class Impl:
+        sample_rate = 22050
+
+        async def stream_pcm(self, text):
+            yield b"\x01\x00" * (22050 * 3) + b"\x02"  # 3 s of audio plus a stray odd byte
+
+    frames = [a.frame async for a in PiperTTSNode(Impl(), chunked=True).synthesize("hello")]
+    assert len(frames) == 30
+    assert all(f.samples_per_channel == 2205 and f.sample_rate == 22050 for f in frames)

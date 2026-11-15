@@ -32,7 +32,7 @@ import asyncio
 import functools
 import re
 import uuid
-from typing import Any, AsyncIterable, Optional
+from typing import Any, AsyncIterable, Iterator, Optional
 
 from livekit import agents, rtc
 from livekit.agents import llm as lk_llm
@@ -260,30 +260,30 @@ class PiperTTSNode(lk_tts.TTS):
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         return self._stream(text)
 
-    def _audio(self, pcm: bytes) -> lk_tts.SynthesizedAudio:
-        frame = rtc.AudioFrame(
-            data=pcm,
-            sample_rate=self._impl.sample_rate,
-            num_channels=1,
-            samples_per_channel=len(pcm) // 2,
-        )
-        return lk_tts.SynthesizedAudio(
-            request_id=str(uuid.uuid4()),
-            segment_id=str(uuid.uuid4()),
-            frame=frame,
-        )
+    # LiveKit's AudioSource buffers about a second; one frame per sentence (several seconds) was refused with
+    # "InvalidState - failed to capture frame" and the caller heard the answer cut off. Ship 100 ms frames instead.
+    FRAME_MS = 100
+
+    def _audio_frames(self, pcm: bytes) -> Iterator[lk_tts.SynthesizedAudio]:
+        rate = self._impl.sample_rate
+        step = max(1, rate * self.FRAME_MS // 1000) * 2  # bytes per frame (16-bit mono)
+        pcm = pcm[: len(pcm) - (len(pcm) % 2)]
+        request_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
+        for start in range(0, len(pcm), step):
+            chunk = pcm[start:start + step]
+            frame = rtc.AudioFrame(data=chunk, sample_rate=rate, num_channels=1, samples_per_channel=len(chunk) // 2)
+            yield lk_tts.SynthesizedAudio(request_id=request_id, segment_id=segment_id, frame=frame)
 
     async def _stream(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         stream_pcm = getattr(self._impl, "stream_pcm", None)
         if self._chunked and stream_pcm is not None:
             async for pcm in stream_pcm(text):
-                if pcm:
-                    yield self._audio(pcm)
+                for audio in self._audio_frames(pcm):
+                    yield audio
             return
         pcm = await self._impl.synthesize_pcm(text)
-        if not pcm:
-            return
-        yield self._audio(pcm)
+        for audio in self._audio_frames(pcm):
+            yield audio
 
 
 # ---------------------------------------------------------------------------
