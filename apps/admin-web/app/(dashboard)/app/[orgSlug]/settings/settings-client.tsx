@@ -36,7 +36,7 @@ export function SettingsClient({ orgSlug }: { orgSlug: string }) {
   const [form, setForm] = React.useState({
     name: "",
     timezone: "UTC",
-    currency: "USD",
+    currency: "NGN",
     locale: "en-US",
   });
   const [error, setError] = React.useState<string | null>(null);

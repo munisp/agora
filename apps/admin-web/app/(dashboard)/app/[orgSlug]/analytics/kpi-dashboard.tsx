@@ -227,7 +227,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
       setData({
         bookings: bookings.length,
         revenueCents,
-        currency: tenant.currency ?? "USD",
+        currency: tenant.currency ?? "NGN",
         callMinutes,
         avgSentiment,
         sentimentSamples,

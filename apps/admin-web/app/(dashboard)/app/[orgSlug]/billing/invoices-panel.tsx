@@ -184,7 +184,7 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
 
   const totals = React.useMemo(() => {
     const list = invoices ?? [];
-    const currency = list[0]?.currency ?? tenant?.currency ?? "USD";
+    const currency = list[0]?.currency ?? tenant?.currency ?? "NGN";
     const sum = (pred: (i: Invoice) => boolean) =>
       list.filter(pred).reduce((s, i) => s + i.subtotal_cents, 0);
     return {

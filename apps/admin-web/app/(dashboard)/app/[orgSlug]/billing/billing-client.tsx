@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
 import { formatMoney, titleCase, listFrom } from "@/lib/utils";
+import { DEFAULT_CURRENCY } from "@/lib/utils";
 import type {
   AccountBalance,
   Beneficiary,
@@ -139,7 +140,7 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
     }
   };
 
-  const currency = balance?.currency ?? "USD";
+  const currency = balance?.currency ?? DEFAULT_CURRENCY;
   const amountCents = Math.round(parseFloat(amount || "0") * 100);
   const amountValid =
     Number.isFinite(amountCents) &&
