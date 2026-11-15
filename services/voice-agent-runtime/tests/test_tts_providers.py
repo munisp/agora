@@ -756,3 +756,13 @@ def test_metrics_series_registered():
     rendered = registry.render()
     assert "# TYPE tts_provider_failures_total counter" in rendered
     assert 'tts_provider_failures_total{provider="mms"} 1' in rendered
+
+
+def test_labels_of_accepts_the_sidecars_list_labels():
+    """mms-tts/xtts-tts send labels as a list of tags; dict(list) raised and emptied GET /voice/voices."""
+    from app.tts_providers.base import labels_of
+
+    assert labels_of({"id": "yor", "labels": ["mms", "vits"]}) == {"tags": ["mms", "vits"]}
+    assert labels_of({"id": "v1", "name": "Front desk", "labels": ["xtts-v2"]}) == {"tags": ["xtts-v2"], "name": "Front desk"}
+    assert labels_of({"id": "x", "labels": {"locale_name": "English (Nigeria)"}}) == {"locale_name": "English (Nigeria)"}
+    assert labels_of({"id": "x"}) == {}

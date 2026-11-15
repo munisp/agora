@@ -33,6 +33,16 @@ class Voice:
         return asdict(self)
 
 
+def labels_of(item: dict[str, Any]) -> dict[str, Any]:
+    """Sidecar labels as a dict. The mms/xtts sidecars send a list of tags (``["mms", "vits"]``), which ``dict()``
+    rejects; that made GET /voice/voices list those providers with no voices."""
+    raw = item.get("labels")
+    out: dict[str, Any] = dict(raw) if isinstance(raw, dict) else ({"tags": [str(t) for t in raw]} if isinstance(raw, list) else {})
+    if item.get("name"):
+        out.setdefault("name", str(item["name"]))
+    return out
+
+
 class TTSProvider(Protocol):
     """Provider contract consumed by FallbackTTS and the control plane."""
 
