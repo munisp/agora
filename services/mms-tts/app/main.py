@@ -79,7 +79,8 @@ def create_app() -> FastAPI:
                     "gender": "unspecified",
                     "labels": VOICE_CATALOG[lang]["labels"],
                 }
-                for lang in SUPPORTED_LANGS
+                # Real mode serves only MMS_LANGS: listing the rest offered voices that 500 on /tts.
+                for lang in (SUPPORTED_LANGS if mock else enabled_langs)
             ]
         }
 
