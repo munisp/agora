@@ -22,6 +22,7 @@ import {
   LineChart,
   Webhook,
   MessagesSquare,
+  MessageCircle,
   MapPin,
   Target,
   AudioLines,
@@ -72,6 +73,7 @@ const items: NavItem[] = [
   // SPEC-W47 UIWEB-14/15: lead pipeline + contacts directory.
   { segment: "leads", label: "Leads", icon: Magnet },
   { segment: "contacts", label: "Contacts", icon: ContactRound },
+  { segment: "conversations", label: "Conversations", icon: MessageCircle },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
   { segment: "voice-agent", label: "Voice Agent", icon: Mic },
   // SPEC-W38: self-serve agents registry (wizard + capture records).

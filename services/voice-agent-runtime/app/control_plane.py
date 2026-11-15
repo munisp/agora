@@ -82,6 +82,7 @@ from .pipeline.stt_stream import (
 )
 from .session_state import SessionStore
 from .ice import IceServerSource
+from .transcripts import TranscriptRecorder
 from .tts_providers.base import voice_tenant
 from .tts_providers.chain import build_fallback_tts
 
@@ -187,7 +188,8 @@ def create_app(
     # Primary LLM endpoint + optional circuit-broken fallback chain
     # (LLM_FALLBACK_* envs, VOICE-SCALING §3).
     llm = build_llm(settings)
-    chat_service = ChatService(settings=settings, dapr=dapr, llm=llm, sessions=sessions)
+    chat_service = ChatService(settings=settings, dapr=dapr, llm=llm, sessions=sessions,
+                               transcripts=TranscriptRecorder(settings.conversation_url))
     # SPEC-W10 Part A: TTS provider fallback chain (default "piper" =
     # pre-W10 behavior). Backs the /voice/voices, /voice/tts-preview and
     # /voice/voices/enroll endpoints below.

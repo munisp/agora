@@ -1,0 +1,227 @@
+"use client";
+
+import * as React from "react";
+import Link from "next/link";
+import { MessageCircle, Phone, PhoneCall, RefreshCw, Wrench, X } from "lucide-react";
+import { api, ApiError } from "@/lib/api";
+import { PageHeader } from "@/components/page-header";
+import { ErrorNote } from "@/components/error-note";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, Label } from "@/components/ui/input";
+import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useNavLabels } from "@/components/terminology-provider";
+import { cn, formatDateTime } from "@/lib/utils";
+
+export interface ConversationSummary {
+  id: string;
+  site_slug: string;
+  channel: string;
+  contact_phone?: string | null;
+  started_at: string;
+  ended_at?: string | null;
+}
+
+interface Turn {
+  id: string;
+  seq: number;
+  role: "user" | "agent" | "system" | "tool" | string;
+  text: string;
+  created_at?: string;
+  sentiment?: number | null;
+}
+
+const CHANNEL: Record<string, { label: string; icon: typeof MessageCircle }> = {
+  chat: { label: "Web chat", icon: MessageCircle },
+  voice: { label: "Voice call", icon: PhoneCall },
+  phone: { label: "Phone call", icon: Phone },
+  ussd: { label: "USSD", icon: Phone },
+  api: { label: "API", icon: MessageCircle },
+};
+
+function channelOf(c: string) {
+  return CHANNEL[c] ?? { label: c, icon: MessageCircle };
+}
+
+export function ConversationsClient({
+  orgSlug,
+  contact,
+  initial,
+  initialError,
+}: {
+  orgSlug: string;
+  contact: string | null;
+  initial: ConversationSummary[];
+  initialError: string | null;
+}) {
+  const labels = useNavLabels();
+  const [rows, setRows] = React.useState(initial);
+  const [error, setError] = React.useState(initialError);
+  const [loading, setLoading] = React.useState(false);
+  const [channel, setChannel] = React.useState("");
+  const [open, setOpen] = React.useState<ConversationSummary | null>(null);
+  const [turns, setTurns] = React.useState<Turn[] | null>(null);
+  const [turnsError, setTurnsError] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api.get<{ conversations?: ConversationSummary[] }>("/api/conversations/v1/conversations", {
+        tenant: orgSlug,
+        limit: 100,
+        ...(contact ? { contact } : {}),
+      });
+      setRows(data.conversations ?? []);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Failed to load conversations.");
+    } finally {
+      setLoading(false);
+    }
+  }, [orgSlug, contact]);
+
+  const show = React.useCallback(
+    async (c: ConversationSummary) => {
+      setOpen(c);
+      setTurns(null);
+      setTurnsError(null);
+      try {
+        const detail = await api.get<{ turns?: Turn[] }>(`/api/conversations/v1/conversations/${c.id}`, { tenant: orgSlug });
+        setTurns([...(detail.turns ?? [])].sort((a, b) => a.seq - b.seq));
+      } catch (e) {
+        setTurnsError(e instanceof ApiError ? e.message : "Failed to load the transcript.");
+      }
+    },
+    [orgSlug],
+  );
+
+  const visible = channel ? rows.filter((r) => r.channel === channel) : rows;
+  const customerWord = labels.contacts.replace(/s$/, "").toLowerCase() || "customer";
+
+  return (
+    <div>
+      <PageHeader
+        title="Conversations"
+        description={
+          contact
+            ? `Every chat and call with ${contact}.`
+            : `Every web chat and voice call your receptionist handled, with the full transcript: what each ${customerWord} asked, what it answered and what it did.`
+        }
+        actions={
+          <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
+            <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} /> Refresh
+          </Button>
+        }
+      />
+      {error ? <ErrorNote message={error} /> : null}
+      <div className="mb-4 flex flex-wrap items-end gap-4">
+        <div className="w-48">
+          <Label htmlFor="conv-channel">Channel</Label>
+          <Select id="conv-channel" value={channel} onChange={(e) => setChannel(e.target.value)}>
+            <option value="">All</option>
+            <option value="chat">Web chat</option>
+            <option value="voice">Voice call</option>
+            <option value="phone">Phone call</option>
+          </Select>
+        </div>
+        {contact ? (
+          <Link href={`/app/${orgSlug}/conversations`} className="pb-2 text-sm underline">
+            Show everyone
+          </Link>
+        ) : null}
+      </div>
+      <div className={cn("grid gap-4", open ? "lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]" : "")}>
+        <Card>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="pl-5">When</TableHead>
+                <TableHead>Channel</TableHead>
+                <TableHead>{labels.contacts.replace(/s$/, "")}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {visible.length === 0 ? (
+                <TableEmpty colSpan={3}>No conversations yet. They appear here as customers chat or call.</TableEmpty>
+              ) : (
+                visible.map((c) => {
+                  const ch = channelOf(c.channel);
+                  const Icon = ch.icon;
+                  return (
+                    <TableRow
+                      key={c.id}
+                      className={cn("cursor-pointer", open?.id === c.id && "bg-muted")}
+                      onClick={() => void show(c)}
+                    >
+                      <TableCell className="pl-5">{formatDateTime(c.started_at)}</TableCell>
+                      <TableCell>
+                        <span className="inline-flex items-center gap-1.5">
+                          <Icon className="h-4 w-4" /> {ch.label}
+                        </span>
+                      </TableCell>
+                      <TableCell>{c.contact_phone || <span className="text-muted-foreground">Not given</span>}</TableCell>
+                    </TableRow>
+                  );
+                })
+              )}
+            </TableBody>
+          </Table>
+        </Card>
+        {open ? (
+          <Card>
+            <CardHeader className="flex flex-row items-start justify-between gap-2">
+              <div>
+                <CardTitle>{channelOf(open.channel).label}</CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  {formatDateTime(open.started_at)}
+                  {open.contact_phone ? ` · ${open.contact_phone}` : ""}
+                </p>
+              </div>
+              <Button variant="ghost" size="sm" aria-label="Close transcript" onClick={() => setOpen(null)}>
+                <X className="h-4 w-4" />
+              </Button>
+            </CardHeader>
+            <CardContent>
+              {turnsError ? <ErrorNote message={turnsError} /> : null}
+              {turns === null && !turnsError ? <p className="text-sm text-muted-foreground">Loading the transcript…</p> : null}
+              {turns && turns.length === 0 ? <p className="text-sm text-muted-foreground">No messages recorded.</p> : null}
+              <ol className="space-y-2" aria-label="Transcript">
+                {(turns ?? []).map((t) =>
+                  t.role === "tool" || t.role === "system" ? (
+                    <li key={t.id} className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Wrench className="h-3 w-3" /> <span className="font-mono">{t.text}</span>
+                    </li>
+                  ) : (
+                    <li key={t.id} className={cn("flex", t.role === "agent" ? "justify-end" : "justify-start")}>
+                      <div
+                        className={cn(
+                          "max-w-[85%] rounded-lg px-3 py-2 text-sm",
+                          t.role === "agent" ? "bg-primary text-primary-foreground" : "bg-muted",
+                        )}
+                      >
+                        <div className="mb-0.5 text-[11px] opacity-70">
+                          {t.role === "agent" ? "Receptionist" : titleCaseWord(customerWord)}
+                          {typeof t.sentiment === "number" ? (
+                            <Badge variant={t.sentiment < -0.2 ? "warning" : "outline"} className="ml-2 align-middle">
+                              {t.sentiment < -0.2 ? "upset" : t.sentiment > 0.2 ? "positive" : "neutral"}
+                            </Badge>
+                          ) : null}
+                        </div>
+                        {t.text}
+                      </div>
+                    </li>
+                  ),
+                )}
+              </ol>
+            </CardContent>
+          </Card>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function titleCaseWord(w: string) {
+  return w.charAt(0).toUpperCase() + w.slice(1);
+}

@@ -1,7 +1,8 @@
 "use client";
 
 import * as React from "react";
-import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import Link from "next/link";
+import { MessageCircle, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { useNavLabels } from "@/components/terminology-provider";
@@ -268,6 +269,15 @@ export function ContactsClient({
                   </TableCell>
                   <TableCell className="pr-5 text-right">
                     <div className="flex justify-end gap-1">
+                      {c.phone ? (
+                        <Link
+                          href={`/app/${orgSlug}/conversations?contact=${encodeURIComponent(c.phone)}`}
+                          className="inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs hover:bg-accent"
+                        >
+                          <MessageCircle className="h-3.5 w-3.5" />
+                          Conversations
+                        </Link>
+                      ) : null}
                       <Button variant="ghost" size="sm" onClick={() => openEdit(c)}>
                         <Pencil className="h-3.5 w-3.5" />
                         Edit

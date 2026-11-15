@@ -220,6 +220,8 @@ class Settings:
     # misses or is unreachable (fail-open). Empty URL disables the registry
     # path; AGENTS_CACHE_TTL_S bounds the in-process resolve cache.
     agents_registry_url: str = "http://conversation:7007"
+    # conversation-service base for transcripts (app/transcripts.py); "" disables recording.
+    conversation_url: str = "http://conversation:7007"
     agents_cache_ttl_s: int = 30
 
     # Multilingual receptionist (Wave 5 #3, app/multilang.py): language ->
@@ -352,6 +354,7 @@ def load_settings() -> Settings:
         tenant_phone_map=parse_tenant_phone_map(_env("TENANT_PHONE_MAP", "")),
         sip_default_site=_env("SIP_DEFAULT_SITE", ""),
         agents_registry_url=_env("AGENTS_REGISTRY_URL", "http://conversation:7007"),
+        conversation_url=_env("CONVERSATION_URL", "http://conversation:7007"),
         agents_cache_ttl_s=_env_int("AGENTS_CACHE_TTL_S", 30),
         piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
         tts_cache_size=_env_int("VOICE_TTS_CACHE_SIZE", 256),

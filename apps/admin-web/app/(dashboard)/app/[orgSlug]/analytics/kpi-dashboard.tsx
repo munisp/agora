@@ -160,7 +160,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
           conversations?: Conversation[];
           items?: Conversation[];
         }>("/api/conversations/v1/conversations", {
-          tenant_id: tenant.id,
+          tenant: orgSlug, // conversation-service reads ?tenant= (tenant_id was ignored: multi-business users got 400)
           limit: 200,
         });
         const conversations = convRes.conversations ?? convRes.items ?? [];
@@ -200,7 +200,7 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
                 try {
                   const detail = await api.get<ConversationWithTurns>(
                     `/api/conversations/v1/conversations/${c.id}`,
-                    { tenant_id: tenant.id },
+                    { tenant: orgSlug },
                   );
                   for (const t of detail.turns ?? []) {
                     if (typeof t.sentiment === "number") scores.push(t.sentiment);

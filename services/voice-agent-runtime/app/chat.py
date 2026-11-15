@@ -13,6 +13,7 @@ from .dapr_client import DaprClient
 from .escalation import LiveKitEscalation
 from .intent_router import find_agent, route_intent
 from .logging import get_logger
+from .transcripts import TranscriptRecorder, exchange_turns
 from .pipeline.llm import LLMInterface, run_tool_loop, run_tool_loop_stream
 from .plugin_tools import build_plugin_tools
 from .prompts import build_system_prompt
@@ -60,6 +61,7 @@ class ChatService:
         llm: LLMInterface,
         sessions: SessionStore,
         escalation: LiveKitEscalation | None = None,
+        transcripts: TranscriptRecorder | None = None,
     ) -> None:
         self._settings = settings
         self._dapr = dapr
@@ -67,6 +69,8 @@ class ChatService:
         self._sessions = sessions
         self._histories = ChatHistory()
         self._escalation = escalation or LiveKitEscalation(settings)
+        # Transcripts for the business's Conversations page (fire-and-forget; None = not recorded).
+        self._transcripts = transcripts
         # VOICE-SCALING §5: hard per-tool timeout on every Dapr tool call.
         self._tool_runner = AsyncToolRunner(
             timeout_s=settings.tool_timeout_s,
@@ -184,6 +188,17 @@ class ChatService:
             )
         return False
 
+    def _record(self, session: SessionState, tool_layer: Any, message: str, reply: str, trace: list[dict[str, Any]]) -> None:
+        if self._transcripts is None:
+            return
+        ctx = getattr(tool_layer, "tenant_context", None)
+        tenant_id = str(getattr(ctx, "tenant_id", "") or "")
+        self._transcripts.record(
+            f"chat:{session.conversation_id}", exchange_turns(message, reply, trace),
+            tenant_id=tenant_id, site_slug=session.site_slug, channel=getattr(session, "channel", None) or "web",
+            contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
+        )
+
     async def handle_message(
         self,
         *,
@@ -228,6 +243,7 @@ class ChatService:
         history.append({"role": "assistant", "content": reply})
 
         copilot_posted = await self._post_copilot(session, reply)
+        self._record(session, tool_layer, message, reply, trace)
 
         log.info(
             "chat turn complete",
@@ -312,6 +328,7 @@ class ChatService:
 
         history.append({"role": "assistant", "content": reply})
         copilot_posted = await self._post_copilot(session, reply)
+        self._record(session, tool_layer, message, reply, trace)
         log.info(
             "chat stream turn complete",
             conversation_id=session.conversation_id,

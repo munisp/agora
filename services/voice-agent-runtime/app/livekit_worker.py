@@ -47,6 +47,7 @@ from . import emergency, metrics, sip
 from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
+from .transcripts import TranscriptRecorder, tool_turn_text
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
 from .agent_definition import merge_definition
@@ -747,6 +748,54 @@ async def build_voice_agent(
     return agent, ctx, session
 
 
+
+_TRANSCRIPTS: "TranscriptRecorder | None" = None
+
+
+def _message_text(msg: Any) -> str:
+    content = getattr(msg, "content", msg)
+    if isinstance(content, list):
+        content = " ".join(str(c) for c in content if isinstance(c, str))
+    return str(content or "").strip()
+
+
+def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, session: Any, conversation_id: str,
+                             site_slug: str, *, channel: str) -> None:
+    """Store the call's words for the business's Conversations page: what the caller said (STT, committed turns),
+    what the receptionist said (greeting included) and the tools it used. Fire-and-forget; never affects the call."""
+    global _TRANSCRIPTS
+    if _TRANSCRIPTS is None:
+        _TRANSCRIPTS = TranscriptRecorder(getattr(settings, "conversation_url", ""))
+    rec = _TRANSCRIPTS
+    if not rec.enabled:
+        return
+    key = f"voice:{conversation_id}"
+
+    def _send(turns: list[dict[str, Any]]) -> None:
+        rec.record(key, turns, tenant_id=str(getattr(tenant_ctx, "tenant_id", "") or ""), site_slug=site_slug,
+                   channel=channel, contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone)
+
+    def _said(role: str):
+        return lambda msg, *_a, **_k: (lambda t: _send([{"role": role, "text": t}]) if t else None)(_message_text(msg))
+
+    def _tools(called, *_a, **_k) -> None:
+        turns = []
+        for fn in called or []:
+            info = getattr(fn, "call_info", fn)
+            name = getattr(getattr(info, "function_info", None), "name", None) or getattr(info, "name", "tool")
+            args = getattr(info, "arguments", None) or {}
+            turns.append({"role": "tool", "text": tool_turn_text({"tool": name, "arguments": args}),
+                          "tool_calls": [{"tool": name, "arguments": args}]})
+        if turns:
+            _send(turns)
+
+    try:
+        agent.on("user_speech_committed", _said("user"))
+        agent.on("agent_speech_committed", _said("agent"))
+        agent.on("function_calls_finished", _tools)
+    except Exception as exc:  # noqa: BLE001 - event surface may shift; the call itself is unaffected
+        log.warning("voice transcript hooks unavailable", error=str(exc)[:200])
+
 async def entrypoint(ctx: agents.JobContext) -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
@@ -806,6 +855,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # the contextvars at creation). The instrumented STT/TTS/LLM/tool call
     # sites feed it; the SessionEnded event below ships its payload.
     session_metrics = metrics.activate_session(metrics.SessionMetrics(conversation_id))
+    _record_voice_transcript(agent, settings, tenant_ctx, session, conversation_id, site_slug,
+                             channel="phone" if sip_call is not None else "voice")
     try:
         # Turn = one committed user utterance (livekit-agents 0.10.x event).
         agent.on("user_speech_committed", lambda *_a, **_k: metrics.session_turn())
