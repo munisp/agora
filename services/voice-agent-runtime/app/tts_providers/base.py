@@ -30,7 +30,16 @@ class Voice:
     labels: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """API shape (GET /voice/voices): ``labels`` is a list of strings, as the admin UI and the sidecars use it;
+        a cloned voice's display name is ``name``."""
+        out = asdict(self)
+        labels = self.labels or {}
+        out["labels"] = [str(t) for t in labels.get("tags", []) or []] + [
+            str(v) for k, v in labels.items() if k not in ("tags", "name") and isinstance(v, (str, int, float))
+        ]
+        if labels.get("name"):
+            out["name"] = str(labels["name"])
+        return out
 
 
 def labels_of(item: dict[str, Any]) -> dict[str, Any]:

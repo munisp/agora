@@ -634,6 +634,8 @@ export interface VoiceInfo {
   languages: string[];
   gender?: string | null;
   labels?: string[];
+  /** Display name of a cloned (XTTS) brand voice. */
+  name?: string;
 }
 
 /** A configured TTS provider and its voice catalog (GET /voice/voices). */

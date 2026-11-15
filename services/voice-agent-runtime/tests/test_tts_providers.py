@@ -403,7 +403,8 @@ async def test_mms_list_voices_and_available():
     mms = MmsTTS("http://mms", client=_mock_client(handler))
     voices = await mms.list_voices()
     assert [v.id for v in voices] == ["pcm"]
-    assert voices[0].as_dict()["labels"] == {"name": "Pidgin"}
+    # API shape: labels are strings (the admin UI maps over them); the display name is its own field.
+    assert voices[0].as_dict()["labels"] == [] and voices[0].as_dict()["name"] == "Pidgin"
     assert await mms.available() is True
 
     down = MmsTTS(
@@ -766,3 +767,10 @@ def test_labels_of_accepts_the_sidecars_list_labels():
     assert labels_of({"id": "v1", "name": "Front desk", "labels": ["xtts-v2"]}) == {"tags": ["xtts-v2"], "name": "Front desk"}
     assert labels_of({"id": "x", "labels": {"locale_name": "English (Nigeria)"}}) == {"locale_name": "English (Nigeria)"}
     assert labels_of({"id": "x"}) == {}
+
+
+def test_voice_as_dict_sends_labels_as_strings():
+    """The admin UI maps over labels; a dict there crashed the Voices page."""
+    v = Voice(id="v1", languages=["en"], labels={"tags": ["xtts-v2"], "name": "Front desk", "engine": "xtts"})
+    assert v.as_dict()["labels"] == ["xtts-v2", "xtts"] and v.as_dict()["name"] == "Front desk"
+    assert Voice(id="en_US", labels={"engine": "piper"}).as_dict()["labels"] == ["piper"]

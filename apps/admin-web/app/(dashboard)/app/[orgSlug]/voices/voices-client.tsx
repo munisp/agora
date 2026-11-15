@@ -74,7 +74,11 @@ function VoiceCard({ voice }: { voice: VoiceInfo }) {
   return (
     <div className="rounded-lg border border-border bg-card p-3 shadow-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-sm font-medium">{voice.id}</span>
+        {voice.name ? (
+          <span className="text-sm font-medium" title={voice.id}>{voice.name}</span>
+        ) : (
+          <span className="font-mono text-sm font-medium">{voice.id}</span>
+        )}
         {voice.gender ? <Badge variant="secondary">{voice.gender}</Badge> : null}
         {(voice.labels ?? []).map((label) => (
           <Badge key={label} variant="info">
