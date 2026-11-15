@@ -16,6 +16,8 @@ converts to PCM for the LiveKit pipeline via app.pipeline.tts._wav_to_pcm.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
@@ -40,6 +42,11 @@ class Voice:
         if labels.get("name"):
             out["name"] = str(labels["name"])
         return out
+
+
+# The business a request acts for. Cloned (XTTS) voices are biometric data owned by one business: the xtts provider
+# only lists and speaks a voice for the business set here, and fails closed when none is set.
+voice_tenant: ContextVar[str | None] = ContextVar("voice_tenant", default=None)
 
 
 def labels_of(item: dict[str, Any]) -> dict[str, Any]:

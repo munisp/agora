@@ -65,11 +65,13 @@ class VoiceRegistry:
         return self.samples_dir / f"{voice_id}.wav"
 
     # -- mutations -------------------------------------------------------------
-    def add(self, name: str, sample_bytes: bytes) -> dict:
+    def add(self, name: str, sample_bytes: bytes, tenant: Optional[str] = None) -> dict:
         voice_id = uuid.uuid4().hex
         entry = {
             "id": voice_id,
             "name": name,
+            # The business the voice belongs to: callers that name a tenant only see and use its voices.
+            "tenant": tenant,
             "languages": list(XTTS_LANGUAGES),
             "gender": "cloned",
             "labels": ["xtts-v2", "voice-clone", "custom"],

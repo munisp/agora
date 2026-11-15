@@ -116,9 +116,10 @@ export function VoicesClient({
     setLoadState("loading");
     setLoadError(null);
     try {
+      // Signed in, for this business: cloned voices are listed only for the business that owns them.
       const data = await api.get<VoicesCatalog>(
-        "/voice/voices",
-        undefined,
+        "/api/voice/voices",
+        { tenant: orgSlug },
         signal,
       );
       setCatalog(data);
@@ -133,7 +134,7 @@ export function VoicesClient({
           : "The voice runtime is unreachable. Check that the voice-agent-runtime is running, then retry.",
       );
     }
-  }, []);
+  }, [orgSlug]);
 
   React.useEffect(() => {
     const controller = new AbortController();
@@ -212,7 +213,7 @@ export function VoicesClient({
       if (providerName) body.provider = providerName;
       if (voiceId) body.voice = voiceId;
       // Raw fetch (not the JSON api wrapper): the response is audio/wav bytes.
-      const res = await fetch("/voice/tts-preview", {
+      const res = await fetch(`/api/voice/tts-preview?tenant=${encodeURIComponent(orgSlug)}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),

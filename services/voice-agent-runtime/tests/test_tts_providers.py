@@ -427,14 +427,30 @@ async def test_xtts_synthesize_and_enroll():
             return httpx.Response(200, json={"voice_id": "brand-1"})
         return httpx.Response(404)
 
-    xtts = XttsTTS("http://xtts:5810", client=_mock_client(handler))
-    wav = await xtts.synthesize("hello", "brand-1", "en")
-    assert wav == WAV
-    assert seen["tts"] == {"text": "hello", "voice_id": "brand-1", "language": "en"}
+    from app.tts_providers.base import voice_tenant
 
-    voice_id = await xtts.enroll_voice("Acme Brand", "QUJD")
+    xtts = XttsTTS("http://xtts:5810", client=_mock_client(handler))
+    token = voice_tenant.set("acme")
+    try:
+        wav = await xtts.synthesize("hello", "brand-1", "en")
+    finally:
+        voice_tenant.reset(token)
+    assert wav == WAV
+    assert seen["tts"] == {"text": "hello", "voice_id": "brand-1", "language": "en", "tenant": "acme"}
+
+    voice_id = await xtts.enroll_voice("Acme Brand", "QUJD", "acme")
     assert voice_id == "brand-1"
-    assert seen["enroll"] == {"name": "Acme Brand", "sample_base64": "QUJD"}
+    assert seen["enroll"] == {"name": "Acme Brand", "sample_base64": "QUJD", "tenant": "acme"}
+
+
+async def test_xtts_fails_closed_without_a_business():
+    """No business on the request: no cloned voices listed, none spoken (a voiceprint never crosses businesses)."""
+    calls = []
+    xtts = XttsTTS("http://xtts", client=_mock_client(lambda r: calls.append(r) or httpx.Response(200, json={"voices": []})))
+    assert await xtts.list_voices() == []
+    with pytest.raises(RuntimeError, match="business"):
+        await xtts.synthesize("hi", "brand-1", "en")
+    assert calls == []
 
 
 async def test_xtts_synthesize_requires_voice():
@@ -665,8 +681,8 @@ async def test_enroll_happy_path_and_base64_guard(monkeypatch):
             super().__init__("xtts")
             self.enrolled = []
 
-        async def enroll_voice(self, name, sample_base64):
-            self.enrolled.append((name, sample_base64))
+        async def enroll_voice(self, name, sample_base64, tenant):
+            self.enrolled.append((name, sample_base64, tenant))
             return "voice-42"
 
     xtts = FakeXtts()
@@ -687,7 +703,18 @@ async def test_enroll_happy_path_and_base64_guard(monkeypatch):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"voice_id": "voice-42"}
-    assert xtts.enrolled == [("Acme", "QUJD")]
+    assert xtts.enrolled == [("Acme", "QUJD", "acme")]
+
+    # A business's owner may enroll for their own business only (gateway-verified roles + tenant slugs).
+    owner = {"X-User-Roles": "owner", "X-Tenant-Slugs": "acme"}
+    resp = await _post_enroll(app, {"name": "Desk", "sample_base64": "QUJD", "tenant": "acme"}, owner)
+    assert resp.status_code == 200, resp.text
+    assert xtts.enrolled[-1] == ("Desk", "QUJD", "acme")
+    resp = await _post_enroll(app, {"name": "Desk", "sample_base64": "QUJD", "tenant": "globex"}, owner)
+    assert resp.status_code in (401, 403)
+    resp = await _post_enroll(app, {"name": "Desk", "sample_base64": "QUJD", "tenant": "acme"},
+                              {"X-User-Roles": "receptionist", "X-Tenant-Slugs": "acme"})
+    assert resp.status_code in (401, 403)
 
 
 async def test_enroll_auth_matrix(monkeypatch):
@@ -721,7 +748,7 @@ async def test_enroll_gateway_role_path(monkeypatch):
     otherwise every human (admin-web voices-client) call 401s."""
 
     class FakeXtts(FakeProvider):
-        async def enroll_voice(self, name, sample_base64):
+        async def enroll_voice(self, name, sample_base64, tenant):
             return "voice-gw"
 
     chain = _FakeChain({"xtts": FakeXtts("xtts")})

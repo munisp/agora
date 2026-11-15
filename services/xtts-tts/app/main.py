@@ -18,6 +18,8 @@ Config (env):
 
 from __future__ import annotations
 
+from typing import Optional
+
 import base64
 import binascii
 import hashlib
@@ -52,11 +54,21 @@ class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_TEXT_LEN)
     voice_id: str = Field(min_length=1, max_length=64)
     language: str = Field(min_length=2, max_length=8)
+    # When set, the voice must belong to this tenant (a voiceprint is biometric data: never cross businesses).
+    tenant: Optional[str] = Field(default=None, max_length=100)
 
 
 class EnrollRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     sample_base64: str = Field(min_length=1)
+    tenant: Optional[str] = Field(default=None, max_length=100)
+
+
+def _owned(entry: Optional[dict], tenant: Optional[str]) -> Optional[dict]:
+    """The voice if the caller may use it: no tenant named (internal/ops call) or the voice is that tenant's."""
+    if entry is None or (tenant is not None and entry.get("tenant") != tenant):
+        return None
+    return entry
 
 
 def mock_synthesize(text: str, voice_id: str, language: str) -> bytes:
@@ -182,8 +194,8 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/voices")
-    def list_voices() -> dict:
-        return {"voices": registry.list()}
+    def list_voices(tenant: Optional[str] = None) -> dict:
+        return {"voices": [v for v in registry.list() if _owned(v, tenant)]}
 
     @app.post("/voices", status_code=201)
     def enroll(req: EnrollRequest) -> dict:
@@ -204,11 +216,13 @@ def create_app() -> FastAPI:
                 status_code=413,
                 detail=f"decoded sample too large ({len(sample)} bytes; max {MAX_SAMPLE_BYTES})",
             )
-        entry = registry.add(req.name, sample)
+        entry = registry.add(req.name, sample, tenant=req.tenant)
         return {"voice_id": entry["id"], "voice": entry}
 
     @app.delete("/voices/{voice_id}")
-    def delete_voice(voice_id: str) -> dict:
+    def delete_voice(voice_id: str, tenant: Optional[str] = None) -> dict:
+        if _owned(registry.get(voice_id), tenant) is None:
+            raise HTTPException(status_code=404, detail=f"unknown voice_id '{voice_id}'")
         try:
             entry = registry.delete(voice_id)
         except VoiceNotFound as exc:
@@ -217,7 +231,7 @@ def create_app() -> FastAPI:
 
     @app.post("/tts", response_class=Response)
     def tts(req: TTSRequest) -> Response:
-        voice = registry.get(req.voice_id)
+        voice = _owned(registry.get(req.voice_id), req.tenant)
         if voice is None:
             raise HTTPException(status_code=404, detail=f"unknown voice_id '{req.voice_id}'")
         language = req.language.lower()

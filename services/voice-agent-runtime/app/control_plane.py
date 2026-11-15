@@ -81,6 +81,7 @@ from .pipeline.stt_stream import (
     StreamingSTTEngine,
 )
 from .session_state import SessionStore
+from .tts_providers.base import voice_tenant
 from .tts_providers.chain import build_fallback_tts
 
 log = get_logger("control-plane")
@@ -334,6 +335,24 @@ def create_app(
         roles = {r.strip().lower() for r in raw.split(",") if r.strip()}
         return bool(roles & ADMIN_GATEWAY_ROLES)
 
+    TENANT_ADMIN_ROLES = frozenset({"owner", "admin"})
+
+    def _caller_roles(request: Request) -> set[str]:
+        raw = request.headers.get("X-User-Roles", "")
+        return {r.strip().lower() for r in raw.split(",") if r.strip()}
+
+    def _caller_tenant(request: Request) -> str | None:
+        """The business this request acts for, from the gateway-verified token: the X-Tenant-Slug the page names must
+        be one of the caller's X-Tenant-Slugs (re-injected by APISIX after OIDC; client copies are stripped). Agency
+        staff may name any business. One business on the token and none named: that one. Otherwise None."""
+        wanted = (request.headers.get("X-Tenant-Slug") or request.query_params.get("tenant") or "").strip().lower()
+        mine = [t.strip().lower() for t in request.headers.get("X-Tenant-Slugs", "").split(",") if t.strip()]
+        if wanted:
+            if wanted in mine or _caller_roles(request) & ADMIN_GATEWAY_ROLES:
+                return wanted
+            return None
+        return mine[0] if len(mine) == 1 else None
+
     def _require_admin_access(request: Request) -> None:
         """Hard guard for /voice-admin/* (K15(d)/(e); verifier F-2 fix).
 
@@ -531,9 +550,11 @@ def create_app(
     # plane endpoints; enrollment is an admin path at the BFF layer.
     # ------------------------------------------------------------------
     @app.get("/voice/voices")
-    async def list_tts_voices() -> dict[str, Any]:
+    async def list_tts_voices(request: Request) -> dict[str, Any]:
         """Aggregate the configured TTS providers with availability flags;
-        unavailable providers are listed with available:false and no voices."""
+        unavailable providers are listed with available:false and no voices.
+        Cloned voices are listed only for the caller's own business."""
+        voice_tenant.set(_caller_tenant(request))
         providers_out: list[dict[str, Any]] = []
         for name, provider in tts_chain.providers_in_order():
             try:
@@ -552,11 +573,12 @@ def create_app(
         return {"providers": providers_out}
 
     @app.post("/voice/tts-preview")
-    async def tts_preview(req: TtsPreviewRequest) -> Response:
+    async def tts_preview(req: TtsPreviewRequest, request: Request) -> Response:
         """Synthesize a preview clip through the same FallbackTTS chain the
         calls use. Voice resolution: explicit `voice` param, then
         TTS_VOICE_MAP (provider-qualified), then PIPER_VOICE_MAP, then the
         default piper voice (app/multilang.py resolve_tts_voice)."""
+        voice_tenant.set(_caller_tenant(request))  # a cloned voice speaks only for its own business
         voice_spec = (req.voice or "").strip() or resolve_tts_voice(
             req.language or "",
             settings.tts_voice_map,
@@ -593,7 +615,10 @@ def create_app(
     ) -> dict[str, Any]:
         """Enroll a brand voice on the XTTS provider (requires `xtts` in
         TTS_PROVIDER_CHAIN). Consent (NDPA) is captured in the admin UI."""
-        _require_admin_access(request)
+        # Agency staff (or the internal token) for any business; a business's owner/admin for their own.
+        tenant = req.tenant.strip().lower()
+        if not (_caller_roles(request) & TENANT_ADMIN_ROLES and _caller_tenant(request) == tenant):
+            _require_admin_access(request)
         xtts = tts_chain.provider("xtts")
         if xtts is None:
             raise HTTPException(
@@ -607,7 +632,7 @@ def create_app(
                 status_code=400, detail="sample_base64 is not valid base64"
             ) from exc
         try:
-            voice_id = await xtts.enroll_voice(req.name, req.sample_base64)
+            voice_id = await xtts.enroll_voice(req.name, req.sample_base64, tenant)
         except Exception as exc:  # noqa: BLE001
             log.warning("voice enrollment failed", tenant=req.tenant, error=str(exc)[:200])
             raise HTTPException(status_code=502, detail=str(exc)) from exc

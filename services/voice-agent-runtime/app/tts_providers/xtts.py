@@ -16,7 +16,7 @@ from __future__ import annotations
 import httpx
 
 from ..logging import get_logger
-from .base import Voice, labels_of
+from .base import Voice, labels_of, voice_tenant
 
 log = get_logger("tts.xtts")
 
@@ -54,22 +54,26 @@ class XttsTTS:
         voice_id = (voice or "").strip() or self.default_voice
         if not voice_id:
             raise RuntimeError("xtts synthesize requires a voice_id")
+        tenant = voice_tenant.get()
+        if not tenant:
+            raise RuntimeError("xtts synthesize needs the business the voice belongs to")
         resp = await self._http().post(
             f"{self.base_url}/tts",
             json={
                 "text": text,
                 "voice_id": voice_id,
                 "language": (language or "").strip() or "en",
+                "tenant": tenant,
             },
         )
         resp.raise_for_status()
         return resp.content
 
-    async def enroll_voice(self, name: str, sample_base64: str) -> str:
-        """Enroll a brand voice from a base64 audio sample -> voice_id."""
+    async def enroll_voice(self, name: str, sample_base64: str, tenant: str) -> str:
+        """Enroll a brand voice for one business from a base64 audio sample -> voice_id."""
         resp = await self._http().post(
             f"{self.base_url}/voices",
-            json={"name": name.strip(), "sample_base64": sample_base64},
+            json={"name": name.strip(), "sample_base64": sample_base64, "tenant": tenant},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -78,12 +82,15 @@ class XttsTTS:
             raise RuntimeError("xtts enrollment response missing voice_id")
         return str(voice_id)
 
-    async def delete_voice(self, voice_id: str) -> None:
-        resp = await self._http().delete(f"{self.base_url}/voices/{voice_id}")
+    async def delete_voice(self, voice_id: str, tenant: str) -> None:
+        resp = await self._http().delete(f"{self.base_url}/voices/{voice_id}", params={"tenant": tenant})
         resp.raise_for_status()
 
     async def list_voices(self) -> list[Voice]:
-        resp = await self._http().get(f"{self.base_url}/voices")
+        tenant = voice_tenant.get()
+        if not tenant:
+            return []  # cloned voices are listed only for the business that owns them
+        resp = await self._http().get(f"{self.base_url}/voices", params={"tenant": tenant})
         resp.raise_for_status()
         data = resp.json()
         out: list[Voice] = []
