@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -64,6 +65,9 @@ class Settings:
     llm_model: str = "qwen3:8b"
     llm_api_key: str = "ollama"  # Ollama ignores the key; hosted providers require one
     llm_timeout_s: float = 20.0  # per-call timeout; exceeding it trips fallback
+    # Extra JSON merged into every chat-completions body (LLM_EXTRA_BODY), e.g. {"reasoning_effort": "none"} so
+    # a thinking model answers a caller straight away instead of reasoning first.
+    llm_extra_body: dict = field(default_factory=dict)
     # LLM fallback chain (VOICE-SCALING §3): secondary OpenAI-compatible
     # endpoint used when the primary fails (connection error, 429, 5xx,
     # timeout). Empty base URL disables the chain.
@@ -289,6 +293,7 @@ def load_settings() -> Settings:
         # ignores it, hosted providers (e.g. MiniMax) require it.
         llm_api_key=_env("LLM_API_KEY", "ollama"),
         llm_timeout_s=float(os.environ.get("LLM_TIMEOUT", "20")),
+        llm_extra_body=json.loads(os.environ.get("LLM_EXTRA_BODY") or "{}"),
         llm_fallback_base_url=_env("LLM_FALLBACK_BASE_URL", ""),
         llm_fallback_model=_env("LLM_FALLBACK_MODEL", ""),
         llm_fallback_api_key=_env("LLM_FALLBACK_API_KEY", ""),

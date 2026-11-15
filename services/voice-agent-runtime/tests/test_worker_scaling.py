@@ -129,3 +129,32 @@ def test_prewarm_releases_clients_bound_to_its_own_loop():
 
     asyncio.run(_warmup_then_release(Chain()))
     assert Chain.closed
+
+
+def test_worker_llm_client_uses_llm_timeout():
+    """The livekit openai plugin defaults to a 5 s read timeout; the worker passes its own client."""
+    from app.config import Settings
+    from app.livekit_worker import _openai_client
+
+    client = _openai_client(Settings(llm_timeout_s=42.0, llm_base_url="http://ollama:11434/v1"))
+    assert client.timeout.read == 42.0 and str(client.base_url).startswith("http://ollama:11434/v1")
+
+
+async def test_llm_extra_body_is_merged_into_chat_requests():
+    """LLM_EXTRA_BODY reaches the model server (e.g. reasoning_effort=none for a thinking model on a live call)."""
+    import json
+
+    import httpx
+
+    from app.pipeline.llm import _BodyMergeTransport
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    client = httpx.AsyncClient(transport=_BodyMergeTransport({"reasoning_effort": "none", "model": "ignored"},
+                                                             httpx.MockTransport(handler)))
+    await client.post("http://llm/v1/chat/completions", json={"model": "gemma4:26b", "messages": []})
+    assert seen["body"] == {"model": "gemma4:26b", "messages": [], "reasoning_effort": "none"}

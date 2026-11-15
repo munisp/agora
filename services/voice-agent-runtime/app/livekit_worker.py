@@ -109,6 +109,23 @@ async def _warmup_tts(tts: Any) -> None:
         await tts.synthesize_pcm(PREWARM_PHRASE)
 
 
+def _openai_client(settings: Settings) -> Any:
+    import httpx
+    import openai
+
+    from .pipeline.llm import http_client_with_body
+
+    timeout = httpx.Timeout(settings.llm_timeout_s, connect=10.0)
+    extra = getattr(settings, "llm_extra_body", None) or {}
+    return openai.AsyncClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        timeout=timeout,
+        max_retries=0,
+        http_client=http_client_with_body(extra, timeout) if extra else None,
+    )
+
+
 async def _warmup_then_release(tts: Any) -> None:
     """Warm the sidecars, then drop the HTTP clients. Prewarm runs in its own asyncio.run() loop, which closes
     afterwards; clients kept from it made every later call fail with "Event loop is closed" (piper then fell
@@ -698,10 +715,11 @@ async def build_voice_agent(
         # hot-swap endpoints mid-process, so the LLM fallback chain
         # (app/pipeline/llm.py FallbackLLM) covers the chat/tool-loop paths;
         # the worker node relies on the primary endpoint + job-level retry.
+        # Own client: the plugin's default read timeout is 5 s, which cut off every reply from a CPU-hosted model
+        # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
         llm=lk_openai.LLM(
             model=settings.llm_model,
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
+            client=_openai_client(settings),
         ),
         tts=PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
         chat_ctx=chat_ctx,
