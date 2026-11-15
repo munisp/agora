@@ -109,6 +109,18 @@ async def _warmup_tts(tts: Any) -> None:
         await tts.synthesize_pcm(PREWARM_PHRASE)
 
 
+async def _warmup_then_release(tts: Any) -> None:
+    """Warm the sidecars, then drop the HTTP clients. Prewarm runs in its own asyncio.run() loop, which closes
+    afterwards; clients kept from it made every later call fail with "Event loop is closed" (piper then fell
+    back to 16 kHz MMS: pitched audio and failed frame capture). Providers re-create clients lazily."""
+    try:
+        await _warmup_tts(tts)
+    finally:
+        aclose = getattr(tts, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 def _prewarm(settings: Settings, proc) -> None:  # noqa: ARG001 - proc userdata unused; module cache suffices
     if not settings.preload_models:
         return
@@ -121,7 +133,7 @@ def _prewarm(settings: Settings, proc) -> None:  # noqa: ARG001 - proc userdata 
         log.warning("prewarm: whisper load failed (lazy fallback)", error=str(exc)[:200])
     try:
         tts = _build_tts(settings)
-        asyncio.run(_warmup_tts(tts))
+        asyncio.run(_warmup_then_release(tts))
         _PREWARMED["tts"] = tts
         log.info(
             "prewarm: tts warmup synthesis done",

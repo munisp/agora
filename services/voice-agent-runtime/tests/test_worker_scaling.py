@@ -109,3 +109,23 @@ def test_prewarm_fnc_survives_spawn_pickling():
 
     fn = pickle.loads(pickle.dumps(make_prewarm_fnc(Settings(preload_models=False))))
     assert fn(None) is None  # preload off: returns without loading anything
+
+
+def test_prewarm_releases_clients_bound_to_its_own_loop():
+    """The prewarm loop closes after asyncio.run(): its HTTP clients must not outlive it."""
+    import asyncio
+
+    from app.livekit_worker import _warmup_then_release
+
+    class Chain:
+        closed = False
+        order: list = []
+
+        async def synthesize_pcm(self, text):
+            return b"\x00\x00"
+
+        async def aclose(self):
+            Chain.closed = True
+
+    asyncio.run(_warmup_then_release(Chain()))
+    assert Chain.closed
