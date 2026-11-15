@@ -60,7 +60,12 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 			"capacity":     o.Capacity,
 			"bookable":     true,
 		}
-		if err := a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "v1/offerings", body, tenantHeader, nil); err != nil {
+		// Service identity: no user is in the loop during onboarding; booking admits the internal token here.
+		seedHeaders := map[string]string{"X-Tenant-Slug": in.Slug}
+		for k, v := range internalHeaders(a.BookingInternalToken) {
+			seedHeaders[k] = v
+		}
+		if err := a.Dapr.InvokeServiceMethod(ctx, http.MethodPost, a.BookingAppID, "v1/offerings", body, seedHeaders, nil); err != nil {
 			return fmt.Errorf("seed offering %q: %w", o.Name, err)
 		}
 		a.Log.Info("pack offering seeded", zap.String("slug", in.Slug), zap.String("offering", o.Name))
