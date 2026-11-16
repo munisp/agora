@@ -47,7 +47,9 @@ from . import emergency, metrics, sip
 from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
+from . import call_language
 from .call_activity import announce_activity
+from .pipeline.naija_stt import NaijaSpeechSTT
 from .lk_tool_loop import ToolLoopLLM
 from .transcripts import TranscriptRecorder, tool_turn_text
 from .events import new_cloudevent, session_lifecycle_data
@@ -202,6 +204,25 @@ def cpu_load_fnc() -> float:
 # ---------------------------------------------------------------------------
 # Bridges: app pipeline stages -> livekit-agents 0.10 node types
 # ---------------------------------------------------------------------------
+class ChosenLanguageSTT:
+    """Speech recognition for a call whose caller chose a Nigerian language: MMS on the GPU host with that language's
+    adapter; whisper is the fallback if the service fails (so the call never goes deaf). Reports the chosen language
+    as "detected" so nothing downstream flips the call back to English."""
+
+    def __init__(self, naija: NaijaSpeechSTT, whisper: Any, language: str) -> None:
+        self._naija, self._whisper, self._language = naija, whisper, language
+        self.last_detected_language: str | None = language
+
+    async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
+                             language: str | None = None) -> str:
+        try:
+            return await self._naija.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels,
+                                                    language=self._language)
+        except Exception as exc:  # noqa: BLE001 - keep hearing the caller
+            log.warning("naija speech recognition failed; using whisper", language=self._language, error=str(exc)[:200])
+            return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels)
+
+
 class WhisperSTTNode(lk_stt.STT):
     """Bridge FasterWhisperSTT into the LiveKit pipeline.
 
@@ -612,6 +633,7 @@ async def build_voice_agent(
     site_slug: str,
     conversation_id: str,
     sip_call: "sip.InboundCallContext | None" = None,
+    caller_language: str = "",
 ) -> tuple[VoicePipelineAgent, TenantContext, SessionState]:
     """Bootstrap tenant context and assemble the VoicePipelineAgent.
 
@@ -645,6 +667,9 @@ async def build_voice_agent(
         ctx, conversation_id=conversation_id, caller_phone=caller_phone or None
     )
 
+    # A Nigerian language the caller chose on the call page: hear, think and speak in it for the whole call.
+    chosen = caller_language if caller_language in call_language.NIGERIAN and settings.naija_speech_url else ""
+    system_prompt += call_language.prompt_instruction(chosen)
     chat_ctx = lk_llm.ChatContext().append(role="system", text=system_prompt)
     runner = AsyncToolRunner(
         timeout_s=settings.tool_timeout_s,
@@ -680,6 +705,11 @@ async def build_voice_agent(
         )
 
     tts_impl.voice = _voice_spec(ml_state.active_language)
+    tts_impl.language = ""  # job processes are reused: never inherit the previous call's language
+    if chosen:
+        session.active_language = chosen
+        tts_impl.voice = "naija:"  # the service picks the language's best voice
+        tts_impl.language = chosen
     # SPEC-W38 F2: definition.voice overrides the session's default voice
     # (per-turn language switching still applies on top). Only piper /
     # provider-less voices are applied here — other providers go through the
@@ -719,7 +749,8 @@ async def build_voice_agent(
 
     agent = VoicePipelineAgent(
         vad=silero.VAD.load(),
-        stt=WhisperSTTNode(stt_impl, on_language=_on_language),
+        stt=(WhisperSTTNode(ChosenLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen))
+             if chosen else WhisperSTTNode(stt_impl, on_language=_on_language)),
         # NOTE (VOICE-SCALING §3): the livekit-plugins-openai LLM node cannot
         # hot-swap endpoints mid-process, so the LLM fallback chain
         # (app/pipeline/llm.py FallbackLLM) covers the chat/tool-loop paths;
@@ -732,6 +763,7 @@ async def build_voice_agent(
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
     )
+    agent.agora_call_language = chosen  # read by the greeting in entrypoint
     # Voice-path filler: speak the ack line through the agent's TTS while a
     # slow tool call is in flight (cancelled when the tool answers fast).
     fnc_ctx.set_speaker(lambda text: agent.say(text, allow_interruptions=True))
@@ -802,6 +834,16 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
     except Exception as exc:  # noqa: BLE001 - event surface may shift; the call itself is unaffected
         log.warning("voice transcript hooks unavailable", error=str(exc)[:200])
 
+async def _caller_language(ctx: agents.JobContext, timeout_s: float = 8.0) -> str:
+    """The language the web caller chose (token metadata, app/call_language.py); "" = English / not chosen."""
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=timeout_s)
+        return call_language.from_metadata(getattr(participant, "metadata", ""))
+    except Exception as exc:  # noqa: BLE001 - no choice = the default (English) call
+        log.info("caller language not read", error=str(exc)[:120])
+        return ""
+
+
 async def entrypoint(ctx: agents.JobContext) -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
@@ -849,7 +891,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     try:
         agent, tenant_ctx, session = await build_voice_agent(
-            settings, dapr, site_slug, conversation_id, sip_call=sip_call
+            settings, dapr, site_slug, conversation_id, sip_call=sip_call,
+            caller_language=await _caller_language(ctx) if sip_call is None else "",
         )
     except DaprError as exc:
         log.error("session bootstrap failed", site_slug=site_slug, error=str(exc))
@@ -886,7 +929,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # recording-consent lines when the tenant context carries a `disclosure`
     # block; absent the block the greeting is byte-identical to before.
     await agent.say(
-        build_greeting(tenant_ctx),
+        call_language.greeting(getattr(agent, "agora_call_language", ""), getattr(tenant_ctx, "display_name", ""),
+                               build_greeting(tenant_ctx)),
         allow_interruptions=True,
     )
 

@@ -35,13 +35,14 @@ from ..pipeline.tts import PiperTTS, TtsLruCache, _wav_to_pcm, split_sentences
 from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
 from .mms import MmsTTS
+from .naija import NaijaSpeechTTS
 from .spitch import SpitchTTS
 from .xtts import XttsTTS
 
 log = get_logger("tts.chain")
 
 #: Providers buildable from Settings (chain names).
-PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch")
+PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "naija")
 
 
 class PiperProvider:
@@ -272,7 +273,9 @@ class FallbackTTS:
             yield cached
             return
         chunks = split_sentences(text)
-        if len(chunks) <= 1:
+        # The naija service generates all sentences of one request in a single GPU batch (~3x faster than one by
+        # one), so a Nigerian-language reply goes over whole.
+        if len(chunks) <= 1 or (self.voice or "").startswith("naija:"):
             pcm = await self.synthesize_pcm(text)
             if pcm:
                 yield pcm
@@ -305,6 +308,8 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
         return MmsTTS(settings.mms_tts_url)
     if name == "xtts":
         return XttsTTS(settings.xtts_tts_url)
+    if name == "naija":
+        return NaijaSpeechTTS(settings.naija_speech_url, sample_rate=settings.piper_sample_rate)
     if name == "azure":
         return AzureTTS(
             api_key=settings.azure_speech_key, region=settings.azure_speech_region

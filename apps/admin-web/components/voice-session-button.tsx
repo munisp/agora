@@ -3,7 +3,7 @@
 import * as React from "react";
 import { playRemoteAudio, unlockCallAudio } from "@/lib/call-audio";
 import { ReceptionistVideo, type CallActivity } from "@/components/receptionist-video";
-import { Mic, PhoneOff } from "lucide-react";
+import { Languages, Mic, PhoneOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { VoiceSession } from "@/lib/types";
 import type { ElevenLabsConvAiSession } from "@/lib/convai";
@@ -40,6 +40,15 @@ function AvatarVideoTile({
   );
 }
 
+/** Languages a caller can choose for a call, in their own names (the voice runtime's CALL_LANGUAGES). */
+const CALL_LANGUAGES = [
+  { code: "en", label: "English" },
+  { code: "pcm", label: "Pidgin" },
+  { code: "yo", label: "Yorùbá" },
+  { code: "ha", label: "Hausa" },
+  { code: "ig", label: "Igbo" },
+];
+
 /**
  * "Talk to receptionist" voice button.
  *
@@ -65,6 +74,8 @@ export function VoiceSessionButton({
   accent?: string;
 }) {
   const [state, setState] = React.useState<CallState>("idle");
+  // The language the caller speaks; the receptionist hears, thinks and answers in it (voice runtime CALL_LANGUAGES).
+  const [language, setLanguage] = React.useState("en");
   const [error, setError] = React.useState<string | null>(null);
   // The receptionist's voice: drives the animated avatar (mouth follows the audio).
   const [voiceTrack, setVoiceTrack] = React.useState<{ mediaStreamTrack: MediaStreamTrack } | null>(null);
@@ -104,6 +115,7 @@ export function VoiceSessionButton({
       const session = await api.post<VoiceSession>("/voice/session", {
         tenant,
         site_slug: siteSlug,
+        ...(language !== "en" ? { language } : {}),
       });
 
       // 2a. ElevenLabs backend: connect the ConvAI signed URL directly
@@ -213,14 +225,33 @@ export function VoiceSessionButton({
 
   return (
     <span className="inline-flex flex-col items-start gap-1">
-      <button
-        onClick={() => void start()}
-        className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium cursor-pointer"
-        style={{ backgroundColor: accent, color: readableOn(accent) }}
-      >
-        <Mic className="h-4 w-4" />
-        Talk to receptionist
-      </button>
+      <span className="inline-flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => void start()}
+          className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium cursor-pointer"
+          style={{ backgroundColor: accent, color: readableOn(accent) }}
+        >
+          <Mic className="h-4 w-4" />
+          Talk to receptionist
+        </button>
+        <label className="inline-flex items-center gap-1.5 text-xs" style={{ color: "inherit", opacity: 0.85 }}>
+          <Languages className="h-3.5 w-3.5" aria-hidden="true" />
+          <span className="sr-only">Language for the call</span>
+          <select
+            value={language}
+            onChange={(e) => setLanguage(e.target.value)}
+            aria-label="Language for the call"
+            className="cursor-pointer rounded-full border bg-transparent px-2 py-1 text-xs"
+            style={{ borderColor: "currentColor" }}
+          >
+            {CALL_LANGUAGES.map((l) => (
+              <option key={l.code} value={l.code} style={{ color: "#2b2119" }}>
+                {l.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </span>
       {state === "error" && error ? (
         <span className="text-xs text-destructive">{error}</span>
       ) : null}

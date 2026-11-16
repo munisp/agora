@@ -63,7 +63,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import metrics, sip
+from . import call_language, metrics, sip
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
 from .config import Settings, load_settings
@@ -92,6 +92,8 @@ log = get_logger("control-plane")
 class SessionRequest(BaseModel):
     site_slug: str = Field(min_length=1)
     participant_name: str | None = None
+    # Language the caller chose on the call page (app/call_language.py); unknown or not offered = English.
+    language: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -251,6 +253,10 @@ def create_app(
 
         room = f"{ROOM_PREFIX}{req.site_slug}-{uuid.uuid4().hex}"
         identity = f"web-{uuid.uuid4().hex[:8]}"
+        # The worker reads the caller's chosen language from their participant metadata.
+        caller_language = (
+            call_language.normalize(req.language, settings.call_languages) if settings.naija_speech_url else ""
+        )
         token = (
             lk_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
             .with_identity(identity)
@@ -264,9 +270,11 @@ def create_app(
                 )
             )
             .with_ttl(timedelta(minutes=30))
-            .to_jwt()
         )
-        log.info("livekit session token minted", room=room, identity=identity)
+        if caller_language:
+            token = token.with_metadata(call_language.token_metadata(caller_language))
+        token = token.to_jwt()
+        log.info("livekit session token minted", room=room, identity=identity, language=caller_language or "en")
 
         # SPEC-W9 Part A: optional avatar presence. Fire-and-forget — the
         # provider join is a background task; misconfiguration is reported

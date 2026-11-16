@@ -247,6 +247,11 @@ class Settings:
     tts_voice_map: dict = field(default_factory=dict)
     mms_tts_url: str = "http://mms-tts:5800"
     xtts_tts_url: str = "http://xtts-tts:5810"
+    # Nigerian-language speech on the GPU host (services/naija-speech): YarnGPT voices for ig/yo/ha, MMS for pcm/ful,
+    # MMS speech recognition for all. Empty = callers can't pick a Nigerian language (English only).
+    naija_speech_url: str = ""
+    # Languages a caller may choose on the call page (ISO codes; en always allowed).
+    call_languages: str = "en,pcm,yo,ha,ig"
     azure_speech_key: str = ""
     azure_speech_region: str = ""
     spitch_api_key: str = ""
@@ -364,6 +369,8 @@ def load_settings() -> Settings:
         tts_voice_map=parse_tts_voice_map(_env("TTS_VOICE_MAP", "")),
         mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
+        naija_speech_url=_env("NAIJA_SPEECH_URL", ""),
+        call_languages=_env("CALL_LANGUAGES", "en,pcm,yo,ha,ig"),
         azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
         spitch_api_key=_env("SPITCH_API_KEY", ""),
