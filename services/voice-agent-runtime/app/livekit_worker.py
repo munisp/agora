@@ -884,7 +884,7 @@ def keep_listening_after_reconnect(agent: Any, room: Any) -> None:
             names = [getattr(a, "identity", None) or getattr(a, "sid", None) or type(a).__name__ for a in args]
             listener = getattr(agent, "_human_input", None)
             linked = getattr(getattr(listener, "_participant", None), "identity", None)
-            log.info("room event", event=event, args=names, linked=linked,
+            log.info("room event", room_event=event, args=names, linked=linked,
                      listening_to=getattr(getattr(listener, "_subscribed_track", None), "sid", None))
         return handler
 

@@ -186,7 +186,10 @@ export function VoiceSessionButton({
         session.ice_servers?.length ? { rtcConfig: { iceServers: session.ice_servers } } : undefined,
       );
       await unlockCallAudio(room);
-      await room.localParticipant.setMicrophoneEnabled(true);
+      // DTX off: with DTX the browser sends almost no packets while the caller is silent (listening to a long answer),
+      // LiveKit rated the connection "lost" and the browser did a full reconnect — after which the receptionist could
+      // no longer hear the caller. A steady packet flow costs ~30 kbps and keeps the call stable.
+      await room.localParticipant.setMicrophoneEnabled(true, undefined, { dtx: false });
       setState("connected");
     } catch (e) {
       setError(

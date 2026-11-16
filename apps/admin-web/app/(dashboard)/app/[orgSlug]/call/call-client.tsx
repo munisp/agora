@@ -101,7 +101,7 @@ export function CallClient({
         }
         await lk.connect(LIVEKIT_URL, token, iceServers?.length ? { rtcConfig: { iceServers } } : undefined);
         await unlockCallAudio(lk);
-        await lk.localParticipant.setMicrophoneEnabled(true);
+        await lk.localParticipant.setMicrophoneEnabled(true, undefined, { dtx: false }); // see voice-session-button
         if (!cancelled) setState("connected");
       } catch (e) {
         if (!cancelled) {
@@ -123,7 +123,7 @@ export function CallClient({
     const lk = roomRef.current;
     if (!lk) return;
     const next = !muted;
-    await lk.localParticipant.setMicrophoneEnabled(!next);
+    await lk.localParticipant.setMicrophoneEnabled(!next, undefined, { dtx: false });
     setMuted(next);
   };
 

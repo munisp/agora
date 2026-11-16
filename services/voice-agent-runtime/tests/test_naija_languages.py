@@ -208,3 +208,20 @@ def test_listener_follows_a_reconnected_caller():
     assert agent._human_input._participant is old
     new = P("web-1"); room.handlers["participant_connected"](new)
     assert agent._human_input._participant is new and agent._human_input.subscribed == 1
+
+
+def test_reconnect_diagnostics_never_raise():
+    from app.livekit_worker import keep_listening_after_reconnect
+
+    class Room:
+        def __init__(self):
+            self.handlers = {}
+
+        def on(self, ev, fn):
+            self.handlers[ev] = fn
+
+    agent = type("A", (), {})(); agent._human_input = None; room = Room()
+    keep_listening_after_reconnect(agent, room)
+    track, pub, who = type("T", (), {"sid": "TR_1"})(), type("P", (), {"sid": "TP_1"})(), type("W", (), {"identity": "web-1"})()
+    for ev in ("participant_disconnected", "track_published", "track_subscribed", "track_unsubscribed", "reconnecting", "reconnected"):
+        room.handlers[ev](track, pub, who)  # must not raise (a logging bug used to break the room's callbacks)
