@@ -4,6 +4,7 @@ The browser shows a person on camera: talking while the receptionist speaks, typ
 availability, looking up a booking), listening otherwise. Speaking can be read from the audio, but tool use is silent,
 so the worker publishes small JSON messages on the room's data channel, topic "agora.activity":
 
+    {"state": "thinking"}       the caller finished speaking; the receptionist is working out the answer
     {"state": "working", "tool": "get_availability", "label": "Checking availability"}
     {"state": "speaking"} / {"state": "listening"}
 
@@ -67,7 +68,7 @@ def announce_activity(agent: Any, room: Any) -> None:
             try:
                 await room.local_participant.publish_data(payload, reliable=True, topic=TOPIC)
             except Exception as exc:  # noqa: BLE001 - the screen's animation is cosmetic
-                log.debug("activity not published", error=str(exc)[:200])
+                log.warning("activity not published", error=str(exc)[:200])
 
         try:
             asyncio.get_running_loop().create_task(_run())
@@ -78,9 +79,14 @@ def announce_activity(agent: Any, room: Any) -> None:
         _send(activity_message("working", _first_tool_name(called) or "tool"))
 
     try:
+        agent.on("user_speech_committed", lambda *_a, **_k: _send(activity_message("thinking")))
         agent.on("function_calls_collected", _collected)
-        agent.on("function_calls_finished", lambda *_a, **_k: _send(activity_message("listening")))
+        # Back to thinking: the model now reads the tool's answer before replying.
+        agent.on("function_calls_finished", lambda *_a, **_k: _send(activity_message("thinking")))
         agent.on("agent_started_speaking", lambda *_a, **_k: _send(activity_message("speaking")))
         agent.on("agent_stopped_speaking", lambda *_a, **_k: _send(activity_message("listening")))
+        llm = getattr(agent, "_llm", None)
+        if hasattr(llm, "on_extra_tools"):  # app/lk_tool_loop.py: lookups made while answering
+            llm.on_extra_tools(collected=_collected, finished=lambda *_a, **_k: _send(activity_message("thinking")))
     except Exception as exc:  # noqa: BLE001
         log.warning("call activity hooks unavailable", error=str(exc)[:200])

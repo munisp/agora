@@ -5,7 +5,7 @@ import { AnimatedReceptionist } from "@/components/animated-receptionist";
 
 /** What the voice worker says the receptionist is doing (data topic "agora.activity", app/call_activity.py). */
 export interface CallActivity {
-  state: "speaking" | "listening" | "working" | string;
+  state: "speaking" | "listening" | "thinking" | "working" | string;
   tool?: string;
   label?: string;
 }
@@ -13,12 +13,15 @@ export interface CallActivity {
 type Clip = "listening" | "talking" | "typing";
 const CLIPS: Clip[] = ["listening", "talking", "typing"];
 const BASE = "/receptionist";
-// A tool call that never reports back must not leave her typing for the rest of the call.
-const WORKING_MAX_MS = 25_000;
+// A turn that never reports back must not leave her typing for the rest of the call.
+const WORKING_MAX_MS = 45_000;
+// A lookup can take a fraction of a second; keep her typing long enough to be seen.
+const TYPING_MIN_MS = 2_500;
 
 /**
  * The receptionist on camera during a call: a person at a front desk who talks while the receptionist speaks, types
- * while it is using a tool (checking availability, looking up a booking — the label says which) and listens otherwise.
+ * while it works out an answer ("One moment…") or uses a tool (checking availability, looking up a booking — the
+ * label says which), and listens otherwise. Speaking wins over typing (a "let me check" filler is spoken).
  *
  * Three short looping clips (public/receptionist/*.mp4, made from one portrait with an image-to-video model) are
  * preloaded and cross-faded, so switching is instant. Speaking is read from the live voice's loudness; tool use comes
@@ -80,18 +83,31 @@ export function ReceptionistVideo({
     };
   }, [track]);
 
-  // Tool use from the worker; cleared when it reports back (or after WORKING_MAX_MS).
+  // Thinking / tool use from the worker; ends when it replies, held at least TYPING_MIN_MS once shown.
+  const typingSince = React.useRef(0);
+  const lastTool = React.useRef<string | null>(null);
   React.useEffect(() => {
-    if (activity?.state !== "working") {
+    const state = activity?.state;
+    if (state === "working" || state === "thinking") {
+      if (state === "working") lastTool.current = activity?.label || "Looking that up";
+      setWorking((prev) => {
+        if (!prev) typingSince.current = Date.now();
+        return state === "working" || lastTool.current ? (lastTool.current as string) : "One moment";
+      });
+      const timer = window.setTimeout(() => setWorking(null), WORKING_MAX_MS);
+      return () => window.clearTimeout(timer);
+    }
+    lastTool.current = null;
+    const left = TYPING_MIN_MS - (Date.now() - typingSince.current);
+    if (left <= 0) {
       setWorking(null);
       return;
     }
-    setWorking(activity.label || "Looking that up");
-    const timer = window.setTimeout(() => setWorking(null), WORKING_MAX_MS);
+    const timer = window.setTimeout(() => setWorking(null), left);
     return () => window.clearTimeout(timer);
   }, [activity]);
 
-  const clip: Clip = working ? "typing" : speaking ? "talking" : "listening";
+  const clip: Clip = speaking ? "talking" : working ? "typing" : "listening";
 
   // Only the visible clip plays (saves the phone's battery); each restarts from where it was.
   React.useEffect(() => {
@@ -105,7 +121,7 @@ export function ReceptionistVideo({
 
   if (failed) return <AnimatedReceptionist track={track} accent={accent} name={name} />;
 
-  const status = !track ? "Connecting…" : working ? `${working}…` : speaking ? "Speaking…" : "Listening…";
+  const status = !track ? "Connecting…" : speaking ? "Speaking…" : working ? `${working}…` : "Listening…";
   return (
     <div
       className="w-[280px] max-w-full overflow-hidden rounded-2xl border shadow-sm"
@@ -113,6 +129,7 @@ export function ReceptionistVideo({
       role="img"
       aria-label={`${name}: ${status.replace("…", "")}`}
       data-clip={clip}
+      data-activity={activity?.state ?? ""}
     >
       <div className="relative aspect-[4/3] w-full bg-black">
         {CLIPS.map((c) => (
@@ -139,7 +156,7 @@ export function ReceptionistVideo({
           {name}
         </p>
         <p className="flex items-center gap-1.5 text-xs" style={{ color: "#7a6656" }}>
-          {working ? <span className="agora-typing" aria-hidden="true"><i /><i /><i /></span> : null}
+          {working && !speaking ? <span className="agora-typing" aria-hidden="true"><i /><i /><i /></span> : null}
           {status}
         </p>
       </div>

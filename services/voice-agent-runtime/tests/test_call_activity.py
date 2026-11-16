@@ -40,20 +40,24 @@ def test_labels():
     assert json.loads(activity_message("listening")) == {"state": "listening"}
 
 
-def test_tool_call_is_announced_as_working_then_listening():
+def test_turn_is_announced_thinking_working_speaking_listening():
     async def run():
         agent, room = _Agent(), type("R", (), {"local_participant": _Participant()})()
         announce_activity(agent, room)
-        agent.emit("agent_started_speaking")
+        agent.emit("user_speech_committed", object())
         agent.emit("function_calls_collected", [_Called("get_availability")])
         agent.emit("function_calls_finished", [])
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        agent.emit("agent_started_speaking")
+        agent.emit("agent_stopped_speaking")
+        for _ in range(3):
+            await asyncio.sleep(0)
         return room.local_participant.sent
 
     sent = asyncio.run(run())
     assert sent == [
-        (TOPIC, {"state": "speaking"}),
+        (TOPIC, {"state": "thinking"}),
         (TOPIC, {"state": "working", "tool": "get_availability", "label": "Checking availability"}),
+        (TOPIC, {"state": "thinking"}),
+        (TOPIC, {"state": "speaking"}),
         (TOPIC, {"state": "listening"}),
     ]

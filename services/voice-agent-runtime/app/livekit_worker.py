@@ -48,6 +48,7 @@ from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from .call_activity import announce_activity
+from .lk_tool_loop import ToolLoopLLM
 from .transcripts import TranscriptRecorder, tool_turn_text
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
@@ -130,7 +131,8 @@ def _openai_client(settings: Settings) -> Any:
 
 def _worker_llm(settings: Settings) -> Any:
     # The plugin refuses to start without api_key even when handed a client.
-    return lk_openai.LLM(model=settings.llm_model, api_key=settings.llm_api_key, client=_openai_client(settings))
+    # ToolLoopLLM: the 0.10 pipeline drops tool calls made in the answer round (a second lookup = silence).
+    return ToolLoopLLM(lk_openai.LLM(model=settings.llm_model, api_key=settings.llm_api_key, client=_openai_client(settings)))
 
 
 async def _warmup_then_release(tts: Any) -> None:
@@ -794,6 +796,9 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
         agent.on("user_speech_committed", _said("user"))
         agent.on("agent_speech_committed", _said("agent"))
         agent.on("function_calls_finished", _tools)
+        llm = getattr(agent, "_llm", None)
+        if hasattr(llm, "on_extra_tools"):
+            llm.on_extra_tools(finished=_tools)  # second and later lookups for the same question
     except Exception as exc:  # noqa: BLE001 - event surface may shift; the call itself is unaffected
         log.warning("voice transcript hooks unavailable", error=str(exc)[:200])
 

@@ -1,0 +1,121 @@
+"""Lets a live call use more than one tool for one question (livekit-agents 0.10.x).
+
+VoicePipelineAgent 0.10.2 runs the tools of the model's first reply, then asks the model for the answer and speaks
+that answer's text — any tool calls in the answer are dropped. So a question that needs two lookups (the model first
+calls get_business_info, then wants get_availability) ended in silence: no answer, nothing recorded.
+
+ToolLoopLLM wraps the worker's LLM. On the answer round (the context ends with tool results) it runs the extra tool
+calls itself, adds their results and asks again, up to `max_rounds` times, and streams only the final reply's text to
+the pipeline. The first round is passed through untouched, so the pipeline's own tool handling (filler lines, events)
+is unchanged. Listeners hear about the extra calls (call activity on screen, transcripts).
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Callable
+
+from livekit.agents import llm as lk_llm
+
+from .logging import get_logger
+
+log = get_logger("tool-loop")
+
+_END = object()
+
+
+def _is_answer_round(chat_ctx: Any) -> bool:
+    msgs = getattr(chat_ctx, "messages", None) or []
+    return bool(msgs) and getattr(msgs[-1], "role", None) == "tool"
+
+
+class _ToolLoopStream(lk_llm.LLMStream):
+    def __init__(self, owner: "ToolLoopLLM", *, chat_ctx: Any, fnc_ctx: Any) -> None:
+        super().__init__(chat_ctx=chat_ctx, fnc_ctx=fnc_ctx)
+        self._owner = owner
+        self._queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._runner = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        owner = self._owner
+        ctx = self._chat_ctx.copy()
+        try:
+            for round_no in range(owner.max_rounds + 1):
+                last = round_no == owner.max_rounds  # out of rounds: answer without tools
+                stream = owner.inner.chat(chat_ctx=ctx, fnc_ctx=None if last else self._fnc_ctx)
+                try:
+                    async for chunk in stream:
+                        await self._queue.put(chunk)  # the pipeline speaks only the text in these
+                    calls = list(stream.function_calls or [])
+                finally:
+                    await stream.aclose()
+                if not calls:
+                    return
+                owner.notify(calls)
+                called = [c.execute() for c in calls]
+                await asyncio.gather(*(c.task for c in called), return_exceptions=True)
+                owner.notify_finished(called)
+                done = [c for c in called if c.result is not None]
+                if not done:
+                    return
+                ctx.messages.append(lk_llm.ChatMessage.create_tool_calls([c.call_info for c in done], text=""))
+                ctx.messages.extend(lk_llm.ChatMessage.create_tool_from_called_function(c) for c in done)
+                log.info("extra tool round", round=round_no + 1, tools=[c.call_info.function_info.name for c in done])
+        except Exception as exc:  # noqa: BLE001 - end the reply rather than hang the call
+            log.warning("tool loop failed", error=str(exc)[:300])
+        finally:
+            await self._queue.put(_END)
+
+    async def __anext__(self) -> Any:
+        item = await self._queue.get()
+        if item is _END:
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self) -> None:
+        if not self._runner.done():
+            self._runner.cancel()
+            try:
+                await self._runner
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await super().aclose()
+
+
+class ToolLoopLLM(lk_llm.LLM):
+    def __init__(self, inner: Any, *, max_rounds: int = 3) -> None:
+        super().__init__()
+        self.inner = inner
+        self.max_rounds = max_rounds
+        self._on_tools: list[Callable[[list[Any]], None]] = []
+        self._on_finished: list[Callable[[list[Any]], None]] = []
+
+    def on_extra_tools(self, collected: Callable[[list[Any]], None] | None = None,
+                       finished: Callable[[list[Any]], None] | None = None) -> None:
+        if collected:
+            self._on_tools.append(collected)
+        if finished:
+            self._on_finished.append(finished)
+
+    def notify(self, calls: list[Any]) -> None:
+        for fn in self._on_tools:
+            try:
+                fn(calls)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("tool listener failed", error=str(exc)[:200])
+
+    def notify_finished(self, called: list[Any]) -> None:
+        for fn in self._on_finished:
+            try:
+                fn(called)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("tool listener failed", error=str(exc)[:200])
+
+    def chat(self, *, chat_ctx: Any, fnc_ctx: Any = None, **kwargs: Any) -> Any:
+        if fnc_ctx is not None and self.max_rounds > 0 and _is_answer_round(chat_ctx):
+            return _ToolLoopStream(self, chat_ctx=chat_ctx, fnc_ctx=fnc_ctx)
+        return self.inner.chat(chat_ctx=chat_ctx, fnc_ctx=fnc_ctx, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:  # anything else (model, capabilities, ...) comes from the real LLM
+        if name == "inner":
+            raise AttributeError(name)
+        return getattr(self.inner, name)
