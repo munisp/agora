@@ -14,7 +14,9 @@ export default async function SignInPage({
 }) {
   const { callbackUrl } = await searchParams;
   const session = await auth();
-  if (session) redirect(callbackUrl ?? "/app");
+  // An expired session (refresh failed) must reach the sign-in button: redirecting it to the dashboard looped, since the
+  // dashboard sends expired sessions here (ERR_TOO_MANY_REDIRECTS).
+  if (session && !session.error) redirect(callbackUrl ?? "/app");
 
   return (
     <div className="grid min-h-screen bg-background lg:grid-cols-[1.1fr_1fr]">
