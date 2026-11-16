@@ -68,7 +68,7 @@
     {
       "id": "ecommerce",
       "version": "1.0.0",
-      "sha256": "0e0e09a2b64e30bd581ed84e9e766e7bddfce8a974aa0ff9d1cc3ab7f2ce9945",
+      "sha256": "4196e5f66c0caf9afcddc6fe8064890e9c116b8569f2ba150f052d2179e4fa7b",
       "author": "opendesk",
       "signature": null,
       "path": "ecommerce.yaml"
@@ -226,6 +226,14 @@
       "path": "nigeria-sme.yaml"
     },
     {
+      "id": "pension-fund",
+      "version": "1.0.0",
+      "sha256": "7fdedd677d63810f257c20802ab449b104f325fc29ab193cc99a0dcc19484576",
+      "author": "opendesk",
+      "signature": null,
+      "path": "pension-fund.yaml"
+    },
+    {
       "id": "pharmacy",
       "version": "1.0.0",
       "sha256": "5fd18bfc665d8c9b25152e688d97230968700e6ab96df81291331033709d2009",
@@ -276,7 +284,7 @@
     {
       "id": "transportation",
       "version": "1.0.0",
-      "sha256": "ab2efeace1fce3524fe576e7b209a2eb98450a653325ac256f263d94b6efa16e",
+      "sha256": "18428bad7e5f00c86e0aa2186e84b90bd82192544ecb27603f4856490fed1810",
       "author": "opendesk",
       "signature": null,
       "path": "transportation.yaml"
@@ -284,7 +292,7 @@
     {
       "id": "travel",
       "version": "1.0.0",
-      "sha256": "b098e195fafeb34a74720dafeec666ea7e942b6585b077056d9c0869ca2d6558",
+      "sha256": "5602718f53b5800094d53d2e27d148823562ab064d45403a5cf129a567c0fa83",
       "author": "opendesk",
       "signature": null,
       "path": "travel.yaml"

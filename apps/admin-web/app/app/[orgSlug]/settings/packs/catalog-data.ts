@@ -1197,6 +1197,99 @@ export const PACK_CATALOG: PackCatalogEntry[] = [
     "consentTextExcerpt": "We dey record this call and we go keep your name, phone number and booking\ndetails so we fit run your appointment and remind you about am. We no dey\nshare your data with anybody wey no concern your booking, and we delete call\nrecords after 180 days under the Nigeria Data Protection Act 2023. You fit\nask us to see, correct or delete your data at any time — just talk to our\nstaff. If you no want mak"
   },
   {
+    "id": "pension-fund",
+    "displayName": "Pension Fund Administrator (Nigeria)",
+    "version": "1.0.0",
+    "indexed": true,
+    "languages": [
+      "en",
+      "pcm",
+      "ha",
+      "yo",
+      "ig"
+    ],
+    "terminology": {
+      "offering": "consultation",
+      "team_member": "pension advisor",
+      "booking": "appointment",
+      "contact": "contributor"
+    },
+    "temporalWorkflow": "ConsultancyFollowupWorkflow",
+    "personaExcerpt": "You are the contributor-service assistant of a Nigerian Pension Fund\nAdministrator (PFA) licensed by the National Pension Commission (PenCom)\nunder Section 60 of the Pension Reform Act 2014. You are warm, patient\nand plain-spoken — your callers are salary earners, HR managers,\nartisans, market traders and retirees asking how to open a Retirement\nSavings Account (RSA), how contributions work, when ",
+    "bookingPolicy": {
+      "depositPercent": 0,
+      "noShowFeeCents": 0,
+      "phoneConfirmation": true,
+      "intakeRequired": true,
+      "cancellationWindowHours": 24
+    },
+    "disclosure": {
+      "spokenAiDisclosure": true,
+      "recordingConsent": true,
+      "text": "You are speaking with an automated pension-fund contributor-service assistant. This call may be recorded for quality and compliance."
+    },
+    "ussdMenu": [
+      {
+        "key": "1",
+        "label": "Open a pension account (RSA)",
+        "action": "book"
+      },
+      {
+        "key": "2",
+        "label": "Check my RSA / benefit status",
+        "action": "status"
+      },
+      {
+        "key": "3",
+        "label": "Retirement & benefits info",
+        "action": "info"
+      },
+      {
+        "key": "4",
+        "label": "Report a pension scam",
+        "action": "sos"
+      },
+      {
+        "key": "5",
+        "label": "Talk to a pension advisor",
+        "action": "handoff"
+      }
+    ],
+    "consentTextExcerpt": "We dey record this call and we go keep your name, phone number and the\ndetails you share so we fit open your RSA, arrange your consultation and\nanswer your pension questions. We no dey share your data with anybody\noutside the PFA's contributor-service team, and we delete call records\nafter 180 days under the Nigeria Data Protection Act 2023. You fit ask\nus to see, correct or delete your data at an",
+    "growth": {
+      "referralBountyNgn": 0,
+      "cacTargetNgn": 10000,
+      "primaryChannels": [
+        "employer-hr",
+        "referral",
+        "whatsapp",
+        "ussd"
+      ]
+    },
+    "i18n": {
+      "pcm": {
+        "greeting": "Welcome o! Na the pension (RSA) line you dey. You wan open RSA, ask about your retirement benefits, or you wan move your pension come meet us?",
+        "ussdPrompt": "Press 1 to open RSA, 2 for your status, 3 for benefits info, 4 to report scam, 5 to talk to pension advisor.",
+        "referralLine": "Tell your padi dem about us — make everybody secure their retirement."
+      },
+      "yo": {
+        "greeting": "Ẹ kaabo! Eyi ni ila-ìgbésí ayé (RSA) wa. Ṣe o fẹ ṣii RSA, béèrè nípa ànfaàní ìgbésí ayé rẹ, tabi gbe RSA rẹ wá sódò wa?",
+        "ussdPrompt": "Tẹ 1 lati ṣii RSA, 2 fun ipo rẹ, 3 fun alaye ànfaàní, 4 lati jẹ́rìí ẹ̀tan, 5 lati ba onímọ̀ pension sọrọ.",
+        "referralLine": "Sọ fún àwọn ọrẹ rẹ nípa wa — kí gbogbo wọn dáàbò bo ìgbésí ayé wọn."
+      },
+      "ig": {
+        "greeting": "Nnọọ! Nke a bụ akara pension (RSA) anyị. Ị chọrọ imeghe RSA, ịjụ gbasara uru retirement gị, ka ị chọrọ ịkwaga RSA gị bịakwute anyị?",
+        "ussdPrompt": "Pịa 1 iji meghee RSA, 2 maka ọnọdụ gị, 3 maka ozi uru, 4 iji kọrọ aghụghọ, 5 iji kwurịta okwu n'aka onye ndụmọdụ pension.",
+        "referralLine": "Gwa ndị enyi gị maka anyị — ka onye ọ bụla chebe ogge retirement ha."
+      },
+      "ha": {
+        "greeting": "Sannu da zuwa! Wannan layin pension (RSA) ne. Kana son buɗe RSA, tambaya game da amfanin ritayarka, ko kana son matsar da RSA ɗinka zuwa gare mu?",
+        "ussdPrompt": "Danna 1 don buɗe RSA, 2 don matsayinka, 3 don bayanin amfani, 4 don kai rahoton ƙarya, 5 don magana da mai ba da shawara na pension.",
+        "referralLine": "Faɗa wa abokanka game da mu — kowa ya kare ritayarsa."
+      }
+    }
+  },
+  {
     "id": "pharmacy",
     "displayName": "Pharmacy & Patent Medicine Vendor (PPMV)",
     "version": "1.0.0",
