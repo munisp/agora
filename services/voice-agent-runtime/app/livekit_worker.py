@@ -237,6 +237,16 @@ def _naija_tts(node: "PiperTTSNode") -> Any:
     )
 
 
+_TAG = re.compile(r"</?[a-zA-Z][^>]{0,80}>")
+_MARKDOWN = re.compile(r"[*_#`~|]+")
+
+
+def speakable(text: str) -> str:
+    """What the voice should say: the model sometimes writes HTML ("</li><li>") or markdown, which was read aloud."""
+    out = _MARKDOWN.sub("", _TAG.sub(" ", text or ""))
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
 class WhisperSTTNode(lk_stt.STT):
     """Bridge FasterWhisperSTT into the LiveKit pipeline.
 
@@ -297,7 +307,7 @@ class PiperTTSNode(lk_tts.TTS):
         self._chunked = chunked
 
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
-        return self._stream(text)
+        return self._stream(speakable(text))
 
     # LiveKit's AudioSource buffers about a second; one frame per sentence (several seconds) was refused with
     # "InvalidState - failed to capture frame" and the caller heard the answer cut off. Ship 100 ms frames instead.
@@ -806,7 +816,7 @@ def _message_text(msg: Any) -> str:
     content = getattr(msg, "content", msg)
     if isinstance(content, list):
         content = " ".join(str(c) for c in content if isinstance(c, str))
-    return str(content or "").strip()
+    return speakable(str(content or ""))
 
 
 def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, session: Any, conversation_id: str,

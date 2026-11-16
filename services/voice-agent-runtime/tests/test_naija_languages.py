@@ -170,3 +170,10 @@ def test_naija_tts_streams():
 
     adapter = _naija_tts(PiperTTSNode(Impl()))
     assert adapter.capabilities.streaming and adapter.sample_rate == 22050
+
+
+def test_markup_is_not_read_aloud():
+    from app.livekit_worker import speakable
+
+    assert speakable("</li><li>I apologize, **Amica**. Please `wait`.") == "I apologize, Amica. Please wait."
+    assert speakable("Fees: ₦10,000 — 9:00 a.m.") == "Fees: ₦10,000 — 9:00 a.m."

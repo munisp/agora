@@ -20,3 +20,13 @@ def test_past_window_is_named_not_reported_as_fully_booked():
     assert _past_window_note("2026-11-16T23:59:59+01:00", "Africa/Lagos", now=NOW) is None  # today is fine
     assert _past_window_note("2026-11-18T23:59:59+01:00", "Africa/Lagos", now=NOW) is None
     assert _past_window_note("not a date", "Africa/Lagos", now=NOW) is None
+
+
+def test_bare_times_become_rfc3339_in_the_business_zone():
+    from app.tools import _rfc3339
+
+    assert _rfc3339("2026-11-18T08:00:00", "Africa/Lagos") == "2026-11-18T08:00:00+01:00"
+    assert _rfc3339("2026-11-18", "Africa/Lagos") == "2026-11-18T00:00:00+01:00"
+    assert _rfc3339("2026-11-18T08:00:00Z", "Africa/Lagos") == "2026-11-18T08:00:00+00:00"
+    assert _rfc3339("2026-11-18T08:00:00+01:00", "Africa/Lagos") == "2026-11-18T08:00:00+01:00"
+    assert _rfc3339("next wednesday", "Africa/Lagos") == "next wednesday"

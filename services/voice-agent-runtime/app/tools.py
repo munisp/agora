@@ -377,6 +377,25 @@ def _verification_unavailable_payload() -> dict[str, Any]:
 
 
 
+def _rfc3339(value: str, tz_name: str | None) -> str:
+    """The booking API needs RFC3339 (with an offset). The model often sends a bare local time ("2026-11-18T08:00:00"),
+    which booking rejected with 400 "from must be RFC3339" and the caller heard "trouble reaching our booking system".
+    A bare date/time is read in the business's time zone; anything unparseable is passed through unchanged."""
+    from zoneinfo import ZoneInfo
+
+    raw = str(value or "").strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if dt.tzinfo is None:
+        try:
+            dt = dt.replace(tzinfo=ZoneInfo(tz_name or "UTC"))
+        except Exception:  # noqa: BLE001
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
 def _past_window_note(to_iso: str, tz_name: str | None, now: datetime | None = None) -> str | None:
     """A note when the requested window ends before today in the business's time zone, else None."""
     from zoneinfo import ZoneInfo
@@ -628,8 +647,8 @@ class ToolLayer:
             params={
                 "offering_id": offering_id,
                 "team_member_id": team_member_id,
-                "from": from_iso,
-                "to": to_iso,
+                "from": _rfc3339(from_iso, self._ctx.timezone),
+                "to": _rfc3339(to_iso, self._ctx.timezone),
             },
         )
         slots = (resp or {}).get("slots") or []

@@ -121,8 +121,27 @@ class Engines:
             for o in outs:
                 codes = self.tok.extract_integers(self.tok.tokenizer.decode(o.outputs[0].token_ids))
                 if codes:
-                    parts += [self.tok.get_audio(codes).squeeze().float().numpy(), gap]
+                    parts += [self._decode(codes).squeeze().float().numpy(), gap]
         return (np.concatenate(parts[:-1]) if parts else np.zeros(0, np.float32)), 24000
+
+    def _decode(self, codes: list[int]) -> torch.Tensor:
+        """WavTokenizer decode. On GB10 cuFFT has failed with CUFFT_INTERNAL_ERROR (seen 2026-11-16) and stayed broken
+        for every later request: clear the FFT plan cache and retry once; if it fails again the CUDA context is gone,
+        so exit and let Docker's restart policy bring the service back clean instead of answering 500 forever."""
+        try:
+            return self.tok.get_audio(codes)
+        except RuntimeError as exc:
+            if "cufft" not in str(exc).lower():
+                raise
+            torch.backends.cuda.cufft_plan_cache.clear()
+            torch.cuda.empty_cache()
+            try:
+                return self.tok.get_audio(codes)
+            except RuntimeError as exc2:
+                if "cufft" in str(exc2).lower():
+                    print(f"cuFFT unusable ({exc2}); exiting for a clean restart", flush=True)
+                    os._exit(3)
+                raise
 
     def mms_tts(self, text: str, lang: str) -> tuple[np.ndarray, int]:
         model, tok = self.vits[lang]
