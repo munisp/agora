@@ -475,7 +475,7 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         return json.dumps(result, ensure_ascii=False)
 
     @lk_llm.ai_callable(
-        description="Book an appointment. Requires the caller's phone number (phone-confirmation policy: the first call returns confirmation_required; read the number back, and call again once the caller confirms)."
+        description="Book an appointment. Call this as soon as you have the slot and the caller's phone number — do NOT read the number back before this first call. The first call returns confirmation_required: then read the number back ONCE, and call again with the same number when the caller confirms."
     )
     async def book_appointment(
         self,
