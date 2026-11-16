@@ -376,6 +376,27 @@ def _verification_unavailable_payload() -> dict[str, Any]:
     }
 
 
+
+def _past_window_note(to_iso: str, tz_name: str | None, now: datetime | None = None) -> str | None:
+    """A note when the requested window ends before today in the business's time zone, else None."""
+    from zoneinfo import ZoneInfo
+
+    try:
+        end = datetime.fromisoformat(str(to_iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("UTC")
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=tz)
+    today = (now or datetime.now(timezone.utc)).astimezone(tz).date()
+    if end.astimezone(tz).date() >= today:
+        return None
+    return (f"The requested dates ({end.astimezone(tz).date().isoformat()}) are in the past. Today is "
+            f"{today.strftime('%A')} {today.isoformat()}. Check again with a date from today onwards.")
+
 class ToolLayer:
     """Implements the six tools against Dapr. One instance per session."""
 
@@ -594,6 +615,13 @@ class ToolLayer:
     async def get_availability(
         self, offering_id: str, team_member_id: str, from_iso: str, to_iso: str
     ) -> dict[str, Any]:
+        # A window that ends before today cannot have free slots; the model sometimes guesses the wrong year. Say so
+        # (with today's date) instead of returning an empty list it reads as "fully booked".
+        past = _past_window_note(to_iso, self._ctx.timezone)
+        if past is not None:
+            await self._emit_tool_event("get_availability", "past_date", {"offering_id": offering_id})
+            return {"offering_id": offering_id, "team_member_id": team_member_id, "timezone": self._ctx.timezone,
+                    "slots": [], "note": past}
         resp = await self._dapr.invoke_get(
             self._settings.booking_app_id,
             f"public/sites/{self._ctx.site_slug}/availability",

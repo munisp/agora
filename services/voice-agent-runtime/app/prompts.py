@@ -7,6 +7,9 @@ is rendered per session from the bootstrapped TenantContext.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
 import json
 
 from .tenant_context import TenantContext
@@ -150,6 +153,19 @@ def build_greeting(ctx: TenantContext) -> str:
     return greeting
 
 
+def today_line(tz_name: str | None, now: datetime | None = None) -> str:
+    """Today's date in the business's time zone. Without it the model guessed the year from its training data and
+    asked for availability in the past (e.g. 2025), then told customers nothing was free."""
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:  # noqa: BLE001 - unknown zone name
+        tz = ZoneInfo("UTC")
+    local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    return (f"Today is {local.strftime('%A')}, {local.day} {local.strftime('%B %Y')}; the local time is "
+            f"{local.strftime('%H:%M')} ({tz.key}). Work out dates such as \"tomorrow\" or \"next Wednesday\" from "
+            f"this date, and never check or book a date in the past.")
+
+
 def build_system_prompt(
     ctx: TenantContext,
     *,
@@ -194,7 +210,7 @@ def build_system_prompt(
     if active_agent is not None:
         agent_name = str(active_agent.get("name") or agent_name)
     extra_names = "".join(f", {n}" for n in (extra_tool_names or []))
-    prompt = _TEMPLATE.format(
+    prompt = today_line(ctx.timezone) + "\n\n" + _TEMPLATE.format(
         agent_name=agent_name,
         business_name=ctx.display_name or ctx.site_slug,
         locale=ctx.locale,
