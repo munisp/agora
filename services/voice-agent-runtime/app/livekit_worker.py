@@ -47,6 +47,7 @@ from . import emergency, metrics, sip
 from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
+from .call_activity import announce_activity
 from .transcripts import TranscriptRecorder, tool_turn_text
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
@@ -873,6 +874,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     metrics.get_registry().active_sessions.inc()
 
     agent.start(ctx.room)
+    # The caller's screen: talking / typing (tool in use) / listening.
+    announce_activity(agent, ctx.room)
     # Greet the caller so the conversation opens naturally. SPEC-W11 Part C
     # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
     # recording-consent lines when the tenant context carries a `disclosure`
