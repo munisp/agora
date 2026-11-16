@@ -43,5 +43,7 @@ create_tenant community-watch "Community Watch Network"       neighborhood-watch
 # Wave 9: hospitality demo (SPEC-W9 Part D). Prices are kobo-denominated
 # (NGN), per-night room rates with a first-night deposit; timezone WAT.
 create_tenant acme-hotel   "Acme Grand Hotel"       hospitality "Africa/Lagos"  "NGN" "en-NG"
+# W69 pension fund administrator demo (PenCom-licensed PFA, Africa/Lagos, NGN).
+create_tenant acme-pension  "Acme Pension Trust"          pension-fund "Africa/Lagos"  "NGN" "en-NG"
 
 echo "Seed complete. Industry packs are applied asynchronously by the TenantOnboardingWorkflow."
