@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { playRemoteAudio, unlockCallAudio } from "@/lib/call-audio";
 import { Mic, PhoneOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { VoiceSession } from "@/lib/types";
@@ -132,6 +133,7 @@ export function VoiceSessionButton({
       const { Room, RoomEvent, Track } = await import("livekit-client");
       const room = new Room();
       roomRef.current = room;
+      playRemoteAudio(room, { RoomEvent, Track });
       room.on(RoomEvent.Disconnected, () => {
         setAvatarTrack(null);
         setState("idle");
@@ -153,6 +155,7 @@ export function VoiceSessionButton({
         session.token,
         session.ice_servers?.length ? { rtcConfig: { iceServers: session.ice_servers } } : undefined,
       );
+      await unlockCallAudio(room);
       await room.localParticipant.setMicrophoneEnabled(true);
       setState("connected");
     } catch (e) {
