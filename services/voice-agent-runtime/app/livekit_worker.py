@@ -898,6 +898,13 @@ async def build_voice_agent(
             msgs = agent.chat_ctx.messages
             if msgs and msgs[0].role == "system":
                 msgs[0].content = prompt if isinstance(msgs[0].content, str) else [prompt]
+            # The opening system prompt alone lost to the recent turns: after Hausa turns the model answered an Igbo
+            # turn in Hausa. A note at the end of the conversation, right before the reply, is followed reliably.
+            name = call_language.NAMES.get(code, (code, code))[0]
+            msgs.append(lk_llm.ChatMessage.create(
+                text=(f"The caller has switched to {name}. From now on reply ONLY in {name}. If some words are unclear, "
+                      f"say so in {name} and ask them to repeat — do not change language yourself."),
+                role="system"))
         except Exception as exc:  # noqa: BLE001
             log.warning("language prompt swap failed", error=str(exc)[:200])
         for listener in list(language_listeners):
