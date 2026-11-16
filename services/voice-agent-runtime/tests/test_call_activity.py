@@ -44,7 +44,8 @@ def test_turn_is_announced_thinking_working_speaking_listening():
     async def run():
         agent, room = _Agent(), type("R", (), {"local_participant": _Participant()})()
         announce_activity(agent, room)
-        agent.emit("user_speech_committed", object())
+        agent.emit("user_started_speaking")
+        agent.emit("user_stopped_speaking")
         agent.emit("function_calls_collected", [_Called("get_availability")])
         agent.emit("function_calls_finished", [])
         agent.emit("agent_started_speaking")
@@ -55,6 +56,7 @@ def test_turn_is_announced_thinking_working_speaking_listening():
 
     sent = asyncio.run(run())
     assert sent == [
+        (TOPIC, {"state": "listening"}),
         (TOPIC, {"state": "thinking"}),
         (TOPIC, {"state": "working", "tool": "get_availability", "label": "Checking availability"}),
         (TOPIC, {"state": "thinking"}),

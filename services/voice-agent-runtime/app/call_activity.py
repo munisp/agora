@@ -79,7 +79,10 @@ def announce_activity(agent: Any, room: Any) -> None:
         _send(activity_message("working", _first_tool_name(called) or "tool"))
 
     try:
-        agent.on("user_speech_committed", lambda *_a, **_k: _send(activity_message("thinking")))
+        # The caller stopped talking (VAD): she starts working on it. user_speech_committed alone is too late — 0.10
+        # commits a tool-less question only when the reply starts playing. Talking again puts her back to listening.
+        agent.on("user_stopped_speaking", lambda *_a, **_k: _send(activity_message("thinking")))
+        agent.on("user_started_speaking", lambda *_a, **_k: _send(activity_message("listening")))
         agent.on("function_calls_collected", _collected)
         # Back to thinking: the model now reads the tool's answer before replying.
         agent.on("function_calls_finished", lambda *_a, **_k: _send(activity_message("thinking")))
