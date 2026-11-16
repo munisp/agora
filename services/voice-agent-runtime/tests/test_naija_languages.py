@@ -177,3 +177,34 @@ def test_markup_is_not_read_aloud():
 
     assert speakable("</li><li>I apologize, **Amica**. Please `wait`.") == "I apologize, Amica. Please wait."
     assert speakable("Fees: ₦10,000 — 9:00 a.m.") == "Fees: ₦10,000 — 9:00 a.m."
+
+
+def test_listener_follows_a_reconnected_caller():
+    """After a full reconnect the caller is a NEW participant object with the same identity; the receptionist must
+    listen to it (0.10 kept the old one and went deaf)."""
+    from app.livekit_worker import keep_listening_after_reconnect
+
+    class P:
+        def __init__(self, identity):
+            self.identity = identity
+
+    class Listener:
+        def __init__(self, p):
+            self._participant, self.subscribed = p, 0
+
+        def _subscribe_to_microphone(self):
+            self.subscribed += 1
+
+    class Room:
+        def __init__(self):
+            self.handlers = {}
+
+        def on(self, ev, fn):
+            self.handlers[ev] = fn
+
+    old = P("web-1"); agent = type("A", (), {})(); agent._human_input = Listener(old); room = Room()
+    keep_listening_after_reconnect(agent, room)
+    room.handlers["participant_connected"](P("someone-else"))
+    assert agent._human_input._participant is old
+    new = P("web-1"); room.handlers["participant_connected"](new)
+    assert agent._human_input._participant is new and agent._human_input.subscribed == 1

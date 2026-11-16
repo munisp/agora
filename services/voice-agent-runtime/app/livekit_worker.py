@@ -859,6 +859,32 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
     except Exception as exc:  # noqa: BLE001 - event surface may shift; the call itself is unaffected
         log.warning("voice transcript hooks unavailable", error=str(exc)[:200])
 
+def keep_listening_after_reconnect(agent: Any, room: Any) -> None:
+    """A caller whose connection blips does a full reconnect (LiveKit logs CLIENT_REQUEST_LEAVE, then a new session
+    with the same identity). livekit-agents 0.10 keeps listening to the OLD participant object, which never gets a
+    microphone track again, so the receptionist went deaf for the rest of the call (seen 2026-11-16, twice, a few
+    minutes into calls). Point the listener at the new participant and subscribe to its microphone."""
+
+    def _relink(participant: Any) -> None:
+        listener = getattr(agent, "_human_input", None)
+        old = getattr(listener, "_participant", None)
+        if listener is None or old is None or participant is old:
+            return
+        if getattr(participant, "identity", None) != getattr(old, "identity", None):
+            return
+        listener._participant = participant
+        try:
+            listener._subscribe_to_microphone()
+        except Exception as exc:  # noqa: BLE001 - the track events retry the subscription
+            log.warning("re-subscribe after reconnect failed", error=str(exc)[:200])
+        log.info("caller reconnected; listening to the new connection", identity=participant.identity)
+
+    try:
+        room.on("participant_connected", _relink)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reconnect hook unavailable", error=str(exc)[:200])
+
+
 async def _caller_language(ctx: agents.JobContext, timeout_s: float = 8.0) -> str:
     """The language the web caller chose (token metadata, app/call_language.py); "" = English / not chosen."""
     try:
@@ -949,6 +975,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     agent.start(ctx.room)
     # The caller's screen: talking / typing (tool in use) / listening.
     announce_activity(agent, ctx.room)
+    keep_listening_after_reconnect(agent, ctx.room)
     # Greet the caller so the conversation opens naturally. SPEC-W11 Part C
     # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
     # recording-consent lines when the tenant context carries a `disclosure`
