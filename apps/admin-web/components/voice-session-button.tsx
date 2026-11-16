@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { playRemoteAudio, unlockCallAudio } from "@/lib/call-audio";
-import { AnimatedReceptionist } from "@/components/animated-receptionist";
+import { ReceptionistVideo, type CallActivity } from "@/components/receptionist-video";
 import { Mic, PhoneOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { VoiceSession } from "@/lib/types";
@@ -68,6 +68,8 @@ export function VoiceSessionButton({
   const [error, setError] = React.useState<string | null>(null);
   // The receptionist's voice: drives the animated avatar (mouth follows the audio).
   const [voiceTrack, setVoiceTrack] = React.useState<{ mediaStreamTrack: MediaStreamTrack } | null>(null);
+  // What the receptionist is doing (worker data topic "agora.activity"): typing while it uses a tool.
+  const [activity, setActivity] = React.useState<CallActivity | null>(null);
   const [avatarTrack, setAvatarTrack] =
     React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
@@ -82,6 +84,7 @@ export function VoiceSessionButton({
       convaiRef.current = null;
       setAvatarTrack(null);
       setVoiceTrack(null);
+      setActivity(null);
       setState("idle");
     }
   }, []);
@@ -141,7 +144,16 @@ export function VoiceSessionButton({
       room.on(RoomEvent.Disconnected, () => {
         setAvatarTrack(null);
         setVoiceTrack(null);
+        setActivity(null);
         setState("idle");
+      });
+      room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+        if (topic !== "agora.activity") return;
+        try {
+          setActivity(JSON.parse(new TextDecoder().decode(payload)) as CallActivity);
+        } catch {
+          // not ours / malformed: ignore
+        }
       });
       // SPEC-W9 Part A: avatar presence — when a provider (Tavus / open
       // renderer) publishes a remote VIDEO track into the room, surface it
@@ -185,7 +197,7 @@ export function VoiceSessionButton({
         {state === "connected" && avatarTrack ? (
           <AvatarVideoTile track={avatarTrack} />
         ) : (
-          <AnimatedReceptionist track={state === "connected" ? voiceTrack : null} accent={accent} />
+          <ReceptionistVideo track={state === "connected" ? voiceTrack : null} activity={activity} accent={accent} />
         )}
         <button
           onClick={() => void hangUp()}
