@@ -879,8 +879,21 @@ def keep_listening_after_reconnect(agent: Any, room: Any) -> None:
             log.warning("re-subscribe after reconnect failed", error=str(exc)[:200])
         log.info("caller reconnected; listening to the new connection", identity=participant.identity)
 
+    def _trace(event: str):
+        def handler(*args: Any) -> None:
+            names = [getattr(a, "identity", None) or getattr(a, "sid", None) or type(a).__name__ for a in args]
+            listener = getattr(agent, "_human_input", None)
+            linked = getattr(getattr(listener, "_participant", None), "identity", None)
+            log.info("room event", event=event, args=names, linked=linked,
+                     listening_to=getattr(getattr(listener, "_subscribed_track", None), "sid", None))
+        return handler
+
     try:
         room.on("participant_connected", _relink)
+        # Diagnostics for mid-call reconnects: what the worker sees when a caller drops and rejoins.
+        for event in ("participant_disconnected", "track_published", "track_subscribed", "track_unsubscribed",
+                      "reconnecting", "reconnected"):
+            room.on(event, _trace(event))
     except Exception as exc:  # noqa: BLE001
         log.warning("reconnect hook unavailable", error=str(exc)[:200])
 

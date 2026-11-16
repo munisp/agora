@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { serverApi, unwrapList } from "@/lib/server-api";
 import { ApiError } from "@/lib/api";
 import { PublicBookingClient } from "./public-booking-client";
+import { DemoBanner } from "@/components/demo-banner";
 import type { Offering, PublicSite } from "@/lib/types";
 
 export async function generateMetadata({
@@ -59,5 +60,10 @@ export default async function PublicBookingPage({
       ? unwrapList<Offering>(offeringsRes.value).filter((o) => o.bookable)
       : [];
 
-  return <PublicBookingClient site={site} offerings={offerings} />;
+  return (
+    <>
+      <DemoBanner slug={siteSlug} />
+      <PublicBookingClient site={site} offerings={offerings} />
+    </>
+  );
 }

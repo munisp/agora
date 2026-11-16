@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import type { Tenant } from "@/lib/types";
 import { resolveNavLabels } from "@/lib/terminology";
 import { TerminologyProvider } from "@/components/terminology-provider";
+import { DemoBanner } from "@/components/demo-banner";
 
 export default async function OrgLayout({
   children,
@@ -108,8 +109,11 @@ export default async function OrgLayout({
           </p>
         </div>
       </aside>
-      <main className="paper-pattern min-w-0 flex-1 px-8 py-8">
-        <TerminologyProvider labels={labels}>{children}</TerminologyProvider>
+      <main className="paper-pattern min-w-0 flex-1">
+        <DemoBanner slug={orgSlug} />
+        <div className="px-8 py-8">
+          <TerminologyProvider labels={labels}>{children}</TerminologyProvider>
+        </div>
       </main>
     </div>
   );
