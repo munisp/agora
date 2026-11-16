@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { ExternalLink, LogOut } from "lucide-react";
 import { auth, signOut } from "@/lib/auth";
 import { serverApi } from "@/lib/server-api";
@@ -21,6 +21,10 @@ export default async function OrgLayout({
   const session = await auth();
   // Middleware already guarantees a session; this is defence in depth.
   if (!session) return notFound();
+  // The Keycloak session behind this dashboard session has ended (idle or max lifespan, or a refresh failed): every
+  // API call would answer 401 and pages would look empty. Send the user to sign in again — Keycloak signs them straight
+  // back in when its own session is still alive.
+  if (session.error === "RefreshAccessTokenError") redirect(`/sign-in?callbackUrl=${encodeURIComponent(`/app/${orgSlug}`)}`);
 
   // Tenant isolation: the dashboard is only reachable for tenants present in
   // the Keycloak `tenant_slugs` claim.

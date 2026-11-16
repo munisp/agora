@@ -83,8 +83,12 @@ async function refreshAccessToken(token: {
       access_token: refreshed.access_token,
       expires_at: Math.floor(Date.now() / 1000) + (refreshed.expires_in ?? 300),
       refresh_token: refreshed.refresh_token ?? token.refresh_token,
-      // Roles can change between refreshes; re-read them from the new token.
+      // Roles and business memberships can change between refreshes; re-read both from the new token
+      // (a business someone was added to appeared only after signing out and in again).
       realm_roles: realmRolesFromClaims(decodeClaims(refreshed.access_token)),
+      ...(Array.isArray(decodeClaims(refreshed.access_token).tenant_slugs)
+        ? { tenant_slugs: decodeClaims(refreshed.access_token).tenant_slugs as string[] }
+        : {}),
       error: undefined,
     };
   } catch {

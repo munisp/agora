@@ -73,6 +73,12 @@ async function request<T>(
       data = text;
     }
   }
+  // Session expired (the BFF answers 401 {error:"session_expired"} only for a dead dashboard session): go back through
+  // sign-in instead of showing empty pages and "Request failed with status 401". Other 401s are left to the page.
+  if (res.status === 401 && typeof window !== "undefined" &&
+      (data as { error?: unknown } | null)?.error === "session_expired") {
+    window.location.href = `/sign-in?callbackUrl=${encodeURIComponent(window.location.pathname)}`;
+  }
   if (!res.ok) throw new ApiError(res.status, data);
   return data as T;
 }

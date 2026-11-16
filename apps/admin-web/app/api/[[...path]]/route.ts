@@ -52,6 +52,11 @@ async function proxy(
   const directToAnalytics = path[0] === "analytics";
 
   const session = await auth();
+  // The session's token could not be refreshed (Keycloak session ended): forwarding the stale token only produces
+  // 401s from every service. Tell the browser plainly so it sends the user back through sign-in.
+  if (session?.error === "RefreshAccessTokenError") {
+    return NextResponse.json({ error: "session_expired", message: "Your session has ended. Please sign in again." }, { status: 401 });
+  }
 
   // W44/F15-15: the analytics service is NOT behind the gateway, so its
   // endpoints are only as protected as this handler makes them.
