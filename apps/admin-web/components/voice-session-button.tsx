@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { playRemoteAudio, unlockCallAudio } from "@/lib/call-audio";
+import { AnimatedReceptionist } from "@/components/animated-receptionist";
 import { Mic, PhoneOff } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { VoiceSession } from "@/lib/types";
@@ -65,6 +66,8 @@ export function VoiceSessionButton({
 }) {
   const [state, setState] = React.useState<CallState>("idle");
   const [error, setError] = React.useState<string | null>(null);
+  // The receptionist's voice: drives the animated avatar (mouth follows the audio).
+  const [voiceTrack, setVoiceTrack] = React.useState<{ mediaStreamTrack: MediaStreamTrack } | null>(null);
   const [avatarTrack, setAvatarTrack] =
     React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
@@ -78,6 +81,7 @@ export function VoiceSessionButton({
       roomRef.current = null;
       convaiRef.current = null;
       setAvatarTrack(null);
+      setVoiceTrack(null);
       setState("idle");
     }
   }, []);
@@ -136,6 +140,7 @@ export function VoiceSessionButton({
       playRemoteAudio(room, { RoomEvent, Track });
       room.on(RoomEvent.Disconnected, () => {
         setAvatarTrack(null);
+        setVoiceTrack(null);
         setState("idle");
       });
       // SPEC-W9 Part A: avatar presence — when a provider (Tavus / open
@@ -145,6 +150,7 @@ export function VoiceSessionButton({
         if (track.kind === Track.Kind.Video) {
           setAvatarTrack(track as import("livekit-client").RemoteVideoTrack);
         }
+        if (track.kind === Track.Kind.Audio) setVoiceTrack(track);
       });
       room.on(RoomEvent.TrackUnsubscribed, (track) => {
         if (track.kind === Track.Kind.Video) setAvatarTrack(null);
@@ -178,7 +184,9 @@ export function VoiceSessionButton({
             visualizer yet; when one lands the tile stays directly above it). */}
         {state === "connected" && avatarTrack ? (
           <AvatarVideoTile track={avatarTrack} />
-        ) : null}
+        ) : (
+          <AnimatedReceptionist track={state === "connected" ? voiceTrack : null} accent={accent} />
+        )}
         <button
           onClick={() => void hangUp()}
           disabled={state === "joining"}
