@@ -226,7 +226,7 @@ class ChosenLanguageSTT:
 # Nigerian-language replies: the naija voices make one sentence at about real time, so a short sentence followed by a
 # long one left a gap of several seconds. Grouping sentences into chunks of at least this many characters lets the
 # service generate each chunk in one GPU batch (~3x real time): every chunk is ready before the previous one ends.
-NAIJA_MIN_CHUNK_CHARS = 120
+NAIJA_MIN_CHUNK_CHARS = 60
 
 
 def _naija_tts(node: "PiperTTSNode") -> Any:
