@@ -258,3 +258,53 @@ def test_short_clips_use_the_call_language():
     finally:
         w.lk_utils.merge_frames = orig
     assert seen == ["en", None]  # short clip pinned to the call language; long clip still auto-detected
+
+
+def _switcher(detect, start="en"):
+    from app.livekit_worker import SwitchingLanguageSTT
+
+    calls = {"asr": [], "whisper": [], "switch": []}
+
+    class Naija:
+        async def identify(self, pcm, *, sample_rate, channels=1, candidates):
+            return detect
+
+        async def transcribe_pcm(self, pcm, *, sample_rate, channels=1, language=None):
+            calls["asr"].append(language)
+            return f"[{language}]"
+
+    class Whisper:
+        async def transcribe_pcm(self, pcm, *, sample_rate, channels=1, language=None):
+            calls["whisper"].append(language)
+            return "[en]"
+
+    s = SwitchingLanguageSTT(Naija(), Whisper(), start, ["en", "pcm", "yo", "ha", "ig"], calls["switch"].append)
+    return s, calls
+
+
+def _pcm(seconds, rate=16000):
+    return b"\x00\x00" * int(rate * seconds)
+
+
+def test_long_turn_in_another_language_switches_the_call():
+    s, calls = _switcher({"language": "yo", "scores": {"yo": 0.97, "en": 0.02}})
+    assert asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000)) == "[yo]"
+    assert calls["switch"] == ["yo"] and calls["asr"] == ["yo"] and s.language == "yo"
+
+
+def test_short_or_unsure_turns_never_switch():
+    s, calls = _switcher({"language": "ha", "scores": {"ha": 0.97}})
+    asyncio.run(s.transcribe_pcm(_pcm(1.5), sample_rate=16000))
+    s2, calls2 = _switcher({"language": "ha", "scores": {"ha": 0.55}})
+    asyncio.run(s2.transcribe_pcm(_pcm(5), sample_rate=16000))
+    assert calls["switch"] == [] and calls2["switch"] == [] and s.language == "en" and s2.language == "en"
+    assert calls["whisper"] == ["en"]
+
+
+def test_english_and_pidgin_are_one_family():
+    s, calls = _switcher({"language": "en", "scores": {"en": 0.99}}, start="pcm")
+    assert asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000)) == "[pcm]"  # a Pidgin call stays Pidgin
+    assert calls["switch"] == []
+    s.language = "ig"  # caller had moved to Igbo; English-family speech returns to their Pidgin side
+    asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
+    assert calls["switch"] == ["pcm"] and s.language == "pcm"

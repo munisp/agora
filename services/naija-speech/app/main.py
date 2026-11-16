@@ -40,6 +40,9 @@ YARN_VOICES = {
 }
 MMS_TTS = {"pcm": "facebook/mms-tts-pcm", "ful": "facebook/mms-tts-ful"}
 ASR_LANG = {"ig": "ibo", "yo": "yor", "ha": "hau", "pcm": "pcm", "ful": "ful"}
+# Spoken-language identification (facebook/mms-lid-256, CC-BY-NC 4.0): on real FLEURS speech 30/30 correct for Igbo,
+# Yoruba, Hausa and English on full sentences, ~80% on the first 2.5 s — callers should only switch on longer turns.
+LID_CODE = {"en": "eng", "pcm": "pcm", "yo": "yor", "ha": "hau", "ig": "ibo", "ful": "ful"}
 WAVTOK_CKPT = os.environ.get("WAVTOKENIZER_CKPT", "/models/wavtokenizer_large_speech_320_24k.ckpt")
 GPU_SHARE = float(os.environ.get("YARN_GPU_MEMORY", "0.08"))
 GAP_S = 0.18  # pause between sentences
@@ -102,6 +105,11 @@ class Engines:
             self.asr_lang: Optional[str] = None
             self.vits = {k: (VitsModel.from_pretrained(m).to("cuda").eval(), AutoTokenizer.from_pretrained(m))
                          for k, m in MMS_TTS.items()}
+            from transformers import Wav2Vec2ForSequenceClassification, AutoFeatureExtractor
+            self.lid_fe = AutoFeatureExtractor.from_pretrained("facebook/mms-lid-256")
+            self.lid = Wav2Vec2ForSequenceClassification.from_pretrained(
+                "facebook/mms-lid-256", torch_dtype=torch.float16).to("cuda").eval()
+            self.lid_index = {v: k for k, v in self.lid.config.id2label.items()}
             self.ready = True
         except Exception as exc:  # noqa: BLE001 - reported by /healthz
             self.error = f"{type(exc).__name__}: {exc}"[:500]
@@ -153,6 +161,18 @@ class Engines:
                           np.zeros(int(model.config.sampling_rate * GAP_S), np.float32)]
         return (np.concatenate(parts[:-1]) if parts else np.zeros(0, np.float32)), model.config.sampling_rate
 
+    # ------------------------------------------------------------------ LID
+    def identify(self, audio: np.ndarray, rate: int, candidates: list[str]) -> dict:
+        """Which of `candidates` (our codes) is spoken: softmax over just those languages' logits."""
+        audio = resample(audio, rate, 16000)
+        cands = [c for c in candidates if LID_CODE.get(c) in self.lid_index]
+        with self.mms_lock, torch.no_grad():
+            x = self.lid_fe(audio, sampling_rate=16000, return_tensors="pt").input_values.half().to("cuda")
+            logits = self.lid(x).logits[0].float()
+        picked = torch.stack([logits[self.lid_index[LID_CODE[c]]] for c in cands]).softmax(-1)
+        scores = {c: round(float(p), 3) for c, p in zip(cands, picked)}
+        return {"language": max(scores, key=scores.get), "scores": scores}
+
     # ------------------------------------------------------------------ ASR
     def transcribe(self, audio: np.ndarray, rate: int, lang: str) -> str:
         audio = resample(audio, rate, 16000)
@@ -182,7 +202,7 @@ def create_app(engines: Engines) -> FastAPI:
     @app.get("/healthz")
     def healthz() -> dict:
         return {"status": "ok" if engines.ready else ("error" if engines.error else "loading"), "error": engines.error,
-                "tts": sorted(list(YARN_LANG) + list(MMS_TTS)), "asr": sorted(ASR_LANG)}
+                "tts": sorted(list(YARN_LANG) + list(MMS_TTS)), "asr": sorted(ASR_LANG), "lid": sorted(LID_CODE)}
 
     @app.get("/voices")
     def voices() -> dict:
@@ -230,6 +250,27 @@ def create_app(engines: Engines) -> FastAPI:
         started = time.time()
         text = engines.transcribe(audio, rate, ASR_LANG[code])
         return {"text": text, "language": code, "seconds": round(time.time() - started, 2)}
+
+    @app.post("/lid")
+    async def lid(request: Request, candidates: str = Query("en,pcm,yo,ha,ig")) -> dict:
+        need_ready()
+        cands = [c.strip().lower() for c in candidates.split(",") if c.strip().lower() in LID_CODE]
+        if len(cands) < 2:
+            raise HTTPException(422, f"give at least two candidates from {sorted(LID_CODE)}")
+        body = await request.body()
+        if not body or len(body) > 20_000_000:
+            raise HTTPException(413 if body else 422, "send one utterance as audio/wav (max 20 MB)")
+        try:
+            audio, rate = sf.read(io.BytesIO(body), dtype="float32")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(422, f"not a readable wav: {exc}") from exc
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        started = time.time()
+        out = engines.identify(audio, rate, cands)
+        out["audio_seconds"] = round(len(audio) / rate, 2)
+        out["seconds"] = round(time.time() - started, 3)
+        return out
 
     return app
 

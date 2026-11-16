@@ -48,7 +48,7 @@ from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from . import call_language
-from .call_activity import announce_activity
+from .call_activity import announce_activity, announce_language
 from .pipeline.naija_stt import NaijaSpeechSTT
 from .lk_tool_loop import ToolLoopLLM
 from .transcripts import TranscriptRecorder, tool_turn_text
@@ -204,6 +204,70 @@ def cpu_load_fnc() -> float:
 # ---------------------------------------------------------------------------
 # Bridges: app pipeline stages -> livekit-agents 0.10 node types
 # ---------------------------------------------------------------------------
+_ENGLISH_FAMILY = frozenset({"en", "pcm"})
+
+
+class SwitchingLanguageSTT:
+    """Speech recognition that follows the caller between languages mid-call (English, Pidgin, Yorùbá, Hausa, Igbo).
+
+    Every caller turn of at least MIN_SWITCH_S seconds is checked with spoken-language identification (MMS-LID on the
+    GPU host: on real speech 30/30 correct for full sentences, ~80% on 2.5 s clips — so short turns never switch).
+    A switch needs MIN_CONFIDENCE and is reported through `on_switch(code)` (voice, prompt and the caller's screen
+    follow). English and Pidgin are one family here: identification cannot tell them apart reliably.
+    The turn is then transcribed with MMS for a Nigerian language, whisper (pinned) for English."""
+
+    MIN_SWITCH_S = 3.0
+    MIN_CONFIDENCE = 0.65  # Igbo came back right at 0.72 on a clean clip
+
+    def __init__(self, naija: NaijaSpeechSTT, whisper: Any, start: str, allowed: list[str], on_switch: Any) -> None:
+        self._naija, self._whisper = naija, whisper
+        self.language = start or "en"
+        self._english_side = start if start in _ENGLISH_FAMILY else "en"
+        self._allowed = [c for c in allowed if c != "ful"] or ["en"]
+        self._on_switch = on_switch
+        self.last_detected_language: str | None = self.language
+
+    def _target(self, detected: str) -> str | None:
+        if detected in _ENGLISH_FAMILY:
+            return None if self.language in _ENGLISH_FAMILY else self._english_side
+        return detected if detected != self.language else None
+
+    async def _maybe_switch(self, pcm: bytes, sample_rate: int, channels: int) -> None:
+        seconds = len(pcm) / (2 * max(1, channels) * max(1, sample_rate))
+        if seconds < self.MIN_SWITCH_S or len(self._allowed) < 2:
+            return
+        try:
+            out = await self._naija.identify(pcm, sample_rate=sample_rate, channels=channels, candidates=self._allowed)
+        except Exception as exc:  # noqa: BLE001 - keep the current language
+            log.warning("language identification failed", error=str(exc)[:200])
+            return
+        detected = str(out.get("language") or "")
+        confidence = float((out.get("scores") or {}).get(detected, 0.0))
+        target = self._target(detected)
+        if target and confidence >= self.MIN_CONFIDENCE:
+            log.info("caller switched language", previous=self.language, language=target, confidence=confidence)
+            self.language = target
+            if target in _ENGLISH_FAMILY:
+                self._english_side = target
+            try:
+                self._on_switch(target)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("language switch hook failed", error=str(exc)[:200])
+
+    async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
+                             language: str | None = None) -> str:
+        await self._maybe_switch(pcm, sample_rate, channels)
+        self.last_detected_language = self.language
+        if self.language in call_language.NIGERIAN:
+            try:
+                return await self._naija.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels,
+                                                        language=self.language)
+            except Exception as exc:  # noqa: BLE001 - keep hearing the caller
+                log.warning("naija speech recognition failed; using whisper", language=self.language,
+                            error=str(exc)[:200])
+        return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en")
+
+
 class ChosenLanguageSTT:
     """Speech recognition for a call whose caller chose a Nigerian language: MMS on the GPU host with that language's
     adapter; whisper is the fallback if the service fails (so the call never goes deaf). Reports the chosen language
@@ -700,8 +764,9 @@ async def build_voice_agent(
         ctx, conversation_id=conversation_id, caller_phone=caller_phone or None
     )
 
-    # A Nigerian language the caller chose on the call page: hear, think and speak in it for the whole call.
+    # A Nigerian language the caller chose on the call page: the call starts in it; the caller may switch later.
     chosen = caller_language if caller_language in call_language.NIGERIAN and settings.naija_speech_url else ""
+    base_prompt = system_prompt
     system_prompt += call_language.prompt_instruction(chosen)
     chat_ctx = lk_llm.ChatContext().append(role="system", text=system_prompt)
     runner = AsyncToolRunner(
@@ -780,11 +845,39 @@ async def build_voice_agent(
         except Exception as exc:  # noqa: BLE001 - prompt stays at default
             log.warning("locale instruction swap failed", error=str(exc)[:200])
 
+    # Mid-call language switching (Nigerian-language service configured): voice, prompt and the caller's screen follow.
+    language_listeners: list[Any] = []
+
+    def _switch_language(code: str) -> None:
+        session.active_language = code
+        if code in call_language.NIGERIAN:
+            tts_impl.voice, tts_impl.language = "naija:auto", code
+        else:
+            tts_impl.voice, tts_impl.language = _voice_spec(code if code != "pcm" else "en"), ""
+        prompt = base_prompt + call_language.prompt_instruction(code)
+        try:
+            msgs = agent.chat_ctx.messages
+            if msgs and msgs[0].role == "system":
+                msgs[0].content = prompt if isinstance(msgs[0].content, str) else [prompt]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("language prompt swap failed", error=str(exc)[:200])
+        for listener in list(language_listeners):
+            try:
+                listener(code)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("language listener failed", error=str(exc)[:200])
+
+    switching_stt = (
+        SwitchingLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen or "en",
+                             call_language.allowed(settings.call_languages), _switch_language)
+        if settings.naija_speech_url and caller_language is not None and sip_call is None else None
+    )
+
     agent = VoicePipelineAgent(
         vad=silero.VAD.load(),
-        stt=(WhisperSTTNode(ChosenLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen))
-             if chosen else WhisperSTTNode(stt_impl, on_language=_on_language,
-                                           current_language=lambda: normalize_language(ml_state.active_language) or "en")),
+        stt=(WhisperSTTNode(switching_stt) if switching_stt is not None
+             else WhisperSTTNode(stt_impl, on_language=_on_language,
+                                 current_language=lambda: normalize_language(ml_state.active_language) or "en")),
         # NOTE (VOICE-SCALING §3): the livekit-plugins-openai LLM node cannot
         # hot-swap endpoints mid-process, so the LLM fallback chain
         # (app/pipeline/llm.py FallbackLLM) covers the chat/tool-loop paths;
@@ -792,13 +885,14 @@ async def build_voice_agent(
         # Own client: the plugin's default read timeout is 5 s, which cut off every reply from a CPU-hosted model
         # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
         llm=_worker_llm(settings),
-        tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked)) if chosen
+        tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked)) if switching_stt is not None
         else PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
     )
     agent.agora_call_language = chosen  # read by the greeting in entrypoint
+    agent.agora_language_listeners = language_listeners  # entrypoint tells the caller's screen about switches
     # Voice-path filler: speak the ack line through the agent's TTS while a
     # slow tool call is in flight (cancelled when the tool answers fast).
     fnc_ctx.set_speaker(lambda text: agent.say(text, allow_interruptions=True))
@@ -999,6 +1093,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # The caller's screen: talking / typing (tool in use) / listening.
     announce_activity(agent, ctx.room)
     keep_listening_after_reconnect(agent, ctx.room)
+    announce_language(agent, ctx.room)
     # Greet the caller so the conversation opens naturally. SPEC-W11 Part C
     # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
     # recording-consent lines when the tenant context carries a `disclosure`

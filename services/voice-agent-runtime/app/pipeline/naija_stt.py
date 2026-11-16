@@ -43,6 +43,15 @@ class NaijaSpeechSTT:
             await self._client.aclose()
             self._client = None
 
+    async def identify(self, pcm: bytes, *, sample_rate: int, channels: int = 1, candidates: list[str]) -> dict:
+        """Spoken-language identification among `candidates` (POST /lid) -> {"language", "scores"}."""
+        resp = await self._http().post(
+            f"{self.base_url}/lid", params={"candidates": ",".join(candidates)},
+            content=pcm_to_wav(pcm, sample_rate, channels), headers={"Content-Type": "audio/wav"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
                              language: str | None = None) -> str:
         if not language:

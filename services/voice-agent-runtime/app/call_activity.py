@@ -93,3 +93,26 @@ def announce_activity(agent: Any, room: Any) -> None:
             llm.on_extra_tools(collected=_collected, finished=lambda *_a, **_k: _send(activity_message("thinking")))
     except Exception as exc:  # noqa: BLE001
         log.warning("call activity hooks unavailable", error=str(exc)[:200])
+
+
+def announce_language(agent: Any, room: Any) -> None:
+    """Tell the caller's screen when the call switches language: {"state": "language", "language": "yo"}."""
+    listeners = getattr(agent, "agora_language_listeners", None)
+    if listeners is None:
+        return
+
+    def _publish(code: str) -> None:
+        payload = json.dumps({"state": "language", "language": code}).encode()
+
+        async def _run() -> None:
+            try:
+                await room.local_participant.publish_data(payload, reliable=True, topic=TOPIC)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("language not published", error=str(exc)[:200])
+
+        try:
+            asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            return
+
+    listeners.append(_publish)

@@ -32,12 +32,15 @@ export function ReceptionistVideo({
   activity,
   accent = "#7c5b3e",
   name = "Receptionist",
+  language,
 }: {
   /** The receptionist's remote audio track; null until it arrives. */
   track: { mediaStreamTrack: MediaStreamTrack } | null;
   activity: CallActivity | null;
   accent?: string;
   name?: string;
+  /** The language the call is in now (its own name, e.g. "Yorùbá"); shown next to the name when not English. */
+  language?: string;
 }) {
   const [speaking, setSpeaking] = React.useState(false);
   const [working, setWorking] = React.useState<string | null>(null);
@@ -154,6 +157,16 @@ export function ReceptionistVideo({
       <div className="flex items-center justify-between gap-2 px-3 py-2">
         <p className="text-sm font-medium" style={{ color: "#2b1d16" }}>
           {name}
+          {language && language !== "English" ? (
+            <span
+              className="ml-1.5 rounded-full px-1.5 py-0.5 align-middle text-[10px] font-semibold"
+              style={{ backgroundColor: accent, color: "#fff" }}
+              aria-label={`Speaking ${language}`}
+              data-call-language={language}
+            >
+              {language}
+            </span>
+          ) : null}
         </p>
         <p className="flex items-center gap-1.5 text-xs" style={{ color: "#7a6656" }}>
           {working && !speaking ? <span className="agora-typing" aria-hidden="true"><i /><i /><i /></span> : null}

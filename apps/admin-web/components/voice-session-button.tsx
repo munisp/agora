@@ -81,6 +81,8 @@ export function VoiceSessionButton({
   const [voiceTrack, setVoiceTrack] = React.useState<{ mediaStreamTrack: MediaStreamTrack } | null>(null);
   // What the receptionist is doing (worker data topic "agora.activity"): typing while it uses a tool.
   const [activity, setActivity] = React.useState<CallActivity | null>(null);
+  // The language the call is in right now: starts as the caller's choice, follows them if they switch mid-call.
+  const [callLanguage, setCallLanguage] = React.useState("en");
   const [avatarTrack, setAvatarTrack] =
     React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
@@ -110,6 +112,7 @@ export function VoiceSessionButton({
   const start = async () => {
     setState("joining");
     setError(null);
+    setCallLanguage(language);
     try {
       // 1. Mint a session via the voice runtime (through APISIX).
       const session = await api.post<VoiceSession>("/voice/session", {
@@ -162,7 +165,12 @@ export function VoiceSessionButton({
       room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
         if (topic !== "agora.activity") return;
         try {
-          setActivity(JSON.parse(new TextDecoder().decode(payload)) as CallActivity);
+          const msg = JSON.parse(new TextDecoder().decode(payload)) as CallActivity & { language?: string };
+          if (msg.state === "language") {
+            if (msg.language) setCallLanguage(msg.language);
+          } else {
+            setActivity(msg);
+          }
         } catch {
           // not ours / malformed: ignore
         }
@@ -212,7 +220,12 @@ export function VoiceSessionButton({
         {state === "connected" && avatarTrack ? (
           <AvatarVideoTile track={avatarTrack} />
         ) : (
-          <ReceptionistVideo track={state === "connected" ? voiceTrack : null} activity={activity} accent={accent} />
+          <ReceptionistVideo
+            track={state === "connected" ? voiceTrack : null}
+            activity={activity}
+            accent={accent}
+            language={CALL_LANGUAGES.find((l) => l.code === callLanguage)?.label}
+          />
         )}
         <button
           onClick={() => void hangUp()}
