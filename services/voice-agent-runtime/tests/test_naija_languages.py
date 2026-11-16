@@ -225,3 +225,36 @@ def test_reconnect_diagnostics_never_raise():
     track, pub, who = type("T", (), {"sid": "TR_1"})(), type("P", (), {"sid": "TP_1"})(), type("W", (), {"identity": "web-1"})()
     for ev in ("participant_disconnected", "track_published", "track_subscribed", "track_unsubscribed", "reconnecting", "reconnected"):
         room.handlers[ev](track, pub, who)  # must not raise (a logging bug used to break the room's callbacks)
+
+
+def test_short_clips_use_the_call_language():
+    """'Nine o'clock is fine.' (1.5 s) was transcribed as German by whisper's language guess."""
+    import asyncio as _a
+
+    from app.livekit_worker import WhisperSTTNode
+
+    seen = []
+
+    class Impl:
+        last_detected_language = None
+
+        async def transcribe_pcm(self, pcm, *, sample_rate, channels, language=None):
+            seen.append(language)
+            return "ok"
+
+    class Frame:
+        def __init__(self, seconds):
+            self.sample_rate, self.num_channels = 16000, 1
+            self.samples_per_channel = int(16000 * seconds)
+            self.data = b"\x00\x00" * self.samples_per_channel
+
+    import app.livekit_worker as w
+    node = WhisperSTTNode(Impl(), current_language=lambda: "en")
+    orig = w.lk_utils.merge_frames
+    try:
+        w.lk_utils.merge_frames = lambda buf: buf
+        _a.run(node.recognize(Frame(1.5)))
+        _a.run(node.recognize(Frame(6.0)))
+    finally:
+        w.lk_utils.merge_frames = orig
+    assert seen == ["en", None]  # short clip pinned to the call language; long clip still auto-detected

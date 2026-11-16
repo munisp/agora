@@ -254,7 +254,11 @@ class WhisperSTTNode(lk_stt.STT):
     on the SpeechEvent and forwarded to ``on_language`` (the per-session
     MultilangState hook that swaps the piper voice + locale instruction)."""
 
-    def __init__(self, impl: FasterWhisperSTT, on_language=None) -> None:
+    # Whisper's language guess is unreliable on short clips: "Nine o'clock is fine." (1.5 s) came back as German
+    # ("Nein, der Klo"). Below this length the call's current language is used instead of a guess.
+    SHORT_CLIP_S = 3.0
+
+    def __init__(self, impl: FasterWhisperSTT, on_language=None, current_language=None) -> None:
         super().__init__(
             capabilities=lk_stt.STTCapabilities(
                 streaming=False, interim_results=False
@@ -262,11 +266,16 @@ class WhisperSTTNode(lk_stt.STT):
         )
         self._impl = impl
         self._on_language = on_language
+        self._current_language = current_language
 
     async def recognize(
         self, buffer: lk_utils.AudioBuffer, *, language: str | None = None
     ) -> lk_stt.SpeechEvent:
         frame = lk_utils.merge_frames(buffer)
+        if language is None and self._current_language is not None:
+            seconds = frame.samples_per_channel / max(1, frame.sample_rate)
+            if seconds < self.SHORT_CLIP_S:
+                language = self._current_language() or None
         text = await self._impl.transcribe_pcm(
             bytes(frame.data),
             sample_rate=frame.sample_rate,
@@ -774,7 +783,8 @@ async def build_voice_agent(
     agent = VoicePipelineAgent(
         vad=silero.VAD.load(),
         stt=(WhisperSTTNode(ChosenLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen))
-             if chosen else WhisperSTTNode(stt_impl, on_language=_on_language)),
+             if chosen else WhisperSTTNode(stt_impl, on_language=_on_language,
+                                           current_language=lambda: normalize_language(ml_state.active_language) or "en")),
         # NOTE (VOICE-SCALING §3): the livekit-plugins-openai LLM node cannot
         # hot-swap endpoints mid-process, so the LLM fallback chain
         # (app/pipeline/llm.py FallbackLLM) covers the chat/tool-loop paths;
