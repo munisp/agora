@@ -63,3 +63,22 @@ def test_turn_is_announced_thinking_working_speaking_listening():
         (TOPIC, {"state": "speaking"}),
         (TOPIC, {"state": "listening"}),
     ]
+
+
+def test_captions_are_published_for_both_sides():
+    from app.call_activity import announce_captions, caption
+
+    async def run():
+        room = type("R", (), {"local_participant": _Participant()})()
+        announce_captions(room)
+        caption("caller", "Good evening, I had an accident.")
+        caption("receptionist", "  ")  # empty: nothing sent
+        caption("receptionist", "I'm sorry to hear that.")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return room.local_participant.sent
+
+    assert asyncio.run(run()) == [
+        (TOPIC, {"state": "caption", "role": "caller", "text": "Good evening, I had an accident."}),
+        (TOPIC, {"state": "caption", "role": "receptionist", "text": "I'm sorry to hear that."}),
+    ]

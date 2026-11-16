@@ -83,6 +83,8 @@ export function VoiceSessionButton({
   const [activity, setActivity] = React.useState<CallActivity | null>(null);
   // The language the call is in right now: starts as the caller's choice, follows them if they switch mid-call.
   const [callLanguage, setCallLanguage] = React.useState("en");
+  // Live captions: the last lines said on the call (worker data topic "agora.activity", state "caption").
+  const [captions, setCaptions] = React.useState<{ role: string; text: string }[]>([]);
   const [avatarTrack, setAvatarTrack] =
     React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
@@ -98,6 +100,7 @@ export function VoiceSessionButton({
       setAvatarTrack(null);
       setVoiceTrack(null);
       setActivity(null);
+      setCaptions([]);
       setState("idle");
     }
   }, []);
@@ -113,6 +116,7 @@ export function VoiceSessionButton({
     setState("joining");
     setError(null);
     setCallLanguage(language);
+    setCaptions([]);
     try {
       // 1. Mint a session via the voice runtime (through APISIX).
       const session = await api.post<VoiceSession>("/voice/session", {
@@ -165,8 +169,14 @@ export function VoiceSessionButton({
       room.on(RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
         if (topic !== "agora.activity") return;
         try {
-          const msg = JSON.parse(new TextDecoder().decode(payload)) as CallActivity & { language?: string };
-          if (msg.state === "language") {
+          const msg = JSON.parse(new TextDecoder().decode(payload)) as CallActivity & {
+            language?: string;
+            role?: string;
+            text?: string;
+          };
+          if (msg.state === "caption") {
+            if (msg.text) setCaptions((prev) => [...prev.slice(-1), { role: msg.role ?? "", text: msg.text as string }]);
+          } else if (msg.state === "language") {
             if (msg.language) setCallLanguage(msg.language);
           } else {
             setActivity(msg);
@@ -227,6 +237,24 @@ export function VoiceSessionButton({
             language={CALL_LANGUAGES.find((l) => l.code === callLanguage)?.label}
           />
         )}
+        {state === "connected" && captions.length > 0 ? (
+          <div
+            className="w-[280px] max-w-full space-y-1 rounded-xl px-3 py-2 text-[13px] leading-snug"
+            style={{ backgroundColor: "rgba(0,0,0,0.55)", color: "#fff" }}
+            aria-live="polite"
+            aria-label="Live captions"
+            data-captions
+          >
+            {captions.map((c, i) => (
+              <p key={i} className={i < captions.length - 1 ? "opacity-70" : ""}>
+                <span className="font-semibold" style={{ color: c.role === "caller" ? "#c9e7ff" : "#f3d9a4" }}>
+                  {c.role === "caller" ? "You" : "Receptionist"}:
+                </span>{" "}
+                {c.text}
+              </p>
+            ))}
+          </div>
+        ) : null}
         <button
           onClick={() => void hangUp()}
           disabled={state === "joining"}

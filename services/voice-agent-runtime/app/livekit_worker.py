@@ -48,7 +48,7 @@ from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from . import call_language
-from .call_activity import announce_activity, announce_language
+from .call_activity import announce_activity, announce_captions, announce_language, caption
 from .pipeline.naija_stt import NaijaSpeechSTT
 from .lk_tool_loop import ToolLoopLLM
 from .transcripts import TranscriptRecorder, tool_turn_text
@@ -352,6 +352,7 @@ class WhisperSTTNode(lk_stt.STT):
                 self._on_language(detected)
             except Exception as exc:  # noqa: BLE001 - never break STT
                 log.warning("language hook failed", error=str(exc)[:200])
+        caption("caller", text)
         return lk_stt.SpeechEvent(
             type=lk_stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[lk_stt.SpeechData(text=text, language=detected)],
@@ -380,7 +381,9 @@ class PiperTTSNode(lk_tts.TTS):
         self._chunked = chunked
 
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
-        return self._stream(speakable(text))
+        spoken = speakable(text)
+        caption("receptionist", spoken)  # live caption on the caller's screen, as the sentence starts
+        return self._stream(spoken)
 
     # LiveKit's AudioSource buffers about a second; one frame per sentence (several seconds) was refused with
     # "InvalidState - failed to capture frame" and the caller heard the answer cut off. Ship 100 ms frames instead.
@@ -1094,6 +1097,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     announce_activity(agent, ctx.room)
     keep_listening_after_reconnect(agent, ctx.room)
     announce_language(agent, ctx.room)
+    announce_captions(ctx.room)
     # Greet the caller so the conversation opens naturally. SPEC-W11 Part C
     # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
     # recording-consent lines when the tenant context carries a `disclosure`

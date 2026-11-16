@@ -116,3 +116,38 @@ def announce_language(agent: Any, room: Any) -> None:
             return
 
     listeners.append(_publish)
+
+
+# --- Live captions -------------------------------------------------------------------------------------------------
+# The caller's screen shows what was just said: the caller's words as soon as they are recognised, the receptionist's
+# as each sentence starts playing. One call per job process, so a module-level sink is per call.
+_CAPTIONS: dict[str, Any] = {"fn": None}
+
+
+def caption(role: str, text: str) -> None:
+    """Send a caption line ("caller" or "receptionist"); no-op outside a call or for empty text."""
+    fn, text = _CAPTIONS["fn"], (text or "").strip()
+    if fn is None or not text:
+        return
+    try:
+        fn(role, text[:400])
+    except Exception as exc:  # noqa: BLE001 - captions are cosmetic
+        log.debug("caption not sent", error=str(exc)[:200])
+
+
+def announce_captions(room: Any) -> None:
+    def _publish(role: str, text: str) -> None:
+        payload = json.dumps({"state": "caption", "role": role, "text": text}).encode()
+
+        async def _run() -> None:
+            try:
+                await room.local_participant.publish_data(payload, reliable=True, topic=TOPIC)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("caption not published", error=str(exc)[:200])
+
+        try:
+            asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            return
+
+    _CAPTIONS["fn"] = _publish
