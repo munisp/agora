@@ -175,7 +175,20 @@ export function VoiceSessionButton({
             text?: string;
           };
           if (msg.state === "caption") {
-            if (msg.text) setCaptions((prev) => [...prev.slice(-1), { role: msg.role ?? "", text: msg.text as string }]);
+            // One line per turn: the receptionist's sentences arrive one by one, so join them onto its current line
+            // (keeping the latest ~220 characters) — otherwise the caller's words scroll away immediately.
+            if (msg.text) {
+              const role = msg.role ?? "";
+              const text = msg.text as string;
+              setCaptions((prev) => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === role) {
+                  const joined = `${last.text} ${text}`;
+                  return [...prev.slice(0, -1), { role, text: joined.length > 220 ? `…${joined.slice(-220)}` : joined }];
+                }
+                return [...prev.slice(-1), { role, text }];
+              });
+            }
           } else if (msg.state === "language") {
             if (msg.language) setCallLanguage(msg.language);
           } else {
