@@ -458,6 +458,9 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         super().__init__()
         self._tools = tool_layer
         self._runner = runner or AsyncToolRunner()
+        # The call's recent spoken lines (role, content), filled from the agent's committed-speech events; used to
+        # see whether a phone number was already read back and confirmed before the first booking call.
+        self.recent_lines: list[Any] = []
         self._ack_policy = ack_policy
         self._speaker = speaker
 
@@ -518,14 +521,11 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
 
         # Already read back and confirmed on the call? Then this first call counts as the confirmed one.
         try:
-            from livekit.agents.pipeline import AgentCallContext
-
-            call = AgentCallContext.get_current()
-            msgs = list(getattr(getattr(call, "llm_stream", None), "chat_ctx", None).messages)
-            if read_back_confirmed(msgs, phone):
+            if read_back_confirmed(list(self.recent_lines), phone):
                 self._tools._session.pending_phone = (phone or "").strip()
+                log.info("phone already confirmed by read-back; booking without a second confirmation")
         except Exception as exc:  # noqa: BLE001 - fall back to the normal two-step confirmation
-            log.debug("read-back check skipped", error=str(exc)[:160])
+            log.warning("read-back check skipped", error=str(exc)[:160])
 
         result = await self._run_slow(
             "book_appointment",
@@ -938,6 +938,20 @@ async def build_voice_agent(
         allow_interruptions=True,
     )
     agent.agora_call_language = chosen  # read by the greeting in entrypoint
+
+    def _remember(role: str):
+        def handler(msg: Any, *_a: Any, **_k: Any) -> None:
+            from types import SimpleNamespace
+
+            fnc_ctx.recent_lines.append(SimpleNamespace(role=role, content=_message_plain(msg)))
+            del fnc_ctx.recent_lines[:-12]
+        return handler
+
+    try:
+        agent.on("user_speech_committed", _remember("user"))
+        agent.on("agent_speech_committed", _remember("assistant"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("recent-lines hooks unavailable", error=str(exc)[:200])
     agent.agora_language_listeners = language_listeners  # entrypoint tells the caller's screen about switches
     # Voice-path filler: speak the ack line through the agent's TTS while a
     # slow tool call is in flight (cancelled when the tool answers fast).
