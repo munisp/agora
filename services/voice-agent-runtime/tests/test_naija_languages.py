@@ -85,13 +85,51 @@ def test_chain_sends_a_naija_reply_whole():
             pass
 
     chain = FallbackTTS({"naija": Fake()}, ["naija"], sample_rate=22050)
-    chain.voice, chain.language = "naija:", "yo"
+    chain.voice, chain.language = "naija:auto", "yo"
 
     async def run():
         return [pcm async for pcm in chain.stream_pcm("Ẹ kú àbọ̀. Báwo ni? Ẹ ṣé.")]
 
     out = asyncio.run(run())
     assert len(out) == 1 and calls == [("Ẹ kú àbọ̀. Báwo ni? Ẹ ṣé.", "yo")]
+
+
+def test_naija_voice_is_pinned_ahead_of_piper():
+    """A Nigerian-language call must speak through naija, not the chain's first provider (piper was asked for a voice
+    called "naija:" and the reply fell through to the English voices)."""
+    from app.tts_providers.chain import FallbackTTS
+
+    spoken = []
+
+    class Fake:
+        default_voice = ""
+
+        def __init__(self, name):
+            self.name = name
+
+        async def synthesize(self, text, voice, language):
+            spoken.append((self.name, voice, language))
+            return _wav()
+
+        async def aclose(self):
+            pass
+
+    chain = FallbackTTS({"piper": Fake("piper"), "naija": Fake("naija")}, ["piper", "naija"], sample_rate=22050)
+    chain.voice, chain.language = "naija:auto", "ig"
+    asyncio.run(chain.synthesize_pcm("Nnọọ!"))
+    assert spoken == [("naija", "auto", "ig")]
+
+
+def test_auto_voice_lets_the_service_choose():
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, content=_wav())
+
+    tts = NaijaSpeechTTS("http://naija:5820", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    asyncio.run(tts.synthesize("Sannu", "auto", "ha"))
+    assert "voice" not in seen
 
 
 def test_chosen_language_stt_falls_back_to_whisper():

@@ -43,7 +43,7 @@ class NaijaSpeechTTS:
         if not lang:
             raise RuntimeError("naija synthesize needs a language")
         body = {"text": text, "language": lang, "sample_rate": self.sample_rate}
-        if voice and voice.strip():
+        if voice and voice.strip() and voice.strip() != "auto":  # "auto": the service's best voice for the language
             body["voice"] = voice.strip()
         resp = await self._http().post(f"{self.base_url}/tts", json=body)
         resp.raise_for_status()

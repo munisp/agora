@@ -708,7 +708,7 @@ async def build_voice_agent(
     tts_impl.language = ""  # job processes are reused: never inherit the previous call's language
     if chosen:
         session.active_language = chosen
-        tts_impl.voice = "naija:"  # the service picks the language's best voice
+        tts_impl.voice = "naija:auto"  # pins the naija provider; "auto" = the service picks the language's best voice
         tts_impl.language = chosen
     # SPEC-W38 F2: definition.voice overrides the session's default voice
     # (per-turn language switching still applies on top). Only piper /
