@@ -321,3 +321,14 @@ def test_read_back_then_yes_counts_as_confirmed():
     assert not read_back_confirmed(convo[:2], "08035552214")                                 # no reply yet
     assert not read_back_confirmed(convo[:2] + [M("user", "No, it's 0803 555 9999")], "08035552214")
     assert not read_back_confirmed(convo, "08061112233")                                    # a different number
+
+
+def test_read_back_counts_even_if_times_were_offered_after_it():
+    from app.livekit_worker import read_back_confirmed
+
+    M = lambda role, text: type("Msg", (), {"role": role, "content": text})()
+    convo = [M("assistant", "I have 0803 555 2214. Is that correct?"), M("user", "Yes, that is correct."),
+             M("assistant", "I have 9:00, 10:00 or 11:00 AM. Which works?"), M("user", "Nine o'clock is fine.")]
+    assert read_back_confirmed(convo, "08035552214")
+    wrong = [convo[0], M("user", "No, it's 0803 555 9999"), convo[2], convo[3]]
+    assert not read_back_confirmed(wrong, "08035552214")  # the reply right after the read-back was a correction

@@ -318,12 +318,14 @@ def read_back_confirmed(messages: list[Any], phone: str) -> bool:
     digits = re.sub(r"\D", "", phone or "")
     if len(digits) < 7:
         return False
-    last_agent = next((m for m in reversed(messages) if getattr(m, "role", "") == "assistant" and _message_plain(m).strip()), None)
-    if last_agent is None:
+    # The latest receptionist line that read this number back (times may have been offered after it)...
+    read_back = next((i for i in range(len(messages) - 1, -1, -1) if getattr(messages[i], "role", "") == "assistant"
+                      and digits[-7:] in re.sub(r"\D", "", _message_plain(messages[i]))), None)
+    if read_back is None:
         return False
-    i = messages.index(last_agent)
-    replies = [_message_plain(m) for m in messages[i + 1:] if getattr(m, "role", "") == "user"]
-    return (digits[-7:] in re.sub(r"\D", "", _message_plain(last_agent))) and any(_YES.search(r) for r in replies)
+    # ...and the caller's answer right after it was yes.
+    reply = next((_message_plain(m) for m in messages[read_back + 1:] if getattr(m, "role", "") == "user"), "")
+    return bool(_YES.search(reply))
 
 
 _TAG = re.compile(r"</?[a-zA-Z][^>]{0,80}>")
