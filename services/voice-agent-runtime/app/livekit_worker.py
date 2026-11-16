@@ -223,6 +223,20 @@ class ChosenLanguageSTT:
             return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels)
 
 
+# Nigerian-language replies: the naija voices make one sentence at about real time, so a short sentence followed by a
+# long one left a gap of several seconds. Grouping sentences into chunks of at least this many characters lets the
+# service generate each chunk in one GPU batch (~3x real time): every chunk is ready before the previous one ends.
+NAIJA_MIN_CHUNK_CHARS = 120
+
+
+def _naija_tts(node: "PiperTTSNode") -> Any:
+    from livekit.agents import tokenize as lk_tokenize
+
+    return lk_tts.StreamAdapter(
+        tts=node, sentence_tokenizer=lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS)
+    )
+
+
 class WhisperSTTNode(lk_stt.STT):
     """Bridge FasterWhisperSTT into the LiveKit pipeline.
 
@@ -758,7 +772,8 @@ async def build_voice_agent(
         # Own client: the plugin's default read timeout is 5 s, which cut off every reply from a CPU-hosted model
         # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
         llm=_worker_llm(settings),
-        tts=PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
+        tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked)) if chosen
+        else PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,

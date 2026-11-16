@@ -146,3 +146,27 @@ def test_chosen_language_stt_falls_back_to_whisper():
     stt = ChosenLanguageSTT(Down(), Whisper(), "ha")
     assert asyncio.run(stt.transcribe_pcm(b"\x00\x00", sample_rate=16000)) == "hello"
     assert stt.last_detected_language == "ha"
+
+
+def test_naija_replies_are_grouped_into_long_chunks():
+    """Sentence-by-sentence naija synthesis left multi-second gaps; chunks of >=120 chars are generated in one batch."""
+    from livekit.agents import tokenize as lk_tokenize
+
+    from app.livekit_worker import NAIJA_MIN_CHUNK_CHARS
+
+    reply = ("I mela, enwere m ntị. Biko, tupu anyị malite, ọ bụrụ na onye ọ bụla merụrụ ahụ, kpọọ ndị ọrụ enyemaka "
+             "ozugbo. Gwa m ihe mere. Biko nye m nọmba polisi gị. Anyị ga-enyere gị aka.")
+    chunks = lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS).tokenize(reply)
+    assert len(chunks) < 5  # five sentences, fewer chunks
+    assert all(len(c) >= NAIJA_MIN_CHUNK_CHARS for c in chunks[:-1])
+    assert "I mela, enwere m ntị." in chunks[0] and "Biko" in chunks[0]  # the short opener rides with the next one
+
+
+def test_naija_tts_streams():
+    from app.livekit_worker import PiperTTSNode, _naija_tts
+
+    class Impl:
+        sample_rate = 22050
+
+    adapter = _naija_tts(PiperTTSNode(Impl()))
+    assert adapter.capabilities.streaming and adapter.sample_rate == 22050
