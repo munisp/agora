@@ -301,6 +301,31 @@ def _naija_tts(node: "PiperTTSNode") -> Any:
     )
 
 
+_YES = re.compile(r"\b(yes|yeah|yep|correct|that'?s right|right|exactly|e correct|na so|ehen|bẹ́ẹ̀ni|beeni|bẹẹni|haka ne|haka|ee|eh|ọ dị mma)\b", re.I)
+
+
+def _message_plain(msg: Any) -> str:
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        content = " ".join(str(c) for c in content if isinstance(c, str))
+    return str(content or "")
+
+
+def read_back_confirmed(messages: list[Any], phone: str) -> bool:
+    """True when the receptionist's last message read this phone number back and the caller's reply after it said
+    yes. The model often reads the number back BEFORE its first booking call; without this the booking tool asked the
+    caller to confirm a second time (callers hung up thinking they were booked)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) < 7:
+        return False
+    last_agent = next((m for m in reversed(messages) if getattr(m, "role", "") == "assistant" and _message_plain(m).strip()), None)
+    if last_agent is None:
+        return False
+    i = messages.index(last_agent)
+    replies = [_message_plain(m) for m in messages[i + 1:] if getattr(m, "role", "") == "user"]
+    return (digits[-7:] in re.sub(r"\D", "", _message_plain(last_agent))) and any(_YES.search(r) for r in replies)
+
+
 _TAG = re.compile(r"</?[a-zA-Z][^>]{0,80}>")
 _MARKDOWN = re.compile(r"[*_#`~|]+")
 
@@ -490,6 +515,17 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         email: str = "",
     ) -> str:
         import json
+
+        # Already read back and confirmed on the call? Then this first call counts as the confirmed one.
+        try:
+            from livekit.agents.pipeline import AgentCallContext
+
+            call = AgentCallContext.get_current()
+            msgs = list(getattr(getattr(call, "llm_stream", None), "chat_ctx", None).messages)
+            if read_back_confirmed(msgs, phone):
+                self._tools._session.pending_phone = (phone or "").strip()
+        except Exception as exc:  # noqa: BLE001 - fall back to the normal two-step confirmation
+            log.debug("read-back check skipped", error=str(exc)[:160])
 
         result = await self._run_slow(
             "book_appointment",

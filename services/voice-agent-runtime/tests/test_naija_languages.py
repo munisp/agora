@@ -308,3 +308,16 @@ def test_english_and_pidgin_are_one_family():
     s.language = "ig"  # caller had moved to Igbo; English-family speech returns to their Pidgin side
     asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
     assert calls["switch"] == ["pcm"] and s.language == "pcm"
+
+
+def test_read_back_then_yes_counts_as_confirmed():
+    from app.livekit_worker import read_back_confirmed
+
+    M = lambda role, text: type("Msg", (), {"role": role, "content": text})()
+    convo = [M("user", "My number is 0803 555 2214."), M("assistant", "I have 0803 555 2214. Is that correct?"),
+             M("user", "Yes, that is correct.")]
+    assert read_back_confirmed(convo, "08035552214")
+    assert read_back_confirmed(convo[:2] + [M("user", "E correct.")], "08035552214")       # Pidgin
+    assert not read_back_confirmed(convo[:2], "08035552214")                                 # no reply yet
+    assert not read_back_confirmed(convo[:2] + [M("user", "No, it's 0803 555 9999")], "08035552214")
+    assert not read_back_confirmed(convo, "08061112233")                                    # a different number
