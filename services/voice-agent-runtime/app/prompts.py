@@ -92,6 +92,21 @@ lexicon; a human operator has already been notified via warm handoff)
 AI_DISCLOSURE_LINE = "You're speaking with an automated assistant."
 RECORDING_NOTICE_LINE = "This call may be recorded for quality and safety."
 
+# SPEC-W70 A3: global spoken-fluency block, appended to EVERY system prompt
+# (all languages) before the per-turn locale instruction. Keeps LLM output
+# speakable — the "not fluent" report was partly markdown-ish, written-style
+# replies being read aloud. Keep this compact (<= 8 bullet lines).
+SPOKEN_STYLE_BLOCK = """
+SPOKEN STYLE (voice call — always apply)
+- Keep sentences short and speakable: one thought per sentence.
+- Plain spoken words only — no markdown, no bullet lists, no emoji.
+- Say amounts naturally in naira words ("five thousand naira", not "₦5,000.00").
+- Confirm your understanding in one short clause before acting on a request.
+- Mirror the caller's language and register immediately, including
+  mid-conversation switches.
+- Warm natural Nigerian conversational tone — no filler spam, no over-apologizing.
+""".strip()
+
 
 def truncate_knowledge_snippets(
     snippets: list[str], budget_tokens: int | None
@@ -225,6 +240,9 @@ def build_system_prompt(
     # SPEC-W38 F2: definition.instructions is its own system-prompt block.
     if definition is not None and definition.instructions.strip():
         prompt += f"\nAGENT INSTRUCTIONS\n{definition.instructions.strip()}\n"
+    # SPEC-W70 A3: global spoken-fluency block for every language, BEFORE
+    # the per-turn locale instruction so the language rule lands last.
+    prompt += "\n" + SPOKEN_STYLE_BLOCK + "\n"
     # Wave 5 #3: per-turn locale instruction when the caller speaks a
     # non-default language (whisper detection -> MultilangState).
     if language:

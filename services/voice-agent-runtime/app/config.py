@@ -20,6 +20,15 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    """Float env with fallback-to-default on bad values (SPEC-W70 A1: a typo
+    in a latency knob must not crash the worker boot)."""
+    try:
+        return float(os.environ.get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     # Control plane
@@ -71,6 +80,24 @@ class Settings:
     whisper_model: str = "base"
     whisper_device: str = "auto"  # auto|cpu|cuda
     whisper_compute_type: str = "int8"
+    # SPEC-W70 A2: optional second whisper model (e.g. large-v3-turbo)
+    # lazy-loaded alongside the default and used ONLY when the effective
+    # language (forced language= or last auto-detection) is non-English —
+    # the accuracy tier for yo/ig/ha. Empty = off (single-model behavior).
+    whisper_model_multilingual: str = ""
+
+    # SPEC-W70 A1: turn-taking / endpointing latency tuning, wired into
+    # VoicePipelineAgent + silero.VAD.load via signature introspection
+    # (app/livekit_worker.py) so the pinned livekit-agents==0.10.* contract
+    # stays safe. Defaults deliberately improve responsiveness over the
+    # framework defaults (0.5s endpointing / 0.55s VAD silence / preemptive
+    # synthesis off) with zero configuration. Knob names verified against
+    # the livekit_agents-0.10.2 wheel (min_endpointing_delay and
+    # preemptive_synthesis are the real VoicePipelineAgent parameters;
+    # 0.10.x has no max-endpointing knob).
+    voice_min_endpointing_delay: float = 0.3
+    voice_vad_min_silence_s: float = 0.35
+    voice_preemptive_synthesis: bool = True
     # SPEC-W48-C: streaming STT endpoint (/v1/stt/stream, WebSocket).
     # Rolling-window chunked inference: window_s of audio re-transcribed
     # every hop_s; an utterance endpoints after silence_ms of trailing
@@ -288,6 +315,11 @@ def load_settings() -> Settings:
         whisper_model=_env("WHISPER_MODEL", "base"),
         whisper_device=_env("WHISPER_DEVICE", "auto"),
         whisper_compute_type=_env("WHISPER_COMPUTE_TYPE", "int8"),
+        whisper_model_multilingual=_env("WHISPER_MODEL_MULTILINGUAL", "").strip(),
+        voice_min_endpointing_delay=_env_float("VOICE_MIN_ENDPOINTING_DELAY", 0.3),
+        voice_vad_min_silence_s=_env_float("VOICE_VAD_MIN_SILENCE_S", 0.35),
+        voice_preemptive_synthesis=_env("VOICE_PREEMPTIVE_SYNTHESIS", "true").lower()
+        not in ("0", "false", "no"),
         stt_stream_window_s=float(os.environ.get("STT_STREAM_WINDOW_S", "1.0")),
         stt_stream_hop_s=float(os.environ.get("STT_STREAM_HOP_S", "0.25")),
         stt_stream_silence_ms=_env_int("STT_STREAM_SILENCE_MS", 700),

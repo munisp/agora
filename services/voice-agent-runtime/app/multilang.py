@@ -26,15 +26,17 @@ fatal. Declared languages bound the auto-switch set: detection outside the
 pack's list falls back to the tenant default language.
 
 Nigerian Pidgin (pcm) note: whisper has no distinct Pidgin detection —
-Pidgin speech is transcribed and reported as English (``en``). Pidgin is
-therefore handled at the PERSONA level via the industry pack
-(industries/nigeria-sme.yaml declares ``languages: [en, pcm]`` and its
-agentPersona carries the code-switching rules), NOT via a locale switch.
-If ``pcm`` ever appears as a detection or pack entry, :func:`pidgin_proxy`
-maps it to ``en`` so the locale instruction and Piper voice stay English.
-Likewise there is no Pidgin Piper voice: PIPER_VOICE_MAP has no ``pcm``
-entry, so Pidgin deployments speak with the configured English voice —
-that is the honest, intended behaviour until a pcm TTS voice exists.
+Pidgin speech is transcribed and reported as English (``en``). SPEC-W70 A4
+(adjudicated deviation from the original persona-only design): the pcm->en
+proxy STILL stands for STT/voice resolution (no whisper pcm model, no piper
+pcm voice — :func:`pidgin_proxy`, :func:`resolve_turn_language` and
+:func:`voice_for_language` are unchanged), but ``locale_instruction("pcm")``
+now emits an explicit natural-Nigerian-Pidgin instruction instead of the
+English one, so Pidgin callers get a fluent Pidgin register even when the
+pack persona is thin. There is still no Pidgin Piper voice:
+PIPER_VOICE_MAP has no ``pcm`` entry, so Pidgin deployments speak with the
+configured English voice (or a provider-qualified TTS_VOICE_MAP pcm entry)
+— that honest limitation stands until a pcm TTS voice exists.
 """
 
 from __future__ import annotations
@@ -73,16 +75,17 @@ LANGUAGE_NAMES = {
     # speech comes back as 'en' — so this name exists only for packs that
     # declare languages: [en, pcm]; see pidgin_proxy() below and the module
     # docstring. There is no Pidgin Piper voice (PIPER_VOICE_MAP falls back
-    # to the default English voice — honest limitation, documented).
+    # to the default English voice — honest limitation, documented). Since
+    # SPEC-W70 A4 the name is used by locale_instruction()'s explicit
+    # natural-Pidgin instruction.
     "pcm": "Nigerian Pidgin",
 }
 
 # Whisper cannot detect Nigerian Pidgin distinctly: pcm audio is reported as
-# English. Pidgin is therefore a PERSONA-level concern (the industry pack's
-# agentPersona carries code-switching rules), not a locale-switch concern.
-# Any pcm that does reach the language pipeline (pack declaration, manual
-# override, a future STT engine) is proxied to English so the locale
-# instruction and TTS voice selection behave sanely.
+# English. The pcm->en proxy applies to the STT/voice resolution paths (no
+# whisper pcm model, no piper pcm voice); per SPEC-W70 A4 the LLM-side locale
+# instruction is the exception — locale_instruction("pcm") emits an explicit
+# natural-Pidgin instruction (see below).
 PIDGIN_CODES = frozenset({"pcm"})
 PIDGIN_PROXY_LANGUAGE = "en"
 
@@ -185,9 +188,20 @@ def resolve_turn_language(
 def locale_instruction(language: str) -> str:
     """Per-turn LLM system-prompt instruction ("respond in {language}").
 
-    Pidgin (pcm) is proxied to English: Pidgin register is driven by the
-    pack persona, not by a locale instruction (see module docstring)."""
-    lang = pidgin_proxy(normalize_language(language)) or "en"
+    SPEC-W70 A4 (adjudicated deviation): pcm now emits an explicit
+    natural-Nigerian-Pidgin instruction instead of the English proxy. The
+    pcm->en proxy UNCHANGED for the STT/voice resolution paths
+    (:func:`resolve_turn_language`, :func:`voice_for_language`)."""
+    lang = normalize_language(language) or "en"
+    if lang in PIDGIN_CODES:
+        return (
+            "\nLANGUAGE (this turn)\n"
+            "- The caller is speaking Nigerian Pidgin. Respond in natural, "
+            "conversational Nigerian Pidgin for the rest of the conversation "
+            "unless the caller switches languages; keep tool arguments (ids, "
+            "dates, phone numbers) unchanged.\n"
+        )
+    lang = pidgin_proxy(lang)
     name = LANGUAGE_NAMES.get(lang, lang)
     return (
         "\nLANGUAGE (this turn)\n"

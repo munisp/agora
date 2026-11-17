@@ -80,6 +80,11 @@ services:
       LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
       LLM_API_KEY: ${LLM_API_KEY:-ollama}
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      # SPEC-W70: latency knobs + optional multilingual STT tier (docs/voice-tuning.md).
+      WHISPER_MODEL_MULTILINGUAL: ${WHISPER_MODEL_MULTILINGUAL:-}
+      VOICE_MIN_ENDPOINTING_DELAY: ${VOICE_MIN_ENDPOINTING_DELAY:-0.3}
+      VOICE_VAD_MIN_SILENCE_S: ${VOICE_VAD_MIN_SILENCE_S:-0.35}
+      VOICE_PREEMPTIVE_SYNTHESIS: ${VOICE_PREEMPTIVE_SYNTHESIS:-true}
       PIPER_MODE: http
       PIPER_HTTP_URL: http://piper:5500
       PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
@@ -118,6 +123,11 @@ services:
       LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
       LLM_API_KEY: ${LLM_API_KEY:-ollama}
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      # SPEC-W70: latency knobs + optional multilingual STT tier (docs/voice-tuning.md).
+      WHISPER_MODEL_MULTILINGUAL: ${WHISPER_MODEL_MULTILINGUAL:-}
+      VOICE_MIN_ENDPOINTING_DELAY: ${VOICE_MIN_ENDPOINTING_DELAY:-0.3}
+      VOICE_VAD_MIN_SILENCE_S: ${VOICE_VAD_MIN_SILENCE_S:-0.35}
+      VOICE_PREEMPTIVE_SYNTHESIS: ${VOICE_PREEMPTIVE_SYNTHESIS:-true}
       PIPER_MODE: http
       PIPER_HTTP_URL: http://piper:5500
       PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}

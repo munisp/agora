@@ -29,6 +29,7 @@ app/pipeline/ are version-agnostic.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import uuid
 from typing import Any, AsyncIterable, Optional
@@ -74,11 +75,93 @@ _PREWARMED: dict[str, Any] = {}
 PREWARM_PHRASE = "Hello, thank you for calling. How can I help you today?"
 
 
+# ---------------------------------------------------------------------------
+# SPEC-W70 A1: endpointing / turn-taking tuning.
+#
+# The new VOICE_* knobs are wired into VoicePipelineAgent and silero.VAD.load
+# via SIGNATURE INTROSPECTION: each candidate kwarg is kept only when the
+# pinned livekit-agents==0.10.* callable actually declares it. A 0.10.x patch
+# that lacks a knob (or a stub in tests) therefore degrades to framework
+# defaults instead of crashing the worker with TypeError; every dropped key
+# is logged ONCE at info level, and the applied set is logged once per label
+# at info level too (startup observability: operators can confirm the knobs
+# actually landed on the pinned SDK).
+# ---------------------------------------------------------------------------
+_DROPPED_KWARGS_LOGGED: set[str] = set()
+_APPLIED_KWARGS_LOGGED: set[str] = set()
+
+
+def filter_supported_kwargs(
+    func: Any, kwargs: dict[str, Any], *, label: str
+) -> dict[str, Any]:
+    """Keep only the kwargs ``func``'s signature accepts.
+
+    A callable with a ``**kwargs`` catch-all accepts everything; a callable
+    whose signature cannot be introspected at all gets the kwargs passed
+    through unchanged with a warning (same "keep the worker bootable"
+    philosophy as the WorkerOptions TypeError fallback below)."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        log.warning(
+            "signature introspection unavailable; passing kwargs through",
+            label=label,
+        )
+        return dict(kwargs)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    accepted = {k: v for k, v in kwargs.items() if k in params}
+    applied_marker = f"{label}.__applied__"
+    if applied_marker not in _APPLIED_KWARGS_LOGGED:
+        _APPLIED_KWARGS_LOGGED.add(applied_marker)
+        log.info(
+            "voice tuning knobs applied",
+            label=label,
+            keys=sorted(accepted),
+        )
+    for key in sorted(set(kwargs) - set(accepted)):
+        marker = f"{label}.{key}"
+        if marker not in _DROPPED_KWARGS_LOGGED:
+            _DROPPED_KWARGS_LOGGED.add(marker)
+            log.info(
+                "voice tuning knob unsupported by this livekit-agents build; "
+                "dropping (framework default applies)",
+                label=label,
+                key=key,
+            )
+    return accepted
+
+
+def _agent_tuning_kwargs(settings: Settings) -> dict[str, Any]:
+    """VoicePipelineAgent turn-taking knobs (SPEC-W70 A1).
+
+    Names verified against the livekit_agents-0.10.2 wheel
+    (``VoicePipelineAgent.__init__``: ``min_endpointing_delay``,
+    ``preemptive_synthesis`` — 0.10.x has no max-endpointing knob).
+    """
+    return {
+        "min_endpointing_delay": settings.voice_min_endpointing_delay,
+        "preemptive_synthesis": settings.voice_preemptive_synthesis,
+    }
+
+
+def _load_vad(settings: Settings) -> Any:
+    """silero.VAD.load with the tuned min_silence_duration (SPEC-W70 A1)."""
+    kwargs = filter_supported_kwargs(
+        silero.VAD.load,
+        {"min_silence_duration": settings.voice_vad_min_silence_s},
+        label="silero.VAD.load",
+    )
+    return silero.VAD.load(**kwargs)
+
+
 def _build_stt(settings: Settings) -> FasterWhisperSTT:
     return FasterWhisperSTT(
         model_size=settings.whisper_model,
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
+        # SPEC-W70 A2: optional multilingual accuracy tier (empty = off).
+        multilingual_model=settings.whisper_model_multilingual,
     )
 
 
@@ -677,7 +760,7 @@ async def build_voice_agent(
             log.warning("locale instruction swap failed", error=str(exc)[:200])
 
     agent = VoicePipelineAgent(
-        vad=silero.VAD.load(),
+        vad=_load_vad(settings),
         stt=WhisperSTTNode(stt_impl, on_language=_on_language),
         # NOTE (VOICE-SCALING §3): the livekit-plugins-openai LLM node cannot
         # hot-swap endpoints mid-process, so the LLM fallback chain
@@ -692,6 +775,13 @@ async def build_voice_agent(
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
+        # SPEC-W70 A1: endpointing / preemptive-synthesis knobs, filtered by
+        # signature introspection against the pinned 0.10.* class.
+        **filter_supported_kwargs(
+            VoicePipelineAgent.__init__,
+            _agent_tuning_kwargs(settings),
+            label="VoicePipelineAgent",
+        ),
     )
     # Voice-path filler: speak the ack line through the agent's TTS while a
     # slow tool call is in flight (cancelled when the tool answers fast).
