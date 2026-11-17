@@ -287,7 +287,7 @@ def _pcm(seconds, rate=16000):
 
 
 def test_long_turn_in_another_language_switches_the_call():
-    s, calls = _switcher({"language": "yo", "scores": {"yo": 0.97, "en": 0.02}})
+    s, calls = _switcher({"language": "yo", "scores": {"yo": 0.99, "en": 0.01}})
     assert asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000)) == "[yo]"
     assert calls["switch"] == ["yo"] and calls["asr"] == ["yo"] and s.language == "yo"
 
@@ -332,3 +332,18 @@ def test_read_back_counts_even_if_times_were_offered_after_it():
     assert read_back_confirmed(convo, "08035552214")
     wrong = [convo[0], M("user", "No, it's 0803 555 9999"), convo[2], convo[3]]
     assert not read_back_confirmed(wrong, "08035552214")  # the reply right after the read-back was a correction
+
+
+def test_leaving_pidgin_needs_a_confident_detection():
+    # Pidgin lines were taken for Igbo at 0.78 and 0.95: the call stays in Pidgin
+    for conf in (0.78, 0.95):
+        s, calls = _switcher({"language": "ig", "scores": {"ig": conf}}, start="pcm")
+        asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
+        assert calls["switch"] == [] and s.language == "pcm"
+    # a real switch (0.99) still goes through, and between Nigerian languages the usual bar applies
+    s, calls = _switcher({"language": "ha", "scores": {"ha": 0.99}}, start="pcm")
+    asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
+    assert calls["switch"] == ["ha"]
+    s, calls = _switcher({"language": "ig", "scores": {"ig": 0.8}}, start="ha")
+    asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
+    assert calls["switch"] == ["ig"]

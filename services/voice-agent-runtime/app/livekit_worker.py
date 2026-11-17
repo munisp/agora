@@ -331,6 +331,9 @@ class SwitchingLanguageSTT:
 
     MIN_SWITCH_S = 3.0
     MIN_CONFIDENCE = 0.65  # Igbo came back right at 0.72 on a clean clip
+    # Leaving English/Pidgin for Yorùbá, Hausa or Igbo needs much more: Pidgin lines were taken for Igbo at 0.78 and
+    # 0.95 (the receptionist then answered a Pidgin caller in Igbo), while real switches came back at 0.99-1.00.
+    MIN_CONFIDENCE_FROM_ENGLISH = 0.97
 
     def __init__(self, naija: NaijaSpeechSTT, whisper: Any, start: str, allowed: list[str], on_switch: Any) -> None:
         self._naija, self._whisper = naija, whisper
@@ -357,7 +360,9 @@ class SwitchingLanguageSTT:
         detected = str(out.get("language") or "")
         confidence = float((out.get("scores") or {}).get(detected, 0.0))
         target = self._target(detected)
-        if target and confidence >= self.MIN_CONFIDENCE:
+        needed = (self.MIN_CONFIDENCE_FROM_ENGLISH
+                  if self.language in _ENGLISH_FAMILY and target not in _ENGLISH_FAMILY else self.MIN_CONFIDENCE)
+        if target and confidence >= needed:
             log.info("caller switched language", previous=self.language, language=target, confidence=confidence)
             self.language = target
             if target in _ENGLISH_FAMILY:
