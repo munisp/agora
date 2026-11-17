@@ -54,6 +54,9 @@ def letters(text: str) -> int:
     return sum(1 for ch in unicodedata.normalize("NFD", text) if ch.isalnum())
 
 
+# Frames of silence appended before decoding, and how much of the padded tail is kept (the end of the last syllable).
+TAIL_PAD = int(os.environ.get("YARN_TAIL_PAD", "8"))
+TAIL_KEEP_S = float(os.environ.get("YARN_TAIL_KEEP_S", "0.12"))
 GAP_S = 0.18  # pause between sentences
 MAX_CHARS = 1200
 
@@ -164,8 +167,21 @@ class Engines:
             parts: list[list[np.ndarray]] = [[] for _ in items]
             for k, c in zip(owner, codes):
                 if c:
-                    parts[k] += [self._decode(c).squeeze().float().numpy(), gap]
+                    parts[k] += [self._decode_tail(c), gap]
         return [np.concatenate(p[:-1]) if p else np.zeros(0, np.float32) for p in parts]
+
+    def _decode_tail(self, codes: list[int]) -> np.ndarray:
+        """Decode with TAIL_PAD frames of the clip's own opening (silent) code appended, so the decoder finishes the
+        last syllable instead of chopping it (every clip ended at full loudness: the last word was clipped), then cut
+        back to the spoken length plus a short natural fade."""
+        if TAIL_PAD <= 0:
+            return self._decode(codes).squeeze().float().numpy()
+        audio = self._decode(codes + [codes[0]] * TAIL_PAD).squeeze().float().numpy()
+        keep = min(len(audio), int(len(codes) / 75.0 * 24000) + int(TAIL_KEEP_S * 24000))
+        audio = audio[:keep].copy()
+        fade = min(len(audio), int(0.04 * 24000))
+        audio[len(audio) - fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+        return audio
 
     def _decode(self, codes: list[int]) -> torch.Tensor:
         """WavTokenizer decode. On GB10 cuFFT has failed with CUFFT_INTERNAL_ERROR (seen 2026-11-16) and stayed broken

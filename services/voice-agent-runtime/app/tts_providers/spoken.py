@@ -51,6 +51,16 @@ def _digits(s: str) -> str:
     return " ".join(_ONES[int(d)] for d in s)
 
 
+def _phone_words(d: str) -> str:
+    """A phone number in groups with pauses ("zero eight zero three, five five five, two two one four"): eleven digits
+    in one breath came out garbled from the voice. Nigerian 11-digit numbers are grouped 4-3-4, others in fours."""
+    if len(d) == 11:
+        groups = [d[:4], d[4:7], d[7:]]
+    else:
+        groups = [d[i:i + 4] for i in range(0, len(d), 4)]
+    return ", ".join(_digits(g) for g in groups)
+
+
 def _time(m: re.Match) -> str:
     h, mins, ampm = int(m.group(1)), m.group(2), (m.group(3) or "").lower().replace(".", "")
     words = number_words(h) if h <= 24 else str(h)
@@ -76,7 +86,7 @@ def spoken(text: str) -> str:
     if not text or not re.search(r"\d", text):
         return text
     # Phone and account numbers (7+ digits, spaces/dashes allowed): digit by digit.
-    text = _PHONE.sub(lambda m: _digits(re.sub(r"\D", "", m.group(0))), text)
+    text = _PHONE.sub(lambda m: _phone_words(re.sub(r"\D", "", m.group(0))), text)
 
     def time_sub(m: re.Match) -> str:
         if m.group(4):  # "9am"

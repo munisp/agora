@@ -37,3 +37,10 @@ def test_bare_booking_time_gets_the_business_offset():
 
     assert _rfc3339("2026-11-25T09:00:00", "Africa/Lagos") == "2026-11-25T09:00:00+01:00"
     assert _rfc3339("2026-11-25T09:00:00Z", "Africa/Lagos") == "2026-11-25T09:00:00+00:00"
+
+
+def test_today_line_spells_out_next_weekdays():
+    line = today_line("Africa/Lagos", now=datetime(2026, 11, 18, 0, 30, tzinfo=timezone.utc))  # Wednesday
+    assert line.startswith("Today is Wednesday, 18 November 2026")
+    assert "Tomorrow is Thursday 19 November" in line
+    assert "next Wednesday = 25 November" in line and "next Tuesday = 24 November" in line

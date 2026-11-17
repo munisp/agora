@@ -21,8 +21,8 @@ def test_times_as_spoken():
 
 def test_phone_numbers_digit_by_digit():
     assert spoken("Your number is 0806-555-3108, is that correct?") == (
-        "Your number is zero eight zero six five five five three one zero eight, is that correct?")
-    assert spoken("I have 0803 555 2214.") == "I have zero eight zero three five five five two two one four."
+        "Your number is zero eight zero six, five five five, three one zero eight, is that correct?")
+    assert spoken("I have 0803 555 2214.") == "I have zero eight zero three, five five five, two two one four."
 
 
 def test_dates_money_and_plain_text():

@@ -176,9 +176,17 @@ def today_line(tz_name: str | None, now: datetime | None = None) -> str:
     except Exception:  # noqa: BLE001 - unknown zone name
         tz = ZoneInfo("UTC")
     local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    # The model mixed up weekdays and dates ("next Wednesday is the 26th"): spell the next two weeks out, and what each
+    # "next <weekday>" means (the first such day after today), so it never has to work a weekday out itself.
+    from datetime import timedelta
+    days = [local + timedelta(days=i) for i in range(15)]
+    fmt = lambda d: f"{d.strftime('%A')} {d.day} {d.strftime('%B')}"
+    calendar = ", ".join(fmt(d) for d in days[1:])
+    nxt = "; ".join(f"next {d.strftime('%A')} = {d.day} {d.strftime('%B')}" for d in days[1:8])
     return (f"Today is {local.strftime('%A')}, {local.day} {local.strftime('%B %Y')}; the local time is "
-            f"{local.strftime('%H:%M')} ({tz.key}). Work out dates such as \"tomorrow\" or \"next Wednesday\" from "
-            f"this date, and never check or book a date in the past.")
+            f"{local.strftime('%H:%M')} ({tz.key}). Tomorrow is {fmt(days[1])}. The coming days: {calendar}. "
+            f"When a caller says \"next\" with a weekday it means the first such day after today: {nxt}. "
+            f"Use exactly these weekday/date pairs, and never check or book a date in the past.")
 
 
 def build_system_prompt(
