@@ -45,7 +45,12 @@ class NaijaSpeechTTS:
         body = {"text": text, "language": lang, "sample_rate": self.sample_rate}
         if voice and voice.strip() and voice.strip() != "auto":  # "auto": the service's best voice for the language
             body["voice"] = voice.strip()
-        resp = await self._http().post(f"{self.base_url}/tts", json=body)
+        try:
+            resp = await self._http().post(f"{self.base_url}/tts", json=body)
+        except httpx.TransportError:
+            # The service closes idle keep-alive connections after a few seconds; the first sentence after a pause in
+            # the call could reuse a closed one and fail with an empty error (that sentence then fell back to piper).
+            resp = await self._http().post(f"{self.base_url}/tts", json=body)
         resp.raise_for_status()
         return resp.content
 

@@ -30,3 +30,23 @@ def test_without_the_naija_service_everything_falls_back_to_piper():
 def test_setting_is_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("NAIJA_ENGLISH_VOICE", " idera ")
     assert load_settings().naija_english_voice == "idera"
+
+
+def test_a_closed_keepalive_connection_is_retried_once():
+    import asyncio
+
+    import httpx
+
+    from app.tts_providers.naija import NaijaSpeechTTS
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.RemoteProtocolError("")
+        return httpx.Response(200, content=b"RIFFwav")
+
+    tts = NaijaSpeechTTS("http://naija", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    assert asyncio.run(tts.synthesize("Hello", "idera", "en")) == b"RIFFwav"
+    assert calls["n"] == 2
