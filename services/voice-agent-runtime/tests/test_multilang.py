@@ -155,7 +155,8 @@ class TestPackLanguages:
 
 
 # --------------------------------------------------------------------------
-# Nigerian Pidgin (pcm) — persona-level, never a locale switch (NDPA pack)
+# Nigerian Pidgin (pcm) — pcm->en proxy for STT/voice resolution; SPEC-W70
+# A4 gives pcm an explicit Pidgin locale instruction (see TestPidgin).
 # --------------------------------------------------------------------------
 class TestPidgin:
     def test_pcm_in_language_names(self):
@@ -183,9 +184,17 @@ class TestPidgin:
         # On a pack without pcm/en the proxy result still bounds correctly.
         assert ml.resolve_turn_language("pcm", default="fr", supported=["fr", "pcm"]) == "fr"
 
-    def test_pcm_locale_instruction_is_english(self):
+    def test_pcm_locale_instruction_is_pidgin(self):
+        # SPEC-W70 A4 (adjudicated ruling, supersedes the old pcm->en proxy
+        # for the locale instruction ONLY): pcm now emits an explicit
+        # natural-Nigerian-Pidgin instruction. The proxy still stands for
+        # the STT/voice resolution paths (tests above/below unchanged).
         instruction = ml.locale_instruction("pcm")
-        assert "Respond in English" in instruction
+        assert "Nigerian Pidgin" in instruction
+        assert "Respond in natural, conversational Nigerian Pidgin" in instruction
+        assert "Respond in English" not in instruction
+        # Non-pcm languages are unaffected.
+        assert "Respond in Spanish" in ml.locale_instruction("es")
 
     def test_pcm_voice_falls_back_to_english_voice(self):
         # No Pidgin Piper voice exists: pcm speaks with the en mapping when

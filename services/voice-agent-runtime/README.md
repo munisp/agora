@@ -124,7 +124,15 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `LLM_MODEL` | `qwen3:8b` | model name (open-weights default, SPEC-W3 §0) |
 | `LLM_API_KEY` | `ollama` | optional pass-through to the OpenAI-compatible client; ignored by Ollama, required by hosted providers (e.g. MiniMax) |
 | `WHISPER_MODEL` | `base` | faster-whisper model size |
+| `WHISPER_MODEL_MULTILINGUAL` | _(unset)_ | W70 A2: optional second whisper model (e.g. `large-v3-turbo`) used ONLY for non-English turns (forced `language=` or last auto-detection); English stays on `WHISPER_MODEL`. Lazy-loaded on first non-en turn; preloaded at boot when `PRELOAD_MODELS=true`. See [docs/voice-tuning.md](../../docs/voice-tuning.md) |
+| `VOICE_MIN_ENDPOINTING_DELAY` | `0.3` | W70 A1: seconds of trailing silence before a turn commits (LiveKit 0.10 default 0.5) |
+| `VOICE_VAD_MIN_SILENCE_S` | `0.35` | W70 A1: silero VAD `min_silence_duration` (silero default 0.55) |
+| `VOICE_PREEMPTIVE_SYNTHESIS` | `true` | W70 A1: start LLM+TTS synthesis before end-of-turn finalizes (LiveKit 0.10 `preemptive_synthesis`, framework default false). All three knobs are wired via signature introspection against the pinned livekit-agents 0.10.x API (unsupported keys on a future 0.10.x patch drop with one info log, framework default applies; the applied/dropped set is logged at startup) |
 | `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | `auto` / `int8` | ctranslate2 device/precision |
+| `WHISPER_CPU_THREADS` / `WHISPER_NUM_WORKERS` | `0` / `1` | W71 P3: CTranslate2 threads per model (0 = auto) / parallel decode workers, passed to every WhisperModel construction |
+| `VOICE_LLM_MAX_TOKENS` | `300` | W71 P7: LLM response-length cap on our own OpenAI-compatible client paths (chat/tool loops); `0` disables. The livekit-plugins-openai node is intentionally not touched (0.10.x has no such param) |
+| `VOICE_LLM_HISTORY_MAX` | `60` | W71 P8: in-call chat-history window (messages); trimmed in place after each committed agent reply at safe boundaries only (never between an assistant tool_calls message and its tool results; system message retained). `0` disables |
+| `OLLAMA_KEEP_ALIVE` / `OLLAMA_NUM_PARALLEL` | `24h` / `2` | W71 P10: compose passthroughs to the ollama service — keep the model resident (5m idle-unload default costs a multi-second reload) and bound concurrent decode slots |
 | `STT_STREAM_WINDOW_S` / `STT_STREAM_HOP_S` | `1.0` / `0.25` | W48-C `/v1/stt/stream`: rolling inference window / hop (seconds) |
 | `STT_STREAM_SILENCE_MS` | `700` | W48-C: trailing silence that endpoints an utterance into a `final` event |
 | `STT_STREAM_MAX_BUFFER_S` | `8` | W48-C: undrained-input backpressure bound (overflow → WS close 1008) |
@@ -262,6 +270,20 @@ The same env family configures the conversation-service call-intelligence
 LLM (`INTEL_LLM_*`) and the eval harness judge, so one Ollama serves
 everything out of the box.
 
+### STT model routing (SPEC-W70 A2)
+
+| Profile | WHISPER_MODEL | WHISPER_MODEL_MULTILINGUAL | Use |
+|---|---|---|---|
+| **default** (CPU dev) | `base` (or `small`) | _(unset)_ | single fast model for every language |
+| Nigerian production (GPU) | `small` | `large-v3-turbo` | English stays on the fast model; yo/ig/ha and other non-English turns route to the accuracy tier |
+
+`condition_on_previous_text=False` is hard-set on every transcribe call
+(kills whisper repetition/hallucination loops on noisy telephony audio).
+The full latency budget (VAD → endpointing → STT → LLM TTFT → TTS
+first-chunk), the new `VOICE_*` turn-taking knobs, and the MMS-self-host vs
+Spitch/Azure hosted TTS trade-off live in
+[docs/voice-tuning.md](../../docs/voice-tuning.md).
+
 ## Warm handoff & whisper-copilot (innovation 1)
 
 Tool `request_human(reason?)`: creates LiveKit room
@@ -379,3 +401,13 @@ swaps the piper voice via `PIPER_VOICE_MAP` with graceful fallback to
 `PIPER_VOICE`. Pack `languages` is validated at the voice runtime's pack
 consumption point (`tenant_context._apply_pack`) because identity passes
 pack fields through unchecked.
+
+**Nigerian Pidgin (pcm, SPEC-W70 A4):** the pcm→en proxy still stands for
+STT/voice resolution (whisper reports Pidgin speech as `en`; no piper pcm
+voice), but `locale_instruction("pcm")` now emits an explicit
+natural-Nigerian-Pidgin instruction instead of the English one, so Pidgin
+callers get a fluent Pidgin register even when the pack persona is thin.
+Every system prompt also carries the global SPOKEN STYLE block
+(`app/prompts.py`, SPEC-W70 A3): short speakable sentences, no
+markdown/lists/emoji, amounts in naira words, mirror the caller's language
+and register immediately.
