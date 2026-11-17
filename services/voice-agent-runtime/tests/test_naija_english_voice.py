@@ -50,3 +50,22 @@ def test_a_closed_keepalive_connection_is_retried_once():
     tts = NaijaSpeechTTS("http://naija", client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     assert asyncio.run(tts.synthesize("Hello", "idera", "en")) == b"RIFFwav"
     assert calls["n"] == 2
+
+
+def test_per_language_voices_for_the_other_nigerian_languages():
+    voices = {"yo": "yoruba_male1", "ig": "igbo_male2"}
+    assert call_voice("yo", english_voice="osagie", naija=True, voice_spec=_piper,
+                      language_voices=voices) == ("naija:yoruba_male1", "yo")
+    assert call_voice("ig", english_voice="osagie", naija=True, voice_spec=_piper,
+                      language_voices=voices) == ("naija:igbo_male2", "ig")
+    # not listed: the service's default voice
+    assert call_voice("ha", english_voice="osagie", naija=True, voice_spec=_piper,
+                      language_voices=voices) == ("naija:auto", "ha")
+
+
+def test_language_voice_setting_parses_and_skips_junk():
+    from app.config import parse_naija_language_voices
+
+    assert parse_naija_language_voices(" yo=yoruba_male1, IG = igbo_male2 ,bad, =x, ha=") == {
+        "yo": "yoruba_male1", "ig": "igbo_male2"}
+    assert parse_naija_language_voices("") == {}

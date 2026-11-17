@@ -406,7 +406,8 @@ class ChosenLanguageSTT:
 NAIJA_MIN_CHUNK_CHARS = 60
 
 
-def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any) -> tuple[str, str]:
+def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any,
+               language_voices: dict[str, str] | None = None) -> tuple[str, str]:
     """(voice spec, synthesis language) for a call language code (en, pcm, yo, ha, ig, ful, or a locale like en-NG).
 
     With a Nigerian English voice configured, English and Pidgin are spoken by it (YarnGPT reads Pidgin naturally; the
@@ -415,7 +416,8 @@ def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any) -
     if english_voice and naija and code in ("en", "pcm"):
         return f"naija:{english_voice}", "en"
     if naija and code in call_language.NIGERIAN:
-        return "naija:auto", code  # pins the naija provider; "auto" = the service picks the language's best voice
+        # pins the naija provider; "auto" = the service picks the language's default voice
+        return f"naija:{(language_voices or {}).get(code) or 'auto'}", code
     return voice_spec(code if code != "pcm" else "en"), ""
 
 
@@ -1138,7 +1140,8 @@ async def build_voice_agent(
 
     def _set_voice(code: str) -> None:
         tts_impl.voice, tts_impl.language = call_voice(code, english_voice=english_voice,
-                                                       naija=bool(settings.naija_speech_url), voice_spec=_voice_spec)
+                                                       naija=bool(settings.naija_speech_url), voice_spec=_voice_spec,
+                                                       language_voices=settings.naija_language_voices)
 
     tts_impl.voice = _voice_spec(ml_state.active_language)
     tts_impl.language = ""  # job processes are reused: never inherit the previous call's language

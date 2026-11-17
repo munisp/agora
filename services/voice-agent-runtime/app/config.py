@@ -303,6 +303,9 @@ class Settings:
     # Nigerian-accented English voice on the naija-speech service (a YarnGPT English speaker, e.g. "idera"). Set: the
     # receptionist speaks English and Pidgin in it instead of piper (piper stays the fallback). Empty = piper/MMS.
     naija_english_voice: str = ""
+    # Per-language naija-speech voices for the other Nigerian languages, "yo=yoruba_male1,ig=igbo_male2" (unset
+    # languages: the service's default voice for that language).
+    naija_language_voices: dict = field(default_factory=dict)
     azure_speech_key: str = ""
     azure_speech_region: str = ""
     spitch_api_key: str = ""
@@ -321,6 +324,16 @@ class Settings:
     @property
     def dapr_base_url(self) -> str:
         return f"http://{self.dapr_host}:{self.dapr_http_port}"
+
+
+def parse_naija_language_voices(raw: str) -> dict[str, str]:
+    """"yo=yoruba_male1, ig=igbo_male2" -> {"yo": "yoruba_male1", "ig": "igbo_male2"}; malformed entries are skipped."""
+    out: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        lang, sep, voice = part.partition("=")
+        if sep and lang.strip() and voice.strip():
+            out[lang.strip().lower()] = voice.strip()
+    return out
 
 
 def load_settings() -> Settings:
@@ -432,6 +445,7 @@ def load_settings() -> Settings:
         naija_speech_url=_env("NAIJA_SPEECH_URL", ""),
         call_languages=_env("CALL_LANGUAGES", "en,pcm,yo,ha,ig"),
         naija_english_voice=_env("NAIJA_ENGLISH_VOICE", "").strip(),
+        naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
         azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
         spitch_api_key=_env("SPITCH_API_KEY", ""),
