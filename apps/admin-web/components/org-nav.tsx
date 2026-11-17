@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { DEFAULT_NAV_LABELS, type NavLabels } from "@/lib/terminology";
+import { DEV_EXTERNAL_LINKS, type ExternalLinks } from "@/lib/external-links";
 import {
   LayoutDashboard,
   LayoutGrid,
@@ -52,14 +53,10 @@ import {
   canViewVoices,
 } from "@/lib/roles";
 
-/** Self-hosted Twenty CRM UI (SPEC-CRM §A). */
-const CRM_URL = "http://localhost:3100";
-/** Grafana dashboards (observability profile, SPEC-W3 §1). */
-const GRAFANA_URL = "http://localhost:3002";
 
 type NavItem =
   | { segment: string; label: string; icon: typeof LayoutDashboard }
-  | { external: string; label: string; icon: typeof LayoutDashboard };
+  | { external: keyof ExternalLinks; label: string; icon: typeof LayoutDashboard };
 
 const items: NavItem[] = [
   { segment: "", label: "Overview", icon: LayoutDashboard },
@@ -108,8 +105,8 @@ const items: NavItem[] = [
   // SPEC-W32: civic case triage console — operational, owner/admin/staff.
   { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
-  { external: CRM_URL, label: "CRM", icon: UsersRound },
-  { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
+  { external: "crm", label: "CRM", icon: UsersRound },
+  { external: "grafana", label: "Grafana", icon: LineChart },
   // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
   // roles (read-only); the page hides provision/enable/disable/config
   // actions for anyone but owner/admin, and identity-service enforces the
@@ -131,8 +128,11 @@ export function OrgNav({
   orgSlug,
   roles = [],
   labels = DEFAULT_NAV_LABELS,
+  externalLinks = DEV_EXTERNAL_LINKS,
 }: {
   orgSlug: string;
+  /** addresses of the external tools (blank: entry hidden) */
+  externalLinks?: ExternalLinks;
   /** the tenant's pack wording for the core entries (bookings, contacts, team, offerings) */
   labels?: NavLabels;
   /** caller's Keycloak realm roles (session.realmRoles) — gates nav entries */
@@ -145,6 +145,7 @@ export function OrgNav({
   // analytics is owner/admin/analyst; staff/viewer see neither. The pages
   // enforce the same rule server-side — this is the client-side hiding.
   const visible = items.filter((item) => {
+    if ("external" in item) return Boolean(externalLinks[item.external]);
     if ("segment" in item && item.segment === "billing")
       return canViewBilling(roles);
     if ("segment" in item && item.segment === "analytics")
@@ -214,7 +215,7 @@ export function OrgNav({
           return (
             <a
               key={item.label}
-              href={item.external}
+              href={externalLinks[item.external]}
               target="_blank"
               rel="noreferrer noopener"
               className={linkClass(false)}

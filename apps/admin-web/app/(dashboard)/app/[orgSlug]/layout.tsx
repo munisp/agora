@@ -10,6 +10,7 @@ import type { Tenant } from "@/lib/types";
 import { resolveNavLabels } from "@/lib/terminology";
 import { TerminologyProvider } from "@/components/terminology-provider";
 import { DemoBanner } from "@/components/demo-banner";
+import { externalLinks } from "@/lib/external-links";
 
 export default async function OrgLayout({
   children,
@@ -78,7 +79,7 @@ export default async function OrgLayout({
         </div>
         <div className="woven-band opacity-80" />
         <div className="flex-1 overflow-y-auto py-3">
-          <OrgNav orgSlug={orgSlug} roles={session.realmRoles ?? []} labels={labels} />
+          <OrgNav orgSlug={orgSlug} roles={session.realmRoles ?? []} labels={labels} externalLinks={externalLinks()} />
         </div>
         <div className="space-y-1 border-t border-paper/10 p-3">
           <Link
