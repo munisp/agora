@@ -13,9 +13,12 @@ export interface CallActivity {
 type Clip = "listening" | "talking" | "typing";
 const CLIPS: Clip[] = ["listening", "talking", "typing"];
 const BASE = "/receptionist";
-// A turn that never reports back must not leave her typing for the rest of the call.
+// Bump when the clips change: Cloudflare caches /receptionist/* for hours, so a new receptionist would otherwise show
+// the old clips (2: the male receptionist that matches the "osagie" voice).
+const CLIP_VERSION = "2";
+// A turn that never reports back must not leave the receptionist typing for the rest of the call.
 const WORKING_MAX_MS = 45_000;
-// A lookup can take a fraction of a second; keep her typing long enough to be seen.
+// A lookup can take a fraction of a second; keep the receptionist typing long enough to be seen.
 const TYPING_MIN_MS = 2_500;
 
 /**
@@ -141,8 +144,8 @@ export function ReceptionistVideo({
             ref={(el) => {
               videos.current[c] = el;
             }}
-            src={`${BASE}/${c}.mp4`}
-            poster={c === "listening" ? `${BASE}/poster.jpg` : undefined}
+            src={`${BASE}/${c}.mp4?v=${CLIP_VERSION}`}
+            poster={c === "listening" ? `${BASE}/poster.jpg?v=${CLIP_VERSION}` : undefined}
             muted
             loop
             playsInline
