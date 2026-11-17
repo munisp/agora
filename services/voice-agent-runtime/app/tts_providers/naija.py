@@ -10,6 +10,7 @@ from __future__ import annotations
 import httpx
 
 from .base import Voice, labels_of
+from .spoken import spoken
 
 
 class NaijaSpeechTTS:
@@ -42,6 +43,8 @@ class NaijaSpeechTTS:
         lang = (language or "").strip().lower()
         if not lang:
             raise RuntimeError("naija synthesize needs a language")
+        if lang in ("en", "pcm"):
+            text = spoken(text)  # YarnGPT garbles digits ("9:30" -> "thirty thoughts"): times and numbers as words
         body = {"text": text, "language": lang, "sample_rate": self.sample_rate}
         if voice and voice.strip() and voice.strip() != "auto":  # "auto": the service's best voice for the language
             body["voice"] = voice.strip()
