@@ -34,6 +34,7 @@ from ..pipeline.llm import CircuitBreaker
 from ..pipeline.tts import PiperTTS, TtsLruCache, _wav_to_pcm, split_sentences
 from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
+from .cosyvoice import CosyVoiceTTS
 from .mms import MmsTTS
 from .spitch import SpitchTTS
 from .xtts import XttsTTS
@@ -41,7 +42,7 @@ from .xtts import XttsTTS
 log = get_logger("tts.chain")
 
 #: Providers buildable from Settings (chain names).
-PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch")
+PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "cosyvoice")
 
 
 class PiperProvider:
@@ -309,6 +310,8 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
         return SpitchTTS(
             api_key=settings.spitch_api_key, base_url=settings.spitch_base_url
         )
+    if name == "cosyvoice":
+        return CosyVoiceTTS(settings.cosyvoice_tts_url)
     raise ValueError(f"unknown TTS provider: {name!r}")
 
 

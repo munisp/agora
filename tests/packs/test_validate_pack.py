@@ -307,3 +307,51 @@ def test_i18n_rejects_bad_shapes():
     for i18n, expected in cases:
         errs = vp.validate_pack(_with_i18n(i18n))
         assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+# ---------------------------------------------- voice (SPEC-W10 Part D, W72)
+def _with_voice(voice):
+    doc = load("valid_minimal.yaml")
+    doc["voice"] = voice
+    return doc
+
+
+def test_voice_cosyvoice_accepted():
+    # SPEC-W72: "cosyvoice" (CosyVoice-2 sidecar, Apache-2.0) joined the
+    # provider enum — kept in sync with packs.go (TestValidateVoiceCosyvoice).
+    assert vp.validate_pack(_with_voice({"provider": "cosyvoice"})) == []
+    assert vp.validate_pack(_with_voice({
+        "provider": "cosyvoice", "voiceId": "naija-1",
+    })) == []
+    assert vp.validate_pack(_with_voice({
+        "provider": "mms",
+        "languages": {"pcm": "cosyvoice:naija-1",
+                      "en": "azure:en-NG-EzinneNeural"},
+    })) == []
+
+
+def test_voice_unknown_provider_still_rejected():
+    for voice in (
+        {"provider": "badprov"},
+        {"provider": "cosyvoice", "languages": {"pcm": "badprov:x"}},
+        {"provider": "mms", "languages": {"pcm": "badprov:x"}},
+    ):
+        errs = vp.validate_pack(_with_voice(voice))
+        assert errs, f"expected rejection for {voice!r}"
+
+
+def test_voice_rejects_bad_shapes():
+    cases = [
+        ("not-a-mapping", "voice must be a mapping"),
+        ({}, "voice.provider"),
+        ({"provider": "MMS"}, "voice.provider"),
+        ({"provider": "mms", "voiceId": "  "},
+         "voice.voiceId must be a non-empty string"),
+        ({"provider": "mms", "languages": {"en": "azure"}},
+         "must match"),
+        ({"provider": "mms", "languages": {"en": "cosyvoice:bad voice!"}},
+         "must match"),
+        ({"provider": "mms", "languages": {"pcm": "cosyvoice:"}},
+         "must match"),
+    ]
+    for voice, expected in cases:
+        errs = vp.validate_pack(_with_voice(voice))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"

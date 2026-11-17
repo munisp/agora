@@ -53,6 +53,28 @@ services:
       timeout: 5s
       retries: 5
 
+  # CosyVoice-2 voice-cloning sidecar (SPEC-W72 A2). MOCK DEFAULT here
+  # (COSYVOICE_MOCK=1): deterministic sine wav, no GPU, no model download —
+  # real CosyVoice-2 inference is GPU-gated (>=8GB VRAM; build the CUDA
+  # variant per services/cosyvoice-tts/Dockerfile and set COSYVOICE_MOCK=0).
+  # Enrollment is fail-closed on consent_basis (services/cosyvoice-tts).
+  cosyvoice-tts:
+    build:
+      context: ../cosyvoice-tts
+    image: opendesk/cosyvoice-tts:dev
+    profiles: ["voice"]
+    networks: [opendesk]
+    environment:
+      COSYVOICE_MOCK: ${COSYVOICE_MOCK:-1}
+      VOICES_DIR: /data
+    volumes:
+      - cosyvoice-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5820/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # One-time piper voice download (idempotent).
   piper-init:
     build:
@@ -113,6 +135,8 @@ services:
       VOICE_BOOKING_INTERNAL_TOKEN: ${VOICE_BOOKING_INTERNAL_TOKEN:-}
       VOICE_ADMIN_INTERNAL_TOKEN: ${VOICE_ADMIN_INTERNAL_TOKEN:-}
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
+      # SPEC-W72: CosyVoice-2 sidecar (cosyvoice TTS provider, A2).
+      COSYVOICE_TTS_URL: ${COSYVOICE_TTS_URL:-http://cosyvoice-tts:5820}
     depends_on:
       - daprd-voice
       - piper
@@ -158,6 +182,8 @@ services:
       BOOKING_URL: ${BOOKING_URL:-http://booking:7002}
       VOICE_BOOKING_INTERNAL_TOKEN: ${VOICE_BOOKING_INTERNAL_TOKEN:-}
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
+      # SPEC-W72: CosyVoice-2 sidecar (cosyvoice TTS provider, A2).
+      COSYVOICE_TTS_URL: ${COSYVOICE_TTS_URL:-http://cosyvoice-tts:5820}
     command: ["python", "-m", "app.livekit_worker", "start"]
     depends_on:
       - daprd-voice
@@ -187,6 +213,7 @@ volumes:
   ollama-models:
   piper-voices:
   whisper-models:
+  cosyvoice-data:
 
 networks:
   # Matches the declaration in infra/docker-compose.core.yml so the fragment

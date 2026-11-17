@@ -283,6 +283,7 @@ class Settings:
     tts_voice_map: dict = field(default_factory=dict)
     mms_tts_url: str = "http://mms-tts:5800"
     xtts_tts_url: str = "http://xtts-tts:5810"
+    cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
     azure_speech_key: str = ""
     azure_speech_region: str = ""
     spitch_api_key: str = ""
@@ -404,6 +405,7 @@ def load_settings() -> Settings:
         tts_voice_map=parse_tts_voice_map(_env("TTS_VOICE_MAP", "")),
         mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
+        cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
         azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
         spitch_api_key=_env("SPITCH_API_KEY", ""),

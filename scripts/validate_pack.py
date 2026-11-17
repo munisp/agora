@@ -42,9 +42,10 @@ AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 TOOL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 MCP_SERVER_NAME_RE = AGENT_ID_RE  # slug rule, kept in sync with packs.go
-# SPEC-W10 Part D: optional pack-level voice defaults.
-VOICE_PROVIDERS = ("piper", "mms", "xtts", "azure", "spitch")
-VOICE_LANG_VALUE_RE = re.compile(r"^(piper|mms|xtts|azure|spitch):[A-Za-z0-9_\-\.]+$")
+# SPEC-W10 Part D: optional pack-level voice defaults. "cosyvoice" added in
+# SPEC-W72 (CosyVoice-2 sidecar, Apache-2.0 commercial-safe path).
+VOICE_PROVIDERS = ("piper", "mms", "xtts", "azure", "spitch", "cosyvoice")
+VOICE_LANG_VALUE_RE = re.compile(r"^(piper|mms|xtts|azure|spitch|cosyvoice):[A-Za-z0-9_\-\.]+$")
 # SPEC-W12 §1: optional pack ussd.menu action enum (kept in sync with
 # packs.go ussdMenuActions).
 USSD_MENU_ACTIONS = ("book", "handoff", "status", "sos", "info")

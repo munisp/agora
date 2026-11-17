@@ -1,0 +1,5 @@
+# GPU (real inference) extra deps — used by the CUDA Dockerfile variant.
+# Base image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime (torch preinstalled).
+# CosyVoice is not on PyPI; install from source (Apache-2.0):
+git+https://github.com/FunAudioLLM/CosyVoice.git@main
+modelscope==1.20.1
