@@ -406,6 +406,19 @@ class ChosenLanguageSTT:
 NAIJA_MIN_CHUNK_CHARS = 60
 
 
+def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any) -> tuple[str, str]:
+    """(voice spec, synthesis language) for a call language code (en, pcm, yo, ha, ig, ful, or a locale like en-NG).
+
+    With a Nigerian English voice configured, English and Pidgin are spoken by it (YarnGPT reads Pidgin naturally; the
+    MMS Pidgin voice sounds robotic). Other Nigerian languages use the service's own voice for that language."""
+    code = normalize_language(code) or (code or "en").strip().lower()
+    if english_voice and naija and code in ("en", "pcm"):
+        return f"naija:{english_voice}", "en"
+    if naija and code in call_language.NIGERIAN:
+        return "naija:auto", code  # pins the naija provider; "auto" = the service picks the language's best voice
+    return voice_spec(code if code != "pcm" else "en"), ""
+
+
 def _naija_tts(node: "PiperTTSNode") -> Any:
     from livekit.agents import tokenize as lk_tokenize
 
@@ -1120,12 +1133,20 @@ async def build_voice_agent(
             settings.piper_voice,
         )
 
+    # A Nigerian-accented English voice (NAIJA_ENGLISH_VOICE): English and Pidgin are spoken by it, not piper/MMS.
+    english_voice = settings.naija_english_voice if settings.naija_speech_url else ""
+
+    def _set_voice(code: str) -> None:
+        tts_impl.voice, tts_impl.language = call_voice(code, english_voice=english_voice,
+                                                       naija=bool(settings.naija_speech_url), voice_spec=_voice_spec)
+
     tts_impl.voice = _voice_spec(ml_state.active_language)
     tts_impl.language = ""  # job processes are reused: never inherit the previous call's language
+    if english_voice:
+        _set_voice(ml_state.active_language)
     if chosen:
         session.active_language = chosen
-        tts_impl.voice = "naija:auto"  # pins the naija provider; "auto" = the service picks the language's best voice
-        tts_impl.language = chosen
+        _set_voice(chosen)
     # SPEC-W38 F2: definition.voice overrides the session's default voice
     # (per-turn language switching still applies on top). Only piper /
     # provider-less voices are applied here — other providers go through the
@@ -1135,6 +1156,7 @@ async def build_voice_agent(
         definition is not None
         and definition.voice.voice_id
         and definition.voice.provider in ("", "piper")
+        and not english_voice  # the Nigerian English voice replaces piper for the whole deployment
     ):
         tts_impl.voice = definition.voice.voice_id
 
@@ -1147,6 +1169,8 @@ async def build_voice_agent(
             tts_impl.voice = _voice_spec(detected)
         elif switched:
             tts_impl.voice = _voice_spec(ml_state.active_language)
+        if english_voice and (normalize_language(detected) in ("en", "pcm")):
+            _set_voice(detected)
         if not switched:
             return
         session.active_language = ml_state.active_language
@@ -1168,10 +1192,7 @@ async def build_voice_agent(
 
     def _switch_language(code: str) -> None:
         session.active_language = code
-        if code in call_language.NIGERIAN:
-            tts_impl.voice, tts_impl.language = "naija:auto", code
-        else:
-            tts_impl.voice, tts_impl.language = _voice_spec(code if code != "pcm" else "en"), ""
+        _set_voice(code)
         prompt = base_prompt + call_language.prompt_instruction(code)
         try:
             msgs = agent.chat_ctx.messages
@@ -1210,7 +1231,7 @@ async def build_voice_agent(
         # Own client: the plugin's default read timeout is 5 s, which cut off every reply from a CPU-hosted model
         # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
         llm=_worker_llm(settings),
-        tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked)) if switching_stt is not None
+        tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked)) if (switching_stt is not None or english_voice)
         else PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,

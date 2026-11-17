@@ -300,6 +300,9 @@ class Settings:
     naija_speech_url: str = ""
     # Languages a caller may choose on the call page (ISO codes; en always allowed).
     call_languages: str = "en,pcm,yo,ha,ig"
+    # Nigerian-accented English voice on the naija-speech service (a YarnGPT English speaker, e.g. "idera"). Set: the
+    # receptionist speaks English and Pidgin in it instead of piper (piper stays the fallback). Empty = piper/MMS.
+    naija_english_voice: str = ""
     azure_speech_key: str = ""
     azure_speech_region: str = ""
     spitch_api_key: str = ""
@@ -428,6 +431,7 @@ def load_settings() -> Settings:
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
         naija_speech_url=_env("NAIJA_SPEECH_URL", ""),
         call_languages=_env("CALL_LANGUAGES", "en,pcm,yo,ha,ig"),
+        naija_english_voice=_env("NAIJA_ENGLISH_VOICE", "").strip(),
         azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
         spitch_api_key=_env("SPITCH_API_KEY", ""),
