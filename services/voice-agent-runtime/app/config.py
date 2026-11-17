@@ -129,6 +129,33 @@ class Settings:
     stt_stream_silence_ms: int = 700
     stt_stream_max_buffer_s: float = 8.0
 
+    # SPEC-W73 A1: dead-mic detection (app/dead_mic.py). Per-session
+    # asyncio watchdog started after the greeting is queued: no user speech
+    # within voice_dead_mic_first_prompt_s -> a short "check your
+    # microphone" re-prompt is spoken; still silent after
+    # voice_dead_mic_second_prompt_s -> polite closer + the session is
+    # ended via room disconnect when voice_dead_mic_hangup_enabled. ANY
+    # user speech activity resets the watchdog to zero. Defaults are ON but
+    # conservative (12s/10s), preserving pre-W73 session behavior.
+    voice_dead_mic_enabled: bool = True
+    voice_dead_mic_first_prompt_s: float = 12.0
+    voice_dead_mic_second_prompt_s: float = 10.0
+    voice_dead_mic_hangup_enabled: bool = True
+
+    # SPEC-W73 A2: pre-rendered greetings (app/greeting_prerender.py). At
+    # worker boot (and in each warm job process) the greeting of every
+    # tenant slug in voice_greeting_prerender_tenants (csv) is synthesized
+    # through the real TTS chain so the session-path greeting is a TTS LRU
+    # cache hit. Empty tenant list = boot prerender is a no-op (honest
+    # fallback: there is no tenant-enumeration seam to reuse). Per-tenant
+    # failures are non-fatal; total boot delay is bounded by
+    # voice_greeting_prerender_timeout_s (on timeout the worker boots with
+    # the partially warmed cache).
+    voice_greeting_prerender_enabled: bool = True
+    voice_greeting_prerender_tenants: str = ""
+    voice_greeting_prerender_concurrency: int = 4
+    voice_greeting_prerender_timeout_s: float = 30.0
+
     # TTS (piper): http sidecar or local subprocess
     piper_mode: str = "http"  # http|subprocess
     piper_http_url: str = "http://piper:5500"
@@ -350,6 +377,23 @@ def load_settings() -> Settings:
         stt_stream_hop_s=float(os.environ.get("STT_STREAM_HOP_S", "0.25")),
         stt_stream_silence_ms=_env_int("STT_STREAM_SILENCE_MS", 700),
         stt_stream_max_buffer_s=float(os.environ.get("STT_STREAM_MAX_BUFFER_S", "8")),
+        voice_dead_mic_enabled=_env("VOICE_DEAD_MIC_ENABLED", "1").lower()
+        not in ("0", "false", "no"),
+        voice_dead_mic_first_prompt_s=_env_float("VOICE_DEAD_MIC_FIRST_PROMPT_S", 12.0),
+        voice_dead_mic_second_prompt_s=_env_float("VOICE_DEAD_MIC_SECOND_PROMPT_S", 10.0),
+        voice_dead_mic_hangup_enabled=_env("VOICE_DEAD_MIC_HANGUP_ENABLED", "1").lower()
+        not in ("0", "false", "no"),
+        voice_greeting_prerender_enabled=_env(
+            "VOICE_GREETING_PRERENDER_ENABLED", "1"
+        ).lower()
+        not in ("0", "false", "no"),
+        voice_greeting_prerender_tenants=_env("VOICE_GREETING_PRERENDER_TENANTS", ""),
+        voice_greeting_prerender_concurrency=_env_int(
+            "VOICE_GREETING_PRERENDER_CONCURRENCY", 4
+        ),
+        voice_greeting_prerender_timeout_s=_env_float(
+            "VOICE_GREETING_PRERENDER_TIMEOUT_S", 30.0
+        ),
         piper_mode=_env("PIPER_MODE", "http"),
         piper_http_url=_env("PIPER_HTTP_URL", "http://piper:5500"),
         piper_voice=_env("PIPER_VOICE", "en_US-lessac-medium"),

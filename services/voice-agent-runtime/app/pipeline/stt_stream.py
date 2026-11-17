@@ -21,11 +21,27 @@ no model download required.
 Backpressure: undrained input is bounded at ``max_buffer_s`` seconds of
 audio (default 8s); ``feed`` raises ``BackpressureError`` past the bound
 and the endpoint closes the socket with code 1008 + reason.
+
+SPEC-W73 (WS-C): the rolling-window parameters are env-tunable. They are
+read from ``os.environ`` at ENGINE CONSTRUCTION (``StreamingSTTEngine
+.__init__``), never at import time:
+
+- ``STT_STREAM_WINDOW_S``      -> ``window_s``      (default 1.0)
+- ``STT_STREAM_HOP_S``         -> ``hop_s``         (default 0.25)
+- ``STT_STREAM_SILENCE_MS``    -> ``silence_ms``    (default 700)
+- ``STT_STREAM_MAX_BUFFER_S``  -> ``max_buffer_s``  (default 8.0)
+
+Precedence: explicit constructor kwargs > env > the defaults above
+(byte-identical to the pre-W73 hardcoded behavior). Bounds are validated
+with a clear ``ValueError``: ``window_s > 0``, ``hop_s > 0``,
+``hop_s <= window_s``, ``silence_ms >= 0``, ``max_buffer_s > 0``.
+``SILENCE_RMS_THRESHOLD`` and ``MAX_SEGMENT_S`` remain fixed constants.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import deque
 from typing import Any, AsyncIterator
 
@@ -50,6 +66,40 @@ SILENCE_RMS_THRESHOLD = 0.01
 #: pathological non-stop stream cannot grow the segment buffer unboundedly.
 MAX_SEGMENT_S = 30.0
 
+#: SPEC-W73 (WS-C) defaults for the env-tunable rolling-window parameters.
+#: These are byte-identical to the pre-W73 hardcoded constructor defaults;
+#: env overrides (read at engine construction, never at import) sit between
+#: explicit constructor kwargs and these values.
+DEFAULT_WINDOW_S = 1.0
+DEFAULT_HOP_S = 0.25
+DEFAULT_SILENCE_MS = 700
+DEFAULT_MAX_BUFFER_S = 8.0
+
+ENV_WINDOW_S = "STT_STREAM_WINDOW_S"
+ENV_HOP_S = "STT_STREAM_HOP_S"
+ENV_SILENCE_MS = "STT_STREAM_SILENCE_MS"
+ENV_MAX_BUFFER_S = "STT_STREAM_MAX_BUFFER_S"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+
 
 class BackpressureError(RuntimeError):
     """Raised by feed() when undrained input exceeds the buffer bound."""
@@ -69,20 +119,48 @@ class StreamingSTTEngine:
         recognizer: STTInterface,
         *,
         sample_rate: int = 16000,
-        window_s: float = 1.0,
-        hop_s: float = 0.25,
-        silence_ms: int = 700,
-        max_buffer_s: float = 8.0,
+        window_s: float | None = None,
+        hop_s: float | None = None,
+        silence_ms: int | None = None,
+        max_buffer_s: float | None = None,
     ) -> None:
+        # SPEC-W73 (WS-C): None means "not explicitly passed" -> fall back
+        # to the env var (read HERE, at construction, never at import) and
+        # then to the module default. Explicit kwargs always win.
+        if window_s is None:
+            window_s = _env_float(ENV_WINDOW_S, DEFAULT_WINDOW_S)
+        if hop_s is None:
+            hop_s = _env_float(ENV_HOP_S, DEFAULT_HOP_S)
+        if silence_ms is None:
+            silence_ms = _env_int(ENV_SILENCE_MS, DEFAULT_SILENCE_MS)
+        if max_buffer_s is None:
+            max_buffer_s = _env_float(ENV_MAX_BUFFER_S, DEFAULT_MAX_BUFFER_S)
+
         if sample_rate <= 0:
-            raise ValueError("sample_rate must be positive")
-        if window_s <= 0 or hop_s <= 0:
-            raise ValueError("window_s and hop_s must be positive")
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+        if window_s <= 0:
+            raise ValueError(f"window_s must be > 0, got {window_s}")
+        if hop_s <= 0:
+            raise ValueError(f"hop_s must be > 0, got {hop_s}")
+        if hop_s > window_s:
+            raise ValueError(
+                f"hop_s must be <= window_s, got hop_s={hop_s} > window_s={window_s}"
+            )
+        if silence_ms < 0:
+            raise ValueError(f"silence_ms must be >= 0, got {silence_ms}")
+        # W73 deviation (orchestrator-sanctioned): the buffer bound stays the
+        # pre-W73 `> 0` check, NOT `>= hop_s` — a tighter-than-hop buffer is
+        # a legitimate backpressure configuration (feed() overflows sooner)
+        # and is exercised by the WS 1008 backpressure path.
         if max_buffer_s <= 0:
-            raise ValueError("max_buffer_s must be positive")
+            raise ValueError(f"max_buffer_s must be > 0, got {max_buffer_s}")
         self._recognizer = recognizer
         self._sample_rate = sample_rate
         self._bytes_per_s = sample_rate * 2  # mono PCM16
+        self._window_s = window_s
+        self._hop_s = hop_s
+        self._silence_ms = silence_ms
+        self._max_buffer_s = max_buffer_s
         self._window_bytes = max(1, int(window_s * self._bytes_per_s))
         self._hop_bytes = max(2, int(hop_s * self._bytes_per_s))
         self._silence_s = max(0, silence_ms) / 1000.0
@@ -102,6 +180,26 @@ class StreamingSTTEngine:
     @property
     def capabilities(self) -> dict[str, bool]:
         return dict(STREAMING_STT_CAPABILITIES)
+
+    @property
+    def window_s(self) -> float:
+        """Resolved rolling-window length (kwargs > env > default)."""
+        return self._window_s
+
+    @property
+    def hop_s(self) -> float:
+        """Resolved hop between interim transcriptions."""
+        return self._hop_s
+
+    @property
+    def silence_ms(self) -> int:
+        """Resolved trailing-silence endpointing threshold (ms)."""
+        return self._silence_ms
+
+    @property
+    def max_buffer_s(self) -> float:
+        """Resolved undrained-input backpressure bound."""
+        return self._max_buffer_s
 
     @property
     def finished(self) -> bool:

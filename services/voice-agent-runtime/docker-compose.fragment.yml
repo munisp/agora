@@ -189,6 +189,37 @@ services:
       - daprd-voice
       - piper
 
+  # Model-server watchdog (SPEC-W73 WS-B B2/B3). OPT-IN profile
+  # "voice-watchdog". Probes REAL inference on the TTS/LLM sidecars
+  # (/healthz can lie: minimal POST /tts or /speak per target, a 1-token
+  # generate for ollama) and, after VOICE_WATCHDOG_FAIL_THRESHOLD
+  # CONSECUTIVE failures, restarts the container through the mounted docker
+  # socket. SAFETY: VOICE_WATCHDOG_DRY_RUN defaults to 1 = log-only, NEVER
+  # restarts — soak it dry, then arm with 0 (see docs/voice-ops.md). The
+  # voice-agent-runtime/worker containers are never eligible restart
+  # targets. Runs from the runtime image (httpx already installed).
+  voice-watchdog:
+    image: opendesk/voice-agent-runtime:dev
+    profiles: ["voice-watchdog"]
+    networks: [opendesk]
+    command: ["python", "/ops/voice_watchdog.py"]
+    volumes:
+      - ./ops:/ops:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      VOICE_WATCHDOG_TARGETS: ${VOICE_WATCHDOG_TARGETS:-piper=http://piper:5500,mms=http://mms-tts:5800,xtts=http://xtts-tts:5810,cosyvoice=http://cosyvoice-tts:5820,ollama=http://ollama:11434}
+      VOICE_WATCHDOG_INTERVAL_S: ${VOICE_WATCHDOG_INTERVAL_S:-30}
+      VOICE_WATCHDOG_FAIL_THRESHOLD: ${VOICE_WATCHDOG_FAIL_THRESHOLD:-3}
+      VOICE_WATCHDOG_PROBE_TIMEOUT_S: ${VOICE_WATCHDOG_PROBE_TIMEOUT_S:-10}
+      VOICE_WATCHDOG_DRY_RUN: ${VOICE_WATCHDOG_DRY_RUN:-1}
+      PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
+      LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
+    depends_on:
+      - piper
+      - ollama
+      - cosyvoice-tts
+    restart: unless-stopped
+
   # Dapr sidecar companion (SPEC §3: app talks to daprd-voice:3500).
   daprd-voice:
     image: daprio/daprd:1.14.4

@@ -19,6 +19,10 @@ Series:
 - voice_llm_first_token_seconds  (histogram) — SPEC-W71 P9 stream TTFC
 - voice_tts_first_chunk_seconds  (histogram) — SPEC-W71 P9 stream_pcm first yield
 - voice_turn_total_seconds       (histogram) — SPEC-W71 P9 user commit -> first agent audio
+- voice_dead_mic_prompts_total   (counter, label stage=first|closer) — SPEC-W73 A1
+- voice_dead_mic_hangups_total   (counter) — SPEC-W73 A1
+- voice_dead_mic_resets_total    (counter) — SPEC-W73 A1
+- voice_greeting_prerender_total (counter, label result=ok|error|timeout) — SPEC-W73 A2
 """
 
 from __future__ import annotations
@@ -215,6 +219,32 @@ class Registry:
             "voice_turn_total_seconds",
             "Voice turn total: user_speech_committed -> first agent audio.",
         )
+        # SPEC-W73 A1: dead-mic detection (app/dead_mic.py). prompts counts
+        # spoken dead-mic utterances (stage=first re-prompt | closer);
+        # hangups counts sessions ended after continued silence; resets
+        # counts user-speech observations that restarted the watchdog.
+        self.dead_mic_prompts = Counter(
+            "voice_dead_mic_prompts_total",
+            "Dead-mic monitor utterances spoken (re-prompt / closer).",
+            ("stage",),  # stage=first|closer
+        )
+        self.dead_mic_hangups = Counter(
+            "voice_dead_mic_hangups_total",
+            "Sessions ended by the dead-mic monitor after continued silence.",
+            (),
+        )
+        self.dead_mic_resets = Counter(
+            "voice_dead_mic_resets_total",
+            "Dead-mic monitor resets on observed user speech activity.",
+            (),
+        )
+        # SPEC-W73 A2: boot-time greeting prerender outcomes
+        # (app/greeting_prerender.py); result=ok|error|timeout.
+        self.greeting_prerender = Counter(
+            "voice_greeting_prerender_total",
+            "Boot-time greeting prerender synthesis outcomes.",
+            ("result",),  # result=ok|error|timeout
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -231,6 +261,10 @@ class Registry:
             self.llm_first_token,
             self.tts_first_chunk,
             self.turn_total,
+            self.dead_mic_prompts,
+            self.dead_mic_hangups,
+            self.dead_mic_resets,
+            self.greeting_prerender,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -362,6 +396,26 @@ def emergency_session() -> None:
 def agent_resolution(source: str) -> None:
     """SPEC-W38 F1: one dialed-number resolution (registry|env_map|default)."""
     _registry.agent_resolution.inc(source=source)
+
+
+def dead_mic_prompt(stage: str = "first") -> None:
+    """SPEC-W73 A1: one dead-mic utterance spoken (stage=first|closer)."""
+    _registry.dead_mic_prompts.inc(stage=stage)
+
+
+def dead_mic_hangup() -> None:
+    """SPEC-W73 A1: session ended by the dead-mic monitor."""
+    _registry.dead_mic_hangups.inc()
+
+
+def dead_mic_reset() -> None:
+    """SPEC-W73 A1: user speech observed; dead-mic watchdog restarted."""
+    _registry.dead_mic_resets.inc()
+
+
+def greeting_prerender_result(result: str) -> None:
+    """SPEC-W73 A2: one boot-time greeting prerender outcome (ok|error|timeout)."""
+    _registry.greeting_prerender.inc(result=result)
 
 
 # ---------------------------------------------------------------------------

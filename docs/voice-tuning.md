@@ -6,6 +6,9 @@
 > - A2 STT decode quality + multilingual model routing: `app/pipeline/stt.py` (`condition_on_previous_text=False`, `WHISPER_MODEL_MULTILINGUAL`)
 > - A3 spoken-fluency prompt block: `app/prompts.py` (`SPOKEN_STYLE_BLOCK`)
 > - A4 Pidgin locale instruction: `app/multilang.py` (`locale_instruction("pcm")`)
+>
+> **W73 additions (voice ops maturity)** — §7 dead-mic detection, §8
+> pre-rendered greetings, §9 streaming-STT env knobs (see below).
 
 Driver: user report — the voice agent on Nigerian languages + Pidgin had
 "lots of lag, not fluent". This document is the operator's tuning guide;
@@ -108,7 +111,89 @@ configuration. Env defaults are triple-consistent across
 Watch the new P9 series alongside the existing `voice_stt/llm/tts_latency_seconds`
 on the worker `/metrics` endpoint (`VOICE_WORKER_METRICS_PORT`, default 9464).
 
-## 6. Honest note (environment-blocked verification)
+## 7. Dead-mic detection (SPEC-W73 A1)
+
+A caller whose microphone is broken or muted hears the greeting and then
+dead air — no turn ever commits and the session sits open. The per-session
+`DeadMicMonitor` (`app/dead_mic.py`, wired in `app/livekit_worker.py`
+`start_dead_mic_monitor`, started right after the greeting is queued)
+intervenes:
+
+1. no user speech within `VOICE_DEAD_MIC_FIRST_PROMPT_S` (default **12.0 s**)
+   → the agent says a short "I can't seem to hear you — can you check your
+   microphone?" re-prompt (a deterministic constant per tenant, so it is a
+   TTS LRU cache hit after the first use);
+2. still silent after `VOICE_DEAD_MIC_SECOND_PROMPT_S` (default **10.0 s**)
+   → a brief polite closer, then the session is ended via the room's own
+   `disconnect()` when `VOICE_DEAD_MIC_HANGUP_ENABLED=1` (default on) —
+   the existing `disconnected` teardown remains the single SessionEnded
+   publisher.
+
+ANY user speech activity (the wheel-verified livekit-agents 0.10.2 events
+`user_started_speaking` / `user_speech_committed`) resets the watchdog to
+zero. Escalation/warm-handoff suppresses every further dead-mic utterance,
+and room disconnect cancels the watchdog — no orphan tasks, no interference
+with the async-tool dead-air/apology paths. `VOICE_DEAD_MIC_ENABLED=0` is a
+complete no-op. Metrics: `voice_dead_mic_prompts_total{stage=first|closer}`,
+`voice_dead_mic_hangups_total`, `voice_dead_mic_resets_total`.
+
+Tuning: raise FIRST_PROMPT_S for tenants whose greeting ends with a long
+menu; lower the pair for kiosk-style deployments. Defaults are deliberately
+conservative (a slow caller digging out a headset is never re-prompted
+prematurely).
+
+## 8. Pre-rendered greetings (SPEC-W73 A2)
+
+The session greeting (`agent.say(build_greeting(ctx))`) pays full TTS
+synthesis on a cold cache. `app/greeting_prerender.py` warms the TTS LRU at
+worker boot for KNOWN tenants so the greeting is a guaranteed cache hit:
+
+- `VOICE_GREETING_PRERENDER_TENANTS` — csv of tenant site slugs (e.g.
+  `acme,beau`). **Empty = no-op** (honest fallback: there is no
+  tenant-enumeration seam at boot — the agents registry / tenant-context
+  paths resolve single tenants only, so none was reused). Tenants not
+  listed behave exactly as before.
+- Greeting text AND voice are resolved through the real session seams
+  (`fetch_tenant_context` → `build_greeting` → `resolve_tts_voice` + the
+  SPEC-W38 F2 definition voice override), so the warmed
+  `(voice, text, format)` cache key is identical to the session-path key.
+- Bounded concurrency `VOICE_GREETING_PRERENDER_CONCURRENCY` (default 4);
+  per-tenant failure is non-fatal (logged +
+  `voice_greeting_prerender_total{result="error"}`) and the remaining
+  tenants still warm.
+- Total boot delay is bounded by `VOICE_GREETING_PRERENDER_TIMEOUT_S`
+  (default 30 s); on timeout the worker boots with the partially warmed
+  cache (`result="timeout"`).
+- Process reality: livekit-agents 0.10.2 SPAWNS job processes
+  (`mp.get_context("spawn")`), so the prerender runs both in the supervisor
+  boot (`main()`, before `agents.cli.run_app`) and in each warm job
+  process (`prewarm_fnc`) — a supervisor-only warm would never reach the
+  processes serving sessions. `schedule_tts_warmup` (W71 P6, post-greeting
+  mid-call warming) is untouched.
+- `VOICE_GREETING_PRERENDER_ENABLED=0` disables entirely.
+
+## 9. Streaming-STT rolling-window knobs (SPEC-W73 A3/C1)
+
+The `/v1/stt/stream` engine (`app/pipeline/stt_stream.py`) reads these from
+env at ENGINE CONSTRUCTION; the endpoint path passes the same values as
+explicit kwargs from `config.py` Settings (constructor kwargs beat env,
+env beats module defaults). **Code-truth defaults below are byte-identical
+to pre-W73 behavior** (SPEC A3's indicative 8.0/1.0 window/hop values were
+wrong; the actual constants are 1.0/0.25):
+
+| Env | Default | Meaning |
+|---|---|---|
+| `STT_STREAM_WINDOW_S` | 1.0 | rolling re-transcription window (s) |
+| `STT_STREAM_HOP_S` | 0.25 | re-transcription cadence (s); must be ≤ window |
+| `STT_STREAM_SILENCE_MS` | 700 | trailing silence that endpoints an utterance |
+| `STT_STREAM_MAX_BUFFER_S` | 8.0 | undrained-input bound (backpressure → WS close 1008) |
+
+Invalid combinations raise a clear `ValueError` at construction
+(window>0, hop>0, hop≤window, silence≥0, buffer≥hop). Larger windows buy
+accuracy per interim at higher re-decode cost; larger hops cut CPU at the
+cost of interim freshness.
+
+## 10. Honest note (environment-blocked verification)
 
 Live model inference (whisper / MMS / Spitch / Azure) and live LiveKit
 round-trips are **not runnable in this development environment**, so the

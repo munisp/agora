@@ -276,3 +276,141 @@ def test_ws_backpressure_closes_1008_on_overflow():
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W73 C2: env-tunable rolling-window parameters. Env is read at ENGINE
+# CONSTRUCTION (StreamingSTTEngine.__init__), never at import. Precedence:
+# explicit kwargs > env > module defaults (byte-identical to pre-W73
+# behavior). All tests isolate env via monkeypatch -> order-independent.
+# ---------------------------------------------------------------------------
+
+STT_STREAM_ENV_VARS = (
+    "STT_STREAM_WINDOW_S",
+    "STT_STREAM_HOP_S",
+    "STT_STREAM_SILENCE_MS",
+    "STT_STREAM_MAX_BUFFER_S",
+)
+
+
+@pytest.fixture
+def clean_stt_env(monkeypatch):
+    """Guarantee none of the STT_STREAM_* vars leak in from the ambient env."""
+    for name in STT_STREAM_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_defaults_unchanged_without_env_or_kwargs(clean_stt_env):
+    """Pre-W73 behavior: no kwargs, no env -> the original hardcoded
+    defaults, byte-identical derived buffers."""
+    engine = StreamingSTTEngine(StubRecognizer())
+    assert engine.window_s == 1.0
+    assert engine.hop_s == 0.25
+    assert engine.silence_ms == 700
+    assert engine.max_buffer_s == 8.0
+    # Derived internals match the pre-W73 constructor math exactly.
+    assert engine._window_bytes == int(1.0 * BYTES_PER_S)
+    assert engine._hop_bytes == int(0.25 * BYTES_PER_S)
+    assert engine._silence_s == 0.7
+    assert engine._max_buffer_bytes == int(8.0 * BYTES_PER_S)
+
+
+def test_env_override_applied_at_construction(clean_stt_env):
+    clean_stt_env.setenv("STT_STREAM_WINDOW_S", "2.0")
+    clean_stt_env.setenv("STT_STREAM_HOP_S", "0.5")
+    clean_stt_env.setenv("STT_STREAM_SILENCE_MS", "900")
+    clean_stt_env.setenv("STT_STREAM_MAX_BUFFER_S", "4.0")
+    engine = StreamingSTTEngine(StubRecognizer())
+    assert engine.window_s == 2.0
+    assert engine.hop_s == 0.5
+    assert engine.silence_ms == 900
+    assert engine.max_buffer_s == 4.0
+    assert engine._window_bytes == int(2.0 * BYTES_PER_S)
+    assert engine._hop_bytes == int(0.5 * BYTES_PER_S)
+    assert engine._silence_s == 0.9
+    assert engine._max_buffer_bytes == int(4.0 * BYTES_PER_S)
+
+
+def test_env_read_at_construction_not_import(clean_stt_env):
+    """Changing env AFTER construction must not mutate a live engine, and a
+    later engine must pick up the new value."""
+    engine_before = StreamingSTTEngine(StubRecognizer())
+    clean_stt_env.setenv("STT_STREAM_HOP_S", "0.5")
+    assert engine_before.hop_s == 0.25
+    engine_after = StreamingSTTEngine(StubRecognizer())
+    assert engine_after.hop_s == 0.5
+
+
+def test_kwargs_beat_env(clean_stt_env):
+    clean_stt_env.setenv("STT_STREAM_WINDOW_S", "2.0")
+    clean_stt_env.setenv("STT_STREAM_HOP_S", "0.5")
+    clean_stt_env.setenv("STT_STREAM_SILENCE_MS", "900")
+    clean_stt_env.setenv("STT_STREAM_MAX_BUFFER_S", "4.0")
+    engine = StreamingSTTEngine(
+        StubRecognizer(), window_s=1.0, hop_s=0.25, silence_ms=700, max_buffer_s=8.0
+    )
+    assert engine.window_s == 1.0
+    assert engine.hop_s == 0.25
+    assert engine.silence_ms == 700
+    assert engine.max_buffer_s == 8.0
+    # Partial kwargs: only the unset parameter falls back to env.
+    partial = StreamingSTTEngine(StubRecognizer(), window_s=3.0)
+    assert partial.window_s == 3.0
+    assert partial.hop_s == 0.5  # from env
+    assert partial.silence_ms == 900  # from env
+    assert partial.max_buffer_s == 4.0  # from env
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"window_s": 0.0},  # window must be > 0
+        {"window_s": -1.0},
+        {"hop_s": 0.0},  # hop must be > 0
+        {"hop_s": -0.25},
+        {"window_s": 0.5, "hop_s": 1.0},  # hop must be <= window
+        {"silence_ms": -1},  # silence must be >= 0
+        {"max_buffer_s": 0.0},  # buffer must be > 0 (pre-W73 bound kept: a
+        {"max_buffer_s": -1.0},  # tighter-than-hop buffer is legitimate)
+    ],
+)
+def test_bounds_violations_raise_value_error(clean_stt_env, kwargs):
+    with pytest.raises(ValueError):
+        StreamingSTTEngine(StubRecognizer(), **kwargs)
+
+
+def test_env_bounds_violation_raises_value_error(clean_stt_env):
+    """Invalid env values fail loudly at construction, not silently."""
+    clean_stt_env.setenv("STT_STREAM_HOP_S", "2.0")  # > default window 1.0
+    with pytest.raises(ValueError, match="hop_s"):
+        StreamingSTTEngine(StubRecognizer())
+    clean_stt_env.setenv("STT_STREAM_HOP_S", "0.25")
+    clean_stt_env.setenv("STT_STREAM_MAX_BUFFER_S", "0")  # must be > 0
+    with pytest.raises(ValueError, match="max_buffer_s"):
+        StreamingSTTEngine(StubRecognizer())
+
+
+def test_env_unparseable_value_raises_value_error(clean_stt_env):
+    clean_stt_env.setenv("STT_STREAM_WINDOW_S", "not-a-number")
+    with pytest.raises(ValueError, match="STT_STREAM_WINDOW_S"):
+        StreamingSTTEngine(StubRecognizer())
+
+
+async def test_env_tuned_engine_still_streams_end_to_end(clean_stt_env):
+    """Functional proof: an env-tuned engine (larger hop + silence floor)
+    endpoints with the tuned parameters, not the defaults."""
+    clean_stt_env.setenv("STT_STREAM_HOP_S", "0.5")
+    clean_stt_env.setenv("STT_STREAM_SILENCE_MS", "1000")
+    engine = StreamingSTTEngine(StubRecognizer())
+    assert engine.hop_s == 0.5
+    engine.feed(tone_pcm(0.5) + silence_pcm(1.0))
+    engine.finish()
+    events = await _collect(engine)
+    kinds = [e["type"] for e in events]
+    # 0.5s hops over 1.5s of audio -> 3 interims; endpoint fires once the
+    # 1.0s trailing-silence floor is reached (2nd silent hop).
+    assert kinds == ["interim", "interim", "interim", "final"]
+    final = events[-1]
+    assert final["text"] == "speech"
+    assert final["end_ts"] == pytest.approx(0.5)

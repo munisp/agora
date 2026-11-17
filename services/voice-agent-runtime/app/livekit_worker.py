@@ -46,6 +46,7 @@ from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
 from . import emergency, metrics, sip
+from . import dead_mic, greeting_prerender
 from .async_tools import SLOW_TOOLS, AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
@@ -245,6 +246,12 @@ def make_prewarm_fnc(settings: Settings):
             tts = _build_tts(settings)
             asyncio.run(_warmup_tts(tts))
             _PREWARMED["tts"] = tts
+            # SPEC-W73 A2: 0.10.2 spawns job processes (worker.py
+            # mp.get_context("spawn")), so the supervisor's boot prerender
+            # never reaches the processes that serve sessions — prerender
+            # the configured tenants' greetings into THIS process' chain
+            # (empty tenant list / failure = no-op, boot continues).
+            greeting_prerender.boot_prerender(settings, build_tts=lambda: tts)
             log.info(
                 "prewarm: tts warmup synthesis done",
                 chain=settings.tts_provider_chain,
@@ -1007,6 +1014,43 @@ async def build_voice_agent(
     return agent, ctx, session
 
 
+# ---------------------------------------------------------------------------
+# SPEC-W73 A1: dead-mic detection wiring (watchdog in app/dead_mic.py).
+# ---------------------------------------------------------------------------
+def start_dead_mic_monitor(
+    settings: Settings, agent: Any, session: SessionState, room: Any
+) -> dead_mic.DeadMicMonitor | None:
+    """Create, wire and start the per-session dead-mic watchdog.
+
+    Returns None (complete no-op) when VOICE_DEAD_MIC_ENABLED=0 or wiring
+    fails. User-speech signals are the wheel-verified VoicePipelineAgent
+    events ``user_started_speaking`` / ``user_speech_committed`` (0.10.2
+    ``EventTypes``); the hangup path is the room's own ``disconnect``
+    (verified on livekit 0.17.x ``rtc.Room``), which fires the room
+    ``disconnected`` handler — the existing teardown stays the single
+    SessionEnded publisher. Escalation (``session.escalation_room`` set)
+    suppresses every further dead-mic utterance.
+    """
+    if not settings.voice_dead_mic_enabled:
+        return None
+    try:
+        monitor = dead_mic.DeadMicMonitor(
+            agent=agent,
+            first_prompt_s=settings.voice_dead_mic_first_prompt_s,
+            second_prompt_s=settings.voice_dead_mic_second_prompt_s,
+            hangup_enabled=settings.voice_dead_mic_hangup_enabled,
+            on_hangup=room.disconnect,
+            is_escalated=lambda: session.escalation_room is not None,
+        )
+        agent.on("user_started_speaking", monitor.note_user_speech)
+        agent.on("user_speech_committed", monitor.note_user_speech)
+        monitor.start()
+        return monitor
+    except Exception as exc:  # noqa: BLE001 - monitor off, call unaffected
+        log.warning("dead-mic monitor unavailable", error=str(exc)[:200])
+        return None
+
+
 async def entrypoint(ctx: agents.JobContext) -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
@@ -1099,10 +1143,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # AFTER session start and the greeting — fire-and-forget; failures log.
     schedule_tts_warmup(agent, ToolAckPolicy.from_context(tenant_ctx))
 
+    # SPEC-W73 A1: dead-mic watchdog, started AFTER the greeting is queued
+    # (helper above; None when disabled). Cancelled on room disconnect below.
+    dead_mic_monitor = start_dead_mic_monitor(settings, agent, session, ctx.room)
+
     @ctx.room.on("disconnected")
     def _on_disconnected(*args) -> None:  # noqa: ARG001
         import asyncio
 
+        if dead_mic_monitor is not None:
+            dead_mic_monitor.cancel()  # no orphan watchdog past session end
         metrics.get_registry().active_sessions.dec()
         # Attach the call-quality payload (None when the session recorded no
         # signals -> the event carries no `quality` key at all).
@@ -1173,6 +1223,16 @@ def main() -> None:
     settings = load_settings()
     configure_logging(settings.log_level)
     _start_worker_metrics(settings)
+    # SPEC-W73 A2: pre-render known tenants' greetings BEFORE the worker
+    # starts accepting jobs (bounded by VOICE_GREETING_PRERENDER_TIMEOUT_S;
+    # timeout -> partial warm). The warmed chain is pinned for sessions
+    # served by THIS process (thread executor / dev); spawned job processes
+    # warm their own chains in prewarm_fnc.
+    warmed_tts = greeting_prerender.boot_prerender(
+        settings, build_tts=lambda: _build_tts(settings)
+    )
+    if warmed_tts is not None:
+        _PREWARMED.setdefault("tts", warmed_tts)
     log.info(
         "starting livekit agents worker",
         backend=settings.agent_backend,

@@ -56,3 +56,28 @@ comparison lands in `ab_report.md`; `--promote` writes the winning persona to
 `eval/promoted/{tenant}.md`, ready to be copied into the pack's
 `agentPersona`. `--no-judge` runs the mechanics without scores (means are
 0.0 and A always keeps the crown — useful for smoke-testing the harness).
+
+## Latency bench (SPEC-W73 WS-B)
+
+`latency_bench.py` measures STT / LLM / TTS stage durations and an
+end-to-end turn estimate through the real pipeline seams with deterministic
+fakes injected (stub whisper model at the test seam, stub LLM through the
+real `run_tool_loop`, piper HTTP path served by `httpx.MockTransport` with
+the LRU cache disabled). The **default mode opens zero sockets and downloads
+zero models** — it runs anywhere, including CI.
+
+```bash
+python3 eval/latency_bench.py --iterations 20 --json bench.json --md bench.md
+make bench-voice BENCH_ARGS="--iterations 50 --json bench.json"   # from repo root
+```
+
+Output schema is pinned: `{stt, llm, tts, e2e}` each with
+`{p50_ms, p95_ms, mean_ms, min_ms, max_ms, n}`, plus
+`meta: {iterations, mode, ts}`. Exit code is 0 on success, non-zero on a
+harness error. Offline numbers measure harness/pipeline overhead (PCM
+conversion, tool loop, wav decode, metrics) — use them for **regression
+drift**, not as production latencies. `--live` hits the real sidecars via
+`WHISPER_MODEL` / `LLM_BASE_URL` / `LLM_MODEL` / `PIPER_HTTP_URL` /
+`PIPER_VOICE` and needs the voice stack up (`make up-voice`); compare those
+numbers with the W71 `voice_*_latency_seconds` runtime histograms
+(docs/voice-ops.md).
