@@ -8,6 +8,12 @@ services:
     image: ollama/ollama:0.3.12
     profiles: ["voice"]
     networks: [opendesk]
+    environment:
+      # SPEC-W71 P10: keep the model resident — ollama's default 5m
+      # idle-unload costs a multi-second model reload on the next call.
+      # NUM_PARALLEL bounds concurrent decode slots.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
     ports:
       - "11434:11434"
     volumes:
@@ -85,6 +91,11 @@ services:
       VOICE_MIN_ENDPOINTING_DELAY: ${VOICE_MIN_ENDPOINTING_DELAY:-0.3}
       VOICE_VAD_MIN_SILENCE_S: ${VOICE_VAD_MIN_SILENCE_S:-0.35}
       VOICE_PREEMPTIVE_SYNTHESIS: ${VOICE_PREEMPTIVE_SYNTHESIS:-true}
+      # SPEC-W71: STT thread tuning + LLM caps/history window (docs/voice-tuning.md).
+      WHISPER_CPU_THREADS: ${WHISPER_CPU_THREADS:-0}
+      WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-1}
+      VOICE_LLM_MAX_TOKENS: ${VOICE_LLM_MAX_TOKENS:-300}
+      VOICE_LLM_HISTORY_MAX: ${VOICE_LLM_HISTORY_MAX:-60}
       PIPER_MODE: http
       PIPER_HTTP_URL: http://piper:5500
       PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}
@@ -128,6 +139,11 @@ services:
       VOICE_MIN_ENDPOINTING_DELAY: ${VOICE_MIN_ENDPOINTING_DELAY:-0.3}
       VOICE_VAD_MIN_SILENCE_S: ${VOICE_VAD_MIN_SILENCE_S:-0.35}
       VOICE_PREEMPTIVE_SYNTHESIS: ${VOICE_PREEMPTIVE_SYNTHESIS:-true}
+      # SPEC-W71: STT thread tuning + LLM caps/history window (docs/voice-tuning.md).
+      WHISPER_CPU_THREADS: ${WHISPER_CPU_THREADS:-0}
+      WHISPER_NUM_WORKERS: ${WHISPER_NUM_WORKERS:-1}
+      VOICE_LLM_MAX_TOKENS: ${VOICE_LLM_MAX_TOKENS:-300}
+      VOICE_LLM_HISTORY_MAX: ${VOICE_LLM_HISTORY_MAX:-60}
       PIPER_MODE: http
       PIPER_HTTP_URL: http://piper:5500
       PIPER_VOICE: ${PIPER_VOICE:-en_US-lessac-medium}

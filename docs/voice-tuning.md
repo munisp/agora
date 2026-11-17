@@ -85,7 +85,30 @@ en-NG) when hosted calls are acceptable, MMS sidecar when data residency
 or offline operation wins. The `FallbackTTS` chain keeps piper as the
 implicit last resort either way (SPEC-W10).
 
-## 5. Honest note (environment-blocked verification)
+
+## 5. W71 performance levers (SPEC-W71)
+
+Ten latency levers landed in W71; defaults improve latency with zero
+configuration. Env defaults are triple-consistent across
+`app/config.py`, `.env.example` and `docker-compose.fragment.yml`.
+
+| # | Lever | Knob (default) | Where |
+|---|---|---|---|
+| P1 | Process-wide silero VAD cache — one VAD load per process instead of per session | _always on_ | `app/livekit_worker.py` (`_load_vad`, thread-safe lazy singleton keyed by tuned kwargs) |
+| P2 | Whisper decode fast-path: `temperature=0.0` (no multi-temperature re-decode) + `without_timestamps=True` (no timestamp-token constraint decoding) | _always on_ | `app/pipeline/stt.py` transcribe call |
+| P3 | CTranslate2 thread tuning passed to every WhisperModel construction | `WHISPER_CPU_THREADS` (0 = auto), `WHISPER_NUM_WORKERS` (1) | `app/pipeline/stt.py` + `app/config.py` |
+| P4 | TTS chunk prefetch — depth-1 lookahead pipelines sentence synthesis (latency ~max(chunks)+first instead of sum); cache order, empty-skip and error propagation preserved | _always on_ | `app/pipeline/tts.py` `stream_pcm` |
+| P5 | Subprocess TTS without temp files: piper `--output-raw` raw s16le on stdout (flag verified against the piper-tts 1.8.0 wheel), sample rate from the voice `.onnx.json` `audio.sample_rate` (cached per voice); WAV container assembled in memory for the chain adapter | _always on_ (subprocess mode) | `app/pipeline/tts.py` `_subprocess_pcm` / `_subprocess_wav` |
+| P6 | Mid-call phrase cache warming — tool-ack/filler lines (from the tenant's real `ToolAckPolicy`) + standard closers synthesized into the TTS LRU after session start; never blocks the greeting; failures only log | _always on_ | `app/livekit_worker.py` (`tts_warm_phrases` / `schedule_tts_warmup`) |
+| P7 | LLM response-length cap on our own OpenAI-compatible client paths (NOT the livekit-plugins-openai node — 0.10.x has no such param) | `VOICE_LLM_MAX_TOKENS` (300, 0 disables) | `app/pipeline/llm.py` + `app/config.py` |
+| P8 | Chat-history windowing — chat_ctx trimmed in place after each committed agent reply, at safe boundaries only (never between an assistant `tool_calls` message and its tool results; system message always retained) | `VOICE_LLM_HISTORY_MAX` (60 messages, 0 disables) | `app/livekit_worker.py` (`trim_chat_messages` + `ChatHistoryTrimHook`) |
+| P9 | Per-stage latency metrics: `voice_llm_first_token_seconds` (stream first chunk), `voice_tts_first_chunk_seconds` (stream_pcm first yield), `voice_turn_total_seconds` (user_speech_committed -> first agent audio via agent event hooks) | _always on_ | `app/metrics.py` + call sites |
+| P10 | Ollama serving: model kept resident (default 5m idle-unload otherwise costs a multi-second reload on the next call) + parallel decode slots | `OLLAMA_KEEP_ALIVE` (24h), `OLLAMA_NUM_PARALLEL` (2) — compose passthroughs | `docker-compose.fragment.yml` (ollama service) |
+
+Watch the new P9 series alongside the existing `voice_stt/llm/tts_latency_seconds`
+on the worker `/metrics` endpoint (`VOICE_WORKER_METRICS_PORT`, default 9464).
+
+## 6. Honest note (environment-blocked verification)
 
 Live model inference (whisper / MMS / Spitch / Azure) and live LiveKit
 round-trips are **not runnable in this development environment**, so the

@@ -6,7 +6,10 @@ Two modes (env PIPER_MODE):
   contract (see docker-compose.fragment.yml).
 - `subprocess`: runs the local `piper` binary (env PIPER_BIN) with the voice
   model from PIPER_MODEL_DIR (env PIPER_VOICE, e.g. en_US-lessac-medium);
-  see README for model download.
+  see README for model download. SPEC-W71 P5: piper is invoked with
+  `--output-raw` (raw s16le mono on stdout at the voice's configured
+  `audio.sample_rate`, read from the voice `.onnx.json` and cached per
+  voice) — no temp file on the hot path.
 
 Both return signed-16-bit mono PCM at `sample_rate` (default 22050 Hz).
 """
@@ -17,7 +20,7 @@ import asyncio
 import io
 import os
 import re
-import tempfile
+import time
 import wave
 from collections import OrderedDict
 from typing import AsyncIterator, Protocol
@@ -127,6 +130,9 @@ class PiperTTS:
         # SPEC-W46 P4: LRU keyed (voice, text, format) — repeated phrases
         # (greetings, read-backs) skip synthesis entirely.
         self._cache = TtsLruCache(cache_size)
+        # SPEC-W71 P5: per-voice sample-rate cache (from the voice
+        # .onnx.json config) for the raw-stdout subprocess path.
+        self._voice_rates: dict[str, int] = {}
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -165,35 +171,83 @@ class PiperTTS:
         return pcm
 
     async def stream_pcm(self, text: str) -> AsyncIterator[bytes]:
-        """Sentence-level streaming synthesis (SPEC-W46 P4).
+        """Sentence-level streaming synthesis (SPEC-W46 P4, SPEC-W71 P4/P9).
 
         Full-utterance cache hits ship the whole buffer immediately;
         otherwise each sentence chunk is synthesized (and cached) in turn,
         so the first audio frame is available after the FIRST chunk's
         synthesis instead of the full utterance. Chunk PCM is concatenated
         into the full-utterance cache entry for the next repeat.
+
+        SPEC-W71 P4 (depth-1 prefetch): while chunk N is awaited/yielded,
+        chunk N+1's synthesis is already in flight as an asyncio task —
+        multi-sentence latency drops from sum(chunk times) toward
+        ~max(chunk times) + first chunk. Preserved semantics: chunks still
+        populate the full-utterance cache entry in ORIGINAL order (parts
+        are appended in iteration order, never completion order),
+        empty-chunk skipping is unchanged, and a prefetch failure raises at
+        exactly the iteration where the sequential path would have raised
+        it. An early exit (generator close) cancels the pending prefetch so
+        no task leaks.
+
+        SPEC-W71 P9: time-to-first-yield is observed on
+        ``voice_tts_first_chunk_seconds`` (every path, cache hits included).
         """
         text = text.strip()
         if not text:
             return
+        started = time.perf_counter()
+        first_yield = True
+
+        def _mark_first_chunk() -> None:
+            nonlocal first_yield
+            if first_yield:
+                first_yield = False
+                metrics.get_registry().tts_first_chunk.observe(
+                    time.perf_counter() - started
+                )
+
         cache_key = (self.voice, text, "pcm")
         cached = self._cache.get(cache_key)
         if cached is not None:
             metrics.session_tts()
+            _mark_first_chunk()
             yield cached
             return
         chunks = split_sentences(text)
         if len(chunks) <= 1:
             pcm = await self.synthesize_pcm(text)
             if pcm:
+                _mark_first_chunk()
                 yield pcm
             return
         parts: list[bytes] = []
-        for chunk in chunks:
-            pcm = await self.synthesize_pcm(chunk)
-            if pcm:
-                parts.append(pcm)
-                yield pcm
+        next_task: asyncio.Task | None = asyncio.ensure_future(
+            self.synthesize_pcm(chunks[0])
+        )
+        try:
+            for i in range(len(chunks)):
+                task, next_task = next_task, None
+                if i + 1 < len(chunks):
+                    # Prefetch depth 1: chunk i+1 synthesizes while chunk i
+                    # is awaited and yielded.
+                    next_task = asyncio.ensure_future(
+                        self.synthesize_pcm(chunks[i + 1])
+                    )
+                pcm = await task  # this chunk's error surfaces at ITS index
+                if pcm:
+                    parts.append(pcm)
+                    _mark_first_chunk()
+                    yield pcm
+        finally:
+            if next_task is not None:
+                # Early exit (consumer closed the generator): never leak the
+                # prefetch task; a completed-but-unconsumed prefetch error is
+                # retrieved so asyncio does not log "never retrieved".
+                if not next_task.done():
+                    next_task.cancel()
+                elif not next_task.cancelled():
+                    next_task.exception()
         if parts:
             self._cache.set(cache_key, b"".join(parts))
 
@@ -229,46 +283,92 @@ class PiperTTS:
         return resp.content
 
     async def _synthesize_subprocess(self, text: str) -> tuple[bytes, int]:
-        return _wav_to_pcm(await self._subprocess_wav(text, self.voice))
+        return await self._subprocess_pcm(text, self.voice)
 
-    async def _subprocess_wav(self, text: str, voice: str) -> bytes:
+    def _voice_sample_rate(self, voice: str) -> int:
+        """Sample rate for `voice` from its piper ``.onnx.json`` config
+        (``audio.sample_rate``), cached per voice (SPEC-W71 P5).
+
+        The raw-stdout path carries no WAV header, so the rate MUST come
+        from the voice config. Falls back to ``self.sample_rate`` (with a
+        warning) when the config is missing or unparseable."""
+        cached = self._voice_rates.get(voice)
+        if cached is not None:
+            return cached
+        rate = 0
+        config_path = os.path.join(self.model_dir, f"{voice}.onnx.json")
+        try:
+            import json
+
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            rate = int((cfg.get("audio") or {}).get("sample_rate") or 0)
+        except Exception as exc:  # noqa: BLE001 - degrade to default rate
+            log.warning(
+                "piper voice config unreadable; using default sample rate",
+                voice=voice,
+                error=str(exc)[:200],
+            )
+        if rate <= 0:
+            rate = self.sample_rate
+        self._voice_rates[voice] = rate
+        return rate
+
+    async def _subprocess_pcm(self, text: str, voice: str) -> tuple[bytes, int]:
+        """SPEC-W71 P5: piper synthesis straight from stdout — no temp file
+        on the hot path.
+
+        Flag verified against the piper-tts 1.8.0 wheel
+        (``piper/__main__.py`` argparse): ``--output-raw`` (alias
+        ``--output_raw``) streams raw signed-16-bit little-endian mono audio
+        to stdout at the voice's configured sample rate, and piper reads the
+        text from stdin when no ``--input-file`` is given (same as the
+        pre-W71 temp-file path). (Code-level fallback note: piper also
+        accepts ``--output_file -`` for WAV-to-stdout; the raw path is the
+        proven single path used here.)
+        """
         model = os.path.join(self.model_dir, f"{voice}.onnx")
         config = os.path.join(self.model_dir, f"{voice}.onnx.json")
+        rate = self._voice_sample_rate(voice)
 
         # Run the blocking subprocess in a thread to keep the event loop free.
         def _exec() -> bytes:
             import subprocess
 
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                out_path = tmp.name
-            try:
-                cmd = [
-                    self.piper_bin,
-                    "--model",
-                    model,
-                    "--config",
-                    config,
-                    "--output_file",
-                    out_path,
-                ]
-                proc = subprocess.run(
-                    cmd,
-                    input=text.encode("utf-8"),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=self._timeout,
-                    check=False,
+            cmd = [
+                self.piper_bin,
+                "--model",
+                model,
+                "--config",
+                config,
+                "--output-raw",
+            ]
+            proc = subprocess.run(
+                cmd,
+                input=text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self._timeout,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"piper exited {proc.returncode}: {proc.stderr.decode(errors='replace')[:512]}"
                 )
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"piper exited {proc.returncode}: {proc.stderr.decode(errors='replace')[:512]}"
-                    )
-                with open(out_path, "rb") as fh:
-                    return fh.read()
-            finally:
-                try:
-                    os.unlink(out_path)
-                except OSError:
-                    pass
+            return proc.stdout
 
-        return await asyncio.to_thread(_exec)
+        return await asyncio.to_thread(_exec), rate
+
+    async def _subprocess_wav(self, text: str, voice: str) -> bytes:
+        """RIFF wav bytes for `text` (consumed by the chain's piper adapter).
+
+        SPEC-W71 P5: the WAV container is assembled in memory around the
+        raw stdout PCM — no temp file is created on any path."""
+        pcm, rate = await self._subprocess_pcm(text, voice)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(pcm)
+        return buf.getvalue()

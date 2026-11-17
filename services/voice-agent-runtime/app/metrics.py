@@ -16,6 +16,9 @@ Series:
 - voice_active_sessions       (gauge)
 - voice_emergency_sessions_total (counter) — SPEC-W11 Part C emergency lane
 - voice_agent_resolution_total (counter, label source) — SPEC-W38 F1 registry
+- voice_llm_first_token_seconds  (histogram) — SPEC-W71 P9 stream TTFC
+- voice_tts_first_chunk_seconds  (histogram) — SPEC-W71 P9 stream_pcm first yield
+- voice_turn_total_seconds       (histogram) — SPEC-W71 P9 user commit -> first agent audio
 """
 
 from __future__ import annotations
@@ -195,6 +198,23 @@ class Registry:
             "Dialed-number resolution outcomes by source.",
             ("source",),
         )
+        # SPEC-W71 P9: per-stage latency breakdown. llm_first_token is
+        # observed on the streaming tool-loop path (first SSE chunk after
+        # the request); tts_first_chunk on PiperTTS.stream_pcm
+        # (time-to-first-yield, cache hits included); turn_total in the
+        # LiveKit worker (user_speech_committed -> agent_started_speaking).
+        self.llm_first_token = Histogram(
+            "voice_llm_first_token_seconds",
+            "LLM streaming time-to-first-chunk per request.",
+        )
+        self.tts_first_chunk = Histogram(
+            "voice_tts_first_chunk_seconds",
+            "TTS stream_pcm time-to-first-yield per utterance.",
+        )
+        self.turn_total = Histogram(
+            "voice_turn_total_seconds",
+            "Voice turn total: user_speech_committed -> first agent audio.",
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -208,6 +228,9 @@ class Registry:
             self.active_sessions,
             self.emergency_sessions,
             self.agent_resolution,
+            self.llm_first_token,
+            self.tts_first_chunk,
+            self.turn_total,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"

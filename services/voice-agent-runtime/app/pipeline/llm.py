@@ -53,12 +53,32 @@ class OpenAICompatibleLLM:
         model: str,
         api_key: str = "ollama",
         timeout_s: float | None = None,
+        # SPEC-W71 P7: response-length cap (VOICE_LLM_MAX_TOKENS) applied on
+        # OUR OWN client paths only (chat_with_tools / stream_with_tools) —
+        # spoken replies are bounded, bounding LLM decode time per turn.
+        # 0 disables (the kwarg is then omitted from the request). The
+        # livekit-plugins-openai node is deliberately NOT touched (0.10.x
+        # has no such param).
+        max_tokens: int = 0,
     ) -> None:
         kwargs: dict[str, Any] = {"base_url": base_url, "api_key": api_key}
         if timeout_s is not None:
             kwargs["timeout"] = timeout_s
         self._client = AsyncOpenAI(**kwargs)
         self.model = model
+        self._max_tokens = max_tokens
+
+    def _create_kwargs(self, messages: list[dict[str, Any]], tools) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools or None,
+            "tool_choice": "auto" if tools else None,
+            "temperature": 0.3,
+            # SPEC-W71 P7: None = omitted by the openai client (0 disables).
+            "max_tokens": self._max_tokens or None,
+        }
+        return kwargs
 
     async def chat_with_tools(
         self,
@@ -69,11 +89,7 @@ class OpenAICompatibleLLM:
         try:
             with timer:
                 resp = await self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools or None,
-                    tool_choice="auto" if tools else None,
-                    temperature=0.3,
+                    **self._create_kwargs(messages, tools)
                 )
         finally:
             metrics.session_llm_latency(timer.elapsed)  # per-session quality
@@ -99,11 +115,7 @@ class OpenAICompatibleLLM:
         try:
             with timer:
                 stream = await self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools or None,
-                    tool_choice="auto" if tools else None,
-                    temperature=0.3,
+                    **self._create_kwargs(messages, tools),
                     stream=True,
                     stream_options={"include_usage": True},
                 )
@@ -270,6 +282,7 @@ def build_llm(settings) -> LLMInterface:
         model=settings.llm_model,
         api_key=settings.llm_api_key,
         timeout_s=settings.llm_timeout_s,
+        max_tokens=getattr(settings, "voice_llm_max_tokens", 300),
     )
     if not settings.llm_fallback_base_url:
         return primary
@@ -278,6 +291,7 @@ def build_llm(settings) -> LLMInterface:
         model=settings.llm_fallback_model or settings.llm_model,
         api_key=settings.llm_fallback_api_key or "none",
         timeout_s=settings.llm_timeout_s,
+        max_tokens=getattr(settings, "voice_llm_max_tokens", 300),
     )
     return FallbackLLM(
         primary,
@@ -382,11 +396,20 @@ async def run_tool_loop_stream(
     trace: list[dict[str, Any]] = []
     final_text = ""
     for _round in range(max_rounds):
+        # SPEC-W71 P9: voice_llm_first_token_seconds — request start to the
+        # first SSE chunk of this round's stream (observed once per round).
+        request_started = time.perf_counter()
         stream = await llm.stream_with_tools(messages, tools)
+        first_chunk_marked = False
         content_parts: list[str] = []
         # Assemble incremental tool-call fragments by their `index` slot.
         tc_acc: dict[int, dict[str, Any]] = {}
         async for chunk in stream:
+            if not first_chunk_marked:
+                first_chunk_marked = True
+                metrics.get_registry().llm_first_token.observe(
+                    time.perf_counter() - request_started
+                )
             _record_usage(getattr(chunk, "usage", None))
             choices = getattr(chunk, "choices", None) or []
             if not choices:

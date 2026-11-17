@@ -129,6 +129,10 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `VOICE_VAD_MIN_SILENCE_S` | `0.35` | W70 A1: silero VAD `min_silence_duration` (silero default 0.55) |
 | `VOICE_PREEMPTIVE_SYNTHESIS` | `true` | W70 A1: start LLM+TTS synthesis before end-of-turn finalizes (LiveKit 0.10 `preemptive_synthesis`, framework default false). All three knobs are wired via signature introspection against the pinned livekit-agents 0.10.x API (unsupported keys on a future 0.10.x patch drop with one info log, framework default applies; the applied/dropped set is logged at startup) |
 | `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | `auto` / `int8` | ctranslate2 device/precision |
+| `WHISPER_CPU_THREADS` / `WHISPER_NUM_WORKERS` | `0` / `1` | W71 P3: CTranslate2 threads per model (0 = auto) / parallel decode workers, passed to every WhisperModel construction |
+| `VOICE_LLM_MAX_TOKENS` | `300` | W71 P7: LLM response-length cap on our own OpenAI-compatible client paths (chat/tool loops); `0` disables. The livekit-plugins-openai node is intentionally not touched (0.10.x has no such param) |
+| `VOICE_LLM_HISTORY_MAX` | `60` | W71 P8: in-call chat-history window (messages); trimmed in place after each committed agent reply at safe boundaries only (never between an assistant tool_calls message and its tool results; system message retained). `0` disables |
+| `OLLAMA_KEEP_ALIVE` / `OLLAMA_NUM_PARALLEL` | `24h` / `2` | W71 P10: compose passthroughs to the ollama service — keep the model resident (5m idle-unload default costs a multi-second reload) and bound concurrent decode slots |
 | `STT_STREAM_WINDOW_S` / `STT_STREAM_HOP_S` | `1.0` / `0.25` | W48-C `/v1/stt/stream`: rolling inference window / hop (seconds) |
 | `STT_STREAM_SILENCE_MS` | `700` | W48-C: trailing silence that endpoints an utterance into a `final` event |
 | `STT_STREAM_MAX_BUFFER_S` | `8` | W48-C: undrained-input backpressure bound (overflow → WS close 1008) |

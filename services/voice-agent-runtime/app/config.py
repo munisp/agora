@@ -85,6 +85,14 @@ class Settings:
     # language (forced language= or last auto-detection) is non-English —
     # the accuracy tier for yo/ig/ha. Empty = off (single-model behavior).
     whisper_model_multilingual: str = ""
+    # SPEC-W71 P3: CTranslate2 thread tuning, passed to every WhisperModel
+    # construction (default + multilingual override). whisper_cpu_threads
+    # (WHISPER_CPU_THREADS, default 0 = CTranslate2 auto) sets the threads
+    # per worker; whisper_num_workers (WHISPER_NUM_WORKERS, default 1) sets
+    # the parallel decode workers. Both are throughput/latency levers on
+    # multi-core hosts; defaults preserve pre-W71 behavior exactly.
+    whisper_cpu_threads: int = 0
+    whisper_num_workers: int = 1
 
     # SPEC-W70 A1: turn-taking / endpointing latency tuning, wired into
     # VoicePipelineAgent + silero.VAD.load via signature introspection
@@ -98,6 +106,19 @@ class Settings:
     voice_min_endpointing_delay: float = 0.3
     voice_vad_min_silence_s: float = 0.35
     voice_preemptive_synthesis: bool = True
+    # SPEC-W71 P7: LLM response-length cap (VOICE_LLM_MAX_TOKENS, default
+    # 300, 0 disables) applied ONLY on our own OpenAI-compatible client
+    # paths (app/pipeline/llm.py chat_with_tools / stream_with_tools) —
+    # spoken replies are bounded, which bounds LLM decode time and
+    # time-to-first-TTS per turn. The livekit-plugins-openai node is NOT
+    # touched (0.10.x has no such param — W70 lesson).
+    voice_llm_max_tokens: int = 300
+    # SPEC-W71 P8: chat-history windowing (VOICE_LLM_HISTORY_MAX, default 60
+    # messages, 0 disables). The in-call chat_ctx is trimmed in place after
+    # each agent reply commits, at safe boundaries only (never between an
+    # assistant tool_calls message and its tool results; the system message
+    # is always retained) — unbounded history inflates every turn's TTFT.
+    voice_llm_history_max: int = 60
     # SPEC-W48-C: streaming STT endpoint (/v1/stt/stream, WebSocket).
     # Rolling-window chunked inference: window_s of audio re-transcribed
     # every hop_s; an utterance endpoints after silence_ms of trailing
@@ -316,10 +337,14 @@ def load_settings() -> Settings:
         whisper_device=_env("WHISPER_DEVICE", "auto"),
         whisper_compute_type=_env("WHISPER_COMPUTE_TYPE", "int8"),
         whisper_model_multilingual=_env("WHISPER_MODEL_MULTILINGUAL", "").strip(),
+        whisper_cpu_threads=_env_int("WHISPER_CPU_THREADS", 0),
+        whisper_num_workers=_env_int("WHISPER_NUM_WORKERS", 1),
         voice_min_endpointing_delay=_env_float("VOICE_MIN_ENDPOINTING_DELAY", 0.3),
         voice_vad_min_silence_s=_env_float("VOICE_VAD_MIN_SILENCE_S", 0.35),
         voice_preemptive_synthesis=_env("VOICE_PREEMPTIVE_SYNTHESIS", "true").lower()
         not in ("0", "false", "no"),
+        voice_llm_max_tokens=_env_int("VOICE_LLM_MAX_TOKENS", 300),
+        voice_llm_history_max=_env_int("VOICE_LLM_HISTORY_MAX", 60),
         stt_stream_window_s=float(os.environ.get("STT_STREAM_WINDOW_S", "1.0")),
         stt_stream_hop_s=float(os.environ.get("STT_STREAM_HOP_S", "0.25")),
         stt_stream_silence_ms=_env_int("STT_STREAM_SILENCE_MS", 700),

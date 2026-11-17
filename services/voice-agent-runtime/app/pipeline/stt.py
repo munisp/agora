@@ -86,11 +86,18 @@ class FasterWhisperSTT:
         device: str = "auto",
         compute_type: str = "int8",
         multilingual_model: str = "",
+        # SPEC-W71 P3: CTranslate2 thread tuning (WHISPER_CPU_THREADS /
+        # WHISPER_NUM_WORKERS), passed to every WhisperModel construction.
+        # cpu_threads=0 keeps the CTranslate2 auto default.
+        cpu_threads: int = 0,
+        num_workers: int = 1,
     ) -> None:
         self._model_size = model_size
         self._device = device
         self._compute_type = compute_type
         self._multilingual_model = (multilingual_model or "").strip()
+        self._cpu_threads = cpu_threads
+        self._num_workers = num_workers
         # Per-model-size cache + locks (SPEC-W70 A2).
         self._models: dict[str, Any] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -135,7 +142,16 @@ class FasterWhisperSTT:
             device=device,
             compute_type=self._compute_type,
         )
-        return WhisperModel(model_size, device=device, compute_type=self._compute_type)
+        # SPEC-W71 P3: cpu_threads (0 = CTranslate2 auto) and num_workers are
+        # real faster-whisper WhisperModel ctor kwargs (CTranslate2 thread
+        # tuning), applied to the default AND the multilingual model alike.
+        return WhisperModel(
+            model_size,
+            device=device,
+            compute_type=self._compute_type,
+            cpu_threads=self._cpu_threads,
+            num_workers=self._num_workers,
+        )
 
     async def _ensure_model(self, model_size: str | None = None):
         size = model_size or self._model_size
@@ -220,6 +236,16 @@ class FasterWhisperSTT:
                 # hallucination loops / repetition on noisy Naija audio and
                 # slows the decode. Behavior fix, deliberately NOT a knob.
                 condition_on_previous_text=False,
+                # SPEC-W71 P2: decode fast-path. temperature=0.0 disables
+                # faster-whisper's multi-temperature fallback re-decode
+                # (each fallback is a FULL extra decode pass on
+                # compression-ratio/logprob failures); greedy single-pass is
+                # the right default for gated telephony turns.
+                temperature=0.0,
+                # SPEC-W71 P2: segment timestamps are unused (the upstream
+                # silero VAD already gates speech) — skipping them avoids
+                # timestamp-token constraint decoding on every segment.
+                without_timestamps=True,
             )
             # Only trust auto-detection; a forced language= is not a detection.
             if language is None:

@@ -193,6 +193,9 @@ class TestIntrospectionFilter:
         assert out == kwargs
 
     def test_load_vad_uses_tuned_silence(self, monkeypatch):
+        # SPEC-W71 P1 (sanctioned update): _load_vad is now cached
+        # process-wide; clear the cache so this test observes its own load.
+        lw._vad_cache_clear()
         calls = []
 
         class _VAD:
@@ -206,6 +209,8 @@ class TestIntrospectionFilter:
         assert calls == [0.35]
 
     def test_load_vad_drops_knob_when_signature_lacks_it(self, monkeypatch):
+        # SPEC-W71 P1 (sanctioned update): see above.
+        lw._vad_cache_clear()
         calls = []
 
         class _VAD:

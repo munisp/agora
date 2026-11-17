@@ -31,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import threading
+import time
 import uuid
 from typing import Any, AsyncIterable, Optional
 
@@ -44,7 +46,7 @@ from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
 from . import emergency, metrics, sip
-from .async_tools import AsyncToolRunner, ToolAckPolicy
+from .async_tools import SLOW_TOOLS, AsyncToolRunner, ToolAckPolicy
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from .events import new_cloudevent, session_lifecycle_data
@@ -89,6 +91,18 @@ PREWARM_PHRASE = "Hello, thank you for calling. How can I help you today?"
 # ---------------------------------------------------------------------------
 _DROPPED_KWARGS_LOGGED: set[str] = set()
 _APPLIED_KWARGS_LOGGED: set[str] = set()
+
+# SPEC-W71 P1: process-wide silero VAD cache (see _load_vad). Keyed by the
+# tuned (post-introspection) kwargs dict; a threading.Lock guards both the
+# lookup and the load so concurrent job threads race-safe.
+_VAD_CACHE: dict[tuple, Any] = {}
+_VAD_CACHE_LOCK = threading.Lock()
+
+
+def _vad_cache_clear() -> None:
+    """Test hook: drop all cached VAD instances."""
+    with _VAD_CACHE_LOCK:
+        _VAD_CACHE.clear()
 
 
 def filter_supported_kwargs(
@@ -146,13 +160,26 @@ def _agent_tuning_kwargs(settings: Settings) -> dict[str, Any]:
 
 
 def _load_vad(settings: Settings) -> Any:
-    """silero.VAD.load with the tuned min_silence_duration (SPEC-W70 A1)."""
+    """silero.VAD.load with the tuned min_silence_duration (SPEC-W70 A1),
+    cached process-wide (SPEC-W71 P1).
+
+    build_voice_agent runs per job; without the cache the silero model was
+    re-loaded on EVERY session. One VAD instance per tuned-kwargs
+    combination is kept per process (thread-safe lazy singleton; the load
+    runs under the lock so concurrent builds are race-safe). Warm
+    processes skip the load entirely."""
     kwargs = filter_supported_kwargs(
         silero.VAD.load,
         {"min_silence_duration": settings.voice_vad_min_silence_s},
         label="silero.VAD.load",
     )
-    return silero.VAD.load(**kwargs)
+    key = tuple(sorted(kwargs.items()))
+    with _VAD_CACHE_LOCK:
+        vad = _VAD_CACHE.get(key)
+        if vad is None:
+            vad = silero.VAD.load(**kwargs)
+            _VAD_CACHE[key] = vad
+    return vad
 
 
 def _build_stt(settings: Settings) -> FasterWhisperSTT:
@@ -162,6 +189,9 @@ def _build_stt(settings: Settings) -> FasterWhisperSTT:
         compute_type=settings.whisper_compute_type,
         # SPEC-W70 A2: optional multilingual accuracy tier (empty = off).
         multilingual_model=settings.whisper_model_multilingual,
+        # SPEC-W71 P3: CTranslate2 thread tuning (0 = auto / 1 worker).
+        cpu_threads=settings.whisper_cpu_threads,
+        num_workers=settings.whisper_num_workers,
     )
 
 
@@ -605,6 +635,170 @@ class EmergencyTurnHook:
 
 
 # ---------------------------------------------------------------------------
+# SPEC-W71 P6: mid-call phrase cache warming.
+#
+# After the session has started (and the greeting is queued — warming NEVER
+# blocks it), a fire-and-forget task synthesizes the phrases the agent is
+# most likely to speak mid-call: the tool-ack/filler lines (derived from
+# the REAL ToolAckPolicy for this tenant — overrides, per-industry
+# defaults, the DEFAULT_ACK fallback) plus the standard closers. They land
+# in the TTS LRU (chain-level + piper-level), so the filler line spoken
+# while a slow tool runs is served from memory. Warm failures only log.
+# ---------------------------------------------------------------------------
+TTS_WARM_CLOSERS: tuple[str, ...] = (
+    "Is there anything else I can help you with?",
+    "Thank you for calling. Goodbye.",
+)
+
+
+def tts_warm_phrases(ack_policy: ToolAckPolicy | None) -> list[str]:
+    """The mid-call TTS warm set: every ack line the given ToolAckPolicy can
+    produce for the slow tools, plus the standard closers. Deduped,
+    order-stable."""
+    phrases: list[str] = []
+    if ack_policy is not None:
+        for tool in sorted(SLOW_TOOLS):
+            ack = ack_policy.ack_for(tool)
+            if ack and ack.strip():
+                phrases.append(ack.strip())
+    phrases.extend(TTS_WARM_CLOSERS)
+    seen: set[str] = set()
+    out: list[str] = []
+    for phrase in phrases:
+        if phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+    return out
+
+
+async def _warm_tts_cache(impl: Any, phrases: list[str]) -> None:
+    """Background TTS LRU warming. Failure-tolerant by contract: a warm
+    failure only logs — the live call is unaffected."""
+    for phrase in phrases:
+        try:
+            await impl.synthesize_pcm(phrase)
+        except Exception as exc:  # noqa: BLE001 - warm failure only logs
+            log.warning("tts warm failed", phrase=phrase[:60], error=str(exc)[:200])
+    log.info("tts warm pass complete", phrases=len(phrases))
+
+
+def schedule_tts_warmup(agent: Any, ack_policy: ToolAckPolicy | None) -> bool:
+    """Schedule the mid-call TTS warm pass (asyncio.create_task). Call AFTER
+    agent.start + the greeting, so warming never delays the caller's first
+    audio. Returns False (and logs) instead of raising when there is no
+    warmable impl or the warm set is empty.
+
+    The impl is reached via the agent's public ``tts`` node
+    (VoicePipelineAgent.tts, verified in the 0.10.2 wheel) and the
+    PiperTTSNode's wrapped chain."""
+    try:
+        node = getattr(agent, "tts", None)
+        impl = getattr(node, "_impl", None)  # PiperTTSNode wraps the chain
+        synth = getattr(impl, "synthesize_pcm", None)
+        phrases = tts_warm_phrases(ack_policy)
+        if synth is None or not phrases:
+            log.warning("tts warmup skipped: no synthesizable impl or empty warm set")
+            return False
+        asyncio.create_task(_warm_tts_cache(impl, phrases))
+        return True
+    except Exception as exc:  # noqa: BLE001 - never break session startup
+        log.warning("tts warmup scheduling failed", error=str(exc)[:200])
+        return False
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W71 P8: chat-history windowing. chat_ctx grows unbounded within a
+# call, inflating every turn's TTFT; it is trimmed in place after each
+# agent reply commits (agent_speech_committed), at SAFE boundaries only.
+# ---------------------------------------------------------------------------
+def _msg_role(message: Any) -> str:
+    role = getattr(message, "role", None)
+    if role is None and isinstance(message, dict):
+        role = message.get("role")
+    return str(role or "")
+
+
+def trim_chat_messages(messages: list, max_messages: int) -> list:
+    """Bound a chat-context message list at SAFE boundaries (pure function;
+    works on livekit ChatMessage and plain test doubles alike).
+
+    Retains the leading system message, then the newest messages up to
+    ``max_messages`` total — walking the cut point BACKWARD (toward older
+    messages) to a user-or-system boundary, so an assistant message
+    carrying ``tool_calls`` is never separated from its tool-result
+    messages (the retained window never starts mid-tool-exchange).
+    ``max_messages <= 0`` disables trimming. Returns a NEW list; callers
+    assign in place (``msgs[:] = ...``)."""
+    if max_messages <= 0 or len(messages) <= max_messages:
+        return list(messages)
+    head = list(messages[:1]) if messages and _msg_role(messages[0]) == "system" else []
+    body = list(messages[len(head):])
+    keep = max_messages - len(head)
+    if keep <= 0:
+        return list(head)
+    cut = len(body) - keep
+    while cut > 0 and _msg_role(body[cut]) not in ("user", "system"):
+        cut -= 1
+    return head + body[cut:]
+
+
+class ChatHistoryTrimHook:
+    """SPEC-W71 P8: trim the agent chat_ctx after each committed agent reply
+    (``agent_speech_committed`` — event name verified against the
+    livekit-agents 0.10.2 wheel). Never raises; disabled when the cap is
+    <= 0."""
+
+    def __init__(self, agent: Any, max_messages: int) -> None:
+        self._agent = agent
+        self._max = max_messages
+
+    def __call__(self, *_args: Any, **_kwargs: Any) -> None:
+        if self._max <= 0:
+            return
+        try:
+            chat_ctx = getattr(self._agent, "chat_ctx", None)
+            if chat_ctx is None:
+                return
+            msgs = chat_ctx.messages
+            trimmed = trim_chat_messages(msgs, self._max)
+            if len(trimmed) < len(msgs):
+                msgs[:] = trimmed
+                log.info(
+                    "chat history trimmed", kept=len(trimmed), cap=self._max
+                )
+        except Exception as exc:  # noqa: BLE001 - never break the call
+            log.warning("chat history trim failed", error=str(exc)[:200])
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W71 P9: turn-total latency (voice_turn_total_seconds).
+# ---------------------------------------------------------------------------
+class TurnLatencyHook:
+    """voice_turn_total_seconds = user_speech_committed -> first agent audio
+    (``agent_started_speaking``, the pipeline's first agent-audio-frame
+    event; both event names verified against the livekit-agents 0.10.2
+    wheel).
+
+    A filler ack line spoken while a slow tool runs IS agent audio and
+    legitimately ends the caller's perceived turn wait; the greeting fires
+    agent_started_speaking without a preceding user turn and is ignored.
+    """
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._turn_started: float | None = None
+
+    def on_user_committed(self, *_args: Any, **_kwargs: Any) -> None:
+        self._turn_started = self._clock()
+
+    def on_agent_speaking(self, *_args: Any, **_kwargs: Any) -> None:
+        started, self._turn_started = self._turn_started, None
+        if started is None:
+            return
+        metrics.get_registry().turn_total.observe(self._clock() - started)
+
+
+# ---------------------------------------------------------------------------
 # Session wiring
 # ---------------------------------------------------------------------------
 async def _publish_lifecycle(
@@ -799,6 +993,17 @@ async def build_voice_agent(
         )
     except Exception as exc:  # noqa: BLE001 - detection off, call unaffected
         log.warning("emergency hook registration failed", error=str(exc)[:200])
+    # SPEC-W71 P8: chat-history windowing — trim the chat_ctx in place after
+    # each committed agent reply, at safe boundaries only (disabled when
+    # VOICE_LLM_HISTORY_MAX <= 0).
+    if settings.voice_llm_history_max > 0:
+        try:
+            agent.on(
+                "agent_speech_committed",
+                ChatHistoryTrimHook(agent, settings.voice_llm_history_max),
+            )
+        except Exception as exc:  # noqa: BLE001 - trimming off, call unaffected
+            log.warning("history trim hook registration failed", error=str(exc)[:200])
     return agent, ctx, session
 
 
@@ -864,6 +1069,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     try:
         # Turn = one committed user utterance (livekit-agents 0.10.x event).
         agent.on("user_speech_committed", lambda *_a, **_k: metrics.session_turn())
+        # SPEC-W71 P9: turn-total latency (user commit -> first agent audio).
+        turn_latency = TurnLatencyHook()
+        agent.on("user_speech_committed", turn_latency.on_user_committed)
+        agent.on("agent_started_speaking", turn_latency.on_agent_speaking)
     except Exception as exc:  # noqa: BLE001 - event surface may shift; turns stay 0
         log.warning("turn counting unavailable", error=str(exc)[:200])
 
@@ -885,6 +1094,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         build_greeting(tenant_ctx),
         allow_interruptions=True,
     )
+    # SPEC-W71 P6: warm the TTS LRU mid-call with the tool-ack/filler phrases
+    # (derived from this tenant's ToolAckPolicy) + standard closers. Scheduled
+    # AFTER session start and the greeting — fire-and-forget; failures log.
+    schedule_tts_warmup(agent, ToolAckPolicy.from_context(tenant_ctx))
 
     @ctx.room.on("disconnected")
     def _on_disconnected(*args) -> None:  # noqa: ARG001
