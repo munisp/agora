@@ -672,6 +672,9 @@ class ToolLayer:
         contact_name: str | None = None,
         email: str | None = None,
     ) -> dict[str, Any]:
+        # The model often sends a bare local time; booking dead-lettered "bad starts_at" and the caller had been told
+        # the visit was booked. Read it in the business's time zone, as for availability.
+        starts_at = _rfc3339(starts_at, self._ctx.timezone)
         try:
             confirmed = self._require_phone(phone)
         except PhoneConfirmationRequired as pcr:
@@ -866,6 +869,7 @@ class ToolLayer:
     async def reschedule_appointment(
         self, booking_id: str, starts_at: str, phone: str
     ) -> dict[str, Any]:
+        starts_at = _rfc3339(starts_at, self._ctx.timezone)
         gate = self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("reschedule_appointment", gate)

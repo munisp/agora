@@ -30,3 +30,10 @@ def test_bare_times_become_rfc3339_in_the_business_zone():
     assert _rfc3339("2026-11-18T08:00:00Z", "Africa/Lagos") == "2026-11-18T08:00:00+00:00"
     assert _rfc3339("2026-11-18T08:00:00+01:00", "Africa/Lagos") == "2026-11-18T08:00:00+01:00"
     assert _rfc3339("next wednesday", "Africa/Lagos") == "next wednesday"
+
+
+def test_bare_booking_time_gets_the_business_offset():
+    from app.tools import _rfc3339
+
+    assert _rfc3339("2026-11-25T09:00:00", "Africa/Lagos") == "2026-11-25T09:00:00+01:00"
+    assert _rfc3339("2026-11-25T09:00:00Z", "Africa/Lagos") == "2026-11-25T09:00:00+00:00"

@@ -45,6 +45,15 @@ ASR_LANG = {"ig": "ibo", "yo": "yor", "ha": "hau", "pcm": "pcm", "ful": "ful"}
 LID_CODE = {"en": "eng", "pcm": "pcm", "yo": "yor", "ha": "hau", "ig": "ibo", "ful": "ful"}
 WAVTOK_CKPT = os.environ.get("WAVTOKENIZER_CKPT", "/models/wavtokenizer_large_speech_320_24k.ckpt")
 GPU_SHARE = float(os.environ.get("YARN_GPU_MEMORY", "0.08"))
+# A sentence shorter than this many seconds per character was cut off by the model (normal speech is ~0.06-0.08).
+MIN_S_PER_CHAR = float(os.environ.get("YARN_MIN_S_PER_CHAR", "0.045"))
+YARN_RETRIES = int(os.environ.get("YARN_RETRIES", "2"))
+def letters(text: str) -> int:
+    """Spoken letters in `text`: no spaces, punctuation or tone marks (Yoruba diacritics would otherwise count twice)."""
+    import unicodedata
+    return sum(1 for ch in unicodedata.normalize("NFD", text) if ch.isalnum())
+
+
 GAP_S = 0.18  # pause between sentences
 MAX_CHARS = 1200
 
@@ -117,20 +126,46 @@ class Engines:
 
     # ------------------------------------------------------------------ TTS
     def yarn(self, text: str, lang: str, voice: str) -> tuple[np.ndarray, int]:
+        return self.yarn_many([(text, lang, voice, None)])[0], 24000
+
+    def yarn_many(self, items: list[tuple[str, str, str, Optional[float]]]) -> list[np.ndarray]:
+        """Several utterances in ONE vLLM batch (about as fast as one): every sentence of every item is a prompt.
+        items: (text, yarn language, voice, temperature or None). Returns 24 kHz audio per item."""
+        from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
 
-        chunks = sentences(text)
-        prompts = [TokensPrompt(prompt_token_ids=self.tok.tokenizer.encode(
-            self.tok.create_prompt(c, lang=lang, speaker_name=voice), add_special_tokens=False)) for c in chunks]
+        owner, chunks, prompts, params = [], [], [], []
+        for k, (text, lang, voice, temp) in enumerate(items):
+            for c in sentences(text):
+                owner.append(k); chunks.append(c)
+                prompts.append(TokensPrompt(prompt_token_ids=self.tok.tokenizer.encode(
+                    self.tok.create_prompt(c, lang=lang, speaker_name=voice), add_special_tokens=False)))
+                params.append(self.sp if temp is None else
+                              SamplingParams(temperature=temp, repetition_penalty=1.1, max_tokens=3000))
         with self.yarn_lock:
-            outs = self.llm.generate(prompts, self.sp, use_tqdm=False)
+            outs = self.llm.generate(prompts, params, use_tqdm=False)
+            codes = [self.tok.extract_integers(self.tok.tokenizer.decode(o.outputs[0].token_ids)) for o in outs]
+            # YarnGPT sometimes stops early and a sentence ends half-said ("cutting off"). WavTokenizer makes 75 codes
+            # a second; a sentence needs at least ~MIN_S_PER_CHAR seconds per letter. Short takes are generated
+            # again (a little warmer, so the retry differs) and the longest take is kept.
+            for attempt in range(YARN_RETRIES):
+                short = [i for i, c in enumerate(chunks) if len(codes[i]) / 75.0 < MIN_S_PER_CHAR * letters(c)]
+                if not short:
+                    break
+                retry = SamplingParams(temperature=0.3 + 0.2 * attempt, repetition_penalty=1.1, max_tokens=3000,
+                                       seed=1000 + attempt)
+                again = self.llm.generate([prompts[i] for i in short], retry, use_tqdm=False)
+                for i, o in zip(short, again):
+                    c = self.tok.extract_integers(self.tok.tokenizer.decode(o.outputs[0].token_ids))
+                    if len(c) > len(codes[i]):
+                        codes[i] = c
+                print(f"yarn: {len(short)} short sentence(s) regenerated (attempt {attempt + 1})", flush=True)
             gap = np.zeros(int(24000 * GAP_S), dtype=np.float32)
-            parts = []
-            for o in outs:
-                codes = self.tok.extract_integers(self.tok.tokenizer.decode(o.outputs[0].token_ids))
-                if codes:
-                    parts += [self._decode(codes).squeeze().float().numpy(), gap]
-        return (np.concatenate(parts[:-1]) if parts else np.zeros(0, np.float32)), 24000
+            parts: list[list[np.ndarray]] = [[] for _ in items]
+            for k, c in zip(owner, codes):
+                if c:
+                    parts[k] += [self._decode(c).squeeze().float().numpy(), gap]
+        return [np.concatenate(p[:-1]) if p else np.zeros(0, np.float32) for p in parts]
 
     def _decode(self, codes: list[int]) -> torch.Tensor:
         """WavTokenizer decode. On GB10 cuFFT has failed with CUFFT_INTERNAL_ERROR (seen 2026-11-16) and stayed broken
@@ -192,6 +227,14 @@ class TTSRequest(BaseModel):
     sample_rate: int = Field(default=24000, ge=8000, le=48000)
 
 
+class TTSBatchItem(TTSRequest):
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=1.5)
+
+
+class TTSBatchRequest(BaseModel):
+    items: list[TTSBatchItem] = Field(min_length=1, max_length=96)
+
+
 def create_app(engines: Engines) -> FastAPI:
     app = FastAPI(title="agora naija-speech")
 
@@ -231,6 +274,24 @@ def create_app(engines: Engines) -> FastAPI:
         audio = resample(audio, rate, req.sample_rate)
         return Response(wav_bytes(audio, req.sample_rate), media_type="audio/wav",
                         headers={"X-Engine": engine, "X-Seconds": f"{time.time() - started:.2f}"})
+
+    @app.post("/tts_batch")
+    def tts_batch(req: TTSBatchRequest) -> dict:
+        """Many YarnGPT utterances in one GPU batch (offline work such as narration): {"wavs": [base64 wav, ...]}."""
+        need_ready()
+        items = []
+        for it in req.items:
+            code = it.language.strip().lower()
+            if code not in YARN_LANG:
+                raise HTTPException(422, f"batch is for YarnGPT languages {sorted(YARN_LANG)}, not {code!r}")
+            lang = YARN_LANG[code]
+            items.append((it.text, lang, it.voice if it.voice in YARN_VOICES[lang] else YARN_VOICES[lang][0], it.temperature))
+        started = time.time()
+        audios = engines.yarn_many(items)
+        print(f"tts_batch: {len(items)} items in {time.time() - started:.1f}s", flush=True)
+        import base64
+        return {"wavs": [base64.b64encode(wav_bytes(resample(a, 24000, it.sample_rate), it.sample_rate)).decode()
+                         for a, it in zip(audios, req.items)]}
 
     @app.post("/asr")
     async def asr(request: Request, language: str = Query(...)) -> dict:
