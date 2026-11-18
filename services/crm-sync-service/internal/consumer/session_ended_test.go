@@ -140,7 +140,7 @@ func TestSessionEndedCreatesCallSummaryNoteViaPhoneLookup(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("expected 1 note, got %d; requests=%+v", len(notes), stub.requests)
 	}
-	body, _ := notes[0].body["body"].(string)
+	body, _ := noteText(notes[0].body), true
 	for _, want := range []string{
 		"📞 AI call summary",
 		"duration 95s",

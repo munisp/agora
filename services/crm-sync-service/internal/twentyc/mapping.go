@@ -2,6 +2,7 @@
 package twentyc
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -120,12 +121,29 @@ func TaskTitle(offering string, startsAt time.Time) string {
 	return fmt.Sprintf("%s appointment at %s", offering, startsAt.UTC().Format(time.RFC3339))
 }
 
+// RichText is Twenty's rich-text field (v1.x renamed tasks'/notes' "body" to "bodyV2"; the old field is rejected with
+// 400 "Field metadata for field body is missing"). Twenty converts the markdown to its own format.
+type RichText struct {
+	Markdown string `json:"markdown"`
+}
+
 // TaskCreate is the body for creating a Twenty Task.
 type TaskCreate struct {
-	Title  string `json:"title"`
-	Body   string `json:"body,omitempty"`
-	DueAt  string `json:"dueAt,omitempty"`
-	Status string `json:"status,omitempty"`
+	Title  string    `json:"title"`
+	Body   string    `json:"-"`
+	BodyV2 *RichText `json:"bodyV2,omitempty"`
+	DueAt  string    `json:"dueAt,omitempty"`
+	Status string    `json:"status,omitempty"`
+}
+
+// MarshalJSON sends Body as Twenty's bodyV2 rich text.
+func (t TaskCreate) MarshalJSON() ([]byte, error) {
+	type plain TaskCreate
+	p := plain(t)
+	if p.BodyV2 == nil && p.Body != "" {
+		p.BodyV2 = &RichText{Markdown: p.Body}
+	}
+	return json.Marshal(p)
 }
 
 // TaskFromBooking maps a booking event -> Task create body linked to a person.

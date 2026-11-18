@@ -429,7 +429,7 @@ func (c *Client) GetTask(ctx context.Context, id string) (TaskRecord, error) {
 
 // CreateNote creates a Note and links it to a person via /rest/noteTargets.
 func (c *Client) CreateNote(ctx context.Context, title, body, personID string) (string, error) {
-	id, err := c.create(ctx, "notes", map[string]string{"title": title, "body": body})
+	id, err := c.create(ctx, "notes", map[string]any{"title": title, "bodyV2": RichText{Markdown: body}})
 	if err != nil {
 		return "", err
 	}
@@ -445,5 +445,5 @@ func (c *Client) CreateNote(ctx context.Context, title, body, personID string) (
 // when a sentiment-enriched CallQualityEnriched event arrives after the
 // plain SessionEnded fallback already created the call-summary note).
 func (c *Client) UpdateNote(ctx context.Context, id, title, body string) error {
-	return c.patch(ctx, "notes", id, map[string]string{"title": title, "body": body})
+	return c.patch(ctx, "notes", id, map[string]any{"title": title, "bodyV2": RichText{Markdown: body}})
 }
