@@ -84,12 +84,53 @@ def test_second_lookup_is_run_and_answered():
     assert roles[-2:] == ["assistant", "tool"]  # the lookup and its result went back to the model
 
 
-def test_first_round_passes_straight_through():
-    inner = _ScriptedLLM([(["hi"], [])])
-    llm = ToolLoopLLM(inner)
-    ctx = lk_llm.ChatContext().append(role="user", text="hello")
-    stream = llm.chat(chat_ctx=ctx, fnc_ctx=_fnc_ctx([]))
-    assert isinstance(stream, _Stream)
+def _chunk(text):
+    try:
+        return lk_llm.ChatChunk(request_id="r", choices=[lk_llm.Choice(delta=lk_llm.ChoiceDelta(role="assistant", content=text))])
+    except TypeError:  # older ChatChunk without request_id
+        return lk_llm.ChatChunk(choices=[lk_llm.Choice(delta=lk_llm.ChoiceDelta(role="assistant", content=text))])
+
+
+def _text(chunks):
+    return "".join(c if isinstance(c, str) else "".join((ch.delta.content or "") for ch in c.choices) for c in chunks)
+
+
+def test_first_round_reply_passes_through_unchanged():
+    async def run():
+        inner = _ScriptedLLM([([_chunk("Hello, how can "), _chunk("I help you today?")], [])])
+        ctx = lk_llm.ChatContext().append(role="user", text="hello")
+        return await _collect(ToolLoopLLM(inner).chat(chat_ctx=ctx, fnc_ctx=_fnc_ctx([])))
+
+    assert _text(asyncio.run(run())) == "Hello, how can I help you today?"
+
+
+def test_unbacked_booking_claim_runs_book_appointment_first():
+    """gemma said "I have booked your clinic…" without calling the tool: the claim is held back, the model is told
+    to call book_appointment, the booking runs, and only the answer after it is spoken."""
+    async def run():
+        ran = []
+        fnc = _fnc_ctx(ran)
+
+        @fnc.ai_callable(description="Book")
+        async def book_appointment() -> str:
+            ran.append("book_appointment")
+            return json.dumps({"status": "accepted"})
+
+        inner = _ScriptedLLM([
+            ([_chunk("I have booked your enrollment clinic with Aisha Bello for Tuesday at 9. "), _chunk("Anything else?")], []),
+            ([], ["book_appointment"]),
+            ([_chunk("Your clinic with Aisha Bello is booked for Tuesday at 9.")], []),
+        ])
+        ctx = lk_llm.ChatContext().append(role="user", text="Nine o'clock is fine.")
+        out = await _collect(ToolLoopLLM(inner).chat(chat_ctx=ctx, fnc_ctx=fnc))
+        return ran, out, inner
+
+    ran, out, inner = asyncio.run(run())
+    assert ran == ["book_appointment"]
+    spoken = _text(out)
+    assert spoken == "Your clinic with Aisha Bello is booked for Tuesday at 9."  # the unbacked claim was never spoken
+    assert any("book_appointment has NOT been called" in (m.content if isinstance(m.content, str) else " ".join(map(str, m.content)))
+               for m in inner.contexts[1].messages if m.role == "system")
 
 
 def test_rounds_are_capped_and_last_round_has_no_tools():
