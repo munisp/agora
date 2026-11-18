@@ -132,6 +132,8 @@ CREATE TABLE IF NOT EXISTS loyalty_ledger (
 CREATE INDEX IF NOT EXISTS idx_loyalty_ledger_tenant_time ON loyalty_ledger (tenant_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_loyalty_ledger_balance
     ON loyalty_ledger (tenant_id, account_code, beneficiary_id);
+-- SPEC-W80 B8: CRM-360 contact rollup (idempotent bootstrap DDL).
+CREATE INDEX IF NOT EXISTS idx_loyalty_ledger_tenant_beneficiary ON loyalty_ledger (tenant_id, beneficiary_id);
 ALTER TABLE loyalty_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE loyalty_ledger FORCE ROW LEVEL SECURITY;
 DO $$

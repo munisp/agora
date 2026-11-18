@@ -204,6 +204,8 @@ func (s *server) publicCreateBooking(w http.ResponseWriter, r *http.Request) {
 	if tenant.Pack != nil {
 		policy := tenant.Pack.BookingPolicy
 		in.BookingPolicy = &policy
+		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
+		in.WorkflowName = tenant.Pack.TemporalWorkflow
 	}
 	in.Source = "web"
 	booking, err := s.d.Ops.Create(r.Context(), in)

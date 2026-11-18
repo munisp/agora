@@ -307,3 +307,32 @@ def test_booking_spend_client_404_becomes_spend_unavailable():
         pass
     else:
         raise AssertionError("expected SpendUnavailable")
+
+
+class _RecordingDapr:
+    """Captures the raw invoke kwargs (incl. headers)."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def invoke(self, app_id, method, *, json_body=None, params=None,
+                     headers=None, http_method=None):
+        self.calls.append({"app_id": app_id, "method": method,
+                           "headers": headers, "http_method": http_method})
+        return {"campaign_id": "x", "spend_ngn": 1}
+
+
+def test_booking_spend_client_sends_internal_token():
+    # SPEC-W80 A11/B7: booking-service gates /internal/campaigns/{id}/
+    # spend-sum behind internAuth (X-Internal-Token == BOOKING_INTERNAL_TOKEN).
+    dapr = _RecordingDapr()
+    client = BookingSpendClient(dapr, "booking", internal_token="tok-123")
+    asyncio.run(client.spend_sum(CAMP_A, FROM, TO))
+    assert dapr.calls[0]["headers"] == {"X-Internal-Token": "tok-123"}
+
+
+def test_booking_spend_client_omits_header_when_token_empty():
+    dapr = _RecordingDapr()
+    client = BookingSpendClient(dapr, "booking")  # legacy: no token wired
+    asyncio.run(client.spend_sum(CAMP_A, FROM, TO))
+    assert dapr.calls[0]["headers"] is None

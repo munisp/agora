@@ -134,6 +134,8 @@ func (s *server) claimWaitlist(w http.ResponseWriter, r *http.Request) {
 	if tenant.Pack != nil {
 		policy := tenant.Pack.BookingPolicy
 		in.BookingPolicy = &policy
+		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
+		in.WorkflowName = tenant.Pack.TemporalWorkflow
 	}
 	booking, entry, err := s.d.Ops.ClaimWaitlist(r.Context(), in)
 	if err != nil {
@@ -406,6 +408,8 @@ func (s *server) claimWaitlistByToken(w http.ResponseWriter, r *http.Request) {
 	if tenant.Pack != nil {
 		policy := tenant.Pack.BookingPolicy
 		in.BookingPolicy = &policy
+		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
+		in.WorkflowName = tenant.Pack.TemporalWorkflow
 	}
 	res, err := s.d.Ops.ClaimWaitlistByToken(r.Context(), in)
 	if err != nil {

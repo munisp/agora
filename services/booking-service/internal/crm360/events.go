@@ -32,6 +32,8 @@ const (
 	// EventTypeNoteUpdated fires when a note body is edited or its pin
 	// is toggled (payload carries the resulting pinned state).
 	EventTypeNoteUpdated = "com.opendesk.crm.NoteUpdated"
+	// EventTypeNoteDeleted fires when a note is deleted (SPEC-W80 B12).
+	EventTypeNoteDeleted = "com.opendesk.crm.NoteDeleted"
 	// EventTypeTagAdded fires when a tag is attached to a contact.
 	EventTypeTagAdded = "com.opendesk.crm.TagAdded"
 	// EventTypeTagRemoved fires when a tag is detached from a contact.

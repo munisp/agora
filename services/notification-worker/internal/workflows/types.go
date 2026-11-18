@@ -41,6 +41,15 @@ type SagaInput struct {
 	// workflow does not need to reload the pack.
 	NoShowFeeCents          int64 `json:"no_show_fee_cents,omitempty"`
 	CancellationWindowHours int   `json:"cancellation_window_hours,omitempty"`
+
+	// SPEC-W80 C1: WorkflowName is the pack-declared Temporal workflow
+	// (pack.temporalWorkflow) resolved by booking-service when the booking
+	// was created. Empty means the input predates W80 (in-flight saga or a
+	// caller that does not resolve packs) — PackWorkflowForIndustry then
+	// falls back to the legacy industry switch, byte-identical to the pre-W80
+	// behavior. Cross-service contract: bookingops.SagaInput serializes this
+	// as "workflow_name" (omitempty).
+	WorkflowName string `json:"workflow_name,omitempty"`
 }
 
 // IndustryOrDefault returns the effective industry id (default "salon").
@@ -75,6 +84,23 @@ type ReminderInput struct {
 	// DevOverrideDelays, when non-empty, replaces the T-24h/T-1h reminder
 	// offsets (used by POST /dev/trigger-reminder for manual testing).
 	DevOverrideDelays []time.Duration `json:"dev_override_delays,omitempty"`
+
+	// SPEC-W80 C3: the pack reminders block (reminders.offsets/channels),
+	// resolved by the saga via the GetPackReminders activity. ReminderOffsets
+	// holds Go duration strings ("24h", "1h"); when empty the legacy
+	// T-24h/T-1h defaults apply. ReminderChannels lists the allowed send
+	// channels ("email", "sms"); when empty every available channel is used
+	// (pre-W80 behavior).
+	ReminderOffsets  []string `json:"reminder_offsets,omitempty"`
+	ReminderChannels []string `json:"reminder_channels,omitempty"`
+}
+
+// PackReminders is the reminders block of an industry pack as resolved by
+// the GetPackReminders activity (SPEC-W80 C3). Offsets are Go duration
+// strings relative to the booking start; Channels are send channel names.
+type PackReminders struct {
+	Offsets  []string `json:"offsets,omitempty"`
+	Channels []string `json:"channels,omitempty"`
 }
 
 // NoShowInput starts a NoShowFollowupWorkflow.

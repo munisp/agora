@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,6 +40,9 @@ type Pinger interface {
 // MapReader is the read side of the sync_map store (booking -> person lookup).
 type MapReader interface {
 	Get(ctx context.Context, kind, opendeskID string, tenantID *uuid.UUID) (syncmap.Mapping, error)
+	// ListByOpendeskID enumerates ALL per-tenant mappings of a natural key
+	// (SPEC-W80 A1): the legacy unscoped /v1/people/lookup path.
+	ListByOpendeskID(ctx context.Context, kind, opendeskID string) ([]syncmap.Mapping, error)
 }
 
 // WebhookDedupe records seen webhook event ids (SPEC-W43 K-13); it reports
@@ -102,9 +106,19 @@ func (s *Server) internauth(next http.Handler) http.Handler {
 	})
 }
 
-// lookupPerson handles GET /v1/people/lookup?email=|phone= (GDPR export
-// collector + tooling, SPEC-W3 §2): finds a Twenty person by e-mail first,
-// then phone. Always 200 — {"person": null} when there is no match.
+// lookupPerson handles GET /v1/people/lookup?email=|phone=[&tenant_id=]
+// (GDPR export collector + tooling, SPEC-W3 §2): resolves a synced Twenty
+// person by e-mail first, then phone. Always 200 — {"person": null} when
+// there is no match.
+//
+// SPEC-W80 A1: the resolution is sync_map-driven (the authoritative list
+// of persons WE synced), NOT Twenty's global find-by-email/phone, whose
+// first-match semantics could return ANOTHER tenant's person record. With
+// tenant_id the lookup is scoped to that tenant's contact_identity /
+// contact_phone mappings; without it (legacy GDPR collector contract) the
+// natural key is enumerated across tenants and the FIRST-SYNCED match is
+// returned (deterministic, id ASC) — callers that know the tenant SHOULD
+// pass tenant_id.
 func (s *Server) lookupPerson(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	email, phone := q.Get("email"), q.Get("phone")
@@ -112,17 +126,72 @@ func (s *Server) lookupPerson(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "email or phone query param is required")
 		return
 	}
-	rec, err := s.Twenty.FindPerson(r.Context(), email, phone)
-	if errors.Is(err, twentyc.ErrNotFound) {
+	var tid *uuid.UUID
+	if v := q.Get("tenant_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "tenant_id must be a UUID")
+			return
+		}
+		tid = &id
+	}
+	if s.Map == nil {
+		writeError(w, http.StatusServiceUnavailable, "sync_map store unavailable")
+		return
+	}
+	personID, err := s.lookupPersonID(r.Context(), email, phone, tid)
+	if err != nil {
+		s.Log.Error("sync_map person lookup failed", zap.Error(err))
+		writeError(w, http.StatusBadGateway, "person lookup failed")
+		return
+	}
+	if personID == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"person": nil})
 		return
 	}
-	if err != nil {
-		s.Log.Error("twenty person lookup failed", zap.Error(err))
-		writeError(w, http.StatusBadGateway, "twenty lookup failed")
-		return
+	writeJSON(w, http.StatusOK, map[string]any{"person": map[string]string{"id": personID}})
+}
+
+// lookupPersonID resolves a person id through the sync_map natural keys:
+// contact_identity "email:|phone:" keys (e-mail first), then the
+// contact_phone raw-phone mapping. tid != nil scopes every read to that
+// tenant; tid == nil enumerates across tenants (first-synced wins).
+func (s *Server) lookupPersonID(ctx context.Context, email, phone string, tid *uuid.UUID) (string, error) {
+	get := func(kind, odID string) (string, error) {
+		if tid != nil {
+			m, err := s.Map.Get(ctx, kind, odID, tid)
+			if errors.Is(err, syncmap.ErrNotFound) {
+				return "", nil
+			}
+			if err != nil {
+				return "", err
+			}
+			return m.TwentyID, nil
+		}
+		rows, err := s.Map.ListByOpendeskID(ctx, kind, odID)
+		if err != nil {
+			return "", err
+		}
+		for _, m := range rows {
+			if m.TwentyID != "" {
+				return m.TwentyID, nil
+			}
+		}
+		return "", nil
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"person": map[string]string{"id": rec.ID}})
+	for _, k := range syncmap.ContactIdentityKeys(email, phone) {
+		id, err := get(syncmap.KindContactIdentity, k)
+		if err != nil {
+			return "", err
+		}
+		if id != "" {
+			return id, nil
+		}
+	}
+	if p := strings.TrimSpace(phone); p != "" {
+		return get(syncmap.KindContactPhone, p)
+	}
+	return "", nil
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -304,11 +373,11 @@ func (s *Server) resolvePerson(r *http.Request, req createTaskRequest) string {
 	if req.PersonID != "" {
 		return req.PersonID
 	}
+	var tid *uuid.UUID
+	if id, err := uuid.Parse(req.TenantID); err == nil {
+		tid = &id
+	}
 	if req.BookingID != "" && s.Map != nil {
-		var tid *uuid.UUID
-		if id, err := uuid.Parse(req.TenantID); err == nil {
-			tid = &id
-		}
 		m, err := s.Map.Get(r.Context(), syncmap.KindBookingContact, req.BookingID, tid)
 		if err == nil && m.TwentyID != "" {
 			return m.TwentyID
@@ -319,6 +388,18 @@ func (s *Server) resolvePerson(r *http.Request, req createTaskRequest) string {
 		}
 	}
 	if req.Phone != "" || req.Email != "" {
+		// SPEC-W80 A1: when the caller identified the tenant, resolve ONLY
+		// through that tenant's sync_map natural-key mappings — the global
+		// Twenty find-by-email/phone could link the task to ANOTHER
+		// tenant's person record. The global find survives solely for
+		// tenant-less legacy callers (canonical shape without tenant_id).
+		if tid != nil {
+			id, err := s.lookupPersonID(r.Context(), req.Email, req.Phone, tid)
+			if err != nil {
+				s.Log.Warn("sync_map person lookup failed; creating task unlinked", zap.Error(err))
+			}
+			return id
+		}
 		rec, err := s.Twenty.FindPerson(r.Context(), req.Email, req.Phone)
 		if err == nil {
 			return rec.ID

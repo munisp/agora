@@ -207,10 +207,13 @@ type LeadPhoneResolver interface {
 // DaprLeadPhoneResolver resolves lead phones via booking-service's internal
 // endpoint (Dapr service invocation, X-Tenant-Slug tenant scoping — the
 // ResolveTenant idiom of cmd/worker/main.go). Batches are chunked to the
-// endpoint's 500-id cap.
+// endpoint's 500-id cap. InternalToken (BOOKING_INTERNAL_TOKEN) rides as
+// X-Internal-Token: /v1/leads/resolve is internAuth-gated (SPEC-W80 B7, G9)
+// — an empty token sends no header and the peer fails closed.
 type DaprLeadPhoneResolver struct {
-	Dapr         *daprc.Client
-	BookingAppID string
+	Dapr          *daprc.Client
+	BookingAppID  string
+	InternalToken string
 }
 
 // ResolveLeadPhones implements LeadPhoneResolver.
@@ -224,9 +227,13 @@ func (r *DaprLeadPhoneResolver) ResolveLeadPhones(ctx context.Context, tenantSlu
 		var out struct {
 			Phones map[string]string `json:"phones"`
 		}
+		headers := map[string]string{"X-Tenant-Slug": tenantSlug}
+		if r.InternalToken != "" {
+			headers["X-Internal-Token"] = r.InternalToken
+		}
 		err := r.Dapr.InvokeServiceWithHeaders(ctx, r.BookingAppID, "v1/leads/resolve",
 			map[string]any{"lead_ids": leadIDs[start:end]},
-			map[string]string{"X-Tenant-Slug": tenantSlug}, &out)
+			headers, &out)
 		if err != nil {
 			return nil, fmt.Errorf("booking-service v1/leads/resolve: %w", err)
 		}
@@ -329,7 +336,9 @@ func NewAudienceIntake(dapr *daprc.Client, bookingAppID string, starter Audience
 	}
 	var phones LeadPhoneResolver
 	if dapr != nil {
-		phones = &DaprLeadPhoneResolver{Dapr: dapr, BookingAppID: bookingAppID}
+		// BOOKING_INTERNAL_TOKEN (same env config.BookingInternalToken
+		// reads): /v1/leads/resolve is internAuth-gated (SPEC-W80 B7, G9).
+		phones = &DaprLeadPhoneResolver{Dapr: dapr, BookingAppID: bookingAppID, InternalToken: os.Getenv("BOOKING_INTERNAL_TOKEN")}
 	} else {
 		log.Warn("no Dapr client: lead phone resolution disabled (lead-linked audience members will be skipped)")
 	}

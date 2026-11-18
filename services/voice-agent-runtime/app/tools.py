@@ -644,9 +644,15 @@ class ToolLayer:
                 "conversation_id": self._session.conversation_id,
             },
         )
-        await self._emit_tool_event(
-            "book_appointment", "accepted", {"offering_id": offering_id, "starts_at": starts_at}
-        )
+        # SPEC-W80 C5: include the confirmed contact identifiers so
+        # crm-sync's ToolInvoked note path (detail.phone / detail.email)
+        # activates. Guarded: only keys actually present are included.
+        detail: dict[str, Any] = {"offering_id": offering_id, "starts_at": starts_at}
+        if confirmed:
+            detail["phone"] = confirmed
+        if email:
+            detail["email"] = email
+        await self._emit_tool_event("book_appointment", "accepted", detail)
         return {
             "status": "accepted",
             "message": "Booking request accepted and queued for confirmation.",
@@ -929,7 +935,14 @@ class ToolLayer:
                     ),
                 }
 
+            # SPEC-W80 B7 (G9): /internal/contacts is internAuth-gated —
+            # forward X-Internal-Token, same token mechanism as v1/bookings
+            # (lookup_appointment): VOICE_BOOKING_INTERNAL_TOKEN. Empty token
+            # sends no header and the peer fails closed (internalHeaders
+            # idiom) — existing header shape is unchanged when unset.
             headers = {"X-Tenant-Slug": self._ctx.tenant_slug}
+            if self._settings.voice_booking_internal_token:
+                headers["X-Internal-Token"] = self._settings.voice_booking_internal_token
             contact = await self._dapr.invoke_get(
                 self._settings.booking_app_id,
                 "internal/contacts",

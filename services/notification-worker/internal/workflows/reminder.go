@@ -24,6 +24,12 @@ func ReminderWorkflow(ctx workflow.Context, in ReminderInput) error {
 
 	offsets := in.DevOverrideDelays
 	if len(offsets) == 0 {
+		// SPEC-W80 C3: pack-declared reminder offsets (reminders.offsets)
+		// resolved by the saga. Empty/invalid entries keep the legacy
+		// T-24h/T-1h defaults.
+		offsets = parseReminderOffsets(in.ReminderOffsets)
+	}
+	if len(offsets) == 0 {
 		offsets = []time.Duration{24 * time.Hour, time.Hour}
 	}
 	sent := map[string]bool{}
@@ -99,4 +105,20 @@ func ReminderWorkflow(ctx workflow.Context, in ReminderInput) error {
 	}
 	state = "done"
 	return nil
+}
+
+// parseReminderOffsets converts pack reminder offset strings ("24h", "1h")
+// to durations (SPEC-W80 C3). Non-positive or unparseable entries are
+// skipped so a malformed pack block degrades to the legacy defaults instead
+// of firing reminders at the booking start.
+func parseReminderOffsets(raw []string) []time.Duration {
+	var offsets []time.Duration
+	for _, s := range raw {
+		d, err := time.ParseDuration(s)
+		if err != nil || d <= 0 {
+			continue
+		}
+		offsets = append(offsets, d)
+	}
+	return offsets
 }

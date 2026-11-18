@@ -262,6 +262,23 @@ func (s *Store) UpdateNote(ctx context.Context, n *Note) error {
 	})
 }
 
+// DeleteNote removes one note scoped to the tenant (SPEC-W80 B12).
+// ErrNotFound when the row is missing or cross-tenant (RLS makes the two
+// indistinguishable, which is the point).
+func (s *Store) DeleteNote(ctx context.Context, tenantID, id uuid.UUID) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		cmd, err := tx.Exec(ctx,
+			`DELETE FROM crm_notes WHERE tenant_id=$1 AND id=$2`, tenantID, id)
+		if err != nil {
+			return err
+		}
+		if cmd.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Tags
 // ---------------------------------------------------------------------------
@@ -269,8 +286,15 @@ func (s *Store) UpdateNote(ctx context.Context, n *Note) error {
 // AddTag attaches a (validated, normalized) tag to a contact. Idempotent:
 // re-adding the same tag is a no-op (PK conflict) so tag add retries and
 // double-clicks never error. maxTagsPerContact bounds the label set.
-func (s *Store) AddTag(ctx context.Context, tenantID, contactID uuid.UUID, tag string) error {
-	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+//
+// The bool reports whether THIS call attached the tag (SPEC-W80 B11): it
+// rides the ON CONFLICT DO NOTHING RowsAffected, closing the old
+// check-then-act race where a concurrent attach between the handler's
+// ListTags probe and the insert misclassified a fresh tag as a replay
+// (suppressing the TagAdded event) or vice versa.
+func (s *Store) AddTag(ctx context.Context, tenantID, contactID uuid.UUID, tag string) (bool, error) {
+	var added bool
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		var count int
 		if err := tx.QueryRow(ctx,
 			`SELECT COUNT(*) FROM crm_tags WHERE tenant_id=$1 AND contact_id=$2`,
@@ -280,12 +304,17 @@ func (s *Store) AddTag(ctx context.Context, tenantID, contactID uuid.UUID, tag s
 		if count >= maxTagsPerContact {
 			return fmt.Errorf("%w: contact already has %d tags", ErrInvalidInput, maxTagsPerContact)
 		}
-		_, err := tx.Exec(ctx,
+		cmd, err := tx.Exec(ctx,
 			`INSERT INTO crm_tags (tenant_id, contact_id, tag) VALUES ($1,$2,$3)
 			 ON CONFLICT (tenant_id, contact_id, tag) DO NOTHING`,
 			tenantID, contactID, tag)
-		return err
+		if err != nil {
+			return err
+		}
+		added = cmd.RowsAffected() == 1
+		return nil
 	})
+	return added, err
 }
 
 // RemoveTag detaches a tag. ErrNotFound when the tag is not attached.

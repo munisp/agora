@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/opendesk/notification-worker/internal/packs"
 	"github.com/opendesk/notification-worker/internal/workflows"
 	"go.uber.org/zap"
 )
@@ -108,6 +109,28 @@ func (a *Activities) ApplyIndustryPack(ctx context.Context, in workflows.Onboard
 		zap.String("slug", in.Slug), zap.String("industry", pack.ID),
 		zap.Int("offerings", len(pack.Offerings)), zap.Int("knowledge_docs", len(pack.KnowledgeSeed)))
 	return nil
+}
+
+// GetPackReminders resolves the pack reminders block (offsets/channels) for
+// an industry (SPEC-W80 C3) so BookingSagaWorkflow can pass it into the
+// ReminderWorkflow input. A nil registry, an unknown industry and a pack
+// without a reminders block all yield empty lists — the ReminderWorkflow
+// then keeps its legacy T-24h/T-1h defaults on every channel.
+func (a *Activities) GetPackReminders(ctx context.Context, industry string) (workflows.PackReminders, error) {
+	if a.Industry.Packs == nil {
+		return workflows.PackReminders{}, nil
+	}
+	if industry == "" {
+		industry = packs.DefaultIndustry
+	}
+	p, ok := a.Industry.Packs.Get(industry)
+	if !ok {
+		return workflows.PackReminders{}, nil
+	}
+	return workflows.PackReminders{
+		Offsets:  p.Reminders.Offsets,
+		Channels: p.Reminders.Channels,
+	}, nil
 }
 
 // VerifyDepositHold asks payments-service for the tenant's ledger balance and

@@ -50,6 +50,9 @@ type MapStore interface {
 	Get(ctx context.Context, kind, opendeskID string, tenantID *uuid.UUID) (syncmap.Mapping, error)
 	Put(ctx context.Context, kind, opendeskID, twentyID string, tenantID *uuid.UUID) error
 	DeleteByTwentyID(ctx context.Context, twentyID string) (int64, error)
+	// ListByOpendeskID enumerates ALL per-tenant mappings of a natural key
+	// (SPEC-W80 A1): GDPR erasure must find every tenant's person record.
+	ListByOpendeskID(ctx context.Context, kind, opendeskID string) ([]syncmap.Mapping, error)
 	// DisableTenant tombstones all rows of a deleted tenant (SPEC-W45 K9).
 	DisableTenant(ctx context.Context, tenantID uuid.UUID) (int64, error)
 }
@@ -196,10 +199,33 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 	}
 	taskID, err := s.Twenty.CreateTask(ctx, twentyc.TaskFromBooking(d), personID)
 	if err != nil {
-		// Person-link failures arrive wrapped after the task exists; still
-		// treat as retryable so the mapping is only stored on full success.
+		// SPEC-W80 A3: CreateTask returns a NON-EMPTY task id when the task
+		// was created in Twenty but the person link (taskTarget) failed.
+		// Persist the mapping BEFORE returning the error — otherwise the
+		// retry (at-least-once delivery) re-enters this handler, finds no
+		// mapping and creates a DUPLICATE task. The error still propagates
+		// so the redelivery re-runs the (now idempotent) patch path and can
+		// re-attempt the link.
+		if taskID != "" {
+			if perr := s.rememberTaskMappings(ctx, d, taskID, personID, tenantUUID); perr != nil {
+				return fmt.Errorf("persist task mapping after partial create: %w", perr)
+			}
+			s.Log.Warn("task created but person link failed; mapping persisted to prevent a duplicate on retry",
+				zap.String("booking_id", d.BookingID), zap.String("task_id", taskID), zap.Error(err))
+		}
 		return fmt.Errorf("create task: %w", err)
 	}
+	if err := s.rememberTaskMappings(ctx, d, taskID, personID, tenantUUID); err != nil {
+		return err
+	}
+	s.Log.Info("booking synced to Twenty task",
+		zap.String("booking_id", d.BookingID), zap.String("task_id", taskID))
+	return nil
+}
+
+// rememberTaskMappings writes the booking -> task mappings (plus the
+// booking -> person edge) after a successful Twenty task create.
+func (s *Syncer) rememberTaskMappings(ctx context.Context, d events.BookingData, taskID, personID string, tenantUUID *uuid.UUID) error {
 	if err := s.Map.Put(ctx, KindBooking, d.BookingID, taskID, tenantUUID); err != nil {
 		return err
 	}
@@ -214,8 +240,6 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 			return err
 		}
 	}
-	s.Log.Info("booking synced to Twenty task",
-		zap.String("booking_id", d.BookingID), zap.String("task_id", taskID))
 	return nil
 }
 
@@ -283,20 +307,14 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	return personID, nil
 }
 
-// personNaturalKeys derives the tenant-scoped natural keys for a contact:
-// "email:<lower(email)>" when an e-mail is present, "phone:<trimmed phone>"
-// when a phone is present (SPEC-W45 K21: the upsert key is
-// (tenant_id, email|phone); the tenant scoping comes from the sync_map
-// tenant_id column, which is part of the table's UNIQUE constraint).
+// personNaturalKeys derives the tenant-scoped natural keys for a contact
+// (SPEC-W45 K21: the upsert key is (tenant_id, email|phone); the tenant
+// scoping comes from the sync_map tenant_id column, which is part of the
+// table's UNIQUE constraint). Delegates to syncmap.ContactIdentityKeys so
+// the /v1/people/lookup reader (httpapi) derives identical keys (SPEC-W80
+// A1).
 func personNaturalKeys(email, phone string) []string {
-	var keys []string
-	if e := strings.ToLower(strings.TrimSpace(email)); e != "" {
-		keys = append(keys, "email:"+e)
-	}
-	if p := strings.TrimSpace(phone); p != "" {
-		keys = append(keys, "phone:"+p)
-	}
-	return keys
+	return syncmap.ContactIdentityKeys(email, phone)
 }
 
 // findTenantPerson resolves the Twenty person this TENANT previously synced
@@ -346,7 +364,7 @@ func (s *Syncer) handleBookingCancelled(ctx context.Context, d events.BookingDat
 	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{"status": "DONE"}); err != nil {
 		return fmt.Errorf("patch task status: %w", err)
 	}
-	if personID, perr := s.findPersonForNote(ctx, d.Phone, d.Email); perr == nil && personID != "" {
+	if personID, perr := s.findPersonForNote(ctx, d.Phone, d.Email, tenantUUID); perr == nil && personID != "" {
 		if _, nerr := s.Twenty.CreateNote(ctx, "Booking cancelled", twentyc.CancelNote(d.Reason), personID); nerr != nil {
 			s.Log.Warn("cancel note failed (task already closed)", zap.Error(nerr))
 		}
@@ -363,10 +381,14 @@ func (s *Syncer) handleBookingRescheduled(ctx context.Context, d events.BookingD
 	if d.StartsAt.IsZero() {
 		return permanent(fmt.Errorf("BookingRescheduled missing starts_at"))
 	}
+	// SPEC-W80 A2: the title embeds the start time ("{offering} appointment
+	// at {starts_at}"), so a dueAt-only patch leaves a STALE title after a
+	// reschedule — patch both.
 	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{
+		"title": twentyc.TaskTitle(d.OfferingName, d.StartsAt),
 		"dueAt": twentyc.FormatTime(d.StartsAt),
 	}); err != nil {
-		return fmt.Errorf("patch task dueDate: %w", err)
+		return fmt.Errorf("patch rescheduled task: %w", err)
 	}
 	s.Log.Info("rescheduled booking task updated", zap.String("task_id", m.TwentyID))
 	return nil
@@ -401,7 +423,7 @@ func (s *Syncer) HandleConversation(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	personID, err := s.findPersonForNote(ctx, phone, email)
+	personID, err := s.findPersonForNote(ctx, phone, email, parseUUID(evt.TenantID))
 	if err != nil {
 		return fmt.Errorf("find person for AI note: %w", err)
 	}
@@ -416,15 +438,33 @@ func (s *Syncer) HandleConversation(ctx context.Context, evt events.CloudEvent) 
 }
 
 // findPersonForNote resolves a person id by phone/email; "" when not found.
-func (s *Syncer) findPersonForNote(ctx context.Context, phone, email string) (string, error) {
-	rec, err := s.Twenty.FindPerson(ctx, email, phone)
-	if errors.Is(err, twentyc.ErrNotFound) {
-		return "", nil
-	}
+//
+// SPEC-W80 A1: TENANT-SCOPED via sync_map — the legacy implementation used
+// Twenty's GLOBAL find-by-email/phone (first match, no tenant scope), so a
+// note for a contact of tenant A could land on tenant B's person record
+// when both tenants share an e-mail/phone. Now: the tenant's own
+// contact_identity natural-key mapping (written at booking sync, K21)
+// first, then the contact_phone mapping written alongside it. A person
+// this tenant never synced is "" (the note paths then skip + ack —
+// best-effort, unchanged).
+func (s *Syncer) findPersonForNote(ctx context.Context, phone, email string, tenantUUID *uuid.UUID) (string, error) {
+	personID, err := s.findTenantPerson(ctx, email, phone, tenantUUID)
 	if err != nil {
 		return "", err
 	}
-	return rec.ID, nil
+	if personID != "" {
+		return personID, nil
+	}
+	if p := strings.TrimSpace(phone); p != "" {
+		m, err := s.Map.Get(ctx, syncmap.KindContactPhone, p, tenantUUID)
+		if err == nil && m.TwentyID != "" {
+			return m.TwentyID, nil
+		}
+		if err != nil && !errors.Is(err, syncmap.ErrNotFound) {
+			return "", fmt.Errorf("lookup contact_phone mapping: %w", err)
+		}
+	}
+	return "", nil
 }
 
 // handleSessionEnded turns an enriched SessionEnded event (call-quality
@@ -613,26 +653,15 @@ func (s *Syncer) rememberQualityNote(ctx context.Context, conversationID, noteID
 	return nil
 }
 
-// resolvePersonForCall resolves the caller's Person by confirmed phone:
-// Twenty people lookup first (existing FindPerson), then the sync_map
-// contact_phone mapping written at booking sync (covers phone-format
-// mismatches between the confirmed number and the Twenty record).
+// resolvePersonForCall resolves the caller's Person by confirmed phone,
+// TENANT-SCOPED (SPEC-W80 A1): the tenant's contact_identity natural-key
+// mapping first ("phone:<trimmed>", written at booking sync, K21), then
+// the contact_phone mapping (covers phone-format mismatches between the
+// confirmed number and the natural key recorded at booking sync). The
+// legacy global Twenty people lookup is gone: it could resolve the caller
+// to ANOTHER tenant's person record when two tenants share a number.
 func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantUUID *uuid.UUID) (string, error) {
-	personID, err := s.findPersonForNote(ctx, phone, "")
-	if err != nil {
-		return "", err
-	}
-	if personID != "" {
-		return personID, nil
-	}
-	m, err := s.Map.Get(ctx, syncmap.KindContactPhone, phone, tenantUUID)
-	if errors.Is(err, syncmap.ErrNotFound) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return m.TwentyID, nil
+	return s.findPersonForNote(ctx, phone, "", tenantUUID)
 }
 
 func parseUUID(v string) *uuid.UUID {
@@ -677,24 +706,84 @@ func (s *Syncer) HandlePrivacy(ctx context.Context, evt events.CloudEvent) error
 	if d.Phone == "" && d.Email == "" {
 		return permanent(fmt.Errorf("PrivacyEraseRequested carries neither phone nor email"))
 	}
-	rec, err := s.Twenty.FindPerson(ctx, d.Email, d.Phone)
-	if errors.Is(err, twentyc.ErrNotFound) {
+	personIDs, err := s.findAllPersonsForErase(ctx, d.Email, d.Phone)
+	if err != nil {
+		return fmt.Errorf("find persons for erase: %w", err)
+	}
+	if len(personIDs) == 0 {
 		s.Log.Info("gdpr erase: no Twenty person for contact; nothing to delete",
 			zap.String("event_id", evt.ID))
 		return nil
 	}
-	if err != nil {
-		return fmt.Errorf("find person for erase: %w", err)
+	for _, personID := range personIDs {
+		if err := s.Twenty.DeletePerson(ctx, personID); err != nil {
+			return fmt.Errorf("delete Twenty person %s: %w", personID, err)
+		}
+		removed, err := s.Map.DeleteByTwentyID(ctx, personID)
+		if err != nil {
+			return err
+		}
+		s.Log.Info("gdpr erase: Twenty person deleted",
+			zap.String("event_id", evt.ID), zap.String("person_id", personID),
+			zap.Int64("sync_map_rows_removed", removed))
 	}
-	if err := s.Twenty.DeletePerson(ctx, rec.ID); err != nil {
-		return fmt.Errorf("delete Twenty person %s: %w", rec.ID, err)
-	}
-	removed, err := s.Map.DeleteByTwentyID(ctx, rec.ID)
-	if err != nil {
-		return err
-	}
-	s.Log.Info("gdpr erase: Twenty person deleted",
-		zap.String("event_id", evt.ID), zap.String("person_id", rec.ID),
-		zap.Int64("sync_map_rows_removed", removed))
+	s.Log.Info("gdpr erase complete",
+		zap.String("event_id", evt.ID), zap.Int("persons_deleted", len(personIDs)))
 	return nil
+}
+
+// findAllPersonsForErase enumerates EVERY Twenty person record matching the
+// erased identity, across ALL tenants (SPEC-W80 A1). The legacy
+// implementation called Twenty's global FindPerson and deleted only the
+// FIRST match — with per-tenant person records (K21), two tenants sharing
+// an e-mail/phone left the second tenant's record behind: an incomplete,
+// non-compliant erasure.
+//
+// Enumeration is sync_map-driven (the mapping rows are the authoritative
+// list of persons WE synced): every contact_identity natural-key row plus
+// every contact_phone row for the identity, deduped. Legacy fallback: when
+// NO mapping exists at all (person synced before the K21 mappings, or
+// created out-of-band), the global FindPerson first-match is still erased
+// so such records are not stranded — but any mapped match takes precedence
+// and short-circuits the global find.
+func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string) ([]string, error) {
+	seen := map[string]bool{}
+	var ids []string
+	add := func(id string) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, k := range personNaturalKeys(email, phone) {
+		rows, err := s.Map.ListByOpendeskID(ctx, syncmap.KindContactIdentity, k)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range rows {
+			add(m.TwentyID)
+		}
+	}
+	if p := strings.TrimSpace(phone); p != "" {
+		rows, err := s.Map.ListByOpendeskID(ctx, syncmap.KindContactPhone, p)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range rows {
+			add(m.TwentyID)
+		}
+	}
+	if len(ids) > 0 {
+		return ids, nil
+	}
+	// Legacy fallback: no sync_map trace of the identity at all.
+	rec, err := s.Twenty.FindPerson(ctx, email, phone)
+	if errors.Is(err, twentyc.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	add(rec.ID)
+	return ids, nil
 }

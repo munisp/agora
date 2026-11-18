@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,26 @@ func (f *fakeMap) seed(kind, odID, twentyID string, tid *uuid.UUID, updatedAt ti
 		Kind: kind, OpenDeskID: odID, TwentyID: twentyID, TenantID: tid,
 		UpdatedAt: updatedAt, LastSyncedAt: lastSyncedAt,
 	}
+}
+
+// ListByOpendeskID mirrors syncmap.Store.ListByOpendeskID (SPEC-W80 A1):
+// all mappings of (kind, opendesk_id) across tenants, first-synced first.
+func (f *fakeMap) ListByOpendeskID(_ context.Context, kind, odID string) ([]syncmap.Mapping, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []syncmap.Mapping
+	for _, m := range f.rows {
+		if m.Kind == kind && m.OpenDeskID == odID {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
+			return out[i].TwentyID < out[j].TwentyID
+		}
+		return out[i].UpdatedAt.Before(out[j].UpdatedAt)
+	})
+	return out, nil
 }
 
 func (f *fakeMap) DeleteByTwentyID(_ context.Context, twentyID string) (int64, error) {
@@ -418,23 +439,55 @@ func TestHandleToolInvokedSkipsWithoutIdentifiers(t *testing.T) {
 }
 
 func TestHandleToolInvokedWithPhoneCreatesNote(t *testing.T) {
-	s, _, stub := newTestSyncer(t)
+	s, fm, stub := newTestSyncer(t)
+	tid := uuid.New()
+	// SPEC-W80 A1: the note path resolves the person TENANT-SCOPED via the
+	// sync_map natural key (no more global Twenty people find).
+	if err := fm.Put(context.Background(), syncmap.KindContactIdentity, "phone:+1555000111", "person-9", &tid); err != nil {
+		t.Fatal(err)
+	}
 	evt := bookingEvent(events.TypeToolInvoked, map[string]any{
 		"conversationId": "conv-1",
 		"tool":           "book_appointment",
 		"status":         "accepted",
 		"detail":         map[string]any{"phone": "+1555000111"},
 	})
-	// Default stub returns empty people list -> FindPerson ErrNotFound -> skip, ack.
+	evt.TenantID = tid.String()
+	if err := s.HandleConversation(context.Background(), evt); err != nil {
+		t.Fatal(err)
+	}
+	var sawNote, sawLink bool
+	for _, r := range stub.requests {
+		if r.method == http.MethodPost && r.path == "/rest/notes" {
+			sawNote = true
+		}
+		if r.method == http.MethodPost && r.path == "/rest/noteTargets" && r.body["personId"] == "person-9" {
+			sawLink = true
+		}
+	}
+	if !sawNote || !sawLink {
+		t.Fatalf("note=%v link-to-person-9=%v; requests=%+v", sawNote, sawLink, stub.requests)
+	}
+}
+
+// Without a tenant-scoped mapping the AI note is skipped (ack) — and NO
+// global Twenty people lookup is attempted (SPEC-W80 A1).
+func TestHandleToolInvokedSkipsWhenPersonUnmapped(t *testing.T) {
+	s, _, stub := newTestSyncer(t)
+	evt := bookingEvent(events.TypeToolInvoked, map[string]any{
+		"conversationId": "conv-2",
+		"tool":           "book_appointment",
+		"status":         "accepted",
+		"detail":         map[string]any{"phone": "+1555000111"},
+	})
 	if err := s.HandleConversation(context.Background(), evt); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range stub.requests {
-		if r.method == http.MethodGet && r.path == "/rest/people" {
-			return // lookup happened; note skipped because person unknown — accepted
+		if r.path == "/rest/notes" || (r.method == http.MethodGet && r.path == "/rest/people") {
+			t.Fatalf("unexpected Twenty call %s %s — unmapped person must skip without a global lookup", r.method, r.path)
 		}
 	}
-	t.Fatal("expected a people lookup")
 }
 
 func TestPermanentErrorWrapping(t *testing.T) {

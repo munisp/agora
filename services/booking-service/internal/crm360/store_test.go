@@ -345,14 +345,14 @@ func TestTags(t *testing.T) {
 	tenantID := uuid.New()
 	contactID := addContact(t, st, tenantID, "Grace Hopper", "", "")
 
-	if err := st.AddTag(ctx, tenantID, contactID, "vip"); err != nil {
+	if _, err := st.AddTag(ctx, tenantID, contactID, "vip"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
-	if err := st.AddTag(ctx, tenantID, contactID, "gold-tier"); err != nil {
+	if _, err := st.AddTag(ctx, tenantID, contactID, "gold-tier"); err != nil {
 		t.Fatalf("add second: %v", err)
 	}
 	// Idempotent replay: re-adding is a no-op, not an error.
-	if err := st.AddTag(ctx, tenantID, contactID, "vip"); err != nil {
+	if _, err := st.AddTag(ctx, tenantID, contactID, "vip"); err != nil {
 		t.Fatalf("idempotent replay: %v", err)
 	}
 	tags, err := st.ListTags(ctx, tenantID, contactID)
@@ -383,10 +383,10 @@ func TestSearchContacts(t *testing.T) {
 	ada := addContact(t, st, tenantID, "Ada Lovelace", "+2348011111111", "ada@example.com")
 	grace := addContact(t, st, tenantID, "Grace Hopper", "+2348022222222", "grace@example.com")
 	_ = addContact(t, st, tenantID, "Alan Turing", "+447700900123", "alan@example.co.uk")
-	if err := st.AddTag(ctx, tenantID, ada, "vip"); err != nil {
+	if _, err := st.AddTag(ctx, tenantID, ada, "vip"); err != nil {
 		t.Fatalf("tag ada: %v", err)
 	}
-	if err := st.AddTag(ctx, tenantID, grace, "vip"); err != nil {
+	if _, err := st.AddTag(ctx, tenantID, grace, "vip"); err != nil {
 		t.Fatalf("tag grace: %v", err)
 	}
 
@@ -464,7 +464,7 @@ func TestProfile360(t *testing.T) {
 		tenantID, contactID, 1250, "gold"); err != nil {
 		t.Fatalf("insert wallet: %v", err)
 	}
-	if err := st.AddTag(ctx, tenantID, contactID, "vip"); err != nil {
+	if _, err := st.AddTag(ctx, tenantID, contactID, "vip"); err != nil {
 		t.Fatalf("tag: %v", err)
 	}
 
@@ -649,7 +649,7 @@ func TestRLSIsolation(t *testing.T) {
 	if err := st.CreateNote(ctx, &note); err != nil {
 		t.Fatalf("create note: %v", err)
 	}
-	if err := st.AddTag(ctx, tenantA, contactA, "vip"); err != nil {
+	if _, err := st.AddTag(ctx, tenantA, contactA, "vip"); err != nil {
 		t.Fatalf("add tag: %v", err)
 	}
 

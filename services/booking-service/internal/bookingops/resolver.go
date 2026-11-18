@@ -57,6 +57,14 @@ type BookingPolicy struct {
 	PhoneConfirmation       bool  `json:"phoneConfirmation"`
 	IntakeRequired          bool  `json:"intakeRequired"`
 	CancellationWindowHours int   `json:"cancellationWindowHours"`
+	// TemporalWorkflow (SPEC-W80 B13) mirrors the SIBLING
+	// PackSummary.TemporalWorkflow — populated by the tenant resolver at
+	// decode time (never deserialized from the pack JSON, hence json:"-").
+	// It exists so the BYTE-IDENTICAL invariant staff create path
+	// (httpapi/bookings.go, W57), which copies tenant.Pack.BookingPolicy
+	// into CreateInput verbatim, flows the pack-declared workflow to
+	// startSaga without a single changed line.
+	TemporalWorkflow string `json:"-"`
 }
 
 // Location returns the tenant's IANA timezone (UTC fallback).
@@ -182,6 +190,13 @@ func (r *TenantResolver) BySlug(ctx context.Context, slug string) (TenantInfo, e
 		return TenantInfo{}, fmt.Errorf("resolve tenant %q: empty id", slug)
 	}
 	t.Slug = slug
+	// SPEC-W80 B13: mirror the pack-declared Temporal workflow into the
+	// booking policy so every create path that carries BookingPolicy (incl.
+	// the invariant staff path) also carries the workflow name. The cached
+	// entry stores the mirrored form, so fresh and stale reads agree.
+	if t.Pack != nil {
+		t.Pack.BookingPolicy.TemporalWorkflow = t.Pack.TemporalWorkflow
+	}
 	r.mu.Lock()
 	r.cache[slug] = tenantCacheEntry{info: t, fetchedAt: time.Now()}
 	r.mu.Unlock()

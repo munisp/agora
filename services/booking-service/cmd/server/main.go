@@ -348,6 +348,10 @@ func run() error {
 		FirstTouchOnly: cfg.LeadAttributionFirstTouchOnly,
 		Log:            logger,
 	}
+	// SPEC-W80 B3: booking→lead conversion — on a contact's FIRST completed
+	// booking, their open lead is walked to `converted` (nil-safe hook on
+	// bookingops.Service; *leads.Service satisfies OpenLeadConverter).
+	ops.LeadConverter = leadSvc
 
 	// SPEC-W32 WS-A — BEGIN (additive): the civic reporting module — public
 	// citizen intake (throttled, honeypot-guarded), operator triage console
@@ -647,6 +651,19 @@ func run() error {
 			// SPEC-W14 Agent D (additive): referral_verified metering.
 			UsageTopic: cfg.UsageEventsTopic,
 			Log:        logger,
+		}
+		// SPEC-W80 B2: wire the referral_converted loyalty earn rule — the
+		// referrer accrues points on a non-idempotent verify. Nil-safe on
+		// the referrals side; absent loyalty store (partial deployment)
+		// leaves the hook disabled.
+		if loyaltyDeps != nil {
+			referralSvc.Loyalty = &loyalty.Service{
+				Store:       loyaltyDeps.Store,
+				Ledger:      loyalty.NewPostgresLedger(loyaltyDeps.Store),
+				EventsTopic: cfg.LoyaltyEventsTopic,
+				UsageTopic:  cfg.UsageEventsTopic,
+				Log:         logger,
+			}
 		}
 	}
 

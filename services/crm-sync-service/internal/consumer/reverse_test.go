@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,11 +58,19 @@ func (f *fakeInvoker) last() invoke {
 
 // reverseTwentyStub serves the GET-by-id Twenty endpoints the reverse worker
 // uses. people/companies/tasks are keyed by id; a nil entry yields an empty
-// envelope (-> ErrNotFound).
+// envelope (-> ErrNotFound). PATCH /rest/tasks/{id} is recorded (SPEC-W80 A9).
 type reverseTwentyStub struct {
 	people    map[string]map[string]any
 	companies map[string]map[string]any
 	tasks     map[string]map[string]any
+
+	mu      sync.Mutex
+	patches []stubPatch
+}
+
+type stubPatch struct {
+	path string
+	body map[string]any
 }
 
 func (s *reverseTwentyStub) handler() http.Handler {
@@ -87,10 +96,25 @@ func (s *reverseTwentyStub) handler() http.Handler {
 		case r.Method == http.MethodGet && len(r.URL.Path) > len("/rest/tasks/") && r.URL.Path[:len("/rest/tasks/")] == "/rest/tasks/":
 			id = r.URL.Path[len("/rest/tasks/"):]
 			write("task", s.tasks[id])
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/rest/tasks/"):
+			var body map[string]any
+			if r.Body != nil {
+				_ = json.NewDecoder(r.Body).Decode(&body)
+			}
+			s.mu.Lock()
+			s.patches = append(s.patches, stubPatch{path: r.URL.Path, body: body})
+			s.mu.Unlock()
+			write("updated", map[string]any{"id": strings.TrimPrefix(r.URL.Path, "/rest/tasks/")})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	})
+}
+
+func (s *reverseTwentyStub) taskPatches() []stubPatch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]stubPatch(nil), s.patches...)
 }
 
 func newTestReverse(t *testing.T, stub *reverseTwentyStub) (*ReverseSyncer, *fakeMap, *fakeInvoker) {
@@ -351,5 +375,125 @@ func TestReverseMissingRecordIDIsPermanent(t *testing.T) {
 	err := r.HandleCRMEvent(context.Background(), evt)
 	if !errors.Is(err, errPermanent) {
 		t.Fatalf("missing record.id err = %v, want permanent", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W80 A9: com.opendesk.crm.TicketEscalated -> Twenty task priority HIGH
+// ---------------------------------------------------------------------------
+
+func TestTicketEscalatedPatchesTaskPriorityHigh(t *testing.T) {
+	stub := &reverseTwentyStub{}
+	r, fm, _ := newTestReverse(t, stub)
+	tid := uuid.New()
+	bookingID := uuid.NewString()
+	old := time.Now().Add(-time.Hour)
+	fm.seed(KindBooking, bookingID, "task-9", &tid, old, &old)
+
+	evt := crmEvent(TypeTicketEscalated, nil)
+	evt.Data = map[string]any{
+		"tenant_slug": "acme-salon",
+		"tenant_id":   tid.String(),
+		"ticket_id":   bookingID,
+		"priority":    "high",
+		"reason":      "first_response_sla_breach",
+		"sla":         "4h0m0s",
+	}
+	if err := r.HandleCRMEvent(context.Background(), evt); err != nil {
+		t.Fatal(err)
+	}
+	patches := stub.taskPatches()
+	if len(patches) != 1 {
+		t.Fatalf("task PATCHes = %d, want 1", len(patches))
+	}
+	if patches[0].path != "/rest/tasks/task-9" {
+		t.Errorf("PATCH path = %q, want /rest/tasks/task-9", patches[0].path)
+	}
+	if patches[0].body["priority"] != "HIGH" {
+		t.Errorf("priority = %v, want HIGH", patches[0].body["priority"])
+	}
+}
+
+// No booking mapping -> graceful no-op (debug log), never an error/DLQ.
+func TestTicketEscalatedWithoutMappingIsAcked(t *testing.T) {
+	stub := &reverseTwentyStub{}
+	r, _, _ := newTestReverse(t, stub)
+	evt := crmEvent(TypeTicketEscalated, nil)
+	evt.Data = map[string]any{
+		"tenant_id": uuid.NewString(),
+		"ticket_id": uuid.NewString(),
+		"priority":  "high",
+	}
+	if err := r.HandleCRMEvent(context.Background(), evt); err != nil {
+		t.Fatalf("unmapped escalation must be acked, got %v", err)
+	}
+	if n := len(stub.taskPatches()); n != 0 {
+		t.Fatalf("no PATCH expected without a mapping; got %d", n)
+	}
+}
+
+// Missing ticket_id is a poison payload (permanent, straight to DLQ).
+func TestTicketEscalatedMissingTicketIDIsPermanent(t *testing.T) {
+	r, _, _ := newTestReverse(t, &reverseTwentyStub{})
+	evt := crmEvent(TypeTicketEscalated, nil)
+	evt.Data = map[string]any{"tenant_id": uuid.NewString()}
+	if err := r.HandleCRMEvent(context.Background(), evt); !errors.Is(err, errPermanent) {
+		t.Fatalf("missing ticket_id err = %v, want permanent", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W80 A11 (B7 caller side): reverse invokes carry X-Internal-Token
+// ---------------------------------------------------------------------------
+
+func TestReverseInvokesCarryInternalToken(t *testing.T) {
+	stub := &reverseTwentyStub{
+		people:    map[string]map[string]any{"person-1": personRecord("person-1", "Jane", "Doe", "jane@x.com", "+1555", "company-9")},
+		companies: map[string]map[string]any{"company-9": companyRecord("company-9", "https://acme-salon.opendesk.local")},
+	}
+	r, fm, inv := newTestReverse(t, stub)
+	r.BookingInternalToken = "test-booking-internal-token"
+	seedTenantChain(fm, uuid.New())
+
+	// contacts/upsert path.
+	if err := r.HandleCRMEvent(context.Background(), crmEvent(TypeTwentyPersonUpdated, map[string]any{"id": "person-1"})); err != nil {
+		t.Fatal(err)
+	}
+	// crm-note path.
+	tid := uuid.New()
+	seedTenantChain(fm, tid)
+	bookingID := uuid.NewString()
+	old := time.Now().Add(-time.Hour)
+	fm.seed(KindBookingTask, bookingID, "task-7", &tid, old, &old)
+	if err := r.HandleCRMEvent(context.Background(), crmEvent(TypeTwentyTaskUpdated, map[string]any{"id": "task-7", "status": "DONE"})); err != nil {
+		t.Fatal(err)
+	}
+	if inv.count() != 2 {
+		t.Fatalf("invokes = %d, want 2", inv.count())
+	}
+	for _, call := range inv.invokes {
+		if got := call.headers["X-Internal-Token"]; got != "test-booking-internal-token" {
+			t.Errorf("A11: %s missing X-Internal-Token, got %q (booking internAuth fails closed)", call.method, got)
+		}
+	}
+}
+
+// Unconfigured token => header omitted (the peer then fails closed; main
+// logs the misconfig at boot). Guards against sending an EMPTY header.
+func TestReverseInvokesOmitTokenHeaderWhenUnset(t *testing.T) {
+	stub := &reverseTwentyStub{
+		people:    map[string]map[string]any{"person-1": personRecord("person-1", "Jane", "Doe", "jane@x.com", "+1555", "company-9")},
+		companies: map[string]map[string]any{"company-9": companyRecord("company-9", "https://acme-salon.opendesk.local")},
+	}
+	r, fm, inv := newTestReverse(t, stub)
+	seedTenantChain(fm, uuid.New())
+	if err := r.HandleCRMEvent(context.Background(), crmEvent(TypeTwentyPersonUpdated, map[string]any{"id": "person-1"})); err != nil {
+		t.Fatal(err)
+	}
+	if inv.count() != 1 {
+		t.Fatalf("invokes = %d, want 1", inv.count())
+	}
+	if _, present := inv.last().headers["X-Internal-Token"]; present {
+		t.Errorf("unset token must OMIT the header, got %q", inv.last().headers["X-Internal-Token"])
 	}
 }

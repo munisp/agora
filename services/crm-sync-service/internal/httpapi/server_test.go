@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -43,6 +44,25 @@ func (f *fakeMap) Get(_ context.Context, kind, odID string, tid *uuid.UUID) (syn
 		return syncmap.Mapping{Kind: kind, OpenDeskID: odID, TwentyID: id}, nil
 	}
 	return syncmap.Mapping{}, syncmap.ErrNotFound
+}
+
+// ListByOpendeskID mirrors the store's cross-tenant enumeration (SPEC-W80
+// A1), deterministic by key (first-synced ordering is the store's concern).
+func (f *fakeMap) ListByOpendeskID(_ context.Context, kind, odID string) ([]syncmap.Mapping, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var keys []string
+	for k := range f.rows {
+		if strings.HasPrefix(k, kind+"|"+odID+"|") {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	out := make([]syncmap.Mapping, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, syncmap.Mapping{Kind: kind, OpenDeskID: odID, TwentyID: f.rows[k]})
+	}
+	return out, nil
 }
 
 // twentyRecorder answers like Twenty and records calls.
@@ -281,5 +301,105 @@ func TestGatedSurfaceDoesNotSwallowWebhookRoute(t *testing.T) {
 	s.Router().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("healthz: code = %d, want 200", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W80 A1: /v1/people/lookup resolves via tenant-scoped sync_map keys
+// ---------------------------------------------------------------------------
+
+func getLookup(t *testing.T, s *Server, path string) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("X-Internal-Token", testInternalToken)
+	rec := httptest.NewRecorder()
+	s.Router().ServeHTTP(rec, req)
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	return rec.Code, out
+}
+
+func TestPeopleLookupTenantScoped(t *testing.T) {
+	s, fm, _ := newTestServer(t)
+	tidA, tidB := uuid.New(), uuid.New()
+	// Two tenants share the e-mail (K21: one person per tenant).
+	fm.put(syncmap.KindContactIdentity, "email:jane@example.com", &tidA, "person-A")
+	fm.put(syncmap.KindContactIdentity, "email:jane@example.com", &tidB, "person-B")
+
+	code, out := getLookup(t, s, "/v1/people/lookup?email=jane@example.com&tenant_id="+tidA.String())
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, out = %v", code, out)
+	}
+	if p, _ := out["person"].(map[string]any); p["id"] != "person-A" {
+		t.Errorf("tenant A lookup = %v, want person-A", out["person"])
+	}
+	code, out = getLookup(t, s, "/v1/people/lookup?email=jane@example.com&tenant_id="+tidB.String())
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, out = %v", code, out)
+	}
+	if p, _ := out["person"].(map[string]any); p["id"] != "person-B" {
+		t.Errorf("tenant B lookup = %v, want person-B (tenant scoping)", out["person"])
+	}
+	// Unknown tenant for the key -> person null.
+	code, out = getLookup(t, s, "/v1/people/lookup?email=jane@example.com&tenant_id="+uuid.NewString())
+	if code != http.StatusOK || out["person"] != nil {
+		t.Errorf("unknown tenant: code = %d person = %v, want 200/null", code, out["person"])
+	}
+	// Malformed tenant_id -> 400.
+	if code, _ := getLookup(t, s, "/v1/people/lookup?email=jane@example.com&tenant_id=nope"); code != http.StatusBadRequest {
+		t.Errorf("bad tenant_id: code = %d, want 400", code)
+	}
+}
+
+// Legacy unscoped contract (GDPR collector): no tenant_id -> the natural
+// key is enumerated across tenants via sync_map (NEVER the global Twenty
+// find) and a mapped person is returned.
+func TestPeopleLookupUnscopedEnumeratesSyncMap(t *testing.T) {
+	s, fm, rec := newTestServer(t)
+	tidA, tidB := uuid.New(), uuid.New()
+	fm.put(syncmap.KindContactIdentity, "email:jane@example.com", &tidA, "person-A")
+	fm.put(syncmap.KindContactIdentity, "email:jane@example.com", &tidB, "person-B")
+	code, out := getLookup(t, s, "/v1/people/lookup?email=jane@example.com")
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, out = %v", code, out)
+	}
+	p, _ := out["person"].(map[string]any)
+	if p["id"] != "person-A" && p["id"] != "person-B" {
+		t.Errorf("unscoped lookup = %v, want one of the mapped persons", out["person"])
+	}
+	if rec.called("GET /rest/people") {
+		t.Error("A1: no global Twenty people find may happen anymore")
+	}
+	// Phone path via contact_phone.
+	fm.put(syncmap.KindContactPhone, "+1555", &tidA, "person-C")
+	code, out = getLookup(t, s, "/v1/people/lookup?phone=%2B1555")
+	if code != http.StatusOK {
+		t.Fatalf("code = %d", code)
+	}
+	if p, _ := out["person"].(map[string]any); p["id"] != "person-C" {
+		t.Errorf("phone lookup = %v, want person-C", out["person"])
+	}
+	// Nothing mapped -> person null.
+	code, out = getLookup(t, s, "/v1/people/lookup?email=nobody@example.com")
+	if code != http.StatusOK || out["person"] != nil {
+		t.Errorf("unmapped: code = %d person = %v, want 200/null", code, out["person"])
+	}
+}
+
+// /v1/tasks phone/email resolution honors the tenant scope: with a
+// tenant_id present, an unmapped contact degrades to unlinked even when a
+// GLOBAL Twenty record exists (no cross-tenant task linking).
+func TestCreateTaskTenantScopedResolutionSkipsGlobalFind(t *testing.T) {
+	s, _, rec := newTestServer(t)
+	rec.people = []map[string]any{{"id": "person-global"}} // exists globally, but not in THIS tenant's map
+	code, out := postTasks(t, s, `{
+		"tenant_slug":"acme-consult","tenant_id":"`+uuid.NewString()+`",
+		"kind":"follow_up","title":"Follow up","email":"jane@example.com",
+		"due_at":"2026-03-08T10:00:00Z"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("code = %d, out = %v", code, out)
+	}
+	if out["linked"] != false || out["personId"] != "" {
+		t.Errorf("out = %v, want unlinked (tenant-scoped resolution must not leak the global record)", out)
 	}
 }

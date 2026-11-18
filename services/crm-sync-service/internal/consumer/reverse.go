@@ -46,6 +46,13 @@ const (
 	TypeTwentyPersonCreated = "com.opendesk.crm.twenty.person.created"
 	TypeTwentyPersonUpdated = "com.opendesk.crm.twenty.person.updated"
 	TypeTwentyTaskUpdated   = "com.opendesk.crm.twenty.task.updated"
+	// TypeTicketEscalated is emitted by the notification-worker's
+	// EscalateTicket activity (support-desk pack, first-response SLA
+	// breach) onto opendesk.crm.events: data carries {tenant_slug,
+	// tenant_id, ticket_id (= OpenDesk booking id), priority:"high",
+	// reason, sla}. The reverse worker flags the booking's Twenty task
+	// HIGH priority (SPEC-W80 A9).
+	TypeTicketEscalated = "com.opendesk.crm.TicketEscalated"
 )
 
 // DefaultEchoWindow is how long after a forward-sync write an inbound person
@@ -76,8 +83,14 @@ type ReverseSyncer struct {
 	Invoker      BookingInvoker
 	BookingAppID string        // Dapr app-id of booking-service (default "booking")
 	EchoWindow   time.Duration // echo suppression window (default DefaultEchoWindow)
-	Metrics      *metrics.Registry
-	Log          *zap.Logger
+	// BookingInternalToken (BOOKING_INTERNAL_TOKEN, SPEC-W80 A11/B7):
+	// booking-service gates its internal routes (/internal/contacts/upsert,
+	// /internal/bookings/{id}/crm-note, ...) behind internAuth — every
+	// invoke must carry X-Internal-Token matching that value. Empty => the
+	// header is omitted and the peer fails closed (warned at boot).
+	BookingInternalToken string
+	Metrics              *metrics.Registry
+	Log                  *zap.Logger
 }
 
 func (s *ReverseSyncer) echoWindow() time.Duration {
@@ -94,6 +107,19 @@ func (s *ReverseSyncer) bookingAppID() string {
 	return "booking"
 }
 
+// bookingHeaders builds the invoke headers for booking-service internal
+// routes: the tenant scope plus the B7 internAuth token (X-Internal-Token
+// == BOOKING_INTERNAL_TOKEN, SPEC-W80 A11). The token header is omitted
+// only when unconfigured — the peer then fails closed (503) and the boot
+// warning in main explains why.
+func (s *ReverseSyncer) bookingHeaders(slug string) map[string]string {
+	h := map[string]string{"X-Tenant-Slug": slug}
+	if s.BookingInternalToken != "" {
+		h["X-Internal-Token"] = s.BookingInternalToken
+	}
+	return h
+}
+
 // HandleCRMEvent processes one opendesk.crm.events CloudEvent.
 func (s *ReverseSyncer) HandleCRMEvent(ctx context.Context, evt events.CloudEvent) error {
 	switch evt.Type {
@@ -101,6 +127,8 @@ func (s *ReverseSyncer) HandleCRMEvent(ctx context.Context, evt events.CloudEven
 		return s.handlePerson(ctx, evt)
 	case TypeTwentyTaskUpdated:
 		return s.handleTaskUpdated(ctx, evt)
+	case TypeTicketEscalated:
+		return s.handleTicketEscalated(ctx, evt)
 	default:
 		s.Log.Debug("ignoring crm event", zap.String("type", evt.Type))
 		return nil
@@ -175,7 +203,7 @@ func (s *ReverseSyncer) handlePerson(ctx context.Context, evt events.CloudEvent)
 		"external_id":     personID,
 	}
 	if err := s.Invoker.InvokeService(ctx, s.bookingAppID(), "internal/contacts/upsert",
-		map[string]string{"X-Tenant-Slug": slug}, payload, nil); err != nil {
+		s.bookingHeaders(slug), payload, nil); err != nil {
 		return fmt.Errorf("invoke booking contact upsert: %w", err)
 	}
 	s.Metrics.Inc("reverse_person_upserted")
@@ -236,13 +264,60 @@ func (s *ReverseSyncer) handleTaskUpdated(ctx context.Context, evt events.CloudE
 	}
 	if err := s.Invoker.InvokeService(ctx, s.bookingAppID(),
 		"internal/bookings/"+m.OpenDeskID+"/crm-note",
-		map[string]string{"X-Tenant-Slug": slug}, payload, nil); err != nil {
+		s.bookingHeaders(slug), payload, nil); err != nil {
 		return fmt.Errorf("invoke booking crm-note: %w", err)
 	}
 	s.Metrics.Inc("reverse_task_completed")
 	s.Log.Info("DONE task reverse-synced to booking crm-note",
 		zap.String("task_id", taskID), zap.String("booking_id", m.OpenDeskID))
 	return nil
+}
+
+// handleTicketEscalated (SPEC-W80 A9): the notification-worker's
+// EscalateTicket activity (support-desk pack, first-response SLA breach)
+// publishes com.opendesk.crm.TicketEscalated with data {tenant_slug,
+// tenant_id, ticket_id (= OpenDesk booking id), priority, reason, sla}.
+// The booking's Twenty task is resolved via sync_map (kind=booking, same
+// mapping the forward syncer wrote) and PATCHed to priority HIGH. No
+// mapping (ticket never synced / booking predates the sync) is a graceful
+// no-op + debug log — never a retry, never a DLQ.
+func (s *ReverseSyncer) handleTicketEscalated(ctx context.Context, evt events.CloudEvent) error {
+	d, err := events.DataAs[TicketEscalatedData](evt)
+	if err != nil {
+		return permanent(err)
+	}
+	if d.TicketID == "" {
+		return permanent(fmt.Errorf("%s missing ticket_id", evt.Type))
+	}
+	tenantUUID := parseUUID(d.TenantID)
+	m, err := s.Map.Get(ctx, KindBooking, d.TicketID, tenantUUID)
+	if errors.Is(err, syncmap.ErrNotFound) {
+		s.Log.Debug("no booking task mapping for escalated ticket; skipping",
+			zap.String("ticket_id", d.TicketID), zap.String("tenant_id", d.TenantID))
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("sync_map booking lookup: %w", err)
+	}
+	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{"priority": "HIGH"}); err != nil {
+		return fmt.Errorf("patch escalated task priority: %w", err)
+	}
+	s.Metrics.Inc("reverse_ticket_escalated")
+	s.Log.Info("escalated ticket: Twenty task priority set HIGH",
+		zap.String("ticket_id", d.TicketID), zap.String("task_id", m.TwentyID),
+		zap.String("reason", d.Reason))
+	return nil
+}
+
+// TicketEscalatedData is the data payload of com.opendesk.crm.TicketEscalated
+// (notification-worker EscalateTicket activity, support-desk pack).
+type TicketEscalatedData struct {
+	TenantSlug string `json:"tenant_slug"`
+	TenantID   string `json:"tenant_id"`
+	TicketID   string `json:"ticket_id"` // OpenDesk booking id
+	Priority   string `json:"priority"`
+	Reason     string `json:"reason"`
+	SLA        string `json:"sla"`
 }
 
 // resolveTenantSlug maps a person to its OpenDesk tenant slug:

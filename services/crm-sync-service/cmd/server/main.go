@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -27,10 +28,48 @@ import (
 )
 
 func main() {
+	// SPEC-W80 A8: the runtime image is distroless (no shell, curl or
+	// wget), so the compose healthcheck execs the binary itself in this
+	// probe mode: GET /healthz on the configured PORT, exit 0 on 2xx.
+	for _, a := range os.Args[1:] {
+		if a == "--healthcheck" || a == "-healthcheck" {
+			os.Exit(healthcheck())
+		}
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)
 	}
+}
+
+// healthcheck probes the local /healthz endpoint (compose healthcheck
+// CMD). Returns 0 healthy, 1 otherwise.
+func healthcheck() int {
+	port := 7010
+	if v := os.Getenv("PORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			port = n
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("http://127.0.0.1:%d/healthz", port), nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, "healthcheck: status", resp.StatusCode)
+	return 1
 }
 
 func run() error {
@@ -69,13 +108,14 @@ func run() error {
 	// from opendesk.crm.events in its own group so it scales/offsets
 	// independently of the forward consumers.
 	reverse := &consumer.ReverseSyncer{
-		Twenty:       twenty,
-		Map:          st,
-		Invoker:      daprClient,
-		BookingAppID: cfg.BookingAppID,
-		EchoWindow:   cfg.EchoWindow,
-		Metrics:      reg,
-		Log:          logger,
+		Twenty:               twenty,
+		Map:                  st,
+		Invoker:              daprClient,
+		BookingAppID:         cfg.BookingAppID,
+		EchoWindow:           cfg.EchoWindow,
+		BookingInternalToken: cfg.BookingInternalToken,
+		Metrics:              reg,
+		Log:                  logger,
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -110,6 +150,12 @@ func run() error {
 		// Runtime fail-closed (503 on the /v1 surface, K2 pattern) — logged
 		// loudly here so the misconfig is obvious at boot.
 		logger.Error("CRM_SYNC_INTERNAL_TOKEN unset — /v1/tasks + /v1/people/lookup will refuse all requests (503 fail-closed, SPEC-W45 K21)")
+	}
+	if cfg.BookingInternalToken == "" {
+		// B7 (SPEC-W80 A11): booking-service's internAuth-guarded internal
+		// routes reject tokenless invokes (503/401) — every reverse-sync
+		// contacts/upsert + crm-note call will fail until this is set.
+		logger.Error("BOOKING_INTERNAL_TOKEN unset — reverse-sync invokes of booking /internal/* will fail closed at the peer (SPEC-W80 B7)")
 	}
 
 	// HTTP server.

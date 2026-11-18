@@ -108,25 +108,11 @@ func (s *Syncer) HandleCapture(ctx context.Context, evt events.CloudEvent) error
 }
 
 // resolvePersonForCapture resolves the caller's Person from the captured
-// contact refs: Twenty people lookup first (existing FindPerson), then the
-// sync_map contact_phone mapping written at booking sync — the same
-// two-step lookup as resolvePersonForCall.
+// contact refs, TENANT-SCOPED via sync_map (SPEC-W80 A1: the legacy global
+// Twenty people lookup could resolve to ANOTHER tenant's person record) —
+// the same lookup as resolvePersonForCall / findPersonForNote.
 func (s *Syncer) resolvePersonForCapture(ctx context.Context, phone, email string, tenantUUID *uuid.UUID) (string, error) {
-	personID, err := s.findPersonForNote(ctx, phone, email)
-	if err != nil {
-		return "", err
-	}
-	if personID != "" || phone == "" {
-		return personID, nil
-	}
-	m, err := s.Map.Get(ctx, syncmap.KindContactPhone, phone, tenantUUID)
-	if errors.Is(err, syncmap.ErrNotFound) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return m.TwentyID, nil
+	return s.findPersonForNote(ctx, phone, email, tenantUUID)
 }
 
 // captureContactRefs picks the first phone and e-mail values out of the

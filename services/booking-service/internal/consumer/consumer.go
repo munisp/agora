@@ -242,6 +242,8 @@ func (c *Consumer) bookAppointment(ctx context.Context, env commandEnvelope, ten
 	if tenant.Pack != nil {
 		policy := tenant.Pack.BookingPolicy
 		in.BookingPolicy = &policy
+		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
+		in.WorkflowName = tenant.Pack.TemporalWorkflow
 	}
 	_, err = c.ops.Create(ctx, in)
 	return err

@@ -246,6 +246,8 @@ func run() error {
 
 	// Industry pack activities (SPEC-CRM §C2)
 	w.RegisterActivityWithOptions(acts.ApplyIndustryPack, activity.RegisterOptions{Name: workflows.ActivityApplyIndustryPack})
+	// SPEC-W80 C3: pack reminders resolution for the saga's ReminderWorkflow.
+	w.RegisterActivityWithOptions(acts.GetPackReminders, activity.RegisterOptions{Name: workflows.ActivityGetPackReminders})
 	w.RegisterActivityWithOptions(acts.VerifyDepositHold, activity.RegisterOptions{Name: workflows.ActivityVerifyDepositHold})
 	w.RegisterActivityWithOptions(acts.SendDepositReminder, activity.RegisterOptions{Name: workflows.ActivitySendDepositReminder})
 	w.RegisterActivityWithOptions(acts.ChargeNoShowFee, activity.RegisterOptions{Name: workflows.ActivityChargeNoShowFee})

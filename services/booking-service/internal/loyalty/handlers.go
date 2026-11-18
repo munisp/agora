@@ -62,14 +62,15 @@ type Deps struct {
 // The variadic middlewares apply to the WHOLE group — the integrator
 // passes the appgate entitlement gate for app_id "loyalty-wallet" there.
 func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler) {
-	topic := d.EventsTopic
-	if topic == "" {
-		topic = "opendesk.loyalty.events.v1"
-	}
+	// SPEC-W80 B10: NO default-override here — an EMPTY Deps.EventsTopic
+	// disables lifecycle emission (Service.emitLifecycle no-ops on empty),
+	// exactly as the Deps contract documents. The default topic lives in
+	// the config layer (LOYALTY_EVENTS_TOPIC default), so production wiring
+	// is unchanged; integrators/tests can now actually switch emission off.
 	svc := &Service{
 		Store:       d.Store,
 		Ledger:      NewPostgresLedger(d.Store),
-		EventsTopic: topic,
+		EventsTopic: d.EventsTopic,
 		UsageTopic:  d.UsageTopic,
 		Log:         d.Log,
 	}

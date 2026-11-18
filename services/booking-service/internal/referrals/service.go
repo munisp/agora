@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/events"
 	"github.com/opendesk/booking-service/internal/leads"
+	"github.com/opendesk/booking-service/internal/loyalty"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
 )
@@ -35,6 +36,12 @@ type Service struct {
 	// (referral verify walks the referee's lead to `converted` through the
 	// leads status machine). Nil disables the hook.
 	Leads *leads.Service
+	// Loyalty is the SPEC-W80 B2 earn-rule seam: on a NON-idempotent
+	// verify of a contact-referrer referral, the referrer accrues
+	// loyalty `referral_converted` points (the earn rule was dead —
+	// nothing ever fired the event). Nil disables the hook (same
+	// optional-dep posture as Leads).
+	Loyalty ReferralConvertedAccruer
 	// CACEventsTopic is the funnel topic (CAC_EVENTS_TOPIC, default
 	// cac.events). Empty disables emission.
 	CACEventsTopic string
@@ -43,6 +50,14 @@ type Service struct {
 	// (SPEC-W14 Agent D (additive); empty disables metering).
 	UsageTopic string
 	Log        *zap.Logger
+}
+
+// ReferralConvertedAccruer is the OPTIONAL loyalty seam for the B2
+// referral_converted earn rule. *loyalty.Service satisfies it. Kept as an
+// interface (not a concrete dep) so referrals tests can substitute a fake
+// and the package wiring stays cycle-free.
+type ReferralConvertedAccruer interface {
+	Accrue(ctx context.Context, tenantID, contactID uuid.UUID, event, refID string) (loyalty.AccrueResult, error)
 }
 
 func (s *Service) log() *zap.Logger {
@@ -171,6 +186,7 @@ func (s *Service) Verify(ctx context.Context, tenantID, referralID uuid.UUID, tr
 
 	// Post-commit hooks (best-effort, logged — see method doc).
 	s.convertRefereeLead(ctx, tenantID, updated.RefereePhone, tenantSlug)
+	s.accrueReferralConverted(ctx, updated)
 	s.emitFunnelHook(ctx, updated, trigger, baseKobo, tenantSlug)
 	// SPEC-W14 Agent D (additive): one referral_verified usage outbox row
 	// per NON-idempotent verify (metering.go).
@@ -288,6 +304,38 @@ func (s *Service) convertRefereeLead(ctx context.Context, tenantID uuid.UUID, re
 			return
 		}
 	}
+}
+
+// accrueReferralConverted implements the SPEC-W80 B2 referral_converted
+// earn rule: the REFERRER (contact referrers only — loyalty wallets are
+// contact-keyed; agent/staff commissions already ride the referral ledger)
+// accrues loyalty points on every NON-idempotent verify. Best-effort post-
+// commit (same posture as convertRefereeLead): the referral + postings are
+// durable; failures are logged for reconciliation. The ref_id anchors the
+// accrual to this referral, so a retried verify can never double-award.
+func (s *Service) accrueReferralConverted(ctx context.Context, ref Referral) {
+	if s.Loyalty == nil || ref.ReferrerType != ReferrerContact {
+		return
+	}
+	referrerID, err := uuid.Parse(ref.ReferrerID)
+	if err != nil {
+		return // validateReferrer guarantees a uuid at create; defensive only
+	}
+	_, err = s.Loyalty.Accrue(ctx, ref.TenantID, referrerID,
+		loyalty.EventReferralConverted, "referral:"+ref.ID.String())
+	if err == nil {
+		return
+	}
+	if errors.Is(err, loyalty.ErrNoActiveProgram) || errors.Is(err, loyalty.ErrInvalidInput) {
+		// No active program (or the program does not award
+		// referral_converted): a config outcome, not a hook failure.
+		s.log().Debug("referral loyalty hook: referral_converted not awarded",
+			zap.String("referral_id", ref.ID.String()))
+		return
+	}
+	s.log().Error("referral loyalty hook: accrual failed; referral durable but points not awarded — reconcile",
+		zap.String("referral_id", ref.ID.String()),
+		zap.String("referrer_id", ref.ReferrerID), zap.Error(err))
 }
 
 // emitFunnelHook emits the §6 referral funnel hook on cac.events: event_name

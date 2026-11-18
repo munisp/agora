@@ -51,6 +51,12 @@ type SagaInput struct {
 
 	// SPEC-CRM §C2/C3: tenant's industry pack + resolved deposit policy.
 	Industry string `json:"industry,omitempty"`
+	// WorkflowName (SPEC-W80 B13, cross-workstream contract with Coder C)
+	// is the pack-DECLARED Temporal workflow (PackSummary.TemporalWorkflow)
+	// for this booking's saga. Empty string = legacy behavior — the
+	// notification-worker owns the industry-switch fallback; never invent
+	// a default here.
+	WorkflowName string `json:"workflow_name,omitempty"`
 	// DepositCents is ceil(price_cents * depositPercent/100); only consulted
 	// when DepositKnown is true (otherwise the saga holds the full price).
 	DepositCents int64 `json:"deposit_cents,omitempty"`
@@ -82,6 +88,12 @@ type Service struct {
 	// the loyalty package does not expose AccrueOnBookingCompleted yet —
 	// see the CONTRACT NOTE on the interface.
 	Loyalty BookingCompletedAccruer
+	// LeadConverter is the SPEC-W80 B3 booking→lead conversion hook
+	// (OpenLeadConverter): on a contact's FIRST completed booking the
+	// contact's open lead is walked to `converted`. Nil disables the hook
+	// (partial deployments stay intact — same optional-dep posture as
+	// Loyalty).
+	LeadConverter OpenLeadConverter
 	// GeoEnforce enables the SPEC-W52 coverage-zone gate on the PUBLIC
 	// booking create path (BOOKING_GEO_ENFORCE, default false). False keeps
 	// every create path byte-identical to pre-W52 behavior. See coverage.go
@@ -118,6 +130,14 @@ type CreateInput struct {
 	// identity tenant context by the HTTP handlers.
 	Industry      string
 	BookingPolicy *BookingPolicy // nil when the tenant has no resolved pack
+	// WorkflowName (SPEC-W80 B13) is the pack-declared Temporal workflow
+	// (PackSummary.TemporalWorkflow), captured alongside Industry by the
+	// HTTP/consumer handlers. Empty = legacy saga routing (the worker owns
+	// the fallback). When unset, startSaga falls back to
+	// BookingPolicy.TemporalWorkflow so the INVARIANT staff create path
+	// (httpapi/bookings.go — byte-identical, W57) flows the pack workflow
+	// through the resolver's BookingPolicy mirror untouched.
+	WorkflowName string `json:"workflow_name,omitempty"`
 }
 
 // Create validates and inserts a booking transactionally with its outbox
@@ -398,6 +418,14 @@ func (s *Service) startSaga(ctx context.Context, b store.Booking, o store.Offeri
 		return
 	}
 	depositCents, depositKnown := depositFor(o.PriceCents, in.BookingPolicy)
+	// SPEC-W80 B13: the pack-declared workflow rides explicitly when the
+	// caller captured it; the BookingPolicy mirror (resolver.go) covers the
+	// invariant staff create path. Empty stays empty — the worker owns the
+	// legacy industry-switch fallback.
+	workflowName := in.WorkflowName
+	if workflowName == "" && in.BookingPolicy != nil {
+		workflowName = in.BookingPolicy.TemporalWorkflow
+	}
 	sagaIn := SagaInput{
 		BookingID:    b.ID.String(),
 		TenantID:     b.TenantID.String(),
@@ -414,6 +442,7 @@ func (s *Service) startSaga(ctx context.Context, b store.Booking, o store.Offeri
 		Currency:     o.Currency,
 		Source:       b.Source,
 		Industry:     in.Industry,
+		WorkflowName: workflowName,
 		DepositCents: depositCents,
 		DepositKnown: depositKnown,
 	}

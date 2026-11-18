@@ -20,7 +20,7 @@ const (
 	ActivityGetBookingStatus = "GetBookingStatus"
 	// SPEC-W34 GF16: CRITICAL ops alert when a saga compensation exhausts
 	// its retries (e.g. orphaned deposit hold — holds have no TB timeout).
-	ActivityEmitOpsAlert = "EmitOpsAlert"
+	ActivityEmitOpsAlert     = "EmitOpsAlert"
 	ActivityMarkNoShow       = "MarkNoShow"
 	ActivitySendNoShowFollow = "SendNoShowFollowup"
 
@@ -40,12 +40,35 @@ const (
 	ActivityCreateCRMFollowupTask = "CreateCRMFollowupTask"
 	ActivitySendProposalReminder  = "SendProposalReminder"
 	ActivityEscalateTicket        = "EscalateTicket"
+
+	// SPEC-W80 C3: resolves the pack reminders block (offsets/channels) for
+	// the saga's industry so the ReminderWorkflow can honor pack timing.
+	ActivityGetPackReminders = "GetPackReminders"
 )
 
-// PackWorkflowForIndustry maps an industry id to its pack workflow name
-// (SPEC-CRM §C2). Unknown industries fall back to SalonDepositWorkflow.
-func PackWorkflowForIndustry(industry string) string {
-	switch industry {
+// knownPackWorkflows is the allowlist of pack child workflow names the saga
+// will start when the input declares one (SPEC-W80 C1). It mirrors the four
+// workflows registered in cmd/worker/main.go and the pack loader's
+// temporalWorkflow validation (internal/packs).
+var knownPackWorkflows = map[string]bool{
+	"SalonDepositWorkflow":        true,
+	"ClinicIntakeWorkflow":        true,
+	"ConsultancyFollowupWorkflow": true,
+	"SupportEscalationWorkflow":   true,
+}
+
+// PackWorkflowForIndustry resolves the pack child workflow for a saga input
+// (SPEC-CRM §C2, SPEC-W80 C1). When the input carries a pack-declared
+// WorkflowName that is one of the four known pack workflows, it wins — this
+// fixes the 29/39 packs whose temporalWorkflow the legacy industry switch
+// could not express. When WorkflowName is empty (in-flight pre-W80 sagas) or
+// unknown, the legacy industry switch applies unchanged; unknown industries
+// fall back to SalonDepositWorkflow exactly as before.
+func PackWorkflowForIndustry(in SagaInput) string {
+	if knownPackWorkflows[in.WorkflowName] {
+		return in.WorkflowName
+	}
+	switch in.IndustryOrDefault() {
 	case "clinic":
 		return "ClinicIntakeWorkflow"
 	case "consultancy":
@@ -215,8 +238,7 @@ func BookingSagaWorkflow(ctx workflow.Context, in SagaInput) error {
 		WorkflowID:        "reminder-" + in.BookingID,
 		ParentClosePolicy: enumspb.PARENT_CLOSE_POLICY_ABANDON,
 	}
-	reminderCtx := workflow.WithChildOptions(ctx, childOpts)
-	workflow.ExecuteChildWorkflow(reminderCtx, "ReminderWorkflow", ReminderInput{
+	reminderIn := ReminderInput{
 		BookingID:    in.BookingID,
 		TenantID:     in.TenantID,
 		TenantSlug:   in.TenantSlug,
@@ -224,7 +246,21 @@ func BookingSagaWorkflow(ctx workflow.Context, in SagaInput) error {
 		ContactEmail: in.ContactEmail,
 		ContactName:  in.ContactName,
 		StartsAt:     in.StartsAt,
-	})
+	}
+	// SPEC-W80 C3: resolve the pack reminders block (offsets/channels) for
+	// the saga's industry. Best-effort: an unknown/unloaded pack or a failed
+	// lookup leaves the fields empty and ReminderWorkflow keeps its legacy
+	// T-24h/T-1h defaults on all channels.
+	var packRem PackReminders
+	if err := workflow.ExecuteActivity(ctx, ActivityGetPackReminders, in.IndustryOrDefault()).Get(ctx, &packRem); err != nil {
+		logger.Warn("GetPackReminders failed; using default reminder offsets",
+			"industry", in.IndustryOrDefault(), "error", err)
+	} else {
+		reminderIn.ReminderOffsets = packRem.Offsets
+		reminderIn.ReminderChannels = packRem.Channels
+	}
+	reminderCtx := workflow.WithChildOptions(ctx, childOpts)
+	workflow.ExecuteChildWorkflow(reminderCtx, "ReminderWorkflow", reminderIn)
 
 	noshowCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
 		WorkflowID:        "noshow-" + in.BookingID,
@@ -243,7 +279,7 @@ func BookingSagaWorkflow(ctx workflow.Context, in SagaInput) error {
 	// workflow name is resolved from the saga's industry (default salon).
 	// Pack workflows are compensation-safe: they only notify / create tasks
 	// and stop on a booking-event "cancelled" signal.
-	packName := PackWorkflowForIndustry(in.IndustryOrDefault())
+	packName := PackWorkflowForIndustry(in)
 	packCtx := workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
 		WorkflowID:        "pack-" + in.BookingID,
 		ParentClosePolicy: enumspb.PARENT_CLOSE_POLICY_ABANDON,

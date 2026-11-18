@@ -93,7 +93,11 @@ async def amain() -> None:
         dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
         cac_deps = CacDeps(
             store=cac_store,
-            spend=BookingSpendClient(dapr, settings.booking_app_id),
+            spend=BookingSpendClient(
+                dapr,
+                settings.booking_app_id,
+                internal_token=settings.booking_internal_token,
+            ),
             tenants=TenantResolver(
                 dapr,
                 settings.identity_app_id,

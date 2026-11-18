@@ -293,6 +293,14 @@ func (h *Handlers) CreateTicket(w http.ResponseWriter, r *http.Request) {
 		h.mapErr(w, err)
 		return
 	}
+	// SPEC-W80 B9: a supplied contact_id must resolve IN-TENANT (404 when
+	// missing or cross-tenant) — no orphaned ticket contact links.
+	if t.ContactID != nil {
+		if err := h.Store.ContactExists(r.Context(), tenant.ID, *t.ContactID); err != nil {
+			h.mapErr(w, err)
+			return
+		}
+	}
 	if err := h.Store.CreateTicket(r.Context(), &t, h.actor(r)); err != nil {
 		h.mapErr(w, err)
 		return

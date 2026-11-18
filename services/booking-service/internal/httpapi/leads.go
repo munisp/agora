@@ -294,7 +294,18 @@ func (s *server) redeemPromo(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusTooManyRequests, "too many redemption attempts — try again later")
 		return
 	}
-	lead, created, err := svc.RedeemPromo(r.Context(), req.Code, req.Phone, "")
+	// SPEC-W80 B6: resolve the REAL tenant slug for the funnel events
+	// RedeemPromo emits — the public path has no tenant header, so map the
+	// code's owning tenant through its site row (resolveClaimTenant idiom).
+	// Best-effort: a resolution failure degrades to "" exactly like before,
+	// never to a failed redemption.
+	tenantSlug := ""
+	if promo, err := s.d.Store.LookupPromoCode(r.Context(), req.Code); err == nil {
+		if tenant, terr := s.resolveClaimTenant(r.Context(), promo.TenantID); terr == nil {
+			tenantSlug = tenant.Slug
+		}
+	}
+	lead, created, err := svc.RedeemPromo(r.Context(), req.Code, req.Phone, tenantSlug)
 	if errors.Is(err, store.ErrNotFound) {
 		// Unknown code: 404 without revealing which tenant (codes unguessable).
 		writeError(w, http.StatusNotFound, "unknown promo code")

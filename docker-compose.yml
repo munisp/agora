@@ -1158,6 +1158,12 @@ services:
       # /v1/tenants/{slug} carries X-Internal-Token. Same DEV ONLY default
       # as the identity block; prod MUST set via the secrets store.
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
+      # SPEC-W80 A11/B7 caller side: BookingSpendClient (CAC spend join)
+      # GET booking /internal/campaigns/{id}/spend-sum carries
+      # X-Internal-Token matching the BOOKING block's
+      # BOOKING_INTERNAL_TOKEN (SAME shared secret var; DEV ONLY default,
+      # prod via the secrets store — docs/runbooks/secrets.md).
+      BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the
@@ -1338,6 +1344,7 @@ services:
   crm-sync:
     logging: *default-logging
     deploy: *default-limits
+    restart: unless-stopped
     build: ./services/crm-sync-service
     # Optional: secrets/dev overrides (compose still boots without it —
     # every ${VAR} below carries a dev fallback). cp .env.example .env
@@ -1348,7 +1355,6 @@ services:
       DAPR_HOST: daprd-crm-sync
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
-      PG_DSN: postgres://${CRM_SYNC_PG_USER:-app_crm_sync_login}:${CRM_SYNC_PG_PASS:-app_crm_sync_dev_password}@postgres:5432
       PORT: '7010'
       # SPEC-W43 G-01: least-privilege app_crm_sync_login by default
       # (05-app-roles.sql); superuser only for migration/bootstrap jobs.
@@ -1381,6 +1387,22 @@ services:
       # (docs/runbooks/secrets.md). Human traffic stays on the APISIX /crm/*
       # route (jwt + admin|staff role claim).
       CRM_SYNC_INTERNAL_TOKEN: ${CRM_SYNC_INTERNAL_TOKEN:-opendesk-dev-crm-sync-internal-token-change-in-prod}
+      # SPEC-W80 A11/B7 caller side: the reverse worker invokes
+      # booking-service's internAuth-guarded internal routes
+      # (/internal/contacts/upsert, /internal/bookings/{id}/crm-note) with
+      # X-Internal-Token matching the BOOKING block's
+      # BOOKING_INTERNAL_TOKEN (SAME shared secret var; DEV ONLY default,
+      # prod via the secrets store — docs/runbooks/secrets.md).
+      BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-opendesk-dev-booking-internal-token-change-in-prod}
+    # A8 (SPEC-W80): liveness via the binary's own probe mode — the
+    # runtime image is distroless (no shell/curl/wget), so the check
+    # re-execs /server --healthcheck (GET 127.0.0.1:7010/healthz).
+    healthcheck:
+      test: ["CMD", "/server", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

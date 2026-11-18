@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,6 +48,29 @@ CREATE TABLE IF NOT EXISTS webhook_events_seen (
 );
 CREATE INDEX IF NOT EXISTS webhook_events_seen_seen_at_idx ON webhook_events_seen (seen_at)`
 
+// constraintRetrofit (SPEC-W80 A7): pre-K21 deployments created sync_map
+// WITHOUT the UNIQUE(kind, opendesk_id, tenant_id) constraint (it only
+// exists inline in the CREATE TABLE above, which is a no-op for tables
+// that already exist). Put's ON CONFLICT (kind, opendesk_id, tenant_id)
+// needs it, so retrofit it here: a guarded, idempotent pg_constraint
+// existence check + ADD CONSTRAINT. Without the constraint a concurrent
+// Put pair could insert duplicates and every later Put would fail with
+// "there is no unique or exclusion constraint matching the ON CONFLICT
+// specification".
+const constraintRetrofit = `DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		WHERE t.relname = 'sync_map'
+		  AND c.conname = 'sync_map_kind_opendesk_id_tenant_id_key'
+	) THEN
+		ALTER TABLE sync_map
+			ADD CONSTRAINT sync_map_kind_opendesk_id_tenant_id_key
+			UNIQUE (kind, opendesk_id, tenant_id);
+	END IF;
+END $$`
+
 // Store wraps the pgx pool.
 type Store struct {
 	pool *pgxpool.Pool
@@ -86,6 +110,26 @@ const KindContactPhone = "contact_phone"
 // email/phone find.
 const KindContactIdentity = "contact_identity"
 
+// ContactIdentityKeys derives the sync_map (KindContactIdentity) natural
+// keys for a contact: "email:<lower(trim(email))>" when an e-mail is
+// present, "phone:<trim(phone)>" when a phone is present (SPEC-W45 K21:
+// the person upsert key is (tenant_id, email|phone); the tenant scoping
+// comes from the sync_map tenant_id column). E-mail wins over phone
+// (ordering mirrors the legacy FindPerson email-first order). Shared by
+// the forward syncer, the note paths, /v1/people/lookup and GDPR erasure
+// (SPEC-W80 A1) so the key derivation can never drift between writer and
+// readers.
+func ContactIdentityKeys(email, phone string) []string {
+	var keys []string
+	if e := strings.ToLower(strings.TrimSpace(email)); e != "" {
+		keys = append(keys, "email:"+e)
+	}
+	if p := strings.TrimSpace(phone); p != "" {
+		keys = append(keys, "phone:"+p)
+	}
+	return keys
+}
+
 // normTenant maps nil to uuid.Nil (stored as a regular value, never NULL).
 func normTenant(t *uuid.UUID) uuid.UUID {
 	if t == nil {
@@ -108,6 +152,12 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 	if _, err := pool.Exec(ctx, ddl); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("bootstrap sync_map: %w", err)
+	}
+	// SPEC-W80 A7: converge pre-existing tables that predate the inline
+	// UNIQUE constraint (guarded, idempotent).
+	if _, err := pool.Exec(ctx, constraintRetrofit); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("retrofit sync_map unique constraint: %w", err)
 	}
 	return &Store{pool: pool}, nil
 }
@@ -163,6 +213,37 @@ func (s *Store) GetByTwentyID(ctx context.Context, kind, twentyID string) (Mappi
 		return m, fmt.Errorf("sync_map get by twenty_id: %w", err)
 	}
 	return m, nil
+}
+
+// ListByOpendeskID returns EVERY non-disabled mapping of a kind with the
+// given opendesk_id, across ALL tenants (SPEC-W80 A1). The tenant-scoped
+// Get returns at most one row; GDPR erasure and the legacy unscoped
+// /v1/people/lookup path must enumerate every per-tenant match of a
+// natural key (two tenants can share an e-mail — incomplete enumeration
+// is a compliance bug). Ordered by id ASC so the "first synced" match is
+// deterministic.
+func (s *Store) ListByOpendeskID(ctx context.Context, kind, opendeskID string) ([]Mapping, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT `+mappingCols+` FROM sync_map
+		     WHERE kind = $1 AND opendesk_id = $2
+		       AND disabled_at IS NULL
+		     ORDER BY id ASC`, kind, opendeskID)
+	if err != nil {
+		return nil, fmt.Errorf("sync_map list by opendesk_id: %w", err)
+	}
+	defer rows.Close()
+	var out []Mapping
+	for rows.Next() {
+		var m Mapping
+		if err := rows.Scan(&m.ID, &m.Kind, &m.OpenDeskID, &m.TwentyID, &m.TenantID, &m.UpdatedAt, &m.LastSyncedAt); err != nil {
+			return nil, fmt.Errorf("sync_map list scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sync_map list rows: %w", err)
+	}
+	return out, nil
 }
 
 // DeleteByTwentyID removes every mapping pointing at a Twenty record

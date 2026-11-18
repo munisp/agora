@@ -112,8 +112,16 @@ func (a *Activities) resolvePushTargets(ctx context.Context, in workflows.PacedP
 	}
 	var devices []DeviceToken
 	method := "internal/devices?contact_id=" + url.QueryEscape(in.ContactID)
+	// SPEC-W80 B7 (G9): /internal/devices is internAuth-gated — forward
+	// X-Internal-Token = BOOKING_INTERNAL_TOKEN alongside the tenant slug
+	// (empty token → no header; the peer fails closed and the error
+	// surfaces, same as the other booking callers via internalHeaders).
+	headers := map[string]string{"X-Tenant-Slug": in.TenantSlug}
+	if a.BookingInternalToken != "" {
+		headers["X-Internal-Token"] = a.BookingInternalToken
+	}
 	err := a.Dapr.InvokeServiceMethod(ctx, http.MethodGet, a.BookingAppID, method, nil,
-		map[string]string{"X-Tenant-Slug": in.TenantSlug}, &devices)
+		headers, &devices)
 	if err != nil {
 		return nil, fmt.Errorf("fetch device tokens (booking %s): %w", method, err)
 	}

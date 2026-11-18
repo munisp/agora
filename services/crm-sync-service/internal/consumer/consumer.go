@@ -20,11 +20,26 @@ const maxAttempts = 3
 // Handler processes one parsed CloudEvent.
 type Handler func(ctx context.Context, evt events.CloudEvent) error
 
+// messageReader is the kafka.Reader surface the Consumer needs (interface
+// for testability; *kafka.Reader satisfies it).
+type messageReader interface {
+	FetchMessage(ctx context.Context) (kafka.Message, error)
+	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
+// dlqWriter is the kafka.Writer surface the Consumer needs (interface for
+// testability; *kafka.Writer satisfies it).
+type dlqWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
 // Consumer reads one topic and applies events via its Handler.
 type Consumer struct {
 	topic   string
-	reader  *kafka.Reader
-	dlq     *kafka.Writer
+	reader  messageReader
+	dlq     dlqWriter
 	handler Handler
 	metrics *metrics.Registry
 	log     *zap.Logger
@@ -67,6 +82,17 @@ func (c *Consumer) Run(ctx context.Context) error {
 			return fmt.Errorf("fetch message: %w", err)
 		}
 		if err := c.processWithRetry(ctx, msg); err != nil {
+			// SPEC-W80 A5: a graceful shutdown cancels ctx mid-processing
+			// (processWithRetry returns ctx.Err()). Dead-lettering a message
+			// that was never really POISON — it simply lost the shutdown
+			// race — pollutes the DLQ with healthy events; instead stop
+			// consuming and let the uncommitted offset redeliver on the
+			// next boot.
+			if errors.Is(err, context.Canceled) {
+				c.log.Info("shutdown during processing; message left uncommitted (no DLQ)",
+					zap.String("topic", c.topic), zap.String("key", string(msg.Key)))
+				return nil
+			}
 			c.log.Error("event dead-lettered",
 				zap.String("topic", c.topic), zap.String("key", string(msg.Key)), zap.Error(err))
 			if dlqErr := c.deadLetter(ctx, msg, err); dlqErr != nil {

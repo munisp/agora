@@ -3,6 +3,7 @@ package leads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -88,6 +89,52 @@ func (s *Service) Create(ctx context.Context, in CreateInput, tenantSlug string)
 	}
 	s.emit(ctx, &lead, EventLeadCreated, tenantSlug)
 	return lead, true, nil
+}
+
+// firstCompletionStep is the status-machine path towards `converted` for
+// the SPEC-W80 B3 booking→lead hook (converted|lost terminal — filtered
+// out by FindOpenLeadByPhone). Mirrors the referral verify walk
+// (referrals.convertRefereeLead).
+var firstCompletionStep = map[string]string{
+	StatusNew:       StatusContacted,
+	StatusContacted: StatusQualified,
+	StatusQualified: StatusConverted,
+}
+
+// ConvertOpenLeadByPhone is the SPEC-W80 B3 booking→lead conversion hook
+// (bookingops.OpenLeadConverter): fired by booking completion on the
+// contact's FIRST completed booking — the contact's open lead (matched by
+// phone via the additive store seam FindOpenLeadByPhone) is walked to
+// `converted` through the status machine (Transition emits the §2
+// FunnelEvents per step). No open lead = graceful no-op. Best-effort:
+// every failure is logged and swallowed — the booking completion is
+// already durable and must never fail on a leads problem.
+func (s *Service) ConvertOpenLeadByPhone(ctx context.Context, tenantID uuid.UUID, phone, tenantSlug string) {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return
+	}
+	lead, err := s.Store.FindOpenLeadByPhone(ctx, tenantID, phone)
+	if errors.Is(err, store.ErrNotFound) {
+		return // no open lead for this phone (or already converted/lost)
+	}
+	if err != nil {
+		s.log().Error("booking lead hook: lookup failed; booking durable but lead not converted — reconcile",
+			zap.String("phone", phone), zap.Error(err))
+		return
+	}
+	for lead.Status != StatusConverted {
+		next := firstCompletionStep[lead.Status]
+		if next == "" {
+			return
+		}
+		lead, err = s.Transition(ctx, tenantID, lead.ID, next, tenantSlug)
+		if err != nil {
+			s.log().Error("booking lead hook: transition failed; booking durable but lead not converted — reconcile",
+				zap.String("lead_id", lead.ID.String()), zap.String("to", next), zap.Error(err))
+			return
+		}
+	}
 }
 
 // Transition moves a lead along new→contacted→qualified→converted|lost and

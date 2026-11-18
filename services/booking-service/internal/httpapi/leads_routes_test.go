@@ -25,13 +25,15 @@ func TestLeadRoutesWiring(t *testing.T) {
 		t.Fatalf("promo redeem without tenant header = %d, want 503 (public path)", rec.Code)
 	}
 
-	// Internal spend-sum: tenant middleware applies (400 without header) —
-	// it is invoked with X-Tenant-Slug like /internal/contacts.
+	// Internal spend-sum: SPEC-W80 B7 internAuth-guards it BEFORE the
+	// tenant middleware — with no BOOKING_INTERNAL_TOKEN configured the
+	// fail-closed answer is 503 (never the tenant-middleware 400). The
+	// token-matrix posture lives in w80_internal_auth_test.go.
 	req = httptest.NewRequest(http.MethodGet, "/internal/campaigns/11111111-1111-1111-1111-111111111111/spend-sum", nil)
 	rec = httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("spend-sum without tenant header = %d, want 400 (tenant middleware)", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("spend-sum without internal token = %d, want 503 (internAuth fail-closed)", rec.Code)
 	}
 
 	// Tenant-scoped reads/mutations: tenant middleware applies.

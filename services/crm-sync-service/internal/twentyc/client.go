@@ -56,17 +56,28 @@ func New(baseURL, apiKey string, ratePerMin int) *Client {
 	return c
 }
 
-// tokenBucket is a simple mutex-guarded token bucket refilled once per minute.
+// tokenBucket is a mutex-guarded token bucket with SPREAD refill (SPEC-W80
+// A6): one token per (60/rate) seconds, capped at capacity. The legacy
+// fixed-window refill dumped the whole capacity at each minute boundary,
+// so a burst straddling the boundary could fire 2×rate requests inside a
+// few seconds — double the configured sustained rate.
 type tokenBucket struct {
 	mu       sync.Mutex
 	capacity int
 	tokens   int
-	refillAt time.Time
+	interval time.Duration // per-token refill interval (time.Minute / rate)
+	last     time.Time     // last refill accounting instant
 	nowFn    func() time.Time
 }
 
 func newTokenBucket(perMin int) *tokenBucket {
-	return &tokenBucket{capacity: perMin, tokens: perMin, refillAt: time.Now().Add(time.Minute), nowFn: time.Now}
+	return &tokenBucket{
+		capacity: perMin,
+		tokens:   perMin,
+		interval: time.Minute / time.Duration(perMin),
+		last:     time.Now(),
+		nowFn:    time.Now,
+	}
 }
 
 // wait blocks until a token is available or ctx is done.
@@ -74,16 +85,21 @@ func (b *tokenBucket) wait(ctx context.Context) error {
 	for {
 		b.mu.Lock()
 		now := b.nowFn()
-		if !now.Before(b.refillAt) {
-			b.tokens = b.capacity
-			b.refillAt = now.Add(time.Minute)
+		// Spread refill: credit one token per elapsed interval, capped.
+		if elapsed := now.Sub(b.last); elapsed >= b.interval {
+			add := int(elapsed / b.interval)
+			b.tokens += add
+			if b.tokens > b.capacity {
+				b.tokens = b.capacity
+			}
+			b.last = b.last.Add(time.Duration(add) * b.interval)
 		}
 		if b.tokens > 0 {
 			b.tokens--
 			b.mu.Unlock()
 			return nil
 		}
-		delay := b.refillAt.Sub(now)
+		delay := b.interval - now.Sub(b.last)
 		b.mu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -97,6 +113,11 @@ func (b *tokenBucket) wait(ctx context.Context) error {
 type apiError struct {
 	Status int
 	Body   string
+	// RetryAfter is the raw Retry-After RESPONSE HEADER value (SPEC-W80 A4).
+	// The legacy code parsed the JSON body instead — Twenty (like every
+	// RFC 9110 stack) signals throttling via the header, so the body parse
+	// never matched and the hint was always lost.
+	RetryAfter string
 }
 
 func (e *apiError) Error() string { return fmt.Sprintf("twenty API status %d: %s", e.Status, e.Body) }
@@ -166,7 +187,7 @@ func (c *Client) do(ctx context.Context, method, path string, query string, body
 				}
 				return nil
 			}
-			lastErr = &apiError{Status: resp.StatusCode, Body: string(b)}
+			lastErr = &apiError{Status: resp.StatusCode, Body: string(b), RetryAfter: resp.Header.Get("Retry-After")}
 			if !retryable(resp.StatusCode) {
 				return lastErr // 4xx (except 429) will not heal with retries
 			}
@@ -198,7 +219,13 @@ func backoff(attempt int, retryAfterHint time.Duration) time.Duration {
 func retryAfter(err error) time.Duration {
 	var ae *apiError
 	if errors.As(err, &ae) && ae.Status == http.StatusTooManyRequests {
-		if n, perr := strconv.Atoi(ae.Body); perr == nil && n > 0 && n < 120 {
+		// SPEC-W80 A4: the Retry-After header (delay-seconds, RFC 9110
+		// §10.2.3) is authoritative; the body parse stays only as a legacy
+		// fallback for stacks that echo the hint in the payload.
+		if n, perr := strconv.Atoi(strings.TrimSpace(ae.RetryAfter)); perr == nil && n > 0 && n < 120 {
+			return time.Duration(n) * time.Second
+		}
+		if n, perr := strconv.Atoi(strings.TrimSpace(ae.Body)); perr == nil && n > 0 && n < 120 {
 			return time.Duration(n) * time.Second
 		}
 		return 2 * time.Second
