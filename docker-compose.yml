@@ -1209,6 +1209,15 @@ services:
       # the analytics-pipeline service is `analytics:7009` on the opendesk
       # network. Without this, the CAC/billing analytics pages 502.
       ANALYTICS_BASE_URL: ${ANALYTICS_BASE_URL:-http://analytics:7009}
+      # SPEC-W77: admin-web BFF forwards /api/ocr-registry/registry-stats
+      # DIRECTLY to the ocr-service (W44/F15-15 analytics precedent; the
+      # handler is session + platform-admin gated, GET only). The code
+      # default is already http://ocr:7020, which is right inside this
+      # container, but pin it so the wiring is explicit. OCR_INTERNAL_TOKEN
+      # (SAME shared secret var as the ocr block) is injected server-side
+      # as X-Internal-Token and NEVER reaches the client bundle.
+      OCR_BASE_URL: ${OCR_BASE_URL:-http://ocr:7020}
+      OCR_INTERNAL_TOKEN: ${OCR_INTERNAL_TOKEN:-opendesk-dev-ocr-internal-token-change-in-prod}
       KEYCLOAK_ISSUER_PUBLIC: http://localhost:8080/realms/opendesk
       # GF4: port 3001 is no longer host-published; the app is reached through
       # the gateway (admin-web route), so NextAuth callbacks use :9080.

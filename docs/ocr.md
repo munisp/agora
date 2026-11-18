@@ -500,6 +500,17 @@ Contract:
   keeps re-runs free). Operator sequence + rotation:
   `docs/runbooks/security.md` §7.
 
+### `GET /v1/internal/ocr/registry-stats`
+
+Platform-scoped registry posture, aggregate COUNTS ONLY (SPEC-W77 R1
+count-not-identity) — response shape exactly `{enabled, keys_total,
+memberships_total, multi_tenant_keys, alerted_memberships, ttl_days,
+reconcile_minutes}`; no registry keys, tenant ids, hashes, or per-key rows.
+Auth: the same `X-Internal-Token` fail-closed idiom as backfill; when the
+HMAC secret is unset it answers 200 with `enabled:false` + zeros. Read
+surface: admin-web `/app/<org>/ops-registry` (platform-admin only) via the
+BFF `/api/ocr-registry/registry-stats` direct exception — runbook §7.4.
+
 ## Receipt OCR via fieldcapture
 
 booking-service fieldcapture owns the staff upload surface:

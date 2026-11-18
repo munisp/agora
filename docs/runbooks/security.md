@@ -416,6 +416,29 @@ reconciler runs even when `OCR_REGISTRY_HMAC_SECRET` is unset.
   duplicate. D9 MERGE dedup still absorbs replays within the membership's
   lifetime.
 
+#### Registry stats read surface (SPEC-W77)
+
+Platform admins can read the registry posture in admin-web at
+**`/app/<org>/ops-registry`** (nav: "Registry"). The page renders the
+internal `GET /v1/internal/ocr/registry-stats` payload — exactly
+`{enabled, keys_total, memberships_total, multi_tenant_keys,
+alerted_memberships, ttl_days, reconcile_minutes}` — aggregate COUNTS +
+posture fields ONLY (R1 count-not-identity: no registry keys, tenant ids,
+hashes, or per-key rows; per-incident triage stays alert-driven). Access
+path: browser → admin-web BFF `/api/ocr-registry/registry-stats` →
+ocr-service directly (W44/F15-15 direct-exception precedent; the internal
+route is never on APISIX). The BFF and the page both gate on the
+**platform-admin realm role ONLY** (plain `admin` gets 403 / is redirected
+— R2, stricter than the ops-alerts gate); the BFF injects
+`OCR_INTERNAL_TOKEN` as `X-Internal-Token` server-side, so the token never
+reaches the client bundle. When `OCR_REGISTRY_HMAC_SECRET` is unset the
+endpoint answers 200 with `enabled:false` and zero counts — the page shows
+a disabled banner, not an error. Token rotation: rotate
+`OCR_INTERNAL_TOKEN` per the standard secrets runbook — every holder
+(ocr-service, booking-service, kyc-service, messaging-gateway, admin-web)
+reads the SAME shared env var, so one rotation covers the page too; no
+enforced cadence.
+
 ### 7.5 Verification battery
 
 `services/ocr-service/tests/test_w67_zero_disclosure.py` (zero-disclosure,

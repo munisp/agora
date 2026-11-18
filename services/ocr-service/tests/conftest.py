@@ -465,6 +465,26 @@ class _RegistryScope:
                 )
         return out
 
+    # SPEC-W77: aggregate stats fakes (lockstep with app.registry).
+    def _stats_keys_total(self) -> int:
+        """SQL_STATS_KEYS_TOTAL: COUNT(*) over the parent registry."""
+        return len(self.db.registry_keys)
+
+    def _stats_memberships_total(self) -> int:
+        """SQL_STATS_MEMBERSHIPS_TOTAL: COUNT(*) over memberships."""
+        return len(self.db.registry_members)
+
+    def _stats_multi_tenant_keys(self) -> int:
+        """SQL_STATS_MULTI_TENANT_KEYS: parents with tenant_count >= 2
+        (the cached column, exactly like the SQL — never re-counted)."""
+        return sum(
+            1 for p in self.db.registry_keys.values() if p["tenant_count"] >= 2
+        )
+
+    def _stats_alerted_memberships(self) -> int:
+        """SQL_STATS_ALERTED_MEMBERSHIPS: memberships with alerted=true."""
+        return sum(1 for m in self.db.registry_members.values() if m["alerted"])
+
     # --- asyncpg-shaped verbs, dispatched on the app.registry constants ---
     async def fetchrow(self, sql: str, *args):
         if _norm_sql(sql) == _norm_sql(registry_module.SQL_UPSERT_PARENT):
@@ -475,6 +495,14 @@ class _RegistryScope:
         if _norm_sql(sql) == _norm_sql(registry_module.SQL_TENANT_COUNT):
             parent = self.db.registry_keys.get(args[0])
             return None if parent is None else parent["tenant_count"]
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_STATS_KEYS_TOTAL):
+            return self._stats_keys_total()
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_STATS_MEMBERSHIPS_TOTAL):
+            return self._stats_memberships_total()
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_STATS_MULTI_TENANT_KEYS):
+            return self._stats_multi_tenant_keys()
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_STATS_ALERTED_MEMBERSHIPS):
+            return self._stats_alerted_memberships()
         raise AssertionError(f"unexpected registry SQL (fetchval): {sql!r}")
 
     async def fetch(self, sql: str, *args):
