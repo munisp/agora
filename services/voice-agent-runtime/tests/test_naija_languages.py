@@ -375,3 +375,15 @@ def test_auto_switch_off_keeps_the_chosen_language():
     s = SwitchingLanguageSTT(Naija(), Whisper(), "en", ["en"], switched.append)
     asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
     assert switched == [] and s.language == "en"
+
+
+def test_switch_mode_nigerian():
+    from app.config import load_settings
+    import os
+    os.environ["VOICE_AUTO_LANGUAGE_SWITCH"] = "nigerian"
+    try:
+        s = load_settings()
+        assert s.voice_language_switch_mode == "nigerian" and s.voice_auto_language_switch is False
+    finally:
+        del os.environ["VOICE_AUTO_LANGUAGE_SWITCH"]
+    assert load_settings().voice_language_switch_mode == "on"

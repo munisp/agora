@@ -1230,7 +1230,9 @@ async def build_voice_agent(
 
     switching_stt = (
         SwitchingLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen or "en",
-                             call_language.allowed(settings.call_languages) if settings.voice_auto_language_switch
+                             call_language.allowed(settings.call_languages)
+                             if (settings.voice_language_switch_mode == "on"
+                                 or (settings.voice_language_switch_mode == "nigerian" and chosen in call_language.NIGERIAN))
                              else [chosen or "en"], _switch_language)
         if settings.naija_speech_url and caller_language is not None and sip_call is None else None
     )

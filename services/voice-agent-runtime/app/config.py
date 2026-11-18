@@ -330,6 +330,9 @@ class Settings:
     # Follow a caller who changes language mid-call. Off: the language picked on the call page holds for the whole
     # call (real Nigerian-accented English was taken for Yoruba at 0.976 and the receptionist switched languages).
     voice_auto_language_switch: bool = True
+    # "on" | "off" | "nigerian": follow language changes only in calls that START in a Nigerian language (an English
+    # caller's accent cannot switch the call; the multi-language demo starting in Pidgin still switches).
+    voice_language_switch_mode: str = "on"
     # Nigerian-accented English voice on the naija-speech service (a YarnGPT English speaker, e.g. "idera"). Set: the
     # receptionist speaks English and Pidgin in it instead of piper (piper stays the fallback). Empty = piper/MMS.
     naija_english_voice: str = ""
@@ -505,6 +508,9 @@ def load_settings() -> Settings:
         call_languages=_env("CALL_LANGUAGES", "en,pcm,yo,ha,ig"),
         naija_english_voice=_env("NAIJA_ENGLISH_VOICE", "").strip(),
         voice_auto_language_switch=_env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() in ("1", "true", "yes", "on"),
+        voice_language_switch_mode=("on" if _env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() in ("1", "true", "yes", "on")
+                                    else "nigerian" if _env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() == "nigerian"
+                                    else "off"),
         naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
         qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
