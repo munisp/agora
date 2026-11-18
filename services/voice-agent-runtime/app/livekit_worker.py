@@ -406,8 +406,8 @@ class SwitchingLanguageSTT:
             except Exception as exc:  # noqa: BLE001 - keep hearing the caller
                 log.warning("naija speech recognition failed; using whisper", language=self.language,
                             error=str(exc)[:200])
-        return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en",
-                                                  initial_prompt=initial_prompt)
+        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
+        return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en", **extra)
 
 
 class ChosenLanguageSTT:
@@ -550,12 +550,14 @@ class WhisperSTTNode(lk_stt.STT):
         if self._hints:
             forced_language = forced_language or self._hints.get("language") or None
             initial_prompt = self._hints.get("initial_prompt") or None
+        # initial_prompt only when a hint supplies one: recognisers without the parameter keep working.
+        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
         text = await self._impl.transcribe_pcm(
             bytes(frame.data),
             sample_rate=frame.sample_rate,
             channels=frame.num_channels,
             language=forced_language,
-            initial_prompt=initial_prompt,
+            **extra,
         )
         detected = forced_language or self._impl.last_detected_language or ""
         if detected and self._on_language is not None:

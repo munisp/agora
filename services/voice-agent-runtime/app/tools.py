@@ -419,6 +419,8 @@ def _rfc3339(value: str, tz_name: str | None) -> str:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return raw
+    if dt.tzinfo is not None:
+        return raw  # already RFC3339 with an offset (e.g. "...Z"): pass through unchanged
     if dt.tzinfo is None:
         try:
             dt = dt.replace(tzinfo=ZoneInfo(tz_name or "UTC"))
