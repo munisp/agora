@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import os
 import inspect
 import re
 import threading
@@ -1589,6 +1590,9 @@ def build_worker_options(settings: Settings) -> "agents.WorkerOptions":
         "load_fnc": cpu_load_fnc,
         "load_threshold": settings.load_threshold,
         "prewarm_fnc": make_prewarm_fnc(settings),
+        # A fresh pod downloads the whisper model (~480 MB for "small") inside the first process' prewarm; the 10 s
+        # default killed every process mid-download ("initialization timed out") and no call could start.
+        "initialize_process_timeout": float(os.environ.get("VOICE_INIT_PROCESS_TIMEOUT_S", "180")),
     }
     base_kwargs: dict[str, Any] = {
         "entrypoint_fnc": entrypoint,

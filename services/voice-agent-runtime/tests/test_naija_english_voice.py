@@ -69,3 +69,11 @@ def test_language_voice_setting_parses_and_skips_junk():
     assert parse_naija_language_voices(" yo=yoruba_male1, IG = igbo_male2 ,bad, =x, ha=") == {
         "yo": "yoruba_male1", "ig": "igbo_male2"}
     assert parse_naija_language_voices("") == {}
+
+
+def test_process_start_allows_a_model_download():
+    from app.config import load_settings
+    from app.livekit_worker import build_worker_options
+
+    opts = build_worker_options(load_settings())
+    assert opts.initialize_process_timeout >= 120
