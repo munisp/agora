@@ -95,7 +95,8 @@ summary{cursor:pointer}
       <!-- SPEC-W63: optional State -> LGA cascade, populated offline from
            the IDB gazetteer snapshot. Progressive enhancement only: when no
            snapshot is on this device the free-text fallback shows instead,
-           and the form submits fine with both left empty. -->
+           and the form submits fine with both left empty. SPEC-W78 adds the
+           third (optional) Locality level. -->
       <div id="f-place-selects" class="hidden">
         <label for="f-state">State (optional)</label>
         <select id="f-state">
@@ -104,6 +105,10 @@ summary{cursor:pointer}
         <label for="f-lga">LGA (optional)</label>
         <select id="f-lga" disabled>
           <option value="">— Select a state first —</option>
+        </select>
+        <label for="f-locality">Locality (optional)</label>
+        <select id="f-locality" disabled>
+          <option value="">— Select an LGA first —</option>
         </select>
       </div>
       <div id="f-place-freetext">

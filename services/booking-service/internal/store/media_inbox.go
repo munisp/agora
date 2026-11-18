@@ -30,15 +30,11 @@ import (
 	"github.com/opendesk/booking-service/internal/events"
 )
 
-// ReceiptIngestedEventType is the CloudEvent type emitted on
-// opendesk.booking.events for each fresh media-inbox ingest (SPEC-W64
-// Scope 3; the G-C pinned string is free of fraud-engine substring
-// needles). LOCAL const: the canonical const lives in
-// internal/events/cloudevents.go (single-owner A this wave) — defined
-// locally so this package builds before A's hunk lands; the integrator may
-// switch to the shared const (the type STRING is pinned by SPEC-W64 G-C
-// either way).
-const ReceiptIngestedEventType = "com.opendesk.booking.ReceiptIngested"
+// SPEC-W78 A3: the ReceiptIngested CloudEvent type emitted for each fresh
+// media-inbox ingest (SPEC-W64 Scope 3; the G-C pinned string is free of
+// fraud-engine substring needles) is referenced ONLY via the canonical
+// events.ReceiptIngestedEventType const — the W64-local duplicate const is
+// deleted.
 
 // mediaInboxParkedCap bounds the per-tenant parked review queue (SPEC-W61
 // pinned constant — NO env knob). On ingest, if parked rows for the tenant
@@ -392,7 +388,7 @@ func (s *Store) IngestMediaInbox(ctx context.Context, in MediaInboxIngest, event
 			if item.BookingID != nil {
 				data["booking_id"] = item.BookingID.String()
 			}
-			payload, err := json.Marshal(events.New("booking-service", ReceiptIngestedEventType, "", item.TenantID.String(), data))
+			payload, err := json.Marshal(events.New("booking-service", events.ReceiptIngestedEventType, "", item.TenantID.String(), data))
 			if err != nil {
 				return fmt.Errorf("marshal receipt ingested event: %w", err)
 			}

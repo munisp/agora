@@ -80,6 +80,19 @@ type Summary struct {
 	TenantsFailed  int       `json:"tenants_failed"`
 	FindingsNew    int       `json:"findings_new"`
 	FindingsDuped  int       `json:"findings_deduped"`
+	// CleanPairs (SPEC-W78 A1, additive) counts receipt↔payment pairs judged
+	// CLEAN — matched by a ladder rung, amounts comparable AND agree, no
+	// finding emitted. It is NEVER incremented for not-comparable heuristic
+	// pairs (which also produce no finding) and never when any finding fires;
+	// classifyCapture's default branch is the single source of truth.
+	//
+	// omitempty is LOAD-BEARING: the W66 manual-trigger contract
+	// (TestTriggerEmptyBodyCompat, read-only) pins the empty-body trigger
+	// response to EXACTLY the five pre-W66 keys, so a zero clean-pair count
+	// must NOT surface the key — it appears precisely when a sweep verified
+	// ≥1 clean pair (additive surfacing, never a shape change for
+	// clean-pair-free runs).
+	CleanPairs int `json:"clean_pairs,omitempty"`
 }
 
 // RunTicker is the ticker driver (pinned decision 6): a sweep per period
@@ -107,7 +120,8 @@ func (s *Service) RunTicker(ctx context.Context, period time.Duration) {
 				zap.Int("tenants_scanned", sum.TenantsScanned),
 				zap.Int("tenants_failed", sum.TenantsFailed),
 				zap.Int("findings_new", sum.FindingsNew),
-				zap.Int("findings_deduped", sum.FindingsDuped))
+				zap.Int("findings_deduped", sum.FindingsDuped),
+				zap.Int("clean_pairs", sum.CleanPairs))
 		}
 	}
 }
@@ -123,7 +137,7 @@ func (s *Service) SweepOnce(ctx context.Context) (Summary, error) {
 		return sum, err
 	}
 	for _, tenantID := range tenants {
-		n, dup, err := s.sweepTenant(ctx, sum.RunID, tenantID, since)
+		n, dup, clean, err := s.sweepTenant(ctx, sum.RunID, tenantID, since)
 		if err != nil {
 			sum.TenantsFailed++
 			s.log().Error("receipt recon tenant sweep failed",
@@ -133,6 +147,7 @@ func (s *Service) SweepOnce(ctx context.Context) (Summary, error) {
 		sum.TenantsScanned++
 		sum.FindingsNew += n
 		sum.FindingsDuped += dup
+		sum.CleanPairs += clean
 	}
 	return sum, nil
 }
@@ -174,13 +189,14 @@ func (s *Service) SweepOnceSince(ctx context.Context, since time.Time, tenantID 
 			// Expired between tenants: stop here with partial progress.
 			return sum, err
 		}
-		n, dup, err := s.sweepTenant(ctx, sum.RunID, id, since)
+		n, dup, clean, err := s.sweepTenant(ctx, sum.RunID, id, since)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				// Expired mid-tenant: the findings it committed are counted
 				// (they persist), the tenant is NOT counted as swept.
 				sum.FindingsNew += n
 				sum.FindingsDuped += dup
+				sum.CleanPairs += clean
 				return sum, ctxErr
 			}
 			sum.TenantsFailed++
@@ -191,28 +207,43 @@ func (s *Service) SweepOnceSince(ctx context.Context, since time.Time, tenantID 
 		sum.TenantsScanned++
 		sum.FindingsNew += n
 		sum.FindingsDuped += dup
+		sum.CleanPairs += clean
 	}
 	return sum, nil
 }
 
 // sweepTenant runs all three finding passes for one tenant. Each finding is
 // persisted (+ outbox) in its own transaction so one poison row never rolls
-// back the tenant's other findings.
-func (s *Service) sweepTenant(ctx context.Context, runID, tenantID uuid.UUID, since time.Time) (newCount, dupCount int, err error) {
+// back the tenant's other findings. cleanCount (SPEC-W78 A1) counts the
+// captures whose ladder outcome was judged a CLEAN pair by classifyCapture
+// (comparable AND amounts agree AND no finding emitted); the Prometheus
+// counter is incremented at the same site so count-level observability
+// covers clean pairs without per-pair events (W64 honest register).
+func (s *Service) sweepTenant(ctx context.Context, runID, tenantID uuid.UUID, since time.Time) (newCount, dupCount, cleanCount int, err error) {
 	captures, err := s.loadCaptures(ctx, tenantID, since)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	matchedBookings := map[uuid.UUID]bool{}
 	for _, cap := range captures {
 		outcome, rv, lerr := s.matchCapture(ctx, tenantID, cap)
 		if lerr != nil {
-			return newCount, dupCount, fmt.Errorf("match capture %s: %w", cap.ClientID, lerr)
+			return newCount, dupCount, cleanCount, fmt.Errorf("match capture %s: %w", cap.ClientID, lerr)
 		}
-		f := s.findingForCapture(runID, tenantID, cap, outcome, rv)
+		f, clean := s.classifyCapture(runID, tenantID, cap, outcome, rv)
+		if clean {
+			// THE clean-pair increment site: classifyCapture returned
+			// clean=true only from its default branch (matched, amounts
+			// verified equal, no finding). Summary.CleanPairs and the
+			// booking_recon_clean_pairs_total counter move together here.
+			cleanCount++
+			cleanPairsTotal.Inc()
+		}
 		if f == nil {
-			// Clean matched pair: record the booking as receipt-linked for
-			// the payment_without_receipt pass.
+			// Clean matched pair (or a not-comparable heuristic pair —
+			// classify=false above keeps it OUT of the clean count): record
+			// the booking as receipt-linked for the payment_without_receipt
+			// pass.
 			if outcome.Candidate != nil {
 				matchedBookings[outcome.Candidate.BookingID] = true
 			}
@@ -231,7 +262,7 @@ func (s *Service) sweepTenant(ctx context.Context, runID, tenantID uuid.UUID, si
 		}
 		n, d, werr := s.persistFinding(ctx, f)
 		if werr != nil {
-			return newCount, dupCount, werr
+			return newCount, dupCount, cleanCount, werr
 		}
 		newCount, dupCount = newCount+n, dupCount+d
 	}
@@ -241,7 +272,7 @@ func (s *Service) sweepTenant(ctx context.Context, runID, tenantID uuid.UUID, si
 	// satisfied by construction).
 	attempts, err := s.loadPaidAttempts(ctx, tenantID, since)
 	if err != nil {
-		return newCount, dupCount, err
+		return newCount, dupCount, cleanCount, err
 	}
 	for _, a := range dedupeCandidates(attempts) {
 		if matchedBookings[a.BookingID] {
@@ -250,11 +281,11 @@ func (s *Service) sweepTenant(ctx context.Context, runID, tenantID uuid.UUID, si
 		f := findingForOrphanPayment(runID, tenantID, a, s.lookbackDays())
 		n, d, werr := s.persistFinding(ctx, f)
 		if werr != nil {
-			return newCount, dupCount, werr
+			return newCount, dupCount, cleanCount, werr
 		}
 		newCount, dupCount = newCount+n, dupCount+d
 	}
-	return newCount, dupCount, nil
+	return newCount, dupCount, cleanCount, nil
 }
 
 func (s *Service) lookbackDays() int {
@@ -373,7 +404,25 @@ func (s *Service) matchCapture(ctx context.Context, tenantID uuid.UUID, cap Rece
 // currency_unknown:true is now CONDITIONAL — carried only when the receipt
 // itself has no currency (pre-fold-in behavior); when receipt_fields
 // carries a currency the detail says so honestly instead.
+//
+// SPEC-W78 A1: the bare *Finding return is AMBIGUOUS on nil — nil means
+// EITHER "clean pair" (default branch) OR "not-comparable heuristic pair,
+// no standalone finding" (the !comparable non-exact branch). The sweep path
+// therefore calls classifyCapture, which disambiguates explicitly; this
+// wrapper keeps the legacy single-value signature for callers (and tests)
+// that only care about the finding.
 func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCapture, o LadderOutcome, rv receiptView) *Finding {
+	f, _ := s.classifyCapture(runID, tenantID, cap, o, rv)
+	return f
+}
+
+// classifyCapture is findingForCapture with an explicit clean flag:
+// clean==true ONLY at the default branch below — the pair was matched
+// (single winning candidate), the amounts were comparable AND agreed, and
+// no finding was emitted. Every other nil-finding exit (not-comparable
+// heuristic pair) returns clean==false. This is the SINGLE source of truth
+// for Summary.CleanPairs / booking_recon_clean_pairs_total.
+func (s *Service) classifyCapture(runID, tenantID uuid.UUID, cap ReceiptCapture, o LadderOutcome, rv receiptView) (finding *Finding, clean bool) {
 	base := Finding{
 		TenantID:           tenantID,
 		RunID:              runID,
@@ -402,7 +451,7 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 		base.Confidence = ConfidenceNone
 		detail["reason"] = "no_payment_candidate"
 		base.Detail = mustJSON(detail)
-		return &base
+		return &base, false
 	case o.Candidate == nil:
 		// Ambiguous winning rung → confidence 'none' + candidates in detail.
 		base.Kind = KindReceiptWithoutPayment
@@ -415,7 +464,7 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 		}
 		detail["candidates"] = cands
 		base.Detail = mustJSON(detail)
-		return &base
+		return &base, false
 	}
 
 	// Single winning candidate — verify the amount.
@@ -433,7 +482,7 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 		base.Confidence = ConfidenceExact
 		detail["reason"] = "linked_booking_unpaid"
 		base.Detail = mustJSON(detail)
-		return &base
+		return &base, false
 	}
 
 	if c.TxRef != "" {
@@ -480,7 +529,10 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 		// (SPEC item 2 note); heuristic pairs just carry the flag in any
 		// other finding's detail.
 		if o.Confidence != ConfidenceExact {
-			return nil
+			// Not-comparable HEURISTIC pair: no finding AND NOT clean (the
+			// amounts were never verified — clean=false disambiguates this
+			// nil from the default branch's clean nil, SPEC-W78 A1).
+			return nil, false
 		}
 		base.Kind = KindCurrencyUnknown
 		if currencyMismatch {
@@ -492,7 +544,7 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 			detail["rail_amount_minor"] = *c.AmountMinor
 		}
 		base.Detail = mustJSON(detail)
-		return &base
+		return &base, false
 	case divergent:
 		// Paper-vs-rail divergence: expected = what the rail captured
 		// (attempt.amount_minor); captured_amount_minor = the receipt's
@@ -503,9 +555,9 @@ func (s *Service) findingForCapture(runID, tenantID uuid.UUID, cap ReceiptCaptur
 		base.CapturedAmountMinor = &receiptMinor
 		detail["reason"] = "paper_vs_rail_amount_divergence"
 		base.Detail = mustJSON(detail)
-		return &base
+		return &base, false
 	default:
-		return nil // clean pair — matched and amounts agree
+		return nil, true // clean pair — matched and amounts agree (SPEC-W78 A1: clean=true ONLY here)
 	}
 }
 
