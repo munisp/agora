@@ -237,7 +237,8 @@ export function ContactsClient({
       />
       {error ? <ErrorNote message={error} /> : null}
 
-      <Card>
+      {/* SPEC-W82 B1.2: table on ≥sm, stacked cards below. */}
+      <Card className="hidden sm:block">
         <Table>
           <TableHeader>
             <TableRow>
@@ -286,6 +287,53 @@ export function ContactsClient({
           </TableBody>
         </Table>
       </Card>
+
+      {/* SPEC-W82 B1.2: stacked contact cards below sm:. */}
+      <div className="space-y-2 sm:hidden">
+        {contacts.length === 0 ? (
+          <p className="rounded-md border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+            {loading
+              ? "Loading…"
+              : "No contacts yet — they are created automatically from bookings, or add one manually."}
+          </p>
+        ) : (
+          contacts.map((c) => (
+            <div
+              key={c.id}
+              className="rounded-md border border-border bg-card px-4 py-3"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="font-medium">{c.name}</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    {[c.phone, c.email].filter(Boolean).join(" · ") ||
+                      "No phone or email"}
+                  </p>
+                  {c.notes ? (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {c.notes}
+                    </p>
+                  ) : null}
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  <Button variant="ghost" size="sm" onClick={() => openEdit(c)}>
+                    <Pencil className="h-3.5 w-3.5" />
+                    Edit
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive"
+                    onClick={() => setDeleting(c)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
 
       {formDialog(createOpen, () => setCreateOpen(false), "Add contact", () => void saveCreate())}
       {formDialog(!!editing, () => setEditing(null), `Edit ${editing?.name ?? "contact"}`, () => void saveEdit())}

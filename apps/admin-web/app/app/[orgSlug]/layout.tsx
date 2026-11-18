@@ -1,9 +1,12 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ExternalLink, LogOut } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { auth, signOut } from "@/lib/auth";
 import { serverApi } from "@/lib/server-api";
+import { CommandPalette } from "@/components/command-palette";
+import { MobileNav } from "@/components/mobile-nav";
 import { OrgNav } from "@/components/org-nav";
+import { SignOutButton } from "@/components/sign-out-button";
 import { Button } from "@/components/ui/button";
 import type { Tenant } from "@/lib/types";
 
@@ -55,7 +58,10 @@ export default async function OrgLayout({
 
   return (
     <div className="flex min-h-screen">
-      <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-card">
+      {/* SPEC-W82 B1.1: global command palette (Ctrl/⌘K or "/"). */}
+      <CommandPalette orgSlug={orgSlug} />
+      {/* SPEC-W82 B1.2: sidebar hides below md:, hamburger drawer takes over. */}
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-border bg-card md:flex">
         <div className="flex items-center gap-2 border-b border-border px-5 py-4">
           <span className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-sm font-bold text-primary-foreground">
             OD
@@ -88,20 +94,31 @@ export default async function OrgLayout({
               await signOut({ redirectTo: "/" });
             }}
           >
-            <button
-              type="submit"
-              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground cursor-pointer"
-            >
-              <LogOut className="h-4 w-4" />
-              Sign out
-            </button>
+            {/* SPEC-W82 B1.3: clears the localStorage last-good cache first. */}
+            <SignOutButton />
           </form>
           <p className="truncate px-3 pt-1 text-xs text-muted-foreground">
             {session.user?.email ?? session.user?.name ?? ""}
           </p>
         </div>
       </aside>
-      <main className="min-w-0 flex-1 px-8 py-6">{children}</main>
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* SPEC-W82 B1.2: mobile top bar with hamburger (below md:). */}
+        <div className="sticky top-0 z-40 flex items-center gap-3 border-b border-border bg-card px-4 py-3 md:hidden">
+          <MobileNav
+            orgSlug={orgSlug}
+            roles={session.realmRoles ?? []}
+            tenantName={tenant?.name ?? orgSlug}
+          />
+          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-xs font-bold text-primary-foreground">
+            OD
+          </span>
+          <p className="min-w-0 flex-1 truncate text-sm font-semibold">
+            {tenant?.name ?? orgSlug}
+          </p>
+        </div>
+        <main className="min-w-0 flex-1 px-4 py-4 md:px-8 md:py-6">{children}</main>
+      </div>
     </div>
   );
 }

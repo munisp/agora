@@ -58,6 +58,28 @@ class TenantContext:
     # (app/agent_definition.py), merged over the pack/env context by
     # merge_definition after bootstrap. None = legacy pack/env behaviour.
     agent_definition: AgentDefinition | None = None
+    # SPEC-W82 A4.2: pack `voice:` block — per-language provider-qualified
+    # voice ids ({"pcm": "mms:pcm", "yo": "mms:yor"}), validated with
+    # parse_tts_voice_map semantics by _apply_pack; slots into the
+    # resolve_tts_voice precedence chain between ctx.tts_voice and
+    # TTS_VOICE_MAP (app/livekit_worker.py _voice_spec).
+    pack_voice_map: dict[str, str] = field(default_factory=dict)
+    # SPEC-W82 A4.2: pack `i18n:` block default language (normalized ISO
+    # primary subtag); wins over the tenant identity locale as the
+    # MultilangState default.
+    pack_default_language: str = ""
+    # SPEC-W82 A4.5: pack `voice.lexicon` pronunciation entries
+    # ({term: respell | {respell, ipa}}), parsed by
+    # app/pronunciation.parse_lexicon; highest-precedence lexicon source.
+    pack_pronunciation_lexicon: dict = field(default_factory=dict)
+    # SPEC-W82 A2/A4.1: per-turn inbound translation annotations (the
+    # context is a per-turn deep copy, so these never leak across turns):
+    # the detected caller language, the pre-translation text, and the
+    # code-switch annotation for mixed pcm/en turns.
+    detected_language: str = ""
+    original_text: str = ""
+    code_switch: bool = False
+    code_switch_segments: list[dict[str, str]] = field(default_factory=list)
 
     def offering_summary(self) -> str:
         parts = []
@@ -113,6 +135,42 @@ def _apply_pack(ctx: TenantContext, tenant_payload: dict[str, Any]) -> None:
             from .multilang import validate_pack_languages
 
             ctx.languages = validate_pack_languages(pack.get("languages"))
+        # SPEC-W82 A4.2: close the prepared pack `voice:` / `i18n:` seams
+        # (identity schema-validates the blocks but nothing consumed them).
+        # Validation happens HERE at consumption, same as `languages` —
+        # malformed entries drop out with a warning, never fatal.
+        voice = pack.get("voice")
+        if isinstance(voice, dict):
+            from .multilang import parse_tts_voice_map
+
+            # Accept either an explicit `languages:` sub-map or bare
+            # lang: voice-id entries at the top of the block (excluding the
+            # reserved `lexicon` key consumed by A4.5).
+            languages_raw = voice.get("languages")
+            if not isinstance(languages_raw, dict):
+                languages_raw = {
+                    k: v
+                    for k, v in voice.items()
+                    if k != "lexicon" and isinstance(v, str)
+                }
+            ctx.pack_voice_map = parse_tts_voice_map(languages_raw)
+            # SPEC-W82 A4.5: pack voice.lexicon (per-tenant pronunciation).
+            lexicon = voice.get("lexicon")
+            if isinstance(lexicon, dict):
+                from .pronunciation import parse_lexicon
+
+                ctx.pack_pronunciation_lexicon = parse_lexicon(lexicon)
+        i18n = pack.get("i18n")
+        if isinstance(i18n, dict):
+            from .multilang import normalize_language
+
+            default_lang = normalize_language(
+                str(i18n.get("default_language") or i18n.get("defaultLanguage") or "")
+            )
+            if default_lang:
+                ctx.pack_default_language = default_lang
+            elif i18n.get("default_language") or i18n.get("defaultLanguage"):
+                log.warning("pack i18n: dropping invalid default_language")
 
 
 # ------------------------------------------------------- TTL cache (W46 P1/P2)

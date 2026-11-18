@@ -58,7 +58,14 @@ from .dapr_client import DaprClient, DaprError
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
 from .agent_definition import merge_definition
-from .multilang import MultilangState, normalize_language, resolve_tts_voice
+from . import pronunciation, tts_normalize
+from .codeswitch import instruction as codeswitch_instruction
+from .multilang import (
+    MultilangState,
+    normalize_language,
+    resolve_pack_voice,
+    resolve_tts_voice,
+)
 from .pipeline.stt import FasterWhisperSTT
 from .pipeline.tts import TTSInterface
 from .prompts import (
@@ -69,6 +76,12 @@ from .prompts import (
 from .session_state import SessionState
 from .tenant_context import TenantContext, fetch_tenant_context
 from .tools import ToolLayer
+from .translation import (
+    build_translator,
+    process_inbound_text,
+    process_outbound_text,
+)
+from .tts_providers.base import split_voice_spec
 from .tts_providers.chain import FallbackTTS, build_fallback_tts
 
 log = get_logger("livekit-worker")
@@ -291,9 +304,23 @@ class WhisperSTTNode(lk_stt.STT):
 
     Wave 5 #3: when whisper auto-detects the spoken language it is reported
     on the SpeechEvent and forwarded to ``on_language`` (the per-session
-    MultilangState hook that swaps the piper voice + locale instruction)."""
+    MultilangState hook that swaps the piper voice + locale instruction).
 
-    def __init__(self, impl: FasterWhisperSTT, on_language=None) -> None:
+    SPEC-W82 A2/A4.4: ``hints`` (per-tenant VOICE_STT_HINTS entry) supplies
+    a forced whisper ``language=`` and an ``initial_prompt`` (fail-open:
+    None/empty keeps the pre-W82 call exactly); ``on_transcript`` is an
+    optional async post-STT hook ``(text, detected) -> text`` — the W82
+    inbound-translation seam. Hook failures are logged and the ORIGINAL
+    transcript is used (translation never breaks STT).
+    """
+
+    def __init__(
+        self,
+        impl: FasterWhisperSTT,
+        on_language=None,
+        on_transcript=None,
+        hints: dict | None = None,
+    ) -> None:
         super().__init__(
             capabilities=lk_stt.STTCapabilities(
                 streaming=False, interim_results=False
@@ -301,23 +328,42 @@ class WhisperSTTNode(lk_stt.STT):
         )
         self._impl = impl
         self._on_language = on_language
+        self._on_transcript = on_transcript
+        self._hints = hints or None
 
     async def recognize(
         self, buffer: lk_utils.AudioBuffer, *, language: str | None = None
     ) -> lk_stt.SpeechEvent:
         frame = lk_utils.merge_frames(buffer)
+        # SPEC-W82 A4.4: an explicit language= argument still wins; the
+        # tenant hint only forces a language when the pipeline left it open.
+        forced_language = language
+        initial_prompt = None
+        if self._hints:
+            forced_language = forced_language or self._hints.get("language") or None
+            initial_prompt = self._hints.get("initial_prompt") or None
         text = await self._impl.transcribe_pcm(
             bytes(frame.data),
             sample_rate=frame.sample_rate,
             channels=frame.num_channels,
-            language=language,
+            language=forced_language,
+            initial_prompt=initial_prompt,
         )
-        detected = language or self._impl.last_detected_language or ""
+        detected = forced_language or self._impl.last_detected_language or ""
         if detected and self._on_language is not None:
             try:
                 self._on_language(detected)
             except Exception as exc:  # noqa: BLE001 - never break STT
                 log.warning("language hook failed", error=str(exc)[:200])
+        # SPEC-W82 A2: post-STT inbound-translation hook (pcm/yo/ig/ha -> en
+        # before the LLM turn; the original transcript is stashed on the
+        # tenant context by the hook). Fail-open: any hook failure keeps the
+        # original transcript.
+        if self._on_transcript is not None and text.strip():
+            try:
+                text = await self._on_transcript(text, detected)
+            except Exception as exc:  # noqa: BLE001 - never break STT
+                log.warning("transcript hook failed", error=str(exc)[:200])
         return lk_stt.SpeechEvent(
             type=lk_stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[lk_stt.SpeechData(text=text, language=detected)],
@@ -334,9 +380,17 @@ class PiperTTSNode(lk_tts.TTS):
     default true), sentence-level chunks are yielded as they synthesize —
     the first audio frame ships after the first chunk instead of the full
     utterance. ``chunked=False`` restores the pre-W46 full-buffer path.
+
+    SPEC-W82 A3/A4.3/A4.5: ``on_text`` is an optional async pre-TTS
+    transform ``text -> text`` (outbound translation -> spoken-entity
+    normalization -> pronunciation lexicon). It runs BEFORE provider
+    dispatch, and any failure falls back to the original text (fail-open —
+    the reply is spoken untransformed rather than dropped).
     """
 
-    def __init__(self, impl: TTSInterface, *, chunked: bool = True) -> None:
+    def __init__(
+        self, impl: TTSInterface, *, chunked: bool = True, on_text=None
+    ) -> None:
         super().__init__(
             capabilities=lk_tts.TTSCapabilities(streaming=False),
             sample_rate=impl.sample_rate,
@@ -344,6 +398,7 @@ class PiperTTSNode(lk_tts.TTS):
         )
         self._impl = impl
         self._chunked = chunked
+        self._on_text = on_text
 
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         return self._stream(text)
@@ -362,6 +417,14 @@ class PiperTTSNode(lk_tts.TTS):
         )
 
     async def _stream(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
+        # SPEC-W82 A3/A4.3/A4.5: pre-TTS transform (outbound translation,
+        # normalization, pronunciation) BEFORE provider dispatch; fail-open
+        # to the original text on any error.
+        if self._on_text is not None:
+            try:
+                text = await self._on_text(text)
+            except Exception as exc:  # noqa: BLE001 - never break TTS
+                log.warning("pre-TTS transform failed", error=str(exc)[:200])
         stream_pcm = getattr(self._impl, "stream_pcm", None)
         if self._chunked and stream_pcm is not None:
             async for pcm in stream_pcm(text):
@@ -969,15 +1032,45 @@ async def build_voice_agent(
     ml_state = MultilangState.from_context(ctx)
     session.active_language = ml_state.active_language
 
+    # SPEC-W82 A1: translation layer for this session (mock-default;
+    # fail-open — a turn never blocks on translation).
+    translator = build_translator(settings)
+
     def _voice_spec(language: str) -> str:
+        # SPEC-W82 A4.2: the pack `voice:` per-language map slots into the
+        # precedence chain ctx.tts_voice -> pack map -> TTS_VOICE_MAP ->
+        # PIPER_VOICE_MAP. A pack entry naming a provider that is NOT in
+        # the configured chain is ignored with a warning (never a crash);
+        # resolution then falls through to the env maps.
+        override = getattr(ctx, "tts_voice", None)
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+        pack_spec = resolve_pack_voice(language, getattr(ctx, "pack_voice_map", None))
+        if pack_spec:
+            pref, _ = split_voice_spec(pack_spec)
+            if pref and isinstance(tts_impl, FallbackTTS) and pref not in tts_impl.order:
+                log.warning(
+                    "pack voice spec provider not in TTS chain; ignoring",
+                    provider=pref,
+                    spec=pack_spec,
+                    language=language,
+                )
+            else:
+                return pack_spec
         return resolve_tts_voice(
             language,
             settings.tts_voice_map,
             settings.piper_voice_map,
             settings.piper_voice,
+            ctx=ctx,
         )
 
     tts_impl.voice = _voice_spec(ml_state.active_language)
+    # SPEC-W82 A4.2 CRITICAL FIX: FallbackTTS.language was NEVER set by the
+    # worker (chain.py:113 gap), so provider-chain language routing never
+    # engaged. It now tracks the session's active language from bootstrap
+    # and on every switch/detection below.
+    tts_impl.language = ml_state.active_language
     # SPEC-W38 F2: definition.voice overrides the session's default voice
     # (per-turn language switching still applies on top). Only piper /
     # provider-less voices are applied here — other providers go through the
@@ -1002,6 +1095,9 @@ async def build_voice_agent(
         if not switched:
             return
         session.active_language = ml_state.active_language
+        # SPEC-W82 A4.2: keep the provider chain's language routing in step
+        # (closes the chain.py:113 never-set gap on switches too).
+        tts_impl.language = ml_state.active_language
         new_prompt = build_system_prompt(
             ctx,
             conversation_id=conversation_id,
@@ -1015,9 +1111,94 @@ async def build_voice_agent(
         except Exception as exc:  # noqa: BLE001 - prompt stays at default
             log.warning("locale instruction swap failed", error=str(exc)[:200])
 
+    async def _on_transcript(text: str, detected: str) -> str:
+        """SPEC-W82 A2/A4.1 post-STT hook: pure pcm/yo/ig/ha transcripts are
+        translated to English before the LLM turn; the original transcript
+        and detection are stashed on the per-turn tenant context, the
+        session active_language + chain language + voice spec follow the
+        caller, and the locale instruction is swapped in. Code-switched
+        pcm/en turns are NOT force-translated (mixed register instruction
+        instead). Fail-open: any error keeps the original transcript.
+        """
+        inbound = await process_inbound_text(
+            text,
+            translator,
+            enabled=settings.voice_translate_enabled,
+            path="voice",
+        )
+        lang = inbound.detected_language
+        if not lang or lang == "en":
+            return inbound.text
+        ctx.detected_language = lang
+        ctx.original_text = inbound.original_text
+        session.active_language = lang
+        # SPEC-W82 A4.2: chain language routing + per-language voice follow
+        # the detected caller language (pcm included — MMS/Spitch have real
+        # pcm/yo/ig/ha voices even though whisper reports pcm as en).
+        tts_impl.language = lang
+        tts_impl.voice = _voice_spec(lang)
+        try:
+            new_prompt = build_system_prompt(
+                ctx,
+                conversation_id=conversation_id,
+                language=lang,
+                caller_phone=session.confirmed_phone or session.claimed_phone,
+            )
+            if inbound.code_switch:
+                ctx.code_switch = True
+                ctx.code_switch_segments = list(inbound.segments)
+                new_prompt = f"{new_prompt}{codeswitch_instruction()}"
+            msgs = agent.chat_ctx.messages
+            if msgs and msgs[0].role == "system":
+                msgs[0].content = [new_prompt]
+        except Exception as exc:  # noqa: BLE001 - prompt stays at default
+            log.warning("locale instruction swap failed", error=str(exc)[:200])
+        return inbound.text
+
+    # SPEC-W82 A4.4: per-tenant STT hints (forced language + initial_prompt),
+    # keyed by site slug first, then tenant slug. Fail-open when unset.
+    stt_hints = (
+        settings.voice_stt_hints.get(site_slug)
+        or settings.voice_stt_hints.get(ctx.tenant_slug)
+        or None
+    )
+
+    # SPEC-W82 A4.5: effective pronunciation lexicon for this tenant
+    # (env "*" < env tenant < pack voice.lexicon — pack wins).
+    lexicon = pronunciation.merge_lexicons(
+        settings.voice_pronunciation_lexicon,
+        ctx.tenant_slug,
+        getattr(ctx, "pack_pronunciation_lexicon", None),
+    )
+
+    async def _prepare_tts_text(text: str) -> str:
+        """SPEC-W82 A3/A4.3/A4.5 pre-TTS transform, applied in order:
+        1. outbound translation en -> session active_language (A3; fail-open
+           English, skipped when the reply is already non-English);
+        2. Naija spoken-entity normalization (A4.3: naira amounts, phone
+           digit read-back, dates, abbreviations);
+        3. pronunciation lexicon (A4.5: azure -> SSML phoneme, others ->
+           respell substitution; provider read from the current voice spec).
+        """
+        out = await process_outbound_text(
+            text,
+            session.active_language,
+            translator,
+            enabled=settings.voice_translate_enabled,
+        )
+        out = tts_normalize.normalize_for_tts(out)
+        provider, _ = split_voice_spec(getattr(tts_impl, "voice", ""))
+        out = pronunciation.apply_pronunciation(out, lexicon, provider=provider or "")
+        return out
+
     agent = VoicePipelineAgent(
         vad=_load_vad(settings),
-        stt=WhisperSTTNode(stt_impl, on_language=_on_language),
+        stt=WhisperSTTNode(
+            stt_impl,
+            on_language=_on_language,
+            on_transcript=_on_transcript,
+            hints=stt_hints,
+        ),
         # NOTE (VOICE-SCALING §3): the livekit-plugins-openai LLM node cannot
         # hot-swap endpoints mid-process, so the LLM fallback chain
         # (app/pipeline/llm.py FallbackLLM) covers the chat/tool-loop paths;
@@ -1027,7 +1208,9 @@ async def build_voice_agent(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
         ),
-        tts=PiperTTSNode(tts_impl, chunked=settings.tts_chunked),
+        tts=PiperTTSNode(
+            tts_impl, chunked=settings.tts_chunked, on_text=_prepare_tts_text
+        ),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,

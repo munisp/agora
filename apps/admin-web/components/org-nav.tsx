@@ -110,7 +110,9 @@ const items: NavItem[] = [
   // SPEC-W32: civic case triage console — operational, owner/admin/staff.
   { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
-  { external: CRM_URL, label: "CRM", icon: UsersRound },
+  // SPEC-W82 B1.1: renamed from "CRM" to disambiguate the external Twenty
+  // console from the in-app CRM 360 console (now in the command palette).
+  { external: CRM_URL, label: "Twenty CRM (external)", icon: UsersRound },
   { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
   // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
   // roles (read-only); the page hides provision/enable/disable/config

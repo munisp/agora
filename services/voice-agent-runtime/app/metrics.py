@@ -27,6 +27,9 @@ Series:
 - voice_stepup_required_total    (counter, labels tool,tier) — SPEC-W81 A3
 - voice_stepup_verified_total    (counter, label method=otp|channel) — SPEC-W81 A3
 - voice_stepup_refused_total     (counter, label reason) — SPEC-W81 A3
+- voice_translation_total        (counter, labels direction,source_lang,target_lang,provider) — SPEC-W82 A5
+- voice_translation_errors_total (counter, label provider) — SPEC-W82 A5
+- voice_language_detected_total  (counter, labels lang,path) — SPEC-W82 A5
 """
 
 from __future__ import annotations
@@ -280,6 +283,27 @@ class Registry:
             "Step-up identity-gate refusals by reason.",
             ("reason",),
         )
+        # SPEC-W82 A5: translation layer (app/translation.py). translation
+        # counts every guarded translate call (direction=inbound|outbound,
+        # source/target ISO codes, provider=mock|http); translation_errors
+        # counts fail-open fallbacks to the original text per provider;
+        # language_detected counts heuristic detections per language and
+        # turn path (path=chat|voice).
+        self.translation = Counter(
+            "voice_translation_total",
+            "Translation calls by direction, language pair and provider.",
+            ("direction", "source_lang", "target_lang", "provider"),
+        )
+        self.translation_errors = Counter(
+            "voice_translation_errors_total",
+            "Translation failures that fell back to the original text.",
+            ("provider",),
+        )
+        self.language_detected = Counter(
+            "voice_language_detected_total",
+            "Heuristic caller-language detections by language and turn path.",
+            ("lang", "path"),  # path=chat|voice
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -304,6 +328,9 @@ class Registry:
             self.stepup_required,
             self.stepup_verified,
             self.stepup_refused,
+            self.translation,
+            self.translation_errors,
+            self.language_detected,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -471,6 +498,29 @@ def stepup_refused(reason: str) -> None:
     """SPEC-W81 A3: identity-gate refusal (verification_required |
     verification_unavailable | phone_mismatch | confirmation_required)."""
     _registry.stepup_refused.inc(reason=reason)
+
+
+def translation(
+    *, direction: str, source_lang: str, target_lang: str, provider: str
+) -> None:
+    """SPEC-W82 A5: one guarded translation call (inbound|outbound)."""
+    _registry.translation.inc(
+        direction=direction,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        provider=provider,
+    )
+
+
+def translation_error(provider: str) -> None:
+    """SPEC-W82 A5: one translation failure that fell back to the original
+    text (fail-open — the turn continued untranslated)."""
+    _registry.translation_errors.inc(provider=provider)
+
+
+def language_detected(lang: str, path: str) -> None:
+    """SPEC-W82 A5: one heuristic caller-language detection (path=chat|voice)."""
+    _registry.language_detected.inc(lang=lang, path=path)
 
 
 # ---------------------------------------------------------------------------

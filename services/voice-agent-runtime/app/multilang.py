@@ -79,6 +79,12 @@ LANGUAGE_NAMES = {
     # SPEC-W70 A4 the name is used by locale_instruction()'s explicit
     # natural-Pidgin instruction.
     "pcm": "Nigerian Pidgin",
+    # SPEC-W82 A2: the three major Nigerian languages. locale_instruction()
+    # names them explicitly for the LLM; whisper has yo/ha (and limited ig)
+    # detection, and MMS/Spitch have native yo/ig/ha voices (TTS_VOICE_MAP).
+    "yo": "Yoruba",
+    "ig": "Igbo",
+    "ha": "Hausa",
 }
 
 # Whisper cannot detect Nigerian Pidgin distinctly: pcm audio is reported as
@@ -314,6 +320,27 @@ def parse_tts_voice_map(raw: str | dict | None) -> dict[str, str]:
     return out
 
 
+def resolve_pack_voice(language: str, pack_voice_map: dict[str, str] | None) -> str:
+    """SPEC-W82 A4.2: per-language voice id from a pack ``voice:`` block.
+
+    The map is pre-validated (parse_tts_voice_map semantics: full tags like
+    "en-ng" kept, pcm NOT proxied). Lookup order mirrors TTS_VOICE_MAP:
+    full tag match first, then the primary subtag. "" when there is no
+    pack entry — the caller then falls through to TTS_VOICE_MAP /
+    PIPER_VOICE_MAP (pack slots into the precedence chain BETWEEN
+    ctx.tts_voice and TTS_VOICE_MAP).
+    """
+    if not pack_voice_map:
+        return ""
+    key = _normalize_voice_key(language)
+    if not key:
+        return ""
+    if key in pack_voice_map:
+        return pack_voice_map[key]
+    primary = key.split("-", 1)[0]
+    return pack_voice_map.get(primary, "")
+
+
 def resolve_tts_voice(
     language: str,
     tts_voice_map: dict[str, str],
@@ -370,9 +397,17 @@ class MultilangState:
     @classmethod
     def from_context(cls, ctx: Any) -> "MultilangState":
         """Build from a TenantContext (locale -> default, pack languages ->
-        supported set)."""
+        supported set).
+
+        SPEC-W82 A4.2: a pack ``i18n:`` block may pin the DEFAULT language
+        (``pack_default_language`` on the context); it wins over the tenant
+        identity locale so a Yoruba-first deployment idles in Yoruba instead
+        of English.
+        """
+        pack_default = normalize_language(getattr(ctx, "pack_default_language", ""))
         return cls(
-            default_language=default_language_from_locale(getattr(ctx, "locale", "en-US")),
+            default_language=pack_default
+            or default_language_from_locale(getattr(ctx, "locale", "en-US")),
             supported=list(getattr(ctx, "languages", []) or []),
         )
 

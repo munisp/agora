@@ -9,6 +9,7 @@ from typing import Any
 
 from . import metrics
 from .async_tools import AsyncToolRunner, ToolAckPolicy
+from .codeswitch import instruction as codeswitch_instruction
 from .config import Settings
 from .dapr_client import DaprClient
 from .escalation import LiveKitEscalation
@@ -20,6 +21,12 @@ from .prompts import build_system_prompt
 from .session_state import SessionState, SessionStore
 from .tenant_context import fetch_tenant_context
 from .tools import UI_ACTION_TOOL_NAMES, ToolLayer
+from .translation import (
+    TranslatorInterface,
+    build_translator,
+    process_inbound_text,
+    process_outbound_text,
+)
 
 log = get_logger("chat")
 
@@ -61,11 +68,17 @@ class ChatService:
         llm: LLMInterface,
         sessions: SessionStore,
         escalation: LiveKitEscalation | None = None,
+        translator: TranslatorInterface | None = None,
     ) -> None:
         self._settings = settings
         self._dapr = dapr
         self._llm = llm
         self._sessions = sessions
+        # SPEC-W82 A1: translation layer (mock-default; fail-open — a turn
+        # never blocks or fails on translation).
+        self._translator = (
+            translator if translator is not None else build_translator(settings)
+        )
         self._histories = ChatHistory()
         self._escalation = escalation or LiveKitEscalation(settings)
         # VOICE-SCALING §5: hard per-tool timeout on every Dapr tool call.
@@ -100,6 +113,33 @@ class ChatService:
         # eval candidate. Hard-gated by EVAL_PERSONA_OVERRIDE (default off).
         if persona_override and self._settings.eval_persona_override:
             ctx.agent_persona = persona_override
+
+        # SPEC-W82 A2 (inbound translation): detect the caller's language
+        # BEFORE route_intent; pure pcm/yo/ig/ha turns are translated to
+        # English for routing/LLM. The detection and the pre-translation
+        # text are stashed on the per-turn context (detected_language /
+        # original_text), and the session's active_language is SET — the
+        # chat path previously never set it, so downstream locale/TTS logic
+        # (locale instruction, outbound translation) now works for text
+        # users. Code-switched pcm/en turns (A4.1) are NOT force-translated
+        # wholesale; they pass through with a code-switch annotation. All of
+        # this is fail-open and gated by VOICE_TRANSLATE_ENABLED (a "0"
+        # flag makes the block a strict no-op).
+        inbound = await process_inbound_text(
+            message,
+            self._translator,
+            enabled=self._settings.voice_translate_enabled,
+            path="chat",
+        )
+        if inbound.detected_language:
+            ctx.detected_language = inbound.detected_language
+            ctx.original_text = inbound.original_text
+            if inbound.detected_language != "en":
+                session.active_language = inbound.detected_language
+            if inbound.code_switch:
+                ctx.code_switch = True
+                ctx.code_switch_segments = list(inbound.segments)
+        message = inbound.text
 
         # Multi-agent crews (SPEC-W3 §4, innovation 6): score the message
         # against the pack agents' intent keywords. A match swaps the active
@@ -158,6 +198,10 @@ class ChatService:
         registered = {t["function"]["name"] for t in tool_layer.schemas()}
         if any(name in registered for name in UI_ACTION_TOOL_NAMES):
             system_prompt = f"{system_prompt}\n\n{UI_ACTION_PROMPT_ADDENDUM}"
+        # SPEC-W82 A4.1: a code-switched pcm/en turn keeps its mixed text;
+        # the locale addendum tells the LLM to answer in the same register.
+        if ctx.code_switch:
+            system_prompt = f"{system_prompt}{codeswitch_instruction()}"
         if history and history[0].get("role") == "system":
             history[0] = {"role": "system", "content": system_prompt}
         else:
@@ -229,6 +273,16 @@ class ChatService:
             dispatch=self._tool_runner.wrap_dispatch(tool_layer.dispatch),
         )
         history.append({"role": "assistant", "content": reply})
+        # SPEC-W82 A3 (outbound translation): the caller-visible reply is
+        # translated en -> active_language; the HISTORY keeps the English
+        # reply (internal reasoning stays English). Fail-open English, and
+        # skipped when the reply is already substantially non-English.
+        outbound_reply = await process_outbound_text(
+            reply,
+            session.active_language,
+            self._translator,
+            enabled=self._settings.voice_translate_enabled,
+        )
 
         copilot_posted = await self._post_copilot(session, reply)
 
@@ -245,7 +299,7 @@ class ChatService:
             # K15(b): the resume credential — the client MUST present it
             # together with conversation_id to continue this session.
             "session_secret": session.session_secret,
-            "reply": reply,
+            "reply": outbound_reply,
             "tool_calls": trace,
             "phone_confirmed": session.confirmed_phone is not None,
             "phone_verified": session.verified_phone is not None,
@@ -314,6 +368,16 @@ class ChatService:
                 trace = event["trace"]
 
         history.append({"role": "assistant", "content": reply})
+        # SPEC-W82 A3 (outbound translation, SSE path): the deltas already
+        # streamed in English, so the translated reply rides the terminal
+        # done frame as an additive "reply" key (only present when it
+        # differs from the streamed text). Fail-open English.
+        outbound_reply = await process_outbound_text(
+            reply,
+            session.active_language,
+            self._translator,
+            enabled=self._settings.voice_translate_enabled,
+        )
         copilot_posted = await self._post_copilot(session, reply)
         log.info(
             "chat stream turn complete",
@@ -327,8 +391,13 @@ class ChatService:
         # `data: {"ui_action": {...}}` frames ahead of the terminal done frame.
         for action in tool_layer.collected_ui_actions:
             yield {"ui_action": action}
-        yield {
+        done_frame: dict[str, Any] = {
             "done": True,
             "conversation_id": session.conversation_id,
             "session_secret": session.session_secret,
         }
+        if outbound_reply != reply:
+            # SPEC-W82 A3 (additive): translated reply for non-English
+            # sessions (the deltas above streamed the English original).
+            done_frame["reply"] = outbound_reply
+        yield done_frame

@@ -14,7 +14,7 @@
  * naira (converted with Math.round(x * 100)).
  */
 import * as React from "react";
-import { BadgeCheck, X } from "lucide-react";
+import { BadgeCheck, Download, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input, Label, Select } from "@/components/ui/input";
@@ -35,11 +35,24 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatDateTime, titleCase } from "@/lib/utils";
+import { downloadCSV, toCSV, type CsvColumn } from "@/lib/export";
 import {
   referralStatusVariant,
   shortId,
   type Referral,
 } from "@/components/growth/types";
+
+/** SPEC-W82 B1.5: CSV columns for the referral leaderboard export. */
+const REFERRAL_CSV_COLUMNS: CsvColumn<Referral>[] = [
+  { header: "Referee phone", value: (r) => r.referee_phone },
+  { header: "Referrer type", value: (r) => r.referrer_type },
+  { header: "Referrer", value: (r) => r.referrer_id },
+  { header: "Status", value: (r) => r.status },
+  { header: "Campaign", value: (r) => r.campaign_id ?? "" },
+  { header: "Created", value: (r) => r.created_at ?? "" },
+  { header: "Verified", value: (r) => r.verified_at ?? "" },
+  { header: "Paid", value: (r) => r.paid_at ?? "" },
+];
 
 export function ReferralTable({
   rows,
@@ -80,15 +93,38 @@ export function ReferralTable({
     (baseNaira.trim() === "" ||
       (Number.isFinite(parsedBase) && parsedBase >= 0));
   const baseKobo = revenueBase ? Math.round((parsedBase || 0) * 100) : 0;
+
+  // SPEC-W82 B1.5: export the leaderboard (the sorted rows on screen,
+  // already fetched — no endpoint involved).
+  const exportCsv = () => {
+    downloadCSV(
+      `referral-leaderboard-${new Date().toISOString().slice(0, 10)}.csv`,
+      toCSV(sorted, REFERRAL_CSV_COLUMNS),
+    );
+  };
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Referrals</CardTitle>
-        <CardDescription>
-          One open referral per referee phone number. Verifying a pending
-          referral evaluates the active commission rules and posts the bounty
-          to the ledger.
-        </CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <CardTitle>Referrals</CardTitle>
+            <CardDescription>
+              One open referral per referee phone number. Verifying a pending
+              referral evaluates the active commission rules and posts the bounty
+              to the ledger.
+            </CardDescription>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={exportCsv}
+            disabled={sorted.length === 0}
+          >
+            <Download className="h-3.5 w-3.5" />
+            Export CSV
+          </Button>
+        </div>
       </CardHeader>
       <CardContent>
         <Table>

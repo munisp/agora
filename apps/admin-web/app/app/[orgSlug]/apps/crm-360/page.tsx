@@ -19,26 +19,42 @@ export const metadata = { title: "CRM 360" };
  */
 export default async function Crm360Page({
   params,
+  searchParams,
 }: {
   params: Promise<{ orgSlug: string }>;
+  // SPEC-W82 B1.4: q/tag live in the URL so filtered searches are
+  // bookmarkable and survive refresh/back. Next 15: await the Promise.
+  searchParams: Promise<{ q?: string | string[]; tag?: string | string[] }>;
 }) {
   const { orgSlug } = await params;
+  const sp = await searchParams;
+  const first = (v: string | string[] | undefined) =>
+    Array.isArray(v) ? (v[0] ?? "") : (v ?? "");
+  const initialFilters = { q: first(sp.q), tag: first(sp.tag) };
+
   const session = await auth();
   const roles = session?.realmRoles;
   if (!hasAnyRole(roles, ["owner", "admin", "staff"])) {
     redirect(`/app/${orgSlug}`);
   }
 
-  // SPEC-W46 AW-2: the unfiltered contact search (default view) is fetched
-  // server-side and handed to the client as initialData; the debounced
-  // search interaction stays client-side. Same degradation semantics the
-  // client applied (404 → "still rolling out" note).
+  // SPEC-W46 AW-2 (+ W82 B1.4): the contact search matching the URL filters
+  // is fetched server-side and handed to the client as initialData; the
+  // debounced re-search interaction stays client-side. Same degradation
+  // semantics the client applied (404 → "still rolling out" note).
   let initialResults: ContactSearchResult[] = [];
   let initialError: string | null = null;
   try {
     const data = await serverApi<unknown>(
       "/api/bookings/v1/crm/contacts/search",
-      { query: { tenant: orgSlug, limit: 50 } },
+      {
+        query: {
+          tenant: orgSlug,
+          q: initialFilters.q || undefined,
+          tag: initialFilters.tag || undefined,
+          limit: 50,
+        },
+      },
     );
     initialResults = unwrap<ContactSearchResult>(data);
   } catch (e) {
@@ -52,6 +68,7 @@ export default async function Crm360Page({
     <Crm360Client
       orgSlug={orgSlug}
       canWork
+      initialFilters={initialFilters}
       initialResults={initialResults}
       initialError={initialError}
     />

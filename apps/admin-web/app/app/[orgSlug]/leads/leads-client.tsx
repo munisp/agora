@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Plus, RefreshCw } from "lucide-react";
+import { Download, Plus, RefreshCw } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -20,7 +20,17 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
 import { formatDateTime, titleCase } from "@/lib/utils";
+import { downloadCSV, toCSV, type CsvColumn } from "@/lib/export";
 import type { Lead } from "@/lib/types";
+
+/** SPEC-W82 B1.5: CSV columns for the filtered leads export. */
+const LEAD_CSV_COLUMNS: CsvColumn<Lead>[] = [
+  { header: "Phone", value: (l) => l.phone_e164 },
+  { header: "Channel", value: (l) => l.channel_of_first_touch },
+  { header: "Promo", value: (l) => l.promo_code ?? "" },
+  { header: "Status", value: (l) => l.status },
+  { header: "Captured", value: (l) => l.created_at },
+];
 
 /** Statuses the backend transition endpoint accepts (booking-service leads.go). */
 const NEXT_STATUSES = ["contacted", "qualified", "converted", "lost"] as const;
@@ -132,6 +142,15 @@ export function LeadsClient({
     } finally {
       setCreating(false);
     }
+  };
+
+  // SPEC-W82 B1.5: export the currently filtered lead set (already-fetched
+  // client state — no endpoint involved).
+  const exportCsv = () => {
+    downloadCSV(
+      `leads-${new Date().toISOString().slice(0, 10)}.csv`,
+      toCSV(leads, LEAD_CSV_COLUMNS),
+    );
   };
 
   const transition = async (lead: Lead, next: string) => {
@@ -255,9 +274,20 @@ export function LeadsClient({
             ))}
           </Select>
         </div>
+        {/* SPEC-W82 B1.5: export exactly the filtered set on screen. */}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={exportCsv}
+          disabled={leads.length === 0}
+        >
+          <Download className="h-3.5 w-3.5" />
+          Export CSV
+        </Button>
       </div>
 
-      <Card>
+      {/* SPEC-W82 B1.2: table on ≥sm, stacked cards below. */}
+      <Card className="hidden sm:block">
         <Table>
           <TableHeader>
             <TableRow>
@@ -321,6 +351,49 @@ export function LeadsClient({
           </TableBody>
         </Table>
       </Card>
+
+      {/* SPEC-W82 B1.2: stacked lead cards below sm:. */}
+      <div className="space-y-2 sm:hidden">
+        {leads.length === 0 ? (
+          <p className="rounded-md border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+            {loading
+              ? "Loading…"
+              : "No leads match — inbound leads from every channel land here."}
+          </p>
+        ) : (
+          leads.map((lead) => (
+            <div
+              key={lead.lead_id}
+              className="rounded-md border border-border bg-card px-4 py-3"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="font-medium">{lead.phone_e164}</p>
+                <Badge variant={statusVariant(lead.status)}>{lead.status}</Badge>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                <Badge variant="outline">
+                  {titleCase(lead.channel_of_first_touch)}
+                </Badge>{" "}
+                {lead.promo_code ? `· ${lead.promo_code} ` : ""}·{" "}
+                {formatDateTime(lead.created_at)}
+              </p>
+              <div className="mt-2 flex flex-wrap gap-1">
+                {NEXT_STATUSES.filter((s) => s !== lead.status).map((s) => (
+                  <Button
+                    key={s}
+                    variant="ghost"
+                    size="sm"
+                    disabled={busyId === lead.lead_id}
+                    onClick={() => void transition(lead, s)}
+                  >
+                    {titleCase(s)}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
     </div>
   );
 }

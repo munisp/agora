@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 
 from .multilang import parse_tts_voice_map, parse_voice_map
+from .pronunciation import parse_tenant_lexicons
 from .sip import parse_tenant_phone_map
 
 
@@ -125,6 +126,44 @@ def parse_voice_tool_tiers(raw: str) -> dict[str, int]:
             )
         tiers[name] = tier
     return tiers
+
+
+def parse_stt_hints(raw: str) -> dict[str, dict[str, str]]:
+    """Parse the VOICE_STT_HINTS JSON env (SPEC-W82 A4.4).
+
+    Shape: ``{"<site-or-tenant-slug>": {"language": "yo", "initial_prompt":
+    "Acme Clinic, braids, Dr. Adaeze"}}``. Tolerant: malformed JSON,
+    non-object entries, invalid language codes and empty prompts drop out
+    with a warning — STT hints are best-effort and NEVER fatal (fail-open
+    when unset is today's behavior).
+    """
+    from .multilang import normalize_language
+
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Deliberately NOT fail-closed (contrast VOICE_TOOL_TIERS): a bad
+        # hint degrades to no hints, never a refused boot.
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for slug, hint in data.items():
+        if not isinstance(hint, dict):
+            continue
+        entry: dict[str, str] = {}
+        lang = normalize_language(str(hint.get("language") or ""))
+        if lang:
+            entry["language"] = lang
+        prompt = str(hint.get("initial_prompt") or "").strip()
+        if prompt:
+            entry["initial_prompt"] = prompt
+        if entry:
+            out[str(slug).strip()] = entry
+    return out
 
 
 @dataclass(frozen=True)
@@ -448,6 +487,34 @@ class Settings:
     # surface; only turn on for eval runs.
     eval_persona_override: bool = False
 
+    # SPEC-W82 A1: Nigerian-language translation layer (app/translation.py).
+    # voice_translate_enabled (VOICE_TRANSLATE_ENABLED, default "1") gates
+    # the inbound pcm/yo/ig/ha->en and outbound en->lang turn seams;
+    # translate_mock (TRANSLATE_MOCK, default "1" — the sanctioned
+    # XTTS_MOCK/COSYVOICE_MOCK/MMS_MOCK dev pattern) forces the MockTranslator
+    # regardless of translate_provider. "http" posts to translate_url with an
+    # optional Bearer key under a hard translate_timeout_s budget and FAILS
+    # OPEN (original text + voice_translation_errors_total) on any error.
+    voice_translate_enabled: bool = True
+    translate_provider: str = "mock"
+    translate_mock: bool = True
+    translate_url: str = ""
+    translate_api_key: str = ""
+    translate_timeout_s: float = 3.0
+
+    # SPEC-W82 A4.4: per-tenant STT hints (VOICE_STT_HINTS JSON keyed by
+    # site/tenant slug) — a forced whisper language= and an initial_prompt
+    # seeded with tenant/offering/staff names, plumbed into WhisperSTTNode.
+    # Empty = today's behavior (auto-detect, no prompt). Parsed by
+    # parse_stt_hints above; bad JSON degrades to no hints (fail-open).
+    voice_stt_hints: dict = field(default_factory=dict)
+
+    # SPEC-W82 A4.5: per-tenant pronunciation lexicon
+    # (VOICE_PRONUNCIATION_LEXICON JSON keyed by tenant slug, "*" = global),
+    # merged under the pack voice.lexicon block by
+    # app/pronunciation.merge_lexicons and applied pre-TTS.
+    voice_pronunciation_lexicon: dict = field(default_factory=dict)
+
     extra: dict = field(default_factory=dict)
 
     @property
@@ -591,4 +658,18 @@ def load_settings() -> Settings:
         tts_cb_cooldown_s=float(os.environ.get("TTS_CB_COOLDOWN_S", "60")),
         eval_persona_override=_env("EVAL_PERSONA_OVERRIDE", "false").lower()
         in ("1", "true", "yes", "on"),
+        # SPEC-W82 A1 translation layer (fail-open everywhere; mock default).
+        voice_translate_enabled=_env("VOICE_TRANSLATE_ENABLED", "1").lower()
+        not in ("0", "false", "no"),
+        translate_provider=_env("TRANSLATE_PROVIDER", "mock"),
+        translate_mock=_env("TRANSLATE_MOCK", "1").lower()
+        not in ("0", "false", "no"),
+        translate_url=_env("TRANSLATE_URL", ""),
+        translate_api_key=_env("TRANSLATE_API_KEY", ""),
+        translate_timeout_s=_env_float("TRANSLATE_TIMEOUT_S", 3.0),
+        # SPEC-W82 A4.4/A4.5 per-tenant hints + pronunciation lexicon.
+        voice_stt_hints=parse_stt_hints(_env("VOICE_STT_HINTS", "")),
+        voice_pronunciation_lexicon=parse_tenant_lexicons(
+            _env("VOICE_PRONUNCIATION_LEXICON", "")
+        ),
     )
