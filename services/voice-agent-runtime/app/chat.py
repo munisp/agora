@@ -191,6 +191,10 @@ class ChatService:
     def _record(self, session: SessionState, tool_layer: Any, message: str, reply: str, trace: list[dict[str, Any]]) -> None:
         if self._transcripts is None:
             return
+        # WhatsApp/Telegram: the messaging gateway's bridge records the conversation (keyed by the customer's number);
+        # recording here as well listed every message twice, in two conversations.
+        if (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram"):
+            return
         ctx = getattr(tool_layer, "tenant_context", None)
         tenant_id = str(getattr(ctx, "tenant_id", "") or "")
         self._transcripts.record(

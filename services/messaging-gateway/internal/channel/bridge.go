@@ -228,7 +228,7 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 		return err
 	}
 
-	if err := b.recordTurn(ctx, convID, site.TenantID, msg.Channel+":"+msg.MessageID+":reply", "assistant", reply); err != nil {
+	if err := b.recordTurn(ctx, convID, site.TenantID, msg.Channel+":"+msg.MessageID+":reply", "agent", reply); err != nil {
 		log.Warn("record assistant turn failed", zap.Error(err))
 		return err
 	}
@@ -317,7 +317,10 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 			ID string `json:"id"`
 		} `json:"conversations"`
 	}
-	if err := b.doJSON(ctx, http.MethodGet, b.ConversationURL+"/v1/conversations?"+q.Encode(), nil, nil, &list); err != nil {
+	// In-cluster callers name the tenant in X-Tenant-Slugs (as the voice runtime does); without it the conversation
+	// service answers 401 and no WhatsApp/Telegram message was ever recorded or answered.
+	tenantHdr := map[string]string{"X-Tenant-Slugs": site.TenantID}
+	if err := b.doJSON(ctx, http.MethodGet, b.ConversationURL+"/v1/conversations?"+q.Encode(), nil, tenantHdr, &list); err != nil {
 		return "", fmt.Errorf("list conversations: %w", err)
 	}
 	if len(list.Conversations) > 0 {
@@ -332,7 +335,7 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 		"channel":       msg.Channel,
 		"contact_phone": msg.From,
 	}
-	if err := b.doJSON(ctx, http.MethodPost, b.ConversationURL+"/v1/conversations", body, nil, &created); err != nil {
+	if err := b.doJSON(ctx, http.MethodPost, b.ConversationURL+"/v1/conversations", body, tenantHdr, &created); err != nil {
 		return "", fmt.Errorf("create conversation: %w", err)
 	}
 	if created.ID == "" {
@@ -346,6 +349,7 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 func (b *Bridge) recordTurn(ctx context.Context, convID, tenantID, idemKey, role, text string) error {
 	headers := map[string]string{
 		"X-Tenant-ID":     tenantID,
+		"X-Tenant-Slugs":  tenantID,
 		"Idempotency-Key": idemKey,
 	}
 	body := map[string]string{"role": role, "text": text}

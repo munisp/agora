@@ -224,7 +224,7 @@ func TestBridgeFullFlowTelegram(t *testing.T) {
 	if user.tenant != "11111111-2222-3333-4444-555555555555" {
 		t.Fatalf("user turn missing X-Tenant-ID: %+v", user)
 	}
-	if assistant.role != "assistant" || assistant.text != "Sure, I can help with that." {
+	if assistant.role != "agent" || assistant.text != "Sure, I can help with that." {
 		t.Fatalf("bad assistant turn: %+v", assistant)
 	}
 	if assistant.idemKey != "telegram:555:reply" {
