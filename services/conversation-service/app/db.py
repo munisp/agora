@@ -841,13 +841,18 @@ class Database:
                 json.dumps(entities) if entities is not None else None,
             )
 
+    async def update_turn_translation(self, turn_id: uuid.UUID, tenant_id: uuid.UUID, translation: str) -> None:
+        """Store a turn's English translation (made when the owner opens a non-English conversation)."""
+        async with self._tenant_tx(tenant_id) as conn:
+            await conn.execute("UPDATE turns SET translation_en = $2 WHERE id = $1", turn_id, translation)
+
     async def list_turns(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> list[asyncpg.Record]:
         async with self._tenant_tx(tenant_id) as conn:
             return await conn.fetch(
                 """
-                SELECT id, conversation_id, seq, role, text, tool_calls, ts
+                SELECT id, conversation_id, seq, role, text, tool_calls, ts, translation_en
                 FROM turns WHERE conversation_id = $1 ORDER BY seq
                 """,
                 conversation_id,

@@ -67,6 +67,11 @@ class Config:
     intel_llm_model: str = "qwen3:8b"
     intel_llm_api_key: str = "ollama"
     intel_llm_timeout_s: float = 3.0
+    # English translation of non-English transcript lines, made when the owner opens a conversation (POST
+    # /v1/conversations/{id}/translate) and stored with the turn. Empty base URL = off.
+    translate_llm_base_url: str = ""
+    translate_llm_model: str = "gemma4:26b"
+    translate_llm_timeout_s: float = 60.0
     enriched_topic: str = "opendesk.conversation.enriched"
 
     # Call-quality sentiment enrichment (STRATEGY §3, Wave 5 innovation 2):
@@ -186,6 +191,9 @@ def load() -> Config:
         fluvio_endpoint=_env("FLUVIO_ENDPOINT", "fluvio:9003"),
         kafka_brokers=[b.strip() for b in _env("KAFKA_BROKERS", "kafka:9092").split(",") if b.strip()],
         intel_llm=_env("INTEL_LLM", "off").lower() in ("1", "on", "true", "yes"),
+        translate_llm_base_url=_env("TRANSLATE_LLM_BASE_URL", ""),
+        translate_llm_model=_env("TRANSLATE_LLM_MODEL", "gemma4:26b"),
+        translate_llm_timeout_s=float(_env("TRANSLATE_LLM_TIMEOUT_S", "60")),
         intel_llm_base_url=_env("INTEL_LLM_BASE_URL", _env("LLM_BASE_URL", "http://ollama:11434/v1")),
         intel_llm_model=_env("INTEL_LLM_MODEL", _env("LLM_MODEL", "qwen3:8b")),
         intel_llm_api_key=_env("INTEL_LLM_API_KEY", _env("LLM_API_KEY", "ollama")),

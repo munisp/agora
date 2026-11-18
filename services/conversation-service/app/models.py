@@ -52,6 +52,8 @@ class Turn(BaseModel):
     sentiment: float | None = None
     intent: str | None = None
     entities: dict[str, Any] | None = None
+    # English translation of a non-English line (None: English already, or not translated yet).
+    translation_en: str | None = None
     ts: datetime
 
 
