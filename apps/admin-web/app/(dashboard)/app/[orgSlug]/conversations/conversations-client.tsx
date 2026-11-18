@@ -30,6 +30,8 @@ interface Turn {
   text: string;
   created_at?: string;
   sentiment?: number | null;
+  /** English translation of a Pidgin/Yoruba/Hausa/Igbo line ("" = English already; null = not translated yet). */
+  translation_en?: string | null;
 }
 
 const CHANNEL: Record<string, { label: string; icon: typeof MessageCircle }> = {
@@ -63,6 +65,7 @@ export function ConversationsClient({
   const [open, setOpen] = React.useState<ConversationSummary | null>(null);
   const [turns, setTurns] = React.useState<Turn[] | null>(null);
   const [turnsError, setTurnsError] = React.useState<string | null>(null);
+  const [translating, setTranslating] = React.useState(false);
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
@@ -88,7 +91,20 @@ export function ConversationsClient({
       setTurnsError(null);
       try {
         const detail = await api.get<{ turns?: Turn[] }>(`/api/conversations/v1/conversations/${c.id}`, { tenant: orgSlug });
-        setTurns([...(detail.turns ?? [])].sort((a, b) => a.seq - b.seq));
+        const loaded = [...(detail.turns ?? [])].sort((a, b) => a.seq - b.seq);
+        setTurns(loaded);
+        // Lines not yet checked for language get an English translation (once; stored by the conversation service).
+        if (loaded.some((t) => (t.role === "user" || t.role === "agent") && t.translation_en == null && t.text?.trim())) {
+          setTranslating(true);
+          try {
+            const tr = await api.post<{ turns?: Turn[] }>(`/api/conversations/v1/conversations/${c.id}/translate`, undefined, { tenant: orgSlug });
+            setTurns([...(tr.turns ?? loaded)].sort((a, b) => a.seq - b.seq));
+          } catch {
+            // the transcript still shows; translations come next time
+          } finally {
+            setTranslating(false);
+          }
+        }
       } catch (e) {
         setTurnsError(e instanceof ApiError ? e.message : "Failed to load the transcript.");
       }
@@ -185,6 +201,7 @@ export function ConversationsClient({
             <CardContent>
               {turnsError ? <ErrorNote message={turnsError} /> : null}
               {turns === null && !turnsError ? <p className="text-sm text-muted-foreground">Loading the transcript…</p> : null}
+              {translating ? <p className="text-xs text-muted-foreground">Translating into English…</p> : null}
               {turns && turns.length === 0 ? <p className="text-sm text-muted-foreground">No messages recorded.</p> : null}
               <ol className="space-y-2" aria-label="Transcript">
                 {(turns ?? []).map((t) =>
@@ -209,6 +226,12 @@ export function ConversationsClient({
                           ) : null}
                         </div>
                         {t.text}
+                        {t.translation_en ? (
+                          <div className="mt-1.5 border-t border-current/20 pt-1.5 text-[12px] italic opacity-85" data-translation>
+                            <span className="not-italic font-semibold">English: </span>
+                            {t.translation_en}
+                          </div>
+                        ) : null}
                       </div>
                     </li>
                   ),

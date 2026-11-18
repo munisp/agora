@@ -222,14 +222,14 @@ async def translate_conversation(
     except NotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"conversation {conversation_id} not found") from None
     turns = [dict(t) for t in await st.db.list_turns(conversation_id, tenant_id)]
-    todo = [t for t in turns if t["role"] in ("user", "agent") and not t.get("translation_en") and (t.get("text") or "").strip()]
+    todo = [t for t in turns if t["role"] in ("user", "agent") and t.get("translation_en") is None and (t.get("text") or "").strip()]
     if todo and st.cfg.translate_llm_base_url:
         sem = asyncio.Semaphore(3)
 
         async def one(t: dict) -> None:
             async with sem:
                 tr = await intel.translate_to_english(t["text"], st.cfg)
-            if tr:
+            if tr is not None:  # "" = English already: stored so the line is not sent again
                 await st.db.update_turn_translation(t["id"], tenant_id, tr)
                 t["translation_en"] = tr
 

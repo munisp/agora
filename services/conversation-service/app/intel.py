@@ -206,10 +206,13 @@ _TRANSLATE_SYSTEM = (
 
 
 def parse_translation(reply: str | None, original: str) -> str | None:
-    """The model's reply -> a translation to store, or None (already English / empty / an echo of the original)."""
+    """The model's reply -> the translation to store: "" when the line is English already (stored, so it is never
+    sent again), None when there is no usable reply (not stored, retried next time)."""
     t = (reply or "").strip().strip('"').strip()
-    if not t or t.upper().rstrip(".") == "ENGLISH" or t == original.strip():
+    if not t:
         return None
+    if t.upper().rstrip(".") == "ENGLISH" or t == original.strip():
+        return ""
     return t
 
 

@@ -1,11 +1,11 @@
 from app.intel import parse_translation
 
 
-def test_english_lines_are_not_translated():
-    assert parse_translation("ENGLISH", "Good afternoon") is None
-    assert parse_translation("english.", "Hello") is None
-    assert parse_translation("", "x") is None
-    assert parse_translation("Good afternoon", "Good afternoon") is None  # an echo is not a translation
+def test_english_lines_are_marked_not_translated():
+    assert parse_translation("ENGLISH", "Good afternoon") == ""
+    assert parse_translation("english.", "Hello") == ""
+    assert parse_translation("Good afternoon", "Good afternoon") == ""  # an echo is not a translation
+    assert parse_translation("", "x") is None  # no reply: not stored, retried later
 
 
 def test_translation_is_kept_clean():
