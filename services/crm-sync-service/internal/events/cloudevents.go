@@ -107,6 +107,9 @@ type SessionEndedData struct {
 	Channel        string       `json:"channel"`
 	SiteSlug       string       `json:"siteSlug"`
 	Quality        *CallQuality `json:"quality"`
+	// StoredConversationID is the conversation-service id of the call's
+	// transcript (the runtime's session id differs); absent on older runtimes.
+	StoredConversationID string `json:"storedConversationId,omitempty"`
 }
 
 // CallQualityEnrichedData mirrors conversation-service app/quality.py

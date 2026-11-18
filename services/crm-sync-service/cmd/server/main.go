@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/opendesk/crm-sync-service/internal/callsummary"
 	"github.com/opendesk/crm-sync-service/internal/config"
 	"github.com/opendesk/crm-sync-service/internal/consumer"
 	"github.com/opendesk/crm-sync-service/internal/daprc"
@@ -64,6 +65,10 @@ func run() error {
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
 
 	syncer := &consumer.Syncer{Twenty: twenty, Map: st, Metrics: reg, Log: logger}
+	if cfg.ConversationURL != "" && cfg.SummaryLLMURL != "" {
+		syncer.Summary = callsummary.New(cfg.ConversationURL, cfg.SummaryLLMURL, cfg.SummaryLLMModel, cfg.SummaryTimeout)
+		logger.Info("call-summary sentences enabled", zap.String("model", cfg.SummaryLLMModel))
+	}
 
 	// Reverse worker (Twenty -> OpenDesk): consumes the webhook CloudEvents
 	// from opendesk.crm.events in its own group so it scales/offsets

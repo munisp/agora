@@ -57,9 +57,8 @@ func TestCallQualityEnrichedCreatesNoteWithSentiment(t *testing.T) {
 	}
 	body, _ := noteText(notes[0].body), true
 	for _, want := range []string{
-		"📞 AI call summary",
-		"duration 95s",
-		"avg sentiment 0.42",
+		"- Call length: 1 min 35 s",
+		"Caller's mood: Positive",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("note body missing %q:\n%s", want, body)
@@ -115,7 +114,7 @@ func TestCallQualityEnrichedPatchesExistingFallbackNote(t *testing.T) {
 		t.Fatalf("expected 1 note patch, got %d; requests=%+v", len(patches), stub.requests)
 	}
 	body, _ := noteText(patches[0].body), true
-	if !strings.Contains(body, "avg sentiment -0.35") {
+	if !strings.Contains(body, "Caller's mood: Negative") {
 		t.Errorf("patched body missing sentiment:\n%s", body)
 	}
 	// mapping still points at the same note
@@ -148,7 +147,7 @@ func TestPlainSessionEndedSkippedAfterEnrichedNote(t *testing.T) {
 		t.Fatalf("expected exactly 1 note across both events, got %d", len(notes))
 	}
 	body, _ := noteText(notes[0].body), true
-	if !strings.Contains(body, "avg sentiment 0.90") {
+	if !strings.Contains(body, "Caller's mood: Positive") {
 		t.Errorf("enriched-created note missing sentiment:\n%s", body)
 	}
 }
@@ -228,7 +227,7 @@ func TestEnrichedNoteUsesNestedAvgSentiment(t *testing.T) {
 		t.Fatalf("expected 1 note, got %d", len(notes))
 	}
 	body, _ := noteText(notes[0].body), true
-	if !strings.Contains(body, "avg sentiment 0.77") {
+	if !strings.Contains(body, "Caller's mood: Positive") {
 		t.Errorf("note body missing nested avg sentiment:\n%s", body)
 	}
 }

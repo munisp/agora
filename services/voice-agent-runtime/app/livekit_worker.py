@@ -1037,6 +1037,7 @@ async def _publish_lifecycle(
     *,
     quality: dict[str, Any] | None = None,
     agent_id: str | None = None,
+    stored_conversation_id: str | None = None,
 ) -> None:
     event = new_cloudevent(
         type_=type_,
@@ -1048,6 +1049,7 @@ async def _publish_lifecycle(
             site_slug=ctx.site_slug,
             quality=quality,
             agent_id=agent_id,
+            stored_conversation_id=stored_conversation_id,
         ),
     )
     await dapr.publish_best_effort(
@@ -1578,6 +1580,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 conversation_id,
                 quality=quality,
                 agent_id=session.resolved_agent_id,
+                stored_conversation_id=_TRANSCRIPTS.stored_id(f"voice:{conversation_id}") if _TRANSCRIPTS else None,
             )
         )
 

@@ -60,6 +60,22 @@ type Syncer struct {
 	Map     MapStore
 	Metrics *metrics.Registry
 	Log     *zap.Logger
+	// Summary writes the plain-language sentences of the call-summary note
+	// (nil or unconfigured: the note carries the structured facts only).
+	Summary CallSummarizer
+}
+
+// CallSummarizer turns a conversation into a short plain-language summary
+// ("" when unavailable). Implemented by callsummary.Summarizer.
+type CallSummarizer interface {
+	Summarize(ctx context.Context, conversationID, tenantID string) string
+}
+
+func (s *Syncer) summarize(ctx context.Context, conversationID, tenantID string) string {
+	if s.Summary == nil {
+		return ""
+	}
+	return s.Summary.Summarize(ctx, conversationID, tenantID)
 }
 
 // HandleIdentity processes opendesk.identity.events.
@@ -486,7 +502,7 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 		return nil
 	}
 	noteID, err := s.Twenty.CreateNote(ctx,
-		twentyc.CallSummaryNoteTitle, twentyc.CallSummaryNote(*d.Quality), personID)
+		twentyc.CallSummaryNoteTitle, twentyc.CallSummaryNote(*d.Quality, s.summarize(ctx, firstNonEmpty(d.StoredConversationID, d.ConversationID), evt.TenantID)), personID)
 	if err != nil {
 		return fmt.Errorf("create call summary note: %w", err)
 	}
@@ -544,7 +560,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 		q.AvgSentiment = d.AvgSentiment
 	}
 	tenantUUID := parseUUID(evt.TenantID)
-	body := twentyc.CallSummaryNote(q)
+	body := twentyc.CallSummaryNote(q, s.summarize(ctx, d.ConversationID, evt.TenantID))
 	if d.ConversationID != "" {
 		m, err := s.Map.Get(ctx, KindQualityNote, d.ConversationID, tenantUUID)
 		if err != nil && !errors.Is(err, syncmap.ErrNotFound) {
@@ -697,4 +713,13 @@ func (s *Syncer) HandlePrivacy(ctx context.Context, evt events.CloudEvent) error
 		zap.String("event_id", evt.ID), zap.String("person_id", rec.ID),
 		zap.Int64("sync_map_rows_removed", removed))
 	return nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

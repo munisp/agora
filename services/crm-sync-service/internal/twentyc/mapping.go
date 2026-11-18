@@ -185,54 +185,72 @@ func CancelNote(reason string) string {
 // AIBookingNote is the Note body for AI-receptionist bookings (SPEC-CRM §B).
 const AIBookingNote = "Booked via AI receptionist"
 
-// CallSummaryNoteTitle is the Note title for AI call-quality summaries
-// (enriched SessionEnded events on opendesk.conversation.events).
-const CallSummaryNoteTitle = "📞 AI call summary"
+// CallSummaryNoteTitle is the Note title for the call summary written when a
+// call ends (SessionEnded / CallQualityEnriched on the conversation topics).
+const CallSummaryNoteTitle = "📞 Call summary"
 
-// CallSummaryNote renders the markdown-ish Note body for an enriched
-// SessionEnded call-quality payload, e.g.:
+// CallSummaryNote renders the call summary a business owner reads in the CRM:
+// the plain-language summary (from callsummary, may be empty) followed by the
+// facts that matter to the business, e.g.
 //
-//	📞 AI call summary — duration 95s, 6 turns, tools: book_appointment×1,
-//	avg LLM 820ms (max 1400ms), escalated: no, fallback used: no
+//	The caller wanted to open a retirement savings account. The receptionist
+//	booked an RSA Registration call for Tuesday 24 November at 9:00 am.
 //
-// Optional segments are omitted when the payload lacks them (no tool calls,
-// no LLM latency samples, no avg sentiment). Sentiment is NOT produced by
-// the voice runtime — per-turn sentiment/intent lives in the OpenSearch
-// conversations index (conversation-service intel); the field exists only
-// for future/event-external enrichment.
-func CallSummaryNote(q events.CallQuality) string {
-	parts := []string{
-		fmt.Sprintf("duration %ds", int(math.Round(q.DurationS))),
-		fmt.Sprintf("%d turns", q.TurnCount),
+//	- Call length: 5 min 42 s
+//	- Phone confirmed: 0806 555 3108
+//	- Appointment booked: Yes
+//	- Passed to a person: No
+//
+// Engineering signals (turn counts, tool names, latencies, speech-engine call
+// counts) stay out of the CRM: they live in the call-quality metrics.
+func CallSummaryNote(q events.CallQuality, summary string) string {
+	var b strings.Builder
+	if s := strings.TrimSpace(summary); s != "" {
+		b.WriteString(s)
+		b.WriteString("\n\n")
 	}
-	if len(q.ToolCalls) > 0 {
-		names := make([]string, 0, len(q.ToolCalls))
-		for name := range q.ToolCalls {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		tools := make([]string, 0, len(names))
-		for _, name := range names {
-			tools = append(tools, fmt.Sprintf("%s×%d", name, q.ToolCalls[name]))
-		}
-		parts = append(parts, "tools: "+strings.Join(tools, ", "))
+	fmt.Fprintf(&b, "- Call length: %s\n", callLength(q.DurationS))
+	if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
+		fmt.Fprintf(&b, "- Phone confirmed: %s\n", spacedPhone(p))
 	}
-	if q.AvgLLMLatencyMs != nil {
-		seg := fmt.Sprintf("avg LLM %dms", *q.AvgLLMLatencyMs)
-		if q.MaxLLMLatencyMs != nil {
-			seg += fmt.Sprintf(" (max %dms)", *q.MaxLLMLatencyMs)
-		}
-		parts = append(parts, seg)
+	booked := "No"
+	switch {
+	case q.ToolCalls["book_appointment"] > 0:
+		booked = "Yes"
+	case q.ToolCalls["reschedule_appointment"] > 0:
+		booked = "Rescheduled"
+	case q.ToolCalls["cancel_appointment"] > 0:
+		booked = "Cancelled"
 	}
-	if q.SttCalls > 0 || q.TtsCalls > 0 {
-		parts = append(parts, fmt.Sprintf("stt %d calls, tts %d calls", q.SttCalls, q.TtsCalls))
-	}
-	parts = append(parts, "escalated: "+yesNo(q.Escalated))
-	parts = append(parts, "fallback used: "+yesNo(q.LLMFallbackUsed))
+	fmt.Fprintf(&b, "- Appointment booked: %s\n", booked)
+	fmt.Fprintf(&b, "- Passed to a person: %s", strings.Title(yesNo(q.Escalated))) //nolint:staticcheck // ASCII yes/no
 	if q.AvgSentiment != nil {
-		parts = append(parts, fmt.Sprintf("avg sentiment %.2f", *q.AvgSentiment))
+		mood := "Neutral"
+		if *q.AvgSentiment >= 0.25 {
+			mood = "Positive"
+		} else if *q.AvgSentiment <= -0.25 {
+			mood = "Negative"
+		}
+		fmt.Fprintf(&b, "\n- Caller's mood: %s", mood)
 	}
-	return CallSummaryNoteTitle + " — " + strings.Join(parts, ", ")
+	return b.String()
+}
+
+func callLength(sec float64) string {
+	n := int(math.Round(sec))
+	if n < 60 {
+		return fmt.Sprintf("%d s", n)
+	}
+	return fmt.Sprintf("%d min %d s", n/60, n%60)
+}
+
+// spacedPhone writes an 11-digit Nigerian mobile as 0806 555 3108; other
+// formats are returned as given.
+func spacedPhone(p string) string {
+	if len(p) == 11 && strings.HasPrefix(p, "0") && strings.Trim(p, "0123456789") == "" {
+		return p[:4] + " " + p[4:7] + " " + p[7:]
+	}
+	return p
 }
 
 // CaptureNoteTitle is the Note title for post-call captured fields

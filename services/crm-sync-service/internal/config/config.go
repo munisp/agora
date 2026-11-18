@@ -29,15 +29,20 @@ type Config struct {
 	CapturesTopic       string // opendesk.conversation.captures (CaptureExtracted, SPEC-W38 F3)
 	CaptureGroup        string // crm-sync-capture (own group for the captures topic)
 	CRMEventsTopic      string // opendesk.crm.events (reverse webhook intake)
-	PrivacyTopic        string // opendesk.privacy.events (GDPR erase tombstones)
-	ConsumerGroup       string // crm-sync
-	ReverseGroup        string // crm-sync-reverse (Twenty -> OpenDesk worker)
-	BookingAppID        string // Dapr app-id of booking-service (default booking)
-	EchoWindow          time.Duration // reverse echo suppression window (default 10s)
-	DLQTopic            string // opendesk.dlq
-	ShutdownTimeout     time.Duration
-	ConsumerEnabled     bool   // run Kafka consumers (default true)
-	InternalToken       string // CRM_SYNC_INTERNAL_TOKEN (SPEC-W45 K21): X-Internal-Token gate on /v1/tasks + /v1/people/lookup — 503 fail-closed when unset, 401 missing/wrong
+	// Call-summary note sentences (empty URL = facts-only notes).
+	ConversationURL string        // CONVERSATION_SERVICE_URL, e.g. http://conversation:7007
+	SummaryLLMURL   string        // SUMMARY_LLM_BASE_URL, OpenAI-compatible (e.g. Ollama .../v1)
+	SummaryLLMModel string        // SUMMARY_LLM_MODEL
+	SummaryTimeout  time.Duration // SUMMARY_TIMEOUT_SECONDS (default 90)
+	PrivacyTopic    string        // opendesk.privacy.events (GDPR erase tombstones)
+	ConsumerGroup   string        // crm-sync
+	ReverseGroup    string        // crm-sync-reverse (Twenty -> OpenDesk worker)
+	BookingAppID    string        // Dapr app-id of booking-service (default booking)
+	EchoWindow      time.Duration // reverse echo suppression window (default 10s)
+	DLQTopic        string        // opendesk.dlq
+	ShutdownTimeout time.Duration
+	ConsumerEnabled bool   // run Kafka consumers (default true)
+	InternalToken   string // CRM_SYNC_INTERNAL_TOKEN (SPEC-W45 K21): X-Internal-Token gate on /v1/tasks + /v1/people/lookup — 503 fail-closed when unset, 401 missing/wrong
 }
 
 // Load reads configuration from the environment.
@@ -60,6 +65,10 @@ func Load() (Config, error) {
 		CapturesTopic:       envStr("CAPTURES_TOPIC", "opendesk.conversation.captures"),
 		CaptureGroup:        envStr("CAPTURE_CONSUMER_GROUP", "crm-sync-capture"),
 		CRMEventsTopic:      envStr("CRM_EVENTS_TOPIC", "opendesk.crm.events"),
+		ConversationURL:     envStr("CONVERSATION_SERVICE_URL", ""),
+		SummaryLLMURL:       envStr("SUMMARY_LLM_BASE_URL", ""),
+		SummaryLLMModel:     envStr("SUMMARY_LLM_MODEL", ""),
+		SummaryTimeout:      time.Duration(envInt("SUMMARY_TIMEOUT_SECONDS", 90)) * time.Second,
 		PrivacyTopic:        envStr("PRIVACY_EVENTS_TOPIC", "opendesk.privacy.events"),
 		ConsumerGroup:       envStr("CONSUMER_GROUP", "crm-sync"),
 		ReverseGroup:        envStr("REVERSE_CONSUMER_GROUP", "crm-sync-reverse"),

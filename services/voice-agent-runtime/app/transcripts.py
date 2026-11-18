@@ -73,6 +73,10 @@ class TranscriptRecorder:
             await self._client.aclose()
             self._client = None
 
+    def stored_id(self, key: str) -> str | None:
+        """The conversation-service id this session's turns are stored under (None before the first turn)."""
+        return self._ids.get(key)
+
     def _remember(self, key: str, conv_id: str) -> None:
         self._ids[key] = conv_id
         self._ids.move_to_end(key)
