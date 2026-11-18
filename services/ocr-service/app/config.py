@@ -115,6 +115,21 @@ class Settings(BaseSettings):
     kyc_ttl_hours: int = 72
     kyc_sweep_minutes: int = 15
 
+    # SPEC-W76 R1/R2: cross-tenant registry TTL-membership reconciler.
+    # Same raw-string + derived-int idiom as the kyc knobs above (invalid
+    # values warn + fall back, never hard-fail boot; the derived field
+    # names are chosen so their auto-derived env names do NOT collide
+    # with the pinned OCR_* envs). ttl_days >= 1 (a TTL of 0 would nuke
+    # every membership); reconcile_minutes 0 = reconciler OFF.
+    ocr_registry_ttl_days_raw: str = Field(
+        default="180", validation_alias=AliasChoices("OCR_REGISTRY_TTL_DAYS")
+    )
+    ocr_registry_reconcile_minutes_raw: str = Field(
+        default="60", validation_alias=AliasChoices("OCR_REGISTRY_RECONCILE_MINUTES")
+    )
+    registry_ttl_days: int = 180
+    registry_reconcile_minutes: int = 60
+
     # Service-to-service auth (SPEC-W44 K2): X-Internal-Token, constant-time
     # compare, FAIL-CLOSED (503) when unset. Callers (booking-service
     # fieldcapture) carry the SAME value.
@@ -181,6 +196,36 @@ class Settings(BaseSettings):
         self.kyc_sweep_minutes = _int_or_default(
             "OCR_KYC_SWEEP_MINUTES", self.ocr_kyc_sweep_minutes_raw, 15
         )
+        return self
+
+    @model_validator(mode="after")
+    def _derive_registry_settings(self) -> "Settings":
+        ttl = _int_or_default(
+            "OCR_REGISTRY_TTL_DAYS", self.ocr_registry_ttl_days_raw, 180
+        )
+        if ttl < 1:  # R1 bounds: a TTL below 1 day would expire everything
+            log.warning(
+                "config.invalid_int_env",
+                key="OCR_REGISTRY_TTL_DAYS",
+                value=self.ocr_registry_ttl_days_raw,
+                default=180,
+            )
+            ttl = 180
+        self.registry_ttl_days = ttl
+        minutes = _int_or_default(
+            "OCR_REGISTRY_RECONCILE_MINUTES",
+            self.ocr_registry_reconcile_minutes_raw,
+            60,
+        )
+        if minutes < 0:  # R2: 0 = disabled; negative is invalid
+            log.warning(
+                "config.invalid_int_env",
+                key="OCR_REGISTRY_RECONCILE_MINUTES",
+                value=self.ocr_registry_reconcile_minutes_raw,
+                default=60,
+            )
+            minutes = 60
+        self.registry_reconcile_minutes = minutes
         return self
 
     @model_validator(mode="after")

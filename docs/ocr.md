@@ -438,6 +438,24 @@ EXISTING key with >=1 OTHER member**" emits.
   (accepted residual — possible stale-count alert needing human triage,
   never a disclosure). Full rationale: `docs/compliance-ndpa.md`.
 
+### TTL-membership reconciler (SPEC-W76)
+
+A background loop (cadence `OCR_REGISTRY_RECONCILE_MINUTES`, default 60
+minutes, `0` = disabled) expires memberships whose `first_seen` is older than
+`OCR_REGISTRY_TTL_DAYS` (default **180** days, >= 1). Expiry is age-keyed,
+never hash-keyed, so it runs even when `OCR_REGISTRY_HMAC_SECRET` is unset;
+it is zero schema change (reads the existing `first_seen` column). Parent
+keys whose last membership left are dropped (recount-verified), drifted
+`tenant_count` values are repaired by re-count, and `doc_count` (cumulative
+history) is NEVER rewritten. An expired membership that re-uploads later is a
+NEW membership (`alerted=false`) and MAY alert again — intended (the stale
+protection had lapsed). Per-run Prometheus counters:
+`opendesk_ocr_registry_ttl_memberships_expired_total`,
+`opendesk_ocr_registry_ttl_keys_dropped_total`,
+`opendesk_ocr_registry_ttl_drift_repaired_total` (ops interpretation:
+`docs/runbooks/security.md` §7.4; retention rationale:
+`docs/compliance-ndpa.md`).
+
 ### `POST /v1/internal/ocr/backfill-document-registry`
 
 Backfills/rebuilds the registry from the durable `ocr_documents` rows (first

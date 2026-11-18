@@ -36,10 +36,12 @@ cross-tenant match is detected per joining tenant.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from prometheus_client import Counter
@@ -58,6 +60,21 @@ REGISTRY_KEYS = Counter(
 REGISTRY_MATCHES = Counter(
     "opendesk_ocr_registry_matches_total",
     "Cross-tenant exact-duplicate matches detected (SPEC-W67 G5).",
+)
+
+# SPEC-W76: TTL-membership reconciler telemetry (same counters-only
+# observability pattern as the W67 counters above).
+REGISTRY_TTL_MEMBERSHIPS_EXPIRED = Counter(
+    "opendesk_ocr_registry_ttl_memberships_expired_total",
+    "Registry memberships expired by the TTL reconciler (SPEC-W76 R1).",
+)
+REGISTRY_TTL_KEYS_DROPPED = Counter(
+    "opendesk_ocr_registry_ttl_keys_dropped_total",
+    "Registry parent rows dropped with zero memberships (SPEC-W76 R6a).",
+)
+REGISTRY_TTL_DRIFT_REPAIRED = Counter(
+    "opendesk_ocr_registry_ttl_drift_repaired_total",
+    "Registry parent tenant_count values repaired to the real count (SPEC-W76 R6b).",
 )
 
 # --- SQL (pinned semantics; tests/conftest.py fakes replicate these in ---
@@ -111,6 +128,33 @@ SQL_DROP_EMPTY_KEY = """
 DELETE FROM ocr_doc_registry r
  WHERE r.registry_key = $1
    AND NOT EXISTS (SELECT 1 FROM ocr_doc_registry_tenants m
+                    WHERE m.registry_key = r.registry_key)
+"""
+
+# SPEC-W76 R1: TTL-membership expiry. Membership age = the membership's own
+# first_seen (immutable per membership); $1 is the age cutoff
+# (now - OCR_REGISTRY_TTL_DAYS). Age-keyed, NEVER hash-keyed — no HMAC
+# needed (R3). R4 (intended): an expired membership that later re-uploads
+# is a NEW membership (alerted=false) and MAY alert again — the stale
+# protection had lapsed.
+SQL_EXPIRE_MEMBERSHIPS = """
+DELETE FROM ocr_doc_registry_tenants
+ WHERE first_seen < $1
+RETURNING registry_key
+"""
+
+# SPEC-W76 R6: drift sweep — returns every parent row that is empty
+# (zero memberships, R6a) OR whose cached tenant_count disagrees with the
+# real membership count (R6b, re-count never trust). doc_count is
+# cumulative history and is NEVER rewritten.
+SQL_DRIFT_SWEEP = """
+SELECT r.registry_key, r.tenant_count,
+       (SELECT COUNT(*) FROM ocr_doc_registry_tenants m
+         WHERE m.registry_key = r.registry_key) AS real_count
+  FROM ocr_doc_registry r
+ WHERE r.tenant_count <> (SELECT COUNT(*) FROM ocr_doc_registry_tenants m
+                           WHERE m.registry_key = r.registry_key)
+    OR NOT EXISTS (SELECT 1 FROM ocr_doc_registry_tenants m
                     WHERE m.registry_key = r.registry_key)
 """
 
@@ -246,3 +290,75 @@ async def remove_tenant_memberships(db, tenant_id: str) -> dict[str, int]:
         keys_dropped=keys_dropped,
     )
     return {"memberships_removed": len(rows), "keys_dropped": keys_dropped}
+
+
+async def reconcile_registry_ttl(db, *, now, ttl_days: int) -> dict[str, int]:
+    """SPEC-W76: TTL-membership reconciler — ONE registry_conn transaction.
+
+    R1: expire memberships whose first_seen < now - ttl_days; per affected
+    key, recount + drop the parent when its last membership left. R6 drift
+    sweep over ALL keys: drop empty parents, repair drifted tenant_count
+    (re-count, never trust; doc_count is cumulative history — untouched).
+
+    R3: age-keyed deletes only — NO HMAC secret required, so this runs even
+    when OCR_REGISTRY_HMAC_SECRET is unset (memberships could predate a
+    rotation/unset). Still rides registry_conn() — the ONLY GUC access path.
+
+    Returns {"memberships_expired", "keys_dropped", "keys_drift_repaired"}.
+    """
+    cutoff = now - timedelta(days=int(ttl_days))
+    async with registry_conn(db) as conn:
+        rows = await conn.fetch(SQL_EXPIRE_MEMBERSHIPS, cutoff)
+        keys = sorted({str(r["registry_key"]) for r in rows})
+        keys_dropped = 0
+        for key in keys:
+            await conn.execute(SQL_RECOUNT, key)
+            res = await conn.execute(SQL_DROP_EMPTY_KEY, key)
+            keys_dropped += int(res.split()[-1])
+        keys_drift_repaired = 0
+        for row in await conn.fetch(SQL_DRIFT_SWEEP):
+            key = str(row["registry_key"])
+            if int(row["real_count"]) == 0:
+                res = await conn.execute(SQL_DROP_EMPTY_KEY, key)
+                keys_dropped += int(res.split()[-1])
+            else:
+                await conn.execute(SQL_RECOUNT, key)
+                keys_drift_repaired += 1
+    stats = {
+        "memberships_expired": len(rows),
+        "keys_dropped": keys_dropped,
+        "keys_drift_repaired": keys_drift_repaired,
+    }
+    if stats["memberships_expired"]:
+        REGISTRY_TTL_MEMBERSHIPS_EXPIRED.inc(stats["memberships_expired"])
+    if stats["keys_dropped"]:
+        REGISTRY_TTL_KEYS_DROPPED.inc(stats["keys_dropped"])
+    if stats["keys_drift_repaired"]:
+        REGISTRY_TTL_DRIFT_REPAIRED.inc(stats["keys_drift_repaired"])
+    log.info(
+        "ocr_registry.ttl_reconciled",
+        ttl_days=int(ttl_days),
+        cutoff=cutoff.isoformat(),
+        **stats,
+    )
+    return stats
+
+
+async def registry_reconcile_loop(db, settings) -> None:
+    """SPEC-W76 R2: periodic TTL reconcile until cancelled (lifespan-managed
+    asyncio task), mirroring sweeper.sweeper_loop. Cadence from
+    settings.registry_reconcile_minutes (the caller never starts the loop
+    when it is 0). A failed run is logged and the loop continues."""
+    interval_minutes = int(settings.registry_reconcile_minutes)
+    interval_s = max(interval_minutes, 1) * 60
+    log.info("ocr_registry.reconcile_started", interval_minutes=interval_minutes)
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await reconcile_registry_ttl(
+                db,
+                now=datetime.now(timezone.utc),
+                ttl_days=int(settings.registry_ttl_days),
+            )
+        except Exception as exc:  # a failed run never kills the loop
+            log.error("ocr_registry.reconcile_failed", error=str(exc))
