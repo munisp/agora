@@ -208,6 +208,8 @@ _CHANNEL_MAP = {
     "api": "webhook",
     # SPEC-W12 contract §2: the classifier treats ussd as web-like.
     "ussd": "web",
+    "whatsapp": "web",
+    "telegram": "web",
 }
 
 _NARRATIVE_MAX = 500
