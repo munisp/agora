@@ -77,3 +77,37 @@ def test_process_start_allows_a_model_download():
 
     opts = build_worker_options(load_settings())
     assert opts.initialize_process_timeout >= 120
+
+
+def test_full_provider_spec_for_english_and_pidgin():
+    for code in ("en", "pcm"):
+        assert call_voice(code, english_voice="edge:en-NG-AbeoNeural", naija=True, voice_spec=_piper) == ("edge:en-NG-AbeoNeural", "en")
+    assert call_voice("yo", english_voice="edge:en-NG-AbeoNeural", naija=True, voice_spec=_piper,
+                      language_voices={"yo": "yoruba_male1"}) == ("naija:yoruba_male1", "yo")
+
+
+def test_edge_provider_returns_wav_at_the_call_rate():
+    import asyncio, io, wave
+    from app.tts_providers.edge import EdgeTTS
+
+    class FakeCommunicate:
+        def __init__(self, text, voice):
+            self.voice = voice
+
+        async def stream(self):
+            import av  # a tiny real mp3 so the decoder path is exercised
+            buf = io.BytesIO()
+            with av.open(buf, "w", format="mp3") as out:
+                st = out.add_stream("mp3", rate=24000)
+                import numpy as np
+                frame = av.AudioFrame.from_ndarray(np.zeros((1, 2400), dtype=np.int16), format="s16", layout="mono")
+                frame.sample_rate = 24000
+                for p in st.encode(frame):
+                    out.mux(p)
+                for p in st.encode(None):
+                    out.mux(p)
+            yield {"type": "audio", "data": buf.getvalue()}
+
+    wav = asyncio.run(EdgeTTS(sample_rate=22050, communicate=FakeCommunicate).synthesize("Hello", "en-NG-AbeoNeural", "en"))
+    with wave.open(io.BytesIO(wav)) as w:
+        assert w.getframerate() == 22050 and w.getnchannels() == 1 and w.getnframes() > 0

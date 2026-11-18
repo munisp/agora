@@ -213,7 +213,7 @@ async def test_qwen3_list_voices_static_default():
 def test_qwen3_in_provider_names():
     assert "qwen3" in PROVIDER_NAMES
     assert PROVIDER_NAMES == (
-        "piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3"
+        "piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3", "edge"
     )
 
 

@@ -423,6 +423,8 @@ def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any,
     With a Nigerian English voice configured, English and Pidgin are spoken by it (YarnGPT reads Pidgin naturally; the
     MMS Pidgin voice sounds robotic). Other Nigerian languages use the service's own voice for that language."""
     code = normalize_language(code) or (code or "en").strip().lower()
+    if english_voice and ":" in english_voice and code in ("en", "pcm"):
+        return english_voice, "en"  # a full provider spec, e.g. "edge:en-NG-AbeoNeural"
     if english_voice and naija and code in ("en", "pcm"):
         return f"naija:{english_voice}", "en"
     if naija and code in call_language.NIGERIAN:
@@ -1146,7 +1148,7 @@ async def build_voice_agent(
         )
 
     # A Nigerian-accented English voice (NAIJA_ENGLISH_VOICE): English and Pidgin are spoken by it, not piper/MMS.
-    english_voice = settings.naija_english_voice if settings.naija_speech_url else ""
+    english_voice = settings.naija_english_voice if (settings.naija_speech_url or ":" in settings.naija_english_voice) else ""
 
     def _set_voice(code: str) -> None:
         tts_impl.voice, tts_impl.language = call_voice(code, english_voice=english_voice,

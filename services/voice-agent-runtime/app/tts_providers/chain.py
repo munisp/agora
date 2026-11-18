@@ -37,6 +37,7 @@ from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
 from .cosyvoice import CosyVoiceTTS
 from .mms import MmsTTS
+from .edge import EdgeTTS
 from .naija import NaijaSpeechTTS
 from .qwen3 import Qwen3TTS
 from .spitch import SpitchTTS
@@ -45,7 +46,7 @@ from .xtts import XttsTTS
 log = get_logger("tts.chain")
 
 #: Providers buildable from Settings (chain names).
-PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3")
+PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3", "edge")
 
 
 class PiperProvider:
@@ -380,6 +381,8 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
         return XttsTTS(settings.xtts_tts_url)
     if name == "naija":
         return NaijaSpeechTTS(settings.naija_speech_url, sample_rate=settings.piper_sample_rate)
+    if name == "edge":
+        return EdgeTTS(sample_rate=settings.piper_sample_rate)
     if name == "azure":
         return AzureTTS(
             api_key=settings.azure_speech_key, region=settings.azure_speech_region
