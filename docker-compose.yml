@@ -582,6 +582,16 @@ services:
       # line wired it pre-W61 (dead without this entry). DEV ONLY default;
       # prod MUST set BOOKING_INTERNAL_TOKEN via the secrets store.
       MESSAGING_BOOKING_INTERNAL_TOKEN: ${BOOKING_INTERNAL_TOKEN:-change-me-internal}
+      # SPEC-W81 (C1): WhatsApp channel-identity pin. The inbound bridge's
+      # agentReply POST /voice/chat carries channel_identity (the provider-
+      # verified wa_id) plus X-Internal-Token matching the VOICE block's
+      # VOICE_ADMIN_INTERNAL_TOKEN (SAME shared secret var, distinct
+      # caller-side name per the K2 idiom). The runtime pins the wa_id as
+      # the session's verified phone ONLY when the token matches — empty
+      # here = header not sent, peer ignores the pin (fail-safe). DEV ONLY
+      # default; prod MUST set VOICE_ADMIN_INTERNAL_TOKEN via the secrets
+      # store (docs/runbooks/secrets.md).
+      MESSAGING_VOICE_INTERNAL_TOKEN: ${VOICE_ADMIN_INTERNAL_TOKEN:-opendesk-dev-voice-admin-internal-token-change-in-prod}
       # SPEC-W61: anchor rollout flag, default OFF — when false the W60
       # media path is byte-identical (no ledger-anchor step, 200 after mark
       # as today). Enable together with WHATSAPP_MEDIA_ENABLED.

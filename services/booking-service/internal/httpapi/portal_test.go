@@ -386,6 +386,90 @@ func TestPortalRequestRateLimit(t *testing.T) {
 	}
 }
 
+// SPEC-W81 B2: channel=whatsapp on the request endpoint is accepted and
+// flows through verify — the published command carries channel whatsapp
+// with the phone destination, and the resulting portal JWT works exactly
+// like the sms one. Code generation / lockout / rate-limit semantics are
+// unchanged (the channel is purely additive).
+func TestPortalWhatsAppChannel(t *testing.T) {
+	f := newPortalFixture(t)
+	f.addContact(t, "Wale", "+2348011111111")
+
+	code, resp := doJSON(t, f.handler, "POST", "/public/sites/acme-books/portal/request", "",
+		map[string]string{"phone": "+2348011111111", "channel": "whatsapp"})
+	if code != http.StatusAccepted {
+		t.Fatalf("request = %d %v", code, resp)
+	}
+	if len(f.publisher.events) == 0 {
+		t.Fatal("no SendPortalCode event published")
+	}
+	evt := f.publisher.events[len(f.publisher.events)-1]
+	if evt.Data["channel"] != "whatsapp" || evt.Data["destination"] != "+2348011111111" {
+		t.Fatalf("event data = %v", evt.Data)
+	}
+	plainCode, _ := evt.Data["code"].(string)
+	if len(plainCode) != 6 {
+		t.Fatalf("code = %q, want 6 digits", plainCode)
+	}
+
+	code, resp = doJSON(t, f.handler, "POST", "/public/sites/acme-books/portal/verify", "",
+		map[string]string{"phone": "+2348011111111", "channel": "whatsapp", "code": plainCode})
+	if code != http.StatusOK {
+		t.Fatalf("verify = %d %v", code, resp)
+	}
+	token, _ := resp["portal_token"].(string)
+	if token == "" {
+		t.Fatalf("no portal_token in %v", resp)
+	}
+
+	// The whatsapp session is contact-scoped exactly like sms.
+	code, resp = doJSON(t, f.handler, "GET", "/portal/bookings", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("list = %d %v", code, resp)
+	}
+	bookings, _ := resp["bookings"].([]any)
+	if len(bookings) != 1 {
+		t.Fatalf("bookings = %d, want 1", len(bookings))
+	}
+}
+
+// SPEC-W81 B2: explicit channel validation — unknown channels and
+// channel/identifier mismatches are a 400 (whatsapp is phone-addressed);
+// explicit sms/email selections and case-insensitivity keep working.
+func TestPortalChannelValidation(t *testing.T) {
+	f := newPortalFixture(t)
+	f.addContact(t, "Ada", "+2348022222222")
+
+	for _, body := range []map[string]string{
+		{"phone": "+2348022222222", "channel": "pigeon"},    // unknown channel
+		{"phone": "+2348022222222", "channel": "email"},     // email needs an email identifier
+		{"email": "ada@example.com", "channel": "whatsapp"}, // whatsapp is phone-addressed
+		{"email": "ada@example.com", "channel": "sms"},      // sms needs a phone identifier
+	} {
+		code, _ := doJSON(t, f.handler, "POST", "/public/sites/acme-books/portal/request", "", body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("request %v = %d, want 400", body, code)
+		}
+		// A 400 never reaches the outbox.
+		if len(f.publisher.events) != 0 {
+			t.Fatalf("request %v published an event", body)
+		}
+	}
+
+	// Explicit channel matching the identifier (case-insensitive) works.
+	code, _ := doJSON(t, f.handler, "POST", "/public/sites/acme-books/portal/request", "",
+		map[string]string{"phone": "+2348022222222", "channel": "WhatsApp"})
+	if code != http.StatusAccepted {
+		t.Fatalf("case-insensitive whatsapp = %d, want 202", code)
+	}
+	// The same 400 validation applies on verify.
+	code, _ = doJSON(t, f.handler, "POST", "/public/sites/acme-books/portal/verify", "",
+		map[string]string{"phone": "+2348022222222", "channel": "pigeon", "code": "123456"})
+	if code != http.StatusBadRequest {
+		t.Fatalf("verify pigeon = %d, want 400", code)
+	}
+}
+
 func TestPortalRequestUnknownContactIsIndistinguishable(t *testing.T) {
 	f := newPortalFixture(t)
 	code, resp := doJSON(t, f.handler, "POST", "/public/sites/acme-books/portal/request", "", map[string]string{"phone": "+19999999"})

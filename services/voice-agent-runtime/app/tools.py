@@ -21,6 +21,11 @@ lookup_appointment, reschedule_appointment, cancel_appointment.
   events topic (internal mint endpoint / targeted in-room delivery).
 - SPEC-W45 K15(f): caller phones in ToolInvoked/capture_location events
   are HMAC-hashed (PHONE_HASH_SALT, W28 scheme) or omitted.
+- SPEC-W81 A2: explicit risk-tier map (VOICE_TOOL_TIERS, app/config.py)
+  enforced at dispatch() as the single choke point — tier 0 pass / tier 1
+  confirmed-or-verified / tier 2 verified; the map formalizes the existing
+  gates (never weakens them) and hard-gates pack plugin tools (default
+  tier 1).
 """
 
 from __future__ import annotations
@@ -31,7 +36,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Coroutine, Optional
 
 from . import metrics, sip, ui_actions
-from .config import Settings
+from .config import (
+    DEFAULT_VOICE_TOOL_TIERS,
+    TIER_HIGH,
+    TIER_LOW,
+    Settings,
+)
 from .dapr_client import DaprClient
 from .escalation import LiveKitEscalation, escalation_room_name
 from .events import new_cloudevent
@@ -360,6 +370,27 @@ def _verification_required_payload() -> dict[str, Any]:
     }
 
 
+def _tier_confirmation_required_payload(tool: str) -> dict[str, Any]:
+    """SPEC-W81 A2: tier-1 refusal for tools WITHOUT their own confirmation
+    flow (pack plugin tools). Built-in tier-1 tools keep their existing
+    in-method read-back flow and the byte-compatible _confirmation_payload;
+    this shape is used ONLY at the dispatch choke point for plugin tools
+    (and never for the built-ins, so the existing refusal payloads are
+    untouched)."""
+    return {
+        "status": "confirmation_required",
+        "error": "confirmed_phone_required",
+        "tool": tool,
+        "tier": 1,
+        "message": (
+            "This tool requires a confirmed caller identity. Collect the "
+            "caller's phone number and have it confirmed (the "
+            "book_appointment read-back flow, or verify_caller_code for a "
+            "verified identity) before calling this tool again."
+        ),
+    }
+
+
 def _verification_unavailable_payload() -> dict[str, Any]:
     """Honest degrade (503-equivalent on the tool path): verification is
     not configured (BOOKING_URL / VOICE_BOOKING_INTERNAL_TOKEN unset), so
@@ -527,8 +558,61 @@ class ToolLayer:
             status = "phone_mismatch"
         else:
             status = "verification_required"
+        metrics.stepup_refused(status)
         await self._emit_tool_event(tool, status, {})
         return gate
+
+    # ------------------------------------------- SPEC-W81 A2: tier policy
+    def _tool_tier(self, name: str) -> int:
+        """Effective risk tier for ``name`` (VOICE_TOOL_TIERS map).
+
+        Tools absent from the map — pack plugin tools included — DEFAULT to
+        tier 1 (confirmed identity), never silently tier 0. The loader
+        (app/config.py parse_voice_tool_tiers) already rejected invalid
+        values at startup; the int coercion here is belt-and-braces for
+        programmatically built Settings."""
+        tiers = getattr(self._settings, "voice_tool_tiers", None) or {}
+        try:
+            return int(tiers.get(name, 1))
+        except (TypeError, ValueError):
+            return 1
+
+    async def _enforce_tool_tier(
+        self, name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """SPEC-W81 A2: the SINGLE tier-policy choke point (dispatch).
+
+        Returns the refusal payload to hand back to the model, or None to
+        proceed. The map FORMALIZES the existing ladder and never weakens
+        it: built-in tools at their default tier self-enforce inside their
+        methods on EVERY path (book_appointment: read-back confirmation;
+        lookup/reschedule/cancel: _require_verified) with byte-compatible
+        refusal payloads, so the choke point deliberately does NOT
+        double-gate them. It hard-gates:
+        - pack plugin tools (no internal gate — default tier 1), and
+        - any tool whose configured tier was RAISED above its built-in
+          floor (the loader refuses lowering).
+        """
+        tier = self._tool_tier(name)
+        if tier <= TIER_LOW:
+            return None
+        metrics.stepup_required(name, tier)
+        floor = DEFAULT_VOICE_TOOL_TIERS.get(name)
+        if floor is not None and tier <= floor:
+            # Built-in at its (un-lowerable) default tier: the method's own
+            # gate enforces it on every path — no double refusal here.
+            return None
+        if tier >= TIER_HIGH:
+            gate = self._require_verified(arguments.get("phone"))
+            if isinstance(gate, dict):
+                return await self._refuse_gate(name, gate)
+            return None
+        # Tier 1 (MEDIUM): confirmed (read-back) or verified identity.
+        if self._session.confirmed_phone or self._session.verified_phone:
+            return None
+        metrics.stepup_refused("confirmation_required")
+        await self._emit_tool_event(name, "confirmation_required", {})
+        return _tier_confirmation_required_payload(name)
 
     def _event_phone_detail(self, phone: str) -> dict[str, Any]:
         """K15(f): phone detail for ToolInvoked/capture_location events —
@@ -628,6 +712,7 @@ class ToolLayer:
         try:
             confirmed = self._require_phone(phone)
         except PhoneConfirmationRequired as pcr:
+            metrics.stepup_refused("confirmation_required")
             await self._emit_tool_event("book_appointment", "confirmation_required", {})
             return _confirmation_payload(pcr.pending_phone)
 
@@ -725,6 +810,7 @@ class ToolLayer:
             await verifier.aclose()
         if result.ok:
             self._session.mark_verified(phone)
+            metrics.stepup_verified("otp")
             await self._emit_tool_event(
                 "verify_caller_code", "verified", self._event_phone_detail(phone)
             )
@@ -1205,6 +1291,13 @@ class ToolLayer:
                 offering_id=str(arguments.get("offering_id", "")),
             ),
         }.get(name)
+        # SPEC-W81 A2: risk-tier policy — the single choke point. Runs after
+        # the allowlist block, before execution; unknown tools fall through
+        # to the unchanged "unknown tool" error below.
+        if handler is not None or name in self._plugin_tools:
+            tier_gate = await self._enforce_tool_tier(name, arguments)
+            if tier_gate is not None:
+                return tier_gate
         if handler is None:
             plugin = self._plugin_tools.get(name)
             if plugin is not None:

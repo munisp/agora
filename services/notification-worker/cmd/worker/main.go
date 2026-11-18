@@ -490,12 +490,17 @@ func run() error {
 	// dispatch push) start one PacedSendWorkflow each on this task queue —
 	// the send rides the NotifyPaced activity (CPS pacer + sender rotation
 	// + SPEC-W12 guards), never a raw binding call.
+	// SPEC-W81 B3: the whatsapp portal-code channel rides the worker-side
+	// WhatsApp Cloud API provider (free-form text; WHATSAPP_MOCK default OFF,
+	// SIM-011 — with no credentials whatsapp sends fail closed with an
+	// explicit error, exactly like the campaign activity path).
 	outboxConsumer := notifyoutbox.New(
 		strings.Split(cfg.KafkaBrokers, ","),
 		cfg.NotificationsOutboxTopic, cfg.NotificationsOutboxGroup,
 		notifyoutbox.BindingSender{
 			Dapr: daprClient, SMTPBinding: cfg.SMTPBinding, TwilioBinding: cfg.TwilioBinding,
 			SMTPFrom: cfg.SMTPFrom, TwilioFrom: cfg.TwilioFrom,
+			WhatsApp: provider.NewWhatsAppFromEnv(logger),
 		}, logger,
 		notifyoutbox.WithStarter(tc, cfg.TemporalTaskQueue))
 	defer outboxConsumer.Close() //nolint:errcheck

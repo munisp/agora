@@ -47,7 +47,12 @@ from livekit.plugins import silero
 
 from . import emergency, metrics, sip
 from . import dead_mic, greeting_prerender
-from .async_tools import SLOW_TOOLS, AsyncToolRunner, ToolAckPolicy
+from .async_tools import (
+    SLOW_TOOLS,
+    VERIFICATION_TOOLS,
+    AsyncToolRunner,
+    ToolAckPolicy,
+)
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
 from .events import new_cloudevent, session_lifecycle_data
@@ -370,14 +375,22 @@ class PiperTTSNode(lk_tts.TTS):
 
 
 # ---------------------------------------------------------------------------
-# Function context: the 6 tools with EXACT names (SPEC §11)
+# Function context: the 6 tools with EXACT names (SPEC §11) + the K15(c) OTP
+# verification tools (SPEC-W81 A1)
 # ---------------------------------------------------------------------------
 class ReceptionistFunctions(lk_llm.FunctionContext):
-    """The 6 tools + escalation, exposed to the LLM.
+    """The 6 tools + OTP verification + escalation, exposed to the LLM.
 
     Slow tools run through AsyncToolRunner (VOICE-SCALING §5): the filler ack
     line is spoken via `speaker` if the call outlasts the grace window, and a
     hard timeout resolves to a spoken apology instead of dead air.
+
+    SPEC-W81 A1: request_verification_code / verify_caller_code close the
+    voice-path gap — the system prompt (app/prompts.py) already instructs
+    the model to drive the OTP flow, and the chat/ElevenLabs paths already
+    expose both tools through ToolLayer.dispatch; these wrappers delegate
+    to the SAME ToolLayer methods so the LiveKit path enforces the same
+    K15(c) verified-session gate on lookup/reschedule/cancel.
     """
 
     def __init__(
@@ -459,6 +472,39 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
                 contact_name=contact_name or None,
                 email=email or None,
             ),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
+            "Send a one-time verification code to the caller's phone "
+            "number (SMS/email via the booking portal). REQUIRED before "
+            "looking up, rescheduling or cancelling an existing booking. "
+            "After calling this, ask the caller to read you the code and "
+            "submit it with verify_caller_code."
+        )
+    )
+    async def request_verification_code(self, phone: str) -> str:
+        import json
+
+        result = await self._run_slow(
+            "request_verification_code",
+            lambda: self._tools.request_verification_code(phone=phone),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
+            "Verify the one-time code the caller read back. On success "
+            "the session is verified and lookup/reschedule/cancel may run."
+        )
+    )
+    async def verify_caller_code(self, phone: str, code: str) -> str:
+        import json
+
+        result = await self._run_slow(
+            "verify_caller_code",
+            lambda: self._tools.verify_caller_code(phone=phone, code=code),
         )
         return json.dumps(result, ensure_ascii=False)
 
@@ -892,6 +938,15 @@ async def build_voice_agent(
     runner = AsyncToolRunner(
         timeout_s=settings.tool_timeout_s,
         ack_grace_ms=settings.tool_ack_grace_ms,
+        # SPEC-W81 A1: the OTP tools do a booking-portal HTTP round-trip
+        # (portal client timeout = http_timeout_s, 15s default) that can
+        # outlast the 4s global tool timeout — give ONLY those tools the
+        # longer budget so the portal answer reaches the caller instead of
+        # a generic timeout apology. The global timeout is untouched.
+        timeout_overrides={
+            tool: settings.verification_tool_timeout_s
+            for tool in VERIFICATION_TOOLS
+        },
     )
     fnc_ctx = ReceptionistFunctions(
         tool_layer,

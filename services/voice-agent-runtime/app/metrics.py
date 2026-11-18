@@ -24,6 +24,9 @@ Series:
 - voice_dead_mic_resets_total    (counter) — SPEC-W73 A1
 - voice_greeting_prerender_total (counter, label result=ok|error|timeout) — SPEC-W73 A2
 - voice_stt_stream_hop_seconds   (histogram) — SPEC-W75 B2 streaming-STT hop timing
+- voice_stepup_required_total    (counter, labels tool,tier) — SPEC-W81 A3
+- voice_stepup_verified_total    (counter, label method=otp|channel) — SPEC-W81 A3
+- voice_stepup_refused_total     (counter, label reason) — SPEC-W81 A3
 """
 
 from __future__ import annotations
@@ -255,6 +258,28 @@ class Registry:
             "Streaming STT per-hop recognizer latency (interim hops and "
             "final-segment transcriptions).",
         )
+        # SPEC-W81 A3: risk-tiered step-up 2FA (VOICE_TOOL_TIERS policy,
+        # app/tools.py dispatch choke point). stepup_required counts policy
+        # evaluations of tier>=1 tools at the choke point (label tier =
+        # 1|2); stepup_refused counts identity-gate refusals on EVERY tool
+        # path (reason = verification_required | verification_unavailable |
+        # phone_mismatch | confirmation_required); stepup_verified counts
+        # successful step-ups (method = otp | channel).
+        self.stepup_required = Counter(
+            "voice_stepup_required_total",
+            "Tier-gated tool calls evaluated by the step-up policy choke point.",
+            ("tool", "tier"),
+        )
+        self.stepup_verified = Counter(
+            "voice_stepup_verified_total",
+            "Successful caller step-up verifications by method.",
+            ("method",),  # method=otp|channel
+        )
+        self.stepup_refused = Counter(
+            "voice_stepup_refused_total",
+            "Step-up identity-gate refusals by reason.",
+            ("reason",),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -276,6 +301,9 @@ class Registry:
             self.dead_mic_resets,
             self.greeting_prerender,
             self.stt_stream_hop,
+            self.stepup_required,
+            self.stepup_verified,
+            self.stepup_refused,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -427,6 +455,22 @@ def dead_mic_reset() -> None:
 def greeting_prerender_result(result: str) -> None:
     """SPEC-W73 A2: one boot-time greeting prerender outcome (ok|error|timeout)."""
     _registry.greeting_prerender.inc(result=result)
+
+
+def stepup_required(tool: str, tier: int) -> None:
+    """SPEC-W81 A3: tier>=1 tool call evaluated by the step-up choke point."""
+    _registry.stepup_required.inc(tool=tool, tier=str(tier))
+
+
+def stepup_verified(method: str) -> None:
+    """SPEC-W81 A3: successful caller step-up (method=otp|channel)."""
+    _registry.stepup_verified.inc(method=method)
+
+
+def stepup_refused(reason: str) -> None:
+    """SPEC-W81 A3: identity-gate refusal (verification_required |
+    verification_unavailable | phone_mismatch | confirmation_required)."""
+    _registry.stepup_refused.inc(reason=reason)
 
 
 # ---------------------------------------------------------------------------

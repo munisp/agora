@@ -155,8 +155,34 @@ func verifyPortalJWT(secret, token string) (portalClaims, error) {
 // ---------------------------------------------------------------------------
 
 type portalRequestBody struct {
-	Phone string `json:"phone"`
-	Email string `json:"email"`
+	Phone   string `json:"phone"`
+	Email   string `json:"email"`
+	Channel string `json:"channel"` // optional explicit channel (SPEC-W81 B2)
+}
+
+// portalChannelFor resolves the portal delivery channel: it derives from
+// the identifier (phone → sms, email → email) unless the caller explicitly
+// selects one (SPEC-W81 B2, purely additive). whatsapp is phone-addressed,
+// so it is only valid alongside a phone identifier; unknown values and
+// channel/identifier mismatches are a 400 (msg != "").
+func portalChannelFor(phone, email, want string) (channel, dest, msg string) {
+	switch {
+	case phone != "" && email == "":
+		channel, dest = store.PortalChannelSMS, phone
+	case email != "" && phone == "":
+		channel, dest = store.PortalChannelEmail, email
+	default:
+		return "", "", "exactly one of phone or email is required"
+	}
+	switch want {
+	case "", channel:
+		return channel, dest, ""
+	case store.PortalChannelWhatsApp:
+		if channel == store.PortalChannelSMS {
+			return store.PortalChannelWhatsApp, dest, ""
+		}
+	}
+	return "", "", "channel must be one of sms, email, whatsapp (whatsapp requires a phone identifier)"
 }
 
 // portalRequestCode serves POST /public/sites/{slug}/portal/request.
@@ -173,14 +199,10 @@ func (s *server) portalRequestCode(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Phone = strings.TrimSpace(req.Phone)
 	req.Email = strings.TrimSpace(req.Email)
-	var channel, dest string
-	switch {
-	case req.Phone != "" && req.Email == "":
-		channel, dest = store.PortalChannelSMS, req.Phone
-	case req.Email != "" && req.Phone == "":
-		channel, dest = store.PortalChannelEmail, req.Email
-	default:
-		writeError(w, http.StatusBadRequest, "exactly one of phone or email is required")
+	req.Channel = strings.ToLower(strings.TrimSpace(req.Channel))
+	channel, dest, cerr := portalChannelFor(req.Phone, req.Email, req.Channel)
+	if cerr != "" {
+		writeError(w, http.StatusBadRequest, cerr)
 		return
 	}
 	if !s.portalLimiter.Allow(site.TenantID.String()+":"+channel+":"+dest, portalRateLimit, portalRateWindow) {
@@ -234,9 +256,10 @@ func (s *server) portalRequestCode(w http.ResponseWriter, r *http.Request) {
 }
 
 type portalVerifyBody struct {
-	Phone string `json:"phone"`
-	Email string `json:"email"`
-	Code  string `json:"code"`
+	Phone   string `json:"phone"`
+	Email   string `json:"email"`
+	Code    string `json:"code"`
+	Channel string `json:"channel"` // optional explicit channel (SPEC-W81 B2)
 }
 
 // portalVerifyCode serves POST /public/sites/{slug}/portal/verify. Success
@@ -253,14 +276,10 @@ func (s *server) portalVerifyCode(w http.ResponseWriter, r *http.Request) {
 	req.Phone = strings.TrimSpace(req.Phone)
 	req.Email = strings.TrimSpace(req.Email)
 	req.Code = strings.TrimSpace(req.Code)
-	var channel, dest string
-	switch {
-	case req.Phone != "" && req.Email == "":
-		channel, dest = store.PortalChannelSMS, req.Phone
-	case req.Email != "" && req.Phone == "":
-		channel, dest = store.PortalChannelEmail, req.Email
-	default:
-		writeError(w, http.StatusBadRequest, "exactly one of phone or email is required")
+	req.Channel = strings.ToLower(strings.TrimSpace(req.Channel))
+	channel, dest, cerr := portalChannelFor(req.Phone, req.Email, req.Channel)
+	if cerr != "" {
+		writeError(w, http.StatusBadRequest, cerr)
 		return
 	}
 	if req.Code == "" {

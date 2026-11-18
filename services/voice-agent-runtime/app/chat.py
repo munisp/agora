@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import metrics
 from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .config import Settings
 from .dapr_client import DaprClient
@@ -213,6 +214,8 @@ class ChatService:
         if pin_verified_identity:
             pinned = session.mark_verified(pin_verified_identity)
             session.claimed_phone = session.claimed_phone or pinned
+            # SPEC-W81 A3: a channel-pinned identity IS a completed step-up.
+            metrics.stepup_verified("channel")
             log.info(
                 "channel-verified identity pinned",
                 conversation_id=session.conversation_id,

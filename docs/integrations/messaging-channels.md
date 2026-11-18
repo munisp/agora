@@ -113,6 +113,25 @@ as the request body to the gateway URL.
   no-show, waitlist claims, industry-pack messages) because all of them flow
   through the paced `NotifyPaced` → `notify` path with the tenant slug.
 
+## Portal OTP over WhatsApp (SPEC-W81)
+
+The customer-portal login code (`POST /public/sites/{slug}/portal/request`
+with `{"phone": "...", "channel": "whatsapp"}`) delivers as a **free-form**
+WhatsApp text via the notification-worker's worker-side Cloud API provider
+(`WHATSAPP_CLOUD_API_TOKEN` / `WHATSAPP_PHONE_NUMBER_ID`; `WHATSAPP_MOCK`
+stays a dev/test-only opt-in). **Pre-deploy gate (human/Meta action):**
+free-form session messages only reach the customer inside the 24h
+customer-service window opened by their last inbound message — a
+business-initiated OTP outside that window is rejected by Meta (error
+131047). Production deployments that need WhatsApp OTP for arbitrary (cold)
+customers must therefore submit and obtain a Meta-approved **authentication
+template** in the WhatsApp Business Manager and switch the delivery to a
+template send; until that approval exists, WhatsApp portal codes are only
+reliable for customers with an open 24h window (e.g. they just messaged the
+business). The channel router (`MESSAGING_CHANNELS` / `TENANT_CHANNEL_MAP`)
+semantics are unchanged — the explicit `whatsapp` portal channel is
+independent of the per-tenant `sms` provider override.
+
 ## Inbound media (WhatsApp → OCR)
 
 SPEC-W60: inbound WhatsApp **images and PDF documents** posted to
