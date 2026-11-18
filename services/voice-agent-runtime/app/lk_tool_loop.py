@@ -86,7 +86,9 @@ import re
 # "I have booked your visit", "your appointment is confirmed for Tuesday", "you're all set for 9:00"
 _BOOKED_CLAIM = re.compile(
     r"\b(i(?:'ve| have)? (?:now )?(?:booked|scheduled|reserved|confirmed)|(?:is|has been|now) (?:booked|scheduled|confirmed)"
-    r"|(?:booking|appointment|visit|call) (?:is |has been )?(?:confirmed|booked)|you(?:'re| are) (?:all )?(?:booked|set for))",
+    r"|(?:booking|appointment|visit|call) (?:is |has been )?(?:confirmed|booked)|you(?:'re| are) (?:all )?(?:booked|set for)"
+    # Nigerian Pidgin: "I don book am", "e don book", "I don confirm your appointment"
+    r"|\b(?:i|we|e|e?m) (?:don|done) (?:book|fix|confirm|schedule)\w*)",
     re.I)
 _BOOKING_WORDS = re.compile(r"appointment|visit|\bcall\b|consultation|clinic|session|slot|booking|\bbooked\b|scheduled|"
                             r"onboarding|registration", re.I)
