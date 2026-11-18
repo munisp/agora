@@ -79,6 +79,7 @@ CREATE UNIQUE INDEX uq_contacts_tenant_phone ON contacts (tenant_id, phone) WHER
 -- CONCURRENTLY. EXISTING deployments: converged by coder A's migration +
 -- ensureDDL mirror (W46-A), same pattern as uq_contacts_tenant_phone above.
 CREATE INDEX IF NOT EXISTS idx_contacts_name_trgm ON contacts USING gin (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_contacts_tenant_name_id ON contacts (tenant_id, name, id);
 
 -- Bookings. idempotency_key makes command retries safe.
 CREATE TABLE bookings (

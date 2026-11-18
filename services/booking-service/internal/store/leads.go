@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -309,40 +310,52 @@ func (s *Store) GetLead(ctx context.Context, tenantID, id uuid.UUID) (Lead, erro
 
 // ListLeads returns leads of a tenant, newest first, with optional
 // status / channel / campaign_id / created_at [from,to] filters (zero
-// values disable a filter).
-func (s *Store) ListLeads(ctx context.Context, tenantID uuid.UUID, status, channel string, campaignID *uuid.UUID, from, to *time.Time) ([]Lead, error) {
-	q := `SELECT ` + leadCols + ` FROM leads WHERE tenant_id=$1`
+// values disable a filter). SPEC-W83: q is an optional phone_e164 PREFIX
+// filter (leads carry no name/email — the phone is the searchable field);
+// it is trimmed and hard-capped at 32 chars as defence in depth (the API
+// layer validates the shape first).
+func (s *Store) ListLeads(ctx context.Context, tenantID uuid.UUID, status, channel string, campaignID *uuid.UUID, from, to *time.Time, q string) ([]Lead, error) {
+	phoneQ := strings.TrimSpace(q)
+	if len(phoneQ) > 32 {
+		phoneQ = phoneQ[:32]
+	}
+	sql := `SELECT ` + leadCols + ` FROM leads WHERE tenant_id=$1`
 	args := []any{tenantID}
 	n := 1
 	if status != "" {
 		n++
-		q += fmt.Sprintf(` AND status=$%d`, n)
+		sql += fmt.Sprintf(` AND status=$%d`, n)
 		args = append(args, status)
 	}
 	if channel != "" {
 		n++
-		q += fmt.Sprintf(` AND channel_of_first_touch=$%d`, n)
+		sql += fmt.Sprintf(` AND channel_of_first_touch=$%d`, n)
 		args = append(args, channel)
 	}
 	if campaignID != nil {
 		n++
-		q += fmt.Sprintf(` AND campaign_id=$%d`, n)
+		sql += fmt.Sprintf(` AND campaign_id=$%d`, n)
 		args = append(args, *campaignID)
 	}
 	if from != nil {
 		n++
-		q += fmt.Sprintf(` AND created_at >= $%d`, n)
+		sql += fmt.Sprintf(` AND created_at >= $%d`, n)
 		args = append(args, *from)
 	}
 	if to != nil {
 		n++
-		q += fmt.Sprintf(` AND created_at <= $%d`, n)
+		sql += fmt.Sprintf(` AND created_at <= $%d`, n)
 		args = append(args, *to)
 	}
-	q += ` ORDER BY created_at DESC LIMIT 500`
+	if phoneQ != "" {
+		n++
+		sql += fmt.Sprintf(` AND phone_e164 LIKE $%d || '%%'`, n)
+		args = append(args, phoneQ)
+	}
+	sql += ` ORDER BY created_at DESC LIMIT 500`
 	var out []Lead
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, q, args...)
+		rows, err := tx.Query(ctx, sql, args...)
 		if err != nil {
 			return err
 		}

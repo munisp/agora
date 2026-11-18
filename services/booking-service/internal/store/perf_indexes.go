@@ -63,6 +63,13 @@ var perfIndexDDL = []perfIndex{
 	// at store.New time).
 	{"contacts", `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contacts_name_trgm
 		ON contacts USING gin (name gin_trgm_ops)`},
+	// SPEC-W83: crm-360 search keyset pagination — ORDER BY (name, id)
+	// under the tenant scope.
+	{"contacts", `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contacts_tenant_name_id
+		ON contacts (tenant_id, name, id)`},
+	// SPEC-W83: leads phone-prefix search filter.
+	{"leads", `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_leads_tenant_phone
+		ON leads (tenant_id, phone_e164)`},
 }
 
 // trgmTables are the pg_trgm GIN targets bootstrapped here (contacts only);

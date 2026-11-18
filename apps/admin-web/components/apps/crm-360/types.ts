@@ -140,3 +140,15 @@ export function statusVariant(
       return "outline";
   }
 }
+
+/**
+ * SPEC-W83: read the keyset cursor sibling key off a /contacts/search
+ * response (the key is emitted only when another page exists). Pure —
+ * shared by the server page (SSR first page) and the client (page walks).
+ */
+export function readNextCursor(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) return null;
+  if (!("next_cursor" in data)) return null;
+  const v = (data as { next_cursor?: unknown }).next_cursor;
+  return typeof v === "string" && v !== "" ? v : null;
+}

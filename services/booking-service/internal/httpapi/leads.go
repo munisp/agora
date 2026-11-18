@@ -3,6 +3,7 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -97,7 +98,12 @@ func (s *server) createLead(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"lead": lead, "created": created})
 }
 
-// listLeads handles GET /v1/leads?status=&channel=&campaign_id=&from=&to=.
+// leadQueryRe bounds the SPEC-W83 phone-prefix search filter (leads carry
+// no name/email — the phone is the searchable field): digits with at most
+// one leading '+', 3-32 chars total ("++234"/"+"/"12" are all rejected).
+var leadQueryRe = regexp.MustCompile(`^(\+[0-9]{2,31}|[0-9]{3,32})$`)
+
+// listLeads handles GET /v1/leads?status=&channel=&campaign_id=&from=&to=&q=.
 func (s *server) listLeads(w http.ResponseWriter, r *http.Request) {
 	svc := s.leadsSvc(w)
 	if svc == nil {
@@ -142,7 +148,14 @@ func (s *server) listLeads(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := svc.Store.ListLeads(r.Context(), tenant.ID, status, channel, campaignID, from, to)
+	// SPEC-W83: optional phone_e164 prefix search; invalid shapes are a
+	// deterministic 400 (operator typos surface, like the enum filters).
+	leadQ := strings.TrimSpace(q.Get("q"))
+	if leadQ != "" && !leadQueryRe.MatchString(leadQ) {
+		writeError(w, http.StatusBadRequest, "invalid q filter")
+		return
+	}
+	rows, err := svc.Store.ListLeads(r.Context(), tenant.ID, status, channel, campaignID, from, to, leadQ)
 	if err != nil {
 		s.internal(w, err)
 		return

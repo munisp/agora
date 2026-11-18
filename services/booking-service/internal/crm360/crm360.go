@@ -54,6 +54,10 @@ import (
 // ErrInvalidInput marks deterministic validation failures (400 at the API).
 var ErrInvalidInput = errors.New("invalid crm input")
 
+// ErrInvalidCursor marks a malformed search pagination cursor (SPEC-W83 —
+// deterministic 400 at the API, never a silent first page).
+var ErrInvalidCursor = errors.New("invalid cursor")
+
 // ---------------------------------------------------------------------------
 // Tags
 // ---------------------------------------------------------------------------
