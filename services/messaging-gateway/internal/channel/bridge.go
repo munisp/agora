@@ -21,6 +21,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -139,7 +141,7 @@ func NewBridge(sites map[string]Site, convURL, voiceURL string, wa *provider.Wha
 		VoiceURL:        voiceURL,
 		WhatsApp:        wa,
 		Telegram:        tg,
-		HC:              &http.Client{Timeout: 10 * time.Second},
+		HC:              &http.Client{Timeout: bridgeHTTPTimeout()},
 		Log:             log,
 		done:            map[string]time.Time{},
 		doneExp:         doneHeap{},
@@ -442,4 +444,13 @@ func (b *Bridge) doJSON(ctx context.Context, method, u string, body, headers map
 		}
 	}
 	return nil
+}
+
+// bridgeHTTPTimeout is the per-request timeout for conversation/voice calls:
+// 10s, or BRIDGE_HTTP_TIMEOUT_S (an LLM reply on a busy GPU can take longer).
+func bridgeHTTPTimeout() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("BRIDGE_HTTP_TIMEOUT_S")); err == nil && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return 10 * time.Second
 }
