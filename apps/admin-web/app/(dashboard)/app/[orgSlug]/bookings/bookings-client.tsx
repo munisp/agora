@@ -239,6 +239,11 @@ export function BookingsClient({
             <Badge variant={connected ? "success" : "secondary"}>
               {connected ? "Live" : "Offline"}
             </Badge>
+            <Link href={`/app/${orgSlug}/bookings/calendar`}>
+              <Button variant="outline" size="sm">
+                Advisor calendar
+              </Button>
+            </Link>
             <Button
               variant="outline"
               size="sm"

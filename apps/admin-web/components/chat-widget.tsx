@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { MessageCircle, Send, X } from "lucide-react";
+import { Maximize2, MessageCircle, Minimize2, Send, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { ChatResponse } from "@/lib/types";
@@ -180,6 +180,17 @@ export function ChatWidget({
   accent?: string;
 }) {
   const [open, setOpen] = React.useState(false);
+  // Full screen: the chat fills the window (easier on a phone or for a long
+  // conversation); Collapse (or Escape) returns to the corner panel.
+  const [full, setFull] = React.useState(false);
+  React.useEffect(() => {
+    if (!full) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFull(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [full]);
   const [turns, setTurns] = React.useState<Turn[]>([]);
   const [draft, setDraft] = React.useState("");
   const [conversationId, setConversationId] = React.useState<string | undefined>();
@@ -276,9 +287,20 @@ export function ChatWidget({
   };
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col items-end gap-3">
+    <div
+      className={cn(
+        "fixed z-50 flex flex-col items-end gap-3",
+        open && full ? "inset-0" : "bottom-4 right-4",
+      )}
+    >
       {open ? (
-        <div className="flex h-96 w-80 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl">
+        <div
+          data-chat-panel={full ? "full" : "compact"}
+          className={cn(
+            "flex flex-col overflow-hidden bg-card shadow-xl",
+            full ? "h-full w-full" : "h-96 w-80 rounded-xl border border-border",
+          )}
+        >
           <div
             className="flex items-center justify-between px-4 py-3 text-white"
             style={{ backgroundColor: accent }}
@@ -289,17 +311,33 @@ export function ChatWidget({
                 Ask anything — I can book for you too
               </p>
             </div>
-            <button
-              onClick={() => setOpen(false)}
-              aria-label="Close chat"
-              className="rounded p-1 hover:bg-white/20 cursor-pointer"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setFull((f) => !f)}
+                aria-label={full ? "Collapse chat" : "Full screen chat"}
+                title={full ? "Collapse" : "Full screen"}
+                className="rounded p-1 hover:bg-white/20 cursor-pointer"
+              >
+                {full ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              </button>
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  setFull(false);
+                }}
+                aria-label="Close chat"
+                className="rounded p-1 hover:bg-white/20 cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
           <div
             ref={scrollRef}
-            className="min-h-0 flex-1 space-y-2 overflow-y-auto bg-muted/30 p-3"
+            className={cn(
+              "min-h-0 flex-1 space-y-2 overflow-y-auto bg-muted/30 p-3",
+              full && "px-[max(0.75rem,calc((100%-48rem)/2))] py-6",
+            )}
           >
             {turns.length === 0 ? (
               <p className="py-6 text-center text-xs text-muted-foreground">
@@ -330,7 +368,13 @@ export function ChatWidget({
               </div>
             ) : null}
           </div>
-          <form onSubmit={send} className="flex gap-2 border-t border-border p-2">
+          <form
+            onSubmit={send}
+            className={cn(
+              "flex gap-2 border-t border-border p-2",
+              full && "px-[max(0.5rem,calc((100%-48rem)/2))] py-3",
+            )}
+          >
             <input
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -349,6 +393,7 @@ export function ChatWidget({
           </form>
         </div>
       ) : null}
+      {open && full ? null : (
       <button
         onClick={() => setOpen((o) => !o)}
         aria-label={open ? "Close chat" : "Open chat"}
@@ -357,6 +402,7 @@ export function ChatWidget({
       >
         <MessageCircle className="h-5 w-5" />
       </button>
+      )}
     </div>
   );
 }
