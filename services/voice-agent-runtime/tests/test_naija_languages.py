@@ -347,3 +347,31 @@ def test_leaving_pidgin_needs_a_confident_detection():
     s, calls = _switcher({"language": "ig", "scores": {"ig": 0.8}}, start="ha")
     asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
     assert calls["switch"] == ["ig"]
+
+
+def test_auto_switch_off_keeps_the_chosen_language():
+    from app.config import load_settings
+    import os
+    os.environ["VOICE_AUTO_LANGUAGE_SWITCH"] = "0"
+    try:
+        assert load_settings().voice_auto_language_switch is False
+    finally:
+        del os.environ["VOICE_AUTO_LANGUAGE_SWITCH"]
+    # a switcher allowed only the chosen language never switches, even on a confident detection
+    from app.livekit_worker import SwitchingLanguageSTT
+
+    class Naija:
+        async def identify(self, *a, **k):
+            return {"language": "yo", "scores": {"yo": 0.99}}
+
+        async def transcribe_pcm(self, *a, **k):
+            return "x"
+
+    class Whisper:
+        async def transcribe_pcm(self, *a, **k):
+            return "hello"
+
+    switched = []
+    s = SwitchingLanguageSTT(Naija(), Whisper(), "en", ["en"], switched.append)
+    asyncio.run(s.transcribe_pcm(_pcm(4), sample_rate=16000))
+    assert switched == [] and s.language == "en"
