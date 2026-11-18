@@ -93,11 +93,28 @@ func PersonFromContact(name, email, phone string) PersonUpsert {
 	if email != "" {
 		p.Emails = &Emails{PrimaryEmail: email}
 	}
-	if phone != "" {
+	if phone != "" && plausiblePhone(phone) {
 		national, country, calling := NationalPhone(phone)
 		p.Phones = &Phones{PrimaryPhoneNumber: national, PrimaryPhoneCountryCode: country, PrimaryPhoneCallingCode: calling}
 	}
 	return p
+}
+
+// plausiblePhone: a Nigerian number NationalPhone recognises, or an international "+" number of 8-15 digits. Anything
+// else (a voice-call mishearing like "080065553108") is left off the Person: Twenty rejects the whole create with 400,
+// which dead-lettered the event and lost the contributor, task and call summary.
+func plausiblePhone(phone string) bool {
+	if _, country, _ := NationalPhone(phone); country != "" {
+		return true
+	}
+	raw := strings.TrimSpace(phone)
+	digits := 0
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	return strings.HasPrefix(raw, "+") && digits >= 8 && digits <= 15
 }
 
 // SplitName splits a display name into first/last at the first space.

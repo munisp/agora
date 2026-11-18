@@ -37,3 +37,15 @@ func TestTaskAndNoteUseBodyV2(t *testing.T) {
 		t.Fatalf("task json = %s", s)
 	}
 }
+
+func TestPersonFromContactDropsImplausiblePhones(t *testing.T) {
+	if p := PersonFromContact("Emika Okofol", "", "080065553108"); p.Phones != nil {
+		t.Errorf("misheard 12-digit number must be left off, got %+v", p.Phones)
+	}
+	if p := PersonFromContact("Ada Obi", "", "08065553108"); p.Phones == nil || p.Phones.PrimaryPhoneNumber != "8065553108" {
+		t.Errorf("valid Nigerian mobile must be kept, got %+v", p.Phones)
+	}
+	if p := PersonFromContact("Jane", "", "+15551234567"); p.Phones == nil {
+		t.Error("international + number must be kept")
+	}
+}
