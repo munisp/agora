@@ -12,6 +12,7 @@ roster for enrolled/cloned voices).
 |---|---|---|---|---|
 | `mms` | Meta MMS checkpoints (`facebook/mms-tts-{eng,pcm,yor,ibo,hau}`) | **CC-BY-NC 4.0 (NON-COMMERCIAL)** | **No, not by default** | Development / evaluation default — see below |
 | `cosyvoice` | CosyVoice-2 (`FunAudioLLM/CosyVoice`) | **Apache-2.0** | **Yes** | Recommended commercial-safe path for owned Nigerian voices |
+| `qwen3` | Qwen3-TTS 1.7B CustomVoice served by nari-qwen3-tts (`nari-labs/nari-qwen3-tts` serving stack; `QwenLM/Qwen3-TTS` model) | **Apache-2.0** (BOTH the serving-stack repo LICENSE and the Qwen3-TTS model repo — verified against the repo LICENSE files, see below) | **Yes** | GPU-tier English-primary option (**requires NVIDIA H100**; **NOT a Nigerian-language path**) |
 | `spitch` | Spitch hosted API | Vendor terms (hosted commercial API) | Yes, per Spitch terms | Operator contract governs |
 | `azure` | Azure AI Speech (e.g. `en-NG-EzinneNeural`, `en-NG-AbeoNeural`) | Microsoft Azure service terms | Yes, per Azure terms | Operator subscription governs |
 | `piper` | Piper (rhasspy/piper) | MIT (code); per-voice-model licenses vary | Check per voice model | Verify the specific voice model license before shipping |
@@ -69,6 +70,33 @@ Notes:
   (see `docs/VOICES.md`; enrollment is fail-closed on `consent_basis`).
 - Real CosyVoice-2 inference is GPU-gated; the sidecar ships mock-default
   (`COSYVOICE_MOCK=1`) like the xtts sidecar.
+
+## Qwen3-TTS (nari) — Apache-2.0 (commercial-safe, GPU-tier, English-primary)
+
+[nari-qwen3-tts](https://github.com/nari-labs/nari-qwen3-tts) — the serving
+stack Agora's `qwen3` provider talks to (SPEC-W74) — is released under the
+**Apache License, Version 2.0**, verified directly against the repo LICENSE
+file (<https://raw.githubusercontent.com/nari-labs/nari-qwen3-tts/main/LICENSE>):
+the file is the verbatim Apache-2.0 text ("Apache License, Version 2.0,
+January 2004, http://www.apache.org/licenses/"), and GitHub's license
+detection reports `apache-2.0`. The underlying model it serves,
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (`Qwen/Qwen3-TTS-12Hz-1.7B-
+CustomVoice`), is also released under **Apache-2.0** (verified against the
+QwenLM/Qwen3-TTS repo LICENSE). **Commercial use is permitted by both
+licenses.**
+
+Caveats that are deployment constraints, not license restrictions:
+
+- **Hardware: the published container requires an NVIDIA H100** (NVIDIA
+  Container Toolkit + CUDA 13.0-compatible driver). There is no CPU or
+  consumer-GPU path.
+- **Language: the engine has been tested with English as the primary
+  language ONLY.** It is **NOT a Nigerian-language path** — cosyvoice
+  remains the recommended commercial-safe path for owned Nigerian voices
+  (pcm/yo/ha/ig).
+- The model weights are pulled from Hugging Face at first boot (HF_TOKEN);
+  operators remain responsible for complying with the model's own Hugging
+  Face distribution terms at pull time.
 
 ## Spitch / Azure — hosted commercial APIs
 

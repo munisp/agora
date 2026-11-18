@@ -75,6 +75,48 @@ services:
       timeout: 5s
       retries: 3
 
+  # Qwen3-TTS GPU-tier TTS server (SPEC-W74 A1, nari-labs/nari-qwen3-tts,
+  # Apache-2.0). The published image IS the sidecar — the voice runtime's
+  # `qwen3` provider POSTs OpenAI-shaped /v1/audio/speech directly to it.
+  # OPT-IN profile "voice-gpu": bring up explicitly with
+  #   docker compose ... --profile voice --profile voice-gpu up
+  # HARDWARE: requires an NVIDIA H100 (single; SXM tested), NVIDIA Container
+  # Toolkit, and a CUDA 13.0-compatible driver — reserve the GPU with
+  # `deploy.resources.reservations.devices` (driver: nvidia, count: 1,
+  # capabilities: [gpu]) or run with `--gpus all` (commented below because
+  # the plain `voice` profile hosts have no GPU). The engine is tested with
+  # English as the PRIMARY language only — NOT a Nigerian-language path
+  # (docs/voices-sidecars.md). Model files + compiled kernels are cached in
+  # the qwen3-cache volume (HF_TOKEN required for the first model pull).
+  # NOT added to the voice-watchdog default targets (GPU-tier, opt-in).
+  qwen3-tts:
+    image: ghcr.io/nari-labs/nari-qwen3-tts:latest
+    profiles: ["voice-gpu"]
+    networks: [opendesk]
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # Serving profile: ttfa|balanced|throughput (see docs/voices-sidecars.md).
+      QWEN3_TTS_PROFILE: ${QWEN3_TTS_PROFILE:-balanced}
+      QWEN3_TTS_MODEL_CACHE_DIR: ${QWEN3_TTS_MODEL_CACHE_DIR:-/home/nari/.cache}
+    volumes:
+      - qwen3-cache:/home/nari/.cache
+    # GPU reservation (uncomment on the H100 host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      # /ready stays false until model load + CUDA-graph capture + warm-up
+      # complete — that is SLOW (minutes), hence the long start_period.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+
   # One-time piper voice download (idempotent).
   piper-init:
     build:
@@ -137,6 +179,9 @@ services:
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
       # SPEC-W72: CosyVoice-2 sidecar (cosyvoice TTS provider, A2).
       COSYVOICE_TTS_URL: ${COSYVOICE_TTS_URL:-http://cosyvoice-tts:5820}
+      # SPEC-W74 A1: Qwen3-TTS GPU-tier provider (opt-in "voice-gpu" profile;
+      # add "qwen3" to TTS_PROVIDER_CHAIN only on an H100 host).
+      QWEN3_TTS_URL: ${QWEN3_TTS_URL:-http://qwen3-tts:8000}
     depends_on:
       - daprd-voice
       - piper
@@ -184,6 +229,9 @@ services:
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
       # SPEC-W72: CosyVoice-2 sidecar (cosyvoice TTS provider, A2).
       COSYVOICE_TTS_URL: ${COSYVOICE_TTS_URL:-http://cosyvoice-tts:5820}
+      # SPEC-W74 A1: Qwen3-TTS GPU-tier provider (opt-in "voice-gpu" profile;
+      # add "qwen3" to TTS_PROVIDER_CHAIN only on an H100 host).
+      QWEN3_TTS_URL: ${QWEN3_TTS_URL:-http://qwen3-tts:8000}
     command: ["python", "-m", "app.livekit_worker", "start"]
     depends_on:
       - daprd-voice
@@ -245,6 +293,7 @@ volumes:
   piper-voices:
   whisper-models:
   cosyvoice-data:
+  qwen3-cache:
 
 networks:
   # Matches the declaration in infra/docker-compose.core.yml so the fragment

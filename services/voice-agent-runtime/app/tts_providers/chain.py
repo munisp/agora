@@ -25,6 +25,7 @@ CircuitBreaker (``tts_cb_failures`` consecutive failures -> open for
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, AsyncIterator, Callable
 
@@ -36,13 +37,14 @@ from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
 from .cosyvoice import CosyVoiceTTS
 from .mms import MmsTTS
+from .qwen3 import Qwen3TTS
 from .spitch import SpitchTTS
 from .xtts import XttsTTS
 
 log = get_logger("tts.chain")
 
 #: Providers buildable from Settings (chain names).
-PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "cosyvoice")
+PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3")
 
 
 class PiperProvider:
@@ -251,37 +253,104 @@ class FallbackTTS:
         return pcm
 
     async def stream_pcm(self, text: str) -> AsyncIterator[bytes]:
-        """Sentence-level streaming synthesis (SPEC-W46 P4).
+        """Sentence-level streaming synthesis (SPEC-W46 P4, SPEC-W74 A2).
 
         Full-utterance cache hits ship the whole buffer immediately;
         otherwise sentence chunks are synthesized through the chain in
         order, so the first audio frame is available after the FIRST
         chunk instead of the full utterance. Chunk PCM is concatenated
         into the full-utterance cache entry for the next repeat.
+
+        SPEC-W74 A2 (depth-1 prefetch, ported from the PiperTTS W71-P4
+        pattern in app/pipeline/tts.py with EXACT preserved semantics):
+        while chunk N is awaited/yielded, chunk N+1's synthesis is already
+        in flight as an asyncio task. Parts are appended in ORIGINAL chunk
+        order (iteration order, never completion order), empty-chunk
+        skipping is unchanged, and a prefetch failure raises at exactly
+        the iteration where the sequential path would have raised it. An
+        early exit (generator close) cancels the pending prefetch — and
+        retrieves a completed-but-unconsumed prefetch error — so no task
+        leaks and asyncio never logs "never retrieved".
+
+        First-chunk observability mirrors PiperTTS._mark_first_chunk:
+        ``voice_tts_first_chunk_seconds`` is observed on every stream path
+        (cache hit, single-chunk, multi-chunk).
         """
         text = text.strip()
         if not text:
             return
+        started = time.perf_counter()
+        first_yield = True
+
+        def _mark_first_chunk() -> None:
+            nonlocal first_yield
+            if first_yield:
+                first_yield = False
+                metrics.get_registry().tts_first_chunk.observe(
+                    time.perf_counter() - started
+                )
+
         cache_key = (f"{self.voice}|{self.language}", text, "pcm")
         cached = self._cache.get(cache_key)
         if cached is not None:
             metrics.session_tts()
+            _mark_first_chunk()
             yield cached
             return
         chunks = split_sentences(text)
         if len(chunks) <= 1:
             pcm = await self.synthesize_pcm(text)
             if pcm:
+                _mark_first_chunk()
                 yield pcm
             return
         parts: list[bytes] = []
-        for chunk in chunks:
-            pcm = await self.synthesize_pcm(chunk)
-            if pcm:
-                parts.append(pcm)
-                yield pcm
+        next_task: asyncio.Task | None = asyncio.ensure_future(
+            self.synthesize_pcm(chunks[0])
+        )
+        try:
+            for i in range(len(chunks)):
+                task, next_task = next_task, None
+                if i + 1 < len(chunks):
+                    # Prefetch depth 1: chunk i+1 synthesizes while chunk i
+                    # is awaited and yielded.
+                    next_task = asyncio.ensure_future(
+                        self.synthesize_pcm(chunks[i + 1])
+                    )
+                pcm = await task  # this chunk's error surfaces at ITS index
+                if pcm:
+                    parts.append(pcm)
+                    _mark_first_chunk()
+                    yield pcm
+        finally:
+            if next_task is not None:
+                # Early exit (consumer closed the generator): never leak the
+                # prefetch task; a completed-but-unconsumed prefetch error is
+                # retrieved so asyncio does not log "never retrieved".
+                if not next_task.done():
+                    next_task.cancel()
+                    # cancel() is only a REQUEST: if the coroutine raises on
+                    # its own before the CancelledError is delivered, the task
+                    # finishes with that exception (not cancelled) — retrieve
+                    # it via a done callback so it is never "never retrieved".
+                    next_task.add_done_callback(_retrieve_prefetch_error)
+                elif not next_task.cancelled():
+                    next_task.exception()
         if parts:
             self._cache.set(cache_key, b"".join(parts))
+
+
+def _retrieve_prefetch_error(task: asyncio.Task) -> None:
+    """Retrieve (discard) a cancelled-prefetch task's exception, if any.
+
+    Attached as a done callback when stream_pcm's early-exit path cancels a
+    still-pending prefetch: cancellation is only a request, and a coroutine
+    that raises before the CancelledError is delivered finishes with that
+    exception — retrieving it here keeps asyncio from logging "Task exception
+    was never retrieved" (SPEC-W74 A2).
+    """
+    if not task.cancelled():
+        task.exception()
 
 
 def build_provider(name: str, settings: Any) -> TTSProvider:
@@ -312,6 +381,14 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
         )
     if name == "cosyvoice":
         return CosyVoiceTTS(settings.cosyvoice_tts_url)
+    if name == "qwen3":
+        return Qwen3TTS(
+            settings.qwen3_tts_url,
+            model=settings.qwen3_tts_model,
+            default_voice=settings.qwen3_tts_voice,
+            default_language=settings.qwen3_tts_language,
+            timeout_s=settings.qwen3_tts_timeout_s,
+        )
     raise ValueError(f"unknown TTS provider: {name!r}")
 
 

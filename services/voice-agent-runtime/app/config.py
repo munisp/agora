@@ -311,6 +311,17 @@ class Settings:
     mms_tts_url: str = "http://mms-tts:5800"
     xtts_tts_url: str = "http://xtts-tts:5810"
     cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
+    # SPEC-W74 A1: Qwen3-TTS (nari-labs/nari-qwen3-tts) GPU-tier provider —
+    # the published image IS the sidecar (OpenAI-shaped /v1/audio/speech).
+    # Requires an NVIDIA H100; engine tested with English as the primary
+    # language ONLY (NOT a Nigerian-language path — see
+    # docs/voices-sidecars.md + docs/voice-licensing.md). Opt-in via
+    # TTS_PROVIDER_CHAIN + the "voice-gpu" compose profile.
+    qwen3_tts_url: str = "http://qwen3-tts:8000"
+    qwen3_tts_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    qwen3_tts_voice: str = "ryan"
+    qwen3_tts_language: str = "english"
+    qwen3_tts_timeout_s: float = 30.0
     azure_speech_key: str = ""
     azure_speech_region: str = ""
     spitch_api_key: str = ""
@@ -450,6 +461,11 @@ def load_settings() -> Settings:
         mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
+        qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
+        qwen3_tts_model=_env("QWEN3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+        qwen3_tts_voice=_env("QWEN3_TTS_VOICE", "ryan"),
+        qwen3_tts_language=_env("QWEN3_TTS_LANGUAGE", "english"),
+        qwen3_tts_timeout_s=_env_float("QWEN3_TTS_TIMEOUT_S", 30.0),
         azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
         spitch_api_key=_env("SPITCH_API_KEY", ""),

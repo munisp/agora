@@ -338,6 +338,29 @@ def test_voice_unknown_provider_still_rejected():
         assert errs, f"expected rejection for {voice!r}"
 
 
+def test_voice_qwen3_accepted():
+    # SPEC-W74: "qwen3" (nari Qwen3-TTS sidecar, GPU-tier) joined the
+    # provider enum — kept in sync with packs.go (TestValidateVoiceQwen3).
+    assert vp.validate_pack(_with_voice({"provider": "qwen3"})) == []
+    assert vp.validate_pack(_with_voice({
+        "provider": "qwen3", "voiceId": "ryan",
+    })) == []
+    assert vp.validate_pack(_with_voice({
+        "provider": "mms",
+        "languages": {"en": "qwen3:ryan", "pcm": "mms:pcm"},
+    })) == []
+
+
+def test_voice_qwen3_rejects_bad_shapes():
+    for voice in (
+        {"provider": "badprov"},
+        {"provider": "qwen3", "languages": {"en": "badprov:x"}},
+        {"provider": "mms", "languages": {"en": "qwen3:"}},
+    ):
+        errs = vp.validate_pack(_with_voice(voice))
+        assert errs, f"expected rejection for {voice!r}"
+
+
 def test_voice_rejects_bad_shapes():
     cases = [
         ("not-a-mapping", "voice must be a mapping"),

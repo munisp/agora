@@ -102,6 +102,32 @@ func TestValidateVoiceCosyvoice(t *testing.T) {
 	}
 }
 
+// SPEC-W74: "qwen3" (nari Qwen3-TTS sidecar, GPU-tier provider) joins the
+// voice provider enum. Kept in sync with scripts/validate_pack.py:
+// "qwen3:ryan" must pass both validators, "badprov:x" must fail both.
+func TestValidateVoiceQwen3(t *testing.T) {
+	good := []string{
+		`voice: {provider: qwen3}`,
+		`voice: {provider: qwen3, voiceId: ryan}`,
+		`voice: {provider: mms, languages: {en: "qwen3:ryan", pcm: "mms:pcm"}}`,
+	}
+	for i, body := range good {
+		if err := mustValidate(t, "\n"+body+"\n"); err != nil {
+			t.Fatalf("case %d: valid qwen3 voice rejected: %v", i, err)
+		}
+	}
+	bad := []string{
+		`voice: {provider: badprov}`,
+		`voice: {provider: qwen3, languages: {en: "badprov:x"}}`,
+		`voice: {provider: mms, languages: {en: "qwen3:"}}`,
+	}
+	for i, body := range bad {
+		if err := mustValidate(t, "\n"+body+"\n"); err == nil {
+			t.Fatalf("case %d: expected validation error", i)
+		}
+	}
+}
+
 func TestPacksWithoutVoiceStillValidate(t *testing.T) {
 	if err := mustValidate(t, ""); err != nil {
 		t.Fatalf("pack without voice must validate: %v", err)

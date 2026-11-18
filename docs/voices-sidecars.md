@@ -89,6 +89,59 @@ GET    /healthz     → {"status": "ok", "mock": true, "voices": N, ...}
 - CosyVoice-2 is **Apache-2.0 (commercial-safe)** — the recommended cloning
   path for owned Nigerian voices (vs. the non-commercial XTTS-v2 weights).
 
+## Qwen3-TTS GPU server (SPEC-W74 — nari-labs/nari-qwen3-tts)
+
+> **⚠ HARDWARE: the nari Qwen3-TTS container REQUIRES an NVIDIA H100**
+> (single H100 SXM tested; NVIDIA Container Toolkit + a CUDA 13.0-compatible
+> driver). There is NO CPU or consumer-GPU mode and no mock mode — do not add
+> `qwen3` to `TTS_PROVIDER_CHAIN` on a host without an H100.
+
+> **⚠ LANGUAGE: the engine has been tested with ENGLISH as the primary
+> language ONLY.** This is **NOT a Nigerian-language path** — pcm/yo/ha/ig
+> stay on `cosyvoice` (owned voices), `mms` (dev/eval), or `spitch` (hosted).
+
+[nari-qwen3-tts](https://github.com/nari-labs/nari-qwen3-tts) is a
+high-performance single-H100 serving implementation of Qwen3-TTS 1.7B
+CustomVoice (**Apache-2.0** — see `docs/voice-licensing.md`). The published
+image `ghcr.io/nari-labs/nari-qwen3-tts:latest` IS the sidecar — no shim:
+the voice runtime's `qwen3` provider talks to it directly with the
+OpenAI-shaped API:
+
+```
+POST /v1/audio/speech  {"model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                        "input": "...", "voice": "ryan", "language": "english",
+                        "response_format": "wav", "stream": false} → audio/wav
+GET  /health           liveness
+GET  /ready            readiness — held FALSE until model load + CUDA-graph
+                       capture + a warm-up TTS request have ALL completed
+                       (slow boot: minutes; the compose healthcheck uses
+                       start_period 600s for exactly this reason)
+GET  /v1/models        model catalog
+```
+
+Enable it (opt-in `voice-gpu` profile — service defined in
+`services/voice-agent-runtime/docker-compose.fragment.yml`):
+
+```bash
+docker compose -f docker-compose.yml \
+  -f services/voice-agent-runtime/docker-compose.fragment.yml \
+  --profile voice --profile voice-gpu up -d qwen3-tts
+# runtime: TTS_PROVIDER_CHAIN=qwen3,piper (QWEN3_TTS_URL default
+# http://qwen3-tts:8000 already wired in the fragment)
+```
+
+Serving profiles (`QWEN3_TTS_PROFILE`, default `balanced` in the fragment):
+`ttfa` (time-to-first-audio optimized, smaller initial codec chunks),
+`balanced` (default container profile), `throughput` (larger codec chunks +
+batches under load). Published numbers: sub-50 ms p95 TTFA at 10 RPS on one
+H100. `HF_TOKEN` is required for the first model pull; model files and
+compiled kernels are cached in the `qwen3-cache` volume
+(`QWEN3_TTS_MODEL_CACHE_DIR`, default `/home/nari/.cache`).
+
+Watchdog note for ops: `qwen3` is deliberately **not** a default target of
+`VOICE_WATCHDOG_TARGETS` in the voice-watchdog service (GPU-tier, opt-in —
+the probe semantics would need a warm H100 to be meaningful).
+
 ### curl examples
 
 ```bash

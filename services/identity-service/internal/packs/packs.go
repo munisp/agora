@@ -592,10 +592,10 @@ func validateMCPServers(servers []MCPServer) error {
 	return nil
 }
 
-var voiceLangValueRe = regexp.MustCompile(`^(piper|mms|xtts|azure|spitch|cosyvoice):[A-Za-z0-9_\-\.]+$`)
+var voiceLangValueRe = regexp.MustCompile(`^(piper|mms|xtts|azure|spitch|cosyvoice|qwen3):[A-Za-z0-9_\-\.]+$`)
 
 // validateVoice enforces the SPEC-W10 Part D voice block: optional mapping,
-// provider required and one of piper/mms/xtts/azure/spitch/cosyvoice,
+// provider required and one of piper/mms/xtts/azure/spitch/cosyvoice/qwen3,
 // optional voiceId string, and optional languages map of lang ->
 // "provider:voiceId". Kept in sync with scripts/validate_pack.py.
 func validateVoice(voice *VoiceDefaults) error {
@@ -603,9 +603,9 @@ func validateVoice(voice *VoiceDefaults) error {
 		return nil
 	}
 	switch voice.Provider {
-	case "piper", "mms", "xtts", "azure", "spitch", "cosyvoice":
+	case "piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3":
 	default:
-		return fmt.Errorf("voice.provider %q must be one of piper, mms, xtts, azure, spitch, cosyvoice", voice.Provider)
+		return fmt.Errorf("voice.provider %q must be one of piper, mms, xtts, azure, spitch, cosyvoice, qwen3", voice.Provider)
 	}
 	if strings.TrimSpace(voice.VoiceID) == "" && voice.VoiceID != "" {
 		return fmt.Errorf("voice.voiceId must be a non-empty string")
