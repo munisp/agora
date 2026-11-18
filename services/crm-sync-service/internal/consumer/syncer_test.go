@@ -230,7 +230,7 @@ func TestHandleBookingCreatedSyncsPersonAndTask(t *testing.T) {
 		}
 		if r.method == http.MethodPost && r.path == "/rest/tasks" {
 			sawTaskCreate = true
-			if r.body["title"] != "Haircut appointment at 2026-03-01T10:00:00Z" {
+			if r.body["title"] != "Haircut — Sun 1 Mar 2026, 11:00 am (Lagos)" {
 				t.Errorf("task title = %v", r.body["title"])
 			}
 			if r.body["dueAt"] != "2026-03-01T10:00:00Z" {

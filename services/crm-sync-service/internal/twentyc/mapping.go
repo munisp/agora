@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -112,13 +113,29 @@ func SplitName(name string) FullName {
 	return FullName{FirstName: first, LastName: strings.TrimSpace(last)}
 }
 
-// TaskTitle renders "{offering} appointment at {starts_at}" (SPEC-CRM §B).
-// starts_at is rendered RFC3339 in UTC for stable, parseable titles.
+// TaskTitle renders "{offering} — Tue 24 Nov 2026, 9:00 am (Lagos)" in the business's time zone (env
+// CRM_TASK_TIMEZONE, default Africa/Lagos). It used to be "… appointment at 2026-11-24T08:00:00Z": a 9 am Lagos visit
+// read as 08:00 to the business. Tasks are matched by booking id (syncmap) and the machine time lives in dueAt, so the
+// title is only for people.
 func TaskTitle(offering string, startsAt time.Time) string {
 	if offering == "" {
 		offering = "Appointment"
 	}
-	return fmt.Sprintf("%s appointment at %s", offering, startsAt.UTC().Format(time.RFC3339))
+	tzName := os.Getenv("CRM_TASK_TIMEZONE")
+	if tzName == "" {
+		tzName = "Africa/Lagos"
+	}
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		loc = time.UTC
+	}
+	local := startsAt.In(loc)
+	city := tzName
+	if i := strings.LastIndex(tzName, "/"); i >= 0 {
+		city = strings.ReplaceAll(tzName[i+1:], "_", " ")
+	}
+	return fmt.Sprintf("%s — %s, %s (%s)", offering, local.Format("Mon 2 Jan 2006"),
+		strings.ToLower(local.Format("3:04 PM")), city)
 }
 
 // RichText is Twenty's rich-text field (v1.x renamed tasks'/notes' "body" to "bodyV2"; the old field is rejected with
