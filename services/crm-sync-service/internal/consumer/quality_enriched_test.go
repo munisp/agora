@@ -213,7 +213,7 @@ func TestEnrichedNoteUsesNestedAvgSentiment(t *testing.T) {
 		Type:        events.TypeCallQualityEnriched,
 		Subject:     "acme-salon",
 		Time:        time.Now().UTC(),
-		TenantID:    uuid.NewString(),
+		TenantID:    callQualityTenant.String(), // matches the seeded tenant-scoped mapping (SPEC-W80 A1)
 		Data: map[string]any{
 			"conversationId": "conv-enriched-5",
 			"quality":        q,

@@ -16,14 +16,11 @@ import (
 // ErrNotFound mirrors store.ErrNotFound (404 mapping at the API).
 var ErrNotFound = errors.New("not found")
 
-// ReceiptIngestedEventType is the CloudEvent type emitted on
-// opendesk.booking.events for each receipt ingest (SPEC-W64 Scope 3; the
-// G-C pinned string is free of fraud-engine substring needles).
-// LOCAL const: the canonical const lives in internal/events/cloudevents.go
-// (single-owner A this wave) — defined locally so this package builds
-// before A's hunk lands; the integrator may switch to the shared const
-// (the type STRING is pinned by SPEC-W64 G-C either way).
-const ReceiptIngestedEventType = "com.opendesk.booking.ReceiptIngested"
+// SPEC-W78 A3: the ReceiptIngested CloudEvent type emitted for each receipt
+// ingest (SPEC-W64 Scope 3; the G-C pinned string is free of fraud-engine
+// substring needles) is referenced ONLY via the canonical
+// events.ReceiptIngestedEventType const — the W64-local duplicate const is
+// deleted.
 
 // Store persists the field_captures idempotency anchors and the
 // field_checkins history. Same packaging idiom as the W14
@@ -301,7 +298,7 @@ func (s *Store) AttachReceipt(ctx context.Context, tenantID uuid.UUID, clientID 
 				data["booking_id"] = bid.String()
 			}
 		}
-		payload, err := json.Marshal(events.New("booking-service", ReceiptIngestedEventType, "", tenantID.String(), data))
+		payload, err := json.Marshal(events.New("booking-service", events.ReceiptIngestedEventType, "", tenantID.String(), data))
 		if err != nil {
 			return fmt.Errorf("marshal receipt ingested event: %w", err)
 		}

@@ -387,7 +387,8 @@ function captureLead() {
     // `phone` rides along for backward compatibility with older readers of
     // the outbox/anchor payload; the server only consumes phone_e164.
     var payload = { name: name, phone_e164: phoneE164, phone: phoneE164, notes: notes };
-    // SPEC-W63: optional gazetteer place names (state/lga as selected).
+    // SPEC-W63/W78: optional gazetteer place names (state/lga/locality as
+    // selected; locality is optional and omitted when not picked).
     // R3 spike: fieldcapture decodes the payload with encoding/json into
     // LeadCapturePayload — unknown keys are ignored, and the raw payload is
     // preserved verbatim on the field_captures anchor row (JSONB) — so new
@@ -396,6 +397,7 @@ function captureLead() {
     var place = selectedPlace();
     if (place.state) payload.state = place.state;
     if (place.lga) payload.lga = place.lga;
+    if (place.locality) payload.locality = place.locality;
     return enqueue("lead_capture", payload, gps).then(function () {
       document.getElementById("f-name").value = "";
       document.getElementById("f-phone").value = "";
@@ -512,8 +514,9 @@ function captureReceipt() {
 
 /* ---------------- gazetteer (SPEC-W63 Scope C) ----------------
  *
- * Offline copy of the geo-service reference gazetteer (states + LGAs) in
- * the IDB `gazetteer` store; the snapshot ETag rides in `meta` under
+ * Offline copy of the geo-service reference gazetteer (states, LGAs and —
+ * since SPEC-W78 — localities) in the IDB `gazetteer` store; the snapshot
+ * ETag rides in `meta` under
  * GAZ_ETAG_KEY. The download runs ONLY in page context (boot + 'online'
  * event): the SW holds no tokens and cannot attach Authorization (TS-003),
  * and the snapshot must NOT be replayed from the SW cache (R4), hence
@@ -599,7 +602,9 @@ function syncGazetteer() {
         "x-tenant-slug": lsGet(LS.slug) || "",
       };
       if (cur && cur.v) headers["if-none-match"] = cur.v;
-      return fetch(cfg().geoBase.replace(/\/+$/, "") + "/v1/geo/gazetteer/snapshot?levels=state,lga", {
+      // SPEC-W78 B1: levels now include locality (rows land only after the
+      // GeoNames import; the picker degrades gracefully until then).
+      return fetch(cfg().geoBase.replace(/\/+$/, "") + "/v1/geo/gazetteer/snapshot?levels=state,lga,locality", {
         headers: headers,
         cache: "no-store", // R4: never serve the snapshot from cache layers
       }).then(function (res) {
@@ -622,9 +627,10 @@ function syncGazetteer() {
   });
 }
 
-/* Cascading State -> LGA selects on the lead form, populated from the IDB
- * gazetteer store. With no snapshot on this device the free-text fallback
- * shows instead — capture is NEVER blocked by a missing gazetteer. */
+/* Cascading State -> LGA -> Locality selects on the lead form, populated
+ * from the IDB gazetteer store (SPEC-W78 adds the third level). With no
+ * snapshot on this device the free-text fallback shows instead — capture
+ * is NEVER blocked by a missing gazetteer. */
 function renderPlaceFields() {
   var selWrap = $("f-place-selects"), txtWrap = $("f-place-freetext");
   if (!selWrap || !txtWrap) return;
@@ -656,7 +662,7 @@ function renderLgaOptions() {
   var code = stateSel.value, cur = lgaSel.value;
   lgaSel.length = 1;
   lgaSel.disabled = !code;
-  if (!code) return;
+  if (!code) { renderLocalityOptions(); return; }
   gazetteerChildren(code).then(function (lgas) {
     lgas.sort(byName).forEach(function (l) {
       var opt = document.createElement("option");
@@ -666,6 +672,43 @@ function renderLgaOptions() {
       lgaSel.appendChild(opt);
     });
     lgaSel.value = cur;
+    renderLocalityOptions();
+  });
+}
+
+/* SPEC-W78 B2: third cascade level. Localities are the children of the
+ * selected LGA via parent_code (mirrors renderLgaOptions exactly). The
+ * level is OPTIONAL — the empty option stays first and a state+lga with
+ * no locality remains valid. An LGA with no locality children yet (the
+ * snapshot predates the GeoNames import) renders disabled-with-hint,
+ * never broken. A state change reaches here via renderLgaOptions, so it
+ * resets BOTH lga and locality; an lga change resets locality. */
+function renderLocalityOptions() {
+  var lgaSel = $("f-lga"), locSel = $("f-locality");
+  if (!locSel) return;
+  var code = lgaSel.value, cur = locSel.value;
+  locSel.length = 1;
+  if (!code) {
+    locSel.options[0].textContent = "— Select an LGA first —";
+    locSel.disabled = true;
+    return;
+  }
+  gazetteerChildren(code).then(function (locs) {
+    if (!locs.length) {
+      locSel.options[0].textContent = "— No localities listed for this LGA —";
+      locSel.disabled = true;
+      return;
+    }
+    locs.sort(byName).forEach(function (l) {
+      var opt = document.createElement("option");
+      opt.value = l.code;
+      opt.textContent = l.name;
+      opt.setAttribute("data-name", l.name);
+      locSel.appendChild(opt);
+    });
+    locSel.options[0].textContent = "— Select locality (optional) —";
+    locSel.disabled = false;
+    locSel.value = cur;
   });
 }
 
@@ -682,6 +725,11 @@ function selectedPlace() {
     }
     if ($("f-lga").value && li >= 0) {
       out.lga = $("f-lga").options[li].getAttribute("data-name") || $("f-lga").options[li].textContent;
+    }
+    // SPEC-W78: locality is optional — included only when actually picked.
+    var locSel = $("f-locality"), oi = locSel ? locSel.selectedIndex : -1;
+    if (locSel && locSel.value && oi >= 0) {
+      out.locality = locSel.options[oi].getAttribute("data-name") || locSel.options[oi].textContent;
     }
   } else {
     var st = $("f-state-text").value.trim(), lg = $("f-lga-text").value.trim();
@@ -1074,6 +1122,7 @@ function boot() {
   $("btn-load-bookings").onclick = loadMyBookings;
   $("btn-sync").onclick = function () { flush().then(function () { toast(navigator.onLine ? "Sync attempted." : "Still offline."); }); };
   if ($("f-state")) $("f-state").onchange = renderLgaOptions;
+  if ($("f-lga")) $("f-lga").onchange = renderLocalityOptions; // SPEC-W78: lga change resets locality
 
   window.addEventListener("online", function () { renderNet(); flush(); syncGazetteer(); });
   window.addEventListener("offline", renderNet);

@@ -40,6 +40,7 @@ import {
   Siren,
   Inbox,
   Scale,
+  Fingerprint,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -102,10 +103,15 @@ const items: NavItem[] = [
   { segment: "incidents", label: "Incidents", icon: Siren },
   // SPEC-W45 ORPH O15: platform ops alerts read-back — admin/platform-admin.
   { segment: "ops-alerts", label: "Ops alerts", icon: Bell },
+  // SPEC-W77: cross-tenant doc-fraud registry stats (count-not-identity
+  // aggregates) — platform-admin ONLY (R2; stricter than ops-alerts); the
+  // page and the BFF both enforce the same gate server-side.
+  { segment: "ops-registry", label: "Registry", icon: Fingerprint },
   // SPEC-W32: civic case triage console — operational, owner/admin/staff.
   { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
-  { external: "crm", label: "CRM", icon: UsersRound },
+  // SPEC-W82 B1.1: labelled to tell the external Twenty console apart from the in-app CRM 360 console.
+  { external: "crm", label: "Twenty CRM (external)", icon: UsersRound },
   { external: "grafana", label: "Grafana", icon: LineChart },
   // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
   // roles (read-only); the page hides provision/enable/disable/config
@@ -204,6 +210,11 @@ export function OrgNav({
     // platform-admin only; the page redirects everyone else.
     if ("segment" in item && item.segment === "ops-alerts")
       return roles.includes("admin") || roles.includes("platform-admin");
+    // SPEC-W77 R2: registry stats are cross-tenant aggregates — strictly
+    // platform-admin (plain admin excluded); the page + BFF enforce the
+    // same gate server-side.
+    if ("segment" in item && item.segment === "ops-registry")
+      return roles.includes("platform-admin");
     return true;
   });
 

@@ -17,6 +17,9 @@ func TestDevicesFieldRoutesWiring(t *testing.T) {
 	r := NewRouter(Deps{Logger: zap.NewNop()})
 
 	// Tenant-scoped routes: tenant middleware applies (400 without header).
+	// SPEC-W80 B7: /internal/devices dropped from this list — it is now
+	// internAuth-guarded BEFORE the tenant middleware (see
+	// TestInternalDevicesInternAuth in w80_internal_auth_test.go).
 	for _, tc := range []struct {
 		method, path string
 	}{
@@ -24,7 +27,6 @@ func TestDevicesFieldRoutesWiring(t *testing.T) {
 		{http.MethodGet, "/v1/devices"},
 		{http.MethodDelete, "/v1/devices/some-token"},
 		{http.MethodPost, "/v1/field/capture"},
-		{http.MethodGet, "/internal/devices"},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
 		rec := httptest.NewRecorder()

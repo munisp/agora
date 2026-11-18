@@ -481,8 +481,13 @@ async def test_pcm_detection_routes_mms_voice_with_chain_fallback(monkeypatch):
     assert pcm == PCM
     # mms pinned first with the qualified voice id; piper fell back with ITS
     # default voice after the mms failure.
-    assert mms.calls == [("sannu, how you dey?", "pcm", "")]
-    assert piper.calls == [("sannu, how you dey?", settings.piper_voice, "")]
+    # SPEC-W82 A4.2 (sanctioned update): the worker now SETS
+    # FallbackTTS.language from the session active language at bootstrap
+    # (closing the chain.py:113 never-set gap), so the chain hands providers
+    # "en" here instead of the pre-W82 never-set "".
+    assert chain.language == "en"
+    assert mms.calls == [("sannu, how you dey?", "pcm", "en")]
+    assert piper.calls == [("sannu, how you dey?", settings.piper_voice, "en")]
     rendered = metrics.get_registry().render()
     assert 'tts_provider_failures_total{provider="mms"} 1' in rendered
 

@@ -149,6 +149,58 @@ func (w *WhatsApp) SendTemplate(ctx context.Context, msg WhatsAppTemplateMessage
 	return w.sendLive(ctx, msg)
 }
 
+// SendText delivers one FREE-FORM text message (Cloud API type "text") —
+// SPEC-W81 B3, the portal login-code (OTP) delivery path.
+//
+// META CAVEAT (pre-deploy gate, human/Meta action): a free-form session
+// message only delivers inside the 24h customer-service window opened by
+// the customer's last inbound message. A business-initiated OTP outside
+// that window is rejected by Meta (e.g. error 131047 "message failed to
+// send because more than 24 hours have passed since the customer last
+// replied"); production OTP-over-WhatsApp therefore needs a Meta-approved
+// AUTHENTICATION template (template send via SendTemplate) — approval is a
+// Meta Business Manager process outside this repo. Until it is in place,
+// WhatsApp portal codes only reach customers with an open 24h window
+// (e.g. they just messaged the business). Mirrored in
+// docs/integrations/messaging-channels.md.
+func (w *WhatsApp) SendText(ctx context.Context, to, text string) (int, []byte, error) {
+	if to == "" {
+		return 0, nil, &Error{StatusCode: 0, Body: "whatsapp: recipient phone is required"}
+	}
+	if text == "" {
+		return 0, nil, &Error{StatusCode: 0, Body: "whatsapp: text body is required"}
+	}
+	if w.Mock {
+		if to == "mock-fail" {
+			return 0, nil, &Error{StatusCode: http.StatusInternalServerError, Body: "whatsapp mock: send failed (phone mock-fail)"}
+		}
+		return http.StatusOK, mockBody(to, "text", text), nil
+	}
+	if !w.Configured() {
+		return 0, nil, &Error{StatusCode: 0, Body: "whatsapp not configured: set WHATSAPP_CLOUD_API_TOKEN and WHATSAPP_PHONE_NUMBER_ID (or WHATSAPP_MOCK=1)"}
+	}
+	payload := map[string]any{
+		"messaging_product": "whatsapp",
+		"to":                to,
+		"type":              "text",
+		"text":              map[string]any{"preview_url": false, "body": text},
+	}
+	return w.Client.send(ctx, func(ctx context.Context) (*http.Request, error) {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal whatsapp payload: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			w.BaseURL+"/"+w.PhoneNumberID+"/messages", strings.NewReader(string(body)))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+w.Token)
+		return req, nil
+	})
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic mock (WHATSAPP_MOCK=1 explicit opt-in; default OFF, SIM-011)
 // ---------------------------------------------------------------------------
@@ -162,13 +214,19 @@ func (w *WhatsApp) sendMock(msg WhatsAppTemplateMessage) (int, []byte, error) {
 	if msg.To == "mock-fail" {
 		return 0, nil, &Error{StatusCode: http.StatusInternalServerError, Body: "whatsapp mock: send failed (phone mock-fail)"}
 	}
-	sum := sha256.Sum256([]byte(msg.To + "|" + msg.Template + "|" + msg.Language))
+	return http.StatusOK, mockBody(msg.To, msg.Template, msg.Language), nil
+}
+
+// mockBody is the deterministic mock Cloud API success body: a fake wamid
+// derived from the parts (never logged plaintext beyond the hash).
+func mockBody(to, kind, discriminator string) []byte {
+	sum := sha256.Sum256([]byte(to + "|" + kind + "|" + discriminator))
 	body, _ := json.Marshal(map[string]any{
 		"messaging_product": "whatsapp",
-		"contacts":          []map[string]string{{"input": msg.To, "wa_id": strings.TrimPrefix(msg.To, "+")}},
+		"contacts":          []map[string]string{{"input": to, "wa_id": strings.TrimPrefix(to, "+")}},
 		"messages":          []map[string]string{{"id": "wamid.mock-" + hex.EncodeToString(sum[:])[:24]}},
 	})
-	return http.StatusOK, body, nil
+	return body
 }
 
 // ---------------------------------------------------------------------------

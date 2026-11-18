@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +127,86 @@ func TestGetContactByChannel(t *testing.T) {
 	// Tenant isolation: same phone under another tenant does not resolve.
 	if _, err := st.GetContactByChannel(ctx, uuid.New(), PortalChannelSMS, "+15550777"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-tenant contact visible, err = %v", err)
+	}
+}
+
+// SPEC-W81 B1: the portal_tokens channel CHECK gains 'whatsapp' (purely
+// additive). A whatsapp token round-trips, contact resolution uses the
+// phone column, and unknown channels remain rejected by the constraint.
+func TestPortalTokenWhatsAppChannel(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	tenantID := uuid.New()
+
+	contact := Contact{TenantID: tenantID, Name: "Wale", Phone: "+2348012345678"}
+	if err := st.CreateContact(ctx, &contact); err != nil {
+		t.Fatal(err)
+	}
+
+	tok := PortalToken{
+		TenantID: tenantID, ContactID: contact.ID, TokenHash: "hash-wa",
+		Channel: PortalChannelWhatsApp, ExpiresAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := st.CreatePortalToken(ctx, &tok); err != nil {
+		t.Fatalf("create whatsapp token: %v", err)
+	}
+	got, err := st.GetActivePortalToken(ctx, tenantID, contact.ID)
+	if err != nil {
+		t.Fatalf("get active: %v", err)
+	}
+	if got.ID != tok.ID || got.Channel != PortalChannelWhatsApp {
+		t.Fatalf("unexpected token %+v", got)
+	}
+
+	// WhatsApp is phone-addressed: contact resolution uses the phone column.
+	byWA, err := st.GetContactByChannel(ctx, tenantID, PortalChannelWhatsApp, "+2348012345678")
+	if err != nil || byWA.ID != contact.ID {
+		t.Fatalf("whatsapp contact lookup: %v %+v", err, byWA)
+	}
+
+	// The enum is widened, not dropped: unknown channels still fail the CHECK.
+	bad := PortalToken{
+		TenantID: tenantID, ContactID: contact.ID, TokenHash: "hash-bad",
+		Channel: "pigeon", ExpiresAt: time.Now().Add(10 * time.Minute),
+	}
+	if err := st.CreatePortalToken(ctx, &bad); err == nil {
+		t.Fatal("channel pigeon accepted — CHECK constraint must reject it")
+	}
+}
+
+// SPEC-W81 B1: the bootstrap DDL is re-runnable (W32 DROP + re-ADD idiom)
+// and the widened enum holds after re-runs; sms/email are unaffected.
+func TestPortalTokensChannelConstraintIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := st.ensurePortalTokensTable(ctx); err != nil {
+			t.Fatalf("bootstrap re-run %d: %v", i+1, err)
+		}
+	}
+
+	// The named constraint exists once, with the full enum.
+	var def string
+	if err := st.pool.QueryRow(ctx,
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		 WHERE conrelid = 'portal_tokens'::regclass AND conname = 'portal_tokens_channel_check'`).Scan(&def); err != nil {
+		t.Fatalf("constraint lookup: %v", err)
+	}
+	for _, ch := range []string{"sms", "email", "whatsapp"} {
+		if !strings.Contains(def, ch) {
+			t.Fatalf("constraint %q missing channel %q", def, ch)
+		}
+	}
+
+	// All three channels insert after the re-runs.
+	for _, ch := range []string{PortalChannelSMS, PortalChannelEmail, PortalChannelWhatsApp} {
+		tok := PortalToken{
+			TenantID: uuid.New(), ContactID: uuid.New(), TokenHash: "h-" + ch,
+			Channel: ch, ExpiresAt: time.Now().Add(10 * time.Minute),
+		}
+		if err := st.CreatePortalToken(ctx, &tok); err != nil {
+			t.Fatalf("create %s token after re-run: %v", ch, err)
+		}
 	}
 }

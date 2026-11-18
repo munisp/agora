@@ -76,6 +76,15 @@ type Bridge struct {
 	ConversationURL string
 	VoiceURL        string
 
+	// VoiceInternalToken (MESSAGING_VOICE_INTERNAL_TOKEN) authorizes the
+	// WhatsApp channel-identity pin on POST /voice/chat (SPEC-W81 C1): the
+	// runtime pins the provider-verified wa_id as the session's verified
+	// phone ONLY when X-Internal-Token matches its
+	// VOICE_ADMIN_INTERNAL_TOKEN (K15(c) soft gate — fail-closed when
+	// unset). Empty here = the header is not sent and the peer ignores the
+	// pin (fail-safe, no spoofing surface opened).
+	VoiceInternalToken string
+
 	WhatsApp *provider.WhatsApp
 	Telegram *provider.Telegram
 
@@ -371,10 +380,25 @@ func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg I
 		"conversation_id": convID,
 		"channel":         msg.Channel,
 	}
+	// SPEC-W81 C1: pin the provider-verified WhatsApp sender identity
+	// (wa_id — the E.164 From) so the runtime can treat the session as
+	// verified (K15(c)). The runtime honors channel_identity ONLY with a
+	// valid X-Internal-Token (VOICE_ADMIN_INTERNAL_TOKEN server-side);
+	// without the token env the header is omitted and the peer ignores the
+	// pin (fail-safe). Telegram is NOT pinned here: its From is a chat_id,
+	// not a phone — the runtime's normalize_phone would reject it anyway,
+	// so the request would be unchanged except for a warning log.
+	var headers map[string]string
+	if msg.Channel == "whatsapp" {
+		body["channel_identity"] = msg.From
+		if b.VoiceInternalToken != "" {
+			headers = map[string]string{"X-Internal-Token": b.VoiceInternalToken}
+		}
+	}
 	var resp struct {
 		Reply string `json:"reply"`
 	}
-	if err := b.doJSON(ctx, http.MethodPost, b.VoiceURL+"/voice/chat", body, nil, &resp); err != nil {
+	if err := b.doJSON(ctx, http.MethodPost, b.VoiceURL+"/voice/chat", body, headers, &resp); err != nil {
 		return "", fmt.Errorf("voice chat: %w", err)
 	}
 	if resp.Reply == "" {

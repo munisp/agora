@@ -68,9 +68,16 @@ class BookingSpendClient:
     body so a minor shape drift degrades gracefully instead of zeroing spend.
     """
 
-    def __init__(self, dapr: DaprClient, app_id: str = "booking"):
+    def __init__(
+        self, dapr: DaprClient, app_id: str = "booking", internal_token: str = ""
+    ):
         self._dapr = dapr
         self._app_id = app_id
+        # SPEC-W80 A11/B7: booking-service's internAuth gate on
+        # /internal/campaigns/{id}/spend-sum requires X-Internal-Token ==
+        # BOOKING_INTERNAL_TOKEN (empty = header not sent; peer fails
+        # closed and the spend join degrades to "unavailable", MW-H1).
+        self._internal_token = internal_token
 
     async def spend_sum(
         self, campaign_id: str, date_from: date | None, date_to: date | None
@@ -80,11 +87,17 @@ class BookingSpendClient:
             params["from"] = date_from.isoformat()
         if date_to is not None:
             params["to"] = date_to.isoformat()
+        headers = (
+            {"X-Internal-Token": self._internal_token}
+            if self._internal_token
+            else None
+        )
         try:
             payload = await self._dapr.invoke(
                 self._app_id,
                 f"internal/campaigns/{campaign_id}/spend-sum",
                 params=params,
+                headers=headers,
                 http_method="GET",
             )
         except Exception as exc:  # noqa: BLE001 — daprd/booking outage or 404

@@ -22,15 +22,25 @@ import (
 	"go.uber.org/zap"
 )
 
+// WhatsAppSender is the worker-side WhatsApp provider seam for free-form
+// text sends (provider.WhatsApp satisfies it; tests inject fakes).
+type WhatsAppSender interface {
+	SendText(ctx context.Context, to, text string) (int, []byte, error)
+}
+
 // BindingSender delivers notification commands through the Dapr output
 // bindings (bindings-smtp / bindings-twilio) — the same path the workflow
-// activities use.
+// activities use. SPEC-W81 B3 adds the whatsapp channel, delivered directly
+// through the worker-side WhatsApp Cloud API provider (free-form text —
+// see the 24h-window / authentication-template caveat on
+// provider.WhatsApp.SendText).
 type BindingSender struct {
 	Dapr          *daprc.Client
 	SMTPBinding   string
 	TwilioBinding string
 	SMTPFrom      string
 	TwilioFrom    string
+	WhatsApp      WhatsAppSender // nil → whatsapp sends fail closed
 }
 
 // Send implements Sender.
@@ -47,6 +57,12 @@ func (s BindingSender) Send(ctx context.Context, channel, destination, subject, 
 			"toNumber":   destination,
 			"fromNumber": s.TwilioFrom,
 		})
+	case "whatsapp":
+		if s.WhatsApp == nil {
+			return fmt.Errorf("whatsapp channel: no provider wired (fail closed)")
+		}
+		_, _, err := s.WhatsApp.SendText(ctx, destination, text)
+		return err
 	default:
 		return fmt.Errorf("unknown channel %q", channel)
 	}
@@ -220,12 +236,15 @@ func (c *Consumer) pacedSend(ctx context.Context, env envelope) error {
 
 // sendPortalCode delivers the 6-digit portal login code. The plaintext code
 // exists only in this payload and in the message to the customer — the
-// booking DB holds its SHA-256 hash.
+// booking DB holds its SHA-256 hash. SPEC-W81 B3: the whatsapp channel
+// (purely additive) rides the worker-side WhatsApp provider as a free-form
+// text (24h customer-service window caveat — see provider.WhatsApp.SendText
+// and docs/integrations/messaging-channels.md).
 func (c *Consumer) sendPortalCode(ctx context.Context, data map[string]any) error {
 	channel, _ := data["channel"].(string)
 	dest, _ := data["destination"].(string)
 	code, _ := data["code"].(string)
-	if (channel != "sms" && channel != "email") || dest == "" || code == "" {
+	if (channel != "sms" && channel != "email" && channel != "whatsapp") || dest == "" || code == "" {
 		return fmt.Errorf("SendPortalCode: invalid payload (channel=%q)", channel)
 	}
 	text := fmt.Sprintf("Your OpenDesk booking portal code is %s. It is valid for 10 minutes.", code)

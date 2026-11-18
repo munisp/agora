@@ -21,6 +21,10 @@ Routes:
                                  SPEC-W67 cross-tenant registry upsert
                                  (same fn as the live path), keyset
                                  pagination + dry_run (SPEC-W67).
+  GET  /v1/internal/ocr/registry-stats
+                                 internauth platform-aggregate registry
+                                 stats (count-not-identity, SPEC-W77 R1)
+                                 for the platform-admin registry page.
   GET  /healthz
   GET  /metrics
   GET  /dapr/subscribe           Dapr programmatic subscriptions (W58 P3):
@@ -1272,6 +1276,47 @@ async def backfill_document_registry(request: Request, deps: AppState = Depends(
         "skipped": skipped,
         "next_cursor": next_cursor,
     }
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W77: platform-admin registry stats (count-not-identity, R1). The
+# W67 registry was alerts-only with NO read surface; this is the platform
+# aggregate read feeding the admin-web ops-registry page. The response is
+# EXACTLY {enabled, keys_total, memberships_total, multi_tenant_keys,
+# alerted_memberships, ttl_days, reconcile_minutes} — aggregate integers
+# + posture echo ONLY: NO registry_key, NO tenant_id, NO per-key rows,
+# NO timestamps of individual keys (zero-disclosure preserved).
+#
+# Internauth ONLY (the backfill endpoint's auth block EXACTLY):
+# X-Internal-Token vs OCR_INTERNAL_TOKEN, constant-time; unset => 503,
+# missing/wrong => 401. Platform scope — NO tenant resolution. The route
+# stays in-cluster (NOT in the APISIX api-ocr route); the admin-web BFF
+# injects the token server-side (SPEC-W77 R3).
+#
+# R4: unlike the backfill endpoint, an unset OCR_REGISTRY_HMAC_SECRET is
+# NOT an error here — the response is 200 with enabled:false + zero
+# counts (registry_stats returns the disabled payload without touching
+# the tables).
+# ---------------------------------------------------------------------------
+@app.get("/v1/internal/ocr/registry-stats")
+async def registry_stats_endpoint(request: Request, deps: AppState = Depends(get_state)):
+    if not settings.internal_token:
+        log.error("registry_stats.unconfigured", msg="OCR_INTERNAL_TOKEN unset (fail closed)")
+        raise HTTPException(
+            status_code=503,
+            detail="internal auth not configured (OCR_INTERNAL_TOKEN unset)",
+        )
+    token = request.headers.get("x-internal-token")
+    if token is None or not hmac.compare_digest(token, settings.internal_token):
+        raise HTTPException(status_code=401, detail="invalid internal token")
+    stats = await registry.registry_stats(
+        deps.db,
+        secret_set=bool(settings.ocr_registry_hmac_secret),
+        ttl_days=int(settings.registry_ttl_days),
+        reconcile_minutes=int(settings.registry_reconcile_minutes),
+    )
+    log.info("registry_stats.served", **stats)
+    return stats
 
 
 # ---------------------------------------------------------------------------

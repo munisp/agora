@@ -59,6 +59,68 @@ func TestProcessSendPortalCodeEmail(t *testing.T) {
 	}
 }
 
+// SPEC-W81 B3: channel whatsapp is accepted and delivered through the
+// sender seam exactly like sms/email (validation widened, not altered).
+func TestProcessSendPortalCodeWhatsApp(t *testing.T) {
+	sender := &fakeSender{}
+	c := &Consumer{sender: sender, log: zap.NewNop()}
+	raw := []byte(`{"specversion":"1.0","id":"e-wa","type":"com.opendesk.notifications.SendPortalCode","subject":"acme","tenantid":"t-1","data":{"channel":"whatsapp","destination":"+2348012345678","code":"482910","contact_name":"Wale","site_slug":"acme-books","expires_in_minutes":10}}`)
+	if err := c.Process(context.Background(), raw); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(sender.sent))
+	}
+	msg := sender.sent[0]
+	if msg.channel != "whatsapp" || msg.dest != "+2348012345678" {
+		t.Fatalf("msg = %+v", msg)
+	}
+	if !strings.Contains(msg.text, "482910") {
+		t.Fatalf("text %q does not contain the code", msg.text)
+	}
+}
+
+// fakeWhatsAppSender records SendText calls (fakeSender idiom).
+type fakeWhatsAppSender struct {
+	calls    int
+	to, text string
+	err      error
+}
+
+func (f *fakeWhatsAppSender) SendText(_ context.Context, to, text string) (int, []byte, error) {
+	if f.err != nil {
+		return 0, nil, f.err
+	}
+	f.calls++
+	f.to, f.text = to, text
+	return 200, []byte(`{"messages":[{"id":"wamid.mock-1"}]}`), nil
+}
+
+// SPEC-W81 B3: BindingSender routes whatsapp through the worker-side
+// WhatsApp provider seam (free-form text), fails closed when none is
+// wired, and propagates provider failures — sms/email are unaffected.
+func TestBindingSenderWhatsApp(t *testing.T) {
+	wa := &fakeWhatsAppSender{}
+	s := BindingSender{WhatsApp: wa}
+	if err := s.Send(context.Background(), "whatsapp", "+2348012345678", "", "Your OpenDesk booking portal code is 482910."); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if wa.calls != 1 || wa.to != "+2348012345678" || !strings.Contains(wa.text, "482910") {
+		t.Fatalf("whatsapp send = %+v", wa)
+	}
+
+	// Fail closed without a provider — never a silent drop.
+	if err := (BindingSender{}).Send(context.Background(), "whatsapp", "+2348012345678", "", "x"); err == nil {
+		t.Fatal("whatsapp without a provider must fail closed")
+	}
+
+	// Provider failures propagate (the consumer logs + acks upstream).
+	wa.err = errors.New("meta down")
+	if err := s.Send(context.Background(), "whatsapp", "+2348012345678", "", "x"); err == nil {
+		t.Fatal("provider failure must propagate")
+	}
+}
+
 func TestProcessRejectsInvalidPayload(t *testing.T) {
 	sender := &fakeSender{}
 	c := &Consumer{sender: sender, log: zap.NewNop()}

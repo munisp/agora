@@ -15,6 +15,13 @@ implements the livekit-agents 0.10.x-pragmatic equivalent of 1.6's
 - **Every path**: a hard timeout (env TOOL_TIMEOUT_SECONDS, default 4s) on
   every Dapr tool call; a timeout (or failure) resolves to a spoken-apology
   payload instead of dead air — TimeoutError never escapes into the pipeline.
+- **SPEC-W81 A1**: the OTP verification tools (request_verification_code /
+  verify_caller_code) do a booking-portal HTTP round-trip whose client
+  timeout is HTTP_TIMEOUT_S (15s default) — longer than the 4s global tool
+  timeout. They are covered by a PER-TOOL timeout override
+  (AsyncToolRunner timeout_overrides, wired from
+  VOICE_VERIFICATION_TOOL_TIMEOUT_S, default 20s) so the global default is
+  untouched and a slow-but-working portal still answers with a real result.
 """
 
 from __future__ import annotations
@@ -28,6 +35,11 @@ from .logging import get_logger
 
 log = get_logger("async-tools")
 
+# SPEC-W81 A1: the caller-verification (OTP) tools, exposed on the LiveKit
+# voice path too. They run through the slow-tool machinery (filler ack +
+# hard timeout) because they do a portal HTTP round-trip.
+VERIFICATION_TOOLS = frozenset({"request_verification_code", "verify_caller_code"})
+
 # Tools whose Dapr round-trip can be felt by the caller. Everything else
 # (get_business_info from the cached tenant context, request_human) answers
 # fast enough to skip the filler.
@@ -40,6 +52,7 @@ SLOW_TOOLS = frozenset(
         "lookup_appointment",
         "knowledge_search",
     }
+    | VERIFICATION_TOOLS
 )
 
 DEFAULT_ACK = "Let me check that for you…"
@@ -112,11 +125,29 @@ def apology_payload(status: str = "timeout") -> dict[str, Any]:
 
 
 class AsyncToolRunner:
-    """Timeout + filler + metrics wrapper shared by the chat and voice paths."""
+    """Timeout + filler + metrics wrapper shared by the chat and voice paths.
 
-    def __init__(self, *, timeout_s: float = 4.0, ack_grace_ms: int = 400) -> None:
+    SPEC-W81 A1: ``timeout_overrides`` maps individual tool names to a
+    longer hard timeout (the OTP verification tools whose portal round-trip
+    can outlast the global default). The global ``timeout_s`` is unchanged
+    for every tool not listed — overrides are strictly opt-in, never a
+    silent global change.
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout_s: float = 4.0,
+        ack_grace_ms: int = 400,
+        timeout_overrides: dict[str, float] | None = None,
+    ) -> None:
         self._timeout_s = timeout_s
         self._grace_s = ack_grace_ms / 1000.0
+        self._timeout_overrides = dict(timeout_overrides or {})
+
+    def timeout_for(self, tool: str) -> float:
+        """Effective hard timeout for ``tool`` (per-tool override, else global)."""
+        return self._timeout_overrides.get(tool, self._timeout_s)
 
     @staticmethod
     def _result_label(result: Any) -> str:
@@ -154,9 +185,10 @@ class AsyncToolRunner:
 
             ack_task = asyncio.create_task(_delayed_ack())
 
+        timeout_s = self.timeout_for(tool)
         started = time.perf_counter()
         try:
-            result = await asyncio.wait_for(call(), timeout=self._timeout_s)
+            result = await asyncio.wait_for(call(), timeout=timeout_s)
             registry.tool_calls.inc(tool=tool, result=self._result_label(result))
             return result
         except TimeoutError:
@@ -164,7 +196,7 @@ class AsyncToolRunner:
             log.warning(
                 "tool call timed out",
                 tool=tool,
-                timeout_s=self._timeout_s,
+                timeout_s=timeout_s,
             )
             return apology_payload("timeout")
         except Exception as exc:  # noqa: BLE001 - never raise into the pipeline

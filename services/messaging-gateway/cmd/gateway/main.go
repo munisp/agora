@@ -107,12 +107,17 @@ func run() error {
 	// app-ids conversation/voice/booking.
 	convBase, voiceBase := channel.ResolveBases(cfg.ConversationURL, cfg.VoiceRuntimeURL, cfg.DaprHTTPPort, cfg.DaprSidecar)
 	bookingBase := httpapi.ResolveIncidentBase(cfg.BookingURL, cfg.DaprHTTPPort, cfg.DaprSidecar)
-	srv.Bridge = channel.NewBridge(siteMap, convBase, voiceBase, srv.WhatsApp, srv.Telegram, logger)
+	bridge := channel.NewBridge(siteMap, convBase, voiceBase, srv.WhatsApp, srv.Telegram, logger)
+	// SPEC-W81 C1: K2 machine token for the WhatsApp channel_identity pin
+	// on /voice/chat (mirrors the voice block's VOICE_ADMIN_INTERNAL_TOKEN).
+	bridge.VoiceInternalToken = cfg.VoiceInternalToken
+	srv.Bridge = bridge
 	logger.Info("inbound bridge bases resolved",
 		zap.String("conversation_base", convBase),
 		zap.String("voice_base", voiceBase),
 		zap.String("booking_base", bookingBase),
-		zap.Bool("dapr_sidecar", cfg.DaprSidecar))
+		zap.Bool("dapr_sidecar", cfg.DaprSidecar),
+		zap.Bool("voice_internal_token", cfg.VoiceInternalToken != ""))
 	srv.Upstreams = []httpapi.UpstreamCheck{
 		{Name: "conversation", Base: convBase},
 		{Name: "voice", Base: voiceBase},

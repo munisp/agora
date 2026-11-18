@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 from .multilang import parse_tts_voice_map, parse_voice_map
+from .pronunciation import parse_tenant_lexicons
 from .sip import parse_tenant_phone_map
 
 
@@ -28,6 +30,140 @@ def _env_float(key: str, default: float) -> float:
         return float(os.environ.get(key, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W81 A2: risk-tiered step-up policy (VOICE_TOOL_TIERS).
+#
+# The tier map FORMALIZES the existing sensitivity ladder — it never weakens
+# it. Tier semantics (enforced by ToolLayer.dispatch, app/tools.py):
+# - tier 0 (LOW):    no identity required;
+# - tier 1 (MEDIUM): confirmed (read-back) OR verified phone required;
+# - tier 2 (HIGH):   VERIFIED phone required (OTP via the booking portal or
+#                    a provider-pinned channel identity — K15(c) semantics).
+#
+# The default below IS the locked ladder: built-in tools keep exactly the
+# gates they already enforce inside their methods (book_appointment:
+# read-back confirmation; lookup/reschedule/cancel: _require_verified).
+# verify_caller_code sits in tier 0 deliberately: submitting a code IS the
+# step-up mechanism — gating it would deadlock the flow, and a wrong code
+# simply fails (rate-limited portal-side).
+# capture_location is tier 1 but stays a deliberately UNGATED emergency lane
+# (its method never refuses; SPEC-W11 Part C) — the tier is documentary for
+# built-ins at their floor; the loader below REJECTS lowering a built-in
+# under its default (fail-closed, never weakening).
+# Pack plugin tools are not listed: they default to tier 1 (confirmed
+# identity) and are overridable per tool name via the same JSON.
+# ---------------------------------------------------------------------------
+TIER_LOW = 0
+TIER_MEDIUM = 1
+TIER_HIGH = 2
+
+DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
+    # Tier 0 — LOW (no identity)
+    "get_business_info": TIER_LOW,
+    "get_availability": TIER_LOW,
+    "request_human": TIER_LOW,
+    "navigate_to_page": TIER_LOW,
+    "highlight_element": TIER_LOW,
+    "prefill_booking": TIER_LOW,
+    "request_verification_code": TIER_LOW,
+    "verify_caller_code": TIER_LOW,
+    # Tier 1 — MEDIUM (confirmed identity)
+    "book_appointment": TIER_MEDIUM,
+    "capture_location": TIER_MEDIUM,
+    # Tier 2 — HIGH (verified)
+    "lookup_appointment": TIER_HIGH,
+    "reschedule_appointment": TIER_HIGH,
+    "cancel_appointment": TIER_HIGH,
+}
+
+# Plugin tool names follow the PluginTool naming rule (app/plugin_tools.py)
+# — the same regex also covers the mcp__{server}__{tool} namespace.
+_TOOL_TIER_NAME_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+
+
+def parse_voice_tool_tiers(raw: str) -> dict[str, int]:
+    """Parse the VOICE_TOOL_TIERS JSON env into the effective tier map.
+
+    FAIL-CLOSED (startup refused with ValueError) on:
+    - malformed JSON or a non-object document;
+    - a key that is neither a built-in tool name nor a syntactically valid
+      plugin tool name (a typo must not silently create a dead entry);
+    - a tier value outside 0|1|2 (bools rejected — they are ints in Python);
+    - an override that LOWERS a built-in below its default tier (the map
+      formalizes the ladder; it never weakens it).
+
+    Overrides may RAISE a built-in's tier (dispatch then hard-gates it at
+    the raised tier) and set tiers for pack plugin tools (default tier 1).
+    """
+    tiers = dict(DEFAULT_VOICE_TOOL_TIERS)
+    raw = (raw or "").strip()
+    if not raw:
+        return tiers
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"VOICE_TOOL_TIERS: invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("VOICE_TOOL_TIERS: expected a JSON object {tool: tier}")
+    for name, tier in data.items():
+        if not isinstance(name, str) or not _TOOL_TIER_NAME_RE.fullmatch(name):
+            raise ValueError(f"VOICE_TOOL_TIERS: invalid tool name {name!r}")
+        if isinstance(tier, bool) or not isinstance(tier, int) or tier not in (
+            TIER_LOW,
+            TIER_MEDIUM,
+            TIER_HIGH,
+        ):
+            raise ValueError(
+                f"VOICE_TOOL_TIERS: {name!r} tier must be 0, 1 or 2 (got {tier!r})"
+            )
+        floor = DEFAULT_VOICE_TOOL_TIERS.get(name)
+        if floor is not None and tier < floor:
+            raise ValueError(
+                f"VOICE_TOOL_TIERS: {name!r} tier {tier} would weaken the "
+                f"built-in floor {floor} — refused (never weakening)"
+            )
+        tiers[name] = tier
+    return tiers
+
+
+def parse_stt_hints(raw: str) -> dict[str, dict[str, str]]:
+    """Parse the VOICE_STT_HINTS JSON env (SPEC-W82 A4.4).
+
+    Shape: ``{"<site-or-tenant-slug>": {"language": "yo", "initial_prompt":
+    "Acme Clinic, braids, Dr. Adaeze"}}``. Tolerant: malformed JSON,
+    non-object entries, invalid language codes and empty prompts drop out
+    with a warning — STT hints are best-effort and NEVER fatal (fail-open
+    when unset is today's behavior).
+    """
+    from .multilang import normalize_language
+
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Deliberately NOT fail-closed (contrast VOICE_TOOL_TIERS): a bad
+        # hint degrades to no hints, never a refused boot.
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for slug, hint in data.items():
+        if not isinstance(hint, dict):
+            continue
+        entry: dict[str, str] = {}
+        lang = normalize_language(str(hint.get("language") or ""))
+        if lang:
+            entry["language"] = lang
+        prompt = str(hint.get("initial_prompt") or "").strip()
+        if prompt:
+            entry["initial_prompt"] = prompt
+        if entry:
+            out[str(slug).strip()] = entry
+    return out
 
 
 @dataclass(frozen=True)
@@ -231,6 +367,14 @@ class Settings:
     # grace window before the filler ack line is spoken (fast calls skip it).
     tool_timeout_s: float = 4.0
     tool_ack_grace_ms: int = 400
+    # SPEC-W81 A1: per-tool timeout override for the OTP verification tools
+    # ONLY (request_verification_code / verify_caller_code), applied by the
+    # LiveKit worker's AsyncToolRunner — the global tool_timeout_s is NOT
+    # changed. These tools do an HTTP round-trip to the booking portal whose
+    # client timeout is http_timeout_s (15s default); the override must
+    # exceed that so a slow-but-working portal answers with a real result
+    # instead of the runner's generic timeout apology.
+    verification_tool_timeout_s: float = 20.0
 
     # Phone-confirmation policy
     phone_confirmation_required: bool = True
@@ -245,6 +389,13 @@ class Settings:
     # and the mutating tools refuse — no fallback to self-asserted numbers.
     booking_url: str = ""
     voice_booking_internal_token: str = ""
+
+    # SPEC-W81 A2: effective risk-tier map (VOICE_TOOL_TIERS JSON merged
+    # over DEFAULT_VOICE_TOOL_TIERS; see parse_voice_tool_tiers — invalid
+    # config fails startup closed). ToolLayer.dispatch is the single choke
+    # point consulting it; pack plugin tools absent from the map default to
+    # tier 1.
+    voice_tool_tiers: dict = field(default_factory=lambda: dict(DEFAULT_VOICE_TOOL_TIERS))
 
     # SPEC-W45 K15(d) + verifier F-2: /voice-admin/* staff paths
     # (brand-voice enrollment, escalation staff-token mint) are guarded by
@@ -364,6 +515,34 @@ class Settings:
     # surface; only turn on for eval runs.
     eval_persona_override: bool = False
 
+    # SPEC-W82 A1: Nigerian-language translation layer (app/translation.py).
+    # voice_translate_enabled (VOICE_TRANSLATE_ENABLED, default "1") gates
+    # the inbound pcm/yo/ig/ha->en and outbound en->lang turn seams;
+    # translate_mock (TRANSLATE_MOCK, default "1" — the sanctioned
+    # XTTS_MOCK/COSYVOICE_MOCK/MMS_MOCK dev pattern) forces the MockTranslator
+    # regardless of translate_provider. "http" posts to translate_url with an
+    # optional Bearer key under a hard translate_timeout_s budget and FAILS
+    # OPEN (original text + voice_translation_errors_total) on any error.
+    voice_translate_enabled: bool = True
+    translate_provider: str = "mock"
+    translate_mock: bool = True
+    translate_url: str = ""
+    translate_api_key: str = ""
+    translate_timeout_s: float = 3.0
+
+    # SPEC-W82 A4.4: per-tenant STT hints (VOICE_STT_HINTS JSON keyed by
+    # site/tenant slug) — a forced whisper language= and an initial_prompt
+    # seeded with tenant/offering/staff names, plumbed into WhisperSTTNode.
+    # Empty = today's behavior (auto-detect, no prompt). Parsed by
+    # parse_stt_hints above; bad JSON degrades to no hints (fail-open).
+    voice_stt_hints: dict = field(default_factory=dict)
+
+    # SPEC-W82 A4.5: per-tenant pronunciation lexicon
+    # (VOICE_PRONUNCIATION_LEXICON JSON keyed by tenant slug, "*" = global),
+    # merged under the pack voice.lexicon block by
+    # app/pronunciation.merge_lexicons and applied pre-TTS.
+    voice_pronunciation_lexicon: dict = field(default_factory=dict)
+
     extra: dict = field(default_factory=dict)
 
     @property
@@ -479,10 +658,14 @@ def load_settings() -> Settings:
         load_threshold=float(os.environ.get("LOAD_THRESHOLD", "0.7")),
         tool_timeout_s=float(os.environ.get("TOOL_TIMEOUT_SECONDS", "4")),
         tool_ack_grace_ms=_env_int("TOOL_ACK_GRACE_MS", 400),
+        verification_tool_timeout_s=_env_float("VOICE_VERIFICATION_TOOL_TIMEOUT_S", 20.0),
         phone_confirmation_required=_env("PHONE_CONFIRMATION_REQUIRED", "true").lower()
         not in ("0", "false", "no"),
         booking_url=_env("BOOKING_URL", ""),
         voice_booking_internal_token=_env("VOICE_BOOKING_INTERNAL_TOKEN", ""),
+        # SPEC-W81 A2: raises ValueError on invalid config — startup fails
+        # closed rather than running with a weakened/typo'd tier map.
+        voice_tool_tiers=parse_voice_tool_tiers(_env("VOICE_TOOL_TIERS", "")),
         voice_admin_internal_token=_env("VOICE_ADMIN_INTERNAL_TOKEN", ""),
         phone_hash_salt=_env("PHONE_HASH_SALT", ""),
         copilot_mode=_env("COPILOT_MODE", "true").lower() not in ("0", "false", "no"),
@@ -526,4 +709,18 @@ def load_settings() -> Settings:
         tts_cb_cooldown_s=float(os.environ.get("TTS_CB_COOLDOWN_S", "60")),
         eval_persona_override=_env("EVAL_PERSONA_OVERRIDE", "false").lower()
         in ("1", "true", "yes", "on"),
+        # SPEC-W82 A1 translation layer (fail-open everywhere; mock default).
+        voice_translate_enabled=_env("VOICE_TRANSLATE_ENABLED", "1").lower()
+        not in ("0", "false", "no"),
+        translate_provider=_env("TRANSLATE_PROVIDER", "mock"),
+        translate_mock=_env("TRANSLATE_MOCK", "1").lower()
+        not in ("0", "false", "no"),
+        translate_url=_env("TRANSLATE_URL", ""),
+        translate_api_key=_env("TRANSLATE_API_KEY", ""),
+        translate_timeout_s=_env_float("TRANSLATE_TIMEOUT_S", 3.0),
+        # SPEC-W82 A4.4/A4.5 per-tenant hints + pronunciation lexicon.
+        voice_stt_hints=parse_stt_hints(_env("VOICE_STT_HINTS", "")),
+        voice_pronunciation_lexicon=parse_tenant_lexicons(
+            _env("VOICE_PRONUNCIATION_LEXICON", "")
+        ),
     )

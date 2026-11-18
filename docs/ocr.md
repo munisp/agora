@@ -455,6 +455,7 @@ protection had lapsed). Per-run Prometheus counters:
 `opendesk_ocr_registry_ttl_drift_repaired_total` (ops interpretation:
 `docs/runbooks/security.md` §7.4; retention rationale:
 `docs/compliance-ndpa.md`).
+The reconciler's age-keyed `DELETE ... WHERE first_seen < $1` is supported by the additive index `idx_ocr_registry_tenants_first_seen` on `ocr_doc_registry_tenants (first_seen)` (IF NOT EXISTS, mirrored in both DDL copies; SPEC-W79).
 
 ### `POST /v1/internal/ocr/backfill-document-registry`
 
@@ -499,6 +500,17 @@ Contract:
   burst** for pre-existing cross-tenant duplicates (S4 alerts; MERGE dedup
   keeps re-runs free). Operator sequence + rotation:
   `docs/runbooks/security.md` §7.
+
+### `GET /v1/internal/ocr/registry-stats`
+
+Platform-scoped registry posture, aggregate COUNTS ONLY (SPEC-W77 R1
+count-not-identity) — response shape exactly `{enabled, keys_total,
+memberships_total, multi_tenant_keys, alerted_memberships, ttl_days,
+reconcile_minutes}`; no registry keys, tenant ids, hashes, or per-key rows.
+Auth: the same `X-Internal-Token` fail-closed idiom as backfill; when the
+HMAC secret is unset it answers 200 with `enabled:false` + zeros. Read
+surface: admin-web `/app/<org>/ops-registry` (platform-admin only) via the
+BFF `/api/ocr-registry/registry-stats` direct exception — runbook §7.4.
 
 ## Receipt OCR via fieldcapture
 

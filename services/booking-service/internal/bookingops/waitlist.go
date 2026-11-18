@@ -119,6 +119,9 @@ type ClaimInput struct {
 	// SPEC-CRM §C3: same industry/policy plumbing as Create.
 	Industry      string
 	BookingPolicy *BookingPolicy
+	// WorkflowName (SPEC-W80 B13): pack-declared Temporal workflow, same
+	// plumbing as CreateInput.WorkflowName. Empty = legacy saga routing.
+	WorkflowName string
 }
 
 // ClaimWaitlist turns a waitlist entry into a real booking, transactionally
@@ -156,7 +159,11 @@ func (s *Service) ClaimWaitlist(ctx context.Context, in ClaimInput) (store.Booki
 		Name:     entry.ContactName,
 		Phone:    entry.ContactPhone,
 	}
-	if err := s.Store.CreateContact(ctx, &contact); err != nil {
+	// SPEC-W80 B1: match-or-create on (tenant_id, phone) instead of a blind
+	// insert — a claimant who is ALREADY a contact (the common case: they
+	// booked before) hit uq_contacts_tenant_phone and the claim 500'd.
+	// Same UpsertBookingContact seam as the regular create path (ops.go).
+	if _, err := s.Store.UpsertBookingContact(ctx, in.TenantID, &contact); err != nil {
 		return store.Booking{}, store.WaitlistEntry{}, err
 	}
 
@@ -191,6 +198,7 @@ func (s *Service) ClaimWaitlist(ctx context.Context, in ClaimInput) (store.Booki
 		TenantSlug:    in.TenantSlug,
 		Industry:      in.Industry,
 		BookingPolicy: in.BookingPolicy,
+		WorkflowName:  in.WorkflowName,
 	})
 	return booking, claimed, nil
 }
@@ -213,6 +221,9 @@ type ClaimByTokenInput struct {
 	// SPEC-CRM §C3: same industry/policy plumbing as Create.
 	Industry      string
 	BookingPolicy *BookingPolicy
+	// WorkflowName (SPEC-W80 B13): pack-declared Temporal workflow, same
+	// plumbing as ClaimInput.WorkflowName. Empty = legacy saga routing.
+	WorkflowName string
 }
 
 // ClaimByTokenResult is the outcome of ClaimWaitlistByToken. Replayed is
@@ -274,6 +285,7 @@ func (s *Service) ClaimWaitlistByToken(ctx context.Context, in ClaimByTokenInput
 		StartsAt:      start,
 		Industry:      in.Industry,
 		BookingPolicy: in.BookingPolicy,
+		WorkflowName:  in.WorkflowName,
 	})
 	if err != nil {
 		// A concurrent claim with the same token flipped the entry between

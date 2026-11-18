@@ -11,10 +11,14 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Portal token channels (Wave 5 #7 customer self-service portal).
+// Portal token channels (Wave 5 #7 customer self-service portal; SPEC-W81
+// B1 adds whatsapp — purely additive, the sms/email semantics are
+// unchanged). WhatsApp is phone-addressed: GetContactByChannel resolves it
+// through the phone column exactly like sms.
 const (
-	PortalChannelSMS   = "sms"
-	PortalChannelEmail = "email"
+	PortalChannelSMS      = "sms"
+	PortalChannelEmail    = "email"
+	PortalChannelWhatsApp = "whatsapp"
 )
 
 // PortalToken mirrors booking.portal_tokens: a one-time 6-digit login code
@@ -55,12 +59,20 @@ CREATE TABLE IF NOT EXISTS portal_tokens (
     tenant_id   UUID NOT NULL,
     contact_id  UUID NOT NULL,
     token_hash  TEXT NOT NULL,
-    channel     TEXT NOT NULL CHECK (channel IN ('sms','email')),
+    channel     TEXT NOT NULL CHECK (channel IN ('sms','email','whatsapp')),
     attempts    INTEGER NOT NULL DEFAULT 0,
     expires_at  TIMESTAMPTZ NOT NULL,
     consumed_at TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- SPEC-W81 B1 (W32 idiom): CREATE TABLE IF NOT EXISTS never alters an
+-- existing table, so pre-W81 databases keep the ('sms','email') CHECK.
+-- Drop + re-add the full enum; idempotent on fresh and upgraded databases
+-- (Postgres auto-names the inline CHECK portal_tokens_channel_check, so the
+-- DROP also covers the freshly-created constraint).
+ALTER TABLE portal_tokens DROP CONSTRAINT IF EXISTS portal_tokens_channel_check;
+ALTER TABLE portal_tokens ADD CONSTRAINT portal_tokens_channel_check
+    CHECK (channel IN ('sms','email','whatsapp'));
 CREATE INDEX IF NOT EXISTS idx_portal_tokens_contact ON portal_tokens (tenant_id, contact_id, created_at DESC);
 ALTER TABLE portal_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE portal_tokens FORCE ROW LEVEL SECURITY;

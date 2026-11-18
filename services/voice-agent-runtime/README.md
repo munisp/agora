@@ -165,6 +165,14 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `AGENTS_CACHE_TTL_S` | `30` | SPEC-W38: in-process cache TTL for agent resolve/get lookups (hits and misses) |
 | `PIPER_VOICE_MAP` | `{}` | multilingual (Wave 5 #3): JSON `{"es":"es_ES-sharvard-medium"}` language→piper voice; unmapped languages fall back to `PIPER_VOICE` |
 | `EVAL_PERSONA_OVERRIDE` | `false` | A/B eval (Wave 5 #8): allow `persona_override` on POST /voice/chat — eval only, prompt-injection surface otherwise |
+| `VOICE_TRANSLATE_ENABLED` | `1` | W82: master gate for the pcm/yo/ig/ha→en inbound and en→caller-language outbound translation seams (`0` = strict no-op) |
+| `TRANSLATE_PROVIDER` | `mock` | W82: translation provider (`mock` echoes; `http` POSTs `{text,source_lang,target_lang}` to `TRANSLATE_URL`) |
+| `TRANSLATE_MOCK` | `1` | W82: sanctioned mock-default (XTTS_MOCK/COSYVOICE_MOCK/MMS_MOCK pattern) — when `1`, MockTranslator is used regardless of `TRANSLATE_PROVIDER` |
+| `TRANSLATE_URL` | _(unset)_ | W82: HTTP translator endpoint; all errors fail open to the original text + `voice_translation_errors_total` |
+| `TRANSLATE_API_KEY` | _(unset)_ | W82: optional Bearer key for the HTTP translator |
+| `TRANSLATE_TIMEOUT_S` | `3.0` | W82: hard per-call translation timeout (fail-open on expiry) |
+| `VOICE_STT_HINTS` | `{}` | W82 A4.4: per-tenant STT hints JSON `{"<slug>": {"language": "yo", "initial_prompt": "Acme Clinic, ..."}}` — forced whisper language + decode prompt; empty = auto-detect as before (fail-open) |
+| `VOICE_PRONUNCIATION_LEXICON` | `{}` | W82 A4.5: per-tenant pronunciation lexicon JSON keyed by tenant slug (`"*"` = global); pack `voice.lexicon` overrides it per term; azure → SSML `<phoneme>`, other providers → respell substitution |
 | `HF_HOME` | `/models` (image) | whisper model cache dir |
 
 ## Local models

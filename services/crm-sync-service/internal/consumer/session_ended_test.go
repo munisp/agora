@@ -19,6 +19,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// callQualityTenant is the FIXED tenant of the call-quality note tests:
+// SPEC-W80 A1 routes person resolution through the TENANT-SCOPED sync_map
+// natural keys, so the harness seeds the mappings under this tenant and
+// the event constructors stamp it.
+var callQualityTenant = uuid.MustParse("11111111-2222-3333-4444-555555555555")
+
 // callQualityStub answers Twenty lookups: people are found only for phones in
 // personByPhone; note/noteTarget creates are recorded.
 type callQualityStub struct {
@@ -83,6 +89,19 @@ func newCallQualitySyncer(t *testing.T, personByPhone map[string]string) (*Synce
 	srv := httptest.NewServer(stub.handler())
 	t.Cleanup(srv.Close)
 	fm := newFakeMap()
+	// SPEC-W80 A1: person resolution is sync_map-driven (contact_identity
+	// natural keys), no longer the stub's global /rest/people find. Seed
+	// each entry as the tenant's natural key ("phone:" for numbers,
+	// "email:" for addresses — mirrors ContactIdentityKeys).
+	for k, id := range personByPhone {
+		key := "phone:" + strings.TrimSpace(k)
+		if strings.Contains(k, "@") {
+			key = "email:" + strings.ToLower(strings.TrimSpace(k))
+		}
+		if err := fm.Put(context.Background(), syncmap.KindContactIdentity, key, id, &callQualityTenant); err != nil {
+			t.Fatal(err)
+		}
+	}
 	s := &Syncer{
 		Twenty:  twentyc.New(srv.URL, "k", 0),
 		Map:     fm,
@@ -100,7 +119,7 @@ func sessionEndedEvent(data map[string]any) events.CloudEvent {
 		Type:        events.TypeSessionEnded,
 		Subject:     "acme-salon",
 		Time:        time.Now().UTC(),
-		TenantID:    uuid.NewString(),
+		TenantID:    callQualityTenant.String(),
 		Data:        data,
 	}
 }

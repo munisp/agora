@@ -125,6 +125,8 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant_status   ON tickets (tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant_assignee ON tickets (tenant_id, assignee_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant_created  ON tickets (tenant_id, created_at DESC);
+-- SPEC-W80 B8: CRM-360 contact rollup (idempotent bootstrap DDL).
+CREATE INDEX IF NOT EXISTS idx_tickets_tenant_contact  ON tickets (tenant_id, contact_id);
 ALTER TABLE tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tickets FORCE ROW LEVEL SECURITY;
 DO $$
@@ -221,6 +223,24 @@ var ErrInvalidTransition = errors.New("invalid ticket state for this action")
 // expired or already used (404 at the public API — one honest answer, no
 // existence/state leak).
 var ErrCSATInvalid = errors.New("invalid or expired csat token")
+
+// ContactExists reports whether the contact exists IN-TENANT (SPEC-W80
+// B9): CreateTicket validates a caller-supplied contact_id against the
+// booking-core contacts table so a dangling (or cross-tenant) id is a 404
+// instead of an orphaned ticket row. RLS tenant_isolation applies inside
+// withTenant, so a cross-tenant id is indistinguishable from missing.
+func (s *Store) ContactExists(ctx context.Context, tenantID, contactID uuid.UUID) error {
+	return s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		var one int
+		err := tx.QueryRow(ctx,
+			`SELECT 1 FROM contacts WHERE tenant_id=$1 AND id=$2`,
+			tenantID, contactID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	})
+}
 
 // csatTokenTTL is the SPEC-W45 K24 single-use CSAT link lifetime (72h).
 const csatTokenTTL = 72 * time.Hour

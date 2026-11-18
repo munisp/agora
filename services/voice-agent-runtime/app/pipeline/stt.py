@@ -39,6 +39,7 @@ class STTInterface(Protocol):
         sample_rate: int,
         channels: int = 1,
         language: str | None = None,
+        initial_prompt: str | None = None,
     ) -> str:
         """Transcribe signed-16-bit little-endian PCM audio to text."""
         ...
@@ -211,6 +212,12 @@ class FasterWhisperSTT:
         sample_rate: int,
         channels: int = 1,
         language: str | None = None,
+        # SPEC-W82 A4.4: per-tenant STT hint — a whisper initial_prompt
+        # seeded with tenant/offering/staff names biases the decode towards
+        # the right spellings on accented telephony audio. None (the
+        # default) preserves the pre-W82 call EXACTLY (the kwarg is only
+        # forwarded when set, so fakes without the parameter still work).
+        initial_prompt: str | None = None,
     ) -> str:
         # SPEC-W70 A2: route to the multilingual model (when configured) for
         # non-English turns; English stays on the fast default model.
@@ -226,10 +233,17 @@ class FasterWhisperSTT:
             return ""
 
         def _run() -> str:
+            # SPEC-W82 A4.4: only forward initial_prompt when actually set —
+            # keeps the pre-W82 transcribe() call byte-identical (and test
+            # fakes that lack the parameter working) when no hint exists.
+            extra_kwargs = (
+                {"initial_prompt": initial_prompt} if initial_prompt else {}
+            )
             segments, info = model.transcribe(
                 audio,
                 language=language,
                 beam_size=1,
+                **extra_kwargs,
                 vad_filter=False,  # silero VAD already gates the audio upstream
                 # SPEC-W70 A2: hard-set False — the whisper default (True)
                 # feeds the previous decode back as a prompt, which causes

@@ -25,7 +25,7 @@ func captureExtractedEvent(data map[string]any) events.CloudEvent {
 		Type:        events.TypeCaptureExtracted,
 		Subject:     "acme-salon",
 		Time:        time.Now().UTC(),
-		TenantID:    uuid.NewString(),
+		TenantID:    callQualityTenant.String(), // fixed: matches the seeded tenant-scoped person mappings (SPEC-W80 A1)
 		Data:        data,
 	}
 }
@@ -101,9 +101,8 @@ func TestCaptureRedeliveryIsDeduped(t *testing.T) {
 }
 
 func TestCaptureResolvesViaEmailField(t *testing.T) {
-	// The stub answers /rest/people by phone substring; register the email
-	// under the phone-filter path by keying on the email string itself (the
-	// stub matches ANY filter containing the key).
+	// The harness seeds the tenant-scoped contact_identity natural key
+	// ("email:ada@example.com" — keys containing "@" become email keys).
 	s, _, stub := newCallQualitySyncer(t, map[string]string{"ada@example.com": "person-78"})
 	evt := captureExtractedEvent(captureData("rec-3", map[string]any{
 		"caller_email": "ada@example.com",

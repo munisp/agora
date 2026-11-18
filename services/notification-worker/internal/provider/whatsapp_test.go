@@ -175,6 +175,77 @@ func TestWhatsAppLiveOmitsComponentsWithoutParams(t *testing.T) {
 	require.Equal(t, "en", tpl["language"].(map[string]any)["code"], "language default en")
 }
 
+// ---------------------------------------------------------------------------
+// SPEC-W81 B3: free-form text sends (portal OTP over the 24h window)
+// ---------------------------------------------------------------------------
+
+func TestWhatsAppSendTextMock(t *testing.T) {
+	w := NewWhatsApp(WhatsAppConfig{Mock: true}, nil)
+	status, body, err := w.SendText(context.Background(), "+2348012345678", "Your OpenDesk booking portal code is 482910.")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
+	require.Contains(t, WhatsAppMessageID(body), "wamid.mock-", "mock must return a fake wamid")
+
+	// The documented mock-fail hook applies to text sends too.
+	_, _, err = w.SendText(context.Background(), "mock-fail", "x")
+	require.Error(t, err)
+}
+
+func TestWhatsAppSendTextValidation(t *testing.T) {
+	w := NewWhatsApp(WhatsAppConfig{Mock: true}, nil)
+	_, _, err := w.SendText(context.Background(), "", "x")
+	require.ErrorContains(t, err, "phone is required")
+	_, _, err = w.SendText(context.Background(), "+2348012345678", "")
+	require.ErrorContains(t, err, "body is required")
+}
+
+// Live mode without credentials fails honestly — never a fake success.
+func TestWhatsAppSendTextLiveUnconfiguredHonestFailure(t *testing.T) {
+	w := NewWhatsApp(WhatsAppConfig{Mock: false}, nil)
+	_, _, err := w.SendText(context.Background(), "+2348012345678", "x")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "WHATSAPP_CLOUD_API_TOKEN")
+}
+
+// The live payload matches the Meta Cloud API free-form text shape:
+// {"messaging_product":"whatsapp","to","type":"text","text":{"preview_url":
+// false,"body"}} against {base}/{phoneNumberID}/messages with bearer auth.
+func TestWhatsAppSendTextLivePayloadShape(t *testing.T) {
+	var gotAuth, gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[{"id":"wamid.TXT1"}]}`))
+	}))
+	defer srv.Close()
+
+	w := NewWhatsApp(WhatsAppConfig{
+		Mock: false, Token: "tok-1", PhoneNumberID: "123456", BaseURL: srv.URL,
+	}, nil)
+	w.Client.sleep = func(context.Context, int) {} // no backoff in tests
+
+	status, body, err := w.SendText(context.Background(), "+2348012345678", "Your OpenDesk booking portal code is 482910. It is valid for 10 minutes.")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, "wamid.TXT1", WhatsAppMessageID(body))
+
+	require.Equal(t, "Bearer tok-1", gotAuth)
+	require.Equal(t, "/123456/messages", gotPath)
+	require.Equal(t, "whatsapp", gotBody["messaging_product"])
+	require.Equal(t, "+2348012345678", gotBody["to"])
+	require.Equal(t, "text", gotBody["type"])
+	text, ok := gotBody["text"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "Your OpenDesk booking portal code is 482910. It is valid for 10 minutes.", text["body"])
+	require.Equal(t, false, text["preview_url"])
+	_, isTemplate := gotBody["template"]
+	require.False(t, isTemplate, "free-form send must not carry a template block")
+}
+
 // A provider 4xx is a caller fault: no retry, provider body surfaced.
 func TestWhatsAppLiveClientErrorNotRetried(t *testing.T) {
 	calls := 0

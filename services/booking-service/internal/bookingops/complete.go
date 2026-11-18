@@ -48,6 +48,17 @@ type BookingCompletedAccruer interface {
 	AccrueOnBookingCompleted(tenantID, bookingID uuid.UUID)
 }
 
+// OpenLeadConverter is the SPEC-W80 B3 booking→lead conversion hook: on a
+// contact's FIRST completed booking, the contact's open lead (same phone)
+// is walked to `converted` through the leads service status machine.
+// Implemented by leads.Service.ConvertOpenLeadByPhone; wired in
+// cmd/server/main.go. Best-effort, exactly like the loyalty hook —
+// failures are logged by the implementation, never propagated (a leads
+// outage must not fail booking completion).
+type OpenLeadConverter interface {
+	ConvertOpenLeadByPhone(ctx context.Context, tenantID uuid.UUID, phone, tenantSlug string)
+}
+
 // CompleteResult reports the outcome of Complete.
 type CompleteResult struct {
 	Booking store.Booking `json:"booking"`
@@ -116,7 +127,37 @@ func (s *Service) Complete(ctx context.Context, tenantID uuid.UUID, tenantSlug s
 	if !res.AlreadyCompleted && s.Loyalty != nil {
 		s.Loyalty.AccrueOnBookingCompleted(tenantID, bookingID)
 	}
+	// SPEC-W80 B3 booking→lead conversion hook (best-effort, nil-safe):
+	// only on the NON-replay path AND only for the contact's FIRST
+	// completed booking — a repeat customer has no fresh conversion.
+	if !res.AlreadyCompleted && s.LeadConverter != nil {
+		s.convertLeadOnFirstCompletion(ctx, tenantID, tenantSlug, booking)
+	}
 	return res, nil
+}
+
+// convertLeadOnFirstCompletion fires the B3 LeadConverter hook when this
+// completion is the contact's first one. Every lookup failure is logged
+// and swallowed — completion is already durable (same posture as the
+// loyalty accrual hook above).
+func (s *Service) convertLeadOnFirstCompletion(ctx context.Context, tenantID uuid.UUID, tenantSlug string, booking store.Booking) {
+	if booking.ContactID == uuid.Nil {
+		return // contactless booking: no phone to match a lead by
+	}
+	completed, err := s.Store.CountCompletedBookingsForContact(ctx, tenantID, booking.ContactID)
+	if err != nil {
+		s.Logger.Error("lead conversion hook: completed-booking count failed; skipping",
+			zap.String("booking_id", booking.ID.String()), zap.Error(err))
+		return
+	}
+	if completed != 1 {
+		return // not the first completed booking (the count includes this one)
+	}
+	contact, err := s.Store.GetContact(ctx, tenantID, booking.ContactID)
+	if err != nil || contact.Phone == "" {
+		return // no phone → FindOpenLeadByPhone could never match; not an error
+	}
+	s.LeadConverter.ConvertOpenLeadByPhone(ctx, tenantID, contact.Phone, tenantSlug)
 }
 
 // RefundRequest is one POST /v1/bookings/{id}/refund call (K12).

@@ -389,7 +389,8 @@ export function WaitlistClient({
         </Select>
       </div>
 
-      <Card>
+      {/* SPEC-W82 B1.2: table on ≥sm, stacked cards below. */}
+      <Card className="hidden sm:block">
         <Table>
           <TableHeader>
             <TableRow>
@@ -479,6 +480,73 @@ export function WaitlistClient({
           </TableBody>
         </Table>
       </Card>
+
+      {/* SPEC-W82 B1.2: stacked waitlist cards below sm:. */}
+      <div className="space-y-2 sm:hidden">
+        {entries.length === 0 ? (
+          <p className="rounded-md border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+            {loading
+              ? "Loading…"
+              : "Nobody is waiting — entries appear here when customers join the waitlist."}
+          </p>
+        ) : (
+          entries.map((w) => (
+            <div
+              key={w.id}
+              className="rounded-md border border-border bg-card px-4 py-3"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="font-medium">{w.contact_name || "—"}</p>
+                <Badge variant={statusVariant(w.status)}>{w.status}</Badge>
+              </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {w.contact_phone}
+              </p>
+              <p className="mt-1 text-xs">
+                {offeringName(w.offering_id)} · {formatDateTime(w.window_start)}{" "}
+                <span className="text-muted-foreground">
+                  to {formatDateTime(w.window_end)}
+                </span>
+              </p>
+              <div className="mt-2 flex flex-wrap gap-1">
+                {LINKABLE.has(w.status) ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void copyClaimLink(w)}
+                  >
+                    <Link2 className="h-3.5 w-3.5" />
+                    Copy claim link
+                  </Button>
+                ) : null}
+                {NOTIFYABLE.has(w.status) ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busyId === w.id}
+                    onClick={() => void notify(w)}
+                  >
+                    <Bell className="h-3.5 w-3.5" />
+                    Notify
+                  </Button>
+                ) : null}
+                {EXPIRABLE.has(w.status) ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="text-destructive"
+                    disabled={busyId === w.id}
+                    onClick={() => setExpireTarget(w)}
+                  >
+                    <TimerOff className="h-3.5 w-3.5" />
+                    Expire
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
       <p className="mt-3 text-xs text-muted-foreground">
         A background sweep marks entries expired about every 5 minutes once
         their window passes; claims on an expired window are refused (410).

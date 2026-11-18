@@ -158,6 +158,14 @@ class Settings:
     identity_internal_token: str = field(
         default_factory=lambda: os.getenv("IDENTITY_INTERNAL_TOKEN", "")
     )
+    # SPEC-W80 A11/B7: X-Internal-Token sent on the booking spend-sum
+    # lookup (booking-service gates /internal/campaigns/{id}/spend-sum
+    # behind internAuth). Reuses booking-service's EXISTING env name
+    # verbatim (BOOKING_INTERNAL_TOKEN); empty = header not sent (peer
+    # fails closed — spend reports unavailable, never zero; MW-H1).
+    booking_internal_token: str = field(
+        default_factory=lambda: os.getenv("BOOKING_INTERNAL_TOKEN", "")
+    )
     tenant_cache_ttl_seconds: float = field(
         default_factory=lambda: float(os.getenv("TENANT_CACHE_TTL_SECONDS", "300"))
     )

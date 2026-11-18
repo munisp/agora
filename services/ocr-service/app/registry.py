@@ -50,9 +50,9 @@ from .logging import get_logger
 
 log = get_logger(__name__)
 
-# G5 platform-side observability: counters + the audit log lines below are
-# the ONLY registry telemetry; there is no read endpoint, no tenant
-# endpoint, no platform-admin page (v1 alerts-only design).
+# G5 platform-side observability: counters + the audit log lines below +
+# the SPEC-W77 aggregate-only registry_stats() read (count-not-identity);
+# there is NO per-key/tenant read endpoint (alerts stay the triage path).
 REGISTRY_KEYS = Counter(
     "opendesk_ocr_registry_keys_total",
     "Cross-tenant registry fingerprint keys created (SPEC-W67 G5).",
@@ -156,6 +156,30 @@ SELECT r.registry_key, r.tenant_count,
                            WHERE m.registry_key = r.registry_key)
     OR NOT EXISTS (SELECT 1 FROM ocr_doc_registry_tenants m
                     WHERE m.registry_key = r.registry_key)
+"""
+
+# SPEC-W77 R1 (count-not-identity): platform-aggregate stats for the
+# platform-admin registry page. Aggregate COUNT(*) INTEGERS ONLY — no
+# registry_key, no tenant_id, no per-key rows, no timestamps ever leave
+# this module. Zero schema change: counts ride the existing columns
+# (tenant_count for the multi-tenant aggregate, alerted for the alert
+# count). Fakes replicate these in lockstep, dispatched on the constants.
+SQL_STATS_KEYS_TOTAL = """
+SELECT COUNT(*) FROM ocr_doc_registry
+"""
+
+SQL_STATS_MEMBERSHIPS_TOTAL = """
+SELECT COUNT(*) FROM ocr_doc_registry_tenants
+"""
+
+SQL_STATS_MULTI_TENANT_KEYS = """
+SELECT COUNT(*) FROM ocr_doc_registry
+ WHERE tenant_count >= 2
+"""
+
+SQL_STATS_ALERTED_MEMBERSHIPS = """
+SELECT COUNT(*) FROM ocr_doc_registry_tenants
+ WHERE alerted
 """
 
 
@@ -362,3 +386,51 @@ async def registry_reconcile_loop(db, settings) -> None:
             )
         except Exception as exc:  # a failed run never kills the loop
             log.error("ocr_registry.reconcile_failed", error=str(exc))
+
+
+async def registry_stats(
+    db,
+    *,
+    secret_set: bool,
+    ttl_days: int,
+    reconcile_minutes: int,
+) -> dict[str, Any]:
+    """SPEC-W77 R1/R4: count-not-identity aggregate stats for the
+    platform-admin registry page.
+
+    Returns EXACTLY {enabled, keys_total, memberships_total,
+    multi_tenant_keys, alerted_memberships, ttl_days, reconcile_minutes}
+    — aggregate integers + posture echo ONLY. NO registry_key, NO
+    tenant_id, NO per-key rows: the W67 zero-disclosure posture (G5) is
+    preserved by returning nothing that identifies a key or a tenant.
+
+    R4: when `secret_set` is False the registry is DISABLED (G1) and the
+    disabled payload is returned WITHOUT touching the tables at all
+    (cheap, honest — never an error page). Otherwise exactly four
+    aggregate COUNT(*) queries run in ONE registry_conn() scope — the
+    ONLY GUC access path; request paths (tenant_conn/sweep_conn) can
+    never reach these tables.
+    """
+    stats: dict[str, Any] = {
+        "enabled": bool(secret_set),
+        "keys_total": 0,
+        "memberships_total": 0,
+        "multi_tenant_keys": 0,
+        "alerted_memberships": 0,
+        "ttl_days": int(ttl_days),
+        "reconcile_minutes": int(reconcile_minutes),
+    }
+    if not secret_set:
+        return stats
+    async with registry_conn(db) as conn:
+        stats["keys_total"] = int(await conn.fetchval(SQL_STATS_KEYS_TOTAL))
+        stats["memberships_total"] = int(
+            await conn.fetchval(SQL_STATS_MEMBERSHIPS_TOTAL)
+        )
+        stats["multi_tenant_keys"] = int(
+            await conn.fetchval(SQL_STATS_MULTI_TENANT_KEYS)
+        )
+        stats["alerted_memberships"] = int(
+            await conn.fetchval(SQL_STATS_ALERTED_MEMBERSHIPS)
+        )
+    return stats

@@ -348,10 +348,32 @@ func (a *Activities) SendConfirmation(ctx context.Context, in workflows.SagaInpu
 	return a.notify(ctx, td, in.ContactEmail, in.ContactPhone, "Appointment confirmed", confirmationEmail)
 }
 
-// SendReminder sends a T-24h / T-1h reminder.
+// SendReminder sends a reminder (T-24h / T-1h by default, pack offsets per
+// SPEC-W80 C3). When the pack declares reminder channels, only those are
+// used; an empty channel list keeps the legacy every-channel behavior.
 func (a *Activities) SendReminder(ctx context.Context, in workflows.ReminderInput, kind string) error {
+	email, phone := in.ContactEmail, in.ContactPhone
+	if len(in.ReminderChannels) > 0 {
+		if !channelListed(in.ReminderChannels, ChannelEmail) {
+			email = ""
+		}
+		if !channelListed(in.ReminderChannels, ChannelSMS) {
+			phone = ""
+		}
+	}
 	td := templateData{Name: in.ContactName, StartsAt: in.StartsAt.Format(time.RFC1123), Kind: kind, Tenant: in.TenantSlug}
-	return a.notify(ctx, td, in.ContactEmail, in.ContactPhone, "Appointment reminder "+kind, reminderEmail)
+	return a.notify(ctx, td, email, phone, "Appointment reminder "+kind, reminderEmail)
+}
+
+// channelListed reports whether ch is one of the pack-declared reminder
+// channels (SPEC-W80 C3).
+func channelListed(channels []string, ch string) bool {
+	for _, c := range channels {
+		if c == ch {
+			return true
+		}
+	}
+	return false
 }
 
 // SendNoShowFollowup sends the no-show follow-up message.

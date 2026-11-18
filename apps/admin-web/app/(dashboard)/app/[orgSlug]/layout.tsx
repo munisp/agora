@@ -1,10 +1,13 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { ExternalLink, LogOut } from "lucide-react";
+import { ExternalLink } from "lucide-react";
 import { auth, signOut } from "@/lib/auth";
 import { serverApi } from "@/lib/server-api";
+import { CommandPalette } from "@/components/command-palette";
+import { MobileNav } from "@/components/mobile-nav";
 import { OrgNav } from "@/components/org-nav";
 import { AgoraMark } from "@/components/brand";
+import { SignOutButton } from "@/components/sign-out-button";
 import { Button } from "@/components/ui/button";
 import type { Tenant } from "@/lib/types";
 import { resolveNavLabels } from "@/lib/terminology";
@@ -65,7 +68,10 @@ export default async function OrgLayout({
   const labels = resolveNavLabels(tenant);
   return (
     <div className="flex min-h-screen">
-      <aside className="flex w-64 shrink-0 flex-col bg-umber-deep text-paper">
+      {/* SPEC-W82 B1.1: global command palette (Ctrl/⌘K or "/"). */}
+      <CommandPalette orgSlug={orgSlug} />
+      {/* SPEC-W82 B1.2: sidebar hides below md:, hamburger drawer takes over. */}
+      <aside className="hidden w-64 shrink-0 flex-col bg-umber-deep text-paper md:flex">
         <div className="flex items-center gap-3 px-5 py-5">
           <AgoraMark tone="light" />
           <div className="min-w-0">
@@ -97,25 +103,36 @@ export default async function OrgLayout({
               await signOut({ redirectTo: "/" });
             }}
           >
-            <button
-              type="submit"
-              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-paper/65 hover:bg-paper/5 hover:text-paper cursor-pointer"
-            >
-              <LogOut className="h-4 w-4" />
-              Sign out
-            </button>
+            {/* SPEC-W82 B1.3: clears the localStorage last-good cache first. */}
+            <SignOutButton className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-paper/65 hover:bg-paper/5 hover:text-paper cursor-pointer" />
           </form>
           <p className="truncate px-3 pt-1 text-xs text-paper/50">
             {session.user?.email ?? session.user?.name ?? ""}
           </p>
         </div>
       </aside>
-      <main className="paper-pattern min-w-0 flex-1">
-        <DemoBanner slug={orgSlug} />
-        <div className="px-8 py-8">
-          <TerminologyProvider labels={labels}>{children}</TerminologyProvider>
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* SPEC-W82 B1.2: mobile top bar with hamburger (below md:). */}
+        <div className="sticky top-0 z-40 flex items-center gap-3 bg-umber-deep px-4 py-3 text-paper md:hidden">
+          <MobileNav
+            orgSlug={orgSlug}
+            roles={session.realmRoles ?? []}
+            tenantName={tenant?.name ?? orgSlug}
+            labels={labels}
+            externalLinks={externalLinks()}
+          />
+          <AgoraMark tone="light" />
+          <p className="min-w-0 flex-1 truncate font-display text-base">
+            {tenant?.name ?? orgSlug}
+          </p>
         </div>
-      </main>
+        <main className="paper-pattern min-w-0 flex-1">
+          <DemoBanner slug={orgSlug} />
+          <div className="px-4 py-4 md:px-8 md:py-8">
+            <TerminologyProvider labels={labels}>{children}</TerminologyProvider>
+          </div>
+        </main>
+      </div>
     </div>
   );
 }

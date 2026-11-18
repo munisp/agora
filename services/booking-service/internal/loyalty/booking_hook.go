@@ -85,6 +85,52 @@ func (d *Deps) AccrueOnBookingCompleted(tenantID, bookingID uuid.UUID) {
 			zap.String("booking_id", bookingID.String()),
 			zap.String("contact_id", contactID.String()), zap.Error(err))
 	}
+
+	// SPEC-W80 B2: the first_txn earn rule — the contact's FIRST completed
+	// booking additionally accrues first_txn points (the rule was dead:
+	// nothing ever fired the event). The completion status flip is already
+	// committed when this hook runs, so a count of exactly 1 means "first".
+	// ref_id anchors the accrual to the CONTACT, so even a racing second
+	// completion can never double-award. ErrNoActiveProgram /
+	// not-awarded-by-program are config outcomes, not failures.
+	count, err := d.Store.completedBookingCount(ctx, tenantID, contactID)
+	if err != nil {
+		log.Error("loyalty hook: first_txn count failed (booking completed unaffected)",
+			zap.String("tenant_id", tenantID.String()),
+			zap.String("booking_id", bookingID.String()), zap.Error(err))
+		return
+	}
+	if count != 1 {
+		return
+	}
+	if _, err := svc.Accrue(ctx, tenantID, contactID, EventFirstTxn, "first_txn:"+contactID.String()); err != nil {
+		if errors.Is(err, ErrNoActiveProgram) {
+			return
+		}
+		if errors.Is(err, ErrInvalidInput) {
+			log.Debug("loyalty hook: active program does not award first_txn",
+				zap.String("tenant_id", tenantID.String()))
+			return
+		}
+		log.Error("loyalty hook: first_txn accrual failed (booking completed unaffected)",
+			zap.String("tenant_id", tenantID.String()),
+			zap.String("booking_id", bookingID.String()),
+			zap.String("contact_id", contactID.String()), zap.Error(err))
+	}
+}
+
+// completedBookingCount counts the contact's bookings in status
+// `completed` inside the tenant's RLS transaction (SPEC-W80 B2 — powers
+// the first_txn detection above).
+func (s *Store) completedBookingCount(ctx context.Context, tenantID, contactID uuid.UUID) (int, error) {
+	var count int
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM bookings
+			  WHERE tenant_id=$1 AND contact_id=$2 AND status='completed'`,
+			tenantID, contactID).Scan(&count)
+	})
+	return count, err
 }
 
 // bookingContactID resolves bookings.contact_id inside the tenant's RLS

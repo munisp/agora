@@ -369,6 +369,10 @@ func NewRouter(d Deps) http.Handler {
 			r.With(s.require("manage_bookings")).Post("/", s.createBooking)
 			r.Get("/", s.listBookings)
 			r.Get("/{id}", s.getBooking)
+			// SPEC-W80 B4: read a booking's crm_notes WITHOUT touching the
+			// invariant bookings.go (W57) — the handler lives in
+			// crm_notes.go. Same tenant-scoped read posture as getBooking.
+			r.Get("/{id}/crm-notes", s.listBookingCRMNotes)
 			r.With(s.require("manage_bookings")).Post("/{id}/reschedule", s.rescheduleBooking)
 			r.With(s.require("manage_bookings")).Post("/{id}/cancel", s.cancelBooking)
 			// SPEC-W45 K11/K12: booking completion (deposit capture +
@@ -776,12 +780,18 @@ func NewRouter(d Deps) http.Handler {
 	// Reverse CRM sync endpoints (Twenty -> OpenDesk, SPEC-CRM §B), invoked
 	// by crm-sync-service via Dapr service invocation. Tenant resolution is
 	// the usual X-Tenant-Slug middleware; no Permify guard (internal only).
+	// SPEC-W80 B7: ALL legacy internal routes are internAuth-guarded
+	// (X-Internal-Token vs BOOKING_INTERNAL_TOKEN, constant-time; 503
+	// fail-closed when unset, 401 on missing/wrong) BEFORE the tenant
+	// middleware — exactly like the civic sla-breach callback below.
 	r.Route("/internal/contacts", func(r chi.Router) {
+		r.Use(s.internAuth)
 		r.Use(s.tenantMiddleware)
 		r.Post("/upsert", s.upsertContactInternal)
 		r.Get("/", s.lookupContactInternal)
 	})
 	r.Route("/internal/bookings", func(r chi.Router) {
+		r.Use(s.internAuth)
 		r.Use(s.tenantMiddleware)
 		r.Post("/{id}/crm-note", s.addBookingCRMNoteInternal)
 	})
@@ -791,6 +801,7 @@ func NewRouter(d Deps) http.Handler {
 	// Tenant resolution is the usual X-Tenant-Slug middleware; no Permify
 	// guard (internal only).
 	r.Route("/internal/campaigns", func(r chi.Router) {
+		r.Use(s.internAuth) // SPEC-W80 B7 — see /internal/contacts above
 		r.Use(s.tenantMiddleware)
 		r.Get("/{id}/spend-sum", s.campaignSpendSum)
 	})
@@ -801,6 +812,7 @@ func NewRouter(d Deps) http.Handler {
 	// usual X-Tenant-Slug middleware; no Permify guard (internal only).
 	// Response shape is frozen for Agent A.
 	r.Route("/internal/devices", func(r chi.Router) {
+		r.Use(s.internAuth) // SPEC-W80 B7 — see /internal/contacts above
 		r.Use(s.tenantMiddleware)
 		r.Get("/", s.devicesHandler((*devices.Handlers).ListInternal))
 	})
@@ -808,7 +820,10 @@ func NewRouter(d Deps) http.Handler {
 	// Internal lead phone resolution (SPEC-W28): the notification-worker's
 	// audience intake invokes this via Dapr to resolve lead_id → phone for
 	// graph audiences. Tenant via X-Tenant-Slug middleware; internal only.
-	r.With(s.tenantMiddleware).Post("/v1/leads/resolve", s.resolveLeadPhones)
+	// SPEC-W80 B7: internAuth (X-Internal-Token vs BOOKING_INTERNAL_TOKEN;
+	// 503 fail-closed when unset, 401 on missing/wrong) BEFORE the tenant
+	// middleware — same posture as the other internal routes above.
+	r.With(s.internAuth, s.tenantMiddleware).Post("/v1/leads/resolve", s.resolveLeadPhones)
 
 	// Internal SLA-breach callback (SPEC-W32 WS-B → booking-service), invoked
 	// via Dapr by the notification-worker's CivicSLAWorkflow. SPEC-W44

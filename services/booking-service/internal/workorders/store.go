@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS work_orders (
 CREATE INDEX IF NOT EXISTS idx_work_orders_status ON work_orders (tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_work_orders_assignee ON work_orders (tenant_id, assignee_id);
 CREATE INDEX IF NOT EXISTS idx_work_orders_scheduled ON work_orders (tenant_id, scheduled_start);
+-- SPEC-W80 B8: CRM-360 contact rollup (idempotent bootstrap DDL).
+CREATE INDEX IF NOT EXISTS idx_work_orders_tenant_contact ON work_orders (tenant_id, contact_id);
 ALTER TABLE work_orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE work_orders FORCE ROW LEVEL SECURITY;
 DO $$

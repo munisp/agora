@@ -12,6 +12,7 @@ package crm360
 //	GET    /v1/crm/contacts/{id}/notes
 //	POST   /v1/crm/contacts/{id}/notes         {body, pinned?, author?}
 //	PATCH  /v1/crm/notes/{id}                  {body?, pinned?}
+//	DELETE /v1/crm/notes/{id}                  (SPEC-W80 B12)
 //
 // AuthZ (SPEC-W20 contract §3): reads are view_analytics, writes are
 // manage_bookings. RegisterRoutes applies the variadic mw GROUP-WIDE; the
@@ -133,6 +134,7 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		r.Get("/contacts/{id}/notes", h.ListNotes)
 		r.Post("/contacts/{id}/notes", h.CreateNote)
 		r.Patch("/notes/{id}", h.PatchNote)
+		r.Delete("/notes/{id}", h.DeleteNote) // SPEC-W80 B12
 	})
 }
 
@@ -369,24 +371,20 @@ func (h *Handlers) AddTag(w http.ResponseWriter, r *http.Request) {
 		h.mapErr(w, err)
 		return
 	}
-	// Distinguish a fresh attach (event-worthy) from an idempotent replay.
-	existing, err := h.Store.ListTags(r.Context(), tenant.ID, contactID)
+	// SPEC-W80 B9: the contact must exist IN-TENANT — tagging a dangling
+	// (or cross-tenant) contact id is a 404, never a silent orphan row.
+	if _, err := h.Store.GetContact(r.Context(), tenant.ID, contactID); err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	// SPEC-W80 B11: fresh-vs-replay is decided atomically by the store's
+	// ON CONFLICT DO NOTHING RowsAffected — no check-then-act race.
+	added, err := h.Store.AddTag(r.Context(), tenant.ID, contactID, tag)
 	if err != nil {
 		h.mapErr(w, err)
 		return
 	}
-	fresh := true
-	for _, t := range existing {
-		if t == tag {
-			fresh = false
-			break
-		}
-	}
-	if err := h.Store.AddTag(r.Context(), tenant.ID, contactID, tag); err != nil {
-		h.mapErr(w, err)
-		return
-	}
-	if fresh {
+	if added {
 		h.publishTagEvent(r.Context(), tenant.Slug, EventTypeTagAdded, tenant.ID, contactID, tag)
 	}
 	tags, err := h.Store.ListTags(r.Context(), tenant.ID, contactID)
@@ -491,6 +489,12 @@ func (h *Handlers) CreateNote(w http.ResponseWriter, r *http.Request) {
 		h.mapErr(w, err)
 		return
 	}
+	// SPEC-W80 B9: the contact must exist IN-TENANT — noting a dangling
+	// (or cross-tenant) contact id is a 404, never a silent orphan row.
+	if _, err := h.Store.GetContact(r.Context(), tenant.ID, contactID); err != nil {
+		h.mapErr(w, err)
+		return
+	}
 	if err := h.Store.CreateNote(r.Context(), &n); err != nil {
 		h.mapErr(w, err)
 		return
@@ -548,4 +552,33 @@ func (h *Handlers) PatchNote(w http.ResponseWriter, r *http.Request) {
 	}
 	h.publishNoteEvent(r.Context(), tenant.Slug, EventTypeNoteUpdated, n)
 	writeJSON(w, http.StatusOK, map[string]any{"note": n})
+}
+
+// DeleteNote (DELETE /v1/crm/notes/{id}) removes a note tenant-scoped
+// (SPEC-W80 B12) — 404 when missing or cross-tenant (indistinguishable
+// under RLS, which is the point). Emits com.opendesk.crm.NoteDeleted on a
+// real delete.
+func (h *Handlers) DeleteNote(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := h.tenantOr400(w, r)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid note id")
+		return
+	}
+	// Load first (tenant-scoped): the delete event carries the note refs,
+	// and a missing/cross-tenant id answers the same 404 as the delete.
+	n, err := h.Store.GetNote(r.Context(), tenant.ID, id)
+	if err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	if err := h.Store.DeleteNote(r.Context(), tenant.ID, id); err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	h.publishNoteEvent(r.Context(), tenant.Slug, EventTypeNoteDeleted, n)
+	w.WriteHeader(http.StatusNoContent)
 }

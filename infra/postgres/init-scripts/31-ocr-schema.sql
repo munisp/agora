@@ -118,3 +118,6 @@ ALTER TABLE ocr_doc_registry_tenants FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS registry_internal_access ON ocr_doc_registry_tenants;
 CREATE POLICY registry_internal_access ON ocr_doc_registry_tenants
     USING (current_setting('app.ocr_registry', true) = 'on');
+
+CREATE INDEX IF NOT EXISTS idx_ocr_registry_tenants_first_seen
+    ON ocr_doc_registry_tenants (first_seen);

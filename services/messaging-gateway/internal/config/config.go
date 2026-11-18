@@ -117,6 +117,13 @@ type Config struct {
 	// /v1/notify/ussd-action (X-Internal-Token, NOTIFICATION_INTERNAL_TOKEN
 	// server-side).
 	NotificationInternalToken string
+	// VoiceInternalToken (MESSAGING_VOICE_INTERNAL_TOKEN) is the K2 machine
+	// token the voice runtime's /voice/chat channel_identity pin gate
+	// checks (X-Internal-Token, VOICE_ADMIN_INTERNAL_TOKEN server-side —
+	// SAME shared secret var, distinct caller-side name per the K2 idiom;
+	// SPEC-W81 C1). Empty = header not sent: the runtime then ignores the
+	// channel_identity pin (fail-safe, public posture preserved).
+	VoiceInternalToken string
 }
 
 // Load reads configuration from the environment.
@@ -178,6 +185,7 @@ func Load() Config {
 		NotificationURL:           os.Getenv("NOTIFICATION_URL"),
 		BookingInternalToken:      os.Getenv("MESSAGING_BOOKING_INTERNAL_TOKEN"),
 		NotificationInternalToken: os.Getenv("MESSAGING_NOTIFICATION_INTERNAL_TOKEN"),
+		VoiceInternalToken:        os.Getenv("MESSAGING_VOICE_INTERNAL_TOKEN"),
 	}
 }
 

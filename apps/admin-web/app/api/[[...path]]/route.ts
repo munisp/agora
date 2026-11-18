@@ -19,6 +19,20 @@ import { auth } from "@/lib/auth";
  * otherwise the session's first slug is used. The bound slug is injected as
  * X-Tenant-Slug and rewrites the ?tenant= query param, so a forged value can
  * never cross tenants.
+ *
+ * EXCEPTION (SPEC-W77 R3): /api/ocr-registry/* is forwarded DIRECTLY to the
+ * ocr-service (W53 posture: /v1/internal/* routes stay in-cluster and are
+ * NEVER added to APISIX). Exactly ONE upstream endpoint is exposed:
+ *   GET /api/ocr-registry/registry-stats
+ *     → GET ${OCR_BASE_URL}/v1/internal/ocr/registry-stats
+ * the platform-scoped cross-tenant doc-fraud registry aggregate counts
+ * (R1 count-not-identity: integers + posture fields ONLY — no registry
+ * keys, no tenant ids, no hashes, no per-key rows). Gate: NextAuth session
+ * required (401 anonymous) and the caller must hold the platform-admin
+ * realm role — 403 otherwise; plain `admin` is NOT enough (R2, stricter
+ * than the ops-alerts gate). OCR_INTERNAL_TOKEN is injected server-side as
+ * x-internal-token and NEVER reaches the client bundle. GET only; no
+ * tenant binding (platform scope).
  */
 
 const API_BASE =
@@ -35,6 +49,13 @@ const API_BASE =
 const ANALYTICS_BASE =
   process.env.ANALYTICS_BASE_URL ?? "http://localhost:7009";
 
+/**
+ * SPEC-W77 R3: ocr-service is not exposed through the gateway (same posture
+ * as analytics). The single registry-stats path handled below forwards to
+ * `${OCR_BASE}/v1/internal/ocr/registry-stats`.
+ */
+const OCR_BASE = process.env.OCR_BASE_URL ?? "http://ocr:7020";
+
 const HOP_BY_HOP = new Set([
   "connection",
   "keep-alive",
@@ -50,12 +71,60 @@ async function proxy(
 ): Promise<NextResponse> {
   const { path = [] } = await ctx.params;
   const directToAnalytics = path[0] === "analytics";
+  const directToOcrRegistry = path[0] === "ocr-registry";
 
   const session = await auth();
   // The session's token could not be refreshed (Keycloak session ended): forwarding the stale token only produces
   // 401s from every service. Tell the browser plainly so it sends the user back through sign-in.
   if (session?.error === "RefreshAccessTokenError") {
     return NextResponse.json({ error: "session_expired", message: "Your session has ended. Please sign in again." }, { status: 401 });
+  }
+
+  // SPEC-W77 R2/R3: the ocr-service registry-stats endpoint is internal-only
+  // (X-Internal-Token), so it is only as protected as this handler makes it.
+  if (directToOcrRegistry) {
+    if (req.method !== "GET") {
+      return NextResponse.json(
+        { error: "method_not_allowed", message: "Registry stats is read-only (GET)." },
+        { status: 405 },
+      );
+    }
+    if (!session?.accessToken) {
+      return NextResponse.json(
+        { error: "authentication_required", message: "Sign-in required for registry stats." },
+        { status: 401 },
+      );
+    }
+    // platform-admin ONLY — plain `admin` must not see cross-tenant
+    // aggregates (R2).
+    if (!(session.realmRoles ?? []).includes("platform-admin")) {
+      return NextResponse.json(
+        {
+          error: "platform_admin_required",
+          message: "Registry stats require the platform-admin role.",
+        },
+        { status: 403 },
+      );
+    }
+    // Zero-disclosure surface: only the aggregate-stats endpoint is exposed
+    // through this exception; every other ocr-registry path 404s.
+    if (path.join("/") !== "ocr-registry/registry-stats") {
+      return NextResponse.json(
+        { error: "not_found", message: "Unknown ocr-registry path." },
+        { status: 404 },
+      );
+    }
+    if (!process.env.OCR_INTERNAL_TOKEN) {
+      // Fail-closed, mirroring the service's own posture: no token configured
+      // here means the upstream call could never authenticate anyway.
+      return NextResponse.json(
+        {
+          error: "ocr_internal_token_unset",
+          message: "OCR_INTERNAL_TOKEN is not configured on admin-web.",
+        },
+        { status: 503 },
+      );
+    }
   }
 
   // W44/F15-15: the analytics service is NOT behind the gateway, so its
@@ -89,8 +158,10 @@ async function proxy(
   const target = new URL(
     directToAnalytics
       ? `${ANALYTICS_BASE}/${path.slice(1).join("/")}`
-      : // The gateway's routes keep the /api prefix (/api/bookings/*, /api/identity/*, …).
-        `${API_BASE}/api/${path.join("/")}`,
+      : directToOcrRegistry
+        ? `${OCR_BASE}/v1/internal/ocr/registry-stats`
+        : // The gateway's routes keep the /api prefix (/api/bookings/*, /api/identity/*, …).
+          `${API_BASE}/api/${path.join("/")}`,
   );
   target.search = req.nextUrl.search;
   if (analyticsTenantSlug) {
@@ -106,14 +177,21 @@ async function proxy(
     // Never forward a caller-sent tenant header on analytics paths; the
     // session-bound value is injected below.
     if (directToAnalytics && lower === "x-tenant-slug") return;
+    // Never forward a caller-sent internal token on ocr-registry paths; the
+    // server-side token is injected below and must be the only one.
+    if (directToOcrRegistry && lower === "x-internal-token") return;
     headers.set(key, value);
   });
   if (!headers.has("accept")) headers.set("accept", "application/json");
   if (analyticsTenantSlug) {
     headers.set("x-tenant-slug", analyticsTenantSlug);
   }
+  if (directToOcrRegistry) {
+    // Set above: the handler 503s before this point when the env is unset.
+    headers.set("x-internal-token", process.env.OCR_INTERNAL_TOKEN as string);
+  }
 
-  if (session?.accessToken) {
+  if (session?.accessToken && !directToOcrRegistry) {
     headers.set("authorization", `Bearer ${session.accessToken}`);
   }
 
@@ -152,7 +230,13 @@ async function proxy(
     return NextResponse.json(
       {
         error: "gateway_unreachable",
-        message: `Could not reach ${directToAnalytics ? `analytics service at ${ANALYTICS_BASE}` : `API gateway at ${API_BASE}`}: ${String(err)}`,
+        message: `Could not reach ${
+          directToAnalytics
+            ? `analytics service at ${ANALYTICS_BASE}`
+            : directToOcrRegistry
+              ? `ocr service at ${OCR_BASE}`
+              : `API gateway at ${API_BASE}`
+        }: ${String(err)}`,
       },
       { status: 502 },
     );
