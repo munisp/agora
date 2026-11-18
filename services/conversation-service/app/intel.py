@@ -201,7 +201,11 @@ async def enrich_turn(
 _TRANSLATE_SYSTEM = (
     "You translate lines from a business phone call or chat in Nigeria into natural English for the business owner. "
     "The line may be in Nigerian Pidgin, Yoruba, Hausa, Igbo, English or a mix. If it is already plain English, reply "
-    "with exactly: ENGLISH. Otherwise reply with the English translation only - no notes, no quotes."
+    "with exactly: ENGLISH. Otherwise reply with the English translation only - no notes, no quotes. "
+    "Translate day names as weekdays - Yoruba: Ọjọ́ Ajé Monday, Ọjọ́ Ìṣẹ́gun Tuesday, Ọjọ́rú Wednesday, Ọjọ́bọ̀ "
+    "Thursday, Ọjọ́ Ẹtì Friday, Ọjọ́ Àbámẹ́ta Saturday, Ọjọ́ Àìkú Sunday; Hausa: Litinin Monday, Talata Tuesday, "
+    "Laraba Wednesday, Alhamis Thursday, Juma'a Friday, Asabar Saturday, Lahadi Sunday. Common words: Igbo 'Daalụ' "
+    "and Hausa 'Na gode' mean 'Thank you'; Yoruba 'Ẹ jọ̀wọ́' means 'Please'."
 )
 
 
