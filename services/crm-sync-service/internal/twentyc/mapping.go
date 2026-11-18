@@ -57,7 +57,31 @@ type Emails struct {
 
 // Phones is Twenty's PHONES field shape.
 type Phones struct {
-	PrimaryPhoneNumber string `json:"primaryPhoneNumber"`
+	PrimaryPhoneNumber      string `json:"primaryPhoneNumber"`
+	PrimaryPhoneCountryCode string `json:"primaryPhoneCountryCode,omitempty"`
+	PrimaryPhoneCallingCode string `json:"primaryPhoneCallingCode,omitempty"`
+}
+
+// NationalPhone splits a phone as callers give it into Twenty's parts. Twenty rejects a local number such as
+// "08065553108" with 400 "Provided phone number is invalid", so every booking/call failed to reach the CRM.
+// Nigerian numbers (0XXXXXXXXXX, 234XXXXXXXXXX, +234XXXXXXXXXX) become national "XXXXXXXXXX" + NG/+234;
+// anything else is passed through unchanged with no country.
+func NationalPhone(phone string) (national, country, calling string) {
+	raw := strings.TrimSpace(phone)
+	var b strings.Builder
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	d := b.String()
+	switch {
+	case strings.HasPrefix(d, "234") && len(d) == 13:
+		return d[3:], "NG", "+234"
+	case strings.HasPrefix(d, "0") && len(d) == 11:
+		return d[1:], "NG", "+234"
+	}
+	return raw, "", ""
 }
 
 // PersonFromContact maps booking contact fields -> Person upsert body.
@@ -68,7 +92,8 @@ func PersonFromContact(name, email, phone string) PersonUpsert {
 		p.Emails = &Emails{PrimaryEmail: email}
 	}
 	if phone != "" {
-		p.Phones = &Phones{PrimaryPhoneNumber: phone}
+		national, country, calling := NationalPhone(phone)
+		p.Phones = &Phones{PrimaryPhoneNumber: national, PrimaryPhoneCountryCode: country, PrimaryPhoneCallingCode: calling}
 	}
 	return p
 }
