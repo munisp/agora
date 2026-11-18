@@ -455,6 +455,7 @@ protection had lapsed). Per-run Prometheus counters:
 `opendesk_ocr_registry_ttl_drift_repaired_total` (ops interpretation:
 `docs/runbooks/security.md` §7.4; retention rationale:
 `docs/compliance-ndpa.md`).
+The reconciler's age-keyed `DELETE ... WHERE first_seen < $1` is supported by the additive index `idx_ocr_registry_tenants_first_seen` on `ocr_doc_registry_tenants (first_seen)` (IF NOT EXISTS, mirrored in both DDL copies; SPEC-W79).
 
 ### `POST /v1/internal/ocr/backfill-document-registry`
 

@@ -89,6 +89,21 @@ def test_sweep_escape_policy_both_copies():
         assert "app.tenant_id" in sql, name
 
 
+def test_registry_first_seen_index_both_copies():
+    """SPEC-W79 G2: the TTL reconciler's age-keyed DELETE on
+    ocr_doc_registry_tenants (first_seen) is supported by
+    idx_ocr_registry_tenants_first_seen — additive, IF NOT EXISTS,
+    mirrored in BOTH DDL copies (store.py runtime bootstrap AND
+    31-ocr-schema.sql)."""
+    for name, sql in (("store.DDL", DDL), ("31-ocr-schema.sql", INIT_SQL)):
+        assert (
+            "CREATE INDEX IF NOT EXISTS idx_ocr_registry_tenants_first_seen"
+            in sql
+        ), name
+        assert "ON ocr_doc_registry_tenants (first_seen);" in sql, name
+        assert "(first_seen)" in sql, name
+
+
 # ---------------------------------------------------------------------------
 # DB-gated idempotency (skips cleanly without a test Postgres)
 # ---------------------------------------------------------------------------
