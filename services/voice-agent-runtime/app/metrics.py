@@ -23,6 +23,7 @@ Series:
 - voice_dead_mic_hangups_total   (counter) — SPEC-W73 A1
 - voice_dead_mic_resets_total    (counter) — SPEC-W73 A1
 - voice_greeting_prerender_total (counter, label result=ok|error|timeout) — SPEC-W73 A2
+- voice_stt_stream_hop_seconds   (histogram) — SPEC-W75 B2 streaming-STT hop timing
 """
 
 from __future__ import annotations
@@ -245,6 +246,15 @@ class Registry:
             "Boot-time greeting prerender synthesis outcomes.",
             ("result",),  # result=ok|error|timeout
         )
+        # SPEC-W75 B2: per-hop re-transcription latency of the streaming
+        # STT engine (app/pipeline/stt_stream.py on_hop_timing hook, wired
+        # in control_plane.py). Buckets: DEFAULT_BUCKETS, consistent with
+        # the W71 voice histograms above.
+        self.stt_stream_hop = Histogram(
+            "voice_stt_stream_hop_seconds",
+            "Streaming STT per-hop recognizer latency (interim hops and "
+            "final-segment transcriptions).",
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -265,6 +275,7 @@ class Registry:
             self.dead_mic_hangups,
             self.dead_mic_resets,
             self.greeting_prerender,
+            self.stt_stream_hop,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"

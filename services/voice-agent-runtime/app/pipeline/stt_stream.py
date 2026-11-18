@@ -36,14 +36,22 @@ Precedence: explicit constructor kwargs > env > the defaults above
 with a clear ``ValueError``: ``window_s > 0``, ``hop_s > 0``,
 ``hop_s <= window_s``, ``silence_ms >= 0``, ``max_buffer_s > 0``.
 ``SILENCE_RMS_THRESHOLD`` and ``MAX_SEGMENT_S`` remain fixed constants.
+
+SPEC-W75 (WS-B): an optional ``on_hop_timing`` hook observes the wall-clock
+seconds of every recognizer call — each interim hop's rolling-window
+re-transcription AND the final-segment transcription — so the control
+plane can feed the ``voice_stt_stream_hop_seconds`` histogram. The hook is
+keyword-only, defaults to None (zero behavior change), and its exceptions
+are swallowed (logged once) so a metrics hook never breaks the stream.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections import deque
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import numpy as np
 
@@ -112,6 +120,14 @@ class StreamingSTTEngine:
     ``process_pending`` (from the sender loop) run on the same loop, so no
     locks are needed. All timestamps are seconds of audio consumed since
     stream start.
+
+    SPEC-W75 (WS-B) ``on_hop_timing``: optional callable invoked with the
+    elapsed wall-clock seconds (``time.perf_counter``) of EVERY recognizer
+    call — each interim hop's rolling-window re-transcription in
+    ``_process_hop`` AND the final-segment transcription in
+    ``_emit_final`` (endpointed and disconnect-flush finals alike). Hook
+    exceptions are swallowed (logged once per engine); default None keeps
+    pre-W75 behavior exactly.
     """
 
     def __init__(
@@ -123,6 +139,7 @@ class StreamingSTTEngine:
         hop_s: float | None = None,
         silence_ms: int | None = None,
         max_buffer_s: float | None = None,
+        on_hop_timing: Callable[[float], None] | None = None,
     ) -> None:
         # SPEC-W73 (WS-C): None means "not explicitly passed" -> fall back
         # to the env var (read HERE, at construction, never at import) and
@@ -165,6 +182,12 @@ class StreamingSTTEngine:
         self._hop_bytes = max(2, int(hop_s * self._bytes_per_s))
         self._silence_s = max(0, silence_ms) / 1000.0
         self._max_buffer_bytes = max(2, int(max_buffer_s * self._bytes_per_s))
+        # SPEC-W75 (WS-B): optional per-hop timing observer (elapsed seconds
+        # of each recognizer call). Keyword-only, default None = zero
+        # behavior change. Wired in app/control_plane.py to the
+        # voice_stt_stream_hop_seconds histogram.
+        self._on_hop_timing = on_hop_timing
+        self._hop_timing_hook_warned = False  # log hook failures once
 
         self._pending: deque[bytes] = deque()  # fed, not yet consumed
         self._pending_bytes = 0
@@ -258,13 +281,34 @@ class StreamingSTTEngine:
         return None
 
     async def _transcribe(self, pcm: bytes | bytearray) -> str:
+        # SPEC-W75 (WS-B): this is THE recognizer-call wrapper, used by both
+        # the interim hop loop (_process_hop) and the final-segment
+        # transcription (_emit_final), so timing it here covers both.
+        start = time.perf_counter()
         try:
-            return await self._recognizer.transcribe_pcm(
+            text = await self._recognizer.transcribe_pcm(
                 bytes(pcm), sample_rate=self._sample_rate, channels=1
             )
         except Exception as exc:  # noqa: BLE001 - never kill the stream
             log.warning("stream transcription failed", error=str(exc)[:200])
-            return ""
+            text = ""
+        self._report_hop_timing(time.perf_counter() - start)
+        return text
+
+    def _report_hop_timing(self, elapsed_s: float) -> None:
+        """SPEC-W75 (WS-B): hand the elapsed recognizer seconds to the
+        optional on_hop_timing hook. A metrics hook NEVER breaks the
+        stream: exceptions are swallowed and logged once (the hook keeps
+        being called for later hops). No-op when no hook is configured."""
+        hook = self._on_hop_timing
+        if hook is None:
+            return
+        try:
+            hook(elapsed_s)
+        except Exception as exc:  # noqa: BLE001 - metrics must not kill audio
+            if not self._hop_timing_hook_warned:
+                self._hop_timing_hook_warned = True
+                log.warning("stt hop-timing hook raised", error=str(exc)[:200])
 
     async def process_pending(self) -> list[dict[str, Any]]:
         """Consume all complete hops currently available; return events."""

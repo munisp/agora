@@ -185,14 +185,41 @@ async def test_d_close_retrieves_completed_prefetch_exception():
     old_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda l, ctx: contexts.append(ctx))
     try:
-        provider = FakeProvider(delays={"Two.": 0.0}, fail_on={"Two."})
+        prefetch_done = asyncio.Event()
+
+        class _ObservedProvider(FakeProvider):
+            """FakeProvider + deterministic completion signal (SPEC-W75 A2).
+
+            The event fires in the SAME loop step in which the prefetch
+            coroutine finishes: its ``finally`` runs while the exception is
+            still propagating, and the task records its outcome before the
+            loop processes the waiter's wakeup — so when ``wait()`` returns,
+            the prefetch task is guaranteed done WITH its error, unconsumed.
+            """
+
+            async def synthesize(self, text: str, voice: str, language: str) -> bytes:
+                try:
+                    return await super().synthesize(text, voice, language)
+                finally:
+                    if text == "Two.":
+                        prefetch_done.set()
+
+        provider = _ObservedProvider(delays={"Two.": 0.0}, fail_on={"Two."})
         chain = _chain(provider)
         agen = chain.stream_pcm("One. Two. Three.")
         assert await agen.__anext__() == b"One."
-        await asyncio.sleep(0.05)  # let the failing prefetch complete unconsumed
+        # Deterministic proof the failing prefetch completed UNCONSUMED
+        # before the close — replaces the blind 0.05s sleep that flaked
+        # 1/22 under host load (V-INT-74). Bounded so a regression fails
+        # fast instead of hanging.
+        await asyncio.wait_for(prefetch_done.wait(), 5)
+        assert "Two." in provider.intervals  # the error path really ran
         await agen.aclose()
-        await asyncio.sleep(0.05)
-        gc.collect()  # surface any unretrieved-exception callbacks NOW
+        # Drain loop turns + gc so any unretrieved-exception callback fires
+        # NOW (fixed loop yields, not a wall-clock guess).
+        for _ in range(10):
+            await asyncio.sleep(0)
+            gc.collect()
         assert contexts == [], f"asyncio reported: {contexts!r}"
         assert _no_leaked_tasks() == []
         await chain.aclose()

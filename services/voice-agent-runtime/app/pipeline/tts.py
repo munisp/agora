@@ -106,6 +106,21 @@ def _wav_to_pcm(wav_bytes: bytes) -> tuple[bytes, int]:
     return frames, rate
 
 
+def _retrieve_prefetch_error(task: asyncio.Task) -> None:
+    """Retrieve (discard) a cancelled-prefetch task's exception, if any.
+
+    Attached as a done callback when stream_pcm's early-exit path cancels a
+    still-pending prefetch: cancellation is only a request, and a coroutine
+    that raises before the CancelledError is delivered finishes with that
+    exception — retrieving it here keeps asyncio from logging "Task exception
+    was never retrieved" (SPEC-W74 A2, ported locally per SPEC-W75 A1; the
+    chain helper cannot be imported here because tts_providers.chain imports
+    pipeline.tts — circular).
+    """
+    if not task.cancelled():
+        task.exception()
+
+
 class PiperTTS:
     def __init__(
         self,
@@ -246,6 +261,11 @@ class PiperTTS:
                 # retrieved so asyncio does not log "never retrieved".
                 if not next_task.done():
                     next_task.cancel()
+                    # cancel() is only a REQUEST: if the coroutine raises on
+                    # its own before the CancelledError is delivered, the task
+                    # finishes with that exception (not cancelled) — retrieve
+                    # it via a done callback so it is never "never retrieved".
+                    next_task.add_done_callback(_retrieve_prefetch_error)
                 elif not next_task.cancelled():
                     next_task.exception()
         if parts:

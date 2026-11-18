@@ -476,6 +476,9 @@ def create_app(
             hop_s=settings.stt_stream_hop_s,
             silence_ms=settings.stt_stream_silence_ms,
             max_buffer_s=settings.stt_stream_max_buffer_s,
+            # SPEC-W75 B3: observe every hop's recognizer latency into the
+            # voice_stt_stream_hop_seconds histogram.
+            on_hop_timing=metrics.get_registry().stt_stream_hop.observe,
         )
         await websocket.send_json(
             {
