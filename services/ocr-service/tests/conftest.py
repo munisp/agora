@@ -435,6 +435,36 @@ class _RegistryScope:
             return "DELETE 0"
         return "DELETE 1"
 
+    # SPEC-W76: TTL reconciler fakes (lockstep with app.registry).
+    def _expire_memberships(self, cutoff) -> list[dict[str, Any]]:
+        """SQL_EXPIRE_MEMBERSHIPS: age filter on the membership's own
+        immutable first_seen (< cutoff); RETURNING registry_key."""
+        doomed = [
+            mk for mk, m in self.db.registry_members.items()
+            if m["first_seen"] < cutoff
+        ]
+        out = [{"registry_key": self.db.registry_members[mk]["registry_key"]} for mk in doomed]
+        for mk in doomed:
+            del self.db.registry_members[mk]
+        return out
+
+    def _drift_sweep(self) -> list[dict[str, Any]]:
+        """SQL_DRIFT_SWEEP: parents that are empty (zero memberships) OR
+        whose cached tenant_count disagrees with the real count."""
+        out = []
+        for key in sorted(self.db.registry_keys):
+            parent = self.db.registry_keys[key]
+            real = sum(1 for k, _t in self.db.registry_members if k == key)
+            if real == 0 or parent["tenant_count"] != real:
+                out.append(
+                    {
+                        "registry_key": key,
+                        "tenant_count": parent["tenant_count"],
+                        "real_count": real,
+                    }
+                )
+        return out
+
     # --- asyncpg-shaped verbs, dispatched on the app.registry constants ---
     async def fetchrow(self, sql: str, *args):
         if _norm_sql(sql) == _norm_sql(registry_module.SQL_UPSERT_PARENT):
@@ -452,6 +482,10 @@ class _RegistryScope:
             return self._other_tenants(args[0], args[1])
         if _norm_sql(sql) == _norm_sql(registry_module.SQL_DELETE_TENANT_MEMBERSHIPS):
             return self._delete_tenant_memberships(args[0])
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_EXPIRE_MEMBERSHIPS):
+            return self._expire_memberships(args[0])
+        if _norm_sql(sql) == _norm_sql(registry_module.SQL_DRIFT_SWEEP):
+            return self._drift_sweep()
         raise AssertionError(f"unexpected registry SQL (fetch): {sql!r}")
 
     async def execute(self, sql: str, *args) -> str:

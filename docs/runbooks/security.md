@@ -296,7 +296,8 @@ phash EXCLUDED from every cross-tenant artifact.
    subject erasure leaves the registry untouched BY DESIGN (no subject
    linkage — tombstone audit-hash precedent); per-document TTL expiry does
    not decrement memberships (accepted residual: stale count => possible
-   alert needing human triage, never a disclosure).
+   alert needing human triage, never a disclosure); memberships expire at
+   `OCR_REGISTRY_TTL_DAYS` via the TTL-membership reconciler (§7.4).
 7. **HMAC posture.** `OCR_REGISTRY_HMAC_SECRET` fail-closed
    (KYC_HASH_SECRET idiom): unset => registry DISABLED (one startup log
    line; upserts skipped). Rotation = re-key backfill (§7.3).
@@ -383,7 +384,39 @@ place; that is the point of HMAC keying).
 8. Destroy the old secret material everywhere (it can no longer verify
    anything once step 4 lands).
 
-### 7.4 Verification battery
+### 7.4 TTL-membership reconciler (SPEC-W76)
+
+A background loop in ocr-service expires registry memberships whose
+`first_seen` is older than **`OCR_REGISTRY_TTL_DAYS`** (default **180**
+days), then drops parent keys left with zero memberships (recount-verified)
+and repairs drifted `tenant_count` by re-count (`doc_count` is cumulative
+history — NEVER rewritten). Expiry is age-keyed, never hash-keyed, so the
+reconciler runs even when `OCR_REGISTRY_HMAC_SECRET` is unset.
+
+- **Cadence:** `OCR_REGISTRY_RECONCILE_MINUTES` (default 60). Set to `0` to
+  disable the loop (same idiom as `RECON_SWEEP_MINUTES`);
+  `OCR_REGISTRY_TTL_DAYS` must be >= 1.
+- **Metrics** (Prometheus counters, per run):
+  - `opendesk_ocr_registry_ttl_memberships_expired_total` — memberships
+    deleted for exceeding the TTL. Expect a burst on the first run after
+    enabling against an old registry, then a low steady rate.
+  - `opendesk_ocr_registry_ttl_keys_dropped_total` — parent fingerprint rows
+    dropped because their last membership left. Normally tracks the expired
+    count minus keys with surviving memberships.
+  - `opendesk_ocr_registry_ttl_drift_repaired_total` — parent rows whose
+    stored `tenant_count` disagreed with the real membership count and was
+    rewritten. **> 0 means drift existed** (e.g. a crashed write left the
+    counter stale); an occasional small increment is self-healing, but a
+    sustained nonzero rate means the write path is leaking drift —
+    investigate the ocr-service logs around the increments.
+- **Alert meaning (intended re-alert, R4):** an expired membership that
+  re-uploads later is a NEW membership (`alerted=false`) and MAY alert again
+  — the stale protection had lapsed, so a fresh
+  `cross_tenant_exact_duplicate` S4 after 180+ quiet days is correct, not a
+  duplicate. D9 MERGE dedup still absorbs replays within the membership's
+  lifetime.
+
+### 7.5 Verification battery
 
 `services/ocr-service/tests/test_w67_zero_disclosure.py` (zero-disclosure,
 timing/oracle invariance, idempotency incl. same-hash race, erasure

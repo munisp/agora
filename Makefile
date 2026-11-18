@@ -1,4 +1,4 @@
-.PHONY: up up-voice down logs ps config smoke seed topics dbt trino eval ab-test loadtest-voice validate-packs install-pack clean
+.PHONY: up up-voice down logs ps config smoke seed topics dbt trino eval ab-test bench-voice loadtest-voice validate-packs install-pack clean
 
 up:            ## Full platform (middleware + services + web)
 	docker compose up -d --build
@@ -48,6 +48,9 @@ eval:          ## Voice agent eval harness (scenarios -> /voice/chat + LLM judge
 
 ab-test:       ## A/B persona eval (needs EVAL_PERSONA_OVERRIDE=true runtime): make ab-test AB_ARGS="--tenant acme --persona-b services/voice-agent-runtime/eval/personas/salon_warm_concise.md [--promote]"
 	python3 services/voice-agent-runtime/eval/ab_test.py $(AB_ARGS)
+
+bench-voice:   ## Offline voice stage-latency bench (SPEC-W73; default needs no sidecars): make bench-voice BENCH_ARGS="--iterations 50 --json bench.json --md bench.md [--live]"
+	python3 services/voice-agent-runtime/eval/latency_bench.py $(BENCH_ARGS)
 
 loadtest-voice: ## Voice load ramp 5->10->25->50 (needs live stack: make up-voice; see tests/load/README.md)
 	python3 tests/load/voice_ramp.py $(LOADTEST_ARGS)

@@ -182,6 +182,15 @@ async def lifespan(app: FastAPI):
                 deps.db, deps.objects, interval_minutes=settings.kyc_sweep_minutes
             )
         )
+    # SPEC-W76 R2/R3: TTL-membership reconciler for the cross-tenant
+    # registry. Age-keyed deletes (NO HMAC) — runs INDEPENDENT of the
+    # registry HMAC posture (memberships could predate a rotation/unset);
+    # 0 minutes disables. Task is cancelled in the shutdown path.
+    reconcile_task: asyncio.Task | None = None
+    if settings.registry_reconcile_minutes > 0:
+        reconcile_task = asyncio.create_task(
+            registry.registry_reconcile_loop(deps.db, settings)
+        )
     log.info(
         "service.started",
         port=settings.port,
@@ -190,6 +199,8 @@ async def lifespan(app: FastAPI):
         bucket=settings.minio_bucket,
         kyc_ttl_hours=settings.kyc_ttl_hours,
         kyc_sweep_minutes=settings.kyc_sweep_minutes,
+        registry_ttl_days=settings.registry_ttl_days,
+        registry_reconcile_minutes=settings.registry_reconcile_minutes,
         av_enabled=deps.av is not None,
     )
     try:
@@ -198,6 +209,8 @@ async def lifespan(app: FastAPI):
         log.info("service.shutting_down")
         if sweep_task is not None:
             sweep_task.cancel()
+        if reconcile_task is not None:
+            reconcile_task.cancel()
         if deps.av is not None:
             await deps.av.aclose()
         await deps.dapr.aclose()

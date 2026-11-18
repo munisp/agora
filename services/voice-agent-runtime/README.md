@@ -141,6 +141,8 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `PIPER_VOICE` | `en_US-lessac-medium` | voice model name |
 | `PIPER_BIN` / `PIPER_MODEL_DIR` | `piper` / `/voices` | subprocess mode: binary + model dir |
 | `PIPER_SAMPLE_RATE` | `22050` | expected PCM rate |
+| `COSYVOICE_TTS_URL` | `http://cosyvoice-tts:5820` | W72: CosyVoice-2 sidecar URL (Apache-2.0, consent-gated voice cloning); add `cosyvoice` to `TTS_PROVIDER_CHAIN` to route voices to it — see [docs/voices-sidecars.md](../../docs/voices-sidecars.md) |
+| `QWEN3_TTS_URL` / `QWEN3_TTS_MODEL` / `QWEN3_TTS_VOICE` / `QWEN3_TTS_LANGUAGE` / `QWEN3_TTS_TIMEOUT_S` | `http://qwen3-tts:8000` / `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `ryan` / `english` / `30` | W74: Qwen3-TTS (nari) GPU-tier provider — OpenAI-shaped `POST /v1/audio/speech` to the published image (opt-in `voice-gpu` compose profile; **requires NVIDIA H100**; English-primary only). Add `qwen3` to `TTS_PROVIDER_CHAIN` to enable — see [docs/voices-sidecars.md](../../docs/voices-sidecars.md) |
 | `AGENT_BACKEND` | `livekit` | `livekit` or `elevenlabs` |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_AGENT_ID` | _(unset)_ | elevenlabs backend |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |
@@ -276,6 +278,23 @@ everything out of the box.
 |---|---|---|---|
 | **default** (CPU dev) | `base` (or `small`) | _(unset)_ | single fast model for every language |
 | Nigerian production (GPU) | `small` | `large-v3-turbo` | English stays on the fast model; yo/ig/ha and other non-English turns route to the accuracy tier |
+
+### TTS provider routing (SPEC-W10 / SPEC-W72)
+
+| Provider | Chain name | Config | Use |
+|---|---|---|---|
+| Piper sidecar | `piper` | `PIPER_HTTP_URL` | default; last-resort fallback |
+| Meta MMS sidecar | `mms` | `MMS_TTS_URL` | yo/ig/ha/pcm dev/eval (CC-BY-NC — non-commercial) |
+| Coqui XTTS-v2 sidecar | `xtts` | `XTTS_TTS_URL` | brand-voice cloning (non-commercial weights; GPU) |
+| CosyVoice-2 sidecar | `cosyvoice` | `COSYVOICE_TTS_URL` (`http://cosyvoice-tts:5820`) | W72: **Apache-2.0, commercial-safe** consent-gated cloning — recommended path for owned Nigerian voices (GPU for real inference; mock default) |
+| Qwen3-TTS (nari) GPU server | `qwen3` | `QWEN3_TTS_URL` (`http://qwen3-tts:8000`), `QWEN3_TTS_MODEL` / `QWEN3_TTS_VOICE` (`ryan`) / `QWEN3_TTS_LANGUAGE` (`english`) / `QWEN3_TTS_TIMEOUT_S` | W74: **Apache-2.0** GPU-tier (nari-labs/nari-qwen3-tts; **requires NVIDIA H100**; opt-in compose profile `voice-gpu`). **Tested with English as the primary language only — NOT a Nigerian-language path** |
+| Azure Speech | `azure` | `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | hosted en-NG neural voices |
+| Spitch | `spitch` | `SPITCH_API_KEY` | hosted yo/ha/ig voices |
+
+Set `TTS_PROVIDER_CHAIN` (e.g. `cosyvoice,piper`) and route languages with
+`TTS_VOICE_MAP` provider-qualified ids (e.g. `{"pcm": "cosyvoice:<voice_id>"}`).
+Licensing posture: [docs/voice-licensing.md](../../docs/voice-licensing.md);
+sidecar contracts: [docs/voices-sidecars.md](../../docs/voices-sidecars.md).
 
 `condition_on_previous_text=False` is hard-set on every transcribe call
 (kills whisper repetition/hallucination loops on noisy telephony audio).

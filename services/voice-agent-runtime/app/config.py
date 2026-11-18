@@ -139,6 +139,33 @@ class Settings:
     stt_stream_silence_ms: int = 700
     stt_stream_max_buffer_s: float = 8.0
 
+    # SPEC-W73 A1: dead-mic detection (app/dead_mic.py). Per-session
+    # asyncio watchdog started after the greeting is queued: no user speech
+    # within voice_dead_mic_first_prompt_s -> a short "check your
+    # microphone" re-prompt is spoken; still silent after
+    # voice_dead_mic_second_prompt_s -> polite closer + the session is
+    # ended via room disconnect when voice_dead_mic_hangup_enabled. ANY
+    # user speech activity resets the watchdog to zero. Defaults are ON but
+    # conservative (12s/10s), preserving pre-W73 session behavior.
+    voice_dead_mic_enabled: bool = True
+    voice_dead_mic_first_prompt_s: float = 12.0
+    voice_dead_mic_second_prompt_s: float = 10.0
+    voice_dead_mic_hangup_enabled: bool = True
+
+    # SPEC-W73 A2: pre-rendered greetings (app/greeting_prerender.py). At
+    # worker boot (and in each warm job process) the greeting of every
+    # tenant slug in voice_greeting_prerender_tenants (csv) is synthesized
+    # through the real TTS chain so the session-path greeting is a TTS LRU
+    # cache hit. Empty tenant list = boot prerender is a no-op (honest
+    # fallback: there is no tenant-enumeration seam to reuse). Per-tenant
+    # failures are non-fatal; total boot delay is bounded by
+    # voice_greeting_prerender_timeout_s (on timeout the worker boots with
+    # the partially warmed cache).
+    voice_greeting_prerender_enabled: bool = True
+    voice_greeting_prerender_tenants: str = ""
+    voice_greeting_prerender_concurrency: int = 4
+    voice_greeting_prerender_timeout_s: float = 30.0
+
     # TTS (piper): http sidecar or local subprocess
     piper_mode: str = "http"  # http|subprocess
     piper_http_url: str = "http://piper:5500"
@@ -306,6 +333,18 @@ class Settings:
     # Per-language naija-speech voices for the other Nigerian languages, "yo=yoruba_male1,ig=igbo_male2" (unset
     # languages: the service's default voice for that language).
     naija_language_voices: dict = field(default_factory=dict)
+    cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
+    # SPEC-W74 A1: Qwen3-TTS (nari-labs/nari-qwen3-tts) GPU-tier provider —
+    # the published image IS the sidecar (OpenAI-shaped /v1/audio/speech).
+    # Requires an NVIDIA H100; engine tested with English as the primary
+    # language ONLY (NOT a Nigerian-language path — see
+    # docs/voices-sidecars.md + docs/voice-licensing.md). Opt-in via
+    # TTS_PROVIDER_CHAIN + the "voice-gpu" compose profile.
+    qwen3_tts_url: str = "http://qwen3-tts:8000"
+    qwen3_tts_model: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    qwen3_tts_voice: str = "ryan"
+    qwen3_tts_language: str = "english"
+    qwen3_tts_timeout_s: float = 30.0
     azure_speech_key: str = ""
     azure_speech_region: str = ""
     spitch_api_key: str = ""
@@ -386,6 +425,23 @@ def load_settings() -> Settings:
         stt_stream_hop_s=float(os.environ.get("STT_STREAM_HOP_S", "0.25")),
         stt_stream_silence_ms=_env_int("STT_STREAM_SILENCE_MS", 700),
         stt_stream_max_buffer_s=float(os.environ.get("STT_STREAM_MAX_BUFFER_S", "8")),
+        voice_dead_mic_enabled=_env("VOICE_DEAD_MIC_ENABLED", "1").lower()
+        not in ("0", "false", "no"),
+        voice_dead_mic_first_prompt_s=_env_float("VOICE_DEAD_MIC_FIRST_PROMPT_S", 12.0),
+        voice_dead_mic_second_prompt_s=_env_float("VOICE_DEAD_MIC_SECOND_PROMPT_S", 10.0),
+        voice_dead_mic_hangup_enabled=_env("VOICE_DEAD_MIC_HANGUP_ENABLED", "1").lower()
+        not in ("0", "false", "no"),
+        voice_greeting_prerender_enabled=_env(
+            "VOICE_GREETING_PRERENDER_ENABLED", "1"
+        ).lower()
+        not in ("0", "false", "no"),
+        voice_greeting_prerender_tenants=_env("VOICE_GREETING_PRERENDER_TENANTS", ""),
+        voice_greeting_prerender_concurrency=_env_int(
+            "VOICE_GREETING_PRERENDER_CONCURRENCY", 4
+        ),
+        voice_greeting_prerender_timeout_s=_env_float(
+            "VOICE_GREETING_PRERENDER_TIMEOUT_S", 30.0
+        ),
         piper_mode=_env("PIPER_MODE", "http"),
         piper_http_url=_env("PIPER_HTTP_URL", "http://piper:5500"),
         piper_voice=_env("PIPER_VOICE", "en_US-lessac-medium"),
@@ -446,6 +502,12 @@ def load_settings() -> Settings:
         call_languages=_env("CALL_LANGUAGES", "en,pcm,yo,ha,ig"),
         naija_english_voice=_env("NAIJA_ENGLISH_VOICE", "").strip(),
         naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
+        cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
+        qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
+        qwen3_tts_model=_env("QWEN3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+        qwen3_tts_voice=_env("QWEN3_TTS_VOICE", "ryan"),
+        qwen3_tts_language=_env("QWEN3_TTS_LANGUAGE", "english"),
+        qwen3_tts_timeout_s=_env_float("QWEN3_TTS_TIMEOUT_S", 30.0),
         azure_speech_key=_env("AZURE_SPEECH_KEY", ""),
         azure_speech_region=_env("AZURE_SPEECH_REGION", ""),
         spitch_api_key=_env("SPITCH_API_KEY", ""),

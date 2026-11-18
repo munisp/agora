@@ -135,7 +135,29 @@ extraction never auto-verifies. NDPA 2023 principle mapping:
   memberships** (membership is per-tenant, not per-document). A stale
   membership can raise `tenant_count` for a hash whose original rows expired —
   the impact is a possible alert needing human triage, NEVER a disclosure.
-  Accepted; optional follow-up reconciler.
+  Accepted; bounded by the TTL-membership reconciler below (SPEC-W76).
+
+### Cross-tenant registry — TTL membership retention (SPEC-W76)
+
+Memberships expire when their `first_seen` is older than
+**`OCR_REGISTRY_TTL_DAYS`** (default **180** days); a reconciler runs every
+**`OCR_REGISTRY_RECONCILE_MINUTES`** (default 60; `0` = disabled). Expiry is
+**age-keyed, never hash-keyed**, so it runs even when
+`OCR_REGISTRY_HMAC_SECRET` is unset; it is zero schema change (it reads the
+existing `first_seen` column — no DDL edits). Parent fingerprint keys whose
+last membership expired are dropped (recount-verified); drifted
+`tenant_count` values are repaired by re-count, while `doc_count` (cumulative
+history) is NEVER rewritten.
+
+- **Data minimization / storage limitation:** without a TTL, a fingerprint
+  shared once — years ago — would flag forever, and the pseudonymous
+  cross-tenant linkage would outlive any conceivable fraud-prevention need.
+  The 180d membership TTL bounds how long a tenant's linkage to a
+  cross-tenant fingerprint is retained, shrinking the registry's live
+  exposure in step with the 72h document-level TTL above.
+- **Re-alert semantics (intended):** an expired membership that re-uploads
+  later is a NEW membership (`alerted=false`) and MAY alert again — the
+  stale protection had lapsed, so a fresh alert is correct, not a duplicate.
 
 ### Lawful basis — PRE-DEPLOY gate (SPEC-W67 G1, RECON §3.2/§4 gate 8)
 

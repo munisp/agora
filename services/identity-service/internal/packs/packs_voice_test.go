@@ -76,6 +76,58 @@ func TestValidateVoice(t *testing.T) {
 	}
 }
 
+// SPEC-W72: "cosyvoice" (CosyVoice-2 sidecar, Apache-2.0 commercial-safe)
+// joins the voice provider enum. Kept in sync with scripts/validate_pack.py:
+// "cosyvoice:naija-1" must pass both validators, "badprov:x" must fail both.
+func TestValidateVoiceCosyvoice(t *testing.T) {
+	good := []string{
+		`voice: {provider: cosyvoice}`,
+		`voice: {provider: cosyvoice, voiceId: naija-1}`,
+		`voice: {provider: mms, languages: {pcm: "cosyvoice:naija-1", en: "azure:en-NG-EzinneNeural"}}`,
+	}
+	for i, body := range good {
+		if err := mustValidate(t, "\n"+body+"\n"); err != nil {
+			t.Fatalf("case %d: valid cosyvoice voice rejected: %v", i, err)
+		}
+	}
+	bad := []string{
+		`voice: {provider: badprov}`,
+		`voice: {provider: cosyvoice, languages: {pcm: "badprov:x"}}`,
+		`voice: {provider: mms, languages: {pcm: "cosyvoice:"}}`,
+	}
+	for i, body := range bad {
+		if err := mustValidate(t, "\n"+body+"\n"); err == nil {
+			t.Fatalf("case %d: expected validation error", i)
+		}
+	}
+}
+
+// SPEC-W74: "qwen3" (nari Qwen3-TTS sidecar, GPU-tier provider) joins the
+// voice provider enum. Kept in sync with scripts/validate_pack.py:
+// "qwen3:ryan" must pass both validators, "badprov:x" must fail both.
+func TestValidateVoiceQwen3(t *testing.T) {
+	good := []string{
+		`voice: {provider: qwen3}`,
+		`voice: {provider: qwen3, voiceId: ryan}`,
+		`voice: {provider: mms, languages: {en: "qwen3:ryan", pcm: "mms:pcm"}}`,
+	}
+	for i, body := range good {
+		if err := mustValidate(t, "\n"+body+"\n"); err != nil {
+			t.Fatalf("case %d: valid qwen3 voice rejected: %v", i, err)
+		}
+	}
+	bad := []string{
+		`voice: {provider: badprov}`,
+		`voice: {provider: qwen3, languages: {en: "badprov:x"}}`,
+		`voice: {provider: mms, languages: {en: "qwen3:"}}`,
+	}
+	for i, body := range bad {
+		if err := mustValidate(t, "\n"+body+"\n"); err == nil {
+			t.Fatalf("case %d: expected validation error", i)
+		}
+	}
+}
+
 func TestPacksWithoutVoiceStillValidate(t *testing.T) {
 	if err := mustValidate(t, ""); err != nil {
 		t.Fatalf("pack without voice must validate: %v", err)

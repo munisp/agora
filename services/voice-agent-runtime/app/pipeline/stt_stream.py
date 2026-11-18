@@ -21,13 +21,37 @@ no model download required.
 Backpressure: undrained input is bounded at ``max_buffer_s`` seconds of
 audio (default 8s); ``feed`` raises ``BackpressureError`` past the bound
 and the endpoint closes the socket with code 1008 + reason.
+
+SPEC-W73 (WS-C): the rolling-window parameters are env-tunable. They are
+read from ``os.environ`` at ENGINE CONSTRUCTION (``StreamingSTTEngine
+.__init__``), never at import time:
+
+- ``STT_STREAM_WINDOW_S``      -> ``window_s``      (default 1.0)
+- ``STT_STREAM_HOP_S``         -> ``hop_s``         (default 0.25)
+- ``STT_STREAM_SILENCE_MS``    -> ``silence_ms``    (default 700)
+- ``STT_STREAM_MAX_BUFFER_S``  -> ``max_buffer_s``  (default 8.0)
+
+Precedence: explicit constructor kwargs > env > the defaults above
+(byte-identical to the pre-W73 hardcoded behavior). Bounds are validated
+with a clear ``ValueError``: ``window_s > 0``, ``hop_s > 0``,
+``hop_s <= window_s``, ``silence_ms >= 0``, ``max_buffer_s > 0``.
+``SILENCE_RMS_THRESHOLD`` and ``MAX_SEGMENT_S`` remain fixed constants.
+
+SPEC-W75 (WS-B): an optional ``on_hop_timing`` hook observes the wall-clock
+seconds of every recognizer call — each interim hop's rolling-window
+re-transcription AND the final-segment transcription — so the control
+plane can feed the ``voice_stt_stream_hop_seconds`` histogram. The hook is
+keyword-only, defaults to None (zero behavior change), and its exceptions
+are swallowed (logged once) so a metrics hook never breaks the stream.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from collections import deque
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import numpy as np
 
@@ -50,6 +74,40 @@ SILENCE_RMS_THRESHOLD = 0.01
 #: pathological non-stop stream cannot grow the segment buffer unboundedly.
 MAX_SEGMENT_S = 30.0
 
+#: SPEC-W73 (WS-C) defaults for the env-tunable rolling-window parameters.
+#: These are byte-identical to the pre-W73 hardcoded constructor defaults;
+#: env overrides (read at engine construction, never at import) sit between
+#: explicit constructor kwargs and these values.
+DEFAULT_WINDOW_S = 1.0
+DEFAULT_HOP_S = 0.25
+DEFAULT_SILENCE_MS = 700
+DEFAULT_MAX_BUFFER_S = 8.0
+
+ENV_WINDOW_S = "STT_STREAM_WINDOW_S"
+ENV_HOP_S = "STT_STREAM_HOP_S"
+ENV_SILENCE_MS = "STT_STREAM_SILENCE_MS"
+ENV_MAX_BUFFER_S = "STT_STREAM_MAX_BUFFER_S"
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+
 
 class BackpressureError(RuntimeError):
     """Raised by feed() when undrained input exceeds the buffer bound."""
@@ -62,6 +120,14 @@ class StreamingSTTEngine:
     ``process_pending`` (from the sender loop) run on the same loop, so no
     locks are needed. All timestamps are seconds of audio consumed since
     stream start.
+
+    SPEC-W75 (WS-B) ``on_hop_timing``: optional callable invoked with the
+    elapsed wall-clock seconds (``time.perf_counter``) of EVERY recognizer
+    call — each interim hop's rolling-window re-transcription in
+    ``_process_hop`` AND the final-segment transcription in
+    ``_emit_final`` (endpointed and disconnect-flush finals alike). Hook
+    exceptions are swallowed (logged once per engine); default None keeps
+    pre-W75 behavior exactly.
     """
 
     def __init__(
@@ -69,24 +135,59 @@ class StreamingSTTEngine:
         recognizer: STTInterface,
         *,
         sample_rate: int = 16000,
-        window_s: float = 1.0,
-        hop_s: float = 0.25,
-        silence_ms: int = 700,
-        max_buffer_s: float = 8.0,
+        window_s: float | None = None,
+        hop_s: float | None = None,
+        silence_ms: int | None = None,
+        max_buffer_s: float | None = None,
+        on_hop_timing: Callable[[float], None] | None = None,
     ) -> None:
+        # SPEC-W73 (WS-C): None means "not explicitly passed" -> fall back
+        # to the env var (read HERE, at construction, never at import) and
+        # then to the module default. Explicit kwargs always win.
+        if window_s is None:
+            window_s = _env_float(ENV_WINDOW_S, DEFAULT_WINDOW_S)
+        if hop_s is None:
+            hop_s = _env_float(ENV_HOP_S, DEFAULT_HOP_S)
+        if silence_ms is None:
+            silence_ms = _env_int(ENV_SILENCE_MS, DEFAULT_SILENCE_MS)
+        if max_buffer_s is None:
+            max_buffer_s = _env_float(ENV_MAX_BUFFER_S, DEFAULT_MAX_BUFFER_S)
+
         if sample_rate <= 0:
-            raise ValueError("sample_rate must be positive")
-        if window_s <= 0 or hop_s <= 0:
-            raise ValueError("window_s and hop_s must be positive")
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+        if window_s <= 0:
+            raise ValueError(f"window_s must be > 0, got {window_s}")
+        if hop_s <= 0:
+            raise ValueError(f"hop_s must be > 0, got {hop_s}")
+        if hop_s > window_s:
+            raise ValueError(
+                f"hop_s must be <= window_s, got hop_s={hop_s} > window_s={window_s}"
+            )
+        if silence_ms < 0:
+            raise ValueError(f"silence_ms must be >= 0, got {silence_ms}")
+        # W73 deviation (orchestrator-sanctioned): the buffer bound stays the
+        # pre-W73 `> 0` check, NOT `>= hop_s` — a tighter-than-hop buffer is
+        # a legitimate backpressure configuration (feed() overflows sooner)
+        # and is exercised by the WS 1008 backpressure path.
         if max_buffer_s <= 0:
-            raise ValueError("max_buffer_s must be positive")
+            raise ValueError(f"max_buffer_s must be > 0, got {max_buffer_s}")
         self._recognizer = recognizer
         self._sample_rate = sample_rate
         self._bytes_per_s = sample_rate * 2  # mono PCM16
+        self._window_s = window_s
+        self._hop_s = hop_s
+        self._silence_ms = silence_ms
+        self._max_buffer_s = max_buffer_s
         self._window_bytes = max(1, int(window_s * self._bytes_per_s))
         self._hop_bytes = max(2, int(hop_s * self._bytes_per_s))
         self._silence_s = max(0, silence_ms) / 1000.0
         self._max_buffer_bytes = max(2, int(max_buffer_s * self._bytes_per_s))
+        # SPEC-W75 (WS-B): optional per-hop timing observer (elapsed seconds
+        # of each recognizer call). Keyword-only, default None = zero
+        # behavior change. Wired in app/control_plane.py to the
+        # voice_stt_stream_hop_seconds histogram.
+        self._on_hop_timing = on_hop_timing
+        self._hop_timing_hook_warned = False  # log hook failures once
 
         self._pending: deque[bytes] = deque()  # fed, not yet consumed
         self._pending_bytes = 0
@@ -102,6 +203,26 @@ class StreamingSTTEngine:
     @property
     def capabilities(self) -> dict[str, bool]:
         return dict(STREAMING_STT_CAPABILITIES)
+
+    @property
+    def window_s(self) -> float:
+        """Resolved rolling-window length (kwargs > env > default)."""
+        return self._window_s
+
+    @property
+    def hop_s(self) -> float:
+        """Resolved hop between interim transcriptions."""
+        return self._hop_s
+
+    @property
+    def silence_ms(self) -> int:
+        """Resolved trailing-silence endpointing threshold (ms)."""
+        return self._silence_ms
+
+    @property
+    def max_buffer_s(self) -> float:
+        """Resolved undrained-input backpressure bound."""
+        return self._max_buffer_s
 
     @property
     def finished(self) -> bool:
@@ -160,13 +281,34 @@ class StreamingSTTEngine:
         return None
 
     async def _transcribe(self, pcm: bytes | bytearray) -> str:
+        # SPEC-W75 (WS-B): this is THE recognizer-call wrapper, used by both
+        # the interim hop loop (_process_hop) and the final-segment
+        # transcription (_emit_final), so timing it here covers both.
+        start = time.perf_counter()
         try:
-            return await self._recognizer.transcribe_pcm(
+            text = await self._recognizer.transcribe_pcm(
                 bytes(pcm), sample_rate=self._sample_rate, channels=1
             )
         except Exception as exc:  # noqa: BLE001 - never kill the stream
             log.warning("stream transcription failed", error=str(exc)[:200])
-            return ""
+            text = ""
+        self._report_hop_timing(time.perf_counter() - start)
+        return text
+
+    def _report_hop_timing(self, elapsed_s: float) -> None:
+        """SPEC-W75 (WS-B): hand the elapsed recognizer seconds to the
+        optional on_hop_timing hook. A metrics hook NEVER breaks the
+        stream: exceptions are swallowed and logged once (the hook keeps
+        being called for later hops). No-op when no hook is configured."""
+        hook = self._on_hop_timing
+        if hook is None:
+            return
+        try:
+            hook(elapsed_s)
+        except Exception as exc:  # noqa: BLE001 - metrics must not kill audio
+            if not self._hop_timing_hook_warned:
+                self._hop_timing_hook_warned = True
+                log.warning("stt hop-timing hook raised", error=str(exc)[:200])
 
     async def process_pending(self) -> list[dict[str, Any]]:
         """Consume all complete hops currently available; return events."""
