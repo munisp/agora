@@ -355,6 +355,18 @@ class Settings:
     agent_backend: str = "livekit"  # livekit|elevenlabs
     elevenlabs_api_key: str = ""
     elevenlabs_agent_id: str = ""
+    # SPEC-W93: ElevenLabs native DTMF input provisioning. On the hosted
+    # backend the caller's keypad digits are collected by ElevenLabs itself
+    # (out-of-band RFC 4733 from Twilio/SIP-trunking) and delivered to the
+    # hosted agent as one user turn; these knobs are PATCHed onto the
+    # hosted agent's conversation_config.conversation.dtmf_input_settings
+    # at control-plane startup. REDACT defaults ON: typed codes (OTP /
+    # portal) must not persist in ElevenLabs stored transcripts (SPEC-W86
+    # digits-never-persisted invariant, extended to the hosted path).
+    elevenlabs_dtmf_enabled: bool = True
+    elevenlabs_dtmf_timeout_s: float = 2.0
+    elevenlabs_dtmf_hash_terminator: bool = True
+    elevenlabs_dtmf_redact: bool = True
 
     # Avatar presence (SPEC-W9 Part A, app/avatar/): which provider joins a
     # visual avatar into the LiveKit room after session mint. `none` (default)
@@ -656,6 +668,15 @@ def load_settings() -> Settings:
         agent_backend=_env("AGENT_BACKEND", "livekit"),
         elevenlabs_api_key=_env("ELEVENLABS_API_KEY", ""),
         elevenlabs_agent_id=_env("ELEVENLABS_AGENT_ID", ""),
+        elevenlabs_dtmf_enabled=_env("ELEVENLABS_DTMF_ENABLED", "1").lower()
+        in ("1", "true", "yes", "on"),
+        elevenlabs_dtmf_timeout_s=_env_float("ELEVENLABS_DTMF_TIMEOUT_S", 2.0),
+        elevenlabs_dtmf_hash_terminator=_env(
+            "ELEVENLABS_DTMF_HASH_TERMINATOR", "1"
+        ).lower()
+        in ("1", "true", "yes", "on"),
+        elevenlabs_dtmf_redact=_env("ELEVENLABS_DTMF_REDACT", "1").lower()
+        in ("1", "true", "yes", "on"),
         avatar_provider=_env("AVATAR_PROVIDER", "none"),
         tavus_api_key=_env("TAVUS_API_KEY", ""),
         tavus_replica_id=_env("TAVUS_REPLICA_ID", ""),

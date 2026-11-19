@@ -206,6 +206,20 @@ def create_app(
         if elevenlabs is not None:
             await elevenlabs.aclose()
 
+    if elevenlabs is not None:
+
+        @app.on_event("startup")
+        async def _sync_elevenlabs_dtmf() -> None:
+            """SPEC-W93: converge the hosted agent's native DTMF input
+            settings with our config. BEST-EFFORT: voice must keep working
+            when the ElevenLabs control plane is unreachable, so any
+            failure is a warning, never a startup abort."""
+            try:
+                result = await elevenlabs.sync_dtmf_input()
+                log.info("elevenlabs dtmf provisioning", status=result.get("status"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("elevenlabs dtmf provisioning failed", error=str(exc)[:200])
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         return {

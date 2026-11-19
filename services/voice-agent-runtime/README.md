@@ -108,6 +108,18 @@ orchestration to ElevenLabs ConvAI: `/voice/session` returns a signed URL and
 hosted tool calls are passed through `/voice/elevenlabs/tools` into the same
 ToolLayer, so the phone policy and Dapr command flow are unchanged.
 
+**DTMF on the ElevenLabs backend (SPEC-W93).** Keypad digits are collected
+natively by ElevenLabs (out-of-band RFC 4733 from Twilio/SIP-trunking) and
+relayed to the hosted agent as one user turn — they never transit this
+runtime. At startup the control plane PATCHes the hosted agent's
+`conversation_config.conversation.dtmf_input_settings` to converge with the
+`ELEVENLABS_DTMF_*` env vars below (best-effort: a provisioning failure logs
+a warning and never blocks startup). `read_keypad_entry` on this backend
+answers `keypad_native` — instructing the agent to take the digits from the
+caller's next message and pass them to `verify_caller_code` — instead of
+`keypad_unavailable`. `ELEVENLABS_DTMF_REDACT` defaults ON so typed codes
+stay out of ElevenLabs stored transcripts.
+
 ## Env vars
 
 | Var | Default | Description |
@@ -145,6 +157,10 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `QWEN3_TTS_URL` / `QWEN3_TTS_MODEL` / `QWEN3_TTS_VOICE` / `QWEN3_TTS_LANGUAGE` / `QWEN3_TTS_TIMEOUT_S` | `http://qwen3-tts:8000` / `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `ryan` / `english` / `30` | W74: Qwen3-TTS (nari) GPU-tier provider — OpenAI-shaped `POST /v1/audio/speech` to the published image (opt-in `voice-gpu` compose profile; **requires NVIDIA H100**; English-primary only). Add `qwen3` to `TTS_PROVIDER_CHAIN` to enable — see [docs/voices-sidecars.md](../../docs/voices-sidecars.md) |
 | `AGENT_BACKEND` | `livekit` | `livekit` or `elevenlabs` |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_AGENT_ID` | _(unset)_ | elevenlabs backend |
+| `ELEVENLABS_DTMF_ENABLED` | `1` | W93: provision native DTMF input on the hosted agent; `0` PATCHes `dtmf_input_settings` to null |
+| `ELEVENLABS_DTMF_TIMEOUT_S` | `2.0` | W93: inactivity timeout completing a digit sequence (clamped 0.5–10.0) |
+| `ELEVENLABS_DTMF_HASH_TERMINATOR` | `1` | W93: `#` completes the sequence immediately (not included in the digits) |
+| `ELEVENLABS_DTMF_REDACT` | `1` | W93: replace keypad turns with `<REDACTED>` in ElevenLabs stored transcripts |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |
 | `VOICE_TENANT_CTX_TTL_S` / `VOICE_TENANT_CTX_STALE_S` | `120` / `300` | W46 P1/P2: per-slug tenant-context cache fresh window / stale-while-error window (refresh failure serves the stale entry; no entry = error propagates as before) |
 | `BOOKING_BASE_URL` | `http://booking:7002` | W46 P-02: direct booking-service base for tool/tenant invokes (daprd invoke fallback on transport failure; empty = pure daprd). Distinct from `BOOKING_URL` (OTP verifier) |

@@ -489,6 +489,7 @@ class ToolLayer:
         ui_action_sink: list[dict[str, Any]] | None = None,
         verifier_factory: "Any | None" = None,
         dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
+        native_keypad: bool = False,
     ) -> None:
         self._dapr = dapr
         self._settings = settings
@@ -504,6 +505,11 @@ class ToolLayer:
         # worker for PSTN (SIP) calls only; None on every other channel —
         # read_keypad_entry then answers keypad_unavailable.
         self._dtmf_buffer = dtmf_buffer
+        # SPEC-W93: ElevenLabs hosted backend — ElevenLabs collects keypad
+        # digits natively (out-of-band) and relays them to the hosted agent
+        # as a user turn; read_keypad_entry reports keypad_native instead
+        # of keypad_unavailable. The LiveKit buffer always wins when set.
+        self._native_keypad = native_keypad
         # SPEC-W9 Part B: per-turn collector for validated UI actions. The
         # chat path injects a fresh list per turn; other callers (voice
         # worker, ElevenLabs) get a private one that is simply never read —
@@ -1017,6 +1023,28 @@ class ToolLayer:
         )
         buffer = self._dtmf_buffer
         if buffer is None:
+            if self._native_keypad:
+                # SPEC-W93: ElevenLabs backend — keypad digits are collected
+                # natively by ElevenLabs and arrive as the caller's NEXT
+                # MESSAGE (a completed user turn); they never transit this
+                # runtime, so there is nothing to wait for here. Tell the
+                # hosted agent the honest relay contract.
+                await self._emit_tool_event("read_keypad_entry", "keypad_native", {})
+                return {
+                    "status": "keypad_native",
+                    "message": (
+                        "On this phone platform keypad entry is collected "
+                        "natively: ask the caller to type the digits on "
+                        "their keypad (pressing # submits early). The "
+                        "digits arrive as the caller's next message — "
+                        "take them from there and pass them as the code "
+                        "to verify_caller_code."
+                    ),
+                    "channel": self._session.channel or "",
+                    "digits": "",
+                    "timeout_s": timeout,
+                    "expected_length": length,
+                }
             await self._emit_tool_event("read_keypad_entry", "keypad_unavailable", {})
             return {
                 "status": "keypad_unavailable",
