@@ -52,7 +52,7 @@
     {
       "id": "clinic",
       "version": "1.1.0",
-      "sha256": "6a4e80db039853f85553730b46409752659797bb65ed29a94e1a49125d47d0d0",
+      "sha256": "296623e0d3a73261d7568cce594603a59c7b834c423b8c2fb4813e3dc786bfd8",
       "author": "opendesk",
       "signature": null,
       "path": "clinic.yaml"

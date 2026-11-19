@@ -68,6 +68,11 @@ class TenantContext:
     # primary subtag); wins over the tenant identity locale as the
     # MultilangState default.
     pack_default_language: str = ""
+    # SPEC-W84: pack `stepUpPolicy.tools` per-tenant risk-tier overrides
+    # (validated tolerant by config.parse_pack_tool_tiers; consumed by
+    # ToolLayer._tool_tier with precedence over the env map, never below
+    # built-in floors).
+    pack_tool_tiers: dict[str, int] = field(default_factory=dict)
     # SPEC-W82 A4.5: pack `voice.lexicon` pronunciation entries
     # ({term: respell | {respell, ipa}}), parsed by
     # app/pronunciation.parse_lexicon; highest-precedence lexicon source.
@@ -160,6 +165,13 @@ def _apply_pack(ctx: TenantContext, tenant_payload: dict[str, Any]) -> None:
                 from .pronunciation import parse_lexicon
 
                 ctx.pack_pronunciation_lexicon = parse_lexicon(lexicon)
+        # SPEC-W84: pack stepUpPolicy.tools (shape-validated by identity;
+        # tolerant re-validation here at consumption, same as `languages`).
+        step_up = pack.get("stepUpPolicy")
+        if isinstance(step_up, dict):
+            from .config import parse_pack_tool_tiers
+
+            ctx.pack_tool_tiers = parse_pack_tool_tiers(step_up.get("tools"))
         i18n = pack.get("i18n")
         if isinstance(i18n, dict):
             from .multilang import normalize_language

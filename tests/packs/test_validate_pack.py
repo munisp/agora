@@ -378,3 +378,68 @@ def test_voice_rejects_bad_shapes():
     for voice, expected in cases:
         errs = vp.validate_pack(_with_voice(voice))
         assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+
+
+# ------------------------------------------------------- stepUpPolicy (SPEC-W84)
+def _with_stepup(policy):
+    doc = load("valid_minimal.yaml")
+    doc["stepUpPolicy"] = policy
+    return doc
+
+
+def test_stepup_valid_block_accepted():
+    assert vp.validate_pack(_with_stepup({"tools": {"book_appointment": 2}})) == []
+    assert vp.validate_pack(_with_stepup({"tools": {"plugin_tool": 0}})) == []
+    assert vp.validate_pack(_with_stepup(
+        {"tools": {"a": 0, "b": 1, "c": 2}})) == []
+
+
+def test_stepup_absent_accepted():
+    assert vp.validate_pack(load("valid_minimal.yaml")) == []
+
+
+def test_stepup_rejects_bad_shapes():
+    cases = [
+        ("not-a-mapping", "stepUpPolicy must be a mapping"),
+        ({}, "stepUpPolicy.tools is required and must be non-empty"),
+        ({"tools": {}}, "stepUpPolicy.tools is required and must be non-empty"),
+        ({"tools": {"bad-name": 1}}, "invalid tool name"),
+        ({"tools": {"9tool": 1}}, "invalid tool name"),
+        ({"tools": {"book_appointment": -1}}, "tier must be 0, 1 or 2"),
+        ({"tools": {"book_appointment": 3}}, "tier must be 0, 1 or 2"),
+        ({"tools": {"book_appointment": True}}, "tier must be 0, 1 or 2"),
+        ({"tools": {"book_appointment": "2"}}, "tier must be 0, 1 or 2"),
+        ({"tools": {"good_tool": 1, "bad name": 2}}, "invalid tool name"),
+    ]
+    for policy, expected in cases:
+        errs = vp.validate_pack(_with_stepup(policy))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"
+
+
+def test_voice_lexicon_accepted():
+    # SPEC-W84: voice.lexicon (W82 seam fix — the identity yaml boundary
+    # previously dropped it) is now schema-validated.
+    assert vp.validate_pack(_with_voice({
+        "provider": "mms",
+        "lexicon": {"Adaeze": "ah-DAH-zeh", "Chukwudi": "choo-KWOO-dee"},
+    })) == []
+
+
+def test_voice_lexicon_rejects_bad_shapes():
+    cases = [
+        ({"provider": "mms", "lexicon": "not-a-mapping"},
+         "voice.lexicon must be a mapping"),
+        ({"provider": "mms", "lexicon": {"": "hint"}},
+         "length must be 1-64 chars"),
+        ({"provider": "mms", "lexicon": {"k" * 65: "hint"}},
+         "length must be 1-64 chars"),
+        ({"provider": "mms", "lexicon": {"Term": ""}},
+         "value must be 1-128 chars"),
+        ({"provider": "mms", "lexicon": {"Term": "   "}},
+         "value must be 1-128 chars"),
+        ({"provider": "mms", "lexicon": {"Term": "v" * 129}},
+         "value must be 1-128 chars"),
+    ]
+    for voice, expected in cases:
+        errs = vp.validate_pack(_with_voice(voice))
+        assert any(expected in e for e in errs), f"{expected!r} missing in {errs}"

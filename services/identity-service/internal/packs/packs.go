@@ -96,6 +96,21 @@ type VoiceDefaults struct {
 	Provider  string            `yaml:"provider" json:"provider"`
 	VoiceID   string            `yaml:"voiceId" json:"voiceId,omitempty"`
 	Languages map[string]string `yaml:"languages" json:"languages,omitempty"`
+	// SPEC-W84: per-tenant pronunciation lexicon (term -> respelling/phoneme
+	// hint). Consumed by the voice runtime (app/pronunciation.py). W82 wired
+	// the runtime side but this field was missing here, so yaml dropped the
+	// block at the identity boundary — adding it closes that dead seam.
+	Lexicon map[string]string `yaml:"lexicon" json:"lexicon,omitempty"`
+}
+
+// StepUpPolicy is the optional pack-level step-up 2FA override block
+// (SPEC-W84): per-tool risk-tier overrides for the voice tool layer. Tier
+// semantics mirror VOICE_TOOL_TIERS (0=low, 1=confirmed, 2=verified); the
+// NEVER-WEAKENING floor for built-in tools is enforced at consumption by
+// the voice runtime (app/config.py parse_pack_tool_tiers) — Validate here
+// checks SHAPE only.
+type StepUpPolicy struct {
+	Tools map[string]int `yaml:"tools" json:"tools"`
 }
 
 // Disclosure is the optional pack-level spoken AI / recording disclosure
@@ -184,6 +199,9 @@ type Pack struct {
 	// SPEC-W15 §3: optional i18n localisation block, validated when
 	// present and passed through to the runtime Summary.
 	I18n I18n `yaml:"i18n" json:"i18n,omitempty"`
+	// SPEC-W84: optional step-up 2FA policy overrides, validated when
+	// present and passed through to the runtime Summary.
+	StepUpPolicy *StepUpPolicy `yaml:"stepUpPolicy" json:"stepUpPolicy,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -210,6 +228,7 @@ type Summary struct {
 	USSD             *USSD             `json:"ussd,omitempty"`
 	Growth           *Growth           `json:"growth,omitempty"`
 	I18n             I18n              `json:"i18n,omitempty"`
+	StepUpPolicy     *StepUpPolicy     `json:"stepUpPolicy,omitempty"`
 	ConsentText      string            `json:"consentText,omitempty"`
 	Languages        []string          `json:"languages,omitempty"`
 }
@@ -246,6 +265,7 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		USSD:             p.USSD,
 		Growth:           p.Growth,
 		I18n:             p.I18n,
+		StepUpPolicy:     p.StepUpPolicy,
 		ConsentText:      p.ConsentText,
 		Languages:        p.Languages,
 	}
@@ -506,6 +526,9 @@ func (p Pack) Validate() error {
 	if err := validateI18n(p.I18n); err != nil {
 		return err
 	}
+	if err := validateStepUpPolicy(p.StepUpPolicy); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -613,6 +636,38 @@ func validateVoice(voice *VoiceDefaults) error {
 	for lang, value := range voice.Languages {
 		if !voiceLangValueRe.MatchString(value) {
 			return fmt.Errorf("voice.languages[%q]: value %q must match %s", lang, value, voiceLangValueRe)
+		}
+	}
+	// SPEC-W84: pronunciation lexicon bounds (kept in sync with
+	// scripts/validate_pack.py).
+	for term, hint := range voice.Lexicon {
+		if l := len(term); l < 1 || l > 64 {
+			return fmt.Errorf("voice.lexicon key %q: length must be 1-64 chars", term)
+		}
+		if h := strings.TrimSpace(hint); h == "" || len(hint) > 128 {
+			return fmt.Errorf("voice.lexicon[%q]: value must be 1-128 chars", term)
+		}
+	}
+	return nil
+}
+
+// validateStepUpPolicy enforces the SPEC-W84 stepUpPolicy shape: a non-empty
+// tools map, plugin-tool-conformant names (same toolNameRe the customTools
+// validator uses), tier in {0,1,2}. Kept in sync with
+// scripts/validate_pack.py (_validate_stepup).
+func validateStepUpPolicy(pol *StepUpPolicy) error {
+	if pol == nil {
+		return nil
+	}
+	if len(pol.Tools) == 0 {
+		return fmt.Errorf("stepUpPolicy.tools is required and must be non-empty")
+	}
+	for name, tier := range pol.Tools {
+		if !toolNameRe.MatchString(name) {
+			return fmt.Errorf("stepUpPolicy.tools: invalid tool name %q", name)
+		}
+		if tier < 0 || tier > 2 {
+			return fmt.Errorf("stepUpPolicy.tools[%q]: tier must be 0, 1 or 2 (got %d)", name, tier)
 		}
 	}
 	return nil

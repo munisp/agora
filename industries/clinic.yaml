@@ -37,6 +37,25 @@ consentText: |
   allows. You may request access, correction or deletion of your data at any
   time via the clinic's data protection contact. Tell the receptionist now if
   you do not consent to recording and the call will continue unrecorded.
+# SPEC-W84 worked example: a clinic handles medical-adjacent bookings, so
+# tenants on this pack REQUIRE an OTP-verified caller (tier 2) before
+# booking — raised from the built-in tier-1 (confirmed) floor. The runtime
+# enforces the never-weakening rule; this block may only raise built-ins.
+stepUpPolicy:
+  tools:
+    book_appointment: 2
+
+# Nigerian clinic deployment: Pidgin/Yoruba/Igbo/Hausa TTS voices (MMS) and
+# a pronunciation lexicon for common names. The lexicon exercises the
+# SPEC-W84 seam fix (VoiceDefaults.lexicon — previously dropped by the
+# identity yaml decode, so pack lexicons never reached the runtime).
+voice:
+  provider: mms
+  languages: {pcm: "mms:pcm", yo: "mms:yor", ig: "mms:ibo", ha: "mms:hau"}
+  lexicon:
+    Adaeze: ah-DAH-zeh
+    Chukwudi: choo-KWOO-dee
+
 offerings:
 - name: General Consultation
   duration_min: 30

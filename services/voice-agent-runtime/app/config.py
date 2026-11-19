@@ -7,9 +7,12 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from .logging import get_logger
 from .multilang import parse_tts_voice_map, parse_voice_map
 from .pronunciation import parse_tenant_lexicons
 from .sip import parse_tenant_phone_map
+
+log = get_logger("config")
 
 
 def _env(key: str, default: str) -> str:
@@ -126,6 +129,51 @@ def parse_voice_tool_tiers(raw: str) -> dict[str, int]:
             )
         tiers[name] = tier
     return tiers
+
+
+def parse_pack_tool_tiers(raw: object) -> dict[str, int]:
+    """Parse a pack ``stepUpPolicy.tools`` map (SPEC-W84).
+
+    TOLERANT variant of parse_voice_tool_tiers for per-tenant payloads:
+    malformed entries — bad tool name, non-int/out-of-range tier, or a tier
+    BELOW a built-in floor — drop out with a warning and never raise (a
+    tenant payload must never crash a session). The never-weakening rule is
+    identical: built-in floors cannot be lowered, only raised; pack plugin
+    tools (absent from the defaults) may take any tier 0|1|2, including 0 —
+    the plugin default of 1 is a safe default, not a floor.
+    """
+    out: dict[str, int] = {}
+    if not isinstance(raw, dict):
+        if raw is not None:
+            log.warning("pack stepUpPolicy.tools: expected a mapping, dropped")
+        return out
+    for name, tier in raw.items():
+        if not isinstance(name, str) or not _TOOL_TIER_NAME_RE.fullmatch(name):
+            log.warning("pack stepUpPolicy: invalid tool name %r — dropped", name)
+            continue
+        if isinstance(tier, bool) or not isinstance(tier, int) or tier not in (
+            TIER_LOW,
+            TIER_MEDIUM,
+            TIER_HIGH,
+        ):
+            log.warning(
+                "pack stepUpPolicy: %r tier must be 0, 1 or 2 (got %r) — dropped",
+                name,
+                tier,
+            )
+            continue
+        floor = DEFAULT_VOICE_TOOL_TIERS.get(name)
+        if floor is not None and tier < floor:
+            log.warning(
+                "pack stepUpPolicy: %r tier %d would weaken the built-in floor "
+                "%d — dropped (never weakening)",
+                name,
+                tier,
+                floor,
+            )
+            continue
+        out[name] = tier
+    return out
 
 
 def parse_stt_hints(raw: str) -> dict[str, dict[str, str]]:

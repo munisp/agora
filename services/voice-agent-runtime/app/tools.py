@@ -573,9 +573,21 @@ class ToolLayer:
         programmatically built Settings."""
         tiers = getattr(self._settings, "voice_tool_tiers", None) or {}
         try:
-            return int(tiers.get(name, 1))
+            base = int(tiers.get(name, 1))
         except (TypeError, ValueError):
-            return 1
+            base = 1
+        # SPEC-W84: per-tenant pack stepUpPolicy.tools overrides the env map
+        # (pack = tenant refinement; env = operator global). The pack parser
+        # (config.parse_pack_tool_tiers) already floored built-ins, so a pack
+        # entry can never sit below DEFAULT_VOICE_TOOL_TIERS.
+        ctx = getattr(self, "_ctx", None)
+        pack_tiers = getattr(ctx, "pack_tool_tiers", None) or {}
+        if name in pack_tiers:
+            try:
+                return int(pack_tiers[name])
+            except (TypeError, ValueError):
+                return base
+        return base
 
     async def _enforce_tool_tier(
         self, name: str, arguments: dict[str, Any]
