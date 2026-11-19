@@ -49,6 +49,9 @@ bookingPolicy:
   intakeRequired: false
   cancellationWindowHours: 4
 temporalWorkflow: SupportEscalationWorkflow
+# SPEC-W92 C6: SLA anchors at the booking slot start (legacy behavior,
+# explicit).
+slaAnchor: booking_start
 languages: [en, pcm]
 consentText: |
   We dey record this call and we go keep your name, phone number, delivery

@@ -50,6 +50,15 @@ type SagaInput struct {
 	// behavior. Cross-service contract: bookingops.SagaInput serializes this
 	// as "workflow_name" (omitempty).
 	WorkflowName string `json:"workflow_name,omitempty"`
+
+	// SPEC-W92 C6: SLAAnchor is the pack-declared escalation SLA anchor
+	// (ticket_created|booking_start; empty = legacy booking_start).
+	// BookingCreatedAt is the booking row's created_at — the anchor when
+	// SLAAnchor is ticket_created. Cross-service contract:
+	// bookingops.SagaInput serializes these as "sla_anchor" /
+	// "booking_created_at" (omitempty).
+	SLAAnchor        string    `json:"sla_anchor,omitempty"`
+	BookingCreatedAt time.Time `json:"booking_created_at,omitempty"`
 }
 
 // IndustryOrDefault returns the effective industry id (default "salon").
@@ -195,6 +204,10 @@ type SupportEscalationInput struct {
 	ContactName  string    `json:"contact_name"`
 	ContactEmail string    `json:"contact_email"`
 	CreatedAt    time.Time `json:"created_at"`
+	// SLAAnchor (SPEC-W92 C6) records which timestamp CreatedAt anchors
+	// (ticket_created|booking_start|"" for legacy) — queryable via the
+	// workflow state for audit.
+	SLAAnchor string `json:"sla_anchor,omitempty"`
 	// FirstResponseSLAHours defaults to 4 (support-desk pack SLA).
 	FirstResponseSLAHours int `json:"first_response_sla_hours,omitempty"`
 }

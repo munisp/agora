@@ -405,9 +405,12 @@ type Journey struct {
 	Status      string     `json:"status"`
 	TriggerKind string     `json:"trigger_kind"`
 	SegmentID   *uuid.UUID `json:"segment_id"`
-	Steps       Steps      `json:"steps"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	// EventName (SPEC-W92 B13) names the business event that fires this
+	// journey (POST /v1/studio/events); required iff TriggerKind is event.
+	EventName string    `json:"event_name"`
+	Steps     Steps     `json:"steps"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ---------------------------------------------------------------------------

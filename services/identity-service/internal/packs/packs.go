@@ -175,10 +175,14 @@ type Pack struct {
 	AgentPersona     string            `yaml:"agentPersona" json:"agentPersona"`
 	BookingPolicy    BookingPolicy     `yaml:"bookingPolicy" json:"bookingPolicy"`
 	TemporalWorkflow string            `yaml:"temporalWorkflow" json:"temporalWorkflow"`
-	Offerings        []Offering        `yaml:"offerings" json:"offerings"`
-	Reminders        Reminders         `yaml:"reminders" json:"reminders"`
-	KnowledgeSeed    []KnowledgeDoc    `yaml:"knowledgeSeed" json:"knowledgeSeed"`
-	DashboardLabels  map[string]string `yaml:"dashboardLabels" json:"dashboardLabels"`
+	// SLAAnchor (SPEC-W92 C6) names the timestamp the pack's escalation SLA
+	// anchors at: ticket_created (booking row created_at) or booking_start
+	// (scheduled slot start — the legacy default when empty).
+	SLAAnchor       string            `yaml:"slaAnchor" json:"slaAnchor,omitempty"`
+	Offerings       []Offering        `yaml:"offerings" json:"offerings"`
+	Reminders       Reminders         `yaml:"reminders" json:"reminders"`
+	KnowledgeSeed   []KnowledgeDoc    `yaml:"knowledgeSeed" json:"knowledgeSeed"`
+	DashboardLabels map[string]string `yaml:"dashboardLabels" json:"dashboardLabels"`
 	// SPEC-W3 §4: optional, validated when present.
 	Agents      []Agent      `yaml:"agents" json:"agents,omitempty"`
 	CustomTools []CustomTool `yaml:"customTools" json:"customTools,omitempty"`
@@ -220,17 +224,19 @@ type Summary struct {
 	DashboardLabels  map[string]string `json:"dashboardLabels"`
 	AgentPersona     string            `json:"agentPersona"`
 	TemporalWorkflow string            `json:"temporalWorkflow"`
-	Agents           []Agent           `json:"agents,omitempty"`
-	CustomTools      []CustomTool      `json:"customTools,omitempty"`
-	MCPServers       []MCPServer       `json:"mcpServers,omitempty"`
-	Voice            *VoiceDefaults    `json:"voice,omitempty"`
-	Disclosure       *Disclosure       `json:"disclosure,omitempty"`
-	USSD             *USSD             `json:"ussd,omitempty"`
-	Growth           *Growth           `json:"growth,omitempty"`
-	I18n             I18n              `json:"i18n,omitempty"`
-	StepUpPolicy     *StepUpPolicy     `json:"stepUpPolicy,omitempty"`
-	ConsentText      string            `json:"consentText,omitempty"`
-	Languages        []string          `json:"languages,omitempty"`
+	// SLAAnchor (SPEC-W92 C6) projects the pack's escalation SLA anchor.
+	SLAAnchor    string         `json:"slaAnchor,omitempty"`
+	Agents       []Agent        `json:"agents,omitempty"`
+	CustomTools  []CustomTool   `json:"customTools,omitempty"`
+	MCPServers   []MCPServer    `json:"mcpServers,omitempty"`
+	Voice        *VoiceDefaults `json:"voice,omitempty"`
+	Disclosure   *Disclosure    `json:"disclosure,omitempty"`
+	USSD         *USSD          `json:"ussd,omitempty"`
+	Growth       *Growth        `json:"growth,omitempty"`
+	I18n         I18n           `json:"i18n,omitempty"`
+	StepUpPolicy *StepUpPolicy  `json:"stepUpPolicy,omitempty"`
+	ConsentText  string         `json:"consentText,omitempty"`
+	Languages    []string       `json:"languages,omitempty"`
 }
 
 // Summary builds the runtime projection of the pack. terminologyOverrides
@@ -257,6 +263,7 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		DashboardLabels:  labels,
 		AgentPersona:     p.AgentPersona,
 		TemporalWorkflow: p.TemporalWorkflow,
+		SLAAnchor:        p.SLAAnchor,
 		Agents:           p.Agents,
 		CustomTools:      p.CustomTools,
 		MCPServers:       p.MCPServers,
@@ -480,6 +487,12 @@ func (p Pack) Validate() error {
 	case "SalonDepositWorkflow", "ClinicIntakeWorkflow", "ConsultancyFollowupWorkflow", "SupportEscalationWorkflow":
 	default:
 		return fmt.Errorf("temporalWorkflow %q is not a known pack workflow", p.TemporalWorkflow)
+	}
+	// SPEC-W92 C6: empty = legacy booking_start anchoring.
+	switch p.SLAAnchor {
+	case "", "ticket_created", "booking_start":
+	default:
+		return fmt.Errorf("slaAnchor %q must be ticket_created or booking_start", p.SLAAnchor)
 	}
 	for i, o := range p.Offerings {
 		if o.Name == "" {

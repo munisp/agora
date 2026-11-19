@@ -41,6 +41,9 @@ bookingPolicy:
   intakeRequired: false
   cancellationWindowHours: 24
 temporalWorkflow: SupportEscalationWorkflow
+# SPEC-W92 C6: SLA anchors at the booking slot start (legacy behavior,
+# explicit).
+slaAnchor: booking_start
 offerings:
 - name: Flight Booking Desk
   duration_min: 20

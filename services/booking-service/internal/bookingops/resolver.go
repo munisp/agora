@@ -48,6 +48,8 @@ type PackSummary struct {
 	DashboardLabels  map[string]string `json:"dashboardLabels"`
 	AgentPersona     string            `json:"agentPersona"`
 	TemporalWorkflow string            `json:"temporalWorkflow"`
+	// SLAAnchor (SPEC-W92 C6) mirrors the pack's escalation SLA anchor.
+	SLAAnchor string `json:"slaAnchor,omitempty"`
 }
 
 // BookingPolicy mirrors the pack bookingPolicy block.
@@ -65,6 +67,9 @@ type BookingPolicy struct {
 	// into CreateInput verbatim, flows the pack-declared workflow to
 	// startSaga without a single changed line.
 	TemporalWorkflow string `json:"-"`
+	// SLAAnchor (SPEC-W92 C6) mirrors PackSummary.SLAAnchor the same way —
+	// same decode-time population, same byte-identical-path rationale.
+	SLAAnchor string `json:"-"`
 }
 
 // Location returns the tenant's IANA timezone (UTC fallback).
@@ -196,6 +201,8 @@ func (r *TenantResolver) BySlug(ctx context.Context, slug string) (TenantInfo, e
 	// entry stores the mirrored form, so fresh and stale reads agree.
 	if t.Pack != nil {
 		t.Pack.BookingPolicy.TemporalWorkflow = t.Pack.TemporalWorkflow
+		// SPEC-W92 C6: same mirror for the escalation SLA anchor.
+		t.Pack.BookingPolicy.SLAAnchor = t.Pack.SLAAnchor
 	}
 	r.mu.Lock()
 	r.cache[slug] = tenantCacheEntry{info: t, fetchedAt: time.Now()}

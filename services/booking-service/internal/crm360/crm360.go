@@ -211,11 +211,12 @@ type TimelineItem struct {
 
 // Timeline kinds (merged feed).
 const (
-	KindBooking     = "booking"
-	KindTicketEvent = "ticket_event"
-	KindWorkOrder   = "work_order"
-	KindLoyalty     = "loyalty"
-	KindNote        = "note"
+	KindBooking        = "booking"
+	KindTicketEvent    = "ticket_event"
+	KindWorkOrder      = "work_order"
+	KindLoyalty        = "loyalty"
+	KindNote           = "note"
+	KindSurveyResponse = "survey_response" // SPEC-W92 B14
 )
 
 const (

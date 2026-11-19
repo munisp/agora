@@ -244,6 +244,8 @@ func (c *Consumer) bookAppointment(ctx context.Context, env commandEnvelope, ten
 		in.BookingPolicy = &policy
 		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
 		in.WorkflowName = tenant.Pack.TemporalWorkflow
+		// SPEC-W92 C6: pack-declared escalation SLA anchor, same plumbing.
+		in.SLAAnchor = tenant.Pack.SLAAnchor
 	}
 	_, err = c.ops.Create(ctx, in)
 	return err

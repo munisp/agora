@@ -122,6 +122,8 @@ type ClaimInput struct {
 	// WorkflowName (SPEC-W80 B13): pack-declared Temporal workflow, same
 	// plumbing as CreateInput.WorkflowName. Empty = legacy saga routing.
 	WorkflowName string
+	// SLAAnchor (SPEC-W92 C6): pack-declared SLA anchor, same plumbing.
+	SLAAnchor string
 }
 
 // ClaimWaitlist turns a waitlist entry into a real booking, transactionally
@@ -199,6 +201,7 @@ func (s *Service) ClaimWaitlist(ctx context.Context, in ClaimInput) (store.Booki
 		Industry:      in.Industry,
 		BookingPolicy: in.BookingPolicy,
 		WorkflowName:  in.WorkflowName,
+		SLAAnchor:     in.SLAAnchor,
 	})
 	return booking, claimed, nil
 }
@@ -224,6 +227,8 @@ type ClaimByTokenInput struct {
 	// WorkflowName (SPEC-W80 B13): pack-declared Temporal workflow, same
 	// plumbing as ClaimInput.WorkflowName. Empty = legacy saga routing.
 	WorkflowName string
+	// SLAAnchor (SPEC-W92 C6): pack-declared SLA anchor, same plumbing.
+	SLAAnchor string
 }
 
 // ClaimByTokenResult is the outcome of ClaimWaitlistByToken. Replayed is
@@ -286,6 +291,7 @@ func (s *Service) ClaimWaitlistByToken(ctx context.Context, in ClaimByTokenInput
 		Industry:      in.Industry,
 		BookingPolicy: in.BookingPolicy,
 		WorkflowName:  in.WorkflowName,
+		SLAAnchor:     in.SLAAnchor,
 	})
 	if err != nil {
 		// A concurrent claim with the same token flipped the entry between

@@ -751,7 +751,12 @@ func (s *Store) Timeline(ctx context.Context, tenantID, contactID uuid.UUID, lim
 		if err := timelineWorkOrders(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
 			return err
 		}
-		return timelineLoyalty(ctx, s, tx, tenantID, contactID, limit, &items)
+		if err := timelineLoyalty(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
+			return err
+		}
+		// SPEC-W92 B14: survey/CSAT responses close the loop — the 360
+		// feed shows what the customer told us, not just what we did.
+		return timelineSurveyResponses(ctx, s, tx, tenantID, contactID, limit, &items)
 	})
 	if err != nil {
 		return nil, err
@@ -907,6 +912,46 @@ func timelineLoyalty(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contact
 			summary = fmt.Sprintf("Loyalty -%d pts (%s)", debit, refType)
 		}
 		*items = append(*items, TimelineItem{TS: ts, Kind: KindLoyalty, Summary: summary, RefID: id.String()})
+	}
+	return rows.Err()
+}
+
+// timelineSurveyResponses contributes one item per survey response the
+// contact submitted (SPEC-W92 B14): survey name + kind (nps/csat/ces/
+// custom) and the score when the survey carries one. Both tables are
+// guarded — deployments without the surveys pack degrade to nothing.
+func timelineSurveyResponses(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
+	ok, err := s.tableExists(ctx, "survey_responses")
+	if err != nil || !ok {
+		return err
+	}
+	ok, err = s.tableExists(ctx, "surveys")
+	if err != nil || !ok {
+		return err
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT sr.id, sr.score, sr.submitted_at, sv.name, sv.kind
+		   FROM survey_responses sr
+		   JOIN surveys sv ON sv.tenant_id = sr.tenant_id AND sv.id = sr.survey_id
+		  WHERE sr.tenant_id=$1 AND sr.contact_id=$2
+		  ORDER BY sr.submitted_at DESC LIMIT $3`, tenantID, contactID, limit)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var score *int
+		var ts time.Time
+		var name, kind string
+		if err := rows.Scan(&id, &score, &ts, &name, &kind); err != nil {
+			return err
+		}
+		summary := fmt.Sprintf("Survey %s (%s)", name, kind)
+		if score != nil {
+			summary += fmt.Sprintf(" — score %d", *score)
+		}
+		*items = append(*items, TimelineItem{TS: ts, Kind: KindSurveyResponse, Summary: summary, RefID: id.String()})
 	}
 	return rows.Err()
 }

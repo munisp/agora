@@ -57,6 +57,13 @@ type SagaInput struct {
 	// notification-worker owns the industry-switch fallback; never invent
 	// a default here.
 	WorkflowName string `json:"workflow_name,omitempty"`
+	// SLAAnchor (SPEC-W92 C6) is the pack-declared escalation SLA anchor
+	// (ticket_created|booking_start). Empty = legacy booking_start
+	// anchoring worker-side.
+	SLAAnchor string `json:"sla_anchor,omitempty"`
+	// BookingCreatedAt is the booking row's created_at — the anchor when
+	// SLAAnchor is ticket_created.
+	BookingCreatedAt time.Time `json:"booking_created_at,omitempty"`
 	// DepositCents is ceil(price_cents * depositPercent/100); only consulted
 	// when DepositKnown is true (otherwise the saga holds the full price).
 	DepositCents int64 `json:"deposit_cents,omitempty"`
@@ -138,6 +145,10 @@ type CreateInput struct {
 	// (httpapi/bookings.go — byte-identical, W57) flows the pack workflow
 	// through the resolver's BookingPolicy mirror untouched.
 	WorkflowName string `json:"workflow_name,omitempty"`
+	// SLAAnchor (SPEC-W92 C6) is the pack-declared escalation SLA anchor,
+	// captured alongside Industry the same way. When unset, startSaga
+	// falls back to BookingPolicy.SLAAnchor (same mirror rationale).
+	SLAAnchor string `json:"sla_anchor,omitempty"`
 }
 
 // Create validates and inserts a booking transactionally with its outbox
@@ -426,25 +437,34 @@ func (s *Service) startSaga(ctx context.Context, b store.Booking, o store.Offeri
 	if workflowName == "" && in.BookingPolicy != nil {
 		workflowName = in.BookingPolicy.TemporalWorkflow
 	}
+	// SPEC-W92 C6: same input-then-policy-mirror resolution for the SLA
+	// anchor; the booking row's created_at always rides along so the
+	// worker can honor ticket_created.
+	slaAnchor := in.SLAAnchor
+	if slaAnchor == "" && in.BookingPolicy != nil {
+		slaAnchor = in.BookingPolicy.SLAAnchor
+	}
 	sagaIn := SagaInput{
-		BookingID:    b.ID.String(),
-		TenantID:     b.TenantID.String(),
-		TenantSlug:   in.TenantSlug,
-		OfferingID:   b.OfferingID.String(),
-		TeamMemberID: b.TeamMemberID.String(),
-		ContactID:    c.ID.String(),
-		ContactPhone: c.Phone,
-		ContactEmail: c.Email,
-		ContactName:  c.Name,
-		StartsAt:     b.StartsAt,
-		EndsAt:       b.EndsAt,
-		PriceCents:   o.PriceCents,
-		Currency:     o.Currency,
-		Source:       b.Source,
-		Industry:     in.Industry,
-		WorkflowName: workflowName,
-		DepositCents: depositCents,
-		DepositKnown: depositKnown,
+		BookingID:        b.ID.String(),
+		TenantID:         b.TenantID.String(),
+		TenantSlug:       in.TenantSlug,
+		OfferingID:       b.OfferingID.String(),
+		TeamMemberID:     b.TeamMemberID.String(),
+		ContactID:        c.ID.String(),
+		ContactPhone:     c.Phone,
+		ContactEmail:     c.Email,
+		ContactName:      c.Name,
+		StartsAt:         b.StartsAt,
+		EndsAt:           b.EndsAt,
+		PriceCents:       o.PriceCents,
+		Currency:         o.Currency,
+		Source:           b.Source,
+		Industry:         in.Industry,
+		WorkflowName:     workflowName,
+		SLAAnchor:        slaAnchor,
+		BookingCreatedAt: b.CreatedAt,
+		DepositCents:     depositCents,
+		DepositKnown:     depositKnown,
 	}
 	if in.BookingPolicy != nil {
 		sagaIn.NoShowFeeCents = in.BookingPolicy.NoShowFeeCents
