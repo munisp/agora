@@ -15,8 +15,47 @@ import (
 	"strings"
 	"time"
 
+	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/store"
 )
+
+// effectiveGrantPolicy (SPEC-W94) resolves the pack-aware verification
+// grant policy. Baseline is the global env behavior (enabled iff envTTL
+// > 0); a pack block narrows it: enabled=false kills grant writing AND
+// honoring for the pack's tenants, ttlHours>0 overrides the TTL (0 = keep
+// env). The env kill switch (envTTL == 0) stays AUTHORITATIVE — a pack
+// can never revive grants the operator disabled globally (W87: the kill
+// switch is global, both sides). A nil pack (or unresolved tenant)
+// preserves the pre-W94 global behavior exactly.
+func effectiveGrantPolicy(pack *bookingops.PackSummary, envTTL time.Duration) (bool, time.Duration) {
+	enabled, ttl := envTTL > 0, envTTL
+	if pack == nil || pack.VerificationGrants == nil {
+		return enabled, ttl
+	}
+	pol := pack.VerificationGrants
+	if !pol.Enabled {
+		return false, ttl
+	}
+	if pol.TTLHours > 0 {
+		ttl = time.Duration(pol.TTLHours) * time.Hour
+	}
+	return enabled, ttl
+}
+
+// grantPolicyFor resolves the effective grant policy for a site's tenant.
+// Tenant-resolution failure (or a nil hook) fails OPEN to the env
+// baseline: the pre-W94 behavior had no tenant lookup at all, so a
+// control-plane outage must not change grant honoring.
+func (s *server) grantPolicyFor(r *http.Request, tenantSlug string) (bool, time.Duration) {
+	if s.d.TenantBySlug == nil {
+		return effectiveGrantPolicy(nil, s.d.VerificationGrantTTL)
+	}
+	tenant, err := s.d.TenantBySlug(r.Context(), tenantSlug)
+	if err != nil {
+		return effectiveGrantPolicy(nil, s.d.VerificationGrantTTL)
+	}
+	return effectiveGrantPolicy(tenant.Pack, s.d.VerificationGrantTTL)
+}
 
 type verificationCheckRequest struct {
 	Phone   string `json:"phone"`
@@ -50,6 +89,13 @@ func (s *server) verificationCheckInternal(w http.ResponseWriter, r *http.Reques
 	}
 	if err != nil {
 		s.internal(w, err)
+		return
+	}
+	// SPEC-W94: the pack policy is authoritative at READ time — a pack
+	// with verificationGrants.enabled=false stops honoring even grants
+	// written before the policy landed.
+	if enabled, _ := s.grantPolicyFor(r, site.TenantSlug); !enabled {
+		writeJSON(w, http.StatusOK, map[string]any{"verified": false})
 		return
 	}
 	grant, err := s.d.Store.GetActiveVerificationGrant(r.Context(), site.TenantID, contact.ID)

@@ -27,6 +27,13 @@ temporalWorkflow: SupportEscalationWorkflow
 # booking row created_at), not the scheduled support slot — a ticket
 # booked for a future slot must not start its 4h SLA in the future.
 slaAnchor: ticket_created
+# SPEC-W94: per-pack OTP verification-grant policy — explicit baseline
+# matching the global default (enabled, 24h TTL). Set enabled: false to
+# stop minting AND honoring grants for this pack's tenants; ttlHours
+# overrides the global VERIFICATION_GRANT_TTL_HOURS (0 = keep env).
+verificationGrants:
+  enabled: true
+  ttlHours: 24
 offerings:
 - name: Standard Support Ticket
   duration_min: 30

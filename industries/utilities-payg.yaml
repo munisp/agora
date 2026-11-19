@@ -45,6 +45,13 @@ temporalWorkflow: SupportEscalationWorkflow
 # SPEC-W92 C6: SLA anchors at the booking slot start (legacy behavior,
 # explicit).
 slaAnchor: booking_start
+# SPEC-W94: per-pack OTP verification-grant policy — explicit baseline
+# matching the global default (enabled, 24h TTL). Set enabled: false to
+# stop minting AND honoring grants for this pack's tenants; ttlHours
+# overrides the global VERIFICATION_GRANT_TTL_HOURS (0 = keep env).
+verificationGrants:
+  enabled: true
+  ttlHours: 24
 languages: [en, pcm]
 consentText: |
   We dey record this call and we go keep your name, phone number, meter or

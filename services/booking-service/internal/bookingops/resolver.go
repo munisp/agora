@@ -50,6 +50,15 @@ type PackSummary struct {
 	TemporalWorkflow string            `json:"temporalWorkflow"`
 	// SLAAnchor (SPEC-W92 C6) mirrors the pack's escalation SLA anchor.
 	SLAAnchor string `json:"slaAnchor,omitempty"`
+	// VerificationGrants (SPEC-W94) mirrors the pack's OTP grant policy;
+	// nil = inherit the global env behavior (VERIFICATION_GRANT_TTL_HOURS).
+	VerificationGrants *GrantPolicySummary `json:"verificationGrants,omitempty"`
+}
+
+// GrantPolicySummary (SPEC-W94) mirrors identity's GrantPolicy projection.
+type GrantPolicySummary struct {
+	Enabled  bool `json:"enabled"`
+	TTLHours int  `json:"ttlHours"`
 }
 
 // BookingPolicy mirrors the pack bookingPolicy block.

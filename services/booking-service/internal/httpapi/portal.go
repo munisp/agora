@@ -326,8 +326,11 @@ func (s *server) portalVerifyCode(w http.ResponseWriter, r *http.Request) {
 	// (strict anchor rule, runtime-side). Fail-open in the safe
 	// direction: a missing grant just re-OTPs the next call — the OTP
 	// itself already succeeded.
-	if s.d.VerificationGrantTTL > 0 {
-		if err := s.d.Store.UpsertVerificationGrant(r.Context(), site.TenantID, contact.ID, "otp", s.d.VerificationGrantTTL); err != nil {
+	// SPEC-W94: pack policy is authoritative at WRITE time too —
+	// enabled=false stops minting grants for the pack's tenants and a
+	// pack ttlHours overrides the global env TTL.
+	if grantEnabled, grantTTL := s.grantPolicyFor(r, site.TenantSlug); grantEnabled {
+		if err := s.d.Store.UpsertVerificationGrant(r.Context(), site.TenantID, contact.ID, "otp", grantTTL); err != nil {
 			s.d.Logger.Error("verification grant upsert failed (verification itself succeeded)", zap.Error(err))
 		}
 	}

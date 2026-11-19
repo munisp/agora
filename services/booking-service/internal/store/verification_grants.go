@@ -84,6 +84,24 @@ func (s *Store) UpsertVerificationGrant(ctx context.Context, tenantID, contactID
 	})
 }
 
+// RevokeVerificationGrant deletes the contact's grant row (SPEC-W94).
+// Idempotent: true iff a row was deleted, false when none existed. Active
+// revocation complements the TTL — a pack policy change, a fraud signal,
+// or an internal reset no longer waits for expiry.
+func (s *Store) RevokeVerificationGrant(ctx context.Context, tenantID, contactID uuid.UUID) (bool, error) {
+	const q = `DELETE FROM verification_grants WHERE tenant_id=$1 AND contact_id=$2`
+	var n int64
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, execErr := tx.Exec(ctx, q, tenantID, contactID)
+		if execErr != nil {
+			return execErr
+		}
+		n = tag.RowsAffected()
+		return nil
+	})
+	return n > 0, err
+}
+
 // GetActiveVerificationGrant returns the contact's grant when it is still
 // inside its TTL, or ErrNotFound when none exists or it has expired.
 func (s *Store) GetActiveVerificationGrant(ctx context.Context, tenantID, contactID uuid.UUID) (VerificationGrant, error) {

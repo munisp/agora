@@ -168,6 +168,12 @@ type Growth struct {
 type I18n map[string]map[string]string
 
 // Pack is one industry pack definition (industries/<id>.yaml).
+// GrantPolicy (SPEC-W94) is the per-pack verification-grant policy block.
+type GrantPolicy struct {
+	Enabled  bool `yaml:"enabled" json:"enabled"`
+	TTLHours int  `yaml:"ttlHours" json:"ttlHours"`
+}
+
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
 	DisplayName      string            `yaml:"displayName" json:"displayName"`
@@ -178,11 +184,17 @@ type Pack struct {
 	// SLAAnchor (SPEC-W92 C6) names the timestamp the pack's escalation SLA
 	// anchors at: ticket_created (booking row created_at) or booking_start
 	// (scheduled slot start — the legacy default when empty).
-	SLAAnchor       string            `yaml:"slaAnchor" json:"slaAnchor,omitempty"`
-	Offerings       []Offering        `yaml:"offerings" json:"offerings"`
-	Reminders       Reminders         `yaml:"reminders" json:"reminders"`
-	KnowledgeSeed   []KnowledgeDoc    `yaml:"knowledgeSeed" json:"knowledgeSeed"`
-	DashboardLabels map[string]string `yaml:"dashboardLabels" json:"dashboardLabels"`
+	SLAAnchor string `yaml:"slaAnchor" json:"slaAnchor,omitempty"`
+	// VerificationGrants (SPEC-W94) is the pack's OTP verification-grant
+	// policy. Nil = inherit the booking-service global env behavior
+	// (VERIFICATION_GRANT_TTL_HOURS). When present: enabled=false kills
+	// grant writing AND honoring for the pack's tenants; ttlHours>0
+	// overrides the global grant TTL.
+	VerificationGrants *GrantPolicy      `yaml:"verificationGrants" json:"verificationGrants,omitempty"`
+	Offerings          []Offering        `yaml:"offerings" json:"offerings"`
+	Reminders          Reminders         `yaml:"reminders" json:"reminders"`
+	KnowledgeSeed      []KnowledgeDoc    `yaml:"knowledgeSeed" json:"knowledgeSeed"`
+	DashboardLabels    map[string]string `yaml:"dashboardLabels" json:"dashboardLabels"`
 	// SPEC-W3 §4: optional, validated when present.
 	Agents      []Agent      `yaml:"agents" json:"agents,omitempty"`
 	CustomTools []CustomTool `yaml:"customTools" json:"customTools,omitempty"`
@@ -225,18 +237,21 @@ type Summary struct {
 	AgentPersona     string            `json:"agentPersona"`
 	TemporalWorkflow string            `json:"temporalWorkflow"`
 	// SLAAnchor (SPEC-W92 C6) projects the pack's escalation SLA anchor.
-	SLAAnchor    string         `json:"slaAnchor,omitempty"`
-	Agents       []Agent        `json:"agents,omitempty"`
-	CustomTools  []CustomTool   `json:"customTools,omitempty"`
-	MCPServers   []MCPServer    `json:"mcpServers,omitempty"`
-	Voice        *VoiceDefaults `json:"voice,omitempty"`
-	Disclosure   *Disclosure    `json:"disclosure,omitempty"`
-	USSD         *USSD          `json:"ussd,omitempty"`
-	Growth       *Growth        `json:"growth,omitempty"`
-	I18n         I18n           `json:"i18n,omitempty"`
-	StepUpPolicy *StepUpPolicy  `json:"stepUpPolicy,omitempty"`
-	ConsentText  string         `json:"consentText,omitempty"`
-	Languages    []string       `json:"languages,omitempty"`
+	SLAAnchor string `json:"slaAnchor,omitempty"`
+	// VerificationGrants (SPEC-W94) projects the pack's grant policy
+	// (nil = inherit the global env behavior).
+	VerificationGrants *GrantPolicy   `json:"verificationGrants,omitempty"`
+	Agents             []Agent        `json:"agents,omitempty"`
+	CustomTools        []CustomTool   `json:"customTools,omitempty"`
+	MCPServers         []MCPServer    `json:"mcpServers,omitempty"`
+	Voice              *VoiceDefaults `json:"voice,omitempty"`
+	Disclosure         *Disclosure    `json:"disclosure,omitempty"`
+	USSD               *USSD          `json:"ussd,omitempty"`
+	Growth             *Growth        `json:"growth,omitempty"`
+	I18n               I18n           `json:"i18n,omitempty"`
+	StepUpPolicy       *StepUpPolicy  `json:"stepUpPolicy,omitempty"`
+	ConsentText        string         `json:"consentText,omitempty"`
+	Languages          []string       `json:"languages,omitempty"`
 }
 
 // Summary builds the runtime projection of the pack. terminologyOverrides
@@ -264,17 +279,24 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		AgentPersona:     p.AgentPersona,
 		TemporalWorkflow: p.TemporalWorkflow,
 		SLAAnchor:        p.SLAAnchor,
-		Agents:           p.Agents,
-		CustomTools:      p.CustomTools,
-		MCPServers:       p.MCPServers,
-		Voice:            p.Voice,
-		Disclosure:       p.Disclosure,
-		USSD:             p.USSD,
-		Growth:           p.Growth,
-		I18n:             p.I18n,
-		StepUpPolicy:     p.StepUpPolicy,
-		ConsentText:      p.ConsentText,
-		Languages:        p.Languages,
+		VerificationGrants: func() *GrantPolicy {
+			if p.VerificationGrants == nil {
+				return nil
+			}
+			cp := *p.VerificationGrants
+			return &cp
+		}(),
+		Agents:       p.Agents,
+		CustomTools:  p.CustomTools,
+		MCPServers:   p.MCPServers,
+		Voice:        p.Voice,
+		Disclosure:   p.Disclosure,
+		USSD:         p.USSD,
+		Growth:       p.Growth,
+		I18n:         p.I18n,
+		StepUpPolicy: p.StepUpPolicy,
+		ConsentText:  p.ConsentText,
+		Languages:    p.Languages,
 	}
 }
 
@@ -493,6 +515,12 @@ func (p Pack) Validate() error {
 	case "", "ticket_created", "booking_start":
 	default:
 		return fmt.Errorf("slaAnchor %q must be ticket_created or booking_start", p.SLAAnchor)
+	}
+	// SPEC-W94: grant policy, validated when present (nil = inherit).
+	// ttlHours 0 = no override (booking keeps the env TTL); the 30-day
+	// ceiling bounds every pack.
+	if p.VerificationGrants != nil && (p.VerificationGrants.TTLHours < 0 || p.VerificationGrants.TTLHours > 720) {
+		return fmt.Errorf("verificationGrants.ttlHours %d must be between 0 and 720", p.VerificationGrants.TTLHours)
 	}
 	for i, o := range p.Offerings {
 		if o.Name == "" {

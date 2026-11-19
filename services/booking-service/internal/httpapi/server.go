@@ -796,6 +796,8 @@ func NewRouter(d Deps) http.Handler {
 	r.Route("/internal/sites/{slug}/verification", func(r chi.Router) {
 		r.Use(s.internAuth)
 		r.Post("/check", s.verificationCheckInternal)
+		// SPEC-W94: active grant revocation, same guard + slug tenancy.
+		r.Post("/revoke", s.verificationRevokeInternal)
 	})
 	r.Route("/internal/contacts", func(r chi.Router) {
 		r.Use(s.internAuth)
