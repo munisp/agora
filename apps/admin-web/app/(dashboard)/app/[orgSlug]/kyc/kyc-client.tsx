@@ -463,7 +463,7 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
         <CardHeader>
           <CardTitle>Find a document</CardTitle>
           <CardDescription>
-            Enter the document's reference number.
+            Enter the document&apos;s reference number.
           </CardDescription>
         </CardHeader>
         <CardContent>
