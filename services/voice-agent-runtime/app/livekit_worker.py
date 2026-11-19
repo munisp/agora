@@ -487,6 +487,63 @@ def read_back_confirmed(messages: list[Any], phone: str) -> bool:
     return bool(_YES.search(reply))
 
 
+import unicodedata as _ud
+
+# Spoken digits in English/Pidgin, Yoruba, Hausa and Igbo (accents stripped: speech recognisers drop them unevenly).
+_DIGIT_WORDS = {
+    **dict.fromkeys(["zero", "oh", "o"], "0"), "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "odo": "0", "okan": "1", "meji": "2", "meta": "3", "merin": "4", "marun": "5", "marunun": "5", "mefa": "6",
+    "meje": "7", "mejo": "8", "mesan": "9", "mesanan": "9",
+    "sifiri": "0", "daya": "1", "biyu": "2", "uku": "3", "hudu": "4", "biyar": "5", "shida": "6", "bakwai": "7",
+    "takwas": "8", "tara": "9",
+    "efu": "0", "otu": "1", "abuo": "2", "ato": "3", "ano": "4", "ise": "5", "isii": "6", "asaa": "7", "asato": "8",
+    "itoolu": "9",
+}
+_MULT = {"double": 2, "triple": 3}
+_NG_MOBILE = re.compile(r"(?:0|234)[789][01]\d{8}")
+
+
+def _plain_word(w: str) -> str:
+    w = _ud.normalize("NFKD", w.lower().translate(str.maketrans("ɗƙƴ", "dky")))
+    return "".join(c for c in w if c.isalnum() and not _ud.combining(c))
+
+
+def spoken_phone(text: str) -> str | None:
+    """A Nigerian mobile number spoken in a line ("zero eight zero six, five five five…", "double five", digits, or
+    Yoruba/Hausa/Igbo number words) as 0XXXXXXXXXX, or None."""
+    digits, mult = [], 1
+    for raw in re.split(r"[\s,.;:!?\-–—]+", text or ""):
+        if not raw:
+            continue
+        if raw.isdigit():
+            digits.append(raw * 1); mult = 1; continue
+        w = _plain_word(raw)
+        if w in _MULT:
+            mult = _MULT[w]; continue
+        if w in _DIGIT_WORDS:
+            digits.append(_DIGIT_WORDS[w] * mult); mult = 1
+    m = _NG_MOBILE.search("".join(digits))
+    if not m:
+        return None
+    n = m.group(0)
+    return "0" + n[3:] if n.startswith("234") else n
+
+
+def caller_phone(messages: list[Any]) -> str | None:
+    """The phone number the caller most recently said, from their own words (newest first)."""
+    for m in reversed(messages):
+        if getattr(m, "role", "") == "user":
+            found = spoken_phone(_message_plain(m))
+            if found:
+                return found
+    return None
+
+
+def plausible_ng_phone(phone: str) -> bool:
+    return bool(_NG_MOBILE.fullmatch(re.sub(r"\D", "", phone or "")))
+
+
 _TAG = re.compile(r"</?[a-zA-Z][^>]{0,80}>")
 _MARKDOWN = re.compile(r"[*_#`~|]+")
 
@@ -741,6 +798,16 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
     ) -> str:
         import json
 
+        # The model sometimes miscounts spoken digits ("zero eight zero six…" became 080065553108): when its number is
+        # not a valid Nigerian mobile, use the number the caller actually said.
+        try:
+            if not plausible_ng_phone(phone):
+                heard = caller_phone(list(self.recent_lines))
+                if heard:
+                    log.info("booking phone corrected from the caller's own words")
+                    phone = heard
+        except Exception as exc:  # noqa: BLE001
+            log.warning("caller phone check skipped", error=str(exc)[:160])
         # Already read back and confirmed on the call? Then this first call counts as the confirmed one.
         try:
             if read_back_confirmed(list(self.recent_lines), phone):
