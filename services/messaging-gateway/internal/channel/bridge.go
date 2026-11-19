@@ -95,11 +95,28 @@ type Bridge struct {
 	// of the previous O(n) sweep of every key on every inbound message
 	// (SPEC-W46 PERF-18), and the map stays bounded at
 	// bridgeDedupeMaxEntries.
-	mu        sync.Mutex
-	done      map[string]time.Time
-	doneExp   doneHeap
+	mu      sync.Mutex
+	done    map[string]time.Time
+	doneExp doneHeap
+	// tgBinds maps a Telegram chat_id to the provider-verified phone the
+	// chat's user shared via a request_contact keyboard (SPEC-W85).
+	// Telegram's From is a chat_id, not a phone, so unlike WhatsApp (wa_id
+	// IS the phone, pinned per-turn) the bridge must remember the binding
+	// and pin it on subsequent turns. tgBindExp mirrors doneExp: a min-heap
+	// for O(log n) expiry/eviction; the map is bounded at
+	// bridgeTgBindMaxEntries with a bridgeTgBindTTL lifetime. In-memory by
+	// design (restart drops bindings -> affected chats are re-prompted via
+	// request_contact); durable bindings are a registered follow-up.
+	tgBinds   map[string]tgBind
+	tgBindExp doneHeap
 	now       func() time.Time // injectable for tests
 	dedupeTTL time.Duration
+}
+
+// tgBind is one Telegram chat_id -> verified-phone binding.
+type tgBind struct {
+	phone string
+	at    time.Time
 }
 
 // doneEntry is one heap element: a completed delivery key + completion time.
@@ -135,6 +152,88 @@ const bridgeDedupeTTL = 24 * time.Hour
 // cannot open a realistic redelivery replay window.
 const bridgeDedupeMaxEntries = 100_000
 
+// bridgeTgBindTTL bounds how long a Telegram chat_id -> verified-phone
+// binding lives (SPEC-W85). 30 days: long enough that an active chat never
+// re-prompts, short enough that a number change is eventually re-verified.
+const bridgeTgBindTTL = 30 * 24 * time.Hour
+
+// bridgeTgBindMaxEntries bounds the binding map (same PERF-18 posture as
+// the dedupe map: every cache needs a bound; oldest-first eviction).
+const bridgeTgBindMaxEntries = 100_000
+
+// TgContactSharedText is the fixed synthetic user-turn text bridged when a
+// Telegram contact share arrives (shares carry no text). Fixed by design:
+// no user-controlled content is synthesized into the agent turn. Exported
+// for the webhook handler (httpapi), which synthesizes the turn.
+const TgContactSharedText = "[shared contact]"
+
+// tgContactButtonText is the request_contact keyboard button label sent
+// when the runtime asks for a contact share (request_contact=true).
+const tgContactButtonText = "Share my number"
+
+// BindTelegramContact records a provider-verified phone for a Telegram
+// chat (called by the webhook handler after the self-share check; SPEC-W85).
+// Safe on a zero-value Bridge (tests): nil map is initialized lazily.
+func (b *Bridge) BindTelegramContact(chatID, phone string) {
+	if chatID == "" || phone == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tgBinds == nil {
+		b.tgBinds = map[string]tgBind{}
+	}
+	now := b.now()
+	b.sweepTgBindsLocked(now)
+	b.tgBinds[chatID] = tgBind{phone: phone, at: now}
+	heap.Push(&b.tgBindExp, doneEntry{key: chatID, at: now})
+	for len(b.tgBinds) > bridgeTgBindMaxEntries {
+		b.evictOldestTgBindLocked()
+	}
+	b.Log.Info("telegram contact bound", zap.String("chat_id", chatID))
+}
+
+// telegramBoundPhone returns the live bound phone for a Telegram chat_id,
+// or "" when unbound/expired.
+func (b *Bridge) telegramBoundPhone(chatID string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sweepTgBindsLocked(b.now())
+	bind, ok := b.tgBinds[chatID]
+	if !ok {
+		return ""
+	}
+	return bind.phone
+}
+
+// sweepTgBindsLocked expires bindings past the TTL (oldest-first heap pops;
+// stale duplicates dropped without touching the newer entry). Caller holds
+// b.mu.
+func (b *Bridge) sweepTgBindsLocked(now time.Time) {
+	for len(b.tgBindExp) > 0 {
+		top := b.tgBindExp[0]
+		if now.Sub(top.at) <= bridgeTgBindTTL {
+			return
+		}
+		heap.Pop(&b.tgBindExp)
+		if bind, ok := b.tgBinds[top.key]; ok && bind.at.Equal(top.at) {
+			delete(b.tgBinds, top.key)
+		}
+	}
+}
+
+// evictOldestTgBindLocked drops the oldest binding (capacity bound).
+// Caller holds b.mu.
+func (b *Bridge) evictOldestTgBindLocked() {
+	for len(b.tgBindExp) > 0 {
+		e := heap.Pop(&b.tgBindExp).(doneEntry)
+		if bind, ok := b.tgBinds[e.key]; ok && bind.at.Equal(e.at) {
+			delete(b.tgBinds, e.key)
+			return
+		}
+	}
+}
+
 // SetClock injects the clock used by the dedupe window (tests).
 func (b *Bridge) SetClock(now func() time.Time) { b.now = now }
 
@@ -152,6 +251,7 @@ func NewBridge(sites map[string]Site, convURL, voiceURL string, wa *provider.Wha
 		Log:             log,
 		done:            map[string]time.Time{},
 		doneExp:         doneHeap{},
+		tgBinds:         map[string]tgBind{},
 		now:             time.Now,
 		dedupeTTL:       bridgeDedupeTTL,
 	}
@@ -231,7 +331,7 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 		return err
 	}
 
-	reply, err := b.agentReply(ctx, site, convID, msg)
+	reply, requestContact, err := b.agentReply(ctx, site, convID, msg)
 	if err != nil {
 		log.Warn("agent reply failed", zap.Error(err))
 		return err
@@ -242,7 +342,7 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 		return err
 	}
 
-	if err := b.sendReply(ctx, msg, reply); err != nil {
+	if err := b.sendReply(ctx, msg, reply, requestContact); err != nil {
 		log.Warn("channel reply failed", zap.Error(err))
 		return err
 	}
@@ -366,8 +466,11 @@ func (b *Bridge) recordTurn(ctx context.Context, convID, tenantID, idemKey, role
 }
 
 // agentReply calls the voice runtime buffered chat path (SPEC-W6 §A3
-// step 4 — /voice/chat, NOT the stream).
-func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg InboundMessage) (string, error) {
+// step 4 — /voice/chat, NOT the stream). The second return reports the
+// runtime's additive request_contact flag (SPEC-W85): true when a telegram
+// turn hit a step-up gate and the user should be prompted to share their
+// contact.
+func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg InboundMessage) (string, bool, error) {
 	body := map[string]string{
 		"site_slug":       site.SiteSlug,
 		"message":         msg.Text,
@@ -379,31 +482,43 @@ func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg I
 	// verified (K15(c)). The runtime honors channel_identity ONLY with a
 	// valid X-Internal-Token (VOICE_ADMIN_INTERNAL_TOKEN server-side);
 	// without the token env the header is omitted and the peer ignores the
-	// pin (fail-safe). Telegram is NOT pinned here: its From is a chat_id,
-	// not a phone — the runtime's normalize_phone would reject it anyway,
-	// so the request would be unchanged except for a warning log.
-	var headers map[string]string
+	// pin (fail-safe).
+	// SPEC-W85: Telegram pins the BOUND phone (recorded by
+	// BindTelegramContact from a self-shared contact). An unbound telegram
+	// chat pins nothing — the request stays byte-identical to the pre-W85
+	// shape, so the W81 telegram byte-compat guarantee holds.
+	pin := ""
 	if msg.Channel == "whatsapp" {
-		body["channel_identity"] = msg.From
+		pin = msg.From
+	} else if msg.Channel == "telegram" {
+		pin = b.telegramBoundPhone(msg.From)
+	}
+	var headers map[string]string
+	if pin != "" {
+		body["channel_identity"] = pin
 		if b.VoiceInternalToken != "" {
 			headers = map[string]string{"X-Internal-Token": b.VoiceInternalToken}
 		}
 	}
 	var resp struct {
-		Reply string `json:"reply"`
+		Reply          string `json:"reply"`
+		RequestContact bool   `json:"request_contact"`
 	}
 	if err := b.doJSON(ctx, http.MethodPost, b.VoiceURL+"/voice/chat", body, headers, &resp); err != nil {
-		return "", fmt.Errorf("voice chat: %w", err)
+		return "", false, fmt.Errorf("voice chat: %w", err)
 	}
 	if resp.Reply == "" {
-		return "", fmt.Errorf("voice chat: empty reply")
+		return "", false, fmt.Errorf("voice chat: empty reply")
 	}
-	return resp.Reply, nil
+	return resp.Reply, resp.RequestContact, nil
 }
 
 // sendReply delivers the agent reply via the same-channel provider
-// (SPEC-W6 §A3 step 6).
-func (b *Bridge) sendReply(ctx context.Context, msg InboundMessage, reply string) error {
+// (SPEC-W6 §A3 step 6). SPEC-W85: on telegram with requestContact=true and
+// no live phone binding the reply carries a one-time request_contact
+// keyboard so the user can verify their number natively; every other case
+// is the pre-W85 plain-text send.
+func (b *Bridge) sendReply(ctx context.Context, msg InboundMessage, reply string, requestContact bool) error {
 	switch msg.Channel {
 	case "whatsapp":
 		if b.WhatsApp == nil || !b.WhatsApp.Configured() {
@@ -414,6 +529,10 @@ func (b *Bridge) sendReply(ctx context.Context, msg InboundMessage, reply string
 	case "telegram":
 		if b.Telegram == nil || !b.Telegram.Configured() {
 			return fmt.Errorf("telegram provider not configured")
+		}
+		if requestContact && b.telegramBoundPhone(msg.From) == "" {
+			_, _, err := b.Telegram.SendContactRequest(ctx, msg.From, reply, tgContactButtonText)
+			return err
 		}
 		_, _, err := b.Telegram.SendMessage(ctx, msg.From, reply)
 		return err

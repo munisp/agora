@@ -294,6 +294,27 @@ class ChatService:
             active_agent=session.active_agent,
             copilot=copilot_posted,
         )
+        # SPEC-W85: ask Telegram callers to share their contact when a
+        # step-up gate refused this turn and the session is not verified.
+        # The gateway answers with a one-time request_contact keyboard;
+        # the resulting self-shared phone is provider-verified (same trust
+        # class as wa_id) and bound chat_id -> phone for subsequent pins.
+        # verification_unavailable is included: where the portal OTP is
+        # unconfigured, the contact share is the ONLY verification path.
+        request_contact = (
+            channel == "telegram"
+            and session.verified_phone is None
+            and any(
+                isinstance(entry.get("result"), dict)
+                and (
+                    entry["result"].get("status") == "verification_required"
+                    # verification_unavailable rides status="error" with the
+                    # reason in `error` (W81 honest-degrade shape).
+                    or entry["result"].get("error") == "verification_unavailable"
+                )
+                for entry in trace
+            )
+        )
         return {
             "conversation_id": session.conversation_id,
             # K15(b): the resume credential — the client MUST present it
@@ -308,6 +329,8 @@ class ChatService:
             # SPEC-W9 Part B (additive): validated UI actions the LLM invoked
             # this turn; the web widget executes them client-side.
             "ui_actions": list(tool_layer.collected_ui_actions),
+            # SPEC-W85 (additive): telegram contact-share prompt request.
+            "request_contact": request_contact,
         }
 
     async def handle_message_stream(
