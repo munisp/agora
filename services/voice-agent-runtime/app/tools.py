@@ -26,6 +26,10 @@ lookup_appointment, reschedule_appointment, cancel_appointment.
   confirmed-or-verified / tier 2 verified; the map formalizes the existing
   gates (never weakens them) and hard-gates pack plugin tools (default
   tier 1).
+- SPEC-W86: read_keypad_entry — DTMF keypad capture for PSTN calls (the
+  app/dtmf.py per-session buffer fed by the LiveKit room data channel;
+  tier 0 passive listener; keypad_unavailable on non-PSTN channels — an
+  honest channel-capability report, never a mock).
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Coroutine, Optional
 
-from . import metrics, sip, ui_actions
+from . import dtmf, metrics, sip, ui_actions
 from .config import (
     DEFAULT_VOICE_TOOL_TIERS,
     TIER_HIGH,
@@ -57,6 +61,14 @@ BOOK = "com.opendesk.booking.command.BookAppointment"
 RESCHEDULE = "com.opendesk.booking.command.RescheduleAppointment"
 CANCEL = "com.opendesk.booking.command.CancelAppointment"
 ESCALATION_REQUESTED = "com.opendesk.conversation.EscalationRequested"
+
+# SPEC-W86: server-side bounds for the read_keypad_entry tool. The model
+# may ask for anything; the tool clamps before arming the DTMF buffer so a
+# call can never wedge the session on an unbounded keypad wait.
+KEYPAD_TIMEOUT_MIN_S = 5
+KEYPAD_TIMEOUT_MAX_S = 60
+KEYPAD_LENGTH_MIN = 4
+KEYPAD_LENGTH_MAX = 8
 
 # OpenAI-format tool schemas, used by the chat path and the ElevenLabs
 # webhook (the LiveKit worker derives its schema from the FunctionContext
@@ -192,6 +204,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "code": {"type": "string", "description": "One-time code read back by the caller"},
                 },
                 "required": ["phone", "code"],
+            },
+        },
+    },
+    # SPEC-W86: DTMF keypad capture (PSTN calls only). The caller types
+    # the OTP on the phone keypad instead of reading it aloud — digit ASR
+    # in noisy environments is error-prone, and reading a security code
+    # aloud in public is a privacy leak. On non-PSTN channels the tool
+    # answers keypad_unavailable (honest channel-capability report).
+    {
+        "type": "function",
+        "function": {
+            "name": "read_keypad_entry",
+            "description": (
+                "Read digits the caller types on their phone keypad "
+                "(phone calls only). Use after request_verification_code "
+                "so the caller can type the 6-digit code instead of "
+                "reading it aloud: call with expected_length 6, then "
+                "submit the returned digits with verify_caller_code. The "
+                "caller presses # to submit early or * to clear."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Seconds to wait for the entry (clamped 5-60, default 30)",
+                    },
+                    "expected_length": {
+                        "type": "integer",
+                        "description": "Optional expected digit count (clamped 4-8); auto-submits when reached, e.g. 6 for portal codes",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -343,6 +388,16 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
 UI_ACTION_TOOL_NAMES = ["navigate_to_page", "highlight_element", "prefill_booking"]
 
 
+def _clamp_int(value: Any, minimum: int, maximum: int, default: "int | None") -> "int | None":
+    """Coerce to int and clamp into [minimum, maximum]; un-coercible -> default
+    (SPEC-W86: server-side bounds for model-supplied tool arguments)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
 def _confirmation_payload(pending_phone: str) -> dict[str, Any]:
     return {
         "status": "confirmation_required",
@@ -421,6 +476,7 @@ class ToolLayer:
         plugin_tools: list[PluginTool] | None = None,
         ui_action_sink: list[dict[str, Any]] | None = None,
         verifier_factory: "Any | None" = None,
+        dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
     ) -> None:
         self._dapr = dapr
         self._settings = settings
@@ -432,6 +488,10 @@ class ToolLayer:
         # the injectable agents-registry client in app/sip.py). None = the
         # real client built from settings on every OTP call.
         self._verifier_factory = verifier_factory
+        # SPEC-W86: per-session DTMF keypad buffer, attached by the LiveKit
+        # worker for PSTN (SIP) calls only; None on every other channel —
+        # read_keypad_entry then answers keypad_unavailable.
+        self._dtmf_buffer = dtmf_buffer
         # SPEC-W9 Part B: per-turn collector for validated UI actions. The
         # chat path injects a fresh list per turn; other callers (voice
         # worker, ElevenLabs) get a private one that is simply never read —
@@ -863,6 +923,55 @@ class ToolLayer:
             "message": "The code could not be verified just now; please try again.",
         }
 
+    async def read_keypad_entry(
+        self, timeout_s: int = 30, expected_length: "int | None" = None
+    ) -> dict[str, Any]:
+        """Collect keypad (DTMF) digits from the caller (SPEC-W86).
+
+        PSTN calls only: the buffer is attached by the LiveKit worker for
+        SIP sessions; every other channel answers keypad_unavailable — an
+        honest capability report, never a mock. Bounds are clamped
+        server-side (the model may request anything). The digits are
+        returned ONLY to this session's own LLM loop — they are never
+        logged and never emitted in events (the ToolInvoked event carries
+        the outcome status only, no digits).
+        """
+        timeout = _clamp_int(timeout_s, KEYPAD_TIMEOUT_MIN_S, KEYPAD_TIMEOUT_MAX_S, 30)
+        length = (
+            _clamp_int(expected_length, KEYPAD_LENGTH_MIN, KEYPAD_LENGTH_MAX, None)
+            if expected_length is not None
+            else None
+        )
+        buffer = self._dtmf_buffer
+        if buffer is None:
+            await self._emit_tool_event("read_keypad_entry", "keypad_unavailable", {})
+            return {
+                "status": "keypad_unavailable",
+                "error": "keypad_unavailable",
+                "channel": self._session.channel or "",
+                "digits": "",
+                "timeout_s": timeout,
+                "expected_length": length,
+            }
+        digits = await buffer.wait_for_entry(
+            timeout_s=float(timeout), expected_length=length
+        )
+        if digits is None:
+            await self._emit_tool_event("read_keypad_entry", "keypad_timeout", {})
+            return {
+                "status": "keypad_timeout",
+                "digits": "",
+                "timeout_s": timeout,
+                "expected_length": length,
+            }
+        await self._emit_tool_event("read_keypad_entry", "keypad_entry", {})
+        return {
+            "status": "keypad_entry",
+            "digits": digits,
+            "timeout_s": timeout,
+            "expected_length": length,
+        }
+
     async def lookup_appointment(self, phone: str) -> dict[str, Any]:
         gate = self._require_verified(phone)
         if isinstance(gate, dict):
@@ -1274,6 +1383,10 @@ class ToolLayer:
             "verify_caller_code": lambda: self.verify_caller_code(
                 phone=str(arguments.get("phone", "")),
                 code=str(arguments.get("code", "")),
+            ),
+            "read_keypad_entry": lambda: self.read_keypad_entry(
+                timeout_s=arguments.get("timeout_s", 30),
+                expected_length=arguments.get("expected_length"),
             ),
             "reschedule_appointment": lambda: self.reschedule_appointment(
                 booking_id=str(arguments.get("booking_id", "")),

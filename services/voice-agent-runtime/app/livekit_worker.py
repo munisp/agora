@@ -45,7 +45,7 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
-from . import emergency, metrics, sip
+from . import dtmf, emergency, metrics, sip
 from . import dead_mic, greeting_prerender
 from .async_tools import (
     SLOW_TOOLS,
@@ -572,6 +572,28 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         return json.dumps(result, ensure_ascii=False)
 
     @lk_llm.ai_callable(
+        description=(
+            "Read digits the caller types on their phone keypad (phone "
+            "calls only). Use after request_verification_code so the "
+            "caller can type the 6-digit code instead of reading it "
+            "aloud: call with expected_length 6, then submit the returned "
+            "digits with verify_caller_code. The caller presses # to "
+            "submit early or * to clear."
+        )
+    )
+    async def read_keypad_entry(self, timeout_s: int = 30, expected_length: int = 0) -> str:
+        import json
+
+        result = await self._run_slow(
+            "read_keypad_entry",
+            lambda: self._tools.read_keypad_entry(
+                timeout_s=timeout_s,
+                expected_length=expected_length or None,
+            ),
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
         description="Look up the caller's upcoming appointments by phone number."
     )
     async def lookup_appointment(self, phone: str) -> str:
@@ -964,6 +986,7 @@ async def build_voice_agent(
     site_slug: str,
     conversation_id: str,
     sip_call: "sip.InboundCallContext | None" = None,
+    dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
 ) -> tuple[VoicePipelineAgent, TenantContext, SessionState]:
     """Bootstrap tenant context and assemble the VoicePipelineAgent.
 
@@ -972,6 +995,11 @@ async def build_voice_agent(
     phone before the prompt is rendered, so the receptionist can greet with
     the number on file — but the K15(c) OTP gate still applies before any
     booking lookup/change (the carrier-asserted bypass was removed).
+
+    SPEC-W86: ``dtmf_buffer`` (created by the entrypoint for PSTN calls so
+    it can also register the room data-received listener — the 3-tuple
+    return contract is unchanged) is attached to the ToolLayer so
+    read_keypad_entry can collect keypad digits; None on non-SIP paths.
     """
     ctx = await fetch_tenant_context(dapr, settings, site_slug)
     # SPEC-W38 F1/F2: when the SIP bootstrap resolved an agent record via
@@ -992,7 +1020,14 @@ async def build_voice_agent(
         # K15(c): claimed (unverified) hint only — never confirmed.
         sip.attach_caller_id(session, sip_call.caller_phone)
         caller_phone = session.claimed_phone or ""
-    tool_layer = ToolLayer(dapr=dapr, settings=settings, ctx=ctx, session=session)
+    tool_layer = ToolLayer(
+        dapr=dapr,
+        settings=settings,
+        ctx=ctx,
+        session=session,
+        # SPEC-W86: PSTN keypad capture buffer (None on non-SIP paths).
+        dtmf_buffer=dtmf_buffer,
+    )
     system_prompt = build_system_prompt(
         ctx, conversation_id=conversation_id, caller_phone=caller_phone or None
     )
@@ -1007,8 +1042,14 @@ async def build_voice_agent(
         # longer budget so the portal answer reaches the caller instead of
         # a generic timeout apology. The global timeout is untouched.
         timeout_overrides={
-            tool: settings.verification_tool_timeout_s
-            for tool in VERIFICATION_TOOLS
+            **{
+                tool: settings.verification_tool_timeout_s
+                for tool in VERIFICATION_TOOLS
+            },
+            # SPEC-W86: read_keypad_entry WAITS on the caller's keypad for
+            # up to 60s — it needs a budget above the max wait (default
+            # 65s); the global 4s tool timeout stays untouched.
+            "read_keypad_entry": settings.keypad_tool_timeout_s,
         },
     )
     fnc_ctx = ReceptionistFunctions(
@@ -1334,14 +1375,27 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         channel="phone" if sip_call is not None else "web",
     )
 
+    # SPEC-W86: PSTN calls get a DTMF keypad-capture buffer (OTP entry via
+    # the phone keypad); web/non-SIP rooms get None — read_keypad_entry
+    # honestly answers keypad_unavailable there. The entrypoint creates
+    # the buffer so it can register the room data-received listener below
+    # (build_voice_agent keeps its 3-tuple return contract).
+    dtmf_buffer = dtmf.DtmfBuffer() if sip_call is not None else None
     try:
         agent, tenant_ctx, session = await build_voice_agent(
-            settings, dapr, site_slug, conversation_id, sip_call=sip_call
+            settings,
+            dapr,
+            site_slug,
+            conversation_id,
+            sip_call=sip_call,
+            dtmf_buffer=dtmf_buffer,
         )
     except DaprError as exc:
         log.error("session bootstrap failed", site_slug=site_slug, error=str(exc))
         await dapr.aclose()
         return
+    if dtmf_buffer is not None:
+        dtmf.attach_dtmf_listener(ctx.room, dtmf_buffer)
 
     # Per-session call-quality accumulator: activated BEFORE agent.start so
     # the pipeline tasks it spawns inherit this context (asyncio tasks copy

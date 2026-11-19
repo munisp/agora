@@ -60,6 +60,10 @@ CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
   submit it with verify_caller_code. Only then retry the original tool.
 - If verify_caller_code answers "invalid_code", ask the caller to
   double-check and try again; after two failures offer request_human.
+- On a phone call, offer the caller the keypad instead of reading the code
+  aloud: ask them to type the code and press # (* clears), call
+  read_keypad_entry with expected_length 6, and submit the returned digits
+  with verify_caller_code.
 - If a tool answers "verification_unavailable", apologize and explain that
   booking changes are temporarily unavailable; do NOT keep retrying.
 

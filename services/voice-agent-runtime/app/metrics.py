@@ -304,6 +304,25 @@ class Registry:
             "Heuristic caller-language detections by language and turn path.",
             ("lang", "path"),  # path=chat|voice
         )
+        # SPEC-W86: DTMF keypad capture (app/dtmf.py). dtmf_digits counts
+        # every accepted keypad digit; dtmf_entries counts submitted
+        # entries (#-submit or expected-length auto-submit); dtmf_timeouts
+        # counts waits that expired before the caller finished.
+        self.dtmf_digits = Counter(
+            "voice_dtmf_digits_total",
+            "Accepted DTMF keypad digits fed into the session buffer.",
+            (),
+        )
+        self.dtmf_entries = Counter(
+            "voice_dtmf_entries_total",
+            "Submitted DTMF keypad entries (# or expected-length auto-submit).",
+            (),
+        )
+        self.dtmf_timeouts = Counter(
+            "voice_dtmf_timeouts_total",
+            "DTMF keypad waits that timed out before the caller finished.",
+            (),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -331,6 +350,9 @@ class Registry:
             self.translation,
             self.translation_errors,
             self.language_detected,
+            self.dtmf_digits,
+            self.dtmf_entries,
+            self.dtmf_timeouts,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -498,6 +520,21 @@ def stepup_refused(reason: str) -> None:
     """SPEC-W81 A3: identity-gate refusal (verification_required |
     verification_unavailable | phone_mismatch | confirmation_required)."""
     _registry.stepup_refused.inc(reason=reason)
+
+
+def dtmf_digit() -> None:
+    """SPEC-W86: one accepted DTMF keypad digit fed into the buffer."""
+    _registry.dtmf_digits.inc()
+
+
+def dtmf_entry() -> None:
+    """SPEC-W86: one submitted DTMF keypad entry (# or auto-submit)."""
+    _registry.dtmf_entries.inc()
+
+
+def dtmf_timeout() -> None:
+    """SPEC-W86: one keypad wait that expired before the caller finished."""
+    _registry.dtmf_timeouts.inc()
 
 
 def translation(

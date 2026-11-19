@@ -72,6 +72,8 @@ DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
     "prefill_booking": TIER_LOW,
     "request_verification_code": TIER_LOW,
     "verify_caller_code": TIER_LOW,
+    # SPEC-W86: passive keypad listener — no identity required.
+    "read_keypad_entry": TIER_LOW,
     # Tier 1 — MEDIUM (confirmed identity)
     "book_appointment": TIER_MEDIUM,
     "capture_location": TIER_MEDIUM,
@@ -414,6 +416,11 @@ class Settings:
     # exceed that so a slow-but-working portal answers with a real result
     # instead of the runner's generic timeout apology.
     verification_tool_timeout_s: float = 20.0
+    # SPEC-W86: per-tool timeout override for read_keypad_entry ONLY. The
+    # tool WAITS on the caller's keypad for up to 60s (KEYPAD_TIMEOUT_MAX_S
+    # in app/tools.py), so the override must exceed that — the global 4s
+    # tool timeout is untouched.
+    keypad_tool_timeout_s: float = 65.0
 
     # Phone-confirmation policy
     phone_confirmation_required: bool = True
@@ -665,6 +672,7 @@ def load_settings() -> Settings:
         tool_timeout_s=float(os.environ.get("TOOL_TIMEOUT_SECONDS", "4")),
         tool_ack_grace_ms=_env_int("TOOL_ACK_GRACE_MS", 400),
         verification_tool_timeout_s=_env_float("VOICE_VERIFICATION_TOOL_TIMEOUT_S", 20.0),
+        keypad_tool_timeout_s=_env_float("KEYPAD_TOOL_TIMEOUT_S", 65.0),
         phone_confirmation_required=_env("PHONE_CONFIRMATION_REQUIRED", "true").lower()
         not in ("0", "false", "no"),
         booking_url=_env("BOOKING_URL", ""),
