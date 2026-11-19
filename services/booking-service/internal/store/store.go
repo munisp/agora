@@ -101,6 +101,12 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W87: verification_grants (durable cross-call OTP verification
+	// grants; idempotent bootstrap, RLS-enabled).
+	if err := s.ensureVerificationGrantsTable(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// SPEC-W11 Part B: incidents + incident_deliveries +
 	// incident_dispatch_endpoints (idempotent bootstrap, RLS-enabled).
 	if err := s.ensureIncidentTables(ctx); err != nil {

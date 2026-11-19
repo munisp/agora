@@ -73,6 +73,10 @@ type Config struct {
 	// BOOKING_INTERNAL_TOKEN; NO default — unset fails the guarded routes
 	// closed (503).
 	InternalToken string
+	// VerificationGrantTTL is the lifetime of a SPEC-W87 verification grant
+	// written on portal OTP success (VERIFICATION_GRANT_TTL_HOURS, default
+	// 24h); <= 0 disables writing (checks then always answer false).
+	VerificationGrantTTL time.Duration
 	// IdentityInternalToken is forwarded as X-Internal-Token on booking→identity
 	// service calls (SPEC-W44 W-B, K2): the appgate entitlement check and the
 	// tenant-resolution GET /v1/tenants/{slug}. IDENTITY_INTERNAL_TOKEN; no
@@ -237,9 +241,12 @@ func Load() (Config, error) {
 		WaitlistSweepInterval: envDur("WAITLIST_SWEEP_INTERVAL", 5*time.Minute),
 		// Dev fallback keeps the portal bootable locally under
 		// OPENDESK_DEV_INSECURE=1; prod MUST override (fail-closed below).
-		PortalSecret:          envStr("PORTAL_SECRET", DevPortalSecretDefault),
-		NotificationsTopic:    envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
-		InternalToken:         os.Getenv("BOOKING_INTERNAL_TOKEN"),
+		PortalSecret:       envStr("PORTAL_SECRET", DevPortalSecretDefault),
+		NotificationsTopic: envStr("NOTIFICATIONS_TOPIC", "opendesk.notifications.outbox"),
+		InternalToken:      os.Getenv("BOOKING_INTERNAL_TOKEN"),
+		// SPEC-W87: grant TTL in HOURS (envInt — envDur would parse a bare
+		// value as seconds).
+		VerificationGrantTTL:  time.Duration(envInt("VERIFICATION_GRANT_TTL_HOURS", 24)) * time.Hour,
 		IdentityInternalToken: os.Getenv("IDENTITY_INTERNAL_TOKEN"),
 		GeocodeEnabled:        envStr("GEOCODE_ENABLED", "false") == "true",
 		GeocodeBaseURL:        envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),

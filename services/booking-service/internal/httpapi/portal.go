@@ -321,6 +321,16 @@ func (s *server) portalVerifyCode(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
+	// SPEC-W87: persist the genuine OTP success as a time-boxed
+	// verification grant so future PSTN voice sessions can honor it
+	// (strict anchor rule, runtime-side). Fail-open in the safe
+	// direction: a missing grant just re-OTPs the next call — the OTP
+	// itself already succeeded.
+	if s.d.VerificationGrantTTL > 0 {
+		if err := s.d.Store.UpsertVerificationGrant(r.Context(), site.TenantID, contact.ID, "otp", s.d.VerificationGrantTTL); err != nil {
+			s.d.Logger.Error("verification grant upsert failed (verification itself succeeded)", zap.Error(err))
+		}
+	}
 	now := time.Now()
 	jwt, err := signPortalJWT(s.d.PortalSecret, portalClaims{
 		Sub:        contact.ID.String(),

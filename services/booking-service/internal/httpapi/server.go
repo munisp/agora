@@ -121,6 +121,10 @@ type Deps struct {
 	// closed with 503; a missing/wrong X-Internal-Token header answers 401
 	// (constant-time compare).
 	InternalToken string
+	// VerificationGrantTTL is the lifetime of a SPEC-W87 verification
+	// grant written on portal OTP success (VERIFICATION_GRANT_TTL_HOURS).
+	// <= 0 disables writing grants (checks then always answer false).
+	VerificationGrantTTL time.Duration
 	// ExtKeys validates X-Api-Key on the SPEC-W45 K17 external bookings
 	// surface (/v1/ext/bookings — the APISIX api-ext-booking upstream).
 	// Nil → NewRouter substitutes an UNCONFIGURED validator that fails
@@ -784,6 +788,15 @@ func NewRouter(d Deps) http.Handler {
 	// (X-Internal-Token vs BOOKING_INTERNAL_TOKEN, constant-time; 503
 	// fail-closed when unset, 401 on missing/wrong) BEFORE the tenant
 	// middleware — exactly like the civic sla-breach callback below.
+	// SPEC-W87: verification-grant check for the voice runtime — is there
+	// an active (unexpired) OTP verification grant for this contact on
+	// this site? internAuth-guarded like every /internal route; tenant
+	// comes from the slug (resolveSite), NOT X-Tenant-Slug, so no tenant
+	// middleware here.
+	r.Route("/internal/sites/{slug}/verification", func(r chi.Router) {
+		r.Use(s.internAuth)
+		r.Post("/check", s.verificationCheckInternal)
+	})
 	r.Route("/internal/contacts", func(r chi.Router) {
 		r.Use(s.internAuth)
 		r.Use(s.tenantMiddleware)

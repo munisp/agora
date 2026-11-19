@@ -422,6 +422,13 @@ class Settings:
     # tool timeout is untouched.
     keypad_tool_timeout_s: float = 65.0
 
+    # SPEC-W87: honor durable booking-side verification grants (genuine
+    # portal OTP within the grant TTL) for PSTN callers under the strict
+    # anchor rule (phone channel + carrier-claimed phone + matching
+    # supplied phone). "0" disables — checks then always fall through to
+    # the OTP flow. Web self-claims are NEVER honored regardless.
+    verification_grants_enabled: bool = True
+
     # Phone-confirmation policy
     phone_confirmation_required: bool = True
 
@@ -673,6 +680,7 @@ def load_settings() -> Settings:
         tool_ack_grace_ms=_env_int("TOOL_ACK_GRACE_MS", 400),
         verification_tool_timeout_s=_env_float("VOICE_VERIFICATION_TOOL_TIMEOUT_S", 20.0),
         keypad_tool_timeout_s=_env_float("KEYPAD_TOOL_TIMEOUT_S", 65.0),
+        verification_grants_enabled=_env("VOICE_VERIFICATION_GRANTS", "1").lower() in ("1", "true", "yes", "on"),
         phone_confirmation_required=_env("PHONE_CONFIRMATION_REQUIRED", "true").lower()
         not in ("0", "false", "no"),
         booking_url=_env("BOOKING_URL", ""),

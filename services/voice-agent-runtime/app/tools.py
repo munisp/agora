@@ -575,16 +575,23 @@ class ToolLayer:
             timeout_s=self._settings.http_timeout_s,
         )
 
-    def _require_verified(self, phone: str | None) -> str | dict[str, Any]:
+    async def _require_verified(self, phone: str | None) -> str | dict[str, Any]:
         """K15(c): mutating tools (lookup/reschedule/cancel) require a
         VERIFIED session (OTP or channel-pinned identity).
 
         Returns the verified phone to use for the operation, or the refusal
         payload to hand back to the model. The verified number ALWAYS wins
         over a model-supplied one; a mismatch is rejected (no silent
-        re-targeting at another customer's bookings)."""
+        re-targeting at another customer's bookings).
+
+        SPEC-W87: before refusing an unverified PSTN caller, honor an
+        active booking-side verification grant under the strict anchor
+        rule (see _honor_verification_grant)."""
         verified = self._session.verified_phone
         if not verified:
+            granted = await self._honor_verification_grant(phone)
+            if granted is not None:
+                return granted
             if not (
                 self._settings.booking_url
                 and self._settings.voice_booking_internal_token
@@ -607,6 +614,54 @@ class ToolLayer:
                     "the new number first."
                 ),
             }
+        return verified
+
+    async def _honor_verification_grant(self, phone: str | None) -> str | None:
+        """SPEC-W87: honor a durable booking-side verification grant.
+
+        Returns the verified phone when the grant applies, else None (the
+        caller falls through to the byte-identical OTP refusal payloads).
+        ALL of the anchor rule must hold:
+          a. grants enabled (settings.verification_grants_enabled),
+          b. session.channel == "phone" — the SIP carrier-asserted anchor
+             ONLY; web self-claims NEVER honor grants (whatsapp/telegram
+             identities are already per-turn pinned and never reach here),
+          c. session.claimed_phone present, and the model-supplied phone
+             absent or equal to the claimed one (no re-targeting),
+          d. the booking check answers verified for the claimed phone.
+        On honor: mark_verified(claimed) + stepup_verified("grant") + log
+        — mirroring the chat.py channel-pin path (NO ToolInvoked event).
+        A check error/unavailable is treated as no-grant (fail-safe)."""
+        if not getattr(self._settings, "verification_grants_enabled", False):
+            return None
+        if self._session.channel != "phone":
+            return None
+        claimed = self._session.claimed_phone
+        if not claimed:
+            return None
+        supplied = sip.normalize_phone(phone)
+        if supplied and supplied != claimed:
+            return None
+        verifier = self._verifier()
+        try:
+            result = await verifier.check_grant(claimed)
+        finally:
+            await verifier.aclose()
+        if not result.ok:
+            if result.status not in ("no_grant",):
+                log.warning(
+                    "verification grant check failed — falling through to OTP",
+                    status=result.status,
+                    conversation_id=self._session.conversation_id,
+                )
+            return None
+        verified = self._session.mark_verified(claimed)
+        metrics.stepup_verified("grant")
+        log.info(
+            "verification grant honored",
+            conversation_id=self._session.conversation_id,
+            channel=self._session.channel,
+        )
         return verified
 
     async def _refuse_gate(self, tool: str, gate: dict[str, Any]) -> dict[str, Any]:
@@ -675,7 +730,7 @@ class ToolLayer:
             # gate enforces it on every path — no double refusal here.
             return None
         if tier >= TIER_HIGH:
-            gate = self._require_verified(arguments.get("phone"))
+            gate = await self._require_verified(arguments.get("phone"))
             if isinstance(gate, dict):
                 return await self._refuse_gate(name, gate)
             return None
@@ -973,7 +1028,7 @@ class ToolLayer:
         }
 
     async def lookup_appointment(self, phone: str) -> dict[str, Any]:
-        gate = self._require_verified(phone)
+        gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("lookup_appointment", gate)
         confirmed = gate
@@ -1032,7 +1087,7 @@ class ToolLayer:
     async def reschedule_appointment(
         self, booking_id: str, starts_at: str, phone: str
     ) -> dict[str, Any]:
-        gate = self._require_verified(phone)
+        gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("reschedule_appointment", gate)
         confirmed = gate
@@ -1061,7 +1116,7 @@ class ToolLayer:
     async def cancel_appointment(
         self, booking_id: str, phone: str, reason: str | None = None
     ) -> dict[str, Any]:
-        gate = self._require_verified(phone)
+        gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("cancel_appointment", gate)
         confirmed = gate

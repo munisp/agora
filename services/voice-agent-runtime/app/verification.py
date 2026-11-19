@@ -66,7 +66,7 @@ class OtpResult:
     """Outcome of a portal OTP call, translated for the tool layer."""
 
     ok: bool
-    status: str  # code_sent|verified|invalid_code|rate_limited|unavailable|error
+    status: str  # code_sent|verified|invalid_code|rate_limited|unavailable|error|no_grant
     detail: str = ""
     payload: dict[str, Any] | None = None
 
@@ -167,6 +167,39 @@ class BookingPortalVerifier:
                 False, "rate_limited", "too many attempts — request a new code"
             )
         log.warning("portal verify-code unexpected status", status=resp.status_code)
+        return OtpResult(
+            False, "error", f"booking portal answered {resp.status_code}"
+        )
+
+    async def check_grant(self, phone: str) -> OtpResult:
+        """SPEC-W87: does this contact hold an active verification grant
+        (a genuine portal OTP success within the grant TTL)? The tool
+        layer honors a grant ONLY under its strict anchor rule (PSTN
+        carrier-claimed phone). ok=True/"verified" = active grant;
+        ok=False/"no_grant" = no active grant; "error"/"unavailable" =
+        check failed — callers MUST treat that as no-grant and fall
+        through to the OTP flow (fail-safe)."""
+        if not self.configured:
+            return OtpResult(False, "unavailable", "verification not configured")
+        try:
+            resp = await self._client.post(
+                f"{self._base}/internal/sites/{self._site_slug}/verification/check",
+                json={"phone": phone},
+                headers=self._headers(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("verification check call failed", error=str(exc)[:200])
+            return OtpResult(False, "error", f"booking portal unreachable: {exc}")
+        if resp.status_code == 200:
+            payload: dict[str, Any] = {}
+            try:
+                payload = resp.json()
+            except Exception:  # noqa: BLE001
+                payload = {}
+            if payload.get("verified") is True:
+                return OtpResult(True, "verified", payload=payload)
+            return OtpResult(False, "no_grant")
+        log.warning("verification check unexpected status", status=resp.status_code)
         return OtpResult(
             False, "error", f"booking portal answered {resp.status_code}"
         )

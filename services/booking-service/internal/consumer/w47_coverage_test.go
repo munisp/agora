@@ -213,8 +213,10 @@ CREATE TABLE IF NOT EXISTS outbox (
 	if err != nil {
 		t.Fatalf("DeleteTenantData on full schema: %v", err)
 	}
+	// SPEC-W87: verification_grants joined the hard-delete cascade
+	// (contact-linked personal data, no owner after tenant deletion).
 	for _, tbl := range []string{"tickets", "survey_invites", "survey_responses", "device_tokens",
-		"portal_tokens", "csat_tokens", "field_captures", "field_checkins", "crm_notes", "outbox"} {
+		"portal_tokens", "verification_grants", "csat_tokens", "field_captures", "field_checkins", "crm_notes", "outbox"} {
 		if _, ok := sum.Details[tbl]; !ok {
 			t.Fatalf("full-schema cascade skipped existing table %s (details=%+v)", tbl, sum.Details)
 		}

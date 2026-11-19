@@ -497,19 +497,24 @@ class TestRefusalPayloadCompatibility:
             ),
         }
 
-    def test_require_verified_semantics_unchanged(self):
+    async def test_require_verified_semantics_unchanged(self):
         """_require_verified: verified phone wins; mismatch rejected; the
-        fail-closed unavailable variant when unconfigured."""
+        fail-closed unavailable variant when unconfigured.
+
+        SPEC-W87 note: _require_verified became async (grant honoring);
+        this test is the await-only adaptation — every assertion is
+        byte-identical to W81. The grant path is inert here (default
+        channel "web" never honors grants)."""
         session = SessionState(conversation_id="conv-1", site_slug="demo")
         layer = _layer(session=session)
         # Unverified + configured -> verification_required payload.
-        assert layer._require_verified(PHONE) == _verification_required_payload()
+        assert await layer._require_verified(PHONE) == _verification_required_payload()
         # Unverified + unconfigured -> fail-closed unavailable payload.
         bare = _layer(session=session, settings=Settings())
-        assert bare._require_verified(PHONE) == _verification_unavailable_payload()
+        assert await bare._require_verified(PHONE) == _verification_unavailable_payload()
         # Verified: the verified number always wins over a supplied one.
         session.mark_verified(PHONE_NORM)
-        assert layer._require_verified(PHONE_NORM) == PHONE_NORM
-        mismatch = layer._require_verified("+2349000000000")
+        assert await layer._require_verified(PHONE_NORM) == PHONE_NORM
+        mismatch = await layer._require_verified("+2349000000000")
         assert mismatch["status"] == "error"
         assert mismatch["error"] == "phone_mismatch"

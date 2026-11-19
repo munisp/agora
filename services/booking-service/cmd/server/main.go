@@ -875,6 +875,8 @@ func run() error {
 		PortalSecret:       cfg.PortalSecret,
 		PubSubName:         cfg.PubSubName,
 		NotificationsTopic: cfg.NotificationsTopic,
+		// SPEC-W87: verification-grant TTL (0 disables grant writes).
+		VerificationGrantTTL: cfg.VerificationGrantTTL,
 		// SPEC-W44 W-B/S1-F7-05 (K2): internauth on the civic sla-breach
 		// callback (BOOKING_INTERNAL_TOKEN, no default — fail closed).
 		InternalToken: cfg.InternalToken,
