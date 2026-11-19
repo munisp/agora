@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -308,13 +309,86 @@ func (s *Store) GetLead(ctx context.Context, tenantID, id uuid.UUID) (Lead, erro
 	return l, err
 }
 
+// ErrInvalidCursor marks a malformed list pagination cursor (SPEC-W90 —
+// mirrored from crm360, which keeps its own copy because the packages do
+// not share an error vocabulary).
+var ErrInvalidCursor = errors.New("invalid cursor")
+
+// leadCursorSep joins the (created_at, id) keyset cursor payload — a unit
+// separator, which can appear in neither an RFC3339Nano timestamp nor a
+// canonical UUID.
+const leadCursorSep = "\x1f"
+
+// defaultLeadListLimit / maxLeadListLimit bound GET /v1/leads pages
+// (SPEC-W90). maxLeadListLimit preserves the pre-W90 hard LIMIT 500.
+const (
+	defaultLeadListLimit = 100
+	maxLeadListLimit     = 500
+)
+
+// encodeLeadCursor builds the opaque URL-safe cursor for the keyset
+// position (created_at, id) — SPEC-W90.
+func encodeLeadCursor(createdAt time.Time, id uuid.UUID) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(createdAt.UTC().Format(time.RFC3339Nano) + leadCursorSep + id.String()))
+}
+
+// decodeLeadCursor parses a cursor back into its keyset position. Any
+// malformed input is ErrInvalidCursor (deterministic 400 at the API —
+// never a silent first page).
+func decodeLeadCursor(cursor string) (time.Time, uuid.UUID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, uuid.Nil, fmt.Errorf("%w: undecodable", ErrInvalidCursor)
+	}
+	parts := strings.SplitN(string(raw), leadCursorSep, 2)
+	if len(parts) != 2 {
+		return time.Time{}, uuid.Nil, fmt.Errorf("%w: malformed", ErrInvalidCursor)
+	}
+	ts, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, uuid.Nil, fmt.Errorf("%w: malformed", ErrInvalidCursor)
+	}
+	id, err := uuid.Parse(parts[1])
+	if err != nil {
+		return time.Time{}, uuid.Nil, fmt.Errorf("%w: malformed", ErrInvalidCursor)
+	}
+	return ts, id, nil
+}
+
 // ListLeads returns leads of a tenant, newest first, with optional
 // status / channel / campaign_id / created_at [from,to] filters (zero
 // values disable a filter). SPEC-W83: q is an optional phone_e164 PREFIX
 // filter (leads carry no name/email — the phone is the searchable field);
 // it is trimmed and hard-capped at 32 chars as defence in depth (the API
 // layer validates the shape first).
+//
+// SPEC-W90: thin first-page wrapper over ListLeadsPage at the pre-W90
+// hard cap of 500 — behavior-compatible (the added id tiebreaker only
+// makes previously-undefined timestamp-tie order deterministic).
 func (s *Store) ListLeads(ctx context.Context, tenantID uuid.UUID, status, channel string, campaignID *uuid.UUID, from, to *time.Time, q string) ([]Lead, error) {
+	out, _, err := s.ListLeadsPage(ctx, tenantID, status, channel, campaignID, from, to, q, "", maxLeadListLimit)
+	return out, err
+}
+
+// ListLeadsPage lists leads one keyset page at a time (SPEC-W90), house
+// idiom mirrored from crm360.SearchContactsPage: ORDER BY created_at
+// DESC, id DESC with an opaque cursor bound to the last row of the
+// previous page — stable under timestamp ties and concurrent inserts (no
+// offset drift). nextCursor is "" on the last page. A malformed cursor is
+// ErrInvalidCursor. limit <=0 or >500 falls back to the 100 default.
+func (s *Store) ListLeadsPage(ctx context.Context, tenantID uuid.UUID, status, channel string, campaignID *uuid.UUID, from, to *time.Time, q, cursor string, limit int) ([]Lead, string, error) {
+	if limit <= 0 || limit > maxLeadListLimit {
+		limit = defaultLeadListLimit
+	}
+	var curTS time.Time
+	curID := uuid.Nil
+	if cursor != "" {
+		ts, id, err := decodeLeadCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		curTS, curID = ts, id
+	}
 	phoneQ := strings.TrimSpace(q)
 	if len(phoneQ) > 32 {
 		phoneQ = phoneQ[:32]
@@ -352,8 +426,16 @@ func (s *Store) ListLeads(ctx context.Context, tenantID uuid.UUID, status, chann
 		sql += fmt.Sprintf(` AND phone_e164 LIKE $%d || '%%'`, n)
 		args = append(args, phoneQ)
 	}
-	sql += ` ORDER BY created_at DESC LIMIT 500`
-	var out []Lead
+	if cursor != "" {
+		sql += fmt.Sprintf(` AND (created_at < $%[1]d OR (created_at = $%[1]d AND id < $%[2]d))`, n+1, n+2)
+		args = append(args, curTS, curID)
+		n += 2
+	}
+	n++
+	// limit+1: the extra row only signals hasMore and is never returned.
+	sql += fmt.Sprintf(` ORDER BY created_at DESC, id DESC LIMIT $%d`, n)
+	args = append(args, limit+1)
+	out := []Lead{}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, sql, args...)
 		if err != nil {
@@ -369,7 +451,15 @@ func (s *Store) ListLeads(ctx context.Context, tenantID uuid.UUID, status, chann
 		}
 		return rows.Err()
 	})
-	return out, err
+	if err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(out) > limit {
+		out = out[:limit]
+		next = encodeLeadCursor(out[len(out)-1].CreatedAt, out[len(out)-1].ID)
+	}
+	return out, next, nil
 }
 
 // UpdateLeadStatus sets a lead's status (and updated_at). Transition

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -155,15 +156,37 @@ func (s *server) listLeads(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid q filter")
 		return
 	}
-	rows, err := svc.Store.ListLeads(r.Context(), tenant.ID, status, channel, campaignID, from, to, leadQ)
+	// SPEC-W90: keyset pagination (see Store.ListLeadsPage). limit follows
+	// the crm360 limitParam semantics: non-integer -> 400, <=0 -> default,
+	// >500 -> clamped. The next_cursor key is emitted only when another
+	// page exists — additive, so pre-W90 clients see no change.
+	limit := 0
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		limit = n
+	}
+	cursor := strings.TrimSpace(q.Get("cursor"))
+	rows, next, err := svc.Store.ListLeadsPage(r.Context(), tenant.ID, status, channel, campaignID, from, to, leadQ, cursor, limit)
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidCursor) {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
 		s.internal(w, err)
 		return
 	}
 	if rows == nil {
 		rows = []store.Lead{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"leads": rows})
+	resp := map[string]any{"leads": rows}
+	if next != "" {
+		resp["next_cursor"] = next
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) getLead(w http.ResponseWriter, r *http.Request) {
