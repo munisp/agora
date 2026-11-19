@@ -52,6 +52,8 @@ mod events;
 mod flutterwave;
 #[path = "../src/ledger/mod.rs"]
 mod ledger;
+#[path = "../src/marketplace.rs"]
+mod marketplace;
 #[path = "../src/mojaloop.rs"]
 mod mojaloop;
 #[path = "../src/payouts.rs"]
@@ -84,6 +86,7 @@ pub struct AppState {
     pub ledger: Arc<dyn ledger::LedgerClient>,
     pub outbox: dapr::DaprOutbox,
     pub mojaloop: mojaloop::MojaloopAdapter,
+    pub marketplace: marketplace::Marketplace,
     pub flutterwave: flutterwave::FlutterwaveAdapter,
     pub config: Arc<config::Config>,
     pub dlq: Arc<dyn consumer::DlqSink>,

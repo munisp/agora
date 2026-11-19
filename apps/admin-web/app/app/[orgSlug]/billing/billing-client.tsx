@@ -27,6 +27,7 @@ import type {
   PricingRecommendation,
 } from "@/lib/types";
 import { InvoicesPanel } from "./invoices-panel";
+import { QuoteComparisonCard, ReconciliationCard } from "./marketplace-panels";
 
 export function BillingClient({ orgSlug }: { orgSlug: string }) {
   const { toast } = useToast();
@@ -493,6 +494,11 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
           ) : null}
         </CardContent>
       </Card>
+
+      {/* SPEC-W99 (innovation #11 MVP): read-only DFSP quote comparison +
+          payout reconciliation report (payments-service). */}
+      <QuoteComparisonCard orgSlug={orgSlug} beneficiaries={beneficiaries} />
+      <ReconciliationCard orgSlug={orgSlug} />
 
       <RecommendationsCard orgSlug={orgSlug} />
     </div>

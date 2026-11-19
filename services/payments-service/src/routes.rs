@@ -47,6 +47,7 @@ use crate::auth::AuthRejection;
 use crate::ledger::{
     transfer_id_from_key, CaptureResult, LedgerError, TenantBalance, Transfer, TransferState,
 };
+use crate::marketplace::{DfspError, DfspQuote};
 use crate::mojaloop::{Money, PartyIdInfo, PayoutInstruction, PayoutOutcome, PayoutRailOutcome};
 use crate::payouts::{payout_post_id, payout_void_id, AttemptState, PayoutAttempt};
 use crate::registry::{Beneficiary, DepositProvenance};
@@ -97,6 +98,13 @@ impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+
+    fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: msg.into(),
         }
     }
@@ -444,6 +452,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/accounts/:tenant_id/balance", get(balance))
         .route("/v1/payouts", post(payout))
         .route("/v1/payouts/:id/approve", post(approve_payout))
+        // SPEC-W99 C1/C2: read-only DFSP quote marketplace + reconciliation
+        // report (no ledger writes, no transfer sends).
+        .route("/v1/payouts/quotes", post(payout_quotes))
+        .route("/v1/reconciliation/report", get(reconciliation_report))
         .route("/v1/beneficiaries", get(list_beneficiaries))
         .route("/v1/beneficiaries", post(create_beneficiary))
         .route("/v1/beneficiaries/:id/disable", post(disable_beneficiary))
@@ -1949,4 +1961,231 @@ async fn activity_void_hold(
     )
     .await;
     Ok(Json(t))
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W99 C1: DFSP quote marketplace (innovation #11 MVP, READ-ONLY)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PayoutQuoteRequest {
+    pub tenant_id: String,
+    pub amount_cents: u64,
+    pub currency: String,
+    /// K7: quotes resolve the SAME vetted beneficiary registry as payouts.
+    pub beneficiary_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayoutQuoteComparisonResponse {
+    pub tenant_id: String,
+    pub amount_cents: u64,
+    pub currency: String,
+    pub beneficiary_id: Uuid,
+    pub quotes: Vec<DfspQuote>,
+    pub errors: Vec<DfspError>,
+    /// fsp ids in rank order (best receive amount first).
+    pub ranked: Vec<String>,
+    pub best_fsp: Option<String>,
+    pub generated_at: String,
+}
+
+/// C1: compare FSPIOP quotes across the configured DFSPs (`PAYOUT_DFSPS`).
+/// Read-only — no ledger write, no transfer send, no idempotency key. The
+/// currency is validated for SHAPE only: read-only cross-border quoting is
+/// explicitly allowed for non-NGN; P-13 NGN-only enforcement on the
+/// money-moving routes is unchanged.
+async fn payout_quotes(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PayoutQuoteRequest>,
+) -> Result<(StatusCode, Json<PayoutQuoteComparisonResponse>), ApiError> {
+    require_safe_tenant(&body.tenant_id)?;
+    // Same posture as GET /v1/beneficiaries: tenant binding + money role —
+    // quoting probes external rails and reveals beneficiary-derived data.
+    require_money_mutation(&st, &headers, &body.tenant_id)?;
+    if body.amount_cents == 0 {
+        return Err(ApiError::bad_request("amount_cents must be > 0"));
+    }
+    let ccy = body.currency.as_str();
+    if ccy.len() != 3 || !ccy.chars().all(|c| c.is_ascii_uppercase()) {
+        return Err(ApiError::bad_request(format!(
+            "invalid currency '{ccy}': expected an ISO-4217 3-letter code (quoting              is read-only; payout execution remains {SUPPORTED_CURRENCY}-only)"
+        )));
+    }
+    if st.marketplace.dfsp_count() == 0 {
+        return Err(ApiError::service_unavailable(
+            "no DFSPs configured: set PAYOUT_DFSPS (fspId=endpoint pairs) to              enable the quote marketplace — quotes are never fabricated",
+        ));
+    }
+    // K7 resolution path, identical to the payout route (uniform 422 for
+    // unknown/foreign/disabled — no cross-tenant beneficiary oracle). The
+    // probe body exists only to reuse resolve_payee unchanged; its
+    // idempotency/amount fields never leave this handler.
+    let probe = PayoutBody {
+        tenant_id: body.tenant_id.clone(),
+        amount_cents: body.amount_cents,
+        currency: body.currency.clone(),
+        payee: None,
+        beneficiary_id: body.beneficiary_id,
+        idempotency_key: None,
+    };
+    let (beneficiary_id, payee) = resolve_payee(&st, &probe).await?;
+    let comparison = st
+        .marketplace
+        .quote_compare(&body.tenant_id, body.amount_cents, &body.currency, &payee)
+        .await;
+    if comparison.quotes.is_empty() {
+        // EVERY DFSP failed: honest 502 with the per-DFSP reasons.
+        return Err(ApiError::bad_gateway(format!(
+            "all {} DFSP(s) failed to quote: {}",
+            comparison.errors.len(),
+            comparison
+                .errors
+                .iter()
+                .map(|e| format!("{}: {}", e.fsp_id, e.error))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )));
+    }
+    Ok((
+        StatusCode::OK,
+        Json(PayoutQuoteComparisonResponse {
+            tenant_id: body.tenant_id,
+            amount_cents: body.amount_cents,
+            currency: body.currency,
+            beneficiary_id,
+            quotes: comparison.quotes,
+            errors: comparison.errors,
+            ranked: comparison.ranked,
+            best_fsp: comparison.best_fsp,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W99 C2: ledger reconciliation report (READ-ONLY)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ReconciliationParams {
+    pub tenant_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconCheck {
+    pub id: String,
+    /// "info" | "warn" — computed honestly from the data, never suppressed.
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconAttemptsSection {
+    pub by_state: Vec<crate::payouts::AttemptSummary>,
+    pub in_flight: Vec<PayoutAttempt>,
+    /// Sum of in-flight attempt amounts (minor units).
+    pub reserved_cents: u128,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconciliationReport {
+    pub tenant_id: String,
+    pub generated_at: String,
+    pub ledger: TenantBalance,
+    pub payout_attempts: ReconAttemptsSection,
+    pub checks: Vec<ReconCheck>,
+}
+
+/// C2: per-tenant reconciliation report — ledger account snapshot + durable
+/// payout-attempt rollups + honestly computed checks. Read-only.
+async fn reconciliation_report(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReconciliationParams>,
+) -> Result<Json<ReconciliationReport>, ApiError> {
+    require_safe_tenant(&params.tenant_id)?;
+    require_money_mutation(&st, &headers, &params.tenant_id)?;
+    let ledger = st.ledger.balance(&params.tenant_id).await?;
+    let by_state = st
+        .payout_attempts
+        .summary_scoped(&params.tenant_id)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("payout attempt summary failed: {e}")))?;
+    let in_flight = st
+        .payout_attempts
+        .list_in_flight_scoped(&params.tenant_id, 100)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("payout in-flight read failed: {e}")))?;
+    let reserved: u128 = in_flight.iter().map(|a| a.amount_cents as u128).sum();
+
+    let mut checks = Vec::new();
+    let count_of = |state: AttemptState| -> u64 {
+        by_state
+            .iter()
+            .find(|s| s.state == state)
+            .map(|s| s.count)
+            .unwrap_or(0)
+    };
+    let unknown = count_of(AttemptState::Unknown);
+    if unknown > 0 {
+        checks.push(ReconCheck {
+            id: "unknown_attempts".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "{unknown} payout attempt(s) in state 'unknown' — the reconciler sweep                  re-queries the rail and settles them; investigate if they persist"
+            ),
+        });
+    }
+    let pending = count_of(AttemptState::PendingApproval);
+    if pending > 0 {
+        checks.push(ReconCheck {
+            id: "pending_approvals".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "{pending} payout(s) awaiting owner approval (funds reserved, rail not called)"
+            ),
+        });
+    }
+    // One-sided invariant (C2): every payout/transfer hold raises the tenant
+    // revenue account's pending DEBITS, so the sum of in-flight payout
+    // attempts can never exceed abs(pending_net) of tenant:{id}:revenue.
+    // Equality is NOT asserted: revenue pending also covers /v1/transfers
+    // (lending bridge) holds, which are tracked in transfer_attempts.
+    let revenue_pending_abs: u128 = ledger
+        .accounts
+        .iter()
+        .find(|a| a.account == format!("tenant:{}:revenue", params.tenant_id))
+        .map(|a| a.pending_net.unsigned_abs())
+        .unwrap_or(0);
+    if reserved > revenue_pending_abs {
+        checks.push(ReconCheck {
+            id: "reserved_within_pending".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "in-flight payout attempts reserve {reserved} minor units but the tenant                  revenue account shows only {revenue_pending_abs} pending — investigate                  (reserved must never exceed ledger pending)"
+            ),
+        });
+    } else {
+        checks.push(ReconCheck {
+            id: "reserved_within_pending".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "in-flight payout attempts reserve {reserved} minor units within the                  {revenue_pending_abs} pending on the tenant revenue account (revenue                  pending also covers lending /v1/transfers holds, so exact equality is                  not asserted)"
+            ),
+        });
+    }
+
+    Ok(Json(ReconciliationReport {
+        tenant_id: params.tenant_id.clone(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        ledger,
+        payout_attempts: ReconAttemptsSection {
+            by_state,
+            in_flight,
+            reserved_cents: reserved,
+        },
+        checks,
+    }))
 }

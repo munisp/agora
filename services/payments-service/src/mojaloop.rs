@@ -67,6 +67,12 @@ struct QuoteResponse {
     expiration: Option<String>,
     ilp_packet: Option<String>,
     condition: Option<String>,
+    /// FSPIOP payeeFspFee / payeeFspCommission (SPEC-W99 C1): disclosed DFSP
+    /// charges, surfaced verbatim for fee transparency in the quote
+    /// marketplace. Optional — a DFSP that does not disclose fees yields
+    /// None and the quote ranks on its transfer amount alone.
+    payee_fsp_fee: Option<Money>,
+    payee_fsp_commission: Option<Money>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,7 +134,7 @@ pub fn classify_transfer_state(state: Option<&str>) -> RailQueryState {
 
 /// Exact decimal-string -> minor units ("1250.00" -> 125000). None on
 /// anything unparseable or with more than 2 fraction digits.
-fn decimal_to_minor(s: &str) -> Option<u64> {
+pub fn decimal_to_minor(s: &str) -> Option<u64> {
     let s = s.trim();
     let (major, frac) = match s.split_once('.') {
         Some((m, f)) => (m, f),
@@ -182,6 +188,18 @@ pub struct PayoutInstruction {
     pub currency: String,
     pub payee: PartyIdInfo,
     pub payer: PartyIdInfo,
+}
+
+/// SPEC-W99 C1: a quote-stage-only, echo-verified FSPIOP quote returned by
+/// [`MojaloopAdapter::request_quote`] for the DFSP marketplace. Read-only —
+/// no transfer is ever sent on this path.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifiedQuote {
+    pub quote_id: String,
+    pub transfer_amount: Money,
+    pub payee_fsp_fee: Option<Money>,
+    pub payee_fsp_commission: Option<Money>,
+    pub expiration: Option<String>,
 }
 
 fn minor_to_decimal(amount_cents: u64) -> String {
@@ -368,6 +386,92 @@ impl MojaloopAdapter {
             Ok(t) => classify_transfer_state(t.transfer_state.as_deref()),
             Err(e) => RailQueryState::Unknown(format!("unparseable query response: {e}")),
         }
+    }
+
+    /// SPEC-W99 C1: quote-stage-only FSPIOP `POST /quotes` against a NAMED
+    /// destination DFSP (the marketplace calls this once per configured
+    /// DFSP). Read-only: no transfer is ever sent here, so every failure is
+    /// a plain `Err` (the caller decides partial-failure posture). The P-08
+    /// echo verification is identical to `execute_payout`'s: a DFSP that
+    /// echoes different amount/currency terms is rejected, never silently
+    /// accepted. `execute_payout` deliberately keeps its own inline quote
+    /// stage — the money path is NOT refactored by this wave.
+    pub async fn request_quote(
+        &self,
+        instruction: &PayoutInstruction,
+        dest_fsp: &str,
+    ) -> Result<VerifiedQuote, String> {
+        let amount = Money {
+            currency: instruction.currency.clone(),
+            amount: minor_to_decimal(instruction.amount_cents),
+        };
+        let quote_id = Uuid::new_v4().to_string();
+        let quote = QuoteRequest {
+            quote_id: quote_id.clone(),
+            transaction_id: instruction.transfer_id.to_string(),
+            payer: Party {
+                party_id_info: instruction.payer.clone(),
+            },
+            payee: Party {
+                party_id_info: instruction.payee.clone(),
+            },
+            amount_type: "SEND",
+            amount: amount.clone(),
+            transaction_type: TransactionType {
+                scenario: "TRANSFER",
+                initiator: "PAYER",
+                initiator_type: "BUSINESS",
+            },
+        };
+        let resp = self
+            .post("/quotes", "quotes", dest_fsp, &quote)
+            .await
+            .map_err(|e| format!("quote request failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("quote rejected: {status}: {body}"));
+        }
+        let quote_resp: QuoteResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("unparseable quote response: {e}"))?;
+        // P-08: verify the quote echo (amount + currency) before accepting
+        // the quote terms — identical posture to execute_payout.
+        if let Some(echo) = &quote_resp.transfer_amount {
+            if !quote_echo_matches(&amount, echo) {
+                return Err(format!(
+                    "quote echo mismatch: requested {} {}, DFSP echoed {} {}",
+                    amount.amount, amount.currency, echo.amount, echo.currency
+                ));
+            }
+        }
+        // Fee disclosure must parse exactly (minor units, <=2dp): a DFSP
+        // returning garbage fees is rejected rather than shown misleading
+        // transparency numbers.
+        for (label, m) in [
+            ("payeeFspFee", &quote_resp.payee_fsp_fee),
+            ("payeeFspCommission", &quote_resp.payee_fsp_commission),
+        ] {
+            if let Some(m) = m {
+                if decimal_to_minor(&m.amount).is_none() {
+                    return Err(format!("unparseable {label} amount: {}", m.amount));
+                }
+                if m.currency != amount.currency {
+                    return Err(format!(
+                        "{label} currency {} != transfer currency {}",
+                        m.currency, amount.currency
+                    ));
+                }
+            }
+        }
+        Ok(VerifiedQuote {
+            quote_id,
+            transfer_amount: quote_resp.transfer_amount.unwrap_or(amount),
+            payee_fsp_fee: quote_resp.payee_fsp_fee,
+            payee_fsp_commission: quote_resp.payee_fsp_commission,
+            expiration: quote_resp.expiration,
+        })
     }
 }
 

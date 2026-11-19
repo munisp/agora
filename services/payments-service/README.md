@@ -58,6 +58,8 @@ is **mandatory** — the service refuses to start when it is unset/unknown
 | GET | `/v1/accounts/{tenant_id}/balance` | — | account snapshots (tenant-bound, P-09) |
 | POST | `/v1/payouts` | `{tenant_id, amount_cents, currency, payee:{party_id_type, party_identifier}, beneficiary_id?, idempotency_key}` | ledger-first two-phase payout (104): pending hold → rail → post/void (P-01/C3); key REQUIRED. K20: amounts strictly above `PAYOUT_APPROVAL_THRESHOLD_KOBO` return 202 `pending_approval` (funds reserved, rail NOT called) until approved |
 | POST | `/v1/payouts/{id}/approve` | — | K20: execute a `pending_approval` payout (money role; above-threshold approvals require the **owner** role specifically). Idempotent: replaying an already-approved payout returns 200 `approved_replay`; approving a payout in any other state is 409 |
+| POST | `/v1/payouts/quotes` | `{tenant_id, amount_cents, currency, beneficiary_id}` | SPEC-W99 C1: READ-ONLY DFSP quote comparison (see "DFSP quote marketplace" below); money role; 503 with zero configured DFSPs, 502 when every DFSP fails |
+| GET | `/v1/reconciliation/report?tenant_id=` | — | SPEC-W99 C2: READ-ONLY reconciliation report (ledger snapshot + payout-attempt rollups + in-flight list + checks); money role |
 | POST | `/v1/internal/accounts/provision` | `{tenant_id}` | explicit idempotent account provisioning (internal token, P-10) |
 | POST | `/activities/hold-deposit` | `{tenant_id, booking_id, amount_cents, currency?}` | Temporal `HoldDeposit` activity (SPEC §6); internal token |
 | POST | `/activities/void-hold` | `{tenant_id, deposit_id? \| booking_id?}` | Temporal `VoidHold` compensation; internal token |
@@ -174,6 +176,36 @@ headers included). Payout ordering is **ledger-first** (P-01, contract C3):
    A ledger post failure after a committed rail transfer is logged CRITICAL
    and swept by the reconciler.
 
+## DFSP quote marketplace + reconciliation (SPEC-W99, innovation #11 MVP)
+
+`POST /v1/payouts/quotes` fans a payout-shaped FSPIOP `POST /quotes` out to
+EVERY DFSP configured in `PAYOUT_DFSPS` (`fspId=endpoint` pairs) in parallel
+(per-DFSP timeout `PAYOUT_QUOTE_TIMEOUT_MS`), verifies each quote echo
+(P-08 posture: mismatched/unparseable quotes are rejected), and returns the
+quotes RANKED by best receive amount (`transfer − payeeFspFee −
+payeeFspCommission` when both fee fields disclose; undisclosed quotes fall
+back to the transfer amount, disclosure breaks ties, fsp id breaks the rest
+— deterministic). Errored DFSPs are reported in `errors[]` with their
+reasons (never silently dropped); one unreachable DFSP never sinks the
+comparison, but when EVERY DFSP fails the route is 502. Zero configured
+DFSPs = 503 (quotes are never fabricated).
+
+**MVP scope (honest):** quoting is READ-ONLY — no ledger write, no transfer
+send, no idempotency key. Payout EXECUTION still runs on the single
+`MOJALOOP_ENDPOINT` rail (`/v1/payouts`, P-13 NGN-only, unchanged).
+Cross-border quoting IS allowed for non-NGN currencies (shape-validated
+ISO-4217) since no money moves; quote-bound execution on the winning DFSP,
+multi-currency execution, DFSP discovery and FSPIOP JWS verification are
+documented phase-2 items.
+
+`GET /v1/reconciliation/report?tenant_id=…` returns the tenant's ledger
+account snapshot plus durable `payout_attempts` rollups (`by_state` counts +
+sums, in-flight `unknown`/`pending_approval` attempts, `reserved_cents`) and
+computed `checks`: unknown-attempt and pending-approval surfacing, and the
+one-sided invariant `reserved ≤ |pending_net(tenant:{id}:revenue)|`
+(equality is NOT asserted — revenue pending also covers lending
+`/v1/transfers` holds; both raw figures are always reported).
+
 ## Env vars
 
 | Var | Default | Description |
@@ -200,6 +232,8 @@ headers included). Payout ordering is **ledger-first** (P-01, contract C3):
 | `PAYMENTS_DATABASE_URL` | — (falls back to `DATABASE_URL`, then `PG_DSN`) | Postgres DSN for the durable `payout_attempts` table (P-01/C3); bootstrapped at boot, fail-closed when configured but unreachable; in-memory dev fallback when unset |
 | `PAYOUT_RECONCILER_INTERVAL_SECS` | `30` | reconciler sweep interval for unknown payout rail outcomes |
 | `PAYOUT_APPROVAL_THRESHOLD_KOBO` | `0` (disabled) | K20: payouts STRICTLY ABOVE this amount (kobo) park as 202 `pending_approval` — funds reserved, rail NOT called — until `POST /v1/payouts/{id}/approve` (owner role required for above-threshold approvals). `0` disables the gate (every payout dispatches immediately) |
+| `PAYOUT_DFSPS` | `` (empty) | W99 C1: DFSP quote marketplace peers, `fspId=endpoint` comma pairs (unique lowercase fsp ids, http(s) URLs; invalid entries skipped with a warning). Empty = `/v1/payouts/quotes` is 503 |
+| `PAYOUT_QUOTE_TIMEOUT_MS` | `4000` | W99 C1: per-DFSP quote timeout (clamp 500–15000) |
 
 ## Run
 

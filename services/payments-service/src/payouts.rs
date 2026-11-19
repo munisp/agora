@@ -116,6 +116,26 @@ pub trait PayoutAttemptStore: Send + Sync {
         state: AttemptState,
         detail: Option<&str>,
     ) -> Result<(), String>;
+    /// SPEC-W99 C2: tenant-scoped per-state rollup for the reconciliation
+    /// report (`GROUP BY state` over the tenant's rows only).
+    async fn summary_scoped(&self, tenant_id: &str) -> Result<Vec<AttemptSummary>, String>;
+    /// SPEC-W99 C2: tenant-scoped in-flight attempts (`unknown` +
+    /// `pending_approval`), oldest first, for the reconciliation report.
+    async fn list_in_flight_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String>;
+}
+
+/// SPEC-W99 C2: per-state rollup row of the reconciliation report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptSummary {
+    pub state: AttemptState,
+    pub count: u64,
+    /// Sum of amount_cents across the state bucket. u128 so the report
+    /// never overflows on pathological histories.
+    pub amount_cents: u128,
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +444,70 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
         Ok(())
     }
+
+    async fn summary_scoped(&self, tenant_id: &str) -> Result<Vec<AttemptSummary>, String> {
+        // SPEC-W99 C2 / DB-01: pinned to the request's tenant (RLS).
+        // SUM is cast to TEXT and parsed as u128 in Rust — no NUMERIC decode
+        // feature needed and no i64 overflow ceiling on the rollup.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
+        let rows = sqlx::query(
+            "SELECT state, COUNT(*)::bigint AS n,
+                    COALESCE(SUM(amount_cents), 0)::text AS total
+             FROM payout_attempts GROUP BY state ORDER BY state",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_attempts summary failed: {e}"))?;
+        let out = rows
+            .iter()
+            .map(|row| {
+                use sqlx::Row;
+                let state: String = row.try_get("state").map_err(|e| e.to_string())?;
+                let n: i64 = row.try_get("n").map_err(|e| e.to_string())?;
+                let total: String = row.try_get("total").map_err(|e| e.to_string())?;
+                Ok(AttemptSummary {
+                    state: AttemptState::from_str(&state)
+                        .ok_or_else(|| format!("unknown payout attempt state '{state}'"))?,
+                    count: u64::try_from(n).map_err(|_| "negative count".to_string())?,
+                    amount_cents: total
+                        .parse::<u128>()
+                        .map_err(|e| format!("summary sum parse: {e}"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
+    }
+
+    async fn list_in_flight_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String> {
+        // SPEC-W99 C2 / DB-01: tenant-pinned in-flight listing.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
+        let rows = sqlx::query(
+            "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
+                    created_at, updated_at
+             FROM payout_attempts WHERE state IN ('unknown', 'pending_approval')
+             ORDER BY created_at LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_attempts in-flight read failed: {e}"))?;
+        let out = rows.iter().map(Self::row_to_attempt).collect::<Result<Vec<_>, _>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +573,44 @@ impl PayoutAttemptStore for MemPayoutAttemptStore {
             a.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn summary_scoped(&self, tenant_id: &str) -> Result<Vec<AttemptSummary>, String> {
+        let rows = self.rows.lock().await;
+        let mut by_state: std::collections::BTreeMap<&str, (u64, u128)> =
+            std::collections::BTreeMap::new();
+        for a in rows.values().filter(|a| a.tenant_id == tenant_id) {
+            let e = by_state.entry(a.state.as_str()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += a.amount_cents as u128;
+        }
+        Ok(by_state
+            .into_iter()
+            .map(|(s, (count, amount_cents))| AttemptSummary {
+                state: AttemptState::from_str(s).expect("store only writes known states"),
+                count,
+                amount_cents,
+            })
+            .collect())
+    }
+
+    async fn list_in_flight_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String> {
+        let rows = self.rows.lock().await;
+        let mut out: Vec<PayoutAttempt> = rows
+            .values()
+            .filter(|a| {
+                a.tenant_id == tenant_id
+                    && matches!(a.state, AttemptState::Unknown | AttemptState::PendingApproval)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.truncate(limit.max(0) as usize);
+        Ok(out)
     }
 }
 
@@ -713,6 +835,8 @@ mod tests {
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,
+            payout_dfsps: Vec::new(),
+            payout_quote_timeout_ms: 4000,
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -722,6 +846,7 @@ mod tests {
                 "opendesk.payments.events".to_string(),
             ),
             mojaloop: mojaloop::MojaloopAdapter::new(rail_url),
+            marketplace: crate::marketplace::Marketplace::new(Vec::new(), 4000),
             flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
             config: Arc::new(cfg),
             dlq: Arc::new(consumer::UnavailableDlqSink),

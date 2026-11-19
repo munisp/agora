@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
-# Multi-stage build: rust:1.80-bookworm -> debian:bookworm-slim (SPEC §15).
+# Multi-stage build: rust:1.100-bookworm -> debian:bookworm-slim (SPEC §15).
+# SPEC-W99 C0: 1.80 can no longer build the committed Cargo.lock (base64ct
+# 1.8.3 requires the edition2024 cargo feature; sqlx 0.7.4 hit the never-type
+# hard error on modern compilers -> sqlx 0.8).
 
-FROM rust:1.80-bookworm AS build
+FROM rust:1.100-bookworm AS build
 WORKDIR /app
 
 # cmake is required by rdkafka's `cmake-build` feature (bundled librdkafka).
