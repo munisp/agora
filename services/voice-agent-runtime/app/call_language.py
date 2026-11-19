@@ -61,10 +61,22 @@ def from_metadata(raw: Any) -> str:
     return lang.strip().lower() if isinstance(lang, str) and lang.strip().lower() in NAMES else ""
 
 
+# Said first on every call, before anything else (the business's English greeting carries its own notice).
+RECORDING_NOTICES = {
+    "pcm": "Dis call fit dey recorded.",
+    "yo": "A lè ṣe ìgbàsílẹ̀ ìpè yìí.",
+    "ha": "Ana iya nadar wannan kiran.",
+    "ig": "Enwere ike ịdekọ oku a.",
+}
+
+
 def greeting(language: str, business: str, english_greeting: str) -> str:
-    """The opening line in the chosen language (the business's own English greeting otherwise)."""
+    """The opening line in the chosen language, starting with the recording notice (the business's own English
+    greeting otherwise, which starts with its own notice)."""
     tpl = _GREETINGS.get(language)
-    return tpl.format(name=business) if tpl and business else english_greeting
+    if tpl and business:
+        return f"{RECORDING_NOTICES.get(language, '')} {tpl.format(name=business)}".strip()
+    return english_greeting
 
 
 def prompt_instruction(language: str) -> str:

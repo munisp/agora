@@ -444,30 +444,27 @@ async def test_capture_location_dispatch():
 DEFAULT_GREETING = "Hello, thank you for calling Acme. How can I help you today?"
 
 
-def test_greeting_byte_identical_without_disclosure_block():
+def test_greeting_starts_with_the_recording_notice_without_disclosure_block():
     ctx = _ctx()
-    assert build_greeting(ctx) == DEFAULT_GREETING
+    assert build_greeting(ctx) == f"{RECORDING_NOTICE_LINE} {DEFAULT_GREETING}"
 
 
 def test_greeting_ignores_non_dict_disclosure():
     ctx = _ctx()
     ctx.disclosure = "yes"  # defensive: garbage values change nothing
-    assert build_greeting(ctx) == DEFAULT_GREETING
+    assert build_greeting(ctx) == f"{RECORDING_NOTICE_LINE} {DEFAULT_GREETING}"
 
 
-def test_greeting_spoken_ai_disclosure_prepended():
+def test_greeting_spoken_ai_disclosure_follows_the_recording_notice():
     ctx = _ctx()
     ctx.disclosure = {"spokenAiDisclosure": True, "recordingConsent": False}
-    greeting = build_greeting(ctx)
-    assert greeting == f"{AI_DISCLOSURE_LINE} {DEFAULT_GREETING}"
-    assert RECORDING_NOTICE_LINE not in greeting
+    assert build_greeting(ctx) == f"{RECORDING_NOTICE_LINE} {AI_DISCLOSURE_LINE} {DEFAULT_GREETING}"
 
 
-def test_greeting_recording_consent_appended():
+def test_greeting_recording_notice_is_always_first():
     ctx = _ctx()
     ctx.disclosure = {"spokenAiDisclosure": False, "recordingConsent": True}
-    greeting = build_greeting(ctx)
-    assert greeting == f"{DEFAULT_GREETING} {RECORDING_NOTICE_LINE}"
+    assert build_greeting(ctx) == f"{RECORDING_NOTICE_LINE} {DEFAULT_GREETING}"
 
 
 def test_greeting_full_disclosure_with_custom_text():
@@ -479,7 +476,6 @@ def test_greeting_full_disclosure_with_custom_text():
     }
     greeting = build_greeting(ctx)
     assert greeting.startswith(
-        f"{AI_DISCLOSURE_LINE} I can connect you to emergency services."
+        f"{RECORDING_NOTICE_LINE} {AI_DISCLOSURE_LINE} I can connect you to emergency services."
     )
-    assert DEFAULT_GREETING in greeting
-    assert greeting.endswith(RECORDING_NOTICE_LINE)
+    assert greeting.endswith(DEFAULT_GREETING)

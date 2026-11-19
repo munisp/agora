@@ -1372,8 +1372,10 @@ async def build_voice_agent(
             # turn in Hausa. A note at the end of the conversation, right before the reply, is followed reliably.
             name = call_language.NAMES.get(code, (code, code))[0]
             msgs.append(lk_llm.ChatMessage.create(
-                text=(f"The caller has switched to {name}. From now on reply ONLY in {name}. If some words are unclear, "
-                      f"say so in {name} and ask them to repeat — do not change language yourself."),
+                text=(f"The caller has switched to {name}. Begin your next reply with one short, warm sentence in {name} "
+                      f"agreeing to continue in {name} (for example: of course, we can continue in {name}), then answer "
+                      f"what they asked. From now on reply ONLY in {name}. If some words are unclear, say so in {name} "
+                      f"and ask them to repeat — do not change language yourself."),
                 role="system"))
         except Exception as exc:  # noqa: BLE001
             log.warning("language prompt swap failed", error=str(exc)[:200])

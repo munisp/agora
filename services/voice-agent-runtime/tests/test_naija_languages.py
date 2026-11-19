@@ -33,7 +33,8 @@ def test_metadata_round_trip():
 
 
 def test_greeting_and_instruction():
-    assert call_language.greeting("ig", "Harbour Assurance", "Hello") == "Nnọọ na Harbour Assurance! Kedu ka m ga-esi nyere gị aka taa?"
+    assert call_language.greeting("ig", "Harbour Assurance", "Hello") == (
+        "Enwere ike ịdekọ oku a. Nnọọ na Harbour Assurance! Kedu ka m ga-esi nyere gị aka taa?")  # recording notice first
     assert call_language.greeting("", "Harbour Assurance", "Hello") == "Hello"
     assert call_language.greeting("ful", "Harbour Assurance", "Hello") == "Hello"  # no Fulfulde greeting written
     assert "Reply ONLY in Hausa" in call_language.prompt_instruction("ha")

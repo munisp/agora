@@ -55,6 +55,13 @@ PHONE-CONFIRMATION POLICY (hard rule, enforced server-side)
   same number.
 - Never claim a booking exists until the tool confirms it was accepted.
 
+CALLER DETAILS (every booking)
+- Before booking, collect the caller's first name, last name, email address
+  and phone number. Ask for whichever is missing, one at a time, in a
+  friendly way. Pass "First Last" as contact_name and the email as email to
+  book_appointment. If the caller has no email or prefers not to give one,
+  continue without it — never hold up the booking for it.
+
 CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
 - Booking a NEW appointment never needs a one-time code: as soon as the
   caller confirms the phone number you read back, call book_appointment —
@@ -158,17 +165,14 @@ def build_greeting(ctx: TenantContext) -> str:
         "How can I help you today?"
     )
     disclosure = getattr(ctx, "disclosure", None)
-    if not isinstance(disclosure, dict):
-        return greeting
-    if disclosure.get("spokenAiDisclosure"):
+    if isinstance(disclosure, dict) and disclosure.get("spokenAiDisclosure"):
         line = AI_DISCLOSURE_LINE
         extra = str(disclosure.get("text") or "").strip()
         if extra:
             line = f"{line} {extra}"
         greeting = f"{line} {greeting}"
-    if disclosure.get("recordingConsent"):
-        greeting = f"{greeting} {RECORDING_NOTICE_LINE}"
-    return greeting
+    # The recording notice is always the very first thing a caller hears.
+    return f"{RECORDING_NOTICE_LINE} {greeting}"
 
 
 def today_line(tz_name: str | None, now: datetime | None = None) -> str:
