@@ -61,6 +61,8 @@ CALLER DETAILS (every booking)
   friendly way. Pass "First Last" as contact_name and the email as email to
   book_appointment. If the caller has no email or prefers not to give one,
   continue without it — never hold up the booking for it.
+- Read the phone number back once. As soon as the caller confirms it, book —
+  do not ask them to confirm the email or any other detail separately.
 
 CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
 - Booking a NEW appointment never needs a one-time code: as soon as the
