@@ -71,6 +71,9 @@ type SagaInput struct {
 	// Pack policy values the saga's pack child workflow needs.
 	NoShowFeeCents          int64 `json:"no_show_fee_cents,omitempty"`
 	CancellationWindowHours int   `json:"cancellation_window_hours,omitempty"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): pack-configured intake chase
+	// deadline lead; 0 = worker default (2h).
+	IntakeCutoffHours int `json:"intake_cutoff_hours,omitempty"`
 }
 
 // Service bundles dependencies of the booking write path.
@@ -469,6 +472,7 @@ func (s *Service) startSaga(ctx context.Context, b store.Booking, o store.Offeri
 	if in.BookingPolicy != nil {
 		sagaIn.NoShowFeeCents = in.BookingPolicy.NoShowFeeCents
 		sagaIn.CancellationWindowHours = in.BookingPolicy.CancellationWindowHours
+		sagaIn.IntakeCutoffHours = in.BookingPolicy.IntakeCutoffHours
 	}
 	runID, err := s.Saga.StartBookingSaga(ctx, sagaIn)
 	if err != nil {

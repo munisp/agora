@@ -98,8 +98,13 @@ func ClinicIntakeWorkflow(ctx workflow.Context, in ClinicIntakeInput) error {
 		state = "intake-reminder-failed"
 	}
 
-	// Phase 2: wait for IntakeCompleted until T-2h.
-	deadline := in.StartsAt.Add(-clinicIntakeDeadlineLead)
+	// Phase 2: wait for IntakeCompleted until the cutoff (SPEC-W95 C5-B:
+	// pack-configured lead when >0, else the T-2h legacy default).
+	cutoff := clinicIntakeDeadlineLead
+	if in.IntakeCutoffHours > 0 {
+		cutoff = time.Duration(in.IntakeCutoffHours) * time.Hour
+	}
+	deadline := in.StartsAt.Add(-cutoff)
 	_, signalled, cancelled = waitForSignalOrTimer(ctx, deadline.Sub(workflow.Now(ctx)), intakeCh)
 	if cancelled {
 		state = "stopped:cancelled"

@@ -28,12 +28,16 @@ type Config struct {
 	SMTPBinding       string // Dapr output binding for email (bindings-smtp)
 	TwilioBinding     string // Dapr output binding for SMS (bindings-twilio)
 	// Messaging channel routing (docs/integrations/messaging-channels.md).
-	MessagingChannels  string // MESSAGING_CHANNELS: "email:smtp,sms:twilio"
-	TenantChannelMap   string // TENANT_CHANNEL_MAP: per-tenant provider JSON
-	SMTPFrom           string // sender address
-	TwilioFrom         string // sender phone number
-	OpenSearchURL      string // used by the tenant onboarding search-alias activity
-	PublicBaseURL      string // user-facing base URL for waitlist claim links (PUBLIC_BASE_URL)
+	MessagingChannels string // MESSAGING_CHANNELS: "email:smtp,sms:twilio"
+	TenantChannelMap  string // TENANT_CHANNEL_MAP: per-tenant provider JSON
+	SMTPFrom          string // sender address
+	TwilioFrom        string // sender phone number
+	OpenSearchURL     string // used by the tenant onboarding search-alias activity
+	PublicBaseURL     string // user-facing base URL for waitlist claim links (PUBLIC_BASE_URL)
+	// IntakeTokenSecret (SPEC-W95 C5-B): shared HMAC secret
+	// (INTAKE_TOKEN_SECRET) minting the intake capability token in the
+	// reminder link; booking-service validates the same HMAC.
+	IntakeTokenSecret  string
 	KafkaBrokers       string // comma-separated broker list for the booking-events signal bridge
 	BookingEventsTopic string // topic consumed by the signal bridge
 	SignalGroup        string // consumer group of the signal bridge
@@ -131,6 +135,7 @@ func Load() Config {
 		TwilioFrom:               envStr("TWILIO_FROM", "+10000000000"),
 		OpenSearchURL:            envStr("OPENSEARCH_URL", "http://opensearch:9200"),
 		PublicBaseURL:            envStr("PUBLIC_BASE_URL", "http://localhost:9080"),
+		IntakeTokenSecret:        os.Getenv("INTAKE_TOKEN_SECRET"),
 		KafkaBrokers:             envStr("KAFKA_BROKERS", "kafka:9092"),
 		BookingEventsTopic:       envStr("BOOKING_EVENTS_TOPIC", "opendesk.booking.events"),
 		SignalGroup:              envStr("SIGNAL_GROUP", "notification-signals"),

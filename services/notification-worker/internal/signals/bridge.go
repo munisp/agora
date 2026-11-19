@@ -178,6 +178,13 @@ func (b *Bridge) Process(ctx context.Context, raw []byte) error {
 		return b.signalAll(ctx,
 			[]string{"pack-" + id},
 			workflows.SignalNoShow, nil)
+	case "com.opendesk.booking.IntakeCompleted":
+		// SPEC-W95 C5-B: the patient's intake submission completes the
+		// ClinicIntakeWorkflow wait (pack-{bookingId}); best-effort ack
+		// semantics unchanged (completed/absent workflows logged+acked).
+		return b.signalAll(ctx,
+			[]string{"pack-" + id},
+			workflows.SignalIntakeCompleted, nil)
 	default:
 		return nil // other event types need no workflow signals
 	}

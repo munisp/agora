@@ -310,7 +310,7 @@ func packWorkflowInput(packName string, in SagaInput, holdID string) any {
 		return ClinicIntakeInput{
 			BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug,
 			ContactName: in.ContactName, ContactEmail: in.ContactEmail, ContactPhone: in.ContactPhone,
-			StartsAt: in.StartsAt,
+			StartsAt: in.StartsAt, IntakeCutoffHours: in.IntakeCutoffHours,
 		}
 	case "ConsultancyFollowupWorkflow":
 		return ConsultancyFollowupInput{

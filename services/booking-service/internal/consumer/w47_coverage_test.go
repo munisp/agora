@@ -215,8 +215,10 @@ CREATE TABLE IF NOT EXISTS outbox (
 	}
 	// SPEC-W87: verification_grants joined the hard-delete cascade
 	// (contact-linked personal data, no owner after tenant deletion).
+	// SPEC-W95: intake_submissions joined the hard-delete cascade
+	// (free-form contact PII, no owner after tenant deletion).
 	for _, tbl := range []string{"tickets", "survey_invites", "survey_responses", "device_tokens",
-		"portal_tokens", "verification_grants", "csat_tokens", "field_captures", "field_checkins", "crm_notes", "outbox"} {
+		"portal_tokens", "verification_grants", "intake_submissions", "csat_tokens", "field_captures", "field_checkins", "crm_notes", "outbox"} {
 		if _, ok := sum.Details[tbl]; !ok {
 			t.Fatalf("full-schema cascade skipped existing table %s (details=%+v)", tbl, sum.Details)
 		}

@@ -68,6 +68,10 @@ type BookingPolicy struct {
 	PhoneConfirmation       bool  `json:"phoneConfirmation"`
 	IntakeRequired          bool  `json:"intakeRequired"`
 	CancellationWindowHours int   `json:"cancellationWindowHours"`
+	// IntakeCutoffHours (SPEC-W95 C5-B) mirrors the pack bookingPolicy
+	// intakeCutoffHours: hours before start the intake chase deadline
+	// lands; 0 = worker default (2h).
+	IntakeCutoffHours int `json:"intakeCutoffHours"`
 	// TemporalWorkflow (SPEC-W80 B13) mirrors the SIBLING
 	// PackSummary.TemporalWorkflow — populated by the tenant resolver at
 	// decode time (never deserialized from the pack JSON, hence json:"-").

@@ -2,9 +2,14 @@ package activities
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -180,16 +185,40 @@ func (a *Activities) ChargeNoShowFee(ctx context.Context, in workflows.SalonDepo
 	}, nil)
 }
 
-// SendIntakeReminder emails the patient their intake form link at T-72h.
+// intakeLink builds the user-facing intake completion URL (SPEC-W95 C5-B).
+// The token is the stateless capability booking-service validates — hex
+// HMAC-SHA256(INTAKE_TOKEN_SECRET, "intake:"+bookingUUID) — so completing
+// intake needs no portal session. An unconfigured secret fails loudly: the
+// workflow records intake-reminder-failed instead of emailing a placeholder
+// or tokenless link (which the public endpoint would 404 anyway).
+func (a *Activities) intakeLink(tenantSlug, bookingID string) (string, error) {
+	if a.IntakeTokenSecret == "" {
+		return "", errors.New("INTAKE_TOKEN_SECRET is not configured")
+	}
+	mac := hmac.New(sha256.New, []byte(a.IntakeTokenSecret))
+	mac.Write([]byte("intake:" + bookingID))
+	base := strings.TrimRight(a.PublicBaseURL, "/")
+	if base == "" {
+		base = "http://localhost:9080"
+	}
+	return fmt.Sprintf("%s/p/%s/intake?booking=%s&token=%s", base, tenantSlug, bookingID, hex.EncodeToString(mac.Sum(nil))), nil
+}
+
+// SendIntakeReminder sends the patient their intake form link at T-72h.
+// Phone is passed so notify() routes the SMS/WhatsApp nudge per the tenant
+// channel map (SPEC-W95 C5-B — was email-only with a placeholder link).
 func (a *Activities) SendIntakeReminder(ctx context.Context, in workflows.ClinicIntakeInput) error {
-	link := fmt.Sprintf("https://forms.opendesk.local/intake/%s/%s", in.TenantSlug, in.BookingID)
+	link, err := a.intakeLink(in.TenantSlug, in.BookingID)
+	if err != nil {
+		return err
+	}
 	td := templateData{
 		Name:     in.ContactName,
 		StartsAt: in.StartsAt.Format(time.RFC1123),
 		Kind:     link,
 		Tenant:   in.TenantSlug,
 	}
-	return a.notify(ctx, td, in.ContactEmail, "", "Intake form for your upcoming visit", intakeEmail)
+	return a.notify(ctx, td, in.ContactEmail, in.ContactPhone, "Intake form for your upcoming visit", intakeEmail)
 }
 
 // SendDepositReminder nudges the client about the missing deposit inside the

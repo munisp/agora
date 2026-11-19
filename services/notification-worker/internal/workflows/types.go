@@ -41,6 +41,11 @@ type SagaInput struct {
 	// workflow does not need to reload the pack.
 	NoShowFeeCents          int64 `json:"no_show_fee_cents,omitempty"`
 	CancellationWindowHours int   `json:"cancellation_window_hours,omitempty"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): pack-configured intake chase
+	// deadline lead; 0 = worker default (2h). Cross-service contract:
+	// bookingops.SagaInput serializes this as "intake_cutoff_hours"
+	// (omitempty).
+	IntakeCutoffHours int `json:"intake_cutoff_hours,omitempty"`
 
 	// SPEC-W80 C1: WorkflowName is the pack-declared Temporal workflow
 	// (pack.temporalWorkflow) resolved by booking-service when the booking
@@ -161,6 +166,9 @@ type ClinicIntakeInput struct {
 	ContactEmail string    `json:"contact_email"`
 	ContactPhone string    `json:"contact_phone,omitempty"`
 	StartsAt     time.Time `json:"starts_at"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): pack-configured intake chase
+	// deadline lead; 0 = default clinicIntakeDeadlineLead (2h).
+	IntakeCutoffHours int `json:"intake_cutoff_hours,omitempty"`
 }
 
 // SalonDepositInput starts a SalonDepositWorkflow.

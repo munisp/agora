@@ -877,6 +877,9 @@ func run() error {
 		NotificationsTopic: cfg.NotificationsTopic,
 		// SPEC-W87: verification-grant TTL (0 disables grant writes).
 		VerificationGrantTTL: cfg.VerificationGrantTTL,
+		// SPEC-W95 C5-B: intake capability-token secret (empty = intake
+		// endpoints 404 uniformly).
+		IntakeTokenSecret: cfg.IntakeTokenSecret,
 		// SPEC-W44 W-B/S1-F7-05 (K2): internauth on the civic sla-breach
 		// callback (BOOKING_INTERNAL_TOKEN, no default — fail closed).
 		InternalToken: cfg.InternalToken,

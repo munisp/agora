@@ -77,6 +77,11 @@ type Config struct {
 	// written on portal OTP success (VERIFICATION_GRANT_TTL_HOURS, default
 	// 24h); <= 0 disables writing (checks then always answer false).
 	VerificationGrantTTL time.Duration
+	// IntakeTokenSecret is the shared HMAC-SHA256 secret (INTAKE_TOKEN_SECRET,
+	// shared with the notification-worker) backing the SPEC-W95 stateless
+	// intake capability token: hex HMAC(secret, "intake:"+bookingUUID).
+	// Empty disables the public intake endpoints (uniform 404).
+	IntakeTokenSecret string
 	// IdentityInternalToken is forwarded as X-Internal-Token on booking→identity
 	// service calls (SPEC-W44 W-B, K2): the appgate entitlement check and the
 	// tenant-resolution GET /v1/tenants/{slug}. IDENTITY_INTERNAL_TOKEN; no
@@ -247,6 +252,7 @@ func Load() (Config, error) {
 		// SPEC-W87: grant TTL in HOURS (envInt — envDur would parse a bare
 		// value as seconds).
 		VerificationGrantTTL:  time.Duration(envInt("VERIFICATION_GRANT_TTL_HOURS", 24)) * time.Hour,
+		IntakeTokenSecret:     os.Getenv("INTAKE_TOKEN_SECRET"),
 		IdentityInternalToken: os.Getenv("IDENTITY_INTERNAL_TOKEN"),
 		GeocodeEnabled:        envStr("GEOCODE_ENABLED", "false") == "true",
 		GeocodeBaseURL:        envStr("GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org"),

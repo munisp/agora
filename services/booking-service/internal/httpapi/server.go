@@ -125,6 +125,10 @@ type Deps struct {
 	// grant written on portal OTP success (VERIFICATION_GRANT_TTL_HOURS).
 	// <= 0 disables writing grants (checks then always answer false).
 	VerificationGrantTTL time.Duration
+	// IntakeTokenSecret backs the SPEC-W95 public intake capability token
+	// (hex HMAC-SHA256(secret, "intake:"+bookingUUID)). Empty disables the
+	// /public/sites/{slug}/intake endpoints (uniform 404).
+	IntakeTokenSecret string
 	// ExtKeys validates X-Api-Key on the SPEC-W45 K17 external bookings
 	// surface (/v1/ext/bookings — the APISIX api-ext-booking upstream).
 	// Nil → NewRouter substitutes an UNCONFIGURED validator that fails
@@ -756,6 +760,10 @@ func NewRouter(d Deps) http.Handler {
 		// authenticated half lives under /portal (portal JWT middleware).
 		r.Post("/portal/request", s.portalRequestCode)
 		r.Post("/portal/verify", s.portalVerifyCode)
+		// SPEC-W95 C5-B: public intake completion endpoints, gated by the
+		// stateless HMAC capability token (no session, no APISIX change).
+		r.Get("/intake", s.intakeInfoPublic)
+		r.Post("/intake", s.intakeSubmitPublic)
 	})
 
 	// Customer self-service portal, contact-scoped via the portal JWT

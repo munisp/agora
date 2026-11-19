@@ -33,6 +33,9 @@ type BookingPolicy struct {
 	PhoneConfirmation       bool  `yaml:"phoneConfirmation" json:"phoneConfirmation"`
 	IntakeRequired          bool  `yaml:"intakeRequired" json:"intakeRequired"`
 	CancellationWindowHours int   `yaml:"cancellationWindowHours" json:"cancellationWindowHours"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): hours before booking start the
+	// intake chase deadline lands; 0 = worker default (2h). Validated 0..720.
+	IntakeCutoffHours int `yaml:"intakeCutoffHours" json:"intakeCutoffHours"`
 }
 
 // Offering is a catalog seed entry of a pack.
@@ -504,6 +507,11 @@ func (p Pack) Validate() error {
 	}
 	if p.BookingPolicy.CancellationWindowHours < 0 {
 		return fmt.Errorf("bookingPolicy.cancellationWindowHours must be >= 0")
+	}
+	// SPEC-W95 C5-B: intake chase cutoff, 0 = worker default (2h); the
+	// 30-day ceiling matches verificationGrants.ttlHours.
+	if p.BookingPolicy.IntakeCutoffHours < 0 || p.BookingPolicy.IntakeCutoffHours > 720 {
+		return fmt.Errorf("bookingPolicy.intakeCutoffHours %d must be between 0 and 720", p.BookingPolicy.IntakeCutoffHours)
 	}
 	switch p.TemporalWorkflow {
 	case "SalonDepositWorkflow", "ClinicIntakeWorkflow", "ConsultancyFollowupWorkflow", "SupportEscalationWorkflow":
