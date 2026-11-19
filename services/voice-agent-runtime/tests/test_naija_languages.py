@@ -388,3 +388,43 @@ def test_switch_mode_nigerian():
     finally:
         del os.environ["VOICE_AUTO_LANGUAGE_SWITCH"]
     assert load_settings().voice_language_switch_mode == "on"
+
+
+def test_english_details_inside_a_yoruba_call_are_heard_in_english_without_switching():
+    import asyncio
+    from app.livekit_worker import SwitchingLanguageSTT
+
+    class Naija:
+        async def identify(self, pcm, **_k):
+            return {"language": "en", "scores": {"en": 0.93}}
+
+        async def transcribe_pcm(self, pcm, **_k):
+            return "go oton"
+
+    class Whisper:
+        async def transcribe_pcm(self, pcm, **_k):
+            return "Yes, that's correct."
+
+    switched = []
+    stt = SwitchingLanguageSTT(Naija(), Whisper(), "yo", ["en", "pcm", "yo", "ha", "ig"], switched.append)
+    pcm = b"\0\0" * 16000 * 2  # 2 s: short turns are checked too
+    text = asyncio.run(stt.transcribe_pcm(pcm, sample_rate=16000))
+    assert text == "Yes, that's correct." and stt.language == "yo" and switched == []
+
+
+def test_asking_for_english_inside_a_yoruba_call_switches():
+    import asyncio
+    from app.livekit_worker import SwitchingLanguageSTT
+
+    class Naija:
+        async def identify(self, pcm, **_k):
+            return {"language": "en", "scores": {"en": 0.95}}
+
+    class Whisper:
+        async def transcribe_pcm(self, pcm, **_k):
+            return "Can we continue in English please?"
+
+    switched = []
+    stt = SwitchingLanguageSTT(Naija(), Whisper(), "yo", ["en", "pcm", "yo", "ha", "ig"], switched.append)
+    asyncio.run(stt.transcribe_pcm(b"\0\0" * 16000 * 3, sample_rate=16000))
+    assert stt.language == "en" and switched == ["en"]

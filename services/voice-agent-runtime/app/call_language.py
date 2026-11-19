@@ -88,6 +88,7 @@ def prompt_instruction(language: str) -> str:
         f"\n\nLANGUAGE: The caller chose to speak {name} on this call. Their words reach you transcribed by a speech "
         f"recogniser, so spelling and tone marks may be imperfect — read for meaning. Reply ONLY in {name}, in short, "
         f"simple spoken sentences (no lists, no symbols, no emojis): your reply is read aloud by a {name} voice. Say "
-        f"numbers, dates and times in words. Keep names of services, people and the business as they are. If the "
-        f"caller switches to English, you may answer in English."
+        f"numbers, dates and times in words. Keep names of services, people and the business as they are. Callers "
+        f"often give dates, names, phone numbers and emails in English: that is normal — keep replying in {name}. "
+        f"Only answer in English if the caller asks to continue in English."
     )

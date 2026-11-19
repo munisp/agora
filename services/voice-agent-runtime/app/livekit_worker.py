@@ -361,6 +361,9 @@ class SwitchingLanguageSTT:
     def __init__(self, naija: NaijaSpeechSTT, whisper: Any, start: str, allowed: list[str], on_switch: Any) -> None:
         self._naija, self._whisper = naija, whisper
         self.language = start or "en"
+        # The call's own language: English said inside a call that STARTED in Yoruba/Hausa/Igbo is code-switching
+        # (details given in English); a caller who started in English/Pidgin and moved away returns home with it.
+        self._home = self.language
         self._english_side = start if start in _ENGLISH_FAMILY else "en"
         self._allowed = [c for c in allowed if c != "ful"] or ["en"]
         self._on_switch = on_switch
@@ -371,33 +374,63 @@ class SwitchingLanguageSTT:
             return None if self.language in _ENGLISH_FAMILY else self._english_side
         return detected if detected != self.language else None
 
-    async def _maybe_switch(self, pcm: bytes, sample_rate: int, channels: int) -> None:
-        seconds = len(pcm) / (2 * max(1, channels) * max(1, sample_rate))
-        if seconds < self.MIN_SWITCH_S or len(self._allowed) < 2:
-            return
+    # Code-switching: in a Yoruba/Hausa/Igbo call, callers often give dates, names, numbers and emails in English. Such a
+    # turn is transcribed with whisper (MMS turned "yes, that's correct" into "go oton" and phone digits into nonsense)
+    # but the call stays in the caller's language unless they ask to change to English.
+    CODE_SWITCH_MIN_S = 1.2
+    CODE_SWITCH_MIN_CONFIDENCE = 0.6
+    _ASKS_FOR_ENGLISH = re.compile(r"\b(speak|talk|continue|switch|change)\b.{0,20}\benglish\b|\bin english\b", re.I)
+
+    async def _identify(self, pcm: bytes, sample_rate: int, channels: int) -> tuple[str, float]:
         try:
             out = await self._naija.identify(pcm, sample_rate=sample_rate, channels=channels, candidates=self._allowed)
         except Exception as exc:  # noqa: BLE001 - keep the current language
             log.warning("language identification failed", error=str(exc)[:200])
-            return
+            return "", 0.0
         detected = str(out.get("language") or "")
-        confidence = float((out.get("scores") or {}).get(detected, 0.0))
+        return detected, float((out.get("scores") or {}).get(detected, 0.0))
+
+    def _switch(self, target: str, confidence: float) -> None:
+        log.info("caller switched language", previous=self.language, language=target, confidence=confidence)
+        self.language = target
+        if target in _ENGLISH_FAMILY:
+            self._english_side = target
+        try:
+            self._on_switch(target)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("language switch hook failed", error=str(exc)[:200])
+
+    async def _maybe_switch(self, pcm: bytes, sample_rate: int, channels: int) -> bool:
+        """Follow a language switch. Returns True when this turn is English said inside a Nigerian-language call
+        (code-switching): transcribe it in English without changing the call's language."""
+        seconds = len(pcm) / (2 * max(1, channels) * max(1, sample_rate))
+        in_nigerian = self.language not in _ENGLISH_FAMILY and self._home not in _ENGLISH_FAMILY
+        if len(self._allowed) < 2 or seconds < (self.CODE_SWITCH_MIN_S if in_nigerian else self.MIN_SWITCH_S):
+            return False
+        detected, confidence = await self._identify(pcm, sample_rate, channels)
+        if in_nigerian and detected in _ENGLISH_FAMILY:
+            return confidence >= self.CODE_SWITCH_MIN_CONFIDENCE
+        if seconds < self.MIN_SWITCH_S:
+            return False
         target = self._target(detected)
         needed = (self.MIN_CONFIDENCE_FROM_ENGLISH
                   if self.language in _ENGLISH_FAMILY and target not in _ENGLISH_FAMILY else self.MIN_CONFIDENCE)
         if target and confidence >= needed:
-            log.info("caller switched language", previous=self.language, language=target, confidence=confidence)
-            self.language = target
-            if target in _ENGLISH_FAMILY:
-                self._english_side = target
-            try:
-                self._on_switch(target)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("language switch hook failed", error=str(exc)[:200])
+            self._switch(target, confidence)
+        return False
 
     async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
                              language: str | None = None, initial_prompt: str | None = None) -> str:
-        await self._maybe_switch(pcm, sample_rate, channels)
+        english_turn = await self._maybe_switch(pcm, sample_rate, channels)
+        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
+        if english_turn:
+            text = await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en", **extra)
+            if self._ASKS_FOR_ENGLISH.search(text or ""):
+                self._switch(self._english_side, 1.0)
+            else:
+                log.info("english turn inside a nigerian-language call", language=self.language)
+            self.last_detected_language = self.language
+            return text
         self.last_detected_language = self.language
         if self.language in call_language.NIGERIAN:
             try:
@@ -406,7 +439,6 @@ class SwitchingLanguageSTT:
             except Exception as exc:  # noqa: BLE001 - keep hearing the caller
                 log.warning("naija speech recognition failed; using whisper", language=self.language,
                             error=str(exc)[:200])
-        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
         return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en", **extra)
 
 
