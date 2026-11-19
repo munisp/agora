@@ -80,7 +80,7 @@ from .pipeline.stt_stream import (
     BackpressureError,
     StreamingSTTEngine,
 )
-from .session_state import SessionStore
+from .session_state import DaprSessionStore, SessionStore, store_get
 from .tts_providers.chain import build_fallback_tts
 
 log = get_logger("control-plane")
@@ -168,7 +168,19 @@ def create_app(
         settings.http_timeout_s,
         direct_bases={settings.booking_app_id: settings.booking_base_url},
     )
-    sessions = SessionStore()
+    # SPEC-W97 G8: session/history persistence backend — "memory" (default,
+    # dev-grade in-process) or "dapr" (DaprSessionStore through the
+    # `statestore` Redis component; sessions + chat history survive
+    # restarts, fail-open on state-store errors).
+    sessions = (
+        DaprSessionStore(
+            dapr,
+            store_name=settings.session_state_store,
+            ttl_s=settings.session_ttl_s,
+        )
+        if settings.session_store_backend == "dapr"
+        else SessionStore(ttl_s=settings.session_ttl_s)
+    )
     # SPEC-W48-C: recognizer for the /v1/stt/stream WebSocket endpoint,
     # behind the STTInterface seam (app/pipeline/stt.py). Default is the
     # real in-process faster-whisper impl (lazy model load, same settings
@@ -484,7 +496,7 @@ def create_app(
         secret = websocket.headers.get("X-Session-Secret") or websocket.query_params.get(
             "session_secret"
         )
-        session = sessions.get(conversation_id) if conversation_id else None
+        session = await store_get(sessions, conversation_id) if conversation_id else None
         if session is None or not session.check_secret(secret):
             log.warning("stt stream upgrade rejected: bad session credentials")
             await websocket.close(code=1008, reason="valid conversation_id and X-Session-Secret required")

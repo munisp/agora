@@ -19,6 +19,17 @@ def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
+def _session_store_backend() -> str:
+    """SPEC-W97 G8: SESSION_STORE_BACKEND — "memory" (default) | "dapr";
+    anything else degrades to memory with a warning (a typo must never
+    crash the boot or silently pick an unexpected backend)."""
+    raw = _env("SESSION_STORE_BACKEND", "memory").strip().lower()
+    if raw in ("memory", "dapr"):
+        return raw
+    log.warning("unknown SESSION_STORE_BACKEND — falling back to memory", value=raw)
+    return "memory"
+
+
 def _env_int(key: str, default: int) -> int:
     try:
         return int(os.environ.get(key, str(default)))
@@ -376,6 +387,16 @@ class Settings:
     ivr_menu_enabled: bool = True
     ivr_menu: str = ""
 
+    # Session persistence (SPEC-W97 G8, app/session_state.py): "memory"
+    # (default, dev-grade in-process) or "dapr" (DaprSessionStore through
+    # the `statestore` Redis component — sessions + chat history survive
+    # restarts; fail-open degradation on state-store errors). Unknown
+    # values degrade to memory with a startup warning. session_ttl_s is
+    # the idle expiry (memory GC + Redis ttlInSeconds), clamped 60..86400.
+    session_store_backend: str = "memory"
+    session_ttl_s: int = 3600
+    session_state_store: str = "statestore"
+
     # Avatar presence (SPEC-W9 Part A, app/avatar/): which provider joins a
     # visual avatar into the LiveKit room after session mint. `none` (default)
     # keeps sessions audio-only; per-tenant override via tenant context
@@ -688,6 +709,9 @@ def load_settings() -> Settings:
         ivr_menu_enabled=_env("IVR_MENU_ENABLED", "1").lower()
         in ("1", "true", "yes", "on"),
         ivr_menu=_env("IVR_MENU", ""),
+        session_store_backend=_session_store_backend(),
+        session_ttl_s=max(60, min(86400, _env_int("SESSION_TTL_S", 3600))),
+        session_state_store=_env("SESSION_STATE_STORE", "statestore"),
         avatar_provider=_env("AVATAR_PROVIDER", "none"),
         tavus_api_key=_env("TAVUS_API_KEY", ""),
         tavus_replica_id=_env("TAVUS_REPLICA_ID", ""),

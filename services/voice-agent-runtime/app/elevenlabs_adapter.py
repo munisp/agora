@@ -21,7 +21,7 @@ from . import ivr_menu
 from .config import Settings
 from .dapr_client import DaprClient
 from .logging import get_logger
-from .session_state import SessionStore
+from .session_state import SessionStore, store_get_or_create, store_save_session
 from .tenant_context import fetch_tenant_context
 from .tools import ToolLayer
 
@@ -141,8 +141,8 @@ class ElevenLabsBackend:
         conversation_id = payload.get("conversation_id")
         session_secret = payload.get("session_secret")
 
-        session = self._sessions.get_or_create(
-            conversation_id, site_slug, session_secret=session_secret
+        session = await store_get_or_create(
+            self._sessions, conversation_id, site_slug, session_secret=session_secret
         )
         ctx = await fetch_tenant_context(self._dapr, self._settings, site_slug)
         tool_layer = ToolLayer(
@@ -167,6 +167,13 @@ class ElevenLabsBackend:
             ),
         )
         result = await tool_layer.dispatch(tool_name, parameters)
+        # SPEC-W97 G8: persist the session after each hosted tool call
+        # (OTP verification/phone confirmation state survives restarts).
+        # Fail-open — never breaks the webhook response.
+        try:
+            await store_save_session(self._sessions, session)
+        except Exception as exc:  # noqa: BLE001 - persistence never breaks a turn
+            log.warning("session persist failed", error=str(exc)[:200])
         # Round-trip the resume credentials (K15(b)) — additive keys.
         result.setdefault("conversation_id", session.conversation_id)
         result.setdefault("session_secret", session.session_secret)

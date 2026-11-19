@@ -120,6 +120,23 @@ caller's next message and pass them to `verify_caller_code` — instead of
 `keypad_unavailable`. `ELEVENLABS_DTMF_REDACT` defaults ON so typed codes
 stay out of ElevenLabs stored transcripts.
 
+**Session persistence (SPEC-W97, closes roadmap G8).** By default sessions
+and chat history are in-memory (dev-grade; lost on restart).
+`SESSION_STORE_BACKEND=dapr` swaps in `DaprSessionStore`: every chat turn
+and hosted tool call persists the session envelope + bounded history (40
+messages) to the `statestore` Redis component (already scoped to `voice`)
+with `SESSION_TTL_S` as the Redis TTL — phone-confirmation, OTP-verified
+identity, escalation state and history survive restarts and replica
+failover. K15(b) is preserved over the wire: resume still requires the
+`session_secret` (constant-time check; a wrong secret starts a fresh
+session under a NEW conversation_id, the targeted envelope untouched).
+Fail-open: a state-store outage degrades resume to fresh sessions but
+never breaks a turn — outcomes ride
+`voice_session_store_ops_total{op,result}` (op: load/save/history_load/
+history_save; result: ok/miss/error). No in-memory cache: one state GET
+per turn load, one PUT per save (single writer per conversation;
+last-writer-wins).
+
 **IVR-A keypad menu (SPEC-W96).** PSTN greetings announce ~3 keypad
 shortcuts (default: 1 = book, 2 = reschedule, 3 = speak to a team member);
 pressing a menu digit outside any keypad wait speaks a short deterministic
@@ -176,6 +193,9 @@ message is provisioned per-tenant on ElevenLabs' side). Metric:
 | `ELEVENLABS_DTMF_TIMEOUT_S` | `2.0` | W93: inactivity timeout completing a digit sequence (clamped 0.5–10.0) |
 | `ELEVENLABS_DTMF_HASH_TERMINATOR` | `1` | W93: `#` completes the sequence immediately (not included in the digits) |
 | `ELEVENLABS_DTMF_REDACT` | `1` | W93: replace keypad turns with `<REDACTED>` in ElevenLabs stored transcripts |
+| `SESSION_STORE_BACKEND` | `memory` | W97: session persistence backend — `memory` (dev) or `dapr` (statestore Redis; sessions + history survive restarts, fail-open on errors) |
+| `SESSION_TTL_S` | `3600` | W97: session idle expiry — memory GC + Redis ttlInSeconds (clamped 60–86400) |
+| `SESSION_STATE_STORE` | `statestore` | W97: Dapr state store component name for session persistence |
 | `IVR_MENU_ENABLED` | `1` | W96: IVR-A keypad menu on PSTN calls (greeting line + digit interception + intent hints); `0` disables |
 | `IVR_MENU` | `1=book:book an appointment,2=reschedule:reschedule an appointment,3=human:speak to a team member` | W96: menu entries `digit=intent:spoken phrase` (comma-separated, max 8, malformed entries skipped); `none` = no menu |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |

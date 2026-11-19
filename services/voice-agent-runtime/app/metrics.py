@@ -328,6 +328,11 @@ class Registry:
             "IVR menu keypad shortcuts pressed (SPEC-W96).",
             ("intent",),
         )
+        self.session_store_ops = Counter(
+            "voice_session_store_ops_total",
+            "Dapr session-store operations by outcome (SPEC-W97 G8).",
+            ("op", "result"),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -359,6 +364,7 @@ class Registry:
             self.dtmf_entries,
             self.dtmf_timeouts,
             self.ivr_menu_digits,
+            self.session_store_ops,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -547,6 +553,12 @@ def ivr_menu_digit(intent: str) -> None:
     """SPEC-W96 IVR-A: one IVR menu shortcut digit intercepted, labelled by
     the menu entry's intent (book | reschedule | human | custom)."""
     _registry.ivr_menu_digits.inc(intent=intent)
+
+
+def session_store_op(op: str, result: str) -> None:
+    """SPEC-W97 G8: one Dapr session-store op (load | save | history_load |
+    history_save) by result (ok | miss | error)."""
+    _registry.session_store_ops.inc(op=op, result=result)
 
 
 def translation(

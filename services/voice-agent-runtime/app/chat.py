@@ -18,7 +18,14 @@ from .logging import get_logger
 from .pipeline.llm import LLMInterface, run_tool_loop, run_tool_loop_stream
 from .plugin_tools import build_plugin_tools
 from .prompts import build_system_prompt
-from .session_state import SessionState, SessionStore
+from .session_state import (
+    SessionState,
+    SessionStore,
+    store_get_or_create,
+    store_load_history,
+    store_save_history,
+    store_save_session,
+)
 from .tenant_context import fetch_tenant_context
 from .tools import UI_ACTION_TOOL_NAMES, ToolLayer
 from .translation import (
@@ -104,8 +111,8 @@ class ChatService:
         conversation_id alone NEVER recovers confirmed/verified phone,
         history or escalation state (SessionStore starts fresh instead).
         """
-        session = self._sessions.get_or_create(
-            conversation_id, site_slug, session_secret=session_secret
+        session = await store_get_or_create(
+            self._sessions, conversation_id, site_slug, session_secret=session_secret
         )
         ctx = await fetch_tenant_context(self._dapr, self._settings, site_slug)
 
@@ -181,6 +188,14 @@ class ChatService:
             ui_action_sink=ui_action_sink,
         )
 
+        # SPEC-W97 G8: hydrate the persisted history (dapr backend) BEFORE
+        # the turn reads it; None = the backend keeps no record (memory:
+        # ChatHistory owns it, hydration is a no-op).
+        persisted = await store_load_history(
+            self._sessions, session.conversation_id
+        )
+        if persisted is not None:
+            self._histories.messages[session.conversation_id] = list(persisted)
         history = self._histories.get(session.conversation_id)
         # The system prompt is re-rendered every turn so a specialist-agent
         # swap (or fallback to the base persona) takes effect immediately.
@@ -208,6 +223,24 @@ class ChatService:
             history.insert(0, {"role": "system", "content": system_prompt})
         history.append({"role": "user", "content": message})
         return session, tool_layer, history
+
+    async def _persist_turn(self, session: SessionState) -> None:
+        """SPEC-W97 G8: turn-boundary persistence (session + bounded
+        history). Fail-open — a state-store outage degrades resume, never
+        breaks a turn; outcomes ride voice_session_store_ops_total."""
+        try:
+            await store_save_session(self._sessions, session)
+            await store_save_history(
+                self._sessions,
+                session.conversation_id,
+                self._histories.get(session.conversation_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence never breaks a turn
+            log.warning(
+                "session persist failed",
+                conversation_id=session.conversation_id,
+                error=str(exc)[:200],
+            )
 
     async def _post_copilot(self, session: SessionState, reply: str) -> bool:
         """Whisper-copilot (SPEC-W3 §4, innovation 1): after an escalation
@@ -315,6 +348,9 @@ class ChatService:
                 for entry in trace
             )
         )
+        # SPEC-W97 G8: persist session + history at the turn boundary
+        # (fail-open; memory backend = no-op).
+        await self._persist_turn(session)
         return {
             "conversation_id": session.conversation_id,
             # K15(b): the resume credential — the client MUST present it
@@ -363,64 +399,70 @@ class ChatService:
         # VOICE-SCALING §5 async tools (chat path): an immediate {"ack": ...}
         # SSE event precedes every slow tool execution; the tool call itself
         # runs under the hard timeout via the runner.
-        ack_policy = ToolAckPolicy.from_context(tool_layer.tenant_context)
+        try:
+            ack_policy = ToolAckPolicy.from_context(tool_layer.tenant_context)
 
-        reply = ""
-        trace: list[dict[str, Any]] = []
-        async for event in run_tool_loop_stream(
-            self._llm,
-            messages=history,
-            tools=tool_layer.schemas(),
-            dispatch=self._tool_runner.wrap_dispatch(tool_layer.dispatch),
-            ack_for_tool=ack_policy.ack_for,
-        ):
-            kind = event["type"]
-            if kind == "delta":
-                yield {"delta": event["text"]}
-            elif kind == "ack":
-                yield {"ack": event["text"], "tool": event["tool"]}
-            elif kind == "tool":
-                yield {
-                    "tool_call": {
-                        "tool": event["tool"],
-                        "arguments": event["arguments"],
+            reply = ""
+            trace: list[dict[str, Any]] = []
+            async for event in run_tool_loop_stream(
+                self._llm,
+                messages=history,
+                tools=tool_layer.schemas(),
+                dispatch=self._tool_runner.wrap_dispatch(tool_layer.dispatch),
+                ack_for_tool=ack_policy.ack_for,
+            ):
+                kind = event["type"]
+                if kind == "delta":
+                    yield {"delta": event["text"]}
+                elif kind == "ack":
+                    yield {"ack": event["text"], "tool": event["tool"]}
+                elif kind == "tool":
+                    yield {
+                        "tool_call": {
+                            "tool": event["tool"],
+                            "arguments": event["arguments"],
+                        }
                     }
-                }
-            elif kind == "final":
-                reply = event["text"]
-                trace = event["trace"]
+                elif kind == "final":
+                    reply = event["text"]
+                    trace = event["trace"]
 
-        history.append({"role": "assistant", "content": reply})
-        # SPEC-W82 A3 (outbound translation, SSE path): the deltas already
-        # streamed in English, so the translated reply rides the terminal
-        # done frame as an additive "reply" key (only present when it
-        # differs from the streamed text). Fail-open English.
-        outbound_reply = await process_outbound_text(
-            reply,
-            session.active_language,
-            self._translator,
-            enabled=self._settings.voice_translate_enabled,
-        )
-        copilot_posted = await self._post_copilot(session, reply)
-        log.info(
-            "chat stream turn complete",
-            conversation_id=session.conversation_id,
-            tool_calls=len(trace),
-            active_agent=session.active_agent,
-            copilot=copilot_posted,
-            ui_actions=len(tool_layer.collected_ui_actions),
-        )
-        # SPEC-W9 Part B: validated UI actions ride the stream as
-        # `data: {"ui_action": {...}}` frames ahead of the terminal done frame.
-        for action in tool_layer.collected_ui_actions:
-            yield {"ui_action": action}
-        done_frame: dict[str, Any] = {
-            "done": True,
-            "conversation_id": session.conversation_id,
-            "session_secret": session.session_secret,
-        }
-        if outbound_reply != reply:
-            # SPEC-W82 A3 (additive): translated reply for non-English
-            # sessions (the deltas above streamed the English original).
-            done_frame["reply"] = outbound_reply
-        yield done_frame
+            history.append({"role": "assistant", "content": reply})
+            # SPEC-W82 A3 (outbound translation, SSE path): the deltas already
+            # streamed in English, so the translated reply rides the terminal
+            # done frame as an additive "reply" key (only present when it
+            # differs from the streamed text). Fail-open English.
+            outbound_reply = await process_outbound_text(
+                reply,
+                session.active_language,
+                self._translator,
+                enabled=self._settings.voice_translate_enabled,
+            )
+            copilot_posted = await self._post_copilot(session, reply)
+            log.info(
+                "chat stream turn complete",
+                conversation_id=session.conversation_id,
+                tool_calls=len(trace),
+                active_agent=session.active_agent,
+                copilot=copilot_posted,
+                ui_actions=len(tool_layer.collected_ui_actions),
+            )
+            # SPEC-W9 Part B: validated UI actions ride the stream as
+            # `data: {"ui_action": {...}}` frames ahead of the terminal done frame.
+            for action in tool_layer.collected_ui_actions:
+                yield {"ui_action": action}
+            done_frame: dict[str, Any] = {
+                "done": True,
+                "conversation_id": session.conversation_id,
+                "session_secret": session.session_secret,
+            }
+            if outbound_reply != reply:
+                # SPEC-W82 A3 (additive): translated reply for non-English
+                # sessions (the deltas above streamed the English original).
+                done_frame["reply"] = outbound_reply
+            yield done_frame
+        finally:
+            # SPEC-W97 G8: persist session + history at the turn
+            # boundary — even on a mid-stream client disconnect
+            # (GeneratorExit). Fail-open; memory backend = no-op.
+            await self._persist_turn(session)
