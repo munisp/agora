@@ -4,6 +4,7 @@ import * as React from "react";
 import Link from "next/link";
 import { MessageCircle, Phone, PhoneCall, RefreshCw, Wrench, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import { describeToolLine, type NameLookup } from "@/lib/tool-lines";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
@@ -66,6 +67,23 @@ export function ConversationsClient({
   const [turns, setTurns] = React.useState<Turn[] | null>(null);
   const [turnsError, setTurnsError] = React.useState<string | null>(null);
   const [translating, setTranslating] = React.useState(false);
+  // Service and advisor names, so the receptionist's actions read as plain sentences.
+  const [names, setNames] = React.useState<NameLookup>({ offerings: {}, team: {} });
+  React.useEffect(() => {
+    const byId = (rows: unknown): Record<string, string> => {
+      const list = Array.isArray(rows) ? rows : Object.values((rows as Record<string, unknown>) ?? {}).find(Array.isArray) ?? [];
+      return Object.fromEntries((list as { id?: string; name?: string }[]).filter((r) => r.id && r.name).map((r) => [r.id as string, r.name as string]));
+    };
+    void Promise.allSettled([
+      api.get<unknown>("/api/bookings/v1/offerings", { tenant: orgSlug }),
+      api.get<unknown>("/api/bookings/v1/team-members", { tenant: orgSlug }),
+    ]).then(([o, t]) =>
+      setNames({
+        offerings: o.status === "fulfilled" ? byId(o.value) : {},
+        team: t.status === "fulfilled" ? byId(t.value) : {},
+      }),
+    );
+  }, [orgSlug]);
 
   const refresh = React.useCallback(async () => {
     setLoading(true);
@@ -207,7 +225,7 @@ export function ConversationsClient({
                 {(turns ?? []).map((t) =>
                   t.role === "tool" || t.role === "system" ? (
                     <li key={t.id} className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Wrench className="h-3 w-3" /> <span className="font-mono">{t.text}</span>
+                      <Wrench className="h-3 w-3" /> <span>{t.role === "tool" ? describeToolLine(t.text, names) : t.text}</span>
                     </li>
                   ) : (
                     <li key={t.id} className={cn("flex", t.role === "agent" ? "justify-end" : "justify-start")}>
