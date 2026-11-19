@@ -645,6 +645,12 @@ func (s *Store) CreateContact(ctx context.Context, c *Contact) error {
 	           VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,''))`
 	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, q, c.ID, c.TenantID, c.Name, c.Phone, c.Email, c.Notes, c.Source, c.ExternalID); err != nil {
+			// SPEC-W89: the digits-expression uq_contacts_tenant_phone makes
+			// a cross-format duplicate a unique violation — surface it as
+			// the domain conflict (409), not a bare 500.
+			if isUniqueViolation(err) {
+				return ErrConflict
+			}
 			return fmt.Errorf("insert contact: %w", err)
 		}
 		return nil

@@ -70,9 +70,13 @@ func TestContactDedupeMigrationAndUpsert(t *testing.T) {
 		t.Fatalf("booking.contact_id = %v, want re-pointed to keeper %v", got.ContactID, keeper.ID)
 	}
 	// The UNIQUE index now rejects a duplicate (tenant, phone).
+	// SPEC-W89: CreateContact surfaces the digits-index violation as the
+	// DOMAIN ErrConflict (the httpapi 409 mapping) instead of the raw pg
+	// unique error — the rejection itself is unchanged (index detail:
+	// uq_contacts_tenant_phone on the digits expression).
 	dupContact := Contact{TenantID: tenantID, Name: "Dup", Phone: "+2348055550001"}
-	if err := st.CreateContact(ctx, &dupContact); !isUniqueViolation(err) {
-		t.Fatalf("duplicate insert after migration: err=%v, want unique violation", err)
+	if err := st.CreateContact(ctx, &dupContact); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate insert after migration: err=%v, want ErrConflict", err)
 	}
 
 	// UpsertBookingContact: create-then-match on (tenant, phone). The

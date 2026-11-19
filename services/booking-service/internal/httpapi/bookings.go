@@ -110,20 +110,12 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "invalid internal token")
 			return
 		}
-		// SPEC-W88: resolve the phone through the digits-canonical contact
-		// match (GetContactByChannel, W61 G3 both-sides) so a WhatsApp
-		// digits-only verified pin and a '+'-form stored contact — the
-		// same subscriber — actually find their bookings (the raw
-		// ContactPhone filter lives in HANDS-OFF store/bookings.go). On
-		// ErrNotFound fall back to the legacy raw filter: a no-contact
-		// needle answers an empty list either way, byte-identical to
-		// before. store.PortalChannelSMS selects the phone branch of the
-		// channel resolver (no SMS is sent here).
-		if contact, err := s.d.Store.GetContactByChannel(r.Context(), tenant.ID, store.PortalChannelSMS, contactPhone); err == nil {
-			f.ContactID = &contact.ID
-		} else {
-			f.ContactPhone = contactPhone
-		}
+		// SPEC-W89: the store-level ContactPhone filter is itself
+		// digits-canonical now (bookings.go exception, lead ruling) — the
+		// W88 handler-side contact resolution is REVERTED to the plain
+		// W47 form. The W88 cross-format route test keeps passing through
+		// the store filter.
+		f.ContactPhone = contactPhone
 	}
 	// mine=true: restrict to the caller's own team member, resolved by
 	// matching the JWT email claim (X-User-Email header fallback, then an
