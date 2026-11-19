@@ -130,7 +130,7 @@ export function NewAgentClient({ orgSlug }: { orgSlug: string }) {
       setError(
         e instanceof ApiError
           ? e.message
-          : "Failed to create the agent — the conversation service may be offline.",
+          : "Failed to create the agent — please try again in a moment.",
       );
     } finally {
       setCreating(false);

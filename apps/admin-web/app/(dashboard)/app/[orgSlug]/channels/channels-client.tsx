@@ -9,6 +9,7 @@ import {
   RefreshCw,
   Send,
 } from "lucide-react";
+import { useSearchParams } from "next/navigation";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -199,6 +200,8 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
   const telegramWebhookUrl = `${gatewayBase || "https://<gateway-host>"}/webhooks/telegram`;
   // Read the site's address after mount: during server rendering there is no window, and rendering "" there but the
   // origin in the browser made React throw #418 (hydration text mismatch).
+  // Installer-only cards (gateway address, environment snippet, provider callback addresses) show with ?setup=1.
+  const setup = useSearchParams()?.get("setup") === "1";
   const [origin, setOrigin] = React.useState("");
   React.useEffect(() => setOrigin(window.location.origin), []);
   const embedSnippet = `<script src="${origin}/embed.js" data-site="${orgSlug}" async></script>`;
@@ -220,16 +223,16 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
     health === "checking" ? (
       <Badge variant="secondary">Checking…</Badge>
     ) : health === "healthy" ? (
-      <Badge variant="success">Gateway healthy</Badge>
+      <Badge variant="success">Messaging online</Badge>
     ) : (
-      <Badge variant="warning">Gateway unreachable</Badge>
+      <Badge variant="warning">Messaging offline</Badge>
     );
 
   return (
     <div className="max-w-3xl">
       <PageHeader
         title="Channels"
-        description="Connect WhatsApp, Telegram and web chat to the messaging gateway."
+        description="Choose where customers can reach your receptionist: WhatsApp, Telegram and web chat."
         actions={
           <div className="flex items-center gap-2">
             {healthBadge}
@@ -243,13 +246,14 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
           </div>
         }
       />
-      {tenantError ? (
+      {setup && tenantError ? (
         <ErrorNote
           message={`Could not load the tenant record (${tenantError}). The snippet below uses a <tenant-uuid> placeholder — replace it before deploying.`}
         />
       ) : null}
 
       <div className="space-y-6">
+        {setup ? (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -282,6 +286,7 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
             </div>
           </CardContent>
         </Card>
+        ) : null}
 
         <Card>
           <CardHeader className="flex-row items-start justify-between space-y-0">
@@ -290,8 +295,8 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
                 <Phone className="h-4 w-4" /> WhatsApp
               </CardTitle>
               <CardDescription>
-                Meta WhatsApp Cloud API. Inbound messages arrive at the
-                gateway&apos;s /webhooks/whatsapp endpoint.
+                Customers message your WhatsApp Business number and the
+                receptionist replies.
               </CardDescription>
             </div>
             <Toggle
@@ -307,7 +312,7 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2">
             <div className="grid gap-1.5">
-              <Label htmlFor="wa-phone-id">Phone number ID</Label>
+              <Label htmlFor="wa-phone-id">WhatsApp number ID</Label>
               <Input
                 id="wa-phone-id"
                 value={state.whatsapp.phoneNumberId}
@@ -321,7 +326,7 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
                 disabled={!state.whatsapp.enabled}
               />
               <p className="text-xs text-muted-foreground">
-                From Meta for Developers → WhatsApp → API setup.
+                Shown in your WhatsApp Business account settings.
               </p>
             </div>
             <div className="grid gap-1.5">
@@ -352,8 +357,8 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
                 <Send className="h-4 w-4" /> Telegram
               </CardTitle>
               <CardDescription>
-                Telegram Bot API. One bot per gateway deployment; updates
-                arrive at /webhooks/telegram.
+                Customers message your Telegram bot and the receptionist
+                replies.
               </CardDescription>
             </div>
             <Toggle
@@ -398,7 +403,7 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
               </CardTitle>
               <CardDescription>
                 The built-in chat widget on your public booking site and any
-                page where you paste the embed snippet.
+                page where you add the chat code.
               </CardDescription>
             </div>
             <Toggle
@@ -425,12 +430,13 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
               </div>
             ) : (
               <p className="text-sm text-muted-foreground">
-                Web chat is disabled. Re-enable it to show the embed snippet.
+                Web chat is disabled. Turn it on to show the chat code.
               </p>
             )}
           </CardContent>
         </Card>
 
+        {setup ? (
         <Card>
           <CardHeader>
             <CardTitle>Gateway config</CardTitle>
@@ -510,11 +516,11 @@ export function ChannelsClient({ orgSlug }: { orgSlug: string }) {
             </div>
           </CardContent>
         </Card>
+        ) : null}
 
         <p className="text-xs text-muted-foreground">
-          Channel settings are stored in this browser (localStorage, per
-          tenant) as a development convenience — the generated snippet is what
-          actually configures the gateway.
+          These choices are saved on this computer. Your Agora installer
+          completes the connection for each channel.
         </p>
       </div>
     </div>

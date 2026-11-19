@@ -165,12 +165,12 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
                 <Globe className="h-4 w-4" /> Address
               </CardTitle>
               <CardDescription>
-                Customers book at <span className="font-mono">/p/{"{slug}"}</span>.
+                Customers book on this page.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4">
               <div className="grid gap-1.5">
-                <Label htmlFor="site-slug">Site slug</Label>
+                <Label htmlFor="site-slug">Page address</Label>
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-muted-foreground">/p/</span>
                   <Input
@@ -236,7 +236,7 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
                 </div>
               </div>
               <div className="grid gap-1.5">
-                <Label htmlFor="site-logo">Logo URL</Label>
+                <Label htmlFor="site-logo">Logo link</Label>
                 <Input
                   id="site-logo"
                   type="url"
@@ -298,10 +298,10 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
 
           <Card>
             <CardHeader>
-              <CardTitle>White label</CardTitle>
+              <CardTitle>Your branding</CardTitle>
               <CardDescription>
-                Branding shown on the public booking page header and footer
-                instead of the default tenant name.
+                Your own branding on the booking page, in place of the
+                standard business name.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4">

@@ -180,7 +180,7 @@ export function GeoCampaignsClient({ orgSlug }: { orgSlug: string }) {
           setPreviewError(
             e instanceof ApiError
               ? e.message
-              : "Audience preview failed — the booking service may be offline.",
+              : "Audience preview failed — please try again in a moment.",
           );
         } finally {
           if (seq === previewSeq.current) setPreviewLoading(false);
@@ -210,7 +210,7 @@ export function GeoCampaignsClient({ orgSlug }: { orgSlug: string }) {
         setListError(
           e instanceof ApiError
             ? e.message
-            : "Failed to load campaigns — the booking service may be offline.",
+            : "Failed to load campaigns — please try again in a moment.",
         );
       } finally {
         setListLoading(false);

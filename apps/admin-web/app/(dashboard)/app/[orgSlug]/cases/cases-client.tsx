@@ -121,7 +121,7 @@ export function CasesClient({
           setUnavailable(true);
         } else {
           setUnavailable(false);
-          setError("Cases unavailable — the booking service may be offline.");
+          setError("Cases unavailable — please try again in a moment.");
         }
       } finally {
         if (!signal?.aborted) setLoading(false);

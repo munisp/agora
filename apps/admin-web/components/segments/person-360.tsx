@@ -148,8 +148,8 @@ export function Person360View({ person }: { person: Person360 }) {
           <CardHeader>
             <CardTitle>Receipt captures</CardTitle>
             <CardDescription>
-              Receipt/invoice OCR extractions attached to this person&apos;s
-              field captures (uploaded by staff via the field-capture API).
+              Receipts and invoices staff collected from this person in the
+              field, with the details read from them.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">

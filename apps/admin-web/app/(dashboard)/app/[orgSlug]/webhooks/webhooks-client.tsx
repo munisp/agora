@@ -162,7 +162,7 @@ export function WebhooksClient({ orgSlug }: { orgSlug: string }) {
     <div className="space-y-6 p-6">
       <PageHeader
         title="Webhooks"
-        description="Push booking & conversation events to your own endpoints — HMAC-signed, retried with backoff."
+        description="Send new bookings and conversations to your other software automatically."
       />
       {error ? <ErrorNote message={error} /> : null}
 
@@ -172,14 +172,13 @@ export function WebhooksClient({ orgSlug }: { orgSlug: string }) {
             <Plus className="h-4 w-4" /> New subscription
           </CardTitle>
           <CardDescription>
-            Events are POSTed as CloudEvents JSON with X-OpenDesk-Signature
-            (HMAC-SHA256). Failed deliveries retry after 1m, 5m, 15m, 1h and 4h,
-            then land in the DLQ.
+            Each update is signed so your system can trust it. If your system is
+            unavailable, Agora tries again over the next few hours.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div>
-            <Label htmlFor="hook-url">Endpoint URL</Label>
+            <Label htmlFor="hook-url">Address of your system</Label>
             <Input
               id="hook-url"
               type="url"
@@ -204,7 +203,7 @@ export function WebhooksClient({ orgSlug }: { orgSlug: string }) {
             </div>
           </div>
           <div>
-            <Label htmlFor="hook-secret">Signing secret (optional)</Label>
+            <Label htmlFor="hook-secret">Shared password (optional)</Label>
             <Input
               id="hook-secret"
               value={secret}

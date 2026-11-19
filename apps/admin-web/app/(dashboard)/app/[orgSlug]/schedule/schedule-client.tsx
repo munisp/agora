@@ -58,7 +58,12 @@ export function ScheduleClient({
       if (e instanceof ApiError && (e.status === 404 || e.status === 501)) {
         setUnsupported(true);
       } else {
-        setError(e instanceof ApiError ? e.message : "Failed to load your schedule.");
+        const msg = e instanceof ApiError ? e.message : "";
+        setError(
+          /no team member/i.test(msg)
+            ? "You are not set up as an advisor, so you have no personal schedule. Everyone's bookings are on the Appointments page."
+            : "Your schedule could not be loaded right now — please try again.",
+        );
       }
     } finally {
       setLoading(false);
@@ -92,7 +97,7 @@ export function ScheduleClient({
       />
       {error ? <ErrorNote message={error} /> : null}
       {unsupported ? (
-        <ErrorNote message="This deployment's booking-service does not expose staff self-service yet (GET /v1/bookings?mine=true). Ask an admin to view the shared Bookings page instead." />
+        <ErrorNote message="Personal schedules are not available yet. Everyone's bookings are on the Appointments page." />
       ) : null}
 
       <div className="mb-3 flex items-center gap-2">

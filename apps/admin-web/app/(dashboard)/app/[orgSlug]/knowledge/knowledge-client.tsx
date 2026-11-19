@@ -843,7 +843,7 @@ function ScanUploadDialog({
                 {result.text}
               </p>
             ) : (
-              <ErrorNote message="The OCR service returned no text for this file — try a sharper scan." />
+              <ErrorNote message="No text could be read from this file — try a sharper scan." />
             )}
             <DialogFooter>
               <Button

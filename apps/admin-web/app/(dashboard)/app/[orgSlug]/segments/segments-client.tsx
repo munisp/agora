@@ -47,7 +47,7 @@ export function SegmentsClient({ orgSlug }: { orgSlug: string }) {
         setError(
           e instanceof ApiError && e.status === 404
             ? "Segment listing is not available yet."
-            : "Segments unavailable — the graph service may be offline.",
+            : "Segments unavailable — please try again in a moment.",
         );
       } finally {
         if (!signal?.aborted) setLoading(false);

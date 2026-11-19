@@ -341,7 +341,7 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
     <div>
       <PageHeader
         title="KYC document review"
-        description="OCR pre-fills the fields; a human reviewer approves or rejects — extraction never auto-verifies. Owner/admin only; every document view is audit-logged."
+        description="Agora reads each identity document and fills in the details; a person always approves or rejects it. Only owners and admins can open documents, and every view is recorded."
         actions={
           <Button
             variant="outline"
@@ -381,10 +381,8 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
             Review queue
           </CardTitle>
           <CardDescription>
-            Server-side queue from kyc-service via the booking proxy — newest
-            first. Rows are the hash-only durable records; open one to see
-            the OCR-extracted fields (while inside the 72-hour retention
-            window).
+            Newest first. Open a document to see the details read from it
+            (kept for 72 hours).
           </CardDescription>
         </CardHeader>
         <CardContent className="p-0">
@@ -463,12 +461,9 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
 
       <Card className="mb-6">
         <CardHeader>
-          <CardTitle>Open by id or reference</CardTitle>
+          <CardTitle>Find a document</CardTitle>
           <CardDescription>
-            Fallback lookup — paste the{" "}
-            <span className="font-mono">document_id</span> or{" "}
-            <span className="font-mono">reference</span> returned at upload
-            (e.g. from a deep link outside the queue).
+            Enter the document's reference number.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -476,9 +471,9 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
             <Input
               value={lookup}
               onChange={(e) => setLookup(e.target.value)}
-              placeholder="document_id or reference…"
+              placeholder="Reference number…"
               className="max-w-xl font-mono"
-              aria-label="Document id or reference"
+              aria-label="Document reference number"
             />
             <Button type="submit" variant="secondary" disabled={loading || !lookup.trim()}>
               <Search className="h-4 w-4" />
@@ -541,10 +536,9 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
               <ExtractedFieldsTable fields={selected.fields} />
             ) : (
               <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-                Extracted fields are no longer available — the 72-hour OCR
-                retention window expired (or the document was erased) and only
-                the hash-only record remains. Compare against the audit trail,
-                not this page.
+                The details read from this document are no longer shown: they
+                are kept for 72 hours (or the document was erased). The record
+                of who reviewed it is kept.
               </p>
             )}
 
@@ -606,8 +600,8 @@ function ExtractedFieldsTable({
   if (rows.length === 0) {
     return (
       <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
-        The OCR service returned no legible fields for this document —
-        review against the original document.
+        No details could be read from this document — please review it
+        against the original.
       </p>
     );
   }
@@ -696,8 +690,8 @@ function ReviewDialog({
             onChange={(e) => setReason(e.target.value)}
             placeholder={
               rejecting
-                ? "e.g. extracted name does not match the document photo…"
-                : "e.g. fields verified against the original document…"
+                ? "e.g. the name does not match the document photo…"
+                : "e.g. details checked against the original document…"
             }
           />
         </div>

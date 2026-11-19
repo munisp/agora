@@ -61,7 +61,7 @@ export function StepReview({ draft }: { draft: AgentDraft }) {
       <div className="sm:col-span-2">
         <Row term={`Capture schema (${draft.captureFields.length} field${draft.captureFields.length === 1 ? "" : "s"})`}>
           {draft.captureFields.length === 0 ? (
-            "No capture schema — the agent will not extract call data."
+            "No details to note — the receptionist will not record call details."
           ) : (
             <span className="flex flex-wrap gap-1">
               {draft.captureFields.map((f) => (

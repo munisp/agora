@@ -79,9 +79,9 @@ const items: NavItem[] = [
   { segment: "public-site", label: "Public Site", icon: Globe },
   { segment: "billing", label: "Billing", icon: CreditCard },
   { segment: "analytics", label: "Analytics", icon: BarChart3 },
-  { segment: "cac", label: "CAC", icon: CircleDollarSign },
+  { segment: "cac", label: "Acquisition cost", icon: CircleDollarSign },
   { segment: "growth", label: "Growth", icon: Gift },
-  { segment: "webhooks", label: "Webhooks", icon: Webhook },
+  { segment: "webhooks", label: "Integrations", icon: Webhook },
   { segment: "channels", label: "Channels", icon: MessagesSquare },
   { segment: "locations", label: "Locations", icon: MapPin },
   { segment: "geo-campaigns", label: "Geo campaigns", icon: Target },
@@ -94,7 +94,7 @@ const items: NavItem[] = [
   // SPEC-W61: media inbox review queue — owner/admin only (sender phone PII
   // + OCR document link; KYC review precedent); the page enforces the same
   // rule server-side.
-  { segment: "media-inbox", label: "Media inbox", icon: Inbox },
+  { segment: "media-inbox", label: "Received documents", icon: Inbox },
   // SPEC-W64: receipt reconciliation findings — UNGATED in nav: the page is
   // manage_bookings-permission gated with a 403-note posture and NO
   // realm-role redirect (page.tsx), so there is no roles gate here.
@@ -111,7 +111,7 @@ const items: NavItem[] = [
   { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
   // SPEC-W82 B1.1: labelled to tell the external Twenty console apart from the in-app CRM 360 console.
-  { external: "crm", label: "Twenty CRM (external)", icon: UsersRound },
+  { external: "crm", label: "CRM", icon: UsersRound },
   { external: "grafana", label: "Grafana", icon: LineChart },
   // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
   // roles (read-only); the page hides provision/enable/disable/config

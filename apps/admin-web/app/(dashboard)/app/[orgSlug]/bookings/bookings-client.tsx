@@ -149,7 +149,7 @@ export function BookingsClient({
           description:
             e instanceof ApiError
               ? e.message
-              : "The voice runtime did not issue a staff token.",
+              : "Could not join the call — please try again.",
           variant: "destructive",
         });
       }

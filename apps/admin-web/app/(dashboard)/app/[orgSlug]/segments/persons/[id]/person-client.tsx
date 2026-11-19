@@ -68,7 +68,7 @@ export function PersonClient({
         if (e instanceof ApiError && e.status === 404) {
           setNotFound(true);
         } else {
-          setError("Person unavailable — the graph service may be offline.");
+          setError("Person unavailable — please try again in a moment.");
         }
       } finally {
         if (!signal?.aborted) setLoading(false);

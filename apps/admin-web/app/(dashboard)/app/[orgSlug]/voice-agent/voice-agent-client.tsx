@@ -14,12 +14,12 @@ import { cn } from "@/lib/utils";
 import type { ChatResponse, Tenant } from "@/lib/types";
 
 const AGENT_TOOLS = [
-  "get_business_info",
-  "get_availability",
-  "book_appointment",
-  "lookup_appointment",
-  "reschedule_appointment",
-  "cancel_appointment",
+  "Answer questions about the business",
+  "Check free times",
+  "Book appointments",
+  "Find an existing booking",
+  "Move a booking",
+  "Cancel a booking",
 ] as const;
 
 interface TermRow {
@@ -141,7 +141,7 @@ export function VoiceAgentClient({ orgSlug }: { orgSlug: string }) {
                 <Mic className="h-4 w-4" /> Agent configuration
               </CardTitle>
               <CardDescription>
-                Resolved from the tenant record at session start.
+                Taken from your business settings at the start of every call.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -162,20 +162,14 @@ export function VoiceAgentClient({ orgSlug }: { orgSlug: string }) {
                   <dt className="text-muted-foreground">Currency</dt>
                   <dd className="font-medium">{tenant?.currency ?? "—"}</dd>
                 </div>
-                <div className="col-span-2">
-                  <dt className="text-muted-foreground">Voice pipeline</dt>
-                  <dd className="font-medium">
-                    silero VAD · faster-whisper STT · Ollama llama3.1:8b · Piper TTS
-                  </dd>
-                </div>
               </dl>
               <div className="mt-4">
                 <p className="mb-2 text-sm text-muted-foreground">
-                  Tools available to the agent
+                  What the receptionist can do
                 </p>
                 <div className="flex flex-wrap gap-1.5">
                   {AGENT_TOOLS.map((t) => (
-                    <Badge key={t} variant="secondary" className="font-mono text-[11px]">
+                    <Badge key={t} variant="secondary" className="text-[11px]">
                       {t}
                     </Badge>
                   ))}

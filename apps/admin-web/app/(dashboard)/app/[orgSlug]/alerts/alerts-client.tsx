@@ -82,7 +82,7 @@ export function AlertsClient({
         setError(
           e instanceof ApiError && e.status === 404
             ? "The alert queue is not available yet on this workspace."
-            : "Alerts unavailable — the graph service may be offline.",
+            : "Alerts unavailable — please try again in a moment.",
         );
       } finally {
         if (!signal?.aborted) setLoading(false);

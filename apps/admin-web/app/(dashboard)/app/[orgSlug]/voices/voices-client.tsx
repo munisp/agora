@@ -131,7 +131,7 @@ export function VoicesClient({
       setLoadError(
         e instanceof ApiError
           ? e.message
-          : "The voice runtime is unreachable. Check that the voice-agent-runtime is running, then retry.",
+          : "Voices are unavailable right now — please try again in a moment.",
       );
     }
   }, [orgSlug]);
@@ -237,7 +237,7 @@ export function VoicesClient({
       setPreviewError(
         e instanceof Error
           ? e.message
-          : "Preview failed — the voice runtime may be offline.",
+          : "Preview failed — please try again in a moment.",
       );
     } finally {
       setPreviewing(false);
@@ -282,7 +282,7 @@ export function VoicesClient({
       setEnrolledVoiceId(res.voice_id);
       toast({
         title: "Brand voice enrolled",
-        description: `Voice "${voiceName.trim()}" is now available to the XTTS provider.`,
+        description: `Voice "${voiceName.trim()}" is ready to use.`,
         variant: "success",
       });
       // Refresh the catalog so the new voice shows up in the browser.
@@ -291,7 +291,7 @@ export function VoicesClient({
       setEnrollError(
         e instanceof ApiError
           ? e.message
-          : "Enrollment failed — the voice runtime or XTTS provider may be offline.",
+          : "Could not create the voice right now — please try again later.",
       );
     } finally {
       setEnrolling(false);
@@ -317,7 +317,7 @@ export function VoicesClient({
     <div className="max-w-3xl">
       <PageHeader
         title="Voices"
-        description="Browse the TTS provider catalog, preview voices, and enroll a brand voice."
+        description="Listen to the available voices and choose one for your receptionist, or create your own brand voice."
         actions={
           <Button
             variant="outline"
@@ -503,9 +503,8 @@ export function VoicesClient({
                 <Mic className="h-4 w-4" /> Enroll a brand voice
               </CardTitle>
               <CardDescription>
-                Clone a voice for the XTTS provider from a clean reference
-                sample (POST /api/voice-admin/voices/enroll, staff-gated).
-                Owner/admin only.
+                Create your own brand voice from a short, clear recording.
+                Owners and admins only.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4">

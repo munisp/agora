@@ -112,8 +112,7 @@ export function CacPromoTables({
             <Megaphone className="h-4 w-4" /> Campaign spend
           </CardTitle>
           <CardDescription>
-            Campaigns by recorded spend (contract §4 — spend enters via
-            POST /v1/campaigns/&#123;id&#125;/spend).
+            Campaigns by recorded spend.
           </CardDescription>
         </CardHeader>
         <CardContent>

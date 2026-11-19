@@ -308,7 +308,7 @@ export function ReconciliationClient({
     <div>
       <PageHeader
         title="Receipt reconciliation"
-        description="Field-captured receipts matched against payment state — payment_receipt captures link to their booking exactly (rung 0); the rest match heuristically. Receipts now carry an OCR-extracted currency: the code is shown next to amounts when known, and amounts stay bare (never converted) when it is absent or mismatched."
+        description="Receipts collected in the field, matched against payments. A receipt taken for a booking is linked to it directly; the rest are matched by amount and date. Amounts are shown in the currency read from the receipt, never converted."
         actions={
           <Button
             variant="outline"
@@ -367,7 +367,7 @@ export function ReconciliationClient({
               <TableEmpty colSpan={9}>
                 {loading
                   ? "Loading…"
-                  : "No reconciliation findings. Findings appear once staff upload receipts via the capture API and a sweep runs."}
+                  : "Nothing to reconcile yet. Results appear here after staff upload receipts from the field."}
               </TableEmpty>
             ) : (
               findings.map((f) => {

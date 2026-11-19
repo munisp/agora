@@ -103,7 +103,7 @@ export function CacClient({ orgSlug }: { orgSlug: string }) {
         setError(
           e instanceof ApiError
             ? e.message
-            : "Failed to load CAC metrics — the analytics service may be offline.",
+            : "Failed to load CAC metrics — please try again in a moment.",
         );
         setSummary(null);
         setPrevious(null);

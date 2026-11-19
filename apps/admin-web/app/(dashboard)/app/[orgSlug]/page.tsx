@@ -148,7 +148,7 @@ export default async function OverviewPage({
               <TableBody>
                 {todayBookings.length === 0 ? (
                   <TableEmpty colSpan={4}>
-                    {error ? "Unavailable while the gateway is down." : "Nothing scheduled today."}
+                    {error ? "Unavailable right now — please try again in a moment." : "Nothing scheduled today."}
                   </TableEmpty>
                 ) : (
                   todayBookings
@@ -180,7 +180,7 @@ export default async function OverviewPage({
             {upcoming.length === 0 ? (
               <p className="py-6 text-center text-sm text-muted-foreground">
                 {error
-                  ? "Unavailable while the gateway is down."
+                  ? "Unavailable right now — please try again in a moment."
                   : "No upcoming bookings in the next 7 days."}
               </p>
             ) : (

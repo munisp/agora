@@ -47,10 +47,8 @@ type TenantWithPack = Omit<Tenant, "pack"> & {
  */
 
 const ACTIVATION_GAP_NOTE =
-  "Pack activation could not be applied: identity-service does not expose a " +
-  "tenant-update endpoint on this build (PATCH /v1/tenants/{slug}). Today a " +
-  "pack is bound at tenant provisioning time (POST /v1/tenants); changing it " +
-  "afterwards needs the backend endpoint tracked as a platform gap.";
+  "Your industry pack is chosen when your business is set up. To switch to " +
+  "a different pack, contact Agora support.";
 
 type LoadState = "loading" | "ready" | "error";
 
@@ -199,7 +197,7 @@ export function PacksClient({
       setActivationNote(`${ACTIVATION_GAP_NOTE} Upstream response: ${detail}`);
       toast({
         title: "Activation not applied",
-        description: "The backend has no pack-activation endpoint yet.",
+        description: "Switching industry packs is not available yet — contact Agora support.",
         variant: "destructive",
       });
     } finally {

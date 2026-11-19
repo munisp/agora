@@ -56,7 +56,7 @@ export default async function CasesPage({
   ) {
     initialUnavailable = true;
   } else {
-    initialError = "Cases unavailable — the booking service may be offline.";
+    initialError = "Cases unavailable — please try again in a moment.";
   }
   const initialCategories: CivicCategory[] =
     categoriesRes.status === "fulfilled"

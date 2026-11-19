@@ -57,7 +57,7 @@ export function AnalyticsClient({ orgSlug }: { orgSlug: string }) {
       setError(
         e instanceof ApiError
           ? e.message
-          : "Analytics query failed — the text-to-SQL service may be offline.",
+          : "Answers are unavailable right now — please try again in a moment.",
       );
     } finally {
       setRunning(false);
@@ -84,8 +84,8 @@ export function AnalyticsClient({ orgSlug }: { orgSlug: string }) {
             <Database className="h-4 w-4" /> Talk to your data
           </CardTitle>
           <CardDescription>
-            Read-only. Generated SQL is validated (single SELECT, curated
-            tables, tenant-scoped) before it runs against Trino.
+            Ask in plain English. Answers come only from your business&apos;s
+            records, and nothing is ever changed.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -180,7 +180,7 @@ export function AnalyticsClient({ orgSlug }: { orgSlug: string }) {
               ) : (
                 <ChevronRight className="h-3.5 w-3.5" />
               )}
-              Generated SQL
+              How this was worked out
             </button>
             {sqlOpen ? (
               <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 text-xs">

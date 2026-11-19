@@ -47,7 +47,7 @@ export function AgentsClient({ orgSlug }: { orgSlug: string }) {
       setError(
         e instanceof ApiError
           ? e.message
-          : "Failed to load agents — the conversation service may be offline.",
+          : "Failed to load agents — please try again in a moment.",
       );
     } finally {
       setLoading(false);
@@ -62,7 +62,7 @@ export function AgentsClient({ orgSlug }: { orgSlug: string }) {
     <div className="space-y-6 p-6">
       <PageHeader
         title="Agents"
-        description="Voice agents as first-class products — each with its own number, persona, tools and capture schema."
+        description="Your receptionists — each with its own phone number, personality, skills and the details it notes from each call."
         actions={
           <Link href={`/app/${orgSlug}/agents/new`}>
             <Button size="sm">
@@ -79,8 +79,8 @@ export function AgentsClient({ orgSlug }: { orgSlug: string }) {
             <Bot className="h-4 w-4" /> Agents
           </CardTitle>
           <CardDescription>
-            Dialed numbers resolve to agents from this registry; the legacy
-            TENANT_PHONE_MAP remains the fallback.
+            When a customer calls one of your numbers, the matching
+            receptionist answers.
           </CardDescription>
         </CardHeader>
         <CardContent>

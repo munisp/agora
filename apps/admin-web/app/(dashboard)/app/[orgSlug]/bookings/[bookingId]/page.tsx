@@ -36,7 +36,7 @@ export default async function BookingDetailPage({
         ? "Booking not found."
         : e instanceof ApiError
           ? e.message
-          : "Failed to load the booking — the booking service may be offline.";
+          : "Failed to load the booking — please try again in a moment.";
   }
 
   return (

@@ -113,7 +113,7 @@ export function AgentDetailClient({
       setError(
         e instanceof ApiError
           ? e.message
-          : "Failed to load the agent — the conversation service may be offline.",
+          : "Failed to load the agent — please try again in a moment.",
       );
     } finally {
       setLoading(false);

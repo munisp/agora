@@ -120,7 +120,7 @@ export function LocationsClient({ orgSlug }: { orgSlug: string }) {
         setError(
           e instanceof ApiError
             ? e.message
-            : "Failed to load locations — the booking service may be offline.",
+            : "Failed to load locations — please try again in a moment.",
         );
       } finally {
         setLoading(false);

@@ -202,14 +202,14 @@ export function SegmentBuilder({
                 message:
                   e2 instanceof ApiError && e2.status === 404
                     ? "Live preview is not available yet — save the segment to see its count."
-                    : "Preview unavailable — the graph service may be offline.",
+                    : "Preview unavailable — please try again in a moment.",
               });
               return;
             }
           }
           setPreview({
             status: "unavailable",
-            message: "Preview unavailable — the graph service may be offline.",
+            message: "Preview unavailable — please try again in a moment.",
           });
         }
       })();

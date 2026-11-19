@@ -103,7 +103,7 @@ export function RecommendationsPanel({
         } else {
           setState({
             status: "error",
-            message: "Recommendations unavailable — the graph service may be offline.",
+            message: "Recommendations unavailable — please try again in a moment.",
           });
         }
       }

@@ -105,10 +105,10 @@ export function SettingsClient({ orgSlug }: { orgSlug: string }) {
               />
             </div>
             <div className="grid gap-1.5">
-              <Label htmlFor="set-slug">Tenant slug</Label>
+              <Label htmlFor="set-slug">Business ID</Label>
               <Input id="set-slug" value={orgSlug} disabled />
               <p className="text-xs text-muted-foreground">
-                Slugs are assigned at provisioning and cannot be changed.
+                Your business ID is used in your booking page address and cannot be changed.
               </p>
             </div>
           </CardContent>
@@ -209,17 +209,16 @@ export function SettingsClient({ orgSlug }: { orgSlug: string }) {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <KeyRound className="h-4 w-4" /> API keys
+              <KeyRound className="h-4 w-4" /> Connection keys
             </CardTitle>
             <CardDescription>
-              Programmatic credentials for external integrations (read-only
-              bookings scope).
+              Keys that let your other software read your bookings.
             </CardDescription>
           </CardHeader>
           <CardContent>
             <Link href={`/app/${orgSlug}/settings/api-keys`}>
               <Button variant="outline" size="sm">
-                Manage API keys <ArrowRight className="h-3.5 w-3.5" />
+                Manage connection keys <ArrowRight className="h-3.5 w-3.5" />
               </Button>
             </Link>
           </CardContent>

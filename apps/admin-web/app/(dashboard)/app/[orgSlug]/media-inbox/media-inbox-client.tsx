@@ -235,7 +235,7 @@ export function MediaInboxClient({ orgSlug }: { orgSlug: string }) {
       toast({
         title: "Media discarded",
         description:
-          "The row is marked discarded; the OCR bytes still expire on the media TTL.",
+          "Discarded. The details read from it are still deleted on schedule.",
         variant: "success",
       });
       setDiscarding(null);
@@ -298,9 +298,9 @@ export function MediaInboxClient({ orgSlug }: { orgSlug: string }) {
             Inbound media queue
           </CardTitle>
           <CardDescription>
-            Server-side queue from booking-service — newest first. Parked rows
-            beyond the per-tenant cap of 500 are auto-discarded; OCR bytes
-            expire on the media TTL regardless.
+            Photos and documents customers sent, newest first. Up to 500 are
+            kept waiting; the details read from them are deleted after a
+            short time.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -504,10 +504,9 @@ function DiscardDialog({
           <DialogTitle>Discard media</DialogTitle>
         </DialogHeader>
         <p className="mb-4 text-sm text-muted-foreground">
-          Discard this media inbox item? It will no longer appear in the
-          review queue and cannot be linked afterwards. The extracted OCR
-          bytes still expire on the media TTL and remain covered by erasure
-          requests.
+          Discard this document? It will no longer appear in the list and
+          cannot be linked afterwards. The details read from it are still
+          deleted on schedule.
         </p>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>

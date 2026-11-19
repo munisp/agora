@@ -243,16 +243,15 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
         <CardHeader>
           <CardTitle>Payout approvals</CardTitle>
           <CardDescription>
-            Payouts above the configured approval threshold park here until an
-            owner approves them (W45 K20). No money moves before approval.
+            Large payouts wait here until an owner approves them. No money
+            moves before approval.
           </CardDescription>
         </CardHeader>
         <CardContent>
           {pendingPayouts.length === 0 ? (
             <p className="mb-3 text-sm text-muted-foreground">
-              Nothing awaiting approval. Above-threshold payouts requested from
-              this page appear here automatically; approve one by id if it was
-              requested elsewhere.
+              Nothing awaiting approval. Large payouts appear here
+              automatically.
             </p>
           ) : (
             <ul className="mb-4 space-y-2">
@@ -362,9 +361,8 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
         <CardHeader>
           <CardTitle>Request payout</CardTitle>
           <CardDescription>
-            Pay out available revenue to a registered beneficiary. Payout
-            destinations come from the payee registry — free-form account
-            details are not accepted.
+            Pay out available revenue to one of your registered accounts. For
+            safety, money only goes to accounts you have registered.
           </CardDescription>
         </CardHeader>
         <CardContent>

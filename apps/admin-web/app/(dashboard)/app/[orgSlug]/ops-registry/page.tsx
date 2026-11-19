@@ -42,7 +42,7 @@ async function fetchRegistryStats(): Promise<RegistryStats> {
   if (!res.ok) {
     throw new Error(
       res.status === 503
-        ? "Registry stats unavailable: OCR_INTERNAL_TOKEN is not set on the ocr-service."
+        ? "Document statistics are unavailable right now."
         : `Registry stats fetch failed (HTTP ${res.status}).`,
     );
   }

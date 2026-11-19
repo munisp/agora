@@ -112,7 +112,7 @@ export function ReferralsClient({
         description:
           e instanceof ApiError
             ? e.message
-            : "The referrals service may be offline.",
+            : "Referrals are unavailable right now — please try again in a moment.",
         variant: "destructive",
       });
       return false;

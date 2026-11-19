@@ -255,7 +255,7 @@ export function IncidentsClient({
     <div>
       <PageHeader
         title="Incidents"
-        description="Device and civic incidents ingested from IoT/webhook sources. Dispatch signs and delivers the incident payload to every active endpoint; acknowledgement and closure come back from the endpoints' callbacks. Staff can also resolve an incident manually once the underlying issue is handled."
+        description="Incidents reported by devices and the public. Dispatch sends each one to your response partners, who confirm when they have it and when it is closed. Staff can also close an incident once it is handled."
         actions={
           <Button
             variant="outline"
@@ -370,7 +370,7 @@ export function IncidentsClient({
           )}
           <form onSubmit={addEndpoint} className="flex flex-wrap items-end gap-3">
             <div className="grid min-w-64 flex-1 gap-1.5">
-              <Label htmlFor="ep-url">Endpoint URL</Label>
+              <Label htmlFor="ep-url">Partner address</Label>
               <Input
                 id="ep-url"
                 type="url"
@@ -380,7 +380,7 @@ export function IncidentsClient({
               />
             </div>
             <div className="grid min-w-48 flex-1 gap-1.5">
-              <Label htmlFor="ep-secret">Signing secret</Label>
+              <Label htmlFor="ep-secret">Shared password</Label>
               <Input
                 id="ep-secret"
                 type="password"
@@ -391,7 +391,7 @@ export function IncidentsClient({
             </div>
             <Button type="submit" variant="secondary" disabled={epBusy || !epUrl.trim()}>
               <Plus className="h-4 w-4" />
-              {epBusy ? "Saving…" : "Add endpoint"}
+              {epBusy ? "Saving…" : "Add partner"}
             </Button>
           </form>
         </CardContent>
