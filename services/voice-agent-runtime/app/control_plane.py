@@ -63,7 +63,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import metrics, sip
+from . import metrics, sip, verification
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
 from .config import Settings, load_settings
@@ -396,10 +396,17 @@ def create_app(
             and req.channel in PROVIDER_VERIFIED_CHANNELS
             and _valid_internal_token(request)
         ):
-            pin = sip.normalize_phone(req.channel_identity) or None
+            # SPEC-W88: the pin is the CANONICAL session identity form
+            # ("+"-prefixed E.164 via verification.canonical_e164) — the
+            # WhatsApp wa_id (digits, no "+") and the telegram/SIP
+            # "+"-forms converge to one form, so verified_phone compares
+            # and booking-side contact resolution are form-independent.
+            # Non-conforming identities pin NOTHING (supersedes the W85
+            # leniency; both production gateway paths conform).
+            pin = verification.canonical_e164(req.channel_identity) or None
             if pin is None:
                 log.warning(
-                    "channel_identity present but not a usable phone; ignoring",
+                    "channel_identity present but not E.164-conforming; ignoring",
                     channel=req.channel,
                 )
         # SPEC-W3 §3 SSE streaming chat: stream=true answers with

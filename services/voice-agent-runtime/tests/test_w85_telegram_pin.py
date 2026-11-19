@@ -228,20 +228,15 @@ class TestTelegramPinEndToEnd:
         assert resp.status_code == 200, resp.text
         assert captured["pin_verified_identity"] is None
 
-    async def test_digits_only_identity_pin_contract_documented(self, monkeypatch):
-        # CONTRACT DOCUMENTATION (W85 recon finding): the runtime's
-        # normalize_phone is LENIENT — it strips separators but keeps
-        # digits-only input, so a digits-only channel_identity (e.g. a raw
-        # chat_id) DOES pin when the request carries a valid internal
-        # token. The W81 bridge comment claiming "normalize_phone would
-        # reject it anyway" is inaccurate. This is accepted for W85:
-        # the pin surface is token-gated (in-cluster callers only — APISIX
-        # strips client-supplied tokens), the WhatsApp production path
-        # legitimately pins Meta's digits-only `from`, and the W85
-        # impersonation gate is the gateway-side self-share check
-        # (contact.user_id == from.id) plus the gateway always binding
-        # "+" + digits. Tightening the shape here would risk the live
-        # WhatsApp pin path — registered as a follow-up audit.
+    async def test_digits_only_identity_pins_canonical_form(self, monkeypatch):
+        # SPEC-W88 (supersedes the W85 contract documentation — the
+        # follow-up audit registered below ran and landed): a digits-only
+        # channel_identity (Meta wa_id form) now pins the CANONICAL
+        # session identity form "+"-prefixed E.164 via
+        # verification.canonical_e164, so WhatsApp/telegram/SIP verified
+        # phones converge to ONE form and the pin/OTP compare paths are
+        # form-independent. Non-conforming identities pin NOTHING
+        # (covered in tests/test_w88_canonical.py).
         captured: dict = {}
 
         async def fake_handle(self, **kwargs):  # noqa: ANN001 - test stub
@@ -259,4 +254,4 @@ class TestTelegramPinEndToEnd:
             {"X-Internal-Token": "admin-tok"},
         )
         assert resp.status_code == 200, resp.text
-        assert captured["pin_verified_identity"] == "42424242"
+        assert captured["pin_verified_identity"] == "+42424242"

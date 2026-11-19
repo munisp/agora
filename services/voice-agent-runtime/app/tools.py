@@ -53,7 +53,7 @@ from .logging import get_logger
 from .plugin_tools import PluginTool
 from .session_state import PhoneConfirmationRequired, SessionState
 from .tenant_context import TenantContext
-from .verification import BookingPortalVerifier, hash_phone
+from .verification import BookingPortalVerifier, canonical_e164, hash_phone, normalize_digits
 
 log = get_logger("tools")
 
@@ -410,6 +410,18 @@ def _confirmation_payload(pending_phone: str) -> dict[str, Any]:
     }
 
 
+def _phones_match(a: str | None, b: str | None) -> bool:
+    """SPEC-W88: form-independent phone equality for the verification
+    gates. Both sides reduce to digits (normalize_digits) and must be
+    NON-EMPTY and equal. ``+234…`` and ``234…`` are the same subscriber;
+    national vs international forms never fold (trunk-0 kept — the W61
+    G3 ruling), so two genuinely different numbers cannot collide. The
+    gates therefore stay fail-closed: only the "+"-vs-no-"+" divergence
+    (WhatsApp wa_id pin vs SIP/OTP "+"-forms) stops false-mismatching."""
+    da, db = normalize_digits(a or ""), normalize_digits(b or "")
+    return bool(da) and da == db
+
+
 def _verification_required_payload() -> dict[str, Any]:
     """K15(c): mutating tools refuse unverified sessions — the agent must
     drive the OTP flow (request_verification_code -> verify_caller_code)."""
@@ -604,7 +616,7 @@ class ToolLayer:
                 return _verification_unavailable_payload()
             return _verification_required_payload()
         supplied = sip.normalize_phone(phone)
-        if supplied and supplied != verified:
+        if supplied and not _phones_match(supplied, verified):
             return {
                 "status": "error",
                 "error": "phone_mismatch",
@@ -640,7 +652,7 @@ class ToolLayer:
         if not claimed:
             return None
         supplied = sip.normalize_phone(phone)
-        if supplied and supplied != claimed:
+        if supplied and not _phones_match(supplied, claimed):
             return None
         verifier = self._verifier()
         try:
@@ -877,7 +889,10 @@ class ToolLayer:
     # ------------------------------------------- K15(c) verification tools
     async def request_verification_code(self, phone: str) -> dict[str, Any]:
         """Send a one-time verification code to the claimed caller phone."""
-        phone = sip.normalize_phone(phone)
+        # SPEC-W88: best-effort canonical E.164 (a conforming number is
+        # sent/stored in ONE form across channels); national read-outs
+        # fall back to the legacy normalize_phone form, never rejected.
+        phone = canonical_e164(phone) or sip.normalize_phone(phone)
         if not phone:
             return {
                 "status": "error",
@@ -924,7 +939,10 @@ class ToolLayer:
     async def verify_caller_code(self, phone: str, code: str) -> dict[str, Any]:
         """Verify the caller-read-back code; success marks the session
         verified (K15(c)) so lookup/reschedule/cancel may run."""
-        phone = sip.normalize_phone(phone)
+        # SPEC-W88: same best-effort canonical form as
+        # request_verification_code, so the OTP pair and the resulting
+        # verified_phone agree (and match the channel-pin form).
+        phone = canonical_e164(phone) or sip.normalize_phone(phone)
         if not phone:
             return {
                 "status": "error",

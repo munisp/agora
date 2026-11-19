@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,28 @@ MAX_CODE_LEN = 12
 def normalize_digits(phone: str) -> str:
     """W28 normalization: digits only (leading +, spaces, dashes stripped)."""
     return "".join(ch for ch in str(phone).strip().lower() if ch.isdigit())
+
+
+# SPEC-W88: E.164 shape for the canonical session identity form — 7..15
+# digits, first non-zero (mirrors the booking civic e164 check minus the
+# leading "+", which canonical_e164 re-adds).
+_E164_DIGITS_RE = re.compile(r"^[1-9][0-9]{6,14}$")
+
+
+def canonical_e164(phone: str | None) -> str:
+    """SPEC-W88: canonical session identity form ``+``-prefixed E.164.
+
+    Strips every non-digit (separators, a leading ``+``, ``tel:`` junk),
+    then requires the E.164 shape (7..15 digits, first non-zero). Returns
+    ``"+" + digits`` on success, ``""`` for non-conforming input. No
+    country inference and no national folding (trunk-0 numbers fail the
+    leading-non-zero check) — the W61 G3 ruling stands. WhatsApp wa_id
+    (digits, no ``+``) and telegram/SIP ``+``-forms converge to ONE form
+    so verified_phone/claimed_phone compares are form-independent."""
+    digits = normalize_digits(phone or "")
+    if not _E164_DIGITS_RE.match(digits):
+        return ""
+    return "+" + digits
 
 
 def hash_phone(salt: str, tenant_id: str, phone: str) -> str:
