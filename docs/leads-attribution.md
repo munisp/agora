@@ -81,7 +81,7 @@ Tenant-scoped (`X-Tenant-Slug` middleware). Mutations require Permify
 | Method & path | Perm | Purpose |
 |---|---|---|
 | `POST /v1/leads` | manage_bookings | Create lead (`{phone_e164, channel, promo_code?, utm?, ref?, campaign_id?, lga_id?, consent_id?}`) → `201 {lead, created}` (`200` on dedupe hit, existing lead returned) |
-| `GET /v1/leads?status=&channel=&campaign_id=&from=&to=` | view_analytics | List (newest first, ≤500) → `{leads:[...]}` |
+| `GET /v1/leads?status=&channel=&campaign_id=&from=&to=&q=&cursor=&limit=` | view_analytics | List newest first, keyset-paginated (SPEC-W90) → `{leads:[...], next_cursor?}`. `q` is an optional phone_e164 **prefix** filter (SPEC-W83 shapes: `+digits` 3–32 chars or digits 3–32; invalid → `400`). `cursor` is the opaque keyset cursor from a previous response's `next_cursor` (malformed → `400`); `limit` defaults to 100, max 500 (non-integer → `400`). `next_cursor` is present only when another page exists |
 | `GET /v1/leads/{id}` | view_analytics | Detail → `{lead}` |
 | `POST /v1/leads/{id}/status` | manage_bookings | Transition `{status}` → `{lead}`; illegal transition → `409` |
 | `POST /v1/promo` | manage_bookings | Upsert promo code `{code, campaign_id?, discount_ngn?, max_redemptions}` (0 = unlimited) → `201 {promo_code}` |
@@ -93,6 +93,12 @@ Tenant-scoped (`X-Tenant-Slug` middleware). Mutations require Permify
 **Spend write semantics:** `campaign_spend` is keyed
 `(tenant_id, campaign_id, day, channel)` with SET semantics — reposting the
 same key REPLACES the amount, so retried posts never double-count.
+
+**Leads list pagination (SPEC-W90):** keyset over `(created_at DESC, id
+DESC)` — stable under timestamp ties and concurrent inserts (no offset
+drift). Page by passing the previous response's `next_cursor` back as
+`cursor`; the key is omitted on the last page. All filters compose with
+the cursor.
 
 ### Public promo redemption (contract §6)
 
