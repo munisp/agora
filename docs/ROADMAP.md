@@ -48,7 +48,7 @@ Assessment of the current codebase (Phase 1 + Phase 2). Items are grounded in th
 ### Developer experience
 - I15 — **Tilt/Skaffold or compose watch** for hot-reload dev; per-service `make dev-<svc>` targets.
 - I16 — **Contract tests** (OpenAPI → schemathesis against services; CloudEvents schemas in a registry — Karapace or JSON Schema files + CI validation on both producer and consumer sides).
-- I17 — **Seed parity** — one `make demo` that seeds all 4 industries + knowledge + a published site each + simulated bookings, so the lakehouse/dbt path has data on day one.
+- I17 ✅ — **Seed parity** — one `make demo` that seeds all 4 industries + knowledge + a published site each + simulated bookings, so the lakehouse/dbt path has data on day one. **done (SPEC-W98):** `scripts/seed-demo-all.sh` — demo-salon/demo-clinic/demo-consultancy/demo-logistics, pack-derived offerings, team + availability, published site, knowledge doc, 3 public-path bookings each (deterministic idempotency keys; one tenant per token round because the gateway strips X-Tenant-Slug and the first JWT claim wins).
 
 ### Product completeness (baseline parity gaps)
 - I18 ✅ — **Public page theming/builder** — theme editor on the Public Site page (primary colour, logo URL, hero title/subtitle, template select → `theme` jsonb via `PUT /v1/site`) with a live `/p/{slug}` preview iframe.
@@ -86,4 +86,4 @@ Assessment of the current codebase (Phase 1 + Phase 2). Items are grounded in th
 | Wave 3 (4–6 wks) | I18–I20, Innovations 4, 5, 8 | Product parity + analytics activation |
 | Wave 4 (ongoing) | Innovations 1–3, 7, 9–15 | SOTA differentiation |
 
-**Progress:** Waves 1–3 are landed (CI, E2E, observability, RLS, secrets, streaming chat, theme editor, staff schedule, embed, innovations 4/5/8) except G1 (full runtime bring-up still unverified) and I17 (seed parity); G8 landed in SPEC-W97 (Dapr statestore session persistence behind `SESSION_STORE_BACKEND=dapr`). Wave 4 items 1–3, 7, 9, 10, 12–15 are implemented at the scope noted above; innovation 11 (Mojaloop payouts marketplace) remains open.
+**Progress:** Waves 1–3 are landed (CI, E2E, observability, RLS, secrets, streaming chat, theme editor, staff schedule, embed, innovations 4/5/8) except G1 (full runtime bring-up still unverified); G8 landed in SPEC-W97 (Dapr statestore session persistence behind `SESSION_STORE_BACKEND=dapr`), I17 landed in SPEC-W98 (`make demo` seed parity). Wave 4 items 1–3, 7, 9, 10, 12–15 are implemented at the scope noted above; innovation 11 (Mojaloop payouts marketplace) remains open.
