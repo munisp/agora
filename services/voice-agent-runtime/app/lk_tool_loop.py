@@ -88,7 +88,10 @@ _BOOKED_CLAIM = re.compile(
     r"\b(i(?:'ve| have)? (?:now )?(?:booked|scheduled|reserved|confirmed)|(?:is|has been|now) (?:booked|scheduled|confirmed)"
     r"|(?:booking|appointment|visit|call) (?:is |has been )?(?:confirmed|booked)|you(?:'re| are) (?:all )?(?:booked|set for)"
     # Nigerian Pidgin: "I don book am", "e don book", "I don confirm your appointment"
-    r"|\b(?:i|we|e|e?m) (?:don|done) (?:book|fix|confirm|schedule)\w*)",
+    r"|\b(?:i|we|e|e?m) (?:don|done) (?:book|fix|confirm|schedule)\w*"
+    # A promise to book now ("I go book it for you now", "I will book that", "let me book…") ends the turn without
+    # booking: the model then waits for the caller. Treated like a claim: the booking is made in this same turn.
+    r"|\b(?:i(?:'ll| will| go| dey| am going to)|let me|we(?:'ll| will| go)) (?:now |just |go ahead and )?(?:book|fix|schedule|reserve)\b)",
     re.I)
 _BOOKING_WORDS = re.compile(r"appointment|visit|\bcall\b|consultation|clinic|session|slot|booking|\bbooked\b|scheduled|"
                             r"onboarding|registration", re.I)

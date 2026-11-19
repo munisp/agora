@@ -9,7 +9,9 @@ def test_booking_claims_are_recognised():
               "Great, you're all set for the registration call on Tuesday.",
               "Your claim assessment visit has been booked.",
               "You dey welcome! I don book the appointment for you with Aisha Bello on Tuesday.",
-              "E don book: your registration call na Tuesday ten o'clock."):
+              "E don book: your registration call na Tuesday ten o'clock.",
+              "I go book this RSA Registration and Onboarding call for you now. One moment abeg.",
+              "Let me book that registration call with Aisha for you."):
         assert booking_claim(t), t
 
 
@@ -19,7 +21,7 @@ def test_ordinary_lines_are_not_claims():
               "Let me check the availability for next Tuesday.",
               "Is there anything else I can help you with?",
               "I don confirm your number: zero eight zero six.",
-              "I go book the registration call for you now."):
+              "Would you like me to book a registration call?"):
         assert not booking_claim(t), t
 
 
