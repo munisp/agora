@@ -120,6 +120,21 @@ caller's next message and pass them to `verify_caller_code` — instead of
 `keypad_unavailable`. `ELEVENLABS_DTMF_REDACT` defaults ON so typed codes
 stay out of ElevenLabs stored transcripts.
 
+**IVR-A keypad menu (SPEC-W96).** PSTN greetings announce ~3 keypad
+shortcuts (default: 1 = book, 2 = reschedule, 3 = speak to a team member);
+pressing a menu digit outside any keypad wait speaks a short deterministic
+ack and injects an intent hint into the LLM turn — deliberately NO state
+machine (a menu digit always maps to the same ack + hint,
+mid-conversation included) and multilingual-safe by construction (digits
+are language-neutral; the LLM composes the reply in the caller's
+language). Guards: `wait_for_entry` (OTP/code capture) always wins — an
+armed wait or a partial entry means the digit buffers exactly as before,
+so menu interception can never steal an OTP digit. On the ElevenLabs
+backend digits never transit this runtime, so the menu is surfaced via
+the `keypad_native` tool message instead (the hosted greeting/first
+message is provisioned per-tenant on ElevenLabs' side). Metric:
+`voice_ivr_menu_digits_total{intent}`.
+
 ## Env vars
 
 | Var | Default | Description |
@@ -161,6 +176,8 @@ stay out of ElevenLabs stored transcripts.
 | `ELEVENLABS_DTMF_TIMEOUT_S` | `2.0` | W93: inactivity timeout completing a digit sequence (clamped 0.5–10.0) |
 | `ELEVENLABS_DTMF_HASH_TERMINATOR` | `1` | W93: `#` completes the sequence immediately (not included in the digits) |
 | `ELEVENLABS_DTMF_REDACT` | `1` | W93: replace keypad turns with `<REDACTED>` in ElevenLabs stored transcripts |
+| `IVR_MENU_ENABLED` | `1` | W96: IVR-A keypad menu on PSTN calls (greeting line + digit interception + intent hints); `0` disables |
+| `IVR_MENU` | `1=book:book an appointment,2=reschedule:reschedule an appointment,3=human:speak to a team member` | W96: menu entries `digit=intent:spoken phrase` (comma-separated, max 8, malformed entries skipped); `none` = no menu |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |
 | `VOICE_TENANT_CTX_TTL_S` / `VOICE_TENANT_CTX_STALE_S` | `120` / `300` | W46 P1/P2: per-slug tenant-context cache fresh window / stale-while-error window (refresh failure serves the stale entry; no entry = error propagates as before) |
 | `BOOKING_BASE_URL` | `http://booking:7002` | W46 P-02: direct booking-service base for tool/tenant invokes (daprd invoke fallback on transport failure; empty = pure daprd). Distinct from `BOOKING_URL` (OTP verifier) |

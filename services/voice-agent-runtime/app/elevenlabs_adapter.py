@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from . import ivr_menu
 from .config import Settings
 from .dapr_client import DaprClient
 from .logging import get_logger
@@ -153,6 +154,17 @@ class ElevenLabsBackend:
             # collects keypad digits natively and relays them to the agent
             # as a user turn. read_keypad_entry reports keypad_native.
             native_keypad=self._settings.elevenlabs_dtmf_enabled,
+            # SPEC-W96 IVR-A: the hosted agent learns the keypad menu from
+            # the keypad_native tool answer (the menu sentence is
+            # provisioned there because digits never transit this runtime
+            # and the hosted greeting prompt lives outside the repo).
+            ivr_menu_hint=(
+                ivr_menu.native_menu_sentence(
+                    ivr_menu.parse_ivr_menu(self._settings.ivr_menu)
+                )
+                if self._settings.ivr_menu_enabled
+                else ""
+            ),
         )
         result = await tool_layer.dispatch(tool_name, parameters)
         # Round-trip the resume credentials (K15(b)) — additive keys.

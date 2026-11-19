@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Callable
 
 from . import metrics, sip
 from .logging import get_logger
@@ -101,6 +101,22 @@ class DtmfBuffer:
         self._submitted: str | None = None
         self._event = asyncio.Event()
         self._expected_length: int | None = None
+        # SPEC-W96: armed IVR menu (digit -> callback) + wait-active flag.
+        # A menu digit is intercepted ONLY while no wait is active and no
+        # partial entry is buffered — OTP/code capture is sacred.
+        self._menu_digits: frozenset[str] = frozenset()
+        self._on_menu_digit: Callable[[str], None] | None = None
+        self._wait_active = False
+
+    def arm_menu(
+        self, digits: frozenset[str], on_menu_digit: Callable[[str], None]
+    ) -> None:
+        """Arm IVR-A menu interception (SPEC-W96): ``digits`` are the menu
+        keys; ``on_menu_digit`` fires instead of buffering when a menu key
+        arrives outside any keypad wait. Called once per session by
+        ivr_menu.attach_ivr_menu."""
+        self._menu_digits = digits
+        self._on_menu_digit = on_menu_digit
 
     @property
     def pending(self) -> str:
@@ -114,6 +130,22 @@ class DtmfBuffer:
         Characters after a submit in the same payload are ignored."""
         for ch in text:
             if ch in DTMF_DIGITS:
+                # SPEC-W96 IVR-A: an armed menu key pressed outside any
+                # keypad wait and with no partial entry buffered is a menu
+                # choice, not entry input — fire the callback, never
+                # buffer it. Inside a wait (OTP/code capture) or mid-entry
+                # the digit buffers exactly as before.
+                if (
+                    self._on_menu_digit is not None
+                    and ch in self._menu_digits
+                    and not self._wait_active
+                    and not self._digits
+                ):
+                    try:
+                        self._on_menu_digit(ch)
+                    except Exception:  # noqa: BLE001 - menu never breaks capture
+                        pass
+                    continue
                 if len(self._digits) >= MAX_DIGITS:
                     continue
                 self._digits.append(ch)
@@ -149,24 +181,31 @@ class DtmfBuffer:
         """
         if expected_length is not None:
             self._expected_length = expected_length
-        if (
-            self._submitted is None
-            and self._expected_length is not None
-            and len(self._digits) >= self._expected_length
-        ):
-            self._submit()
-        if self._submitted is None:
-            try:
-                await asyncio.wait_for(self._event.wait(), timeout_s)
-            except (asyncio.TimeoutError, TimeoutError):
-                metrics.dtmf_timeout()
-                self._digits.clear()  # never mix partials across attempts
-                self._expected_length = None
-                return None
-        entry, self._submitted = self._submitted, None
-        self._event.clear()
-        self._expected_length = None
-        return entry
+        # SPEC-W96: mark the wait active so the IVR menu never intercepts
+        # digits while the tool layer is collecting (OTP capture is
+        # sacred), whatever the expected_length.
+        self._wait_active = True
+        try:
+            if (
+                self._submitted is None
+                and self._expected_length is not None
+                and len(self._digits) >= self._expected_length
+            ):
+                self._submit()
+            if self._submitted is None:
+                try:
+                    await asyncio.wait_for(self._event.wait(), timeout_s)
+                except (asyncio.TimeoutError, TimeoutError):
+                    metrics.dtmf_timeout()
+                    self._digits.clear()  # never mix partials across attempts
+                    self._expected_length = None
+                    return None
+            entry, self._submitted = self._submitted, None
+            self._event.clear()
+            self._expected_length = None
+            return entry
+        finally:
+            self._wait_active = False
 
 
 def attach_dtmf_listener(room: Any, buffer: DtmfBuffer) -> Any:

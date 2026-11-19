@@ -45,7 +45,7 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
-from . import dtmf, emergency, metrics, sip
+from . import dtmf, emergency, ivr_menu, metrics, sip
 from . import dead_mic, greeting_prerender
 from .async_tools import (
     SLOW_TOOLS,
@@ -1020,6 +1020,18 @@ async def build_voice_agent(
         # K15(c): claimed (unverified) hint only — never confirmed.
         sip.attach_caller_id(session, sip_call.caller_phone)
         caller_phone = session.claimed_phone or ""
+    # SPEC-W96 IVR-A: parse the keypad menu for PSTN sessions when enabled
+    # ("" env -> DEFAULT_MENU; "none" -> disabled; web/non-SIP -> none).
+    # Stashed on the session for the entrypoint's greeting line + buffer
+    # arming; the prompt addendum rides every build_system_prompt below
+    # so the mapping survives per-turn rebuilds (locale switches).
+    menu = (
+        ivr_menu.parse_ivr_menu(settings.ivr_menu)
+        if (sip_call is not None and settings.ivr_menu_enabled)
+        else ()
+    )
+    session.ivr_menu = menu or None
+    keypad_hint = ivr_menu.prompt_addendum(menu) if menu else None
     tool_layer = ToolLayer(
         dapr=dapr,
         settings=settings,
@@ -1029,7 +1041,10 @@ async def build_voice_agent(
         dtmf_buffer=dtmf_buffer,
     )
     system_prompt = build_system_prompt(
-        ctx, conversation_id=conversation_id, caller_phone=caller_phone or None
+        ctx,
+        conversation_id=conversation_id,
+        caller_phone=caller_phone or None,
+        keypad_menu_hint=keypad_hint,
     )
 
     chat_ctx = lk_llm.ChatContext().append(role="system", text=system_prompt)
@@ -1144,6 +1159,7 @@ async def build_voice_agent(
             conversation_id=conversation_id,
             language=ml_state.active_language,
             caller_phone=session.confirmed_phone or session.claimed_phone,
+            keypad_menu_hint=keypad_hint,
         )
         try:
             msgs = agent.chat_ctx.messages
@@ -1184,6 +1200,7 @@ async def build_voice_agent(
                 conversation_id=conversation_id,
                 language=lang,
                 caller_phone=session.confirmed_phone or session.claimed_phone,
+                keypad_menu_hint=keypad_hint,
             )
             if inbound.code_switch:
                 ctx.code_switch = True
@@ -1396,6 +1413,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         return
     if dtmf_buffer is not None:
         dtmf.attach_dtmf_listener(ctx.room, dtmf_buffer)
+        # SPEC-W96 IVR-A: arm the menu interception (PSTN + enabled only;
+        # session.ivr_menu is None otherwise). Menu digits are acked +
+        # injected as intent hints; OTP capture (wait_for_entry) always
+        # wins — the buffer never steals digits mid-wait.
+        if session.ivr_menu:
+            ivr_menu.attach_ivr_menu(dtmf_buffer, session.ivr_menu, agent)
 
     # Per-session call-quality accumulator: activated BEFORE agent.start so
     # the pipeline tasks it spawns inherit this context (asyncio tasks copy
@@ -1426,8 +1449,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
     # recording-consent lines when the tenant context carries a `disclosure`
     # block; absent the block the greeting is byte-identical to before.
+    # SPEC-W96 IVR-A: the keypad menu line is appended LAST (after any
+    # disclosure lines) so the shortcuts are the caller's last heard
+    # instruction; None when the menu is disabled or the call is non-SIP.
+    menu_line = ivr_menu.menu_line(session.ivr_menu) if session.ivr_menu else None
     await agent.say(
-        build_greeting(tenant_ctx),
+        build_greeting(tenant_ctx, menu_line=menu_line),
         allow_interruptions=True,
     )
     # SPEC-W71 P6: warm the TTS LRU mid-call with the tool-ack/filler phrases

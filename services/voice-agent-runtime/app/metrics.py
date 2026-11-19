@@ -323,6 +323,11 @@ class Registry:
             "DTMF keypad waits that timed out before the caller finished.",
             (),
         )
+        self.ivr_menu_digits = Counter(
+            "voice_ivr_menu_digits_total",
+            "IVR menu keypad shortcuts pressed (SPEC-W96).",
+            ("intent",),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -353,6 +358,7 @@ class Registry:
             self.dtmf_digits,
             self.dtmf_entries,
             self.dtmf_timeouts,
+            self.ivr_menu_digits,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -535,6 +541,12 @@ def dtmf_entry() -> None:
 def dtmf_timeout() -> None:
     """SPEC-W86: one keypad wait that expired before the caller finished."""
     _registry.dtmf_timeouts.inc()
+
+
+def ivr_menu_digit(intent: str) -> None:
+    """SPEC-W96 IVR-A: one IVR menu shortcut digit intercepted, labelled by
+    the menu entry's intent (book | reschedule | human | custom)."""
+    _registry.ivr_menu_digits.inc(intent=intent)
 
 
 def translation(

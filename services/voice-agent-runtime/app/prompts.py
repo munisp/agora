@@ -138,7 +138,7 @@ def truncate_knowledge_snippets(
     return out
 
 
-def build_greeting(ctx: TenantContext) -> str:
+def build_greeting(ctx: TenantContext, menu_line: str | None = None) -> str:
     """Session-opening greeting, with the SPEC-W11 Part C §5 disclosure.
 
     Default (no pack ``disclosure`` block on the tenant context) is
@@ -150,22 +150,27 @@ def build_greeting(ctx: TenantContext) -> str:
       speaking with an automated assistant." — followed by the optional
       pack ``text``) to the greeting;
     - ``recordingConsent`` appends the recording notice.
+
+    SPEC-W96 IVR-A: ``menu_line`` (ivr_menu.menu_line for PSTN sessions,
+    None/"" everywhere else) is appended LAST — recency: the keypad menu
+    is the final thing the caller hears. Byte-identical when absent.
     """
     greeting = (
         f"Hello, thank you for calling {ctx.display_name}. "
         "How can I help you today?"
     )
     disclosure = getattr(ctx, "disclosure", None)
-    if not isinstance(disclosure, dict):
-        return greeting
-    if disclosure.get("spokenAiDisclosure"):
-        line = AI_DISCLOSURE_LINE
-        extra = str(disclosure.get("text") or "").strip()
-        if extra:
-            line = f"{line} {extra}"
-        greeting = f"{line} {greeting}"
-    if disclosure.get("recordingConsent"):
-        greeting = f"{greeting} {RECORDING_NOTICE_LINE}"
+    if isinstance(disclosure, dict):
+        if disclosure.get("spokenAiDisclosure"):
+            line = AI_DISCLOSURE_LINE
+            extra = str(disclosure.get("text") or "").strip()
+            if extra:
+                line = f"{line} {extra}"
+            greeting = f"{line} {greeting}"
+        if disclosure.get("recordingConsent"):
+            greeting = f"{greeting} {RECORDING_NOTICE_LINE}"
+    if menu_line:
+        greeting = f"{greeting} {menu_line}"
     return greeting
 
 
@@ -178,6 +183,7 @@ def build_system_prompt(
     extra_tool_names: list[str] | None = None,
     language: str | None = None,
     caller_phone: str | None = None,
+    keypad_menu_hint: str | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -268,6 +274,11 @@ def build_system_prompt(
             "flow, and new bookings still require the read-back "
             "confirmation.\n"
         )
+    # SPEC-W96 IVR-A: the keypad menu mapping (ivr_menu.prompt_addendum),
+    # passed at every build site so the bare-digit rule survives per-turn
+    # rebuilds (locale switches re-render the whole prompt).
+    if keypad_menu_hint:
+        prompt += "\n" + keypad_menu_hint
     if active_agent is not None:
         persona = str(active_agent.get("persona") or "").strip()
         if persona:

@@ -368,6 +368,14 @@ class Settings:
     elevenlabs_dtmf_hash_terminator: bool = True
     elevenlabs_dtmf_redact: bool = True
 
+    # IVR-A DTMF accelerator (SPEC-W96, app/ivr_menu.py): PSTN greeting
+    # announces a small keypad menu; a menu digit press outside any keypad
+    # wait injects an intent hint into the LLM turn (no state machine).
+    # ivr_menu: "" = the default 1=book/2=reschedule/3=human menu,
+    # "none" = no menu, else "1=book:book an appointment,2=...".
+    ivr_menu_enabled: bool = True
+    ivr_menu: str = ""
+
     # Avatar presence (SPEC-W9 Part A, app/avatar/): which provider joins a
     # visual avatar into the LiveKit room after session mint. `none` (default)
     # keeps sessions audio-only; per-tenant override via tenant context
@@ -677,6 +685,9 @@ def load_settings() -> Settings:
         in ("1", "true", "yes", "on"),
         elevenlabs_dtmf_redact=_env("ELEVENLABS_DTMF_REDACT", "1").lower()
         in ("1", "true", "yes", "on"),
+        ivr_menu_enabled=_env("IVR_MENU_ENABLED", "1").lower()
+        in ("1", "true", "yes", "on"),
+        ivr_menu=_env("IVR_MENU", ""),
         avatar_provider=_env("AVATAR_PROVIDER", "none"),
         tavus_api_key=_env("TAVUS_API_KEY", ""),
         tavus_replica_id=_env("TAVUS_REPLICA_ID", ""),

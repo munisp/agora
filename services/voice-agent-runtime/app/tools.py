@@ -490,6 +490,7 @@ class ToolLayer:
         verifier_factory: "Any | None" = None,
         dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
         native_keypad: bool = False,
+        ivr_menu_hint: str = "",
     ) -> None:
         self._dapr = dapr
         self._settings = settings
@@ -510,6 +511,11 @@ class ToolLayer:
         # as a user turn; read_keypad_entry reports keypad_native instead
         # of keypad_unavailable. The LiveKit buffer always wins when set.
         self._native_keypad = native_keypad
+        # SPEC-W96 IVR-A: the IVR menu sentence appended to the
+        # keypad_native tool answer so the hosted agent knows the keypad
+        # shortcuts even though digits never transit this runtime. Empty
+        # when the menu is disabled or absent.
+        self._ivr_menu_hint = ivr_menu_hint
         # SPEC-W9 Part B: per-turn collector for validated UI actions. The
         # chat path injects a fresh list per turn; other callers (voice
         # worker, ElevenLabs) get a private one that is simply never read —
@@ -1030,16 +1036,21 @@ class ToolLayer:
                 # runtime, so there is nothing to wait for here. Tell the
                 # hosted agent the honest relay contract.
                 await self._emit_tool_event("read_keypad_entry", "keypad_native", {})
+                message = (
+                    "On this phone platform keypad entry is collected "
+                    "natively: ask the caller to type the digits on "
+                    "their keypad (pressing # submits early). The "
+                    "digits arrive as the caller's next message — "
+                    "take them from there and pass them as the code "
+                    "to verify_caller_code."
+                )
+                # SPEC-W96 IVR-A: append the menu sentence so the hosted
+                # agent can speak/route the keypad shortcuts itself.
+                if self._ivr_menu_hint:
+                    message = f"{message} {self._ivr_menu_hint}"
                 return {
                     "status": "keypad_native",
-                    "message": (
-                        "On this phone platform keypad entry is collected "
-                        "natively: ask the caller to type the digits on "
-                        "their keypad (pressing # submits early). The "
-                        "digits arrive as the caller's next message — "
-                        "take them from there and pass them as the code "
-                        "to verify_caller_code."
-                    ),
+                    "message": message,
                     "channel": self._session.channel or "",
                     "digits": "",
                     "timeout_s": timeout,

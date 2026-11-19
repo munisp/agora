@@ -34,6 +34,7 @@ import hmac
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 
 class PhoneConfirmationRequired(RuntimeError):
@@ -65,6 +66,11 @@ class SessionState:
     # bypass (OOS-03).
     claimed_phone: str | None = None
     caller_name: str | None = None
+    # SPEC-W96 IVR-A: the session's parsed IVR menu (ivr_menu.IvrEntry
+    # tuple), set by build_voice_agent for PSTN sessions when the menu is
+    # enabled; None everywhere else. Typed Any to keep this module free of
+    # the ivr_menu import (duck-typed, same discipline as other bags).
+    ivr_menu: Any = None
     last_booking_ids: list[str] = field(default_factory=list)
     # Multi-agent crews (SPEC-W3 §4, innovation 6): id of the specialist
     # agent currently steering the persona, or None for the base persona.
