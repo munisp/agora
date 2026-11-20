@@ -424,6 +424,7 @@ fn attempt(id: &str, tenant: &str, cents: u64, state: payouts::AttemptState, sec
         payee: serde_json::Value::Null,
         state,
         detail: None,
+        dfsp_fsp_id: None,
         created_at: ts,
         updated_at: ts,
     }

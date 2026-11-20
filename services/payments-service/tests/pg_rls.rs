@@ -557,6 +557,7 @@ async fn db01_store_pins_tenant_guc_under_app_role() {
             payee: serde_json::json!({"partyIdType":"ALIAS","partyIdentifier":"p-1"}),
             state: payouts::AttemptState::PendingApproval,
             detail: None,
+            dfsp_fsp_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })

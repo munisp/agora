@@ -264,6 +264,8 @@ export interface Payout {
   rail_ref?: string | null;
   /** payments-service PayoutResponse spelling of the id (POST /v1/payouts). */
   payout_id?: string;
+  /** W100: marketplace DFSP binding sent with the payout, if any. */
+  dfsp_fsp_id?: string | null;
   created_at: string;
 }
 
@@ -344,6 +346,8 @@ export interface PayoutAttemptInFlight {
   currency: string;
   state: string;
   detail?: string | null;
+  /** W100: marketplace DFSP the payout is bound to; null = legacy rail. */
+  dfsp_fsp_id?: string | null;
   created_at: string;
   updated_at: string;
 }

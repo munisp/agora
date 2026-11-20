@@ -82,6 +82,9 @@ pub struct PayoutAttempt {
     pub payee: serde_json::Value,
     pub state: AttemptState,
     pub detail: Option<String>,
+    /// SPEC-W100 C2: the marketplace DFSP this payout was bound to
+    /// (PAYOUT_DFSPS fsp id); None = legacy single MOJALOOP_ENDPOINT rail.
+    pub dfsp_fsp_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -165,6 +168,8 @@ ALTER TABLE payout_attempts DROP CONSTRAINT IF EXISTS payout_attempts_state_chec
 ALTER TABLE payout_attempts ADD CONSTRAINT payout_attempts_state_check
     CHECK (state IN
         ('unknown','failed','committed','resolved_committed','resolved_failed','pending_approval'));
+-- SPEC-W100 C2: marketplace DFSP provenance (nullable; NULL = legacy rail).
+ALTER TABLE payout_attempts ADD COLUMN IF NOT EXISTS dfsp_fsp_id TEXT;
 "#;
 
 pub struct PgPayoutAttemptStore {
@@ -313,6 +318,7 @@ impl PgPayoutAttemptStore {
             state: AttemptState::from_str(&state)
                 .ok_or_else(|| format!("unknown payout attempt state '{state}'"))?,
             detail: row.try_get("detail").map_err(|e| e.to_string())?,
+            dfsp_fsp_id: row.try_get("dfsp_fsp_id").map_err(|e| e.to_string())?,
             created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
             updated_at: row.try_get("updated_at").map_err(|e| e.to_string())?,
         })
@@ -328,8 +334,8 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         sqlx::query(
             "INSERT INTO payout_attempts
-                (payout_id, tenant_id, amount_cents, currency, payee, state, detail)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (payout_id, tenant_id, amount_cents, currency, payee, state, detail, dfsp_fsp_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (payout_id) DO NOTHING",
         )
         .bind(&attempt.payout_id)
@@ -339,6 +345,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
         .bind(&attempt.payee)
         .bind(attempt.state.as_str())
         .bind(&attempt.detail)
+        .bind(&attempt.dfsp_fsp_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("payout_attempts insert failed: {e}"))?;
@@ -358,7 +365,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE payout_id = $1",
         )
         .bind(payout_id)
@@ -380,7 +387,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts internal tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE payout_id = $1",
         )
         .bind(payout_id)
@@ -403,7 +410,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts internal tx failed: {e}"))?;
         let rows = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE state = 'unknown'
              ORDER BY created_at LIMIT $1",
         )
@@ -494,7 +501,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         let rows = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE state IN ('unknown', 'pending_approval')
              ORDER BY created_at LIMIT $1",
         )
@@ -775,6 +782,7 @@ mod tests {
             payee: serde_json::json!({"partyIdType":"ALIAS","partyIdentifier":"payee-1"}),
             state,
             detail: None,
+            dfsp_fsp_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

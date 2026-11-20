@@ -139,6 +139,15 @@ impl Marketplace {
         self.dfsps.len()
     }
 
+    /// SPEC-W100 C1: endpoint of a configured DFSP by fsp id (execution
+    /// binding); None when the id is not configured.
+    pub fn dfsp_endpoint(&self, fsp_id: &str) -> Option<String> {
+        self.dfsps
+            .iter()
+            .find(|d| d.fsp_id == fsp_id)
+            .map(|d| d.endpoint.clone())
+    }
+
     /// Fan the quote out to every configured DFSP in parallel; per-DFSP
     /// timeout and error isolation. Deterministic output order (config
     /// order), ranking via [`rank_quotes`].

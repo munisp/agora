@@ -257,12 +257,24 @@ impl MojaloopAdapter {
         &self,
         instruction: &PayoutInstruction,
     ) -> PayoutRailOutcome {
+        // Legacy single-rail posture: the mojaloop-simulator default payee FSP.
+        self.execute_payout_to(instruction, "payeefsp").await
+    }
+
+    /// SPEC-W100 C1: same quote -> transfer sequence against a NAMED
+    /// destination DFSP (FSPIOP-Destination = `dest_fsp`). Identical
+    /// classification to `execute_payout`; only the destination differs.
+    pub async fn execute_payout_to(
+        &self,
+        instruction: &PayoutInstruction,
+        dest_fsp: &str,
+    ) -> PayoutRailOutcome {
         let amount = Money {
             currency: instruction.currency.clone(),
             amount: minor_to_decimal(instruction.amount_cents),
         };
         let quote_id = Uuid::new_v4().to_string();
-        let payee_fsp = "payeefsp".to_string(); // mojaloop-simulator default payee FSP
+        let payee_fsp = dest_fsp.to_string();
 
         // 1. Quote.
         let quote = QuoteRequest {

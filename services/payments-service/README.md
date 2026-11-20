@@ -56,8 +56,8 @@ is **mandatory** — the service refuses to start when it is unset/unknown
 | POST | `/v1/transfers` | `{tenant_id, amount_kobo, currency?, loan_id?, application_id?, contact_id?, payee?, reason?, debit_account_code?, credit_account_code?}` + `Idempotency-Key` header | lending disbursement bridge (SPEC-W45): ledger-first hold → Mojaloop rail → post/void; 201 `committed`, 502 with status JSON for `failed`/`queued_manual` (see below) |
 | POST | `/v1/no-show-fee` | `{tenant_id, deposit_id, amount_cents, booking_id?, idempotency_key}` | charge fee from hold (103); key REQUIRED |
 | GET | `/v1/accounts/{tenant_id}/balance` | — | account snapshots (tenant-bound, P-09) |
-| POST | `/v1/payouts` | `{tenant_id, amount_cents, currency, payee:{party_id_type, party_identifier}, beneficiary_id?, idempotency_key}` | ledger-first two-phase payout (104): pending hold → rail → post/void (P-01/C3); key REQUIRED. K20: amounts strictly above `PAYOUT_APPROVAL_THRESHOLD_KOBO` return 202 `pending_approval` (funds reserved, rail NOT called) until approved |
-| POST | `/v1/payouts/{id}/approve` | — | K20: execute a `pending_approval` payout (money role; above-threshold approvals require the **owner** role specifically). Idempotent: replaying an already-approved payout returns 200 `approved_replay`; approving a payout in any other state is 409 |
+| POST | `/v1/payouts` | `{tenant_id, amount_cents, currency, payee:{party_id_type, party_identifier}, beneficiary_id?, idempotency_key, dfsp_fsp_id?}` | ledger-first two-phase payout (104): pending hold → rail → post/void (P-01/C3); key REQUIRED. K20: amounts strictly above `PAYOUT_APPROVAL_THRESHOLD_KOBO` return 202 `pending_approval` (funds reserved, rail NOT called) until approved. W100: optional `dfsp_fsp_id` binds execution to a `PAYOUT_DFSPS` DFSP (unknown id → 422 BEFORE any hold; omitted → legacy `MOJALOOP_ENDPOINT` rail, unchanged) |
+| POST | `/v1/payouts/{id}/approve` | — | K20: execute a `pending_approval` payout (money role; above-threshold approvals require the **owner** role specifically). W100: bound payouts execute on their RECORDED `dfsp_fsp_id` — if that DFSP has since left `PAYOUT_DFSPS`, approve fails honestly 502 (funds stay reserved, never silently rerouted). Idempotent: replaying an already-approved payout returns 200 `approved_replay`; approving a payout in any other state is 409 |
 | POST | `/v1/payouts/quotes` | `{tenant_id, amount_cents, currency, beneficiary_id}` | SPEC-W99 C1: READ-ONLY DFSP quote comparison (see "DFSP quote marketplace" below); money role; 503 with zero configured DFSPs, 502 when every DFSP fails |
 | GET | `/v1/reconciliation/report?tenant_id=` | — | SPEC-W99 C2: READ-ONLY reconciliation report (ledger snapshot + payout-attempt rollups + in-flight list + checks); money role |
 | POST | `/v1/internal/accounts/provision` | `{tenant_id}` | explicit idempotent account provisioning (internal token, P-10) |
@@ -193,6 +193,19 @@ DFSPs = 503 (quotes are never fabricated).
 **MVP scope (honest):** quoting is READ-ONLY — no ledger write, no transfer
 send, no idempotency key. Payout EXECUTION still runs on the single
 `MOJALOOP_ENDPOINT` rail (`/v1/payouts`, P-13 NGN-only, unchanged).
+
+**W100 (phase 2): DFSP-bound execution.** `POST /v1/payouts` accepts an
+optional `dfsp_fsp_id` naming one of the configured marketplace DFSPs. The
+binding is validated BEFORE the pending hold (unknown id → 422 with no
+reservation leaked), recorded durably on the payout attempt
+(`payout_attempts.dfsp_fsp_id`, NULL = legacy rail), executed against that
+DFSP's endpoint with `FSPIOP-Destination` = fsp id (the chosen DFSP's quote
+is re-requested atomically at execution — FSPIOP quotes are short-lived, no
+quoteId pinning), and surfaced in the `PayoutPosted` event (`dfspFspId`)
+plus the reconciliation report's in-flight section. K20 continuity: the
+approve path dispatches on the RECORDED DFSP; a DFSP that left the config
+meanwhile yields an honest 502 with the reservation intact (never a silent
+reroute to the legacy rail).
 Cross-border quoting IS allowed for non-NGN currencies (shape-validated
 ISO-4217) since no money moves; quote-bound execution on the winning DFSP,
 multi-currency execution, DFSP discovery and FSPIOP JWS verification are

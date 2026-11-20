@@ -4,11 +4,12 @@
  * SPEC-W99 (innovation #11 MVP): DFSP quote marketplace + payout
  * reconciliation panels for the Billing page.
  *
- * Quote comparison is READ-ONLY (no ledger write, no transfer send): it
- * fans a real FSPIOP POST /quotes out to every DFSP the payments-service
- * has configured (PAYOUT_DFSPS) and ranks the verified quotes by receive
- * amount. Payout execution itself still runs on the single configured rail
- * and remains NGN-only — the disclaimer below renders that verbatim.
+ * Quote comparison fans a real FSPIOP POST /quotes out to every DFSP the
+ * payments-service has configured (PAYOUT_DFSPS) and ranks the verified
+ * quotes by receive amount. SPEC-W100 (phase 2): for NGN comparisons each
+ * ranked row offers a "Pay out via {fsp}" action that binds the real payout
+ * to that DFSP (dfsp_fsp_id) — one idempotency key per comparison result,
+ * behind a confirm() — while non-NGN comparisons stay read-only.
  */
 import * as React from "react";
 import { GitCompareArrows, ShieldCheck } from "lucide-react";
@@ -35,6 +36,7 @@ import {
 import { formatMoney } from "@/lib/utils";
 import type {
   Beneficiary,
+  Payout,
   PayoutQuoteComparison,
   ReconciliationReport,
 } from "@/lib/types";
@@ -66,6 +68,15 @@ export function QuoteComparisonCard({
   const [result, setResult] = React.useState<PayoutQuoteComparison | null>(
     null,
   );
+  // W100: ONE idempotency key per comparison result — re-clicking "Pay out"
+  // after a retry/refresh replays the same payout instead of duplicating it.
+  const [payoutKey, setPayoutKey] = React.useState<string>("");
+  const [payingFsp, setPayingFsp] = React.useState<string | null>(null);
+  const [payOutcome, setPayOutcome] = React.useState<{
+    fsp: string;
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   React.useEffect(() => {
     if (!beneficiaryId && beneficiaries && beneficiaries.length > 0) {
@@ -98,6 +109,8 @@ export function QuoteComparisonCard({
         },
       );
       setResult(data);
+      setPayoutKey(crypto.randomUUID());
+      setPayOutcome(null);
     } catch (err) {
       setError(
         err instanceof ApiError
@@ -113,6 +126,50 @@ export function QuoteComparisonCard({
     (result?.quotes ?? []).map((q) => [q.fsp_id, q] as const),
   );
 
+  // W100 C3: bind the real payout to the chosen DFSP. NGN-only (P-13
+  // execution is unchanged); the service validates the binding BEFORE any
+  // ledger hold and re-quotes the DFSP atomically at execution time.
+  const payVia = async (fsp: string) => {
+    if (!result || result.currency !== "NGN" || !payoutKey) return;
+    const ok = window.confirm(
+      `Pay out ${formatMoney(result.amount_cents, "NGN")} to the selected beneficiary via ${fsp}? ` +
+        `This moves real money on the ${fsp} rail.`,
+    );
+    if (!ok) return;
+    setPayingFsp(fsp);
+    setPayOutcome(null);
+    try {
+      const payout = await api.post<Payout>("/api/payments/v1/payouts", {
+        tenant_id: orgSlug,
+        beneficiary_id: result.beneficiary_id,
+        amount: result.amount_cents,
+        amount_cents: result.amount_cents,
+        currency: "NGN",
+        idempotency_key: payoutKey,
+        dfsp_fsp_id: fsp,
+      });
+      setPayOutcome({
+        fsp,
+        ok: true,
+        message:
+          payout.status === "pending_approval"
+            ? `Payout ${payout.payout_id ?? payout.id} is parked for owner approval (funds reserved, ${fsp} not called yet).`
+            : `Payout ${payout.payout_id ?? payout.id} committed on ${fsp}.`,
+      });
+    } catch (err) {
+      setPayOutcome({
+        fsp,
+        ok: false,
+        message:
+          err instanceof ApiError
+            ? err.message
+            : "Payout failed unexpectedly.",
+      });
+    } finally {
+      setPayingFsp(null);
+    }
+  };
+
   return (
     <Card className="mt-6">
       <CardHeader>
@@ -123,8 +180,9 @@ export function QuoteComparisonCard({
           Compare real FSPIOP quotes across the configured DFSPs before
           paying out.{" "}
           <span className="font-medium">
-            Quotes are read-only and expire; the payout itself still executes
-            on the configured rail and remains NGN-only.
+            Quotes expire quickly; executing one (NGN only) re-requests fresh
+            terms from the chosen DFSP at payout time. Non-NGN comparisons
+            stay read-only.
           </span>
         </CardDescription>
       </CardHeader>
@@ -188,12 +246,21 @@ export function QuoteComparisonCard({
                   <TableHead>Fee</TableHead>
                   <TableHead>Commission</TableHead>
                   <TableHead>Beneficiary receives</TableHead>
-                  <TableHead className="pr-2 text-right">Expires</TableHead>
+                  <TableHead
+                    className={
+                      result.currency === "NGN" ? "" : "pr-2 text-right"
+                    }
+                  >
+                    Expires
+                  </TableHead>
+                  {result.currency === "NGN" ? (
+                    <TableHead className="pr-2 text-right">Execute</TableHead>
+                  ) : null}
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {result.ranked.length === 0 ? (
-                  <TableEmpty colSpan={7}>
+                  <TableEmpty colSpan={result.currency === "NGN" ? 8 : 7}>
                     No DFSP returned a usable quote.
                   </TableEmpty>
                 ) : (
@@ -228,11 +295,33 @@ export function QuoteComparisonCard({
                         <TableCell className="font-medium">
                           {moneyStr(q.receive_amount_cents, result.currency)}
                         </TableCell>
-                        <TableCell className="pr-2 text-right text-xs text-muted-foreground">
+                        <TableCell
+                          className={
+                            result.currency === "NGN"
+                              ? "text-xs text-muted-foreground"
+                              : "pr-2 text-right text-xs text-muted-foreground"
+                          }
+                        >
                           {q.expiration
                             ? new Date(q.expiration).toLocaleString()
                             : "—"}
                         </TableCell>
+                        {result.currency === "NGN" ? (
+                          <TableCell className="pr-2 text-right">
+                            <Button
+                              size="sm"
+                              variant={
+                                result.best_fsp === fsp ? "default" : "secondary"
+                              }
+                              disabled={payingFsp !== null}
+                              onClick={() => void payVia(fsp)}
+                            >
+                              {payingFsp === fsp
+                                ? "Executing…"
+                                : `Pay out via ${fsp}`}
+                            </Button>
+                          </TableCell>
+                        ) : null}
                       </TableRow>
                     );
                   })
@@ -253,9 +342,19 @@ export function QuoteComparisonCard({
                 </ul>
               </div>
             ) : null}
+            {payOutcome ? (
+              <p
+                className={`mt-3 text-sm ${payOutcome.ok ? "text-green-700 dark:text-green-400" : "text-destructive"}`}
+              >
+                {payOutcome.message}
+              </p>
+            ) : null}
             <p className="mt-2 text-xs text-muted-foreground">
               Compared {result.quotes.length + result.errors.length} DFSP(s) at{" "}
               {new Date(result.generated_at).toLocaleString()}.
+              {result.currency === "NGN"
+                ? " Executing a quote re-requests fresh terms from the chosen DFSP at payout time."
+                : " Execution is NGN-only; this comparison is read-only."}
             </p>
           </div>
         ) : null}
@@ -407,6 +506,7 @@ export function ReconciliationCard({ orgSlug }: { orgSlug: string }) {
                     <TableRow>
                       <TableHead>Payout</TableHead>
                       <TableHead>State</TableHead>
+                      <TableHead>DFSP</TableHead>
                       <TableHead>Amount</TableHead>
                       <TableHead className="pr-2 text-right">
                         Created
@@ -420,6 +520,15 @@ export function ReconciliationCard({ orgSlug }: { orgSlug: string }) {
                           {a.payout_id}
                         </TableCell>
                         <TableCell>{a.state}</TableCell>
+                        <TableCell>
+                          {a.dfsp_fsp_id ? (
+                            <Badge variant="secondary">{a.dfsp_fsp_id}</Badge>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">
+                              legacy rail
+                            </span>
+                          )}
+                        </TableCell>
                         <TableCell>
                           {formatMoney(a.amount_cents, a.currency)}
                         </TableCell>
