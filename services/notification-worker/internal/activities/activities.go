@@ -49,6 +49,10 @@ type Activities struct {
 	// PublicBaseURL is the user-facing base for claim links
 	// (PUBLIC_BASE_URL); set by main after New.
 	PublicBaseURL string
+	// IntakeTokenSecret (SPEC-W95 C5-B) mints the intake capability token
+	// in SendIntakeReminder links; set by main after New. Empty makes the
+	// link build fail loudly (never a placeholder link).
+	IntakeTokenSecret string
 	// Pacer is the outbound CPS limiter + sender rotator (VOICE-SCALING §4);
 	// set by main after New. Nil disables pacing/rotation (tests).
 	Pacer *pacer.Pacer

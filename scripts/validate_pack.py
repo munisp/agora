@@ -197,6 +197,45 @@ def _validate_voice(voice: Any, errs: list[str]) -> None:
                         f"voice.languages[{lang!r}]: value {value!r} must match "
                         f"{VOICE_LANG_VALUE_RE.pattern}"
                     )
+    # SPEC-W84: pronunciation lexicon bounds (kept in sync with packs.go).
+    lexicon = voice.get("lexicon")
+    if lexicon is not None:
+        if not isinstance(lexicon, dict):
+            errs.append("voice.lexicon must be a mapping of term -> hint")
+        else:
+            for term, hint in lexicon.items():
+                if not isinstance(term, str) or not 1 <= len(term) <= 64:
+                    errs.append(
+                        f"voice.lexicon key {term!r}: length must be 1-64 chars"
+                    )
+                if not isinstance(hint, str) or not hint.strip() or len(hint) > 128:
+                    errs.append(
+                        f"voice.lexicon[{term!r}]: value must be 1-128 chars"
+                    )
+
+
+def _validate_stepup(policy: Any, errs: list[str]) -> None:
+    """SPEC-W84: optional stepUpPolicy block — per-tool risk-tier overrides
+    for the voice tool layer ({tools: {name: 0|1|2}}). Shape only: the
+    never-weakening built-in floors are enforced at consumption by the
+    voice runtime (app/config.py parse_pack_tool_tiers). Kept in sync with
+    packs.go validateStepUpPolicy."""
+    if policy is None:
+        return
+    if not isinstance(policy, dict):
+        errs.append("stepUpPolicy must be a mapping")
+        return
+    tools = policy.get("tools")
+    if not isinstance(tools, dict) or not tools:
+        errs.append("stepUpPolicy.tools is required and must be non-empty")
+        return
+    for name, tier in tools.items():
+        if not isinstance(name, str) or not TOOL_NAME_RE.match(name):
+            errs.append(f"stepUpPolicy.tools: invalid tool name {name!r}")
+        if isinstance(tier, bool) or not isinstance(tier, int) or tier not in (0, 1, 2):
+            errs.append(
+                f"stepUpPolicy.tools[{name!r}]: tier must be 0, 1 or 2 (got {tier!r})"
+            )
 
 
 def _validate_disclosure(disclosure: Any, errs: list[str]) -> None:
@@ -421,6 +460,7 @@ def validate_pack(doc: Any, *, source: str = "<pack>") -> list[str]:
     _validate_ussd(doc.get("ussd"), errs)
     _validate_growth(doc.get("growth"), errs)
     _validate_i18n(doc.get("i18n"), errs)
+    _validate_stepup(doc.get("stepUpPolicy"), errs)
     return errs
 
 

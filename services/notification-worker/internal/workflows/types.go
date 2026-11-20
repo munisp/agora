@@ -41,6 +41,11 @@ type SagaInput struct {
 	// workflow does not need to reload the pack.
 	NoShowFeeCents          int64 `json:"no_show_fee_cents,omitempty"`
 	CancellationWindowHours int   `json:"cancellation_window_hours,omitempty"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): pack-configured intake chase
+	// deadline lead; 0 = worker default (2h). Cross-service contract:
+	// bookingops.SagaInput serializes this as "intake_cutoff_hours"
+	// (omitempty).
+	IntakeCutoffHours int `json:"intake_cutoff_hours,omitempty"`
 
 	// SPEC-W80 C1: WorkflowName is the pack-declared Temporal workflow
 	// (pack.temporalWorkflow) resolved by booking-service when the booking
@@ -50,6 +55,15 @@ type SagaInput struct {
 	// behavior. Cross-service contract: bookingops.SagaInput serializes this
 	// as "workflow_name" (omitempty).
 	WorkflowName string `json:"workflow_name,omitempty"`
+
+	// SPEC-W92 C6: SLAAnchor is the pack-declared escalation SLA anchor
+	// (ticket_created|booking_start; empty = legacy booking_start).
+	// BookingCreatedAt is the booking row's created_at — the anchor when
+	// SLAAnchor is ticket_created. Cross-service contract:
+	// bookingops.SagaInput serializes these as "sla_anchor" /
+	// "booking_created_at" (omitempty).
+	SLAAnchor        string    `json:"sla_anchor,omitempty"`
+	BookingCreatedAt time.Time `json:"booking_created_at,omitempty"`
 }
 
 // IndustryOrDefault returns the effective industry id (default "salon").
@@ -152,6 +166,9 @@ type ClinicIntakeInput struct {
 	ContactEmail string    `json:"contact_email"`
 	ContactPhone string    `json:"contact_phone,omitempty"`
 	StartsAt     time.Time `json:"starts_at"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): pack-configured intake chase
+	// deadline lead; 0 = default clinicIntakeDeadlineLead (2h).
+	IntakeCutoffHours int `json:"intake_cutoff_hours,omitempty"`
 }
 
 // SalonDepositInput starts a SalonDepositWorkflow.
@@ -195,6 +212,10 @@ type SupportEscalationInput struct {
 	ContactName  string    `json:"contact_name"`
 	ContactEmail string    `json:"contact_email"`
 	CreatedAt    time.Time `json:"created_at"`
+	// SLAAnchor (SPEC-W92 C6) records which timestamp CreatedAt anchors
+	// (ticket_created|booking_start|"" for legacy) — queryable via the
+	// workflow state for audit.
+	SLAAnchor string `json:"sla_anchor,omitempty"`
 	// FirstResponseSLAHours defaults to 4 (support-desk pack SLA).
 	FirstResponseSLAHours int `json:"first_response_sla_hours,omitempty"`
 }

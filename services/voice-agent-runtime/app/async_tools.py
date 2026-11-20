@@ -22,6 +22,9 @@ implements the livekit-agents 0.10.x-pragmatic equivalent of 1.6's
   (AsyncToolRunner timeout_overrides, wired from
   VOICE_VERIFICATION_TOOL_TIMEOUT_S, default 20s) so the global default is
   untouched and a slow-but-working portal still answers with a real result.
+- **SPEC-W86**: read_keypad_entry waits on the caller's keypad (DTMF) for
+  up to 60s — it joins SLOW_TOOLS with its own per-tool timeout override
+  (KEYPAD_TOOL_TIMEOUT_S, default 65s) wired in the LiveKit worker.
 """
 
 from __future__ import annotations
@@ -51,6 +54,9 @@ SLOW_TOOLS = frozenset(
         "cancel_appointment",
         "lookup_appointment",
         "knowledge_search",
+        # SPEC-W86: read_keypad_entry blocks up to 60s waiting for the
+        # caller to type on the keypad — slow by definition.
+        "read_keypad_entry",
     }
     | VERIFICATION_TOOLS
 )

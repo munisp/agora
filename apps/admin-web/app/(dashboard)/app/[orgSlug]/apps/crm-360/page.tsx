@@ -4,7 +4,10 @@ import { hasAnyRole } from "@/lib/roles";
 import { serverApi } from "@/lib/server-api";
 import { ApiError } from "@/lib/api";
 import { unwrap } from "@/components/apps/types";
-import type { ContactSearchResult } from "@/components/apps/crm-360/types";
+import {
+  readNextCursor,
+  type ContactSearchResult,
+} from "@/components/apps/crm-360/types";
 import { Crm360Client } from "./crm-360-client";
 
 export const metadata = { title: "CRM 360" };
@@ -43,6 +46,7 @@ export default async function Crm360Page({
   // debounced re-search interaction stays client-side. Same degradation
   // semantics the client applied (404 → "still rolling out" note).
   let initialResults: ContactSearchResult[] = [];
+  let initialNextCursor: string | null = null;
   let initialError: string | null = null;
   try {
     const data = await serverApi<unknown>(
@@ -57,6 +61,9 @@ export default async function Crm360Page({
       },
     );
     initialResults = unwrap<ContactSearchResult>(data);
+    // SPEC-W83: the SSR first page carries its continuation cursor so the
+    // client can offer Load more before any client-side re-search.
+    initialNextCursor = readNextCursor(data);
   } catch (e) {
     initialError =
       e instanceof ApiError && e.status !== 404
@@ -70,6 +77,7 @@ export default async function Crm360Page({
       canWork
       initialFilters={initialFilters}
       initialResults={initialResults}
+      initialNextCursor={initialNextCursor}
       initialError={initialError}
     />
   );

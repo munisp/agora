@@ -112,7 +112,7 @@ func TestLeadCaptureApplyAndDedupe(t *testing.T) {
 		t.Fatalf("leads 24h dedupe stacking: %+v", res2[0])
 	}
 
-	all, err := rig.leads.ListLeads(ctx, rig.tenant.ID, "", "", nil, nil, nil)
+	all, err := rig.leads.ListLeads(ctx, rig.tenant.ID, "", "", nil, nil, nil, "")
 	if err != nil || len(all) != 1 {
 		t.Fatalf("exactly one lead row expected: %+v, %v", all, err)
 	}

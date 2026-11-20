@@ -83,13 +83,22 @@ func (s *Store) FindContactByPhoneOrEmail(ctx context.Context, tenantID uuid.UUI
 		return c, ErrNotFound
 	}
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		// SPEC-W88: the phone needle matches on the pinned W61 G3 digits
+		// canonical form BOTH SIDES (same idiom as GetContactByChannel),
+		// so a CRM/admin '+'-form and a WhatsApp wa_id digits-form of the
+		// SAME subscriber dedupe to one contact instead of accumulating
+		// parallel rows (the raw uq_contacts_tenant_phone unique index
+		// permits both forms). E-mail stays exact. The digits<>''
+		// guards keep no-digit needles/rows from matching each other.
+		d := mediaInboxDigitsSQL
+		phoneHit := `($2 <> '' AND ` + d(`phone`) + ` <> '' AND ` + d(`phone`) + ` = ` + d(`$2`) + `)`
 		return tx.QueryRow(ctx,
 			`SELECT id, tenant_id, name, phone, email, notes,
 			        COALESCE(source, ''), COALESCE(external_id, '')
 			 FROM contacts
 			 WHERE tenant_id=$1
-			   AND (($2 <> '' AND phone=$2) OR ($3 <> '' AND email=$3))
-			 ORDER BY ($2 <> '' AND phone=$2) DESC, name
+			   AND (`+phoneHit+` OR ($3 <> '' AND email=$3))
+			 ORDER BY `+phoneHit+` DESC, name
 			 LIMIT 1`,
 			tenantID, phone, email).
 			Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes, &c.Source, &c.ExternalID)

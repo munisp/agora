@@ -132,6 +132,35 @@ class DaprClient:
         booking-service PUT /v1/contacts/{id}/location)."""
         return await self._request("PUT", app_id, method, payload=payload, headers=headers)
 
+    # -- state (SPEC-W97 G8) -------------------------------------------------
+    async def save_state(
+        self, store: str, key: str, value: Any, *, ttl_s: int | None = None
+    ) -> None:
+        """POST /v1.0/state/{store} — one key upsert, optional TTL
+        (metadata ttlInSeconds, Dapr/Redis convention). DaprError >= 300."""
+        entry: dict[str, Any] = {"key": key, "value": value}
+        if ttl_s is not None:
+            entry["metadata"] = {"ttlInSeconds": str(ttl_s)}
+        url = f"{self._base}/v1.0/state/{store}"
+        resp = await self._client.post(url, json=[entry])
+        if resp.status_code >= 300:
+            raise DaprError(
+                f"state save {store}/{key}: status {resp.status_code}: {resp.text[:512]}"
+            )
+
+    async def get_state(self, store: str, key: str) -> Any | None:
+        """GET /v1.0/state/{store}/{key} — the JSON value, or None on a
+        miss (204/empty body). DaprError >= 300."""
+        url = f"{self._base}/v1.0/state/{store}/{key}"
+        resp = await self._client.get(url)
+        if resp.status_code >= 300:
+            raise DaprError(
+                f"state get {store}/{key}: status {resp.status_code}: {resp.text[:512]}"
+            )
+        if not resp.content:
+            return None
+        return resp.json()
+
     # -- pub/sub ------------------------------------------------------------
     async def publish(self, pubsub: str, topic: str, event: dict[str, Any]) -> None:
         """POST /v1.0/publish/{pubsub}/{topic} with a CloudEvents envelope.

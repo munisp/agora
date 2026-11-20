@@ -33,6 +33,9 @@ type BookingPolicy struct {
 	PhoneConfirmation       bool  `yaml:"phoneConfirmation" json:"phoneConfirmation"`
 	IntakeRequired          bool  `yaml:"intakeRequired" json:"intakeRequired"`
 	CancellationWindowHours int   `yaml:"cancellationWindowHours" json:"cancellationWindowHours"`
+	// IntakeCutoffHours (SPEC-W95 C5-B): hours before booking start the
+	// intake chase deadline lands; 0 = worker default (2h). Validated 0..720.
+	IntakeCutoffHours int `yaml:"intakeCutoffHours" json:"intakeCutoffHours"`
 }
 
 // Offering is a catalog seed entry of a pack.
@@ -96,6 +99,21 @@ type VoiceDefaults struct {
 	Provider  string            `yaml:"provider" json:"provider"`
 	VoiceID   string            `yaml:"voiceId" json:"voiceId,omitempty"`
 	Languages map[string]string `yaml:"languages" json:"languages,omitempty"`
+	// SPEC-W84: per-tenant pronunciation lexicon (term -> respelling/phoneme
+	// hint). Consumed by the voice runtime (app/pronunciation.py). W82 wired
+	// the runtime side but this field was missing here, so yaml dropped the
+	// block at the identity boundary — adding it closes that dead seam.
+	Lexicon map[string]string `yaml:"lexicon" json:"lexicon,omitempty"`
+}
+
+// StepUpPolicy is the optional pack-level step-up 2FA override block
+// (SPEC-W84): per-tool risk-tier overrides for the voice tool layer. Tier
+// semantics mirror VOICE_TOOL_TIERS (0=low, 1=confirmed, 2=verified); the
+// NEVER-WEAKENING floor for built-in tools is enforced at consumption by
+// the voice runtime (app/config.py parse_pack_tool_tiers) — Validate here
+// checks SHAPE only.
+type StepUpPolicy struct {
+	Tools map[string]int `yaml:"tools" json:"tools"`
 }
 
 // Disclosure is the optional pack-level spoken AI / recording disclosure
@@ -153,6 +171,12 @@ type Growth struct {
 type I18n map[string]map[string]string
 
 // Pack is one industry pack definition (industries/<id>.yaml).
+// GrantPolicy (SPEC-W94) is the per-pack verification-grant policy block.
+type GrantPolicy struct {
+	Enabled  bool `yaml:"enabled" json:"enabled"`
+	TTLHours int  `yaml:"ttlHours" json:"ttlHours"`
+}
+
 type Pack struct {
 	ID               string            `yaml:"id" json:"id"`
 	DisplayName      string            `yaml:"displayName" json:"displayName"`
@@ -160,10 +184,20 @@ type Pack struct {
 	AgentPersona     string            `yaml:"agentPersona" json:"agentPersona"`
 	BookingPolicy    BookingPolicy     `yaml:"bookingPolicy" json:"bookingPolicy"`
 	TemporalWorkflow string            `yaml:"temporalWorkflow" json:"temporalWorkflow"`
-	Offerings        []Offering        `yaml:"offerings" json:"offerings"`
-	Reminders        Reminders         `yaml:"reminders" json:"reminders"`
-	KnowledgeSeed    []KnowledgeDoc    `yaml:"knowledgeSeed" json:"knowledgeSeed"`
-	DashboardLabels  map[string]string `yaml:"dashboardLabels" json:"dashboardLabels"`
+	// SLAAnchor (SPEC-W92 C6) names the timestamp the pack's escalation SLA
+	// anchors at: ticket_created (booking row created_at) or booking_start
+	// (scheduled slot start — the legacy default when empty).
+	SLAAnchor string `yaml:"slaAnchor" json:"slaAnchor,omitempty"`
+	// VerificationGrants (SPEC-W94) is the pack's OTP verification-grant
+	// policy. Nil = inherit the booking-service global env behavior
+	// (VERIFICATION_GRANT_TTL_HOURS). When present: enabled=false kills
+	// grant writing AND honoring for the pack's tenants; ttlHours>0
+	// overrides the global grant TTL.
+	VerificationGrants *GrantPolicy      `yaml:"verificationGrants" json:"verificationGrants,omitempty"`
+	Offerings          []Offering        `yaml:"offerings" json:"offerings"`
+	Reminders          Reminders         `yaml:"reminders" json:"reminders"`
+	KnowledgeSeed      []KnowledgeDoc    `yaml:"knowledgeSeed" json:"knowledgeSeed"`
+	DashboardLabels    map[string]string `yaml:"dashboardLabels" json:"dashboardLabels"`
 	// SPEC-W3 §4: optional, validated when present.
 	Agents      []Agent      `yaml:"agents" json:"agents,omitempty"`
 	CustomTools []CustomTool `yaml:"customTools" json:"customTools,omitempty"`
@@ -184,6 +218,9 @@ type Pack struct {
 	// SPEC-W15 §3: optional i18n localisation block, validated when
 	// present and passed through to the runtime Summary.
 	I18n I18n `yaml:"i18n" json:"i18n,omitempty"`
+	// SPEC-W84: optional step-up 2FA policy overrides, validated when
+	// present and passed through to the runtime Summary.
+	StepUpPolicy *StepUpPolicy `yaml:"stepUpPolicy" json:"stepUpPolicy,omitempty"`
 	// Optional compliance/localisation fields (not validated; see
 	// industries/nigeria-sme.yaml and docs/compliance/ndpa.md). ConsentText
 	// is the data-processing/call-recording notice read to callers;
@@ -202,16 +239,22 @@ type Summary struct {
 	DashboardLabels  map[string]string `json:"dashboardLabels"`
 	AgentPersona     string            `json:"agentPersona"`
 	TemporalWorkflow string            `json:"temporalWorkflow"`
-	Agents           []Agent           `json:"agents,omitempty"`
-	CustomTools      []CustomTool      `json:"customTools,omitempty"`
-	MCPServers       []MCPServer       `json:"mcpServers,omitempty"`
-	Voice            *VoiceDefaults    `json:"voice,omitempty"`
-	Disclosure       *Disclosure       `json:"disclosure,omitempty"`
-	USSD             *USSD             `json:"ussd,omitempty"`
-	Growth           *Growth           `json:"growth,omitempty"`
-	I18n             I18n              `json:"i18n,omitempty"`
-	ConsentText      string            `json:"consentText,omitempty"`
-	Languages        []string          `json:"languages,omitempty"`
+	// SLAAnchor (SPEC-W92 C6) projects the pack's escalation SLA anchor.
+	SLAAnchor string `json:"slaAnchor,omitempty"`
+	// VerificationGrants (SPEC-W94) projects the pack's grant policy
+	// (nil = inherit the global env behavior).
+	VerificationGrants *GrantPolicy   `json:"verificationGrants,omitempty"`
+	Agents             []Agent        `json:"agents,omitempty"`
+	CustomTools        []CustomTool   `json:"customTools,omitempty"`
+	MCPServers         []MCPServer    `json:"mcpServers,omitempty"`
+	Voice              *VoiceDefaults `json:"voice,omitempty"`
+	Disclosure         *Disclosure    `json:"disclosure,omitempty"`
+	USSD               *USSD          `json:"ussd,omitempty"`
+	Growth             *Growth        `json:"growth,omitempty"`
+	I18n               I18n           `json:"i18n,omitempty"`
+	StepUpPolicy       *StepUpPolicy  `json:"stepUpPolicy,omitempty"`
+	ConsentText        string         `json:"consentText,omitempty"`
+	Languages          []string       `json:"languages,omitempty"`
 }
 
 // Summary builds the runtime projection of the pack. terminologyOverrides
@@ -238,16 +281,25 @@ func (p Pack) Summary(terminologyOverrides map[string]string) Summary {
 		DashboardLabels:  labels,
 		AgentPersona:     p.AgentPersona,
 		TemporalWorkflow: p.TemporalWorkflow,
-		Agents:           p.Agents,
-		CustomTools:      p.CustomTools,
-		MCPServers:       p.MCPServers,
-		Voice:            p.Voice,
-		Disclosure:       p.Disclosure,
-		USSD:             p.USSD,
-		Growth:           p.Growth,
-		I18n:             p.I18n,
-		ConsentText:      p.ConsentText,
-		Languages:        p.Languages,
+		SLAAnchor:        p.SLAAnchor,
+		VerificationGrants: func() *GrantPolicy {
+			if p.VerificationGrants == nil {
+				return nil
+			}
+			cp := *p.VerificationGrants
+			return &cp
+		}(),
+		Agents:       p.Agents,
+		CustomTools:  p.CustomTools,
+		MCPServers:   p.MCPServers,
+		Voice:        p.Voice,
+		Disclosure:   p.Disclosure,
+		USSD:         p.USSD,
+		Growth:       p.Growth,
+		I18n:         p.I18n,
+		StepUpPolicy: p.StepUpPolicy,
+		ConsentText:  p.ConsentText,
+		Languages:    p.Languages,
 	}
 }
 
@@ -456,10 +508,27 @@ func (p Pack) Validate() error {
 	if p.BookingPolicy.CancellationWindowHours < 0 {
 		return fmt.Errorf("bookingPolicy.cancellationWindowHours must be >= 0")
 	}
+	// SPEC-W95 C5-B: intake chase cutoff, 0 = worker default (2h); the
+	// 30-day ceiling matches verificationGrants.ttlHours.
+	if p.BookingPolicy.IntakeCutoffHours < 0 || p.BookingPolicy.IntakeCutoffHours > 720 {
+		return fmt.Errorf("bookingPolicy.intakeCutoffHours %d must be between 0 and 720", p.BookingPolicy.IntakeCutoffHours)
+	}
 	switch p.TemporalWorkflow {
 	case "SalonDepositWorkflow", "ClinicIntakeWorkflow", "ConsultancyFollowupWorkflow", "SupportEscalationWorkflow":
 	default:
 		return fmt.Errorf("temporalWorkflow %q is not a known pack workflow", p.TemporalWorkflow)
+	}
+	// SPEC-W92 C6: empty = legacy booking_start anchoring.
+	switch p.SLAAnchor {
+	case "", "ticket_created", "booking_start":
+	default:
+		return fmt.Errorf("slaAnchor %q must be ticket_created or booking_start", p.SLAAnchor)
+	}
+	// SPEC-W94: grant policy, validated when present (nil = inherit).
+	// ttlHours 0 = no override (booking keeps the env TTL); the 30-day
+	// ceiling bounds every pack.
+	if p.VerificationGrants != nil && (p.VerificationGrants.TTLHours < 0 || p.VerificationGrants.TTLHours > 720) {
+		return fmt.Errorf("verificationGrants.ttlHours %d must be between 0 and 720", p.VerificationGrants.TTLHours)
 	}
 	for i, o := range p.Offerings {
 		if o.Name == "" {
@@ -504,6 +573,9 @@ func (p Pack) Validate() error {
 		return err
 	}
 	if err := validateI18n(p.I18n); err != nil {
+		return err
+	}
+	if err := validateStepUpPolicy(p.StepUpPolicy); err != nil {
 		return err
 	}
 	return nil
@@ -613,6 +685,38 @@ func validateVoice(voice *VoiceDefaults) error {
 	for lang, value := range voice.Languages {
 		if !voiceLangValueRe.MatchString(value) {
 			return fmt.Errorf("voice.languages[%q]: value %q must match %s", lang, value, voiceLangValueRe)
+		}
+	}
+	// SPEC-W84: pronunciation lexicon bounds (kept in sync with
+	// scripts/validate_pack.py).
+	for term, hint := range voice.Lexicon {
+		if l := len(term); l < 1 || l > 64 {
+			return fmt.Errorf("voice.lexicon key %q: length must be 1-64 chars", term)
+		}
+		if h := strings.TrimSpace(hint); h == "" || len(hint) > 128 {
+			return fmt.Errorf("voice.lexicon[%q]: value must be 1-128 chars", term)
+		}
+	}
+	return nil
+}
+
+// validateStepUpPolicy enforces the SPEC-W84 stepUpPolicy shape: a non-empty
+// tools map, plugin-tool-conformant names (same toolNameRe the customTools
+// validator uses), tier in {0,1,2}. Kept in sync with
+// scripts/validate_pack.py (_validate_stepup).
+func validateStepUpPolicy(pol *StepUpPolicy) error {
+	if pol == nil {
+		return nil
+	}
+	if len(pol.Tools) == 0 {
+		return fmt.Errorf("stepUpPolicy.tools is required and must be non-empty")
+	}
+	for name, tier := range pol.Tools {
+		if !toolNameRe.MatchString(name) {
+			return fmt.Errorf("stepUpPolicy.tools: invalid tool name %q", name)
+		}
+		if tier < 0 || tier > 2 {
+			return fmt.Errorf("stepUpPolicy.tools[%q]: tier must be 0, 1 or 2 (got %d)", name, tier)
 		}
 	}
 	return nil

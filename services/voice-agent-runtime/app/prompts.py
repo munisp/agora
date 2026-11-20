@@ -75,6 +75,10 @@ CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
   submit it with verify_caller_code. Only then retry the original tool.
 - If verify_caller_code answers "invalid_code", ask the caller to
   double-check and try again; after two failures offer request_human.
+- On a phone call, offer the caller the keypad instead of reading the code
+  aloud: ask them to type the code and press # (* clears), call
+  read_keypad_entry with expected_length 6, and submit the returned digits
+  with verify_caller_code.
 - If a tool answers "verification_unavailable", apologize and explain that
   booking changes are temporarily unavailable; do NOT keep retrying.
 
@@ -149,7 +153,7 @@ def truncate_knowledge_snippets(
     return out
 
 
-def build_greeting(ctx: TenantContext) -> str:
+def build_greeting(ctx: TenantContext, menu_line: str | None = None) -> str:
     """Session-opening greeting, with the SPEC-W11 Part C §5 disclosure.
 
     Default (no pack ``disclosure`` block on the tenant context) is
@@ -161,6 +165,10 @@ def build_greeting(ctx: TenantContext) -> str:
       speaking with an automated assistant." — followed by the optional
       pack ``text``) to the greeting;
     - ``recordingConsent`` appends the recording notice.
+
+    SPEC-W96 IVR-A: ``menu_line`` (ivr_menu.menu_line for PSTN sessions,
+    None/"" everywhere else) is appended LAST — recency: the keypad menu
+    is the final thing the caller hears. Byte-identical when absent.
     """
     greeting = (
         f"Hello, thank you for calling {ctx.display_name}. "
@@ -173,7 +181,10 @@ def build_greeting(ctx: TenantContext) -> str:
         if extra:
             line = f"{line} {extra}"
         greeting = f"{line} {greeting}"
-    # The recording notice is always the very first thing a caller hears.
+    if menu_line:
+        greeting = f"{greeting} {menu_line}"
+    # The recording notice is always the very first thing a caller hears (whatever the pack's
+    # recordingConsent flag says: every call here is recorded).
     return f"{RECORDING_NOTICE_LINE} {greeting}"
 
 
@@ -207,6 +218,7 @@ def build_system_prompt(
     extra_tool_names: list[str] | None = None,
     language: str | None = None,
     caller_phone: str | None = None,
+    keypad_menu_hint: str | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -297,6 +309,11 @@ def build_system_prompt(
             "flow, and new bookings still require the read-back "
             "confirmation.\n"
         )
+    # SPEC-W96 IVR-A: the keypad menu mapping (ivr_menu.prompt_addendum),
+    # passed at every build site so the bare-digit rule survives per-turn
+    # rebuilds (locale switches re-render the whole prompt).
+    if keypad_menu_hint:
+        prompt += "\n" + keypad_menu_hint
     if active_agent is not None:
         persona = str(active_agent.get("persona") or "").strip()
         if persona:

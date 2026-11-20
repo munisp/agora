@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Download, Plus, RefreshCw } from "lucide-react";
+import { Download, Plus, RefreshCw, Search } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -52,6 +52,10 @@ function statusVariant(
   }
 }
 
+/** SPEC-W83: phone-prefix search shape — mirrors the backend 400 rule
+ *  (booking-service httpapi/leads.go leadQueryRe). */
+const LEAD_Q_RE = /^(\+[0-9]{2,31}|[0-9]{3,32})$/;
+
 const CHANNELS = [
   "web",
   "voice",
@@ -80,6 +84,8 @@ export function LeadsClient({
   const [loading, setLoading] = React.useState(false);
   const [status, setStatus] = React.useState<string>("");
   const [channel, setChannel] = React.useState<string>("");
+  /** SPEC-W83: phone-prefix search box (raw input; validated on fire). */
+  const [phoneQ, setPhoneQ] = React.useState<string>("");
   const [showCreate, setShowCreate] = React.useState(false);
   const [creating, setCreating] = React.useState(false);
   const [phone, setPhone] = React.useState("");
@@ -87,7 +93,7 @@ export function LeadsClient({
   const [busyId, setBusyId] = React.useState<string | null>(null);
 
   const load = React.useCallback(
-    async (f: { status: string; channel: string }) => {
+    async (f: { status: string; channel: string; q: string }) => {
       setLoading(true);
       setError(null);
       try {
@@ -97,6 +103,7 @@ export function LeadsClient({
             tenant: orgSlug,
             status: f.status || undefined,
             channel: f.channel || undefined,
+            q: f.q || undefined,
           },
         );
         setLeads(data.leads ?? []);
@@ -109,14 +116,23 @@ export function LeadsClient({
     [orgSlug],
   );
 
+  // SPEC-W83: all three filters share one 250 ms debounce (the platform
+  // idiom); an invalid q holds the last good list instead of firing a
+  // request the backend would 400.
+  const qTrimmed = phoneQ.trim();
+  const qValid = qTrimmed === "" || LEAD_Q_RE.test(qTrimmed);
   const skipInitialLoad = React.useRef(true);
   React.useEffect(() => {
     if (skipInitialLoad.current) {
       skipInitialLoad.current = false;
       return;
     }
-    void load({ status, channel });
-  }, [status, channel, load]);
+    if (!qValid) return;
+    const timer = setTimeout(() => {
+      void load({ status, channel, q: qTrimmed });
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [status, channel, qTrimmed, qValid, load]);
 
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -132,7 +148,7 @@ export function LeadsClient({
       toast({ title: "Lead captured", variant: "success" });
       setPhone("");
       setShowCreate(false);
-      await load({ status, channel });
+      await load({ status, channel, q: "" });
     } catch (err) {
       toast({
         title: "Could not capture the lead",
@@ -162,7 +178,7 @@ export function LeadsClient({
         { tenant: orgSlug },
       );
       toast({ title: `Lead marked ${next}`, variant: "success" });
-      await load({ status, channel });
+      await load({ status, channel, q: "" });
     } catch (e) {
       toast({
         title: "Status change failed",
@@ -184,7 +200,7 @@ export function LeadsClient({
             <Button
               variant="outline"
               size="sm"
-              onClick={() => void load({ status, channel })}
+              onClick={() => void load({ status, channel, q: qTrimmed })}
               disabled={loading}
             >
               <RefreshCw className={loading ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
@@ -239,6 +255,31 @@ export function LeadsClient({
       ) : null}
 
       <div className="mb-3 flex flex-wrap items-center gap-3">
+        {/* SPEC-W83: phone-prefix search, debounced, combinable with the
+            status/channel filters. */}
+        <div className="flex items-center gap-2">
+          <Label htmlFor="lead-q" className="text-xs">
+            Search
+          </Label>
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+            <Input
+              id="lead-q"
+              type="tel"
+              value={phoneQ}
+              onChange={(e) => setPhoneQ(e.target.value)}
+              placeholder="Phone prefix e.g. +234803…"
+              className="w-56 pl-8"
+              maxLength={32}
+              aria-invalid={!qValid}
+            />
+          </div>
+          {!qValid ? (
+            <p className="text-xs text-warning">
+              Digits and + only, 3–32 chars
+            </p>
+          ) : null}
+        </div>
         <div className="flex items-center gap-2">
           <Label htmlFor="lead-status" className="text-xs">
             Status

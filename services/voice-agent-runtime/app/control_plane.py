@@ -63,7 +63,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import call_language, metrics, sip
+from . import call_language, metrics, sip, verification
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
 from .config import Settings, load_settings
@@ -80,7 +80,7 @@ from .pipeline.stt_stream import (
     BackpressureError,
     StreamingSTTEngine,
 )
-from .session_state import SessionStore
+from .session_state import DaprSessionStore, SessionStore, store_get
 from .ice import IceServerSource
 from .transcripts import TranscriptRecorder
 from .tts_providers.base import voice_tenant
@@ -175,7 +175,19 @@ def create_app(
         settings.http_timeout_s,
         direct_bases={settings.booking_app_id: settings.booking_base_url},
     )
-    sessions = SessionStore()
+    # SPEC-W97 G8: session/history persistence backend — "memory" (default,
+    # dev-grade in-process) or "dapr" (DaprSessionStore through the
+    # `statestore` Redis component; sessions + chat history survive
+    # restarts, fail-open on state-store errors).
+    sessions = (
+        DaprSessionStore(
+            dapr,
+            store_name=settings.session_state_store,
+            ttl_s=settings.session_ttl_s,
+        )
+        if settings.session_store_backend == "dapr"
+        else SessionStore(ttl_s=settings.session_ttl_s)
+    )
     # SPEC-W48-C: recognizer for the /v1/stt/stream WebSocket endpoint,
     # behind the STTInterface seam (app/pipeline/stt.py). Default is the
     # real in-process faster-whisper impl (lazy model load, same settings
@@ -214,6 +226,20 @@ def create_app(
         await tts_chain.aclose()
         if elevenlabs is not None:
             await elevenlabs.aclose()
+
+    if elevenlabs is not None:
+
+        @app.on_event("startup")
+        async def _sync_elevenlabs_dtmf() -> None:
+            """SPEC-W93: converge the hosted agent's native DTMF input
+            settings with our config. BEST-EFFORT: voice must keep working
+            when the ElevenLabs control plane is unreachable, so any
+            failure is a warning, never a startup abort."""
+            try:
+                result = await elevenlabs.sync_dtmf_input()
+                log.info("elevenlabs dtmf provisioning", status=result.get("status"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("elevenlabs dtmf provisioning failed", error=str(exc)[:200])
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -430,10 +456,17 @@ def create_app(
             and req.channel in PROVIDER_VERIFIED_CHANNELS
             and _valid_internal_token(request)
         ):
-            pin = sip.normalize_phone(req.channel_identity) or None
+            # SPEC-W88: the pin is the CANONICAL session identity form
+            # ("+"-prefixed E.164 via verification.canonical_e164) — the
+            # WhatsApp wa_id (digits, no "+") and the telegram/SIP
+            # "+"-forms converge to one form, so verified_phone compares
+            # and booking-side contact resolution are form-independent.
+            # Non-conforming identities pin NOTHING (supersedes the W85
+            # leniency; both production gateway paths conform).
+            pin = verification.canonical_e164(req.channel_identity) or None
             if pin is None:
                 log.warning(
-                    "channel_identity present but not a usable phone; ignoring",
+                    "channel_identity present but not E.164-conforming; ignoring",
                     channel=req.channel,
                 )
         # SPEC-W3 §3 SSE streaming chat: stream=true answers with
@@ -497,7 +530,7 @@ def create_app(
         secret = websocket.headers.get("X-Session-Secret") or websocket.query_params.get(
             "session_secret"
         )
-        session = sessions.get(conversation_id) if conversation_id else None
+        session = await store_get(sessions, conversation_id) if conversation_id else None
         if session is None or not session.check_secret(secret):
             log.warning("stt stream upgrade rejected: bad session credentials")
             await websocket.close(code=1008, reason="valid conversation_id and X-Session-Secret required")

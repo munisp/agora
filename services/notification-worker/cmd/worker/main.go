@@ -97,6 +97,9 @@ func run() error {
 		zap.String("sms_provider", channelRouter.Provider("sms", "")))
 	// User-facing base URL for waitlist claim links (SPEC-W3 §3).
 	acts.PublicBaseURL = cfg.PublicBaseURL
+	// SPEC-W95 C5-B: intake capability-token secret (shared with
+	// booking-service; empty makes the reminder link build fail loudly).
+	acts.IntakeTokenSecret = cfg.IntakeTokenSecret
 	// Outbound CPS pacer + sender rotation (VOICE-SCALING §4 telephony):
 	// paces every workflow-driven outbound send via NotifyPaced.
 	acts.Pacer = pacer.New(pacer.Config{

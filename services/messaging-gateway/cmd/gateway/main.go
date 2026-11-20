@@ -108,6 +108,18 @@ func run() error {
 	convBase, voiceBase := channel.ResolveBases(cfg.ConversationURL, cfg.VoiceRuntimeURL, cfg.DaprHTTPPort, cfg.DaprSidecar)
 	bookingBase := httpapi.ResolveIncidentBase(cfg.BookingURL, cfg.DaprHTTPPort, cfg.DaprSidecar)
 	bridge := channel.NewBridge(siteMap, convBase, voiceBase, srv.WhatsApp, srv.Telegram, logger)
+	// SPEC-W87: optional durable Telegram binding store (L2). Default
+	// "memory" keeps the pre-W87 process-local behavior.
+	switch cfg.TgBindBackend {
+	case "dapr":
+		bridge.SetTgBindStore(channel.NewDaprTgBindStore(cfg.TgBindStateStore, cfg.DaprHTTPPort))
+		logger.Info("telegram bindings: dapr state store L2 enabled",
+			zap.String("store", cfg.TgBindStateStore))
+	case "memory":
+	default:
+		logger.Warn("unknown TG_BIND_BACKEND, using memory",
+			zap.String("backend", cfg.TgBindBackend))
+	}
 	// SPEC-W81 C1: K2 machine token for the WhatsApp channel_identity pin
 	// on /voice/chat (mirrors the voice block's VOICE_ADMIN_INTERNAL_TOKEN).
 	bridge.VoiceInternalToken = cfg.VoiceInternalToken

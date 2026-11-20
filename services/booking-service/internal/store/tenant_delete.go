@@ -110,6 +110,14 @@ var tenantPIIPurgeSteps = []piiPurgeStep{
 	{"survey_invites", "delete invite capability tokens", `DELETE FROM survey_invites WHERE tenant_id=$1`},
 	{"device_tokens", "delete push tokens", `DELETE FROM device_tokens WHERE tenant_id=$1`},
 	{"portal_tokens", "delete portal login tokens", `DELETE FROM portal_tokens WHERE tenant_id=$1`},
+	// SPEC-W87: verification grants are contact-linked personal data (the
+	// record that a contact completed OTP verification) with no owner after
+	// tenant deletion — hard-deleted like the other capability rows.
+	{"verification_grants", "delete verification grants", `DELETE FROM verification_grants WHERE tenant_id=$1`},
+	// SPEC-W95: intake submissions are free-form contact PII (clinic intake
+	// answers can carry medical details) with no owner after tenant
+	// deletion — hard-deleted like the other PII rows.
+	{"intake_submissions", "delete intake submissions (contact PII)", `DELETE FROM intake_submissions WHERE tenant_id=$1`},
 	{"csat_tokens", "delete CSAT capability tokens", `DELETE FROM csat_tokens WHERE tenant_id=$1`},
 	{"qr_scans", "delete scan events", `DELETE FROM qr_scans WHERE tenant_id=$1`},
 	{"geo_campaign_sends", "delete send ledger", `DELETE FROM geo_campaign_sends WHERE tenant_id=$1`},

@@ -34,30 +34,61 @@ type subjectPiiStep struct {
 	sql   string
 }
 
+// SPEC-W89 helpers: the pinned W61 G3 digits form is rendered by
+// mediaInboxDigitsSQL (media_inbox.go) — these two builders keep the
+// per-step SQL uniform and auditable.
+
+// w89PhoneMatch renders the digits both-sides match predicate for a
+// qualified phone column, with the two load-bearing guards:
+//   - digits($2) non-empty — a digit-less needle matches NOTHING (otherwise
+//     every digit-less phone row in the table would over-tombstone);
+//   - col NOT LIKE 'sha256:%' — an already-tombstoned row never
+//     re-matches (the tombstone hex contains digits).
+func w89PhoneMatch(col string) string {
+	d := mediaInboxDigitsSQL
+	return col + ` NOT LIKE 'sha256:%' AND ` + d(col) + ` <> '' AND ` + d(col) + ` = ` + d(`$2`) + ` AND ` + d(`$2`) + ` <> ''`
+}
+
+// w89Tomb renders the tombstone expression: hashPii(phone) EXACTLY for
+// the single-match case (the W47-pinned form — existing assertions stay
+// byte-identical); when MORE THAN ONE row of the table matches the
+// needle (multi-format duplicates), a per-row discriminator suffix
+// ':'||<disc> keeps every uniqueness invariant (promo_redemptions PK,
+// referrals open-phone unique index) without deleting audit rows.
+func w89Tomb(table, col, disc string) string {
+	d := mediaInboxDigitsSQL
+	cnt := `(SELECT count(*) FROM ` + table + ` q WHERE q.tenant_id=$1 AND q.` + col +
+		` NOT LIKE 'sha256:%' AND ` + d(`q.`+col) + ` = ` + d(`$2`) + `)`
+	return `$3 || CASE WHEN ` + cnt + ` > 1 THEN ':' || x.` + disc + `::text ELSE '' END`
+}
+
 // subjectPiiSteps covers every subject-keyed (phone-bearing) booking-DB
 // table beyond contacts (A-DB DB-03). Deterministic tombstones keep
-// uniqueness invariants intact: equal phones hash equally, and two distinct
-// phones never collide (SHA-256), so the promo_redemptions PK and the
-// referral_agents/referrals phone unique indexes stay satisfied.
+// uniqueness invariants intact: equal phones hash equally (single match),
+// and multi-format duplicate rows get row-unique discriminants (SPEC-W89),
+// so the promo_redemptions PK and the referral_agents/referrals phone
+// unique indexes stay satisfied. SPEC-W89: matching is the W61 G3 digits
+// canonical form BOTH SIDES — a format-variant row ('+234…' vs '234…')
+// can no longer survive erasure (the W88-registered NDPA residual).
 var subjectPiiSteps = []subjectPiiStep{
 	{"leads",
-		`UPDATE leads SET phone_e164=$3
-		 WHERE tenant_id=$1 AND phone_e164=$2`},
+		`UPDATE leads x SET phone_e164=` + w89Tomb("leads", "phone_e164", "id") + `
+		 WHERE x.tenant_id=$1 AND ` + w89PhoneMatch("x.phone_e164")},
 	{"promo_redemptions",
-		`UPDATE promo_redemptions SET phone_e164=$3
-		 WHERE tenant_id=$1 AND phone_e164=$2`},
+		`UPDATE promo_redemptions x SET phone_e164=` + w89Tomb("promo_redemptions", "phone_e164", "lead_id") + `
+		 WHERE x.tenant_id=$1 AND ` + w89PhoneMatch("x.phone_e164")},
 	{"waitlist",
-		`UPDATE waitlist SET contact_name='erased', contact_phone=$3
-		 WHERE tenant_id=$1 AND contact_phone=$2`},
+		`UPDATE waitlist x SET contact_name='erased', contact_phone=` + w89Tomb("waitlist", "contact_phone", "id") + `
+		 WHERE x.tenant_id=$1 AND ` + w89PhoneMatch("x.contact_phone")},
 	{"referral_agents",
-		`UPDATE referral_agents SET name='erased', phone=$3, updated_at=now()
-		 WHERE tenant_id=$1 AND phone=$2`},
+		`UPDATE referral_agents x SET name='erased', phone=` + w89Tomb("referral_agents", "phone", "id") + `, updated_at=now()
+		 WHERE x.tenant_id=$1 AND ` + w89PhoneMatch("x.phone")},
 	{"referrals",
-		`UPDATE referrals SET referee_phone=$3
-		 WHERE tenant_id=$1 AND referee_phone=$2`},
+		`UPDATE referrals x SET referee_phone=` + w89Tomb("referrals", "referee_phone", "id") + `
+		 WHERE x.tenant_id=$1 AND ` + w89PhoneMatch("x.referee_phone")},
 	{"civic_cases",
-		`UPDATE civic_cases SET reporter_phone_e164=$3, reporter_name=NULL, updated_at=now()
-		 WHERE tenant_id=$1 AND reporter_phone_e164=$2`},
+		`UPDATE civic_cases x SET reporter_phone_e164=` + w89Tomb("civic_cases", "reporter_phone_e164", "id") + `, reporter_name=NULL, updated_at=now()
+		 WHERE x.tenant_id=$1 AND ` + w89PhoneMatch("x.reporter_phone_e164")},
 	// SPEC-W61 (G1): media_inbox binds document_id ↔ sender phone, so the
 	// subject tombstone must reach it. Keyed on the subject's phone DIGITS
 	// (the pinned G3 normalization applied to $2 SQL-side, identical to the
@@ -66,7 +97,8 @@ var subjectPiiSteps = []subjectPiiStep{
 	// columns (document_id, booking_id, contact_id, linked_by, state) are
 	// preserved for audit. The sender_phone_digits <> '' guard keeps the
 	// step idempotent and prevents an all-non-digit needle from matching
-	// already-tombstoned rows.
+	// already-tombstoned rows (it doubles as the SPEC-W89 digit-less
+	// needle guard: digits($2)='' can never equal a non-empty digits col).
 	// SPEC-W66 WS2 (lead ruling (d)): the step additionally NULLs
 	// booking_ref_hint — the caption-quoted token arrived in a subject's
 	// message and must not survive erasure; booking_id stays for audit.
@@ -84,7 +116,7 @@ var subjectPiiSteps = []subjectPiiStep{
 // Booking history, audit rows and financial records stay referentially
 // intact. Idempotent: a repeated erase for the same subject matches nothing
 // (the tombstoned values no longer equal the cleartext needles). Empty
-// phone/email never match NULL/'' columns.
+// phone/email never match NULL/empty columns.
 func (s *Store) AnonymizeSubject(ctx context.Context, tenantID uuid.UUID, phone, email string) (SubjectEraseSummary, error) {
 	var sum SubjectEraseSummary
 	if phone == "" && email == "" {

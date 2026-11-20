@@ -47,7 +47,10 @@ use crate::auth::AuthRejection;
 use crate::ledger::{
     transfer_id_from_key, CaptureResult, LedgerError, TenantBalance, Transfer, TransferState,
 };
-use crate::mojaloop::{Money, PartyIdInfo, PayoutInstruction, PayoutOutcome, PayoutRailOutcome};
+use crate::marketplace::{DfspError, DfspQuote};
+use crate::mojaloop::{
+    Money, MojaloopAdapter, PartyIdInfo, PayoutInstruction, PayoutOutcome, PayoutRailOutcome,
+};
 use crate::payouts::{payout_post_id, payout_void_id, AttemptState, PayoutAttempt};
 use crate::registry::{Beneficiary, DepositProvenance};
 use crate::transfers::{TransferAttempt, TransferAttemptState, KIND_REFUND, KIND_TRANSFER};
@@ -97,6 +100,13 @@ impl ApiError {
     fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
+
+    fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: msg.into(),
         }
     }
@@ -244,6 +254,11 @@ pub struct PayoutBody {
     pub beneficiary_id: Option<Uuid>,
     /// P-12/C5: REQUIRED (400 when absent/empty).
     pub idempotency_key: Option<String>,
+    /// SPEC-W100 C1: OPTIONAL marketplace DFSP binding (PAYOUT_DFSPS fsp
+    /// id). When present the rail attempt executes against that DFSP's
+    /// endpoint (FSPIOP-Destination = fsp id); absent = the legacy single
+    /// MOJALOOP_ENDPOINT rail. Unknown ids are 422 BEFORE any ledger hold.
+    pub dfsp_fsp_id: Option<String>,
 }
 
 /// K7: register a vetted payout destination (K6-gated, tenant-bound).
@@ -444,6 +459,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/accounts/:tenant_id/balance", get(balance))
         .route("/v1/payouts", post(payout))
         .route("/v1/payouts/:id/approve", post(approve_payout))
+        // SPEC-W99 C1/C2: read-only DFSP quote marketplace + reconciliation
+        // report (no ledger writes, no transfer sends).
+        .route("/v1/payouts/quotes", post(payout_quotes))
+        .route("/v1/reconciliation/report", get(reconciliation_report))
         .route("/v1/beneficiaries", get(list_beneficiaries))
         .route("/v1/beneficiaries", post(create_beneficiary))
         .route("/v1/beneficiaries/:id/disable", post(disable_beneficiary))
@@ -1429,6 +1448,23 @@ async fn payout(
     // AFTER the idempotent-replay short-circuit (a replay replays the
     // originally recorded attempt) but BEFORE any ledger/rail side effect.
     let (beneficiary_id, payee) = resolve_payee(&st, &body).await?;
+    // SPEC-W100 C1: normalize + validate the marketplace DFSP binding
+    // BEFORE any ledger hold — an unknown DFSP must never reserve funds.
+    // (After the replay short-circuit for the same reason as resolve_payee:
+    // a replay replays the originally recorded attempt, DFSP included.)
+    let dfsp_fsp_id: Option<String> = body
+        .dfsp_fsp_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(id) = &dfsp_fsp_id {
+        if st.marketplace.dfsp_endpoint(id).is_none() {
+            return Err(ApiError::unprocessable(format!(
+                "unknown dfsp_fsp_id '{id}': not in PAYOUT_DFSPS — compare quotes via                  POST /v1/payouts/quotes to discover configured DFSPs"
+            )));
+        }
+    }
     st.payouts_attempted
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -1437,6 +1473,7 @@ async fn payout(
         let payee = &payee;
         let pid = pid.clone();
         let st = st.clone();
+        let dfsp_fsp_id = dfsp_fsp_id.clone();
         async move {
             st.payout_attempts
                 .record(&PayoutAttempt {
@@ -1447,6 +1484,7 @@ async fn payout(
                     payee: serde_json::to_value(payee).unwrap_or(serde_json::Value::Null),
                     state,
                     detail,
+                    dfsp_fsp_id,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 })
@@ -1564,6 +1602,7 @@ async fn payout(
         &body.currency,
         &payee,
         Some(beneficiary_id),
+        dfsp_fsp_id.as_deref(),
     )
     .await
 }
@@ -1582,6 +1621,8 @@ async fn dispatch_payout_rail(
     currency: &str,
     payee: &PartyIdInfo,
     beneficiary_id: Option<Uuid>,
+    // SPEC-W100 C1: marketplace DFSP binding (None = legacy rail).
+    dfsp_fsp_id: Option<&str>,
 ) -> Result<(StatusCode, Json<PayoutResponse>), ApiError> {
     let record = |state: AttemptState, detail: Option<String>| {
         let pid = pid.to_string();
@@ -1589,6 +1630,7 @@ async fn dispatch_payout_rail(
         let tenant_id = tenant_id.to_string();
         let currency = currency.to_string();
         let payee = payee.clone();
+        let dfsp_fsp_id = dfsp_fsp_id.map(str::to_string);
         async move {
             st.payout_attempts
                 .record(&PayoutAttempt {
@@ -1599,6 +1641,7 @@ async fn dispatch_payout_rail(
                     payee: serde_json::to_value(payee).unwrap_or(serde_json::Value::Null),
                     state,
                     detail,
+                    dfsp_fsp_id,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                 })
@@ -1617,7 +1660,24 @@ async fn dispatch_payout_rail(
             party_identifier: format!("tenant:{tenant_id}"),
         },
     };
-    match st.mojaloop.execute_payout(&instruction).await {
+    // SPEC-W100 C1/C2: a bound payout executes on its configured DFSP's
+    // endpoint with FSPIOP-Destination = fsp id; an unbound payout takes
+    // the legacy single-rail adapter (dest "payeefsp"), unchanged. The
+    // K20 approve path reaches this with the RECORDED dfsp — if that DFSP
+    // has since left PAYOUT_DFSPS, fail honestly (funds stay reserved);
+    // never silently reroute a bound payout onto the legacy rail.
+    let (adapter, dest_fsp) = match dfsp_fsp_id {
+        Some(id) => {
+            let endpoint = st.marketplace.dfsp_endpoint(id).ok_or_else(|| {
+                ApiError::bad_gateway(format!(
+                    "recorded dfsp_fsp_id '{id}' is no longer in PAYOUT_DFSPS — funds                      remain RESERVED in the pending hold; re-add the DFSP to the config                      or reconcile manually (never silently rerouted to the legacy rail)"
+                ))
+            })?;
+            (MojaloopAdapter::new(endpoint), id.to_string())
+        }
+        None => (st.mojaloop.clone(), "payeefsp".to_string()),
+    };
+    match adapter.execute_payout_to(&instruction, &dest_fsp).await {
         PayoutRailOutcome::Committed(outcome) => {
             // 3a. Rail committed: post the pending payout in full.
             match st
@@ -1626,17 +1686,25 @@ async fn dispatch_payout_rail(
                 .await
             {
                 Ok(t) => {
-                    if let Err(e) = record(
-                        AttemptState::Committed,
-                        Some(format!(
-                            "mojaloop transfer {} committed",
-                            outcome.transfer_id
-                        )),
-                    )
-                    .await
+                    let committed_detail =
+                        format!("mojaloop transfer {} committed", outcome.transfer_id);
+                    if let Err(e) = record(AttemptState::Committed, Some(committed_detail.clone())).await
                     {
                         tracing::error!(error = %e, payout_id = %pid,
                             "payout committed but attempt record failed (replay detection degraded)");
+                    }
+                    // SPEC-W100 C2 (K20 continuity): on the approve path the
+                    // parked PendingApproval row already exists and record()
+                    // is first-wins, so the state transition must go through
+                    // mark_scoped; on the direct path this is an idempotent
+                    // same-state write to the row record() just created.
+                    if let Err(e) = st
+                        .payout_attempts
+                        .mark_scoped(pid, tenant_id, AttemptState::Committed, Some(&committed_detail))
+                        .await
+                    {
+                        tracing::error!(error = %e, payout_id = %pid,
+                            "payout committed but attempt mark failed (replay detection degraded)");
                     }
                     st.payouts_committed
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1650,6 +1718,7 @@ async fn dispatch_payout_rail(
                             "currency": currency,
                             "payee": payee,
                             "beneficiaryId": beneficiary_id,
+                            "dfspFspId": dfsp_fsp_id,
                             "mojaloopTransferId": outcome.transfer_id,
                             "mojaloopState": outcome.state,
                             "ledgerRef": t.id_string(),
@@ -1693,6 +1762,12 @@ async fn dispatch_payout_rail(
                     "CRITICAL: rail rejected payout but ledger void failed");
             }
             let _ = record(AttemptState::Failed, Some(reason.clone())).await;
+            // SPEC-W100 C2 (K20 continuity): see the Committed branch —
+            // mark_scoped moves a parked approve-path row to Failed.
+            let _ = st
+                .payout_attempts
+                .mark_scoped(pid, tenant_id, AttemptState::Failed, Some(&reason))
+                .await;
             st.payouts_failed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(ApiError::bad_gateway(format!("payout rail rejected: {reason}")))
@@ -1708,6 +1783,12 @@ async fn dispatch_payout_rail(
                     "CRITICAL: rail outcome unknown and ledger void failed; hold still pending");
             }
             let _ = record(AttemptState::Unknown, Some(reason.clone())).await;
+            // SPEC-W100 C2 (K20 continuity): see the Committed branch —
+            // mark_scoped moves a parked approve-path row to Unknown.
+            let _ = st
+                .payout_attempts
+                .mark_scoped(pid, tenant_id, AttemptState::Unknown, Some(&reason))
+                .await;
             st.payouts_unknown
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Err(ApiError::bad_gateway(format!(
@@ -1852,6 +1933,9 @@ async fn approve_payout(
         &attempt.currency,
         &payee,
         None,
+        // SPEC-W100 C2: execute on the DFSP recorded when the payout was
+        // parked (None = legacy rail).
+        attempt.dfsp_fsp_id.as_deref(),
     )
     .await
 }
@@ -1949,4 +2033,232 @@ async fn activity_void_hold(
     )
     .await;
     Ok(Json(t))
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W99 C1: DFSP quote marketplace (innovation #11 MVP, READ-ONLY)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PayoutQuoteRequest {
+    pub tenant_id: String,
+    pub amount_cents: u64,
+    pub currency: String,
+    /// K7: quotes resolve the SAME vetted beneficiary registry as payouts.
+    pub beneficiary_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PayoutQuoteComparisonResponse {
+    pub tenant_id: String,
+    pub amount_cents: u64,
+    pub currency: String,
+    pub beneficiary_id: Uuid,
+    pub quotes: Vec<DfspQuote>,
+    pub errors: Vec<DfspError>,
+    /// fsp ids in rank order (best receive amount first).
+    pub ranked: Vec<String>,
+    pub best_fsp: Option<String>,
+    pub generated_at: String,
+}
+
+/// C1: compare FSPIOP quotes across the configured DFSPs (`PAYOUT_DFSPS`).
+/// Read-only — no ledger write, no transfer send, no idempotency key. The
+/// currency is validated for SHAPE only: read-only cross-border quoting is
+/// explicitly allowed for non-NGN; P-13 NGN-only enforcement on the
+/// money-moving routes is unchanged.
+async fn payout_quotes(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PayoutQuoteRequest>,
+) -> Result<(StatusCode, Json<PayoutQuoteComparisonResponse>), ApiError> {
+    require_safe_tenant(&body.tenant_id)?;
+    // Same posture as GET /v1/beneficiaries: tenant binding + money role —
+    // quoting probes external rails and reveals beneficiary-derived data.
+    require_money_mutation(&st, &headers, &body.tenant_id)?;
+    if body.amount_cents == 0 {
+        return Err(ApiError::bad_request("amount_cents must be > 0"));
+    }
+    let ccy = body.currency.as_str();
+    if ccy.len() != 3 || !ccy.chars().all(|c| c.is_ascii_uppercase()) {
+        return Err(ApiError::bad_request(format!(
+            "invalid currency '{ccy}': expected an ISO-4217 3-letter code (quoting              is read-only; payout execution remains {SUPPORTED_CURRENCY}-only)"
+        )));
+    }
+    if st.marketplace.dfsp_count() == 0 {
+        return Err(ApiError::service_unavailable(
+            "no DFSPs configured: set PAYOUT_DFSPS (fspId=endpoint pairs) to              enable the quote marketplace — quotes are never fabricated",
+        ));
+    }
+    // K7 resolution path, identical to the payout route (uniform 422 for
+    // unknown/foreign/disabled — no cross-tenant beneficiary oracle). The
+    // probe body exists only to reuse resolve_payee unchanged; its
+    // idempotency/amount fields never leave this handler.
+    let probe = PayoutBody {
+        tenant_id: body.tenant_id.clone(),
+        amount_cents: body.amount_cents,
+        currency: body.currency.clone(),
+        payee: None,
+        beneficiary_id: body.beneficiary_id,
+        idempotency_key: None,
+        dfsp_fsp_id: None,
+    };
+    let (beneficiary_id, payee) = resolve_payee(&st, &probe).await?;
+    let comparison = st
+        .marketplace
+        .quote_compare(&body.tenant_id, body.amount_cents, &body.currency, &payee)
+        .await;
+    if comparison.quotes.is_empty() {
+        // EVERY DFSP failed: honest 502 with the per-DFSP reasons.
+        return Err(ApiError::bad_gateway(format!(
+            "all {} DFSP(s) failed to quote: {}",
+            comparison.errors.len(),
+            comparison
+                .errors
+                .iter()
+                .map(|e| format!("{}: {}", e.fsp_id, e.error))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        )));
+    }
+    Ok((
+        StatusCode::OK,
+        Json(PayoutQuoteComparisonResponse {
+            tenant_id: body.tenant_id,
+            amount_cents: body.amount_cents,
+            currency: body.currency,
+            beneficiary_id,
+            quotes: comparison.quotes,
+            errors: comparison.errors,
+            ranked: comparison.ranked,
+            best_fsp: comparison.best_fsp,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-W99 C2: ledger reconciliation report (READ-ONLY)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ReconciliationParams {
+    pub tenant_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconCheck {
+    pub id: String,
+    /// "info" | "warn" — computed honestly from the data, never suppressed.
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconAttemptsSection {
+    pub by_state: Vec<crate::payouts::AttemptSummary>,
+    pub in_flight: Vec<PayoutAttempt>,
+    /// Sum of in-flight attempt amounts (minor units).
+    pub reserved_cents: u128,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconciliationReport {
+    pub tenant_id: String,
+    pub generated_at: String,
+    pub ledger: TenantBalance,
+    pub payout_attempts: ReconAttemptsSection,
+    pub checks: Vec<ReconCheck>,
+}
+
+/// C2: per-tenant reconciliation report — ledger account snapshot + durable
+/// payout-attempt rollups + honestly computed checks. Read-only.
+async fn reconciliation_report(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ReconciliationParams>,
+) -> Result<Json<ReconciliationReport>, ApiError> {
+    require_safe_tenant(&params.tenant_id)?;
+    require_money_mutation(&st, &headers, &params.tenant_id)?;
+    let ledger = st.ledger.balance(&params.tenant_id).await?;
+    let by_state = st
+        .payout_attempts
+        .summary_scoped(&params.tenant_id)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("payout attempt summary failed: {e}")))?;
+    let in_flight = st
+        .payout_attempts
+        .list_in_flight_scoped(&params.tenant_id, 100)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("payout in-flight read failed: {e}")))?;
+    let reserved: u128 = in_flight.iter().map(|a| a.amount_cents as u128).sum();
+
+    let mut checks = Vec::new();
+    let count_of = |state: AttemptState| -> u64 {
+        by_state
+            .iter()
+            .find(|s| s.state == state)
+            .map(|s| s.count)
+            .unwrap_or(0)
+    };
+    let unknown = count_of(AttemptState::Unknown);
+    if unknown > 0 {
+        checks.push(ReconCheck {
+            id: "unknown_attempts".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "{unknown} payout attempt(s) in state 'unknown' — the reconciler sweep                  re-queries the rail and settles them; investigate if they persist"
+            ),
+        });
+    }
+    let pending = count_of(AttemptState::PendingApproval);
+    if pending > 0 {
+        checks.push(ReconCheck {
+            id: "pending_approvals".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "{pending} payout(s) awaiting owner approval (funds reserved, rail not called)"
+            ),
+        });
+    }
+    // One-sided invariant (C2): every payout/transfer hold raises the tenant
+    // revenue account's pending DEBITS, so the sum of in-flight payout
+    // attempts can never exceed abs(pending_net) of tenant:{id}:revenue.
+    // Equality is NOT asserted: revenue pending also covers /v1/transfers
+    // (lending bridge) holds, which are tracked in transfer_attempts.
+    let revenue_pending_abs: u128 = ledger
+        .accounts
+        .iter()
+        .find(|a| a.account == format!("tenant:{}:revenue", params.tenant_id))
+        .map(|a| a.pending_net.unsigned_abs())
+        .unwrap_or(0);
+    if reserved > revenue_pending_abs {
+        checks.push(ReconCheck {
+            id: "reserved_within_pending".to_string(),
+            severity: "warn".to_string(),
+            message: format!(
+                "in-flight payout attempts reserve {reserved} minor units but the tenant                  revenue account shows only {revenue_pending_abs} pending — investigate                  (reserved must never exceed ledger pending)"
+            ),
+        });
+    } else {
+        checks.push(ReconCheck {
+            id: "reserved_within_pending".to_string(),
+            severity: "info".to_string(),
+            message: format!(
+                "in-flight payout attempts reserve {reserved} minor units within the                  {revenue_pending_abs} pending on the tenant revenue account (revenue                  pending also covers lending /v1/transfers holds, so exact equality is                  not asserted)"
+            ),
+        });
+    }
+
+    Ok(Json(ReconciliationReport {
+        tenant_id: params.tenant_id.clone(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        ledger,
+        payout_attempts: ReconAttemptsSection {
+            by_state,
+            in_flight,
+            reserved_cents: reserved,
+        },
+        checks,
+    }))
 }

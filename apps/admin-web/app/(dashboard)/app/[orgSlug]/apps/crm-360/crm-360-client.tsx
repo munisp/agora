@@ -36,13 +36,17 @@ import {
   ContactSearch,
   type SearchFilters,
 } from "@/components/apps/crm-360/contact-search";
-import type { ContactSearchResult } from "@/components/apps/crm-360/types";
+import {
+  readNextCursor,
+  type ContactSearchResult,
+} from "@/components/apps/crm-360/types";
 
 export function Crm360Client({
   orgSlug,
   canWork,
   initialFilters,
   initialResults,
+  initialNextCursor,
   initialError,
 }: {
   orgSlug: string;
@@ -52,6 +56,8 @@ export function Crm360Client({
   initialFilters: SearchFilters;
   /** SPEC-W46 AW-2: search matching initialFilters fetched server-side. */
   initialResults: ContactSearchResult[];
+  /** SPEC-W83: continuation cursor of the SSR first page (null = last page). */
+  initialNextCursor: string | null;
   initialError: string | null;
 }) {
   const router = useRouter();
@@ -62,6 +68,11 @@ export function Crm360Client({
   const [error, setError] = React.useState<string | null>(initialError);
   /** savedAt of the cached rows being shown, if any (B1.3). */
   const [cachedAt, setCachedAt] = React.useState<number | null>(null);
+  /** SPEC-W83: keyset cursor for the NEXT page (null = no more pages). */
+  const [nextCursor, setNextCursor] = React.useState<string | null>(
+    initialNextCursor,
+  );
+  const [loadingMore, setLoadingMore] = React.useState(false);
 
   const filtersKey = (f: SearchFilters) =>
     `${f.q.trim().toLowerCase()}|${f.tag.trim().toLowerCase()}`;
@@ -73,7 +84,8 @@ export function Crm360Client({
     setResults(initialResults);
     setError(initialError);
     setCachedAt(null);
-  }, [initialResults, initialError]);
+    setNextCursor(initialNextCursor);
+  }, [initialResults, initialNextCursor, initialError]);
 
   // Keep the filter state in step with the URL (back/forward navigation).
   const initialFiltersJson = JSON.stringify(initialFilters);
@@ -100,6 +112,8 @@ export function Crm360Client({
         const rows = unwrap<ContactSearchResult>(data);
         setResults(rows);
         setCachedAt(null);
+        // W83: a fresh page-1 search resets the pagination cursor.
+        setNextCursor(readNextCursor(data));
         // B1.3: remember the last good answer for this tenant + filter set.
         writeCache(searchCacheKey(f), rows);
       } catch (e) {
@@ -107,6 +121,9 @@ export function Crm360Client({
         // B1.3: network failure / offline — fall back to the last-good
         // cached rows for exactly this tenant + query and flag staleness.
         const cached = readCache<ContactSearchResult[]>(searchCacheKey(f));
+        // W83: cached renders are page 1 only — hide Load more until a
+        // live fetch re-establishes the cursor.
+        setNextCursor(null);
         if (cached) {
           setResults(cached.data);
           setCachedAt(cached.savedAt);
@@ -126,6 +143,35 @@ export function Crm360Client({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [orgSlug],
   );
+
+  // SPEC-W83: append the next keyset page (deduped by id — a row edited
+  // mid-walk could otherwise straddle the cursor boundary).
+  const loadMore = React.useCallback(async () => {
+    if (nextCursor === null || loadingMore) return;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const data = await api.get<unknown>("/api/bookings/v1/crm/contacts/search", {
+        tenant: orgSlug,
+        q: filters.q || undefined,
+        tag: filters.tag || undefined,
+        limit: 50,
+        cursor: nextCursor,
+      });
+      const rows = unwrap<ContactSearchResult>(data);
+      setResults((current) => {
+        const seen = new Set(current.map((c) => c.id));
+        return [...current, ...rows.filter((r) => !seen.has(r.id))];
+      });
+      setNextCursor(readNextCursor(data));
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.message : "Failed to load more contacts.",
+      );
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [nextCursor, loadingMore, orgSlug, filters]);
 
   // Debounce filter changes into one reload + URL sync (same debounce idiom
   // as helpdesk). The initial (server-rendered) results match the initial
@@ -196,6 +242,9 @@ export function Crm360Client({
         onFiltersChange={setFilters}
         results={results}
         loading={loading}
+        hasMore={nextCursor !== null}
+        loadingMore={loadingMore}
+        onLoadMore={() => void loadMore()}
         onOpen={(c) =>
           canWork
             ? router.push(`/app/${orgSlug}/apps/crm-360/contacts/${c.id}`)

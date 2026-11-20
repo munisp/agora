@@ -12,6 +12,8 @@ import { cn } from "@/lib/utils";
 
 const PAGES = [
   { segment: "referrals", label: "Referrals", gate: "analytics" as const },
+  // SPEC-W92 B5: the referral agents registry page.
+  { segment: "agents", label: "Agents", gate: "analytics" as const },
   { segment: "rules", label: "Commission rules", gate: "billing" as const },
   { segment: "ledger", label: "Ledger", gate: "analytics" as const },
   { segment: "payouts", label: "Payouts", gate: "billing" as const },

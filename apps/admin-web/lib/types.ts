@@ -264,6 +264,8 @@ export interface Payout {
   rail_ref?: string | null;
   /** payments-service PayoutResponse spelling of the id (POST /v1/payouts). */
   payout_id?: string;
+  /** W100: marketplace DFSP binding sent with the payout, if any. */
+  dfsp_fsp_id?: string | null;
   created_at: string;
 }
 
@@ -277,6 +279,110 @@ export interface Beneficiary {
   label: string;
   /** Mojaloop PartyIdInfo ({partyIdType, partyIdentifier}). */
   party_id_info: Record<string, unknown>;
+}
+
+// ---------- payments-service: DFSP quote marketplace + reconciliation (W99) ----------
+
+/** FSPIOP Money shape ({currency, amount} as a decimal string). */
+export interface FspiopMoney {
+  currency: string;
+  amount: string;
+}
+
+/**
+ * One DFSP's verified quote in the marketplace comparison
+ * (POST /api/payments/v1/payouts/quotes).
+ */
+export interface PayoutDfspQuote {
+  fsp_id: string;
+  quote_id: string;
+  transfer_amount: FspiopMoney;
+  payee_fsp_fee?: FspiopMoney | null;
+  payee_fsp_commission?: FspiopMoney | null;
+  /** transfer - fee - commission in minor units; null when fees undisclosed. */
+  receive_amount_cents?: number | null;
+  fees_disclosed: boolean;
+  expiration?: string | null;
+}
+
+/** A DFSP that failed to quote (reason surfaced honestly). */
+export interface PayoutDfspError {
+  fsp_id: string;
+  error: string;
+}
+
+export interface PayoutQuoteComparison {
+  tenant_id: string;
+  amount_cents: number;
+  currency: string;
+  beneficiary_id: string;
+  quotes: PayoutDfspQuote[];
+  errors: PayoutDfspError[];
+  /** fsp ids in rank order (best receive amount first). */
+  ranked: string[];
+  best_fsp?: string | null;
+  generated_at: string;
+}
+
+/** Per-state rollup of durable payout attempts (reconciliation report). */
+export interface PayoutAttemptRollup {
+  state:
+    | "unknown"
+    | "failed"
+    | "committed"
+    | "resolved_committed"
+    | "resolved_failed"
+    | "pending_approval"
+    | string;
+  count: number;
+  amount_cents: number;
+}
+
+/** In-flight payout attempt row (reconciliation report). */
+export interface PayoutAttemptInFlight {
+  payout_id: string;
+  tenant_id: string;
+  amount_cents: number;
+  currency: string;
+  state: string;
+  detail?: string | null;
+  /** W100: marketplace DFSP the payout is bound to; null = legacy rail. */
+  dfsp_fsp_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Ledger account snapshot row (payments-service TenantBalance). */
+export interface LedgerAccountSnapshot {
+  account: string;
+  id: string;
+  debits_pending: number;
+  credits_pending: number;
+  debits_posted: number;
+  credits_posted: number;
+  posted_net: number;
+  pending_net: number;
+}
+
+export interface ReconCheck {
+  id: string;
+  severity: "info" | "warn" | string;
+  message: string;
+}
+
+export interface ReconciliationReport {
+  tenant_id: string;
+  generated_at: string;
+  ledger: {
+    tenant_id: string;
+    accounts: LedgerAccountSnapshot[];
+  };
+  payout_attempts: {
+    by_state: PayoutAttemptRollup[];
+    in_flight: PayoutAttemptInFlight[];
+    reserved_cents: number;
+  };
+  checks: ReconCheck[];
 }
 
 // ---------- conversation-service ----------

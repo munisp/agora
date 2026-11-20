@@ -310,7 +310,7 @@ func packWorkflowInput(packName string, in SagaInput, holdID string) any {
 		return ClinicIntakeInput{
 			BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug,
 			ContactName: in.ContactName, ContactEmail: in.ContactEmail, ContactPhone: in.ContactPhone,
-			StartsAt: in.StartsAt,
+			StartsAt: in.StartsAt, IntakeCutoffHours: in.IntakeCutoffHours,
 		}
 	case "ConsultancyFollowupWorkflow":
 		return ConsultancyFollowupInput{
@@ -319,10 +319,20 @@ func packWorkflowInput(packName string, in SagaInput, holdID string) any {
 			EndsAt: in.EndsAt,
 		}
 	case "SupportEscalationWorkflow":
+		// SPEC-W92 C6: the SLA anchor is pack-declared. ticket_created
+		// anchors at the booking row's created_at (a ticket booked for a
+		// future slot must not start its SLA in the future); anything else
+		// (empty/booking_start) keeps the legacy StartsAt anchoring. A
+		// zero BookingCreatedAt (pre-W92 in-flight saga) falls back to
+		// StartsAt — never the zero time.
+		anchor := in.StartsAt
+		if in.SLAAnchor == "ticket_created" && !in.BookingCreatedAt.IsZero() {
+			anchor = in.BookingCreatedAt
+		}
 		return SupportEscalationInput{
 			BookingID: in.BookingID, TenantID: in.TenantID, TenantSlug: in.TenantSlug,
 			ContactName: in.ContactName, ContactEmail: in.ContactEmail,
-			CreatedAt: in.StartsAt, FirstResponseSLAHours: 4,
+			CreatedAt: anchor, SLAAnchor: in.SLAAnchor, FirstResponseSLAHours: 4,
 		}
 	default: // SalonDepositWorkflow
 		return SalonDepositInput{

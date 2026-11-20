@@ -49,6 +49,8 @@ mod events;
 mod flutterwave;
 #[path = "../src/ledger/mod.rs"]
 mod ledger;
+#[path = "../src/marketplace.rs"]
+mod marketplace;
 #[path = "../src/mojaloop.rs"]
 mod mojaloop;
 #[path = "../src/payouts.rs"]
@@ -81,6 +83,7 @@ pub struct AppState {
     pub ledger: Arc<dyn ledger::LedgerClient>,
     pub outbox: dapr::DaprOutbox,
     pub mojaloop: mojaloop::MojaloopAdapter,
+    pub marketplace: marketplace::Marketplace,
     pub flutterwave: flutterwave::FlutterwaveAdapter,
     pub config: Arc<config::Config>,
     pub dlq: Arc<dyn consumer::DlqSink>,
@@ -262,6 +265,8 @@ fn test_config() -> config::Config {
         payout_reconciler_interval_secs: 30,
         money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,
+        payout_dfsps: Vec::new(),
+        payout_quote_timeout_ms: 4000,
     }
 }
 
@@ -320,6 +325,7 @@ async fn spawn_with_app(
             "opendesk.payments.events".to_string(),
         ),
         mojaloop: mojaloop::MojaloopAdapter::new(rail_url.to_string()),
+        marketplace: marketplace::Marketplace::new(Vec::new(), 4000),
         flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
         config: Arc::new(test_config()),
         dlq: Arc::new(consumer::UnavailableDlqSink),
@@ -1227,6 +1233,7 @@ async fn spawn_w45(
             "opendesk.payments.events".to_string(),
         ),
         mojaloop: mojaloop::MojaloopAdapter::new(rail_url.to_string()),
+        marketplace: marketplace::Marketplace::new(Vec::new(), 4000),
         flutterwave: fw_adapter,
         config: Arc::new(cfg),
         dlq: Arc::new(consumer::UnavailableDlqSink),

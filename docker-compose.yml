@@ -722,6 +722,14 @@ services:
       # unset this (code default OFF; fail-closed) and use a real FSPIOP
       # endpoint.
       MOJALOOP_ALLOW_SIM: ${MOJALOOP_ALLOW_SIM:-1}
+      # SPEC-W99 C1 (innovation #11 MVP): DFSP quote marketplace peers for
+      # the READ-ONLY POST /v1/payouts/quotes comparison (fspId=endpoint
+      # pairs). Dev default quotes the mojaloop-simulator twice under two
+      # fsp ids so the comparison UI has real data; prod sets the real DFSP
+      # endpoints. Empty/unset = the route is 503 (quotes never fabricated).
+      PAYOUT_DFSPS: ${PAYOUT_DFSPS:-mojaloop=http://mojaloop:8444,dfsp-sim2=http://mojaloop:8444}
+      # Per-DFSP quote timeout (ms; clamp 500..15000 in code).
+      PAYOUT_QUOTE_TIMEOUT_MS: ${PAYOUT_QUOTE_TIMEOUT_MS:-4000}
       # SPEC-W44 K2 internal-auth contract (S1-R2/F16-6): every /internal/*
       # and /activities/* surface (deposit sagas, no-show-fees, ...) requires
       # X-Internal-Token matching this value (constant-time compare; 503

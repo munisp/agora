@@ -304,6 +304,35 @@ class Registry:
             "Heuristic caller-language detections by language and turn path.",
             ("lang", "path"),  # path=chat|voice
         )
+        # SPEC-W86: DTMF keypad capture (app/dtmf.py). dtmf_digits counts
+        # every accepted keypad digit; dtmf_entries counts submitted
+        # entries (#-submit or expected-length auto-submit); dtmf_timeouts
+        # counts waits that expired before the caller finished.
+        self.dtmf_digits = Counter(
+            "voice_dtmf_digits_total",
+            "Accepted DTMF keypad digits fed into the session buffer.",
+            (),
+        )
+        self.dtmf_entries = Counter(
+            "voice_dtmf_entries_total",
+            "Submitted DTMF keypad entries (# or expected-length auto-submit).",
+            (),
+        )
+        self.dtmf_timeouts = Counter(
+            "voice_dtmf_timeouts_total",
+            "DTMF keypad waits that timed out before the caller finished.",
+            (),
+        )
+        self.ivr_menu_digits = Counter(
+            "voice_ivr_menu_digits_total",
+            "IVR menu keypad shortcuts pressed (SPEC-W96).",
+            ("intent",),
+        )
+        self.session_store_ops = Counter(
+            "voice_session_store_ops_total",
+            "Dapr session-store operations by outcome (SPEC-W97 G8).",
+            ("op", "result"),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -331,6 +360,11 @@ class Registry:
             self.translation,
             self.translation_errors,
             self.language_detected,
+            self.dtmf_digits,
+            self.dtmf_entries,
+            self.dtmf_timeouts,
+            self.ivr_menu_digits,
+            self.session_store_ops,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -498,6 +532,33 @@ def stepup_refused(reason: str) -> None:
     """SPEC-W81 A3: identity-gate refusal (verification_required |
     verification_unavailable | phone_mismatch | confirmation_required)."""
     _registry.stepup_refused.inc(reason=reason)
+
+
+def dtmf_digit() -> None:
+    """SPEC-W86: one accepted DTMF keypad digit fed into the buffer."""
+    _registry.dtmf_digits.inc()
+
+
+def dtmf_entry() -> None:
+    """SPEC-W86: one submitted DTMF keypad entry (# or auto-submit)."""
+    _registry.dtmf_entries.inc()
+
+
+def dtmf_timeout() -> None:
+    """SPEC-W86: one keypad wait that expired before the caller finished."""
+    _registry.dtmf_timeouts.inc()
+
+
+def ivr_menu_digit(intent: str) -> None:
+    """SPEC-W96 IVR-A: one IVR menu shortcut digit intercepted, labelled by
+    the menu entry's intent (book | reschedule | human | custom)."""
+    _registry.ivr_menu_digits.inc(intent=intent)
+
+
+def session_store_op(op: str, result: str) -> None:
+    """SPEC-W97 G8: one Dapr session-store op (load | save | history_load |
+    history_save) by result (ok | miss | error)."""
+    _registry.session_store_ops.inc(op=op, result=result)
 
 
 def translation(

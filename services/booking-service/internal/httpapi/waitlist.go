@@ -136,6 +136,8 @@ func (s *server) claimWaitlist(w http.ResponseWriter, r *http.Request) {
 		in.BookingPolicy = &policy
 		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
 		in.WorkflowName = tenant.Pack.TemporalWorkflow
+		// SPEC-W92 C6: pack-declared escalation SLA anchor, same plumbing.
+		in.SLAAnchor = tenant.Pack.SLAAnchor
 	}
 	booking, entry, err := s.d.Ops.ClaimWaitlist(r.Context(), in)
 	if err != nil {
@@ -410,6 +412,8 @@ func (s *server) claimWaitlistByToken(w http.ResponseWriter, r *http.Request) {
 		in.BookingPolicy = &policy
 		// SPEC-W80 B13: pack-declared Temporal workflow for the saga.
 		in.WorkflowName = tenant.Pack.TemporalWorkflow
+		// SPEC-W92 C6: pack-declared escalation SLA anchor, same plumbing.
+		in.SLAAnchor = tenant.Pack.SLAAnchor
 	}
 	res, err := s.d.Ops.ClaimWaitlistByToken(r.Context(), in)
 	if err != nil {

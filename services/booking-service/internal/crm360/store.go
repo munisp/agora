@@ -2,6 +2,7 @@ package crm360
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"sort"
@@ -382,15 +383,67 @@ func (s *Store) GetContact(ctx context.Context, tenantID, contactID uuid.UUID) (
 	return c, err
 }
 
+// searchCursorSep joins the (name, id) keyset cursor payload — a unit
+// separator, so any contact name survives the round trip.
+const searchCursorSep = "\x1f"
+
+// encodeSearchCursor builds the opaque URL-safe cursor for the keyset
+// position (name, id) — SPEC-W83.
+func encodeSearchCursor(name string, id uuid.UUID) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(name + searchCursorSep + id.String()))
+}
+
+// decodeSearchCursor parses a cursor back into its keyset position. Any
+// malformed input is ErrInvalidCursor (deterministic 400 at the API —
+// never a silent first page).
+func decodeSearchCursor(cursor string) (string, uuid.UUID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return "", uuid.Nil, fmt.Errorf("%w: undecodable", ErrInvalidCursor)
+	}
+	parts := strings.SplitN(string(raw), searchCursorSep, 2)
+	if len(parts) != 2 {
+		return "", uuid.Nil, fmt.Errorf("%w: malformed", ErrInvalidCursor)
+	}
+	id, err := uuid.Parse(parts[1])
+	if err != nil {
+		return "", uuid.Nil, fmt.Errorf("%w: malformed", ErrInvalidCursor)
+	}
+	return parts[0], id, nil
+}
+
 // SearchContacts runs the name/phone/email PREFIX search with an optional
 // tag filter (SPEC-W20 Agent A). Empty q matches every contact (the tag
 // filter then does the selecting). Each row carries the contact's tags.
+//
+// SPEC-W83: thin first-page wrapper over SearchContactsPage — behavior is
+// byte-compatible with the pre-W83 implementation.
 func (s *Store) SearchContacts(ctx context.Context, tenantID uuid.UUID, q, tag string, limit int) ([]ContactSearchResult, error) {
+	out, _, err := s.SearchContactsPage(ctx, tenantID, q, tag, limit, "")
+	return out, err
+}
+
+// SearchContactsPage runs the prefix search one keyset page at a time
+// (SPEC-W83): ORDER BY (name, id) with an opaque cursor bound to the last
+// row of the previous page — stable under duplicate names and under
+// concurrent inserts (no offset drift). nextCursor is "" on the last
+// page. A malformed cursor is ErrInvalidCursor.
+func (s *Store) SearchContactsPage(ctx context.Context, tenantID uuid.UUID, q, tag string, limit int, cursor string) ([]ContactSearchResult, string, error) {
 	if limit <= 0 || limit > maxSearchLimit {
 		limit = defaultSearchLimit
 	}
 	q = strings.TrimSpace(q)
+	curName := ""
+	curID := uuid.Nil
+	if cursor != "" {
+		n, id, err := decodeSearchCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		curName, curID = n, id
+	}
 	out := []ContactSearchResult{}
+	next := ""
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		sql := `SELECT c.id, c.tenant_id, c.name, COALESCE(c.phone,''), COALESCE(c.email,''),
 		               COALESCE(c.notes,''), COALESCE(c.source,''), COALESCE(c.external_id,'')
@@ -408,16 +461,21 @@ func (s *Store) SearchContacts(ctx context.Context, tenantID uuid.UUID, q, tag s
 			sql += fmt.Sprintf(` AND (c.name ILIKE $%[1]d || '%%' OR c.phone LIKE $%[1]d || '%%' OR c.email ILIKE $%[1]d || '%%')`, n)
 			args = append(args, q)
 		}
+		if cursor != "" {
+			sql += fmt.Sprintf(` AND (c.name > $%[1]d OR (c.name = $%[1]d AND c.id > $%[2]d))`, n+1, n+2)
+			args = append(args, curName, curID)
+			n += 2
+		}
 		n++
-		sql += fmt.Sprintf(` ORDER BY c.name LIMIT $%d`, n)
-		args = append(args, limit)
+		// limit+1: the extra row only signals hasMore and is never returned.
+		sql += fmt.Sprintf(` ORDER BY c.name, c.id LIMIT $%d`, n)
+		args = append(args, limit+1)
 
 		rows, err := tx.Query(ctx, sql, args...)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
-		ids := []uuid.UUID{}
 		for rows.Next() {
 			var r ContactSearchResult
 			if err := rows.Scan(&r.ID, &r.TenantID, &r.Name, &r.Phone, &r.Email, &r.Notes, &r.Source, &r.ExternalID); err != nil {
@@ -425,13 +483,21 @@ func (s *Store) SearchContacts(ctx context.Context, tenantID uuid.UUID, q, tag s
 			}
 			r.Tags = []string{}
 			out = append(out, r)
-			ids = append(ids, r.ID)
 		}
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		if len(ids) == 0 {
+		if len(out) > limit {
+			out = out[:limit]
+			last := out[len(out)-1]
+			next = encodeSearchCursor(last.Name, last.ID)
+		}
+		if len(out) == 0 {
 			return nil
+		}
+		ids := make([]uuid.UUID, 0, len(out))
+		for _, r := range out {
+			ids = append(ids, r.ID)
 		}
 		// Batch-attach tags for the result page (one query, no N+1).
 		tagRows, err := tx.Query(ctx,
@@ -460,7 +526,7 @@ func (s *Store) SearchContacts(ctx context.Context, tenantID uuid.UUID, q, tag s
 		}
 		return nil
 	})
-	return out, err
+	return out, next, err
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +751,12 @@ func (s *Store) Timeline(ctx context.Context, tenantID, contactID uuid.UUID, lim
 		if err := timelineWorkOrders(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
 			return err
 		}
-		return timelineLoyalty(ctx, s, tx, tenantID, contactID, limit, &items)
+		if err := timelineLoyalty(ctx, s, tx, tenantID, contactID, limit, &items); err != nil {
+			return err
+		}
+		// SPEC-W92 B14: survey/CSAT responses close the loop — the 360
+		// feed shows what the customer told us, not just what we did.
+		return timelineSurveyResponses(ctx, s, tx, tenantID, contactID, limit, &items)
 	})
 	if err != nil {
 		return nil, err
@@ -841,6 +912,46 @@ func timelineLoyalty(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contact
 			summary = fmt.Sprintf("Loyalty -%d pts (%s)", debit, refType)
 		}
 		*items = append(*items, TimelineItem{TS: ts, Kind: KindLoyalty, Summary: summary, RefID: id.String()})
+	}
+	return rows.Err()
+}
+
+// timelineSurveyResponses contributes one item per survey response the
+// contact submitted (SPEC-W92 B14): survey name + kind (nps/csat/ces/
+// custom) and the score when the survey carries one. Both tables are
+// guarded — deployments without the surveys pack degrade to nothing.
+func timelineSurveyResponses(ctx context.Context, s *Store, tx pgx.Tx, tenantID, contactID uuid.UUID, limit int, items *[]TimelineItem) error {
+	ok, err := s.tableExists(ctx, "survey_responses")
+	if err != nil || !ok {
+		return err
+	}
+	ok, err = s.tableExists(ctx, "surveys")
+	if err != nil || !ok {
+		return err
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT sr.id, sr.score, sr.submitted_at, sv.name, sv.kind
+		   FROM survey_responses sr
+		   JOIN surveys sv ON sv.tenant_id = sr.tenant_id AND sv.id = sr.survey_id
+		  WHERE sr.tenant_id=$1 AND sr.contact_id=$2
+		  ORDER BY sr.submitted_at DESC LIMIT $3`, tenantID, contactID, limit)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var score *int
+		var ts time.Time
+		var name, kind string
+		if err := rows.Scan(&id, &score, &ts, &name, &kind); err != nil {
+			return err
+		}
+		summary := fmt.Sprintf("Survey %s (%s)", name, kind)
+		if score != nil {
+			summary += fmt.Sprintf(" — score %d", *score)
+		}
+		*items = append(*items, TimelineItem{TS: ts, Kind: KindSurveyResponse, Summary: summary, RefID: id.String()})
 	}
 	return rows.Err()
 }

@@ -45,12 +45,19 @@ export function ContactSearch({
   onFiltersChange,
   results,
   loading,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
   onOpen,
 }: {
   filters: SearchFilters;
   onFiltersChange: (f: SearchFilters) => void;
   results: ContactSearchResult[];
   loading: boolean;
+  /** SPEC-W83: another keyset page exists on the backend. */
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
   onOpen: (contact: ContactSearchResult) => void;
 }) {
   // B1.5: CSV export of exactly what is on screen.
@@ -203,6 +210,24 @@ export function ContactSearch({
               </button>
             ))}
           </div>
+
+          {/* SPEC-W83: keyset Load more — appended pages dedupe by id in
+              the parent; the count is announced for screen readers. */}
+          {hasMore ? (
+            <div className="flex flex-col items-center gap-1 pt-1" aria-live="polite">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onLoadMore}
+                disabled={loadingMore || !onLoadMore}
+              >
+                {loadingMore ? "Loading…" : "Load more"}
+              </Button>
+              <p className="text-xs text-muted-foreground">
+                Showing {results.length} contact{results.length === 1 ? "" : "s"}
+              </p>
+            </div>
+          ) : null}
         </>
       )}
     </div>

@@ -26,6 +26,10 @@ lookup_appointment, reschedule_appointment, cancel_appointment.
   confirmed-or-verified / tier 2 verified; the map formalizes the existing
   gates (never weakens them) and hard-gates pack plugin tools (default
   tier 1).
+- SPEC-W86: read_keypad_entry — DTMF keypad capture for PSTN calls (the
+  app/dtmf.py per-session buffer fed by the LiveKit room data channel;
+  tier 0 passive listener; keypad_unavailable on non-PSTN channels — an
+  honest channel-capability report, never a mock).
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Coroutine, Optional
 
-from . import metrics, sip, ui_actions
+from . import dtmf, metrics, sip, ui_actions
 from .config import (
     DEFAULT_VOICE_TOOL_TIERS,
     TIER_HIGH,
@@ -49,7 +53,7 @@ from .logging import get_logger
 from .plugin_tools import PluginTool
 from .session_state import PhoneConfirmationRequired, SessionState
 from .tenant_context import TenantContext
-from .verification import BookingPortalVerifier, hash_phone
+from .verification import BookingPortalVerifier, canonical_e164, hash_phone, normalize_digits
 
 log = get_logger("tools")
 
@@ -57,6 +61,14 @@ BOOK = "com.opendesk.booking.command.BookAppointment"
 RESCHEDULE = "com.opendesk.booking.command.RescheduleAppointment"
 CANCEL = "com.opendesk.booking.command.CancelAppointment"
 ESCALATION_REQUESTED = "com.opendesk.conversation.EscalationRequested"
+
+# SPEC-W86: server-side bounds for the read_keypad_entry tool. The model
+# may ask for anything; the tool clamps before arming the DTMF buffer so a
+# call can never wedge the session on an unbounded keypad wait.
+KEYPAD_TIMEOUT_MIN_S = 5
+KEYPAD_TIMEOUT_MAX_S = 60
+KEYPAD_LENGTH_MIN = 4
+KEYPAD_LENGTH_MAX = 8
 
 # OpenAI-format tool schemas, used by the chat path and the ElevenLabs
 # webhook (the LiveKit worker derives its schema from the FunctionContext
@@ -192,6 +204,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "code": {"type": "string", "description": "One-time code read back by the caller"},
                 },
                 "required": ["phone", "code"],
+            },
+        },
+    },
+    # SPEC-W86: DTMF keypad capture (PSTN calls only). The caller types
+    # the OTP on the phone keypad instead of reading it aloud — digit ASR
+    # in noisy environments is error-prone, and reading a security code
+    # aloud in public is a privacy leak. On non-PSTN channels the tool
+    # answers keypad_unavailable (honest channel-capability report).
+    {
+        "type": "function",
+        "function": {
+            "name": "read_keypad_entry",
+            "description": (
+                "Read digits the caller types on their phone keypad "
+                "(phone calls only). Use after request_verification_code "
+                "so the caller can type the 6-digit code instead of "
+                "reading it aloud: call with expected_length 6, then "
+                "submit the returned digits with verify_caller_code. The "
+                "caller presses # to submit early or * to clear."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Seconds to wait for the entry (clamped 5-60, default 30)",
+                    },
+                    "expected_length": {
+                        "type": "integer",
+                        "description": "Optional expected digit count (clamped 4-8); auto-submits when reached, e.g. 6 for portal codes",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -343,6 +388,16 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
 UI_ACTION_TOOL_NAMES = ["navigate_to_page", "highlight_element", "prefill_booking"]
 
 
+def _clamp_int(value: Any, minimum: int, maximum: int, default: "int | None") -> "int | None":
+    """Coerce to int and clamp into [minimum, maximum]; un-coercible -> default
+    (SPEC-W86: server-side bounds for model-supplied tool arguments)."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
 def _confirmation_payload(pending_phone: str) -> dict[str, Any]:
     return {
         "status": "confirmation_required",
@@ -353,6 +408,18 @@ def _confirmation_payload(pending_phone: str) -> dict[str, Any]:
         ),
         "pending_phone": pending_phone,
     }
+
+
+def _phones_match(a: str | None, b: str | None) -> bool:
+    """SPEC-W88: form-independent phone equality for the verification
+    gates. Both sides reduce to digits (normalize_digits) and must be
+    NON-EMPTY and equal. ``+234…`` and ``234…`` are the same subscriber;
+    national vs international forms never fold (trunk-0 kept — the W61
+    G3 ruling), so two genuinely different numbers cannot collide. The
+    gates therefore stay fail-closed: only the "+"-vs-no-"+" divergence
+    (WhatsApp wa_id pin vs SIP/OTP "+"-forms) stops false-mismatching."""
+    da, db = normalize_digits(a or ""), normalize_digits(b or "")
+    return bool(da) and da == db
 
 
 def _verification_required_payload() -> dict[str, Any]:
@@ -463,6 +530,9 @@ class ToolLayer:
         plugin_tools: list[PluginTool] | None = None,
         ui_action_sink: list[dict[str, Any]] | None = None,
         verifier_factory: "Any | None" = None,
+        dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
+        native_keypad: bool = False,
+        ivr_menu_hint: str = "",
     ) -> None:
         self._dapr = dapr
         self._settings = settings
@@ -474,6 +544,20 @@ class ToolLayer:
         # the injectable agents-registry client in app/sip.py). None = the
         # real client built from settings on every OTP call.
         self._verifier_factory = verifier_factory
+        # SPEC-W86: per-session DTMF keypad buffer, attached by the LiveKit
+        # worker for PSTN (SIP) calls only; None on every other channel —
+        # read_keypad_entry then answers keypad_unavailable.
+        self._dtmf_buffer = dtmf_buffer
+        # SPEC-W93: ElevenLabs hosted backend — ElevenLabs collects keypad
+        # digits natively (out-of-band) and relays them to the hosted agent
+        # as a user turn; read_keypad_entry reports keypad_native instead
+        # of keypad_unavailable. The LiveKit buffer always wins when set.
+        self._native_keypad = native_keypad
+        # SPEC-W96 IVR-A: the IVR menu sentence appended to the
+        # keypad_native tool answer so the hosted agent knows the keypad
+        # shortcuts even though digits never transit this runtime. Empty
+        # when the menu is disabled or absent.
+        self._ivr_menu_hint = ivr_menu_hint
         # SPEC-W9 Part B: per-turn collector for validated UI actions. The
         # chat path injects a fresh list per turn; other callers (voice
         # worker, ElevenLabs) get a private one that is simply never read —
@@ -557,16 +641,23 @@ class ToolLayer:
             timeout_s=self._settings.http_timeout_s,
         )
 
-    def _require_verified(self, phone: str | None) -> str | dict[str, Any]:
+    async def _require_verified(self, phone: str | None) -> str | dict[str, Any]:
         """K15(c): mutating tools (lookup/reschedule/cancel) require a
         VERIFIED session (OTP or channel-pinned identity).
 
         Returns the verified phone to use for the operation, or the refusal
         payload to hand back to the model. The verified number ALWAYS wins
         over a model-supplied one; a mismatch is rejected (no silent
-        re-targeting at another customer's bookings)."""
+        re-targeting at another customer's bookings).
+
+        SPEC-W87: before refusing an unverified PSTN caller, honor an
+        active booking-side verification grant under the strict anchor
+        rule (see _honor_verification_grant)."""
         verified = self._session.verified_phone
         if not verified:
+            granted = await self._honor_verification_grant(phone)
+            if granted is not None:
+                return granted
             if not (
                 self._settings.booking_url
                 and self._settings.voice_booking_internal_token
@@ -579,7 +670,7 @@ class ToolLayer:
                 return _verification_unavailable_payload()
             return _verification_required_payload()
         supplied = sip.normalize_phone(phone)
-        if supplied and supplied != verified:
+        if supplied and not _phones_match(supplied, verified):
             return {
                 "status": "error",
                 "error": "phone_mismatch",
@@ -589,6 +680,54 @@ class ToolLayer:
                     "the new number first."
                 ),
             }
+        return verified
+
+    async def _honor_verification_grant(self, phone: str | None) -> str | None:
+        """SPEC-W87: honor a durable booking-side verification grant.
+
+        Returns the verified phone when the grant applies, else None (the
+        caller falls through to the byte-identical OTP refusal payloads).
+        ALL of the anchor rule must hold:
+          a. grants enabled (settings.verification_grants_enabled),
+          b. session.channel == "phone" — the SIP carrier-asserted anchor
+             ONLY; web self-claims NEVER honor grants (whatsapp/telegram
+             identities are already per-turn pinned and never reach here),
+          c. session.claimed_phone present, and the model-supplied phone
+             absent or equal to the claimed one (no re-targeting),
+          d. the booking check answers verified for the claimed phone.
+        On honor: mark_verified(claimed) + stepup_verified("grant") + log
+        — mirroring the chat.py channel-pin path (NO ToolInvoked event).
+        A check error/unavailable is treated as no-grant (fail-safe)."""
+        if not getattr(self._settings, "verification_grants_enabled", False):
+            return None
+        if self._session.channel != "phone":
+            return None
+        claimed = self._session.claimed_phone
+        if not claimed:
+            return None
+        supplied = sip.normalize_phone(phone)
+        if supplied and not _phones_match(supplied, claimed):
+            return None
+        verifier = self._verifier()
+        try:
+            result = await verifier.check_grant(claimed)
+        finally:
+            await verifier.aclose()
+        if not result.ok:
+            if result.status not in ("no_grant",):
+                log.warning(
+                    "verification grant check failed — falling through to OTP",
+                    status=result.status,
+                    conversation_id=self._session.conversation_id,
+                )
+            return None
+        verified = self._session.mark_verified(claimed)
+        metrics.stepup_verified("grant")
+        log.info(
+            "verification grant honored",
+            conversation_id=self._session.conversation_id,
+            channel=self._session.channel,
+        )
         return verified
 
     async def _refuse_gate(self, tool: str, gate: dict[str, Any]) -> dict[str, Any]:
@@ -615,9 +754,21 @@ class ToolLayer:
         programmatically built Settings."""
         tiers = getattr(self._settings, "voice_tool_tiers", None) or {}
         try:
-            return int(tiers.get(name, 1))
+            base = int(tiers.get(name, 1))
         except (TypeError, ValueError):
-            return 1
+            base = 1
+        # SPEC-W84: per-tenant pack stepUpPolicy.tools overrides the env map
+        # (pack = tenant refinement; env = operator global). The pack parser
+        # (config.parse_pack_tool_tiers) already floored built-ins, so a pack
+        # entry can never sit below DEFAULT_VOICE_TOOL_TIERS.
+        ctx = getattr(self, "_ctx", None)
+        pack_tiers = getattr(ctx, "pack_tool_tiers", None) or {}
+        if name in pack_tiers:
+            try:
+                return int(pack_tiers[name])
+            except (TypeError, ValueError):
+                return base
+        return base
 
     async def _enforce_tool_tier(
         self, name: str, arguments: dict[str, Any]
@@ -645,7 +796,7 @@ class ToolLayer:
             # gate enforces it on every path — no double refusal here.
             return None
         if tier >= TIER_HIGH:
-            gate = self._require_verified(arguments.get("phone"))
+            gate = await self._require_verified(arguments.get("phone"))
             if isinstance(gate, dict):
                 return await self._refuse_gate(name, gate)
             return None
@@ -802,7 +953,10 @@ class ToolLayer:
     # ------------------------------------------- K15(c) verification tools
     async def request_verification_code(self, phone: str) -> dict[str, Any]:
         """Send a one-time verification code to the claimed caller phone."""
-        phone = sip.normalize_phone(phone)
+        # SPEC-W88: best-effort canonical E.164 (a conforming number is
+        # sent/stored in ONE form across channels); national read-outs
+        # fall back to the legacy normalize_phone form, never rejected.
+        phone = canonical_e164(phone) or sip.normalize_phone(phone)
         if not phone:
             return {
                 "status": "error",
@@ -849,7 +1003,10 @@ class ToolLayer:
     async def verify_caller_code(self, phone: str, code: str) -> dict[str, Any]:
         """Verify the caller-read-back code; success marks the session
         verified (K15(c)) so lookup/reschedule/cancel may run."""
-        phone = sip.normalize_phone(phone)
+        # SPEC-W88: same best-effort canonical form as
+        # request_verification_code, so the OTP pair and the resulting
+        # verified_phone agree (and match the channel-pin form).
+        phone = canonical_e164(phone) or sip.normalize_phone(phone)
         if not phone:
             return {
                 "status": "error",
@@ -903,8 +1060,84 @@ class ToolLayer:
             "message": "The code could not be verified just now; please try again.",
         }
 
+    async def read_keypad_entry(
+        self, timeout_s: int = 30, expected_length: "int | None" = None
+    ) -> dict[str, Any]:
+        """Collect keypad (DTMF) digits from the caller (SPEC-W86).
+
+        PSTN calls only: the buffer is attached by the LiveKit worker for
+        SIP sessions; every other channel answers keypad_unavailable — an
+        honest capability report, never a mock. Bounds are clamped
+        server-side (the model may request anything). The digits are
+        returned ONLY to this session's own LLM loop — they are never
+        logged and never emitted in events (the ToolInvoked event carries
+        the outcome status only, no digits).
+        """
+        timeout = _clamp_int(timeout_s, KEYPAD_TIMEOUT_MIN_S, KEYPAD_TIMEOUT_MAX_S, 30)
+        length = (
+            _clamp_int(expected_length, KEYPAD_LENGTH_MIN, KEYPAD_LENGTH_MAX, None)
+            if expected_length is not None
+            else None
+        )
+        buffer = self._dtmf_buffer
+        if buffer is None:
+            if self._native_keypad:
+                # SPEC-W93: ElevenLabs backend — keypad digits are collected
+                # natively by ElevenLabs and arrive as the caller's NEXT
+                # MESSAGE (a completed user turn); they never transit this
+                # runtime, so there is nothing to wait for here. Tell the
+                # hosted agent the honest relay contract.
+                await self._emit_tool_event("read_keypad_entry", "keypad_native", {})
+                message = (
+                    "On this phone platform keypad entry is collected "
+                    "natively: ask the caller to type the digits on "
+                    "their keypad (pressing # submits early). The "
+                    "digits arrive as the caller's next message — "
+                    "take them from there and pass them as the code "
+                    "to verify_caller_code."
+                )
+                # SPEC-W96 IVR-A: append the menu sentence so the hosted
+                # agent can speak/route the keypad shortcuts itself.
+                if self._ivr_menu_hint:
+                    message = f"{message} {self._ivr_menu_hint}"
+                return {
+                    "status": "keypad_native",
+                    "message": message,
+                    "channel": self._session.channel or "",
+                    "digits": "",
+                    "timeout_s": timeout,
+                    "expected_length": length,
+                }
+            await self._emit_tool_event("read_keypad_entry", "keypad_unavailable", {})
+            return {
+                "status": "keypad_unavailable",
+                "error": "keypad_unavailable",
+                "channel": self._session.channel or "",
+                "digits": "",
+                "timeout_s": timeout,
+                "expected_length": length,
+            }
+        digits = await buffer.wait_for_entry(
+            timeout_s=float(timeout), expected_length=length
+        )
+        if digits is None:
+            await self._emit_tool_event("read_keypad_entry", "keypad_timeout", {})
+            return {
+                "status": "keypad_timeout",
+                "digits": "",
+                "timeout_s": timeout,
+                "expected_length": length,
+            }
+        await self._emit_tool_event("read_keypad_entry", "keypad_entry", {})
+        return {
+            "status": "keypad_entry",
+            "digits": digits,
+            "timeout_s": timeout,
+            "expected_length": length,
+        }
+
     async def lookup_appointment(self, phone: str) -> dict[str, Any]:
-        gate = self._require_verified(phone)
+        gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("lookup_appointment", gate)
         confirmed = gate
@@ -964,7 +1197,7 @@ class ToolLayer:
         self, booking_id: str, starts_at: str, phone: str
     ) -> dict[str, Any]:
         starts_at = _rfc3339(starts_at, self._ctx.timezone)
-        gate = self._require_verified(phone)
+        gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("reschedule_appointment", gate)
         confirmed = gate
@@ -993,7 +1226,7 @@ class ToolLayer:
     async def cancel_appointment(
         self, booking_id: str, phone: str, reason: str | None = None
     ) -> dict[str, Any]:
-        gate = self._require_verified(phone)
+        gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("cancel_appointment", gate)
         confirmed = gate
@@ -1315,6 +1548,10 @@ class ToolLayer:
             "verify_caller_code": lambda: self.verify_caller_code(
                 phone=str(arguments.get("phone", "")),
                 code=str(arguments.get("code", "")),
+            ),
+            "read_keypad_entry": lambda: self.read_keypad_entry(
+                timeout_s=arguments.get("timeout_s", 30),
+                expected_length=arguments.get("expected_length"),
             ),
             "reschedule_appointment": lambda: self.reschedule_appointment(
                 booking_id=str(arguments.get("booking_id", "")),

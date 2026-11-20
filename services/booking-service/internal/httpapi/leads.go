@@ -3,6 +3,8 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,7 +99,12 @@ func (s *server) createLead(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"lead": lead, "created": created})
 }
 
-// listLeads handles GET /v1/leads?status=&channel=&campaign_id=&from=&to=.
+// leadQueryRe bounds the SPEC-W83 phone-prefix search filter (leads carry
+// no name/email — the phone is the searchable field): digits with at most
+// one leading '+', 3-32 chars total ("++234"/"+"/"12" are all rejected).
+var leadQueryRe = regexp.MustCompile(`^(\+[0-9]{2,31}|[0-9]{3,32})$`)
+
+// listLeads handles GET /v1/leads?status=&channel=&campaign_id=&from=&to=&q=.
 func (s *server) listLeads(w http.ResponseWriter, r *http.Request) {
 	svc := s.leadsSvc(w)
 	if svc == nil {
@@ -142,15 +149,44 @@ func (s *server) listLeads(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := svc.Store.ListLeads(r.Context(), tenant.ID, status, channel, campaignID, from, to)
+	// SPEC-W83: optional phone_e164 prefix search; invalid shapes are a
+	// deterministic 400 (operator typos surface, like the enum filters).
+	leadQ := strings.TrimSpace(q.Get("q"))
+	if leadQ != "" && !leadQueryRe.MatchString(leadQ) {
+		writeError(w, http.StatusBadRequest, "invalid q filter")
+		return
+	}
+	// SPEC-W90: keyset pagination (see Store.ListLeadsPage). limit follows
+	// the crm360 limitParam semantics: non-integer -> 400, <=0 -> default,
+	// >500 -> clamped. The next_cursor key is emitted only when another
+	// page exists — additive, so pre-W90 clients see no change.
+	limit := 0
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		limit = n
+	}
+	cursor := strings.TrimSpace(q.Get("cursor"))
+	rows, next, err := svc.Store.ListLeadsPage(r.Context(), tenant.ID, status, channel, campaignID, from, to, leadQ, cursor, limit)
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidCursor) {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
 		s.internal(w, err)
 		return
 	}
 	if rows == nil {
 		rows = []store.Lead{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"leads": rows})
+	resp := map[string]any{"leads": rows}
+	if next != "" {
+		resp["next_cursor"] = next
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) getLead(w http.ResponseWriter, r *http.Request) {

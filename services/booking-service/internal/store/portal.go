@@ -156,14 +156,26 @@ func (s *Store) ConsumePortalToken(ctx context.Context, tenantID, id uuid.UUID) 
 func (s *Store) GetContactByChannel(ctx context.Context, tenantID uuid.UUID, channel, value string) (Contact, error) {
 	var c Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
-		col := `phone`
 		if channel == PortalChannelEmail {
-			col = `lower(email)`
-			value = strings.ToLower(value)
+			return tx.QueryRow(ctx,
+				`SELECT id, tenant_id, name, phone, email, notes FROM contacts
+				 WHERE tenant_id=$1 AND lower(email)=$2 ORDER BY name LIMIT 1`,
+				tenantID, strings.ToLower(value)).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)
 		}
+		// SPEC-W88: phone channels match on the pinned W61 G3 canonical
+		// form BOTH SIDES (mediaInboxDigitsSQL; backed by the existing
+		// idx_contacts_phone_digits index). contacts.phone storage stays
+		// RAW — a '+234…' needle and a '234…' stored row (WhatsApp wa_id
+		// vs portal/OTP '+'-forms) are the same subscriber and MUST
+		// resolve; without this the OTP request hid the miss behind the
+		// anti-enumeration 202 and the W87 grant check answered no_grant.
+		// The digits<>'' guard keeps no-digit needles/rows from matching
+		// each other ('' = '' would otherwise be true).
+		d := mediaInboxDigitsSQL
 		return tx.QueryRow(ctx,
 			`SELECT id, tenant_id, name, phone, email, notes FROM contacts
-			 WHERE tenant_id=$1 AND `+col+`=$2 ORDER BY name LIMIT 1`,
+			 WHERE tenant_id=$1 AND `+d(`phone`)+` <> '' AND `+d(`phone`)+` = `+d(`$2`)+`
+			 ORDER BY name LIMIT 1`,
 			tenantID, value).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -110,6 +110,9 @@ func RegisterRoutes(r chi.Router, d *Deps, mw ...func(http.Handler) http.Handler
 		r.Method(http.MethodGet, "/journeys/{id}", adapt(d.RequireRead, (*Handlers).GetJourney))
 		r.Method(http.MethodPatch, "/journeys/{id}", adapt(d.RequireWrite, (*Handlers).PatchJourney))
 		r.Method(http.MethodPost, "/journeys/{id}/enroll", adapt(d.RequireWrite, (*Handlers).Enroll))
+		// SPEC-W92 B13: the segment + event triggers.
+		r.Method(http.MethodPost, "/journeys/{id}/fire-segment", adapt(d.RequireWrite, (*Handlers).FireSegment))
+		r.Method(http.MethodPost, "/events", adapt(d.RequireWrite, (*Handlers).FireEvent))
 		r.Method(http.MethodPost, "/journeys/{id}/step", adapt(d.RequireWrite, (*Handlers).Step))
 		r.Method(http.MethodPost, "/journeys/{id}/conversions", adapt(d.RequireWrite, (*Handlers).ReportConversion))
 		r.Method(http.MethodGet, "/journeys/{id}/stats", adapt(d.RequireRead, (*Handlers).Stats))

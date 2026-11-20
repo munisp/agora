@@ -82,6 +82,9 @@ pub struct PayoutAttempt {
     pub payee: serde_json::Value,
     pub state: AttemptState,
     pub detail: Option<String>,
+    /// SPEC-W100 C2: the marketplace DFSP this payout was bound to
+    /// (PAYOUT_DFSPS fsp id); None = legacy single MOJALOOP_ENDPOINT rail.
+    pub dfsp_fsp_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -116,6 +119,26 @@ pub trait PayoutAttemptStore: Send + Sync {
         state: AttemptState,
         detail: Option<&str>,
     ) -> Result<(), String>;
+    /// SPEC-W99 C2: tenant-scoped per-state rollup for the reconciliation
+    /// report (`GROUP BY state` over the tenant's rows only).
+    async fn summary_scoped(&self, tenant_id: &str) -> Result<Vec<AttemptSummary>, String>;
+    /// SPEC-W99 C2: tenant-scoped in-flight attempts (`unknown` +
+    /// `pending_approval`), oldest first, for the reconciliation report.
+    async fn list_in_flight_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String>;
+}
+
+/// SPEC-W99 C2: per-state rollup row of the reconciliation report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptSummary {
+    pub state: AttemptState,
+    pub count: u64,
+    /// Sum of amount_cents across the state bucket. u128 so the report
+    /// never overflows on pathological histories.
+    pub amount_cents: u128,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +168,8 @@ ALTER TABLE payout_attempts DROP CONSTRAINT IF EXISTS payout_attempts_state_chec
 ALTER TABLE payout_attempts ADD CONSTRAINT payout_attempts_state_check
     CHECK (state IN
         ('unknown','failed','committed','resolved_committed','resolved_failed','pending_approval'));
+-- SPEC-W100 C2: marketplace DFSP provenance (nullable; NULL = legacy rail).
+ALTER TABLE payout_attempts ADD COLUMN IF NOT EXISTS dfsp_fsp_id TEXT;
 "#;
 
 pub struct PgPayoutAttemptStore {
@@ -293,6 +318,7 @@ impl PgPayoutAttemptStore {
             state: AttemptState::from_str(&state)
                 .ok_or_else(|| format!("unknown payout attempt state '{state}'"))?,
             detail: row.try_get("detail").map_err(|e| e.to_string())?,
+            dfsp_fsp_id: row.try_get("dfsp_fsp_id").map_err(|e| e.to_string())?,
             created_at: row.try_get("created_at").map_err(|e| e.to_string())?,
             updated_at: row.try_get("updated_at").map_err(|e| e.to_string())?,
         })
@@ -308,8 +334,8 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         sqlx::query(
             "INSERT INTO payout_attempts
-                (payout_id, tenant_id, amount_cents, currency, payee, state, detail)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (payout_id, tenant_id, amount_cents, currency, payee, state, detail, dfsp_fsp_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (payout_id) DO NOTHING",
         )
         .bind(&attempt.payout_id)
@@ -319,6 +345,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
         .bind(&attempt.payee)
         .bind(attempt.state.as_str())
         .bind(&attempt.detail)
+        .bind(&attempt.dfsp_fsp_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("payout_attempts insert failed: {e}"))?;
@@ -338,7 +365,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE payout_id = $1",
         )
         .bind(payout_id)
@@ -360,7 +387,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts internal tx failed: {e}"))?;
         let row = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE payout_id = $1",
         )
         .bind(payout_id)
@@ -383,7 +410,7 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts internal tx failed: {e}"))?;
         let rows = sqlx::query(
             "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
-                    created_at, updated_at
+                    dfsp_fsp_id, created_at, updated_at
              FROM payout_attempts WHERE state = 'unknown'
              ORDER BY created_at LIMIT $1",
         )
@@ -423,6 +450,70 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .await
             .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
         Ok(())
+    }
+
+    async fn summary_scoped(&self, tenant_id: &str) -> Result<Vec<AttemptSummary>, String> {
+        // SPEC-W99 C2 / DB-01: pinned to the request's tenant (RLS).
+        // SUM is cast to TEXT and parsed as u128 in Rust — no NUMERIC decode
+        // feature needed and no i64 overflow ceiling on the rollup.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
+        let rows = sqlx::query(
+            "SELECT state, COUNT(*)::bigint AS n,
+                    COALESCE(SUM(amount_cents), 0)::text AS total
+             FROM payout_attempts GROUP BY state ORDER BY state",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_attempts summary failed: {e}"))?;
+        let out = rows
+            .iter()
+            .map(|row| {
+                use sqlx::Row;
+                let state: String = row.try_get("state").map_err(|e| e.to_string())?;
+                let n: i64 = row.try_get("n").map_err(|e| e.to_string())?;
+                let total: String = row.try_get("total").map_err(|e| e.to_string())?;
+                Ok(AttemptSummary {
+                    state: AttemptState::from_str(&state)
+                        .ok_or_else(|| format!("unknown payout attempt state '{state}'"))?,
+                    count: u64::try_from(n).map_err(|_| "negative count".to_string())?,
+                    amount_cents: total
+                        .parse::<u128>()
+                        .map_err(|e| format!("summary sum parse: {e}"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
+    }
+
+    async fn list_in_flight_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String> {
+        // SPEC-W99 C2 / DB-01: tenant-pinned in-flight listing.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
+        let rows = sqlx::query(
+            "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
+                    dfsp_fsp_id, created_at, updated_at
+             FROM payout_attempts WHERE state IN ('unknown', 'pending_approval')
+             ORDER BY created_at LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_attempts in-flight read failed: {e}"))?;
+        let out = rows.iter().map(Self::row_to_attempt).collect::<Result<Vec<_>, _>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
     }
 }
 
@@ -489,6 +580,44 @@ impl PayoutAttemptStore for MemPayoutAttemptStore {
             a.updated_at = Utc::now();
         }
         Ok(())
+    }
+
+    async fn summary_scoped(&self, tenant_id: &str) -> Result<Vec<AttemptSummary>, String> {
+        let rows = self.rows.lock().await;
+        let mut by_state: std::collections::BTreeMap<&str, (u64, u128)> =
+            std::collections::BTreeMap::new();
+        for a in rows.values().filter(|a| a.tenant_id == tenant_id) {
+            let e = by_state.entry(a.state.as_str()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += a.amount_cents as u128;
+        }
+        Ok(by_state
+            .into_iter()
+            .map(|(s, (count, amount_cents))| AttemptSummary {
+                state: AttemptState::from_str(s).expect("store only writes known states"),
+                count,
+                amount_cents,
+            })
+            .collect())
+    }
+
+    async fn list_in_flight_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String> {
+        let rows = self.rows.lock().await;
+        let mut out: Vec<PayoutAttempt> = rows
+            .values()
+            .filter(|a| {
+                a.tenant_id == tenant_id
+                    && matches!(a.state, AttemptState::Unknown | AttemptState::PendingApproval)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.truncate(limit.max(0) as usize);
+        Ok(out)
     }
 }
 
@@ -653,6 +782,7 @@ mod tests {
             payee: serde_json::json!({"partyIdType":"ALIAS","partyIdentifier":"payee-1"}),
             state,
             detail: None,
+            dfsp_fsp_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -713,6 +843,8 @@ mod tests {
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,
+            payout_dfsps: Vec::new(),
+            payout_quote_timeout_ms: 4000,
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -722,6 +854,7 @@ mod tests {
                 "opendesk.payments.events".to_string(),
             ),
             mojaloop: mojaloop::MojaloopAdapter::new(rail_url),
+            marketplace: crate::marketplace::Marketplace::new(Vec::new(), 4000),
             flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
             config: Arc::new(cfg),
             dlq: Arc::new(consumer::UnavailableDlqSink),

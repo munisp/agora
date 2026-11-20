@@ -101,6 +101,18 @@ func New(ctx context.Context, databaseURL string, maxConns int32) (*Store, error
 		pool.Close()
 		return nil, err
 	}
+	// SPEC-W87: verification_grants (durable cross-call OTP verification
+	// grants; idempotent bootstrap, RLS-enabled).
+	if err := s.ensureVerificationGrantsTable(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	// SPEC-W95 C5-B: intake_submissions (durable intake form payloads;
+	// idempotent bootstrap, RLS-enabled).
+	if err := s.ensureIntakeSubmissionsTable(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	// SPEC-W11 Part B: incidents + incident_deliveries +
 	// incident_dispatch_endpoints (idempotent bootstrap, RLS-enabled).
 	if err := s.ensureIncidentTables(ctx); err != nil {
@@ -639,6 +651,12 @@ func (s *Store) CreateContact(ctx context.Context, c *Contact) error {
 	           VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,''))`
 	return s.withTenant(ctx, c.TenantID, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, q, c.ID, c.TenantID, c.Name, c.Phone, c.Email, c.Notes, c.Source, c.ExternalID); err != nil {
+			// SPEC-W89: the digits-expression uq_contacts_tenant_phone makes
+			// a cross-format duplicate a unique violation — surface it as
+			// the domain conflict (409), not a bare 500.
+			if isUniqueViolation(err) {
+				return ErrConflict
+			}
 			return fmt.Errorf("insert contact: %w", err)
 		}
 		return nil

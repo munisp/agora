@@ -73,6 +73,10 @@ func (s *Server) bridgeAsync(msg channel.InboundMessage, routeID string) {
 // (implemented by *channel.Bridge; faked in tests).
 type Bridger interface {
 	Handle(ctx context.Context, msg channel.InboundMessage, routeID string) error
+	// BindTelegramContact records a self-shared, provider-verified phone
+	// for a Telegram chat_id (SPEC-W85); the bridge pins it on subsequent
+	// turns. Called only AFTER the webhook's self-share check.
+	BindTelegramContact(chatID, phone string)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +255,9 @@ func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // tgUpdate is the Telegram Bot API Update shape (message-only subset).
+// SPEC-W85: Contact carries a request_contact share — phone_number arrives
+// digits-only (no '+'); user_id is the account the phone belongs to and
+// MUST equal from.id (self-share check, see handleTelegramWebhook).
 type tgUpdate struct {
 	UpdateID int64 `json:"update_id"`
 	Message  *struct {
@@ -263,6 +270,10 @@ type tgUpdate struct {
 		From *struct {
 			ID int64 `json:"id"`
 		} `json:"from"`
+		Contact *struct {
+			PhoneNumber string `json:"phone_number"`
+			UserID      int64  `json:"user_id"`
+		} `json:"contact"`
 	} `json:"message"`
 }
 
@@ -289,17 +300,47 @@ func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
 		return
 	}
-	if upd.Message == nil || upd.Message.Text == "" {
+	if upd.Message == nil || (upd.Message.Text == "" && upd.Message.Contact == nil) {
 		// Edits, stickers, join events, …: nothing to bridge.
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
 		return
 	}
 	m := upd.Message
+	text := m.Text
+	if m.Contact != nil {
+		// SPEC-W85: a contact share is honored ONLY as a SELF-share —
+		// contact.user_id must equal the sender's from.id. Without this
+		// check a forwarded contact would pin SOMEONE ELSE's phone as the
+		// caller's verified identity (impersonation). Rejected shares are
+		// ignored, never bridged, never an error (no redelivery loop).
+		if m.From == nil || m.Contact.UserID != m.From.ID {
+			s.Log.Warn("telegram contact share rejected: not a self-share",
+				zap.Int64("chat_id", m.Chat.ID))
+			writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
+			return
+		}
+		digits := phone.Digits(m.Contact.PhoneNumber)
+		if digits == "" {
+			s.Log.Warn("telegram contact share rejected: empty phone",
+				zap.Int64("chat_id", m.Chat.ID))
+			writeJSON(w, http.StatusOK, map[string]any{"status": "ignored"})
+			return
+		}
+		if s.Bridge != nil {
+			s.Bridge.BindTelegramContact(
+				strconv.FormatInt(m.Chat.ID, 10), "+"+digits)
+		}
+		if text == "" {
+			// Shares carry no text; bridge a fixed synthetic turn so the
+			// agent can acknowledge the now-verified identity.
+			text = channel.TgContactSharedText
+		}
+	}
 	if err := s.bridge(r.Context(), channel.InboundMessage{
 		Channel:   "telegram",
 		From:      strconv.FormatInt(m.Chat.ID, 10), // chat_id as string
 		MessageID: strconv.FormatInt(m.MessageID, 10),
-		Text:      m.Text,
+		Text:      text,
 		Timestamp: m.Date,
 	}, s.TelegramBotUsername); err != nil {
 		writeError(w, http.StatusInternalServerError, "bridge processing failed")

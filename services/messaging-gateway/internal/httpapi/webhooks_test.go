@@ -22,7 +22,13 @@ import (
 type fakeBridge struct {
 	mu    sync.Mutex
 	calls []bridgeCall
+	binds []tgBindCall
 	err   error
+}
+
+type tgBindCall struct {
+	chatID string
+	phone  string
 }
 
 type bridgeCall struct {
@@ -35,6 +41,20 @@ func (f *fakeBridge) Handle(_ context.Context, msg channel.InboundMessage, route
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, bridgeCall{msg: msg, routeID: routeID})
 	return f.err
+}
+
+func (f *fakeBridge) BindTelegramContact(chatID, phone string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.binds = append(f.binds, tgBindCall{chatID: chatID, phone: phone})
+}
+
+func (f *fakeBridge) capturedBinds() []tgBindCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]tgBindCall, len(f.binds))
+	copy(out, f.binds)
+	return out
 }
 
 func (f *fakeBridge) captured() []bridgeCall {

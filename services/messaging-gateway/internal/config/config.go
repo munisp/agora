@@ -93,7 +93,11 @@ type Config struct {
 	IdentityURL        string // IDENTITY_URL override (tests, no-Dapr dev); empty = Dapr invoke identity
 	USSDSessionBackend string // USSD_SESSION_BACKEND: "memory" (default) | "dapr"
 	USSDStateStore     string // USSD_STATE_STORE Dapr component name (backend=dapr), default "statestore"
-	USSDSessionTTL     int    // USSD_SESSION_TTL_SECONDS, default 180 (contract §1)
+	// SPEC-W87: durable Telegram chat_id→phone bindings (L2 behind the
+	// bridge's in-memory L1). Mirrors the USSD backend pair.
+	TgBindBackend    string // TG_BIND_BACKEND: "memory" (default) | "dapr"
+	TgBindStateStore string // TG_BIND_STATE_STORE Dapr component name (backend=dapr), default "statestore"
+	USSDSessionTTL   int    // USSD_SESSION_TTL_SECONDS, default 180 (contract §1)
 	// ATCallbackSecret (AT_CALLBACK_SECRET) authenticates the USSD callback
 	// path (K14). Empty = fail-closed: every callback answers 503.
 	ATCallbackSecret string
@@ -179,6 +183,8 @@ func Load() Config {
 		IdentityURL:               os.Getenv("IDENTITY_URL"),
 		USSDSessionBackend:        envStr("USSD_SESSION_BACKEND", "memory"),
 		USSDStateStore:            envStr("USSD_STATE_STORE", "statestore"),
+		TgBindBackend:             envStr("TG_BIND_BACKEND", "memory"),
+		TgBindStateStore:          envStr("TG_BIND_STATE_STORE", "statestore"),
 		USSDSessionTTL:            envInt("USSD_SESSION_TTL_SECONDS", 180),
 		ATCallbackSecret:          os.Getenv("AT_CALLBACK_SECRET"),
 		USSDRatePerMinute:         envInt("USSD_RATE_LIMIT_PER_MINUTE", 30),

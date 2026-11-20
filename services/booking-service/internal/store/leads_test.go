@@ -94,20 +94,20 @@ func TestLeadStatusAndFilters(t *testing.T) {
 		t.Fatalf("updated_at not stamped: %+v", updated)
 	}
 
-	contacted, err := st.ListLeads(ctx, tenantID, "contacted", "", nil, nil, nil)
+	contacted, err := st.ListLeads(ctx, tenantID, "contacted", "", nil, nil, nil, "")
 	if err != nil || len(contacted) != 1 || contacted[0].ID != a.ID {
 		t.Fatalf("status filter: %+v, %v", contacted, err)
 	}
-	qr, err := st.ListLeads(ctx, tenantID, "", "qr", nil, nil, nil)
+	qr, err := st.ListLeads(ctx, tenantID, "", "qr", nil, nil, nil, "")
 	if err != nil || len(qr) != 1 || qr[0].ID != b.ID {
 		t.Fatalf("channel filter: %+v, %v", qr, err)
 	}
-	byCampaign, err := st.ListLeads(ctx, tenantID, "", "", &campaignID, nil, nil)
+	byCampaign, err := st.ListLeads(ctx, tenantID, "", "", &campaignID, nil, nil, "")
 	if err != nil || len(byCampaign) != 1 || byCampaign[0].ID != a.ID {
 		t.Fatalf("campaign filter: %+v, %v", byCampaign, err)
 	}
 	future := time.Now().Add(24 * time.Hour)
-	none, err := st.ListLeads(ctx, tenantID, "", "", nil, &future, nil)
+	none, err := st.ListLeads(ctx, tenantID, "", "", nil, &future, nil, "")
 	if err != nil || len(none) != 0 {
 		t.Fatalf("from filter: %d, %v", len(none), err)
 	}

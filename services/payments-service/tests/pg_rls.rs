@@ -52,6 +52,8 @@ mod events;
 mod flutterwave;
 #[path = "../src/ledger/mod.rs"]
 mod ledger;
+#[path = "../src/marketplace.rs"]
+mod marketplace;
 #[path = "../src/mojaloop.rs"]
 mod mojaloop;
 #[path = "../src/payouts.rs"]
@@ -84,6 +86,7 @@ pub struct AppState {
     pub ledger: Arc<dyn ledger::LedgerClient>,
     pub outbox: dapr::DaprOutbox,
     pub mojaloop: mojaloop::MojaloopAdapter,
+    pub marketplace: marketplace::Marketplace,
     pub flutterwave: flutterwave::FlutterwaveAdapter,
     pub config: Arc<config::Config>,
     pub dlq: Arc<dyn consumer::DlqSink>,
@@ -554,6 +557,7 @@ async fn db01_store_pins_tenant_guc_under_app_role() {
             payee: serde_json::json!({"partyIdType":"ALIAS","partyIdentifier":"p-1"}),
             state: payouts::AttemptState::PendingApproval,
             detail: None,
+            dfsp_fsp_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         })

@@ -11,6 +11,7 @@ mod event_failures;
 mod events;
 mod flutterwave;
 mod ledger;
+mod marketplace;
 mod mojaloop;
 mod payouts;
 mod registry;
@@ -45,6 +46,9 @@ pub struct AppState {
     pub ledger: Arc<dyn LedgerClient>,
     pub outbox: dapr::DaprOutbox,
     pub mojaloop: mojaloop::MojaloopAdapter,
+    /// SPEC-W99 C1: DFSP quote marketplace (read-only quote comparison;
+    /// zero configured DFSPs => POST /v1/payouts/quotes is 503).
+    pub marketplace: marketplace::Marketplace,
     /// SPEC-W12 §6: Flutterwave checkout rail (env-configured; initialize is
     /// 503 until FLUTTERWAVE_SECRET_KEY is set, webhook 503 until
     /// FLUTTERWAVE_SECRET_HASH is set).
@@ -409,6 +413,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "K20: payouts above the threshold require POST /v1/payouts/:id/approve (owner role)"
         );
     }
+    if cfg.payout_dfsps.is_empty() {
+        warn!("PAYOUT_DFSPS unset: POST /v1/payouts/quotes is 503 (DFSP quote marketplace                    disabled — no quoting peers configured; quotes are never fabricated)");
+    } else {
+        info!(
+            dfsps = cfg.payout_dfsps.len(),
+            "W99 C1: DFSP quote marketplace enabled (read-only quote comparison)"
+        );
+    }
     if cfg.internal_token.is_none() && !cfg.trust_direct_tenant {
         warn!("PAYMENTS_INTERNAL_TOKEN unset and OPENDESK_TRUST_DIRECT_TENANT off: money routes                fail closed (503) unless the gateway injects X-Tenant-Slugs (C1)");
     }
@@ -416,6 +428,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ledger,
         outbox,
         mojaloop: mojaloop::MojaloopAdapter::new(cfg.mojaloop_endpoint.clone()),
+        marketplace: marketplace::Marketplace::new(
+            cfg.payout_dfsps.clone(),
+            cfg.payout_quote_timeout_ms,
+        ),
         flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
         config: Arc::new(cfg.clone()),
         dlq,

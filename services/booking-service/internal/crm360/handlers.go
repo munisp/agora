@@ -234,8 +234,8 @@ func limitParam(r *http.Request, def, max int) (int, error) {
 // Search
 // ---------------------------------------------------------------------------
 
-// Search (GET /v1/crm/contacts/search?q=&tag=&limit=) — name/phone/email
-// prefix search plus optional tag filter. The tag filter is normalized +
+// Search (GET /v1/crm/contacts/search?q=&tag=&limit=&cursor=) — name/phone/email
+// prefix search plus optional tag filter and keyset pagination (SPEC-W83). The tag filter is normalized +
 // validated like a write (an invalid tag shape is a 400, not an empty
 // result, so operator typos surface).
 func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
@@ -256,12 +256,24 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	results, err := h.Store.SearchContacts(r.Context(), tenant.ID, q.Get("q"), tag, limit)
+	// SPEC-W83: opaque keyset cursor (see Store.SearchContactsPage). The
+	// next_cursor key is emitted only when another page exists — additive,
+	// so pre-W83 clients see no change.
+	cursor := strings.TrimSpace(q.Get("cursor"))
+	results, next, err := h.Store.SearchContactsPage(r.Context(), tenant.ID, q.Get("q"), tag, limit, cursor)
 	if err != nil {
+		if errors.Is(err, ErrInvalidCursor) {
+			writeError(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
 		h.mapErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"contacts": results})
+	resp := map[string]any{"contacts": results}
+	if next != "" {
+		resp["next_cursor"] = next
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---------------------------------------------------------------------------

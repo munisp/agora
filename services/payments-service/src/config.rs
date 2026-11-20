@@ -67,6 +67,13 @@ pub struct Config {
     /// ledger-first and parked in `pending_approval` until an
     /// owner-role caller approves it via POST /v1/payouts/{id}/approve.
     pub payout_approval_threshold_cents: u64,
+    /// SPEC-W99 C1: DFSP marketplace peers for `POST /v1/payouts/quotes`
+    /// (env `PAYOUT_DFSPS`, `fspId=endpoint` pairs). Empty => the quotes
+    /// route fails closed with 503 (never a fabricated quote).
+    pub payout_dfsps: Vec<crate::marketplace::DfspConfig>,
+    /// SPEC-W99 C1: per-DFSP quote timeout (`PAYOUT_QUOTE_TIMEOUT_MS`,
+    /// default 4000, clamp 500..=15000).
+    pub payout_quote_timeout_ms: u64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -176,6 +183,12 @@ impl Config {
             payout_reconciler_interval_secs: env_parse("PAYOUT_RECONCILER_INTERVAL_SECS", 30),
             money_roles: parse_roles(&env_or("MONEY_ROLES", "owner,admin")),
             payout_approval_threshold_cents: env_parse("PAYOUT_APPROVAL_THRESHOLD_KOBO", 0),
+            payout_dfsps: crate::marketplace::parse_dfsps(
+                &std::env::var("PAYOUT_DFSPS").unwrap_or_default(),
+            ),
+            // clamp 500..=15000: below 500ms a real DFSP round trip can never
+            // answer (falsy all-down 502s); above 15s the marketplace feels hung.
+            payout_quote_timeout_ms: env_parse("PAYOUT_QUOTE_TIMEOUT_MS", 4000u64).clamp(500, 15_000),
         })
     }
 

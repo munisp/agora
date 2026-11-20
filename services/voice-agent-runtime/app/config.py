@@ -7,13 +7,27 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from .logging import get_logger
 from .multilang import parse_tts_voice_map, parse_voice_map
 from .pronunciation import parse_tenant_lexicons
 from .sip import parse_tenant_phone_map
 
+log = get_logger("config")
+
 
 def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
+
+
+def _session_store_backend() -> str:
+    """SPEC-W97 G8: SESSION_STORE_BACKEND — "memory" (default) | "dapr";
+    anything else degrades to memory with a warning (a typo must never
+    crash the boot or silently pick an unexpected backend)."""
+    raw = _env("SESSION_STORE_BACKEND", "memory").strip().lower()
+    if raw in ("memory", "dapr"):
+        return raw
+    log.warning("unknown SESSION_STORE_BACKEND — falling back to memory", value=raw)
+    return "memory"
 
 
 def _env_int(key: str, default: int) -> int:
@@ -69,6 +83,8 @@ DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
     "prefill_booking": TIER_LOW,
     "request_verification_code": TIER_LOW,
     "verify_caller_code": TIER_LOW,
+    # SPEC-W86: passive keypad listener — no identity required.
+    "read_keypad_entry": TIER_LOW,
     # Tier 1 — MEDIUM (confirmed identity)
     "book_appointment": TIER_MEDIUM,
     "capture_location": TIER_MEDIUM,
@@ -126,6 +142,51 @@ def parse_voice_tool_tiers(raw: str) -> dict[str, int]:
             )
         tiers[name] = tier
     return tiers
+
+
+def parse_pack_tool_tiers(raw: object) -> dict[str, int]:
+    """Parse a pack ``stepUpPolicy.tools`` map (SPEC-W84).
+
+    TOLERANT variant of parse_voice_tool_tiers for per-tenant payloads:
+    malformed entries — bad tool name, non-int/out-of-range tier, or a tier
+    BELOW a built-in floor — drop out with a warning and never raise (a
+    tenant payload must never crash a session). The never-weakening rule is
+    identical: built-in floors cannot be lowered, only raised; pack plugin
+    tools (absent from the defaults) may take any tier 0|1|2, including 0 —
+    the plugin default of 1 is a safe default, not a floor.
+    """
+    out: dict[str, int] = {}
+    if not isinstance(raw, dict):
+        if raw is not None:
+            log.warning("pack stepUpPolicy.tools: expected a mapping, dropped")
+        return out
+    for name, tier in raw.items():
+        if not isinstance(name, str) or not _TOOL_TIER_NAME_RE.fullmatch(name):
+            log.warning("pack stepUpPolicy: invalid tool name %r — dropped", name)
+            continue
+        if isinstance(tier, bool) or not isinstance(tier, int) or tier not in (
+            TIER_LOW,
+            TIER_MEDIUM,
+            TIER_HIGH,
+        ):
+            log.warning(
+                "pack stepUpPolicy: %r tier must be 0, 1 or 2 (got %r) — dropped",
+                name,
+                tier,
+            )
+            continue
+        floor = DEFAULT_VOICE_TOOL_TIERS.get(name)
+        if floor is not None and tier < floor:
+            log.warning(
+                "pack stepUpPolicy: %r tier %d would weaken the built-in floor "
+                "%d — dropped (never weakening)",
+                name,
+                tier,
+                floor,
+            )
+            continue
+        out[name] = tier
+    return out
 
 
 def parse_stt_hints(raw: str) -> dict[str, dict[str, str]]:
@@ -314,6 +375,36 @@ class Settings:
     agent_backend: str = "livekit"  # livekit|elevenlabs
     elevenlabs_api_key: str = ""
     elevenlabs_agent_id: str = ""
+    # SPEC-W93: ElevenLabs native DTMF input provisioning. On the hosted
+    # backend the caller's keypad digits are collected by ElevenLabs itself
+    # (out-of-band RFC 4733 from Twilio/SIP-trunking) and delivered to the
+    # hosted agent as one user turn; these knobs are PATCHed onto the
+    # hosted agent's conversation_config.conversation.dtmf_input_settings
+    # at control-plane startup. REDACT defaults ON: typed codes (OTP /
+    # portal) must not persist in ElevenLabs stored transcripts (SPEC-W86
+    # digits-never-persisted invariant, extended to the hosted path).
+    elevenlabs_dtmf_enabled: bool = True
+    elevenlabs_dtmf_timeout_s: float = 2.0
+    elevenlabs_dtmf_hash_terminator: bool = True
+    elevenlabs_dtmf_redact: bool = True
+
+    # IVR-A DTMF accelerator (SPEC-W96, app/ivr_menu.py): PSTN greeting
+    # announces a small keypad menu; a menu digit press outside any keypad
+    # wait injects an intent hint into the LLM turn (no state machine).
+    # ivr_menu: "" = the default 1=book/2=reschedule/3=human menu,
+    # "none" = no menu, else "1=book:book an appointment,2=...".
+    ivr_menu_enabled: bool = True
+    ivr_menu: str = ""
+
+    # Session persistence (SPEC-W97 G8, app/session_state.py): "memory"
+    # (default, dev-grade in-process) or "dapr" (DaprSessionStore through
+    # the `statestore` Redis component — sessions + chat history survive
+    # restarts; fail-open degradation on state-store errors). Unknown
+    # values degrade to memory with a startup warning. session_ttl_s is
+    # the idle expiry (memory GC + Redis ttlInSeconds), clamped 60..86400.
+    session_store_backend: str = "memory"
+    session_ttl_s: int = 3600
+    session_state_store: str = "statestore"
 
     # Avatar presence (SPEC-W9 Part A, app/avatar/): which provider joins a
     # visual avatar into the LiveKit room after session mint. `none` (default)
@@ -375,6 +466,18 @@ class Settings:
     # exceed that so a slow-but-working portal answers with a real result
     # instead of the runner's generic timeout apology.
     verification_tool_timeout_s: float = 20.0
+    # SPEC-W86: per-tool timeout override for read_keypad_entry ONLY. The
+    # tool WAITS on the caller's keypad for up to 60s (KEYPAD_TIMEOUT_MAX_S
+    # in app/tools.py), so the override must exceed that — the global 4s
+    # tool timeout is untouched.
+    keypad_tool_timeout_s: float = 65.0
+
+    # SPEC-W87: honor durable booking-side verification grants (genuine
+    # portal OTP within the grant TTL) for PSTN callers under the strict
+    # anchor rule (phone channel + carrier-claimed phone + matching
+    # supplied phone). "0" disables — checks then always fall through to
+    # the OTP flow. Web self-claims are NEVER honored regardless.
+    verification_grants_enabled: bool = True
 
     # Phone-confirmation policy
     phone_confirmation_required: bool = True
@@ -636,6 +739,21 @@ def load_settings() -> Settings:
         agent_backend=_env("AGENT_BACKEND", "livekit"),
         elevenlabs_api_key=_env("ELEVENLABS_API_KEY", ""),
         elevenlabs_agent_id=_env("ELEVENLABS_AGENT_ID", ""),
+        elevenlabs_dtmf_enabled=_env("ELEVENLABS_DTMF_ENABLED", "1").lower()
+        in ("1", "true", "yes", "on"),
+        elevenlabs_dtmf_timeout_s=_env_float("ELEVENLABS_DTMF_TIMEOUT_S", 2.0),
+        elevenlabs_dtmf_hash_terminator=_env(
+            "ELEVENLABS_DTMF_HASH_TERMINATOR", "1"
+        ).lower()
+        in ("1", "true", "yes", "on"),
+        elevenlabs_dtmf_redact=_env("ELEVENLABS_DTMF_REDACT", "1").lower()
+        in ("1", "true", "yes", "on"),
+        ivr_menu_enabled=_env("IVR_MENU_ENABLED", "1").lower()
+        in ("1", "true", "yes", "on"),
+        ivr_menu=_env("IVR_MENU", ""),
+        session_store_backend=_session_store_backend(),
+        session_ttl_s=max(60, min(86400, _env_int("SESSION_TTL_S", 3600))),
+        session_state_store=_env("SESSION_STATE_STORE", "statestore"),
         avatar_provider=_env("AVATAR_PROVIDER", "none"),
         tavus_api_key=_env("TAVUS_API_KEY", ""),
         tavus_replica_id=_env("TAVUS_REPLICA_ID", ""),
@@ -659,6 +777,8 @@ def load_settings() -> Settings:
         tool_timeout_s=float(os.environ.get("TOOL_TIMEOUT_SECONDS", "4")),
         tool_ack_grace_ms=_env_int("TOOL_ACK_GRACE_MS", 400),
         verification_tool_timeout_s=_env_float("VOICE_VERIFICATION_TOOL_TIMEOUT_S", 20.0),
+        keypad_tool_timeout_s=_env_float("KEYPAD_TOOL_TIMEOUT_S", 65.0),
+        verification_grants_enabled=_env("VOICE_VERIFICATION_GRANTS", "1").lower() in ("1", "true", "yes", "on"),
         phone_confirmation_required=_env("PHONE_CONFIRMATION_REQUIRED", "true").lower()
         not in ("0", "false", "no"),
         booking_url=_env("BOOKING_URL", ""),

@@ -108,6 +108,50 @@ orchestration to ElevenLabs ConvAI: `/voice/session` returns a signed URL and
 hosted tool calls are passed through `/voice/elevenlabs/tools` into the same
 ToolLayer, so the phone policy and Dapr command flow are unchanged.
 
+**DTMF on the ElevenLabs backend (SPEC-W93).** Keypad digits are collected
+natively by ElevenLabs (out-of-band RFC 4733 from Twilio/SIP-trunking) and
+relayed to the hosted agent as one user turn — they never transit this
+runtime. At startup the control plane PATCHes the hosted agent's
+`conversation_config.conversation.dtmf_input_settings` to converge with the
+`ELEVENLABS_DTMF_*` env vars below (best-effort: a provisioning failure logs
+a warning and never blocks startup). `read_keypad_entry` on this backend
+answers `keypad_native` — instructing the agent to take the digits from the
+caller's next message and pass them to `verify_caller_code` — instead of
+`keypad_unavailable`. `ELEVENLABS_DTMF_REDACT` defaults ON so typed codes
+stay out of ElevenLabs stored transcripts.
+
+**Session persistence (SPEC-W97, closes roadmap G8).** By default sessions
+and chat history are in-memory (dev-grade; lost on restart).
+`SESSION_STORE_BACKEND=dapr` swaps in `DaprSessionStore`: every chat turn
+and hosted tool call persists the session envelope + bounded history (40
+messages) to the `statestore` Redis component (already scoped to `voice`)
+with `SESSION_TTL_S` as the Redis TTL — phone-confirmation, OTP-verified
+identity, escalation state and history survive restarts and replica
+failover. K15(b) is preserved over the wire: resume still requires the
+`session_secret` (constant-time check; a wrong secret starts a fresh
+session under a NEW conversation_id, the targeted envelope untouched).
+Fail-open: a state-store outage degrades resume to fresh sessions but
+never breaks a turn — outcomes ride
+`voice_session_store_ops_total{op,result}` (op: load/save/history_load/
+history_save; result: ok/miss/error). No in-memory cache: one state GET
+per turn load, one PUT per save (single writer per conversation;
+last-writer-wins).
+
+**IVR-A keypad menu (SPEC-W96).** PSTN greetings announce ~3 keypad
+shortcuts (default: 1 = book, 2 = reschedule, 3 = speak to a team member);
+pressing a menu digit outside any keypad wait speaks a short deterministic
+ack and injects an intent hint into the LLM turn — deliberately NO state
+machine (a menu digit always maps to the same ack + hint,
+mid-conversation included) and multilingual-safe by construction (digits
+are language-neutral; the LLM composes the reply in the caller's
+language). Guards: `wait_for_entry` (OTP/code capture) always wins — an
+armed wait or a partial entry means the digit buffers exactly as before,
+so menu interception can never steal an OTP digit. On the ElevenLabs
+backend digits never transit this runtime, so the menu is surfaced via
+the `keypad_native` tool message instead (the hosted greeting/first
+message is provisioned per-tenant on ElevenLabs' side). Metric:
+`voice_ivr_menu_digits_total{intent}`.
+
 ## Env vars
 
 | Var | Default | Description |
@@ -145,6 +189,15 @@ ToolLayer, so the phone policy and Dapr command flow are unchanged.
 | `QWEN3_TTS_URL` / `QWEN3_TTS_MODEL` / `QWEN3_TTS_VOICE` / `QWEN3_TTS_LANGUAGE` / `QWEN3_TTS_TIMEOUT_S` | `http://qwen3-tts:8000` / `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `ryan` / `english` / `30` | W74: Qwen3-TTS (nari) GPU-tier provider — OpenAI-shaped `POST /v1/audio/speech` to the published image (opt-in `voice-gpu` compose profile; **requires NVIDIA H100**; English-primary only). Add `qwen3` to `TTS_PROVIDER_CHAIN` to enable — see [docs/voices-sidecars.md](../../docs/voices-sidecars.md) |
 | `AGENT_BACKEND` | `livekit` | `livekit` or `elevenlabs` |
 | `ELEVENLABS_API_KEY` / `ELEVENLABS_AGENT_ID` | _(unset)_ | elevenlabs backend |
+| `ELEVENLABS_DTMF_ENABLED` | `1` | W93: provision native DTMF input on the hosted agent; `0` PATCHes `dtmf_input_settings` to null |
+| `ELEVENLABS_DTMF_TIMEOUT_S` | `2.0` | W93: inactivity timeout completing a digit sequence (clamped 0.5–10.0) |
+| `ELEVENLABS_DTMF_HASH_TERMINATOR` | `1` | W93: `#` completes the sequence immediately (not included in the digits) |
+| `ELEVENLABS_DTMF_REDACT` | `1` | W93: replace keypad turns with `<REDACTED>` in ElevenLabs stored transcripts |
+| `SESSION_STORE_BACKEND` | `memory` | W97: session persistence backend — `memory` (dev) or `dapr` (statestore Redis; sessions + history survive restarts, fail-open on errors) |
+| `SESSION_TTL_S` | `3600` | W97: session idle expiry — memory GC + Redis ttlInSeconds (clamped 60–86400) |
+| `SESSION_STATE_STORE` | `statestore` | W97: Dapr state store component name for session persistence |
+| `IVR_MENU_ENABLED` | `1` | W96: IVR-A keypad menu on PSTN calls (greeting line + digit interception + intent hints); `0` disables |
+| `IVR_MENU` | `1=book:book an appointment,2=reschedule:reschedule an appointment,3=human:speak to a team member` | W96: menu entries `digit=intent:spoken phrase` (comma-separated, max 8, malformed entries skipped); `none` = no menu |
 | `KNOWLEDGE_SNIPPET_COUNT` / `KNOWLEDGE_QUERY` | `3` / `opening hours services pricing` | bootstrap grounding |
 | `VOICE_TENANT_CTX_TTL_S` / `VOICE_TENANT_CTX_STALE_S` | `120` / `300` | W46 P1/P2: per-slug tenant-context cache fresh window / stale-while-error window (refresh failure serves the stale entry; no entry = error propagates as before) |
 | `BOOKING_BASE_URL` | `http://booking:7002` | W46 P-02: direct booking-service base for tool/tenant invokes (daprd invoke fallback on transport failure; empty = pure daprd). Distinct from `BOOKING_URL` (OTP verifier) |

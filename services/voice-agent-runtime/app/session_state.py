@@ -24,16 +24,24 @@ SPEC-W45 K15 — two hardening layers on top of that:
   messaging-gateway (e.g. WhatsApp wa_id). ``confirmed_phone`` (read-back)
   is NOT sufficient for those tools anymore.
 
-State is in-memory (dev-grade; swap `SessionStore` for the Dapr state store
-`statestore.redis` in production — the interface is tiny).
+State is in-memory by default (dev-grade); SPEC-W97 G8 adds
+`DaprSessionStore`, persisting sessions + chat history through the Dapr
+state store (`statestore`, Redis) behind SESSION_STORE_BACKEND=dapr.
 """
 
 from __future__ import annotations
 
 import hmac
+import inspect
 import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
+
+from . import metrics
+from .logging import get_logger
+
+log = get_logger("session-state")
 
 
 class PhoneConfirmationRequired(RuntimeError):
@@ -65,6 +73,11 @@ class SessionState:
     # bypass (OOS-03).
     claimed_phone: str | None = None
     caller_name: str | None = None
+    # SPEC-W96 IVR-A: the session's parsed IVR menu (ivr_menu.IvrEntry
+    # tuple), set by build_voice_agent for PSTN sessions when the menu is
+    # enabled; None everywhere else. Typed Any to keep this module free of
+    # the ivr_menu import (duck-typed, same discipline as other bags).
+    ivr_menu: Any = None
     last_booking_ids: list[str] = field(default_factory=list)
     # Multi-agent crews (SPEC-W3 §4, innovation 6): id of the specialist
     # agent currently steering the persona, or None for the base persona.
@@ -137,6 +150,76 @@ class SessionState:
             return False
         return hmac.compare_digest(session_secret, self.session_secret)
 
+    # ------------------------------------------------------------ SPEC-W97
+    _STATE_VERSION = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the resume-relevant state (SPEC-W97 G8).
+
+        ``ivr_menu`` is deliberately NOT persisted: it is derived
+        per-call from settings (parse_ivr_menu is deterministic), so a
+        resumed session re-parses it in build_voice_agent.
+        """
+        return {
+            "v": self._STATE_VERSION,
+            "conversation_id": self.conversation_id,
+            "site_slug": self.site_slug,
+            "session_secret": self.session_secret,
+            "pending_phone": self.pending_phone,
+            "confirmed_phone": self.confirmed_phone,
+            "verified_phone": self.verified_phone,
+            "claimed_phone": self.claimed_phone,
+            "caller_name": self.caller_name,
+            "last_booking_ids": list(self.last_booking_ids),
+            "active_agent": self.active_agent,
+            "escalation_room": self.escalation_room,
+            "active_language": self.active_language,
+            "channel": self.channel,
+            "resolved_agent_id": self.resolved_agent_id,
+            "created_at": self.created_at,
+            "touched_at": self.touched_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "SessionState | None":
+        """Inverse of to_dict; defensive — junk/foreign envelopes return
+        None (the store treats them as a miss, never a crash)."""
+        if not isinstance(data, dict):
+            return None
+        if data.get("v") != cls._STATE_VERSION:
+            return None
+        cid = data.get("conversation_id")
+        slug = data.get("site_slug")
+        secret = data.get("session_secret")
+        if not all(isinstance(x, str) and x for x in (cid, slug, secret)):
+            return None
+        session = cls(conversation_id=cid, site_slug=slug, session_secret=secret)
+
+        def _str(key: str) -> "str | None":
+            value = data.get(key)
+            return value if isinstance(value, str) and value else None
+
+        session.pending_phone = _str("pending_phone")
+        session.confirmed_phone = _str("confirmed_phone")
+        session.verified_phone = _str("verified_phone")
+        session.claimed_phone = _str("claimed_phone")
+        session.caller_name = _str("caller_name")
+        ids = data.get("last_booking_ids")
+        session.last_booking_ids = (
+            [x for x in ids if isinstance(x, str)] if isinstance(ids, list) else []
+        )
+        session.active_agent = _str("active_agent")
+        session.escalation_room = _str("escalation_room")
+        session.active_language = _str("active_language")
+        channel = data.get("channel")
+        session.channel = channel if isinstance(channel, str) and channel else "web"
+        session.resolved_agent_id = _str("resolved_agent_id")
+        for key in ("created_at", "touched_at"):
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                setattr(session, key, float(value))
+        return session
+
 
 @dataclass
 class SessionStore:
@@ -186,3 +269,206 @@ class SessionStore:
         ]
         for cid in expired:
             del self._sessions[cid]
+
+    # -- SPEC-W97 persistence hooks (memory backend: documented no-ops) --
+    def save(self, session: SessionState) -> None:
+        """Memory sessions are shared by reference; nothing to write."""
+
+    def load_history(self, conversation_id: str) -> None:
+        """Memory backend: ChatHistory owns the history — returns None."""
+        return None
+
+    def save_history(self, conversation_id: str, messages: list[dict[str, Any]]) -> None:
+        """Memory backend: ChatHistory owns the history — nothing to write."""
+
+
+class DaprSessionStore:
+    """SPEC-W97 G8: session + chat-history persistence through the Dapr
+    state store (``statestore``, Redis — component + voice scope already
+    exist in infra/dapr/components/statestore.redis.yaml).
+
+    No in-memory cache: every get_or_create is one state GET, every save
+    one state PUT (single writer per conversation; last-writer-wins —
+    ETag concurrency is a documented non-goal). Fail-open: a GET error
+    degrades to a fresh session (resume lost, calls unaffected); save
+    errors propagate to the caller's fail-open wrapper. Both directions
+    are counted on voice_session_store_ops_total{op,result}.
+
+    K15(b) wire parity: resuming STILL requires the session_secret —
+    the envelope is loaded but state is adopted only when the secret
+    matches (constant-time); otherwise a fresh session under a NEW
+    conversation_id is created, the targeted envelope untouched.
+    """
+
+    KEY_PREFIX = "voice-session:"
+    HISTORY_PREFIX = "voice-history:"
+    HISTORY_MAX = 40  # ChatHistory.max_messages parity
+
+    def __init__(
+        self,
+        dapr: Any,
+        *,
+        store_name: str = "statestore",
+        ttl_s: int = 3600,
+    ) -> None:
+        self._dapr = dapr
+        self._store = store_name
+        self.ttl_s = ttl_s
+
+    def _key(self, conversation_id: str) -> str:
+        return f"{self.KEY_PREFIX}{conversation_id}"
+
+    def _history_key(self, conversation_id: str) -> str:
+        return f"{self.HISTORY_PREFIX}{conversation_id}"
+
+    async def get(self, conversation_id: str) -> SessionState | None:
+        """Load a session envelope; None on miss, foreign junk, or a
+        state-store error (fail-open, counted)."""
+        try:
+            data = await self._dapr.get_state(self._store, self._key(conversation_id))
+        except Exception as exc:  # noqa: BLE001 - fail-open degradation
+            metrics.session_store_op("load", "error")
+            log.warning(
+                "session state load failed", conversation_id=conversation_id,
+                error=str(exc)[:200],
+            )
+            return None
+        if data is None:
+            metrics.session_store_op("load", "miss")
+            return None
+        session = SessionState.from_dict(data)
+        metrics.session_store_op("load", "ok" if session is not None else "miss")
+        return session
+
+    async def get_or_create(
+        self,
+        conversation_id: str | None,
+        site_slug: str,
+        session_secret: str | None = None,
+    ) -> SessionState:
+        """Resume (secret-gated) or start fresh — K15(b) over the wire."""
+        if conversation_id:
+            session = await self.get(conversation_id)
+            if session is not None and session.check_secret(session_secret):
+                session.touch()
+                return session
+            if session is not None:
+                # Wrong/absent secret: NEVER adopt the targeted id — a
+                # fresh session under a NEW conversation_id, the targeted
+                # envelope untouched (K15(b) wire parity).
+                return SessionState(
+                    conversation_id=str(uuid.uuid4()), site_slug=site_slug
+                )
+            # Miss: a caller-chosen fresh id is fine (same as memory).
+        cid = conversation_id or str(uuid.uuid4())
+        return SessionState(conversation_id=cid, site_slug=site_slug)
+
+    async def save(self, session: SessionState) -> None:
+        """Persist the envelope with TTL. Raises DaprError — callers wrap
+        fail-open; the metric counts both outcomes."""
+        try:
+            await self._dapr.save_state(
+                self._store, self._key(session.conversation_id),
+                session.to_dict(), ttl_s=self.ttl_s,
+            )
+        except Exception:
+            metrics.session_store_op("save", "error")
+            raise
+        metrics.session_store_op("save", "ok")
+
+    async def load_history(self, conversation_id: str) -> "list[dict[str, Any]] | None":
+        """The persisted chat history (None on miss — NOT an empty list —
+        so the caller can distinguish 'no record' from 'empty history')."""
+        try:
+            data = await self._dapr.get_state(
+                self._store, self._history_key(conversation_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-open degradation
+            metrics.session_store_op("history_load", "error")
+            log.warning(
+                "chat history load failed", conversation_id=conversation_id,
+                error=str(exc)[:200],
+            )
+            return None
+        if not isinstance(data, list):
+            metrics.session_store_op("history_load", "miss")
+            return None
+        metrics.session_store_op("history_load", "ok")
+        return [m for m in data if isinstance(m, dict)]
+
+    async def save_history(
+        self, conversation_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        """Persist the bounded history (last HISTORY_MAX messages)."""
+        bounded = list(messages)[-self.HISTORY_MAX :]
+        try:
+            await self._dapr.save_state(
+                self._store, self._history_key(conversation_id),
+                bounded, ttl_s=self.ttl_s,
+            )
+        except Exception:
+            metrics.session_store_op("history_save", "error")
+            raise
+        metrics.session_store_op("history_save", "ok")
+
+
+# ---------------------------------------------------------------------------
+# SPEC-W97 backend-agnostic helpers (maybe-await idiom; the memory backend's
+# hooks are sync no-ops, the Dapr backend's are async).
+
+
+async def store_get_or_create(
+    store: Any,
+    conversation_id: str | None,
+    site_slug: str,
+    session_secret: str | None = None,
+) -> SessionState:
+    result = store.get_or_create(
+        conversation_id, site_slug, session_secret=session_secret
+    )
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def store_get(store: Any, conversation_id: str) -> SessionState | None:
+    result = store.get(conversation_id)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def store_save_session(store: Any, session: SessionState) -> None:
+    """Persist the session if the backend has a save hook. Raises whatever
+    the backend raises — callers wrap fail-open (never breaks a turn)."""
+    save = getattr(store, "save", None)
+    if save is None:
+        return
+    result = save(session)
+    if inspect.isawaitable(result):
+        await result
+
+
+async def store_load_history(
+    store: Any, conversation_id: str
+) -> "list[dict[str, Any]] | None":
+    """None = the backend keeps no history record (memory: ChatHistory
+    owns it); a list hydrates the caller's in-turn bag."""
+    load = getattr(store, "load_history", None)
+    if load is None:
+        return None
+    result = load(conversation_id)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def store_save_history(
+    store: Any, conversation_id: str, messages: list[dict[str, Any]]
+) -> None:
+    save = getattr(store, "save_history", None)
+    if save is None:
+        return
+    result = save(conversation_id, messages)
+    if inspect.isawaitable(result):
+        await result

@@ -221,6 +221,7 @@ type journeyRequest struct {
 	Name        string     `json:"name"`
 	TriggerKind string     `json:"trigger_kind"`
 	SegmentID   *uuid.UUID `json:"segment_id"`
+	EventName   string     `json:"event_name"`
 	Steps       Steps      `json:"steps"`
 }
 
@@ -247,6 +248,12 @@ func (h *Handlers) CreateJourney(w http.ResponseWriter, r *http.Request, tenant 
 		writeError(w, http.StatusBadRequest, "segment_id is required for trigger_kind segment")
 		return
 	}
+	// SPEC-W92 B13: an event journey is meaningless without the event it
+	// listens for.
+	if req.TriggerKind == TriggerEvent && strings.TrimSpace(req.EventName) == "" {
+		writeError(w, http.StatusBadRequest, "event_name is required for trigger_kind event")
+		return
+	}
 	if err := ValidateSteps(req.Steps); err != nil {
 		h.mapErr(w, err)
 		return
@@ -256,6 +263,7 @@ func (h *Handlers) CreateJourney(w http.ResponseWriter, r *http.Request, tenant 
 		Name:        req.Name,
 		TriggerKind: req.TriggerKind,
 		SegmentID:   req.SegmentID,
+		EventName:   strings.TrimSpace(req.EventName),
 		Steps:       req.Steps,
 	}
 	if err := h.Store.CreateJourney(r.Context(), &j); err != nil {
@@ -285,6 +293,7 @@ type patchJourneyRequest struct {
 	Status      *string    `json:"status"`
 	TriggerKind *string    `json:"trigger_kind"`
 	SegmentID   *uuid.UUID `json:"segment_id"`
+	EventName   *string    `json:"event_name"`
 	Steps       *Steps     `json:"steps"`
 }
 
@@ -304,7 +313,7 @@ func (h *Handlers) PatchJourney(w http.ResponseWriter, r *http.Request, tenant b
 		return
 	}
 
-	structural := req.Name != nil || req.TriggerKind != nil || req.SegmentID != nil || req.Steps != nil
+	structural := req.Name != nil || req.TriggerKind != nil || req.SegmentID != nil || req.EventName != nil || req.Steps != nil
 	var j Journey
 	if structural {
 		cur, err := h.Store.GetJourney(r.Context(), tenant.ID, id)
@@ -320,6 +329,21 @@ func (h *Handlers) PatchJourney(w http.ResponseWriter, r *http.Request, tenant b
 			writeError(w, http.StatusBadRequest, "trigger_kind must be segment|manual|event")
 			return
 		}
+		// SPEC-W92 B13: switching a journey to the event trigger requires
+		// naming the event in the same patch (the effective row must never
+		// be an event journey with an empty event_name).
+		effectiveEvent := cur.EventName
+		if req.EventName != nil {
+			effectiveEvent = strings.TrimSpace(*req.EventName)
+		}
+		effectiveTrigger := cur.TriggerKind
+		if req.TriggerKind != nil {
+			effectiveTrigger = *req.TriggerKind
+		}
+		if effectiveTrigger == TriggerEvent && effectiveEvent == "" {
+			writeError(w, http.StatusBadRequest, "event_name is required for trigger_kind event")
+			return
+		}
 		if req.Steps != nil {
 			if err := ValidateSteps(*req.Steps); err != nil {
 				h.mapErr(w, err)
@@ -330,7 +354,12 @@ func (h *Handlers) PatchJourney(w http.ResponseWriter, r *http.Request, tenant b
 		if req.SegmentID != nil {
 			segmentID = &req.SegmentID
 		}
-		j, err = h.Store.UpdateJourney(r.Context(), tenant.ID, id, req.Name, req.TriggerKind, segmentID, req.Steps)
+		var eventName *string
+		if req.EventName != nil {
+			trimmed := strings.TrimSpace(*req.EventName)
+			eventName = &trimmed
+		}
+		j, err = h.Store.UpdateJourney(r.Context(), tenant.ID, id, req.Name, req.TriggerKind, segmentID, eventName, req.Steps)
 		if err != nil {
 			h.mapErr(w, err)
 			return
@@ -409,6 +438,79 @@ func (h *Handlers) Enroll(w http.ResponseWriter, r *http.Request, tenant booking
 		"journey_id": id,
 		"enrolled":   len(created),
 		"existing":   existing,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Trigger firing (SPEC-W92 B13)
+// ---------------------------------------------------------------------------
+
+// FireSegment (POST /v1/studio/journeys/{id}/fire-segment) — the segment
+// trigger: enrolls every CURRENT member of the journey's bound segment.
+// Idempotent per (journey, contact) — re-firing enrolls only NEW members
+// (run it on a schedule to approximate "on segment entry"). New
+// enrollments are metered + emitted post-commit, identical to Enroll.
+func (h *Handlers) FireSegment(w http.ResponseWriter, r *http.Request, tenant bookingops.TenantInfo) {
+	id, err := urlUUID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	created, existing, truncated, err := h.Store.FireSegmentJourney(r.Context(), tenant.ID, id)
+	if err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	h.meterJourneyEnrolled(r.Context(), tenant.Slug, tenant.ID, created)
+	h.publishJourneyEvents(r.Context(), EventTypeJourneyEnrolled, tenant.Slug, tenant.ID, created)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"journey_id": id,
+		"enrolled":   len(created),
+		"existing":   existing,
+		"truncated":  truncated,
+	})
+}
+
+type fireEventRequest struct {
+	Event     string    `json:"event"`
+	ContactID uuid.UUID `json:"contact_id"`
+}
+
+// FireEvent (POST /v1/studio/events) — the event trigger: enrolls one
+// contact into every ACTIVE journey listening for the named event.
+// Idempotent per (journey, contact) — a replayed event re-fires nothing.
+// A zero-match event is a valid empty result, never an error.
+func (h *Handlers) FireEvent(w http.ResponseWriter, r *http.Request, tenant bookingops.TenantInfo) {
+	var req fireEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	req.Event = strings.TrimSpace(req.Event)
+	if req.Event == "" {
+		writeError(w, http.StatusBadRequest, "event is required")
+		return
+	}
+	if len(req.Event) > 128 {
+		writeError(w, http.StatusBadRequest, "event must be at most 128 chars")
+		return
+	}
+	if req.ContactID == uuid.Nil {
+		writeError(w, http.StatusBadRequest, "contact_id is required")
+		return
+	}
+	results, created, err := h.Store.FireEventJourneys(r.Context(), tenant.ID, req.Event, req.ContactID)
+	if err != nil {
+		h.mapErr(w, err)
+		return
+	}
+	// Post-commit, best-effort: meter + lifecycle events for the NEW rows
+	// only (replayed events can never double-meter — created is empty).
+	h.meterJourneyEnrolled(r.Context(), tenant.Slug, tenant.ID, created)
+	h.publishJourneyEvents(r.Context(), EventTypeJourneyEnrolled, tenant.Slug, tenant.ID, created)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"event":   req.Event,
+		"results": results,
 	})
 }
 

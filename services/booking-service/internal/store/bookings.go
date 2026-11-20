@@ -268,8 +268,9 @@ type BookingFilter struct {
 	// phone number OR e-mail address (GDPR export lookup, SPEC-W3 §2).
 	Contact string
 	// ContactPhone filters bookings to those whose linked contact's phone
-	// matches exactly (SPEC-W47 W47-A item 4, A-UIMOB UIMOB-05: the voice
-	// runtime's lookup_appointment — phone-only, no e-mail fallback).
+	// matches on the W61 G3 digits canonical form (SPEC-W47 W47-A item 4,
+	// A-UIMOB UIMOB-05: the voice runtime's lookup_appointment — phone-
+	// only, no e-mail fallback; SPEC-W89: format-independent).
 	ContactPhone string
 	// ContactID restricts to one contact's bookings (customer portal,
 	// Wave 5 #7 — exact id match, no contact-table join needed).
@@ -307,12 +308,25 @@ func (s *Store) ListBookings(ctx context.Context, tenantID uuid.UUID, f BookingF
 	}
 	if f.Contact != "" {
 		n++
-		q += fmt.Sprintf(` AND contact_id IN (SELECT id FROM contacts WHERE tenant_id=$1 AND (phone=$%[1]d OR email=$%[1]d))`, n)
+		// SPEC-W89 (exception): the phone side of the GDPR-export lookup
+		// matches the W61 G3 digits canonical form BOTH SIDES; e-mail
+		// stays exact. A format-variant export needle can no longer miss
+		// the subject's bookings.
+		d := mediaInboxDigitsSQL(fmt.Sprintf(`$%d`, n))
+		q += fmt.Sprintf(` AND contact_id IN (SELECT id FROM contacts WHERE tenant_id=$1 AND ((%s <> '' AND %s = %s AND %s <> '') OR email=$%[5]d))`,
+			mediaInboxDigitsSQL("phone"), mediaInboxDigitsSQL("phone"), d, d, n)
 		args = append(args, f.Contact)
 	}
 	if f.ContactPhone != "" {
 		n++
-		q += fmt.Sprintf(` AND contact_id IN (SELECT id FROM contacts WHERE tenant_id=$1 AND phone=$%[1]d)`, n)
+		// SPEC-W89 (exception): digits canonical form BOTH SIDES (W61 G3)
+		// — the voice runtime's verified pin and the stored contact form
+		// of the same subscriber resolve regardless of the '+'-form
+		// divergence. The digit-less guards keep empty-form needles/rows
+		// from matching each other.
+		d := mediaInboxDigitsSQL(fmt.Sprintf(`$%d`, n))
+		q += fmt.Sprintf(` AND contact_id IN (SELECT id FROM contacts WHERE tenant_id=$1 AND %s <> '' AND %s = %s AND %s <> '')`,
+			mediaInboxDigitsSQL("phone"), mediaInboxDigitsSQL("phone"), d, d)
 		args = append(args, f.ContactPhone)
 	}
 	if f.ContactID != nil {
@@ -514,7 +528,7 @@ func (s *Store) RescheduleBooking(ctx context.Context, tenantID, id, teamMemberI
 // (SPEC-W3 §2 innovation 13): name is replaced with 'erased' and phone/email
 // with their salted SHA-256 hashes so booking history stays referentially
 // intact while PII is irreversibly pseudonymized. Returns rows affected.
-// Empty phone/email values are ignored (never match NULL/” columns).
+// Empty phone/email values are ignored (never match NULL/empty columns).
 //
 // NOTE (SPEC-W47, A-DB DB-03): contacts-only erasure is incomplete — the
 // same phone survives in leads/waitlist/referral_agents/referrals/
@@ -546,8 +560,21 @@ func anonymizeContactsTx(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, pho
 	sets := []string{`name='erased'`, `notes=''`}
 	var conds []string
 	if phone != "" {
-		sets = append(sets, fmt.Sprintf(`phone=$%d`, bind(hashPii(phone))))
-		conds = append(conds, fmt.Sprintf(`phone=$%d`, bind(phone)))
+		// SPEC-W89 (exception, lead ruling): the phone match is the W61 G3
+		// digits canonical form BOTH SIDES — a format-variant contacts row
+		// ('+234…' vs '234…') can no longer survive erasure. Guards:
+		// digit-less needle matches nothing; tombstoned rows are excluded
+		// by the outer name<>'erased'. The tombstone is hashPii(phone)
+		// EXACTLY for a single match; multi-format duplicates (only
+		// reachable on a pre-dedupe database) get a per-row discriminator
+		// so the digits unique index is never violated mid-transaction.
+		tombIdx := bind(hashPii(phone))
+		dn := mediaInboxDigitsSQL(fmt.Sprintf(`$%d`, bind(phone)))
+		sets = append(sets, fmt.Sprintf(
+			`phone=$%d || CASE WHEN (SELECT count(*) FROM contacts q WHERE q.tenant_id=$1 AND q.name <> 'erased' AND %s <> '' AND %s = %s) > 1 THEN ':' || id::text ELSE '' END`,
+			tombIdx, mediaInboxDigitsSQL("q.phone"), mediaInboxDigitsSQL("q.phone"), dn))
+		conds = append(conds, fmt.Sprintf(`%s <> '' AND %s = %s AND %s <> ''`,
+			mediaInboxDigitsSQL("phone"), mediaInboxDigitsSQL("phone"), dn, dn))
 	}
 	if email != "" {
 		sets = append(sets, fmt.Sprintf(`email=$%d`, bind(hashPii(email))))

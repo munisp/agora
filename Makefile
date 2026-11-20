@@ -27,6 +27,9 @@ topics:        ## Re-run Kafka topic init
 seed:          ## Seed demo tenant "acme" + catalog + availability
 	./scripts/seed-demo.sh
 
+demo:          ## Seed ALL 4 demo industries (salon/clinic/consultancy/logistics) + published sites + simulated bookings (SPEC-W98 I17)
+	./scripts/seed-demo-all.sh
+
 validate-packs: ## Validate industry packs + registry checksums (Wave 5 #6)
 	python3 scripts/validate_pack.py validate industries/*.yaml
 	python3 scripts/validate_pack.py validate-index industries/index.json

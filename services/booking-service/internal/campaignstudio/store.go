@@ -98,10 +98,13 @@ CREATE TABLE IF NOT EXISTS studio_journeys (
     trigger_kind TEXT NOT NULL DEFAULT 'manual'
                  CHECK (trigger_kind IN ('segment','manual','event')),
     segment_id   UUID,
+    event_name   TEXT NOT NULL DEFAULT '',
     steps        JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- SPEC-W92 B13: existing deployments gain event_name idempotently.
+ALTER TABLE studio_journeys ADD COLUMN IF NOT EXISTS event_name TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_studio_journeys_tenant ON studio_journeys (tenant_id, status, created_at);
 ALTER TABLE studio_journeys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE studio_journeys FORCE ROW LEVEL SECURITY;
@@ -347,22 +350,22 @@ func (s *Store) CountSegment(ctx context.Context, tenantID, segmentID uuid.UUID)
 // Journeys
 // ---------------------------------------------------------------------------
 
-const journeyCols = `id, tenant_id, name, status, trigger_kind, segment_id, steps, created_at, updated_at`
+const journeyCols = `id, tenant_id, name, status, trigger_kind, segment_id, event_name, steps, created_at, updated_at`
 
 func scanJourney(row pgx.Row) (Journey, error) {
 	var j Journey
 	err := row.Scan(&j.ID, &j.TenantID, &j.Name, &j.Status, &j.TriggerKind,
-		&j.SegmentID, &j.Steps, &j.CreatedAt, &j.UpdatedAt)
+		&j.SegmentID, &j.EventName, &j.Steps, &j.CreatedAt, &j.UpdatedAt)
 	return j, err
 }
 
 // CreateJourney inserts one journey in draft status.
 func (s *Store) CreateJourney(ctx context.Context, j *Journey) error {
-	const q = `INSERT INTO studio_journeys (tenant_id, name, trigger_kind, segment_id, steps)
-		           VALUES ($1,$2,$3,$4,$5)
+	const q = `INSERT INTO studio_journeys (tenant_id, name, trigger_kind, segment_id, event_name, steps)
+		           VALUES ($1,$2,$3,$4,$5,$6)
 		           RETURNING ` + journeyCols
 	return s.withTenant(ctx, j.TenantID, func(tx pgx.Tx) error {
-		row, err := scanJourney(tx.QueryRow(ctx, q, j.TenantID, j.Name, j.TriggerKind, j.SegmentID, j.Steps))
+		row, err := scanJourney(tx.QueryRow(ctx, q, j.TenantID, j.Name, j.TriggerKind, j.SegmentID, j.EventName, j.Steps))
 		if err != nil {
 			return fmt.Errorf("insert journey: %w", err)
 		}
@@ -417,9 +420,10 @@ func (s *Store) GetJourney(ctx context.Context, tenantID, journeyID uuid.UUID) (
 }
 
 // UpdateJourney applies a mutable-fields patch (name / trigger_kind /
-// segment_id / steps; nil leaves the column untouched). The caller
-// enforces the edit-state rule (draft|paused only for structural edits).
-func (s *Store) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, name *string, triggerKind *string, segmentID **uuid.UUID, steps *Steps) (Journey, error) {
+// segment_id / event_name / steps; nil leaves the column untouched). The
+// caller enforces the edit-state rule (draft|paused only for structural
+// edits).
+func (s *Store) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID, name *string, triggerKind *string, segmentID **uuid.UUID, eventName *string, steps *Steps) (Journey, error) {
 	var j Journey
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		row, err := scanJourney(tx.QueryRow(ctx,
@@ -427,11 +431,12 @@ func (s *Store) UpdateJourney(ctx context.Context, tenantID, journeyID uuid.UUID
 			    SET name         = COALESCE($3, name),
 			        trigger_kind = COALESCE($4, trigger_kind),
 			        segment_id   = COALESCE($5, segment_id),
-			        steps        = COALESCE($6, steps),
+			        event_name   = COALESCE($6, event_name),
+			        steps        = COALESCE($7, steps),
 			        updated_at   = now()
 			  WHERE tenant_id=$1 AND id=$2
 			  RETURNING `+journeyCols,
-			tenantID, journeyID, name, triggerKind, segmentID, steps))
+			tenantID, journeyID, name, triggerKind, segmentID, eventName, steps))
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -530,6 +535,134 @@ func (s *Store) Enroll(ctx context.Context, tenantID, journeyID uuid.UUID, conta
 		return nil
 	})
 	return created, existing, err
+}
+
+// ---------------------------------------------------------------------------
+// Trigger firing (SPEC-W92 B13)
+// ---------------------------------------------------------------------------
+
+// ListSegmentContactIDs evaluates the segment definition (same
+// buildSegmentQuery as CountSegment) and returns the member contact ids,
+// capped at maxEnrollBatch; truncated=true when the segment is larger
+// (the caller refuses to fire rather than silently enroll a partial
+// segment). Ordered by id for a deterministic enroll batch.
+func (s *Store) ListSegmentContactIDs(ctx context.Context, tenantID, segmentID uuid.UUID) (ids []uuid.UUID, truncated bool, err error) {
+	ids = []uuid.UUID{}
+	err = s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		seg, err := scanSegment(tx.QueryRow(ctx,
+			`SELECT `+segmentCols+` FROM studio_segments WHERE tenant_id=$1 AND id=$2`,
+			tenantID, segmentID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		where, args, err := buildSegmentQuery(&seg.Definition)
+		if err != nil {
+			return err
+		}
+		q := `SELECT c.id FROM contacts c WHERE c.tenant_id=$1 AND ` + where +
+			fmt.Sprintf(` ORDER BY c.id LIMIT %d`, maxEnrollBatch+1)
+		rows, err := tx.Query(ctx, q, append([]any{tenantID}, args...)...)
+		if err != nil {
+			return fmt.Errorf("list segment members: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(ids) > maxEnrollBatch {
+			ids = ids[:maxEnrollBatch]
+			truncated = true
+		}
+		return nil
+	})
+	return ids, truncated, err
+}
+
+// FireSegmentJourney enrolls every current member of the journey's bound
+// segment (SPEC-W92 B13 segment trigger). The journey must be active and
+// carry a segment_id — ErrConflict otherwise (the API maps it to 409,
+// same posture as manual enroll). Idempotent per (journey, contact) via
+// the Enroll UNIQUE anchor: a re-fire enrolls only NEW members, so
+// re-firing on a schedule approximates "on segment entry" without a
+// membership ledger. truncated=true refuses nothing but flags that the
+// segment exceeded one enroll batch (5000) — the response surfaces it.
+func (s *Store) FireSegmentJourney(ctx context.Context, tenantID, journeyID uuid.UUID) (created []Enrollment, existing int, truncated bool, err error) {
+	j, err := s.GetJourney(ctx, tenantID, journeyID)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if j.Status != StatusActive {
+		return nil, 0, false, fmt.Errorf("%w: fire requires an active journey (status %s)", ErrConflict, j.Status)
+	}
+	if j.SegmentID == nil {
+		return nil, 0, false, fmt.Errorf("%w: journey has no bound segment", ErrConflict)
+	}
+	ids, truncated, err := s.ListSegmentContactIDs(ctx, tenantID, *j.SegmentID)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	created, existing, err = s.Enroll(ctx, tenantID, journeyID, ids)
+	return created, existing, truncated, err
+}
+
+// EventFireResult is one journey's outcome in FireEventJourneys.
+type EventFireResult struct {
+	JourneyID uuid.UUID `json:"journey_id"`
+	Enrolled  bool      `json:"enrolled"` // false = contact was already enrolled (idempotent)
+}
+
+// FireEventJourneys enrolls one contact into every ACTIVE journey whose
+// trigger_kind is event and whose event_name matches (SPEC-W92 B13 event
+// trigger). Idempotent per (journey, contact): a replayed event re-fires
+// nothing. Journeys are scanned newest-first for a deterministic result
+// order. A zero-match event is a valid, empty result — never an error.
+// The second return is the flattened set of NEWLY created enrollments so
+// the caller can meter/emit exactly those (replay-safe).
+func (s *Store) FireEventJourneys(ctx context.Context, tenantID uuid.UUID, eventName string, contactID uuid.UUID) ([]EventFireResult, []Enrollment, error) {
+	results := []EventFireResult{}
+	journeyIDs := []uuid.UUID{}
+	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`SELECT id FROM studio_journeys
+			  WHERE tenant_id=$1 AND status='active'
+			    AND trigger_kind='event' AND event_name=$2
+			  ORDER BY created_at DESC, id DESC`, tenantID, eventName)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			journeyIDs = append(journeyIDs, id)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	createdAll := []Enrollment{}
+	for _, jid := range journeyIDs {
+		created, _, err := s.Enroll(ctx, tenantID, jid, []uuid.UUID{contactID})
+		if err != nil {
+			return nil, nil, err
+		}
+		createdAll = append(createdAll, created...)
+		results = append(results, EventFireResult{JourneyID: jid, Enrolled: len(created) == 1})
+	}
+	return results, createdAll, nil
 }
 
 // ---------------------------------------------------------------------------

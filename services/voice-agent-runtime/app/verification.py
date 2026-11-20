@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,28 @@ def normalize_digits(phone: str) -> str:
     return "".join(ch for ch in str(phone).strip().lower() if ch.isdigit())
 
 
+# SPEC-W88: E.164 shape for the canonical session identity form — 7..15
+# digits, first non-zero (mirrors the booking civic e164 check minus the
+# leading "+", which canonical_e164 re-adds).
+_E164_DIGITS_RE = re.compile(r"^[1-9][0-9]{6,14}$")
+
+
+def canonical_e164(phone: str | None) -> str:
+    """SPEC-W88: canonical session identity form ``+``-prefixed E.164.
+
+    Strips every non-digit (separators, a leading ``+``, ``tel:`` junk),
+    then requires the E.164 shape (7..15 digits, first non-zero). Returns
+    ``"+" + digits`` on success, ``""`` for non-conforming input. No
+    country inference and no national folding (trunk-0 numbers fail the
+    leading-non-zero check) — the W61 G3 ruling stands. WhatsApp wa_id
+    (digits, no ``+``) and telegram/SIP ``+``-forms converge to ONE form
+    so verified_phone/claimed_phone compares are form-independent."""
+    digits = normalize_digits(phone or "")
+    if not _E164_DIGITS_RE.match(digits):
+        return ""
+    return "+" + digits
+
+
 def hash_phone(salt: str, tenant_id: str, phone: str) -> str:
     """K15(f) event hash: HMAC-SHA256(salt, '{tenant}|{digits}') hex.
 
@@ -66,7 +89,7 @@ class OtpResult:
     """Outcome of a portal OTP call, translated for the tool layer."""
 
     ok: bool
-    status: str  # code_sent|verified|invalid_code|rate_limited|unavailable|error
+    status: str  # code_sent|verified|invalid_code|rate_limited|unavailable|error|no_grant
     detail: str = ""
     payload: dict[str, Any] | None = None
 
@@ -167,6 +190,39 @@ class BookingPortalVerifier:
                 False, "rate_limited", "too many attempts — request a new code"
             )
         log.warning("portal verify-code unexpected status", status=resp.status_code)
+        return OtpResult(
+            False, "error", f"booking portal answered {resp.status_code}"
+        )
+
+    async def check_grant(self, phone: str) -> OtpResult:
+        """SPEC-W87: does this contact hold an active verification grant
+        (a genuine portal OTP success within the grant TTL)? The tool
+        layer honors a grant ONLY under its strict anchor rule (PSTN
+        carrier-claimed phone). ok=True/"verified" = active grant;
+        ok=False/"no_grant" = no active grant; "error"/"unavailable" =
+        check failed — callers MUST treat that as no-grant and fall
+        through to the OTP flow (fail-safe)."""
+        if not self.configured:
+            return OtpResult(False, "unavailable", "verification not configured")
+        try:
+            resp = await self._client.post(
+                f"{self._base}/internal/sites/{self._site_slug}/verification/check",
+                json={"phone": phone},
+                headers=self._headers(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("verification check call failed", error=str(exc)[:200])
+            return OtpResult(False, "error", f"booking portal unreachable: {exc}")
+        if resp.status_code == 200:
+            payload: dict[str, Any] = {}
+            try:
+                payload = resp.json()
+            except Exception:  # noqa: BLE001
+                payload = {}
+            if payload.get("verified") is True:
+                return OtpResult(True, "verified", payload=payload)
+            return OtpResult(False, "no_grant")
+        log.warning("verification check unexpected status", status=resp.status_code)
         return OtpResult(
             False, "error", f"booking portal answered {resp.status_code}"
         )

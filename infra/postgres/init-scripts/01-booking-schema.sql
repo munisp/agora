@@ -72,13 +72,18 @@ CREATE TABLE contacts (
 -- installs; existing deployments are migrated idempotently by the
 -- store.ensureContactDedupe bootstrap (folds duplicate rows, re-points
 -- bookings/loan references, then creates this same index).
-CREATE UNIQUE INDEX uq_contacts_tenant_phone ON contacts (tenant_id, phone) WHERE phone IS NOT NULL AND phone <> '';
+-- SPEC-W89: the dedupe key is the pinned W61 G3 DIGITS canonical form
+-- (regexp_replace both sides) — cross-format duplicates ('+234…' vs
+-- '234…') are structurally impossible. Existing databases get the fold +
+-- index swap from store.ensureContactDedupe (contacts_dedupe.go).
+CREATE UNIQUE INDEX uq_contacts_tenant_phone ON contacts (tenant_id, (regexp_replace(regexp_replace(phone,'\D','','g'),'^00',''))) WHERE regexp_replace(regexp_replace(phone,'\D','','g'),'^00','') <> '';
 -- W46-I (P-DATA DDL #11, contacts part): GIN trgm index — crm360 contact
 -- search uses ILIKE '%...%' (crm360/store.go:348) which defeats B-trees.
 -- Plain CREATE INDEX (no CONCURRENTLY): init-db scripts must not use
 -- CONCURRENTLY. EXISTING deployments: converged by coder A's migration +
 -- ensureDDL mirror (W46-A), same pattern as uq_contacts_tenant_phone above.
 CREATE INDEX IF NOT EXISTS idx_contacts_name_trgm ON contacts USING gin (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_contacts_tenant_name_id ON contacts (tenant_id, name, id);
 
 -- Bookings. idempotency_key makes command retries safe.
 CREATE TABLE bookings (

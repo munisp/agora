@@ -111,6 +111,11 @@ func (s *server) listBookings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "invalid internal token")
 			return
 		}
+		// SPEC-W89: the store-level ContactPhone filter is itself
+		// digits-canonical now (bookings.go exception, lead ruling) — the
+		// W88 handler-side contact resolution is REVERTED to the plain
+		// W47 form. The W88 cross-format route test keeps passing through
+		// the store filter.
 		f.ContactPhone = contactPhone
 	}
 	// mine=true: restrict to the caller's own team member, resolved by

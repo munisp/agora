@@ -42,7 +42,9 @@ func (s *server) createContact(w http.ResponseWriter, r *http.Request) {
 		Notes:    req.Notes,
 	}
 	if err := s.d.Store.CreateContact(r.Context(), &c); err != nil {
-		s.internal(w, err)
+		// SPEC-W89: ErrConflict (cross-format duplicate phone) -> 409 via
+		// mapOpError; everything else keeps the 500 path.
+		s.mapOpError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, c)

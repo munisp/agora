@@ -558,6 +558,8 @@ mod tests {
             payout_reconciler_interval_secs: 30,
             money_roles: vec!["owner".to_string(), "admin".to_string()],
             payout_approval_threshold_cents: 0,
+            payout_dfsps: Vec::new(),
+            payout_quote_timeout_ms: 4000,
         };
         AppState {
             ledger: Arc::new(SimLedgerClient::new(0)),
@@ -567,6 +569,7 @@ mod tests {
                 "opendesk.payments.events".to_string(),
             ),
             mojaloop: mojaloop::MojaloopAdapter::new("http://127.0.0.1:1".to_string()),
+            marketplace: crate::marketplace::Marketplace::new(Vec::new(), 4000),
             flutterwave: flutterwave::FlutterwaveAdapter::from_env(),
             config: Arc::new(cfg),
             dlq,
