@@ -40,6 +40,9 @@ class TurnCreate(BaseModel):
     text: str = Field(min_length=1)
     tool_calls: list[dict[str, Any]] | None = None
     audio_url: str | None = None
+    # The English a non-English line was made from (the voice receptionist thinks in English and speaks Yoruba,
+    # Hausa or Igbo): stored as the line's translation, so it is exact instead of re-translated later.
+    translation_en: str | None = Field(default=None, max_length=4000)
 
 
 class Turn(BaseModel):

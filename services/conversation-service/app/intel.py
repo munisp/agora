@@ -220,10 +220,30 @@ def parse_translation(reply: str | None, original: str) -> str | None:
     return t
 
 
+# The receptionist's own fixed lines, translated exactly: a model once rendered the Yoruba recording notice as
+# "We cannot record this call" and the Hausa one as "I can hear this call" (voice-agent call_language.RECORDING_NOTICES).
+_KNOWN_LINES = {
+    "Dis call fit dey recorded.": "This call may be recorded.",
+    "A lè ṣe ìgbàsílẹ̀ ìpè yìí.": "This call may be recorded.",
+    "Ana iya nadar wannan kiran.": "This call may be recorded.",
+    "Enwere ike ịdekọ oku a.": "This call may be recorded.",
+}
+
+
 async def translate_to_english(text: str, cfg: Config, *, client: httpx.AsyncClient | None = None) -> str | None:
     """English translation of one transcript line, or None when it is English already or the model is unavailable."""
     if not cfg.translate_llm_base_url or not (text or "").strip():
         return None
+    stripped = text.strip()
+    for line, english in _KNOWN_LINES.items():
+        if stripped.startswith(line):
+            rest = stripped[len(line):].strip()
+            if not rest:
+                return english
+            translated = await translate_to_english(rest, cfg, client=client)
+            if translated is None:
+                return None  # retried later as a whole
+            return f"{english} {translated or rest}"
     payload = {
         "model": cfg.translate_llm_model,
         "messages": [{"role": "system", "content": _TRANSLATE_SYSTEM}, {"role": "user", "content": text[:2000]}],

@@ -291,6 +291,12 @@ async def add_turn(
         idempotency_key=idempotency_key,
     )
 
+    if created and body.translation_en and body.translation_en.strip():
+        st = _state(request)
+        if hasattr(st.db, "update_turn_translation"):
+            await st.db.update_turn_translation(turn.id, tenant_id, body.translation_en.strip())
+            turn = turn.model_copy(update={"translation_en": body.translation_en.strip()})
+
     # SPEC-W3 §3: Idempotency-Key replay — return the original turn with
     # 200 and do NOT re-publish sink/Dapr/enriched events (exactly-once
     # semantics for the caller).
