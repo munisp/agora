@@ -271,8 +271,19 @@ async fn build_ledger(
 ) -> Result<Arc<dyn LedgerClient>, Box<dyn std::error::Error>> {
     match cfg.ledger_impl.as_str() {
         "sim" => {
+            let sim = SimLedgerClient::new(cfg.platform_fee_bps);
+            // 2026-11-21: with a DSN the sim ledger survives restarts
+            // (ledger/durable.rs); without one it stays in-memory.
+            if let Some(dsn) = &cfg.database_url {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect_with(payouts::pg_connect_options(dsn)?)
+                    .await?;
+                info!(fee_bps = cfg.platform_fee_bps, "using durable sim ledger (state in sim_ledger_state)");
+                return Ok(Arc::new(ledger::durable::DurableSimLedger::open(sim, pool).await?));
+            }
             info!(fee_bps = cfg.platform_fee_bps, "using in-memory sim ledger (ADR-0007)");
-            Ok(Arc::new(SimLedgerClient::new(cfg.platform_fee_bps)))
+            Ok(Arc::new(sim))
         }
         "tigerbeetle" => {
             #[cfg(feature = "tb-live")]

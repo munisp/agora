@@ -25,6 +25,7 @@
 //! rule (see the note in `sim.rs`).
 
 pub mod sim;
+pub mod durable;
 #[cfg(feature = "tb-live")]
 pub mod tigerbeetle;
 

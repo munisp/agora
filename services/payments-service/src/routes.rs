@@ -457,7 +457,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/transfers", post(transfer))
         .route("/v1/no-show-fee", post(no_show_fee))
         .route("/v1/accounts/:tenant_id/balance", get(balance))
-        .route("/v1/payouts", post(payout))
+        .route("/v1/payouts", post(payout).get(list_payouts))
         .route("/v1/payouts/:id/approve", post(approve_payout))
         // SPEC-W99 C1/C2: read-only DFSP quote marketplace + reconciliation
         // report (no ledger writes, no transfer sends).
@@ -1291,6 +1291,37 @@ async fn list_beneficiaries(
         .list_beneficiaries(&params.tenant_id)
         .await
         .map_err(|e| ApiError::bad_gateway(format!("beneficiary store error: {e}")))?;
+    Ok(Json(list))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PayoutListParams {
+    pub tenant_id: String,
+    /// Optional state filter (e.g. pending_approval).
+    pub state: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// GET /v1/payouts?tenant_id=&state=&limit= (2026-11-21) — the tenant's
+/// payout attempts, newest first. Same guard as the beneficiary list; the
+/// Billing approval queue loads pending_approval rows from here, so it
+/// survives a reload and shows payouts requested anywhere.
+async fn list_payouts(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<PayoutListParams>,
+) -> Result<Json<Vec<PayoutAttempt>>, ApiError> {
+    require_safe_tenant(&params.tenant_id)?;
+    require_money_mutation(&st, &headers, &params.tenant_id)?;
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let mut list = st
+        .payout_attempts
+        .list_recent_scoped(&params.tenant_id, limit)
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("payout attempt list failed: {e}")))?;
+    if let Some(state) = params.state.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        list.retain(|a| a.state.as_str() == state);
+    }
     Ok(Json(list))
 }
 
