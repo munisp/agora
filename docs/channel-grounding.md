@@ -47,12 +47,26 @@ selection triggers a KB lookup:
 Config: `KNOWLEDGE_APP_ID`, `USSD_KB_GROUNDING` (default on),
 `USSD_KB_TIMEOUT_S`, `USSD_KB_MAX_REPLY_CHARS`, `USSD_KB_MAX_SNIPPETS`.
 
+## Per-turn grounding (W109)
+
+`/voice/chat` (web chat + the WhatsApp/Telegram bridges) now grounds EACH
+turn: the post-translation user message becomes the `/v1/context` query
+(turn snippets lead the bootstrap snippets in the system prompt, deduped,
+capped at `knowledge_snippet_count`). Best-effort under
+`KNOWLEDGE_TURN_TIMEOUT_S` (default 1.5s): any error/timeout/empty result
+keeps the bootstrap grounding, and a turn never fails on grounding.
+`KNOWLEDGE_TURN_QUERIES=0` restores bootstrap-only behavior.
+
+The LiveKit REALTIME voice path is deliberately unchanged: its per-utterance
+latency budget is sub-second and the prompt is built at session start; the
+`knowledge_search` slow tool (filler ack + 4s tool timeout) covers explicit
+lookups there.
+
 ## Honest limits
 
-- The voice knowledge leg runs once per tenant-context TTL with a STATIC
-  bootstrap query (`KNOWLEDGE_QUERY`, default "opening hours services
-  pricing") — it grounds the session persona, not each turn. Per-turn
-  grounding queries are a separate wave.
+- The bootstrap knowledge leg still runs once per tenant-context TTL with
+  the static `KNOWLEDGE_QUERY` — it grounds the session persona; per-turn
+  relevance comes from W109.
 - USSD answers are raw KB text, not LLM-composed — good for facts (hours,
   pricing, policies), terse by design. LLM compression is a documented
   follow-up.

@@ -419,6 +419,13 @@ class Settings:
     # Session bootstrap
     knowledge_snippet_count: int = 3
     knowledge_query: str = "opening hours services pricing"
+    # SPEC-W109: per-turn knowledge queries on the chat path (the bootstrap
+    # query above grounds the session persona; these ground EACH turn's
+    # message). Default ON; KNOWLEDGE_TURN_QUERIES=0 restores pre-W109
+    # bootstrap-only grounding. The fetch is best-effort under a tight
+    # budget — a turn never fails on grounding.
+    knowledge_turn_queries: bool = True
+    knowledge_turn_timeout_s: float = 1.5
     http_timeout_s: float = 15.0
 
     # SPEC-W46 P1/P2: tenant-context TTL cache (VOICE_TENANT_CTX_TTL_S,
@@ -743,6 +750,9 @@ def load_settings() -> Settings:
         in ("1", "true", "yes", "on"),
         knowledge_snippet_count=_env_int("KNOWLEDGE_SNIPPET_COUNT", 3),
         knowledge_query=_env("KNOWLEDGE_QUERY", "opening hours services pricing"),
+        knowledge_turn_queries=_env("KNOWLEDGE_TURN_QUERIES", "on").lower()
+        in ("1", "on", "true", "yes"),
+        knowledge_turn_timeout_s=float(_env("KNOWLEDGE_TURN_TIMEOUT_S", "1.5")),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
         tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),
         tenant_ctx_stale_s=_env_int("VOICE_TENANT_CTX_STALE_S", 300),

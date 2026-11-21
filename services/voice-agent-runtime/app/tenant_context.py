@@ -237,6 +237,64 @@ def _cache_store(site_slug: str, ctx: TenantContext, ttl_s: float, stale_s: floa
         _ctx_cache.popitem(last=False)
 
 
+def _parse_kb_snippets(payload: Any, count: int) -> list[str]:
+    """Normalize a knowledge-service /v1/context payload to snippet strings.
+
+    Shared by the bootstrap leg and the W109 per-turn fetch: accepts the
+    {snippets: [...]} shape (or {results: [...]} / a bare list), dict items
+    reading content/text/title, capped at `count`.
+    """
+    items: list[Any] = []
+    if isinstance(payload, dict):
+        items = payload.get("snippets") or payload.get("results") or []
+    elif isinstance(payload, list):
+        items = payload
+    out: list[str] = []
+    for item in items[:count]:
+        if isinstance(item, dict):
+            text = item.get("content") or item.get("text") or item.get("title")
+        else:
+            text = str(item)
+        if text:
+            out.append(str(text))
+    return out
+
+
+async def fetch_turn_knowledge(
+    dapr: DaprClient,
+    settings: Settings,
+    tenant_slug: str,
+    query: str,
+    *,
+    timeout_s: float,
+) -> list[str]:
+    """SPEC-W109: per-turn knowledge grounding for the chat path.
+
+    Same /v1/context contract as the bootstrap leg (params + W108 binding
+    header), but q is THIS turn's message instead of the static bootstrap
+    query. Best-effort by contract: any error, an empty query, or a timeout
+    over the turn budget returns [] — a chat turn NEVER fails on grounding.
+    """
+    if not query.strip():
+        return []
+    try:
+        kb = await asyncio.wait_for(
+            dapr.invoke_get(
+                settings.knowledge_app_id,
+                "v1/context",
+                params={"tenant": tenant_slug, "q": query},
+                headers={"X-Tenant-Slugs": tenant_slug},
+            ),
+            timeout=timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - grounding is best-effort
+        log.warning(
+            "turn knowledge fetch failed", slug=tenant_slug, error=str(exc)[:200]
+        )
+        return []
+    return _parse_kb_snippets(kb, settings.knowledge_snippet_count)
+
+
 async def fetch_tenant_context(
     dapr: DaprClient, settings: Settings, site_slug: str
 ) -> TenantContext:
@@ -348,18 +406,9 @@ async def _fetch_tenant_context_uncached(
                 # via /voice/chat) was dead with only a warning log.
                 headers={"X-Tenant-Slugs": tenant_slug},
             )
-            items = []
-            if isinstance(kb, dict):
-                items = kb.get("snippets") or kb.get("results") or []
-            elif isinstance(kb, list):
-                items = kb
-            for item in items[: settings.knowledge_snippet_count]:
-                if isinstance(item, dict):
-                    text = item.get("content") or item.get("text") or item.get("title")
-                else:
-                    text = str(item)
-                if text:
-                    ctx.knowledge_snippets.append(str(text))
+            ctx.knowledge_snippets.extend(
+                _parse_kb_snippets(kb, settings.knowledge_snippet_count)
+            )
         except Exception as exc:  # noqa: BLE001 - grounding is optional
             log.warning("knowledge context fetch failed", slug=tenant_slug, error=str(exc))
 

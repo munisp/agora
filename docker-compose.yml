@@ -923,6 +923,11 @@ services:
     - path: .env
       required: false
     environment:
+      # SPEC-W109: per-turn KB grounding on /voice/chat (default on; the
+      # fetch is best-effort under a 1.5s budget — a turn never fails on
+      # grounding).
+      KNOWLEDGE_TURN_QUERIES: ${KNOWLEDGE_TURN_QUERIES:-on}
+      KNOWLEDGE_TURN_TIMEOUT_S: ${KNOWLEDGE_TURN_TIMEOUT_S:-1.5}
       DAPR_HOST: daprd-voice
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
