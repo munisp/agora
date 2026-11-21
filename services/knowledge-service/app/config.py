@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     # (IDENTITY_INTERNAL_TOKEN env; empty = header not sent).
     identity_internal_token: str = ""
 
+    # Document intelligence (SPEC-W107): docling doc-intel sidecar is the
+    # ONLY extraction engine for POST /v1/documents/upload. No local
+    # fallback parser — sidecar down => 503, never silent text-only.
+    doc_intel_url: str = "http://doc-intel:5001"
+    doc_intel_api_key: str = ""  # X-Api-Key when the sidecar sets DOCLING_SERVE_API_KEY
+    doc_intel_timeout_s: float = 300.0
+    doc_intel_max_bytes: int = 10 * 1024 * 1024  # decoded upload ceiling -> 413
+    doc_intel_max_chars: int = 1_000_000  # extracted-text ceiling -> 413
+
     # Text-to-SQL (SPEC-W3 §3, innovation 8): OpenAI-compatible LLM
     # (default qwen3:8b via Ollama) + Trino HTTP API.
     llm_base_url: str = "http://ollama:11434/v1"

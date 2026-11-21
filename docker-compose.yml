@@ -1123,6 +1123,12 @@ services:
       # as the identity block; prod MUST set via the secrets store.
       IDENTITY_INTERNAL_TOKEN: ${IDENTITY_INTERNAL_TOKEN:-opendesk-dev-identity-internal-token-change-in-prod}
       EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      # SPEC-W107: docling doc-intel sidecar (OPTIONAL overlay
+      # infra/compose/doc-intel.compose.yml). Upload endpoint 503s honestly
+      # when the sidecar is absent — no silent text-only fallback.
+      DOC_INTEL_URL: ${DOC_INTEL_URL:-http://doc-intel:5001}
+      DOC_INTEL_API_KEY: ${DOC_INTEL_API_KEY:-}
+      DOC_INTEL_TIMEOUT_S: ${DOC_INTEL_TIMEOUT_S:-300}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

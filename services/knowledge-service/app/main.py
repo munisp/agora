@@ -2,6 +2,7 @@
 
 Routes:
   POST   /v1/documents          ingest: store, chunk (~500 tokens), embed, bulk index
+  POST   /v1/documents/upload   file ingest via docling doc-intel sidecar (SPEC-W107)
   GET    /v1/documents          tenant-scoped document list from Postgres (SPEC-W47)
   DELETE /v1/documents/{id}     delete doc + chunks from Postgres and OpenSearch
   GET    /v1/search             hybrid BM25 + kNN with reciprocal rank fusion
@@ -14,6 +15,8 @@ Routes:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -29,6 +32,12 @@ from .chunking import chunk_text
 from .config import settings
 from .dapr_client import DaprClient
 from .db import Database, bind_tenant_value, parse_tenant_slugs, resolve_tenant_id
+from .docintel import (
+    DocIntelClient,
+    DocIntelEmpty,
+    DocIntelRejected,
+    DocIntelUnavailable,
+)
 from .embeddings import Embedder
 from .logging import configure_logging, get_logger
 from .rrf import reciprocal_rank_fusion
@@ -45,11 +54,27 @@ class IngestRequest(BaseModel):
     source_url: str | None = None
 
 
+# SPEC-W107: extensions the docling doc-intel sidecar can convert. Images go
+# through the OCR path (RapidOCR / PaddleOCR ONNX models).
+ALLOWED_UPLOAD_EXTENSIONS = frozenset({
+    "pdf", "docx", "pptx", "xlsx", "html", "htm", "md", "txt",
+    "asciidoc", "adoc", "png", "jpg", "jpeg", "tiff", "tif",
+})
+
+
+class UploadRequest(BaseModel):
+    tenant: str = Field(..., description="tenant slug or UUID")
+    filename: str = Field(..., min_length=1, max_length=255)
+    content_base64: str = Field(..., min_length=1)
+    title: str | None = None
+
+
 class AppState:
     db: Database
     search: SearchStore
     embedder: Embedder
     dapr: DaprClient
+    docintel: DocIntelClient
 
 
 def get_state(request: Request) -> AppState:
@@ -87,6 +112,11 @@ async def lifespan(app: FastAPI):
     )
     deps.embedder = Embedder(settings.embed_model, settings.sentence_transformers_home)
     deps.dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
+    deps.docintel = DocIntelClient(
+        settings.doc_intel_url,
+        api_key=settings.doc_intel_api_key,
+        timeout_s=settings.doc_intel_timeout_s,
+    )
     await deps.db.connect()
     # SPEC-W3 §4 innovation 4: kb_suggestions bootstrap DDL (idempotent).
     try:
@@ -190,6 +220,65 @@ async def ingest_document(
 ):
     tenant_id = await _bound_tenant_id(request, req.tenant, deps)
     return await _ingest_document(deps, tenant_id, req.title, req.body, req.source_url)
+
+
+@app.post("/v1/documents/upload", status_code=201)
+async def upload_document(
+    req: UploadRequest, request: Request, deps: AppState = Depends(get_state)
+):
+    """SPEC-W107: binary document ingest via the docling doc-intel sidecar.
+
+    The sidecar (docling layout-aware parsing; RapidOCR/PaddleOCR models for
+    scanned content; tables -> Markdown) is the ONLY extraction engine. There
+    is no silent local fallback: sidecar down -> 503, conversion refused or
+    empty -> 422, oversized -> 413, unsupported type -> 415.
+    """
+    ext = req.filename.rsplit(".", 1)[-1].lower() if "." in req.filename else ""
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"unsupported file type '.{ext or '(none)'}'; allowed: "
+                f"{sorted(ALLOWED_UPLOAD_EXTENSIONS)}"
+            ),
+        )
+    try:
+        data = base64.b64decode(req.content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid base64: {exc}") from exc
+    if len(data) > settings.doc_intel_max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"decoded upload is {len(data)} bytes; limit is "
+                f"{settings.doc_intel_max_bytes}"
+            ),
+        )
+    tenant_id = await _bound_tenant_id(request, req.tenant, deps)
+    try:
+        extraction = await deps.docintel.convert(req.filename, data)
+    except DocIntelUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (DocIntelRejected, DocIntelEmpty) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if len(extraction.text) > settings.doc_intel_max_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"extracted text is {len(extraction.text)} chars; limit is "
+                f"{settings.doc_intel_max_chars}"
+            ),
+        )
+    title = req.title or req.filename.rsplit(".", 1)[0]
+    result = await _ingest_document(
+        deps, tenant_id, title, extraction.text, f"upload:{req.filename}"
+    )
+    result["extraction"] = {
+        "engine": "docling",
+        "processing_time_s": extraction.processing_time_s,
+        "chars": len(extraction.text),
+    }
+    return result
 
 
 @app.get("/v1/documents")

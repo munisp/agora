@@ -10,6 +10,10 @@ sentence-transformers (`all-MiniLM-L6-v2`, 384-dim) + OpenSearch.
   approximation, 375 words ≈ 500 tokens, 64-word overlap), embed with
   `all-MiniLM-L6-v2`, bulk-index into OpenSearch `kb-chunks` (knn_vector, HNSW/lucene,
   cosinesimil).
+- `POST /v1/documents/upload` — binary file ingest (SPEC-W107): JSON base64 upload
+  converted by the docling doc-intel sidecar (layout-aware Markdown, RapidOCR for
+  scanned content) and fed through the same ingest pipeline. 400/403/413/415/422/503
+  taxonomy, formats, limits and runbook: `docs/document-intelligence.md`.
 - `DELETE /v1/documents/{id}?tenant=` — delete doc + chunks (Postgres cascade) and
   delete-by-query in OpenSearch.
 - `GET /v1/search?q=&tenant=&k=` — hybrid search: BM25 (`multi_match` on content/title)
@@ -23,6 +27,16 @@ sentence-transformers (`all-MiniLM-L6-v2`, 384-dim) + OpenSearch.
 invocation to identity-service `GET /v1/tenants/{slug}` — callers never pass tenant
 IDs obtained from a model. RLS is enforced by setting `app.tenant_id` per transaction
 (`SET LOCAL` via `app/db.py`).
+
+### SPEC-W107 upload settings
+
+| Var | Default | Description |
+|---|---|---|
+| DOC_INTEL_URL | http://doc-intel:5001 | docling doc-intel sidecar base URL |
+| DOC_INTEL_API_KEY | (empty) | X-Api-Key for the sidecar (matches DOCLING_SERVE_API_KEY) |
+| DOC_INTEL_TIMEOUT_S | 300 | conversion timeout (>= sidecar sync wait) |
+| DOC_INTEL_MAX_BYTES | 10485760 | decoded upload ceiling (413) |
+| DOC_INTEL_MAX_CHARS | 1000000 | extracted-text ceiling (413) |
 
 ## Environment variables
 
