@@ -81,7 +81,9 @@ GET    /healthz     → {"status": "ok", "mock": true, "voices": N, ...}
 - `language` ∈ CosyVoice-2 base-model languages `en, zh, ja, ko, yue`
   (+ cross-lingual) — 400 otherwise. **pcm/yo/ha/ig are not covered by the
   base model**; the Naija-TTS pcm fine-tune corpus is the candidate path
-  (pre-use license gate — see `docs/voice-licensing.md`). Fine-tuned
+  (pre-use license gate — see `docs/voice-licensing.md`). Corpus collection,
+  consent, QA, and training-manifest export for that track run through the
+  voice-corpus service (SPEC-W103 — see `docs/voice-corpus.md`). Fine-tuned
   languages can be recorded per voice via the enrollment `languages` field.
 - Same bounds as xtts-tts: unknown `voice_id` → 404; invalid base64 / tiny
   samples (<1000 bytes decoded) → 400; >50 MB decoded → 413; text 1–5000

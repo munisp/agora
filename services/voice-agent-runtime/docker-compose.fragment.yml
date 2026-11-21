@@ -101,6 +101,30 @@ services:
       timeout: 5s
       retries: 3
 
+  # voice-corpus (SPEC-W103 C2): commissioned native-speaker corpus
+  # registry + QA + training-manifest export — the fine-tune READINESS
+  # scaffold (data infrastructure for the CosyVoice-2 Naija-TTS track and
+  # any future LongCat spike). Pure data plumbing: no model, no GPU, no mock
+  # mode. Deliberately NOT part of the realtime voice path: opt-in profile
+  # "corpus", no watchdog target, no worker env — nothing at serving time
+  # consumes it. Consent is fail-closed at enrollment (services/voice-corpus).
+  voice-corpus:
+    build:
+      context: ../voice-corpus
+    image: opendesk/voice-corpus:dev
+    profiles: ["corpus"]
+    networks: [opendesk]
+    environment:
+      CORPUS_DIR: /data
+      CORPUS_LANGUAGES: ${CORPUS_LANGUAGES:-pcm,yo,ha,ig,en}
+    volumes:
+      - voice-corpus-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5840/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # Qwen3-TTS GPU-tier TTS server (SPEC-W74 A1, nari-labs/nari-qwen3-tts,
   # Apache-2.0). The published image IS the sidecar — the voice runtime's
   # `qwen3` provider POSTs OpenAI-shaped /v1/audio/speech directly to it.
@@ -325,6 +349,7 @@ volumes:
   whisper-models:
   cosyvoice-data:
   longcat-data:
+  voice-corpus-data:
   qwen3-cache:
 
 networks:
