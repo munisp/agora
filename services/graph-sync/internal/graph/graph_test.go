@@ -219,3 +219,52 @@ func TestParseQueryResult(t *testing.T) {
 	require.Equal(t, "p1", rows[0]["person_id"])
 	require.Equal(t, "2026-08-05T12:00:00Z", rows[0]["processed_at"])
 }
+
+// FalkorDB v4.x sends a non-compact query's header as plain column names (graph-sync dead-lettered every event on
+// v4.22 when only the [type, name] form was accepted).
+func TestParseQueryResultPlainHeader(t *testing.T) {
+	reply := []any{
+		[]any{"person_id", "processed_at"},
+		[]any{[]any{"p1", "2026-11-20T12:00:00Z"}},
+		[]any{"Cached execution: 0"},
+	}
+	rows, err := parseQueryResult(reply)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "2026-11-20T12:00:00Z", rows[0]["processed_at"])
+	_, err = parseQueryResult([]any{[]any{int64(7)}, []any{}})
+	require.Error(t, err)
+}
+
+// 2026-11-20: a write with no RETURN replies with only its statistics.
+func TestParseQueryResultStatsOnly(t *testing.T) {
+	rows, err := parseQueryResult([]any{[]any{"Nodes created: 1", "Query internal execution time: 0.1 milliseconds"}})
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("stats-only reply: rows=%v err=%v", rows, err)
+	}
+}
+
+// 2026-11-21: a late BookingCreated must not overwrite a newer status.
+func TestUpsertBookingInitialStatusOnlyOnCreate(t *testing.T) {
+	q := upsertBookingQuery(Booking{TenantID: "t", BookingID: "b", Status: "pending", StatusInitial: true}, "p")
+	if !strings.Contains(q.text, "ON CREATE SET b.created_at = $created_at, b.booked_at = $booked_at, b.status = $status") ||
+		strings.Contains(q.text, "\nSET b.status") {
+		t.Fatalf("initial-only status must be ON CREATE only:\n%s", q.text)
+	}
+	q = upsertBookingQuery(Booking{TenantID: "t", BookingID: "b", Status: "confirmed"}, "p")
+	if !strings.Contains(q.text, "SET b.status = $status") {
+		t.Fatalf("lifecycle status must always apply:\n%s", q.text)
+	}
+}
+
+// 2026-11-21: GPS-only captures get their own Location per ~100 m cell.
+func TestCaptureLocationCellForGPSOnly(t *testing.T) {
+	q := captureLocationQuery(Contact{TenantID: "t", LeadID: "l1", Lat: 6.456, Lon: 3.388})
+	if !strings.Contains(q.text, "cell: $cell") || q.params["cell"] != "6.456,3.388" {
+		t.Fatalf("GPS-only capture must key on its cell: %v\n%s", q.params["cell"], q.text)
+	}
+	q = captureLocationQuery(Contact{TenantID: "t", LeadID: "l2", LGA: "Ikeja", Lat: 6.6, Lon: 3.3})
+	if strings.Contains(q.text, "cell: $cell") || !strings.Contains(q.text, "lga: $lga, ward: $ward") {
+		t.Fatalf("LGA captures keep the lga/ward key:\n%s", q.text)
+	}
+}

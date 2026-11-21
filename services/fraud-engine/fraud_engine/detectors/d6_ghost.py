@@ -1,4 +1,6 @@
 """D6 ghost_booking (SPEC-W30 §3, fraud pattern F5).
+2026-11-21: create->cancel is measured from booked_at (when the booking was made; graph-sync sets it)
+when present - created_at on Booking nodes is the appointment start.
 
 >= GHOST_MIN (3) bookings created AND cancelled within GHOST_WINDOW_MIN (10)
 by the same staff member in a single day => medium. (The secondary F5
@@ -18,9 +20,9 @@ CYPHER = """
 // detector:d6_ghost_booking
 MATCH (b:Booking {tenant_id:$tenant_id})
 WHERE b.created_by IS NOT NULL AND b.status = 'cancelled'
-  AND b.cancelled_at IS NOT NULL AND b.created_at >= $since
+  AND b.cancelled_at IS NOT NULL AND coalesce(b.booked_at, b.created_at) >= $since
 RETURN b.created_by AS staff, b.booking_id AS booking_id,
-       b.created_at AS created_at, b.cancelled_at AS cancelled_at
+       coalesce(b.booked_at, b.created_at) AS created_at, b.cancelled_at AS cancelled_at
 """
 
 

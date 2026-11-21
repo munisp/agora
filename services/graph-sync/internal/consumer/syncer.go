@@ -152,10 +152,12 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 	if err != nil {
 		return err
 	}
-	status := d.Status
-	if evt.Type == events.TypeBookingNoShow {
-		status = "no_show"
-	}
+	// 2026-11-21: the status comes from the event TYPE. booking-service
+	// marshals the row as it was before the change (a BookingConfirmed
+	// carries status "pending"), and events for one booking land on
+	// different partitions, so a late BookingCreated must not overwrite a
+	// newer status (initialOnly: set only when the node is created).
+	status, initialOnly := bookingStatusFor(evt.Type, d.Status)
 	showed := d.Showed
 	if evt.Type == events.TypeBookingNoShow && showed == nil {
 		f := false
@@ -173,15 +175,17 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 		cancelledAt = &t
 	}
 	return s.Graph.UpsertBooking(ctx, graph.Booking{
-		BookingID:    d.BookingID,
-		TenantID:     tenantID,
-		Status:       status,
-		OfferingID:   d.OfferingID,
-		OfferingName: d.OfferingName,
-		CreatedAt:    orEventTime(d.StartsAt, evt, s.now()),
-		Showed:       showed,
-		CreatedBy:    createdBy,
-		CancelledAt:  cancelledAt,
+		BookingID:     d.BookingID,
+		TenantID:      tenantID,
+		Status:        status,
+		OfferingID:    d.OfferingID,
+		OfferingName:  d.OfferingName,
+		CreatedAt:     orEventTime(d.StartsAt, evt, s.now()),
+		BookedAt:      orEventTime(time.Time{}, evt, s.now()),
+		StatusInitial: initialOnly,
+		Showed:        showed,
+		CreatedBy:     createdBy,
+		CancelledAt:   cancelledAt,
 	}, personID)
 }
 
@@ -917,4 +921,24 @@ func orEventTime(t time.Time, evt events.CloudEvent, def time.Time) time.Time {
 		return evt.Time.UTC()
 	}
 	return def.UTC()
+}
+
+// bookingStatusFor maps a booking event to the status it establishes.
+// initialOnly=true means the status only applies to a node created by this
+// event (BookingCreated / BookingRescheduled do not move the lifecycle).
+func bookingStatusFor(eventType, payloadStatus string) (status string, initialOnly bool) {
+	switch eventType {
+	case events.TypeBookingConfirmed:
+		return "confirmed", false
+	case events.TypeBookingCancelled:
+		return "cancelled", false
+	case events.TypeBookingCompleted:
+		return "completed", false
+	case events.TypeBookingNoShow:
+		return "no_show", false
+	}
+	if payloadStatus == "" {
+		payloadStatus = "pending"
+	}
+	return payloadStatus, true
 }

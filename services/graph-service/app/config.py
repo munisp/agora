@@ -61,6 +61,8 @@ class Settings:
     # X-Internal-Token header must equal this value (constant-time compare).
     # Empty -> every internal call answers 401 (fail-closed).
     internal_token: str = field(default_factory=lambda: os.getenv("INTERNAL_TOKEN", ""))
+    # identity-service, to turn the gateway's X-Tenant-Slugs into the business's tenant uuid (empty = off)
+    identity_url: str = field(default_factory=lambda: os.getenv("IDENTITY_URL", "http://identity:7001"))
 
     # SPEC-W33 §2 A2 graph export: salt for the W28 sha256(salt|tenant|id)
     # person-identifier hash — SAME env var and scheme as graph-sync

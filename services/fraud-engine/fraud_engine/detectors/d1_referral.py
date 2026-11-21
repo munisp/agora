@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from ..config import Settings
-from ..graph import GraphClient
+from ..graph import GraphClient, as_list
 from .base import Detector, Finding
 
 CYPHER_TEMPLATE = """
@@ -56,7 +56,7 @@ class ReferralCycleDetector(Detector):
         # Dedup rotations of the same ring.
         cycles: dict[tuple[str, ...], int] = {}
         for row in rows:
-            members = [str(m) for m in (row.get("cycle") or [])]
+            members = [str(m) for m in as_list(row.get("cycle"))]
             hops = int(row.get("hops") or len(members))
             # nodes(path) closes the ring by repeating the start node —
             # drop it before canonical rotation.

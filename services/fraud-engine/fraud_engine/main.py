@@ -120,7 +120,15 @@ def create_app(
         await asyncio.sleep(5)  # let the graph warm up after boot
         while not state["stop"].is_set():
             try:
-                await asyncio.to_thread(run_and_record)
+                report = await asyncio.to_thread(run_and_record)
+                # 2026-11-21: one summary line per sweep (it was silent, so a
+                # stalled or empty sweep was indistinguishable from a clean one).
+                log.warning(
+                    "sweep done: tenants=%d findings=%d alerts_created=%d deduped=%d errors=%d%s",
+                    len(report.tenants), report.findings, report.alerts_created,
+                    report.alerts_deduped, len(report.errors),
+                    (" first_error=" + report.errors[0][:200]) if report.errors else "",
+                )
             except Exception as exc:  # noqa: BLE001
                 log.error("sweep failed: %s", exc)
             await asyncio.sleep(settings.sweep_minutes * 60)
