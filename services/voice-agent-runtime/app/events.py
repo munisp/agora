@@ -21,6 +21,7 @@ def session_lifecycle_data(
     site_slug: str,
     quality: dict[str, Any] | None = None,
     agent_id: str | None = None,
+    direction: str | None = None,
 ) -> dict[str, Any]:
     """Data payload for SessionStarted/SessionEnded events.
 
@@ -44,6 +45,10 @@ def session_lifecycle_data(
         data["agentId"] = agent_id
     if quality:
         data["quality"] = quality
+    # SPEC-W101 C4: "outbound" marks platform-dialed calls; absent on the
+    # inbound/web paths so pre-W101 consumers keep the exact same shape.
+    if direction:
+        data["direction"] = direction
     return data
 
 

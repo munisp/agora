@@ -29,6 +29,7 @@ command -v lk >/dev/null 2>&1 || {
 }
 
 LK=(lk --url "$LK_URL" --api-key "$LK_KEY" --api-secret "$LK_SECRET")
+OUTBOUND_CONFIG="${OUTBOUND_CONFIG:-$HERE/outbound-trunk-config.example.yaml}"
 
 echo "==> creating SIP inbound trunk from $TRUNK_CONFIG"
 "${LK[@]}" sip inbound create "$TRUNK_CONFIG"
@@ -36,9 +37,17 @@ echo "==> creating SIP inbound trunk from $TRUNK_CONFIG"
 echo "==> creating SIP dispatch rule from $DISPATCH_CONFIG"
 "${LK[@]}" sip dispatch create "$DISPATCH_CONFIG"
 
+# SPEC-W101 C1: outbound trunk (platform-dialed calls). Skipped when the
+# config is absent, so the script stays inbound-safe for old checkouts.
+if [ -f "$OUTBOUND_CONFIG" ]; then
+  echo "==> creating SIP outbound trunk from $OUTBOUND_CONFIG"
+  "${LK[@]}" sip outbound create "$OUTBOUND_CONFIG"
+fi
+
 echo "==> verifying"
 "${LK[@]}" sip inbound list
 "${LK[@]}" sip dispatch list
+"${LK[@]}" sip outbound list 2>/dev/null || true
 
 cat <<'EOF'
 
@@ -49,4 +58,9 @@ Done. Next steps:
        TENANT_PHONE_MAP='{"+15551234567":"acme"}'  (see docs/telephony.md)
   3. Call the number — the room `call-{number}` is dispatched to the
      receptionist agent.
+  4. OUTBOUND (SPEC-W101): copy the created outbound trunk id from
+     `lk sip outbound list` into OUTBOUND_TRUNK_ID on the voice worker,
+     then POST /v1/calls (X-Internal-Token) dials out. Every call start is
+     token-bucket paced at OUTBOUND_CPS (default 1/s) — set it at or below
+     the carrier's CPS limit, in writing, before any campaign.
 EOF
