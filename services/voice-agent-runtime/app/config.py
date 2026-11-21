@@ -578,6 +578,12 @@ class Settings:
     # provider via the longcat-tts sidecar — ZH+EN only (NOT a Nigerian
     # language path); zero-shot cloning needs the sample transcript.
     longcat_tts_url: str = "http://longcat-tts:5830"
+    # SPEC-W106 C3: runtime prosody layer (chain-level time-stretch, join
+    # pads, sample-rate normalization). OFF by default — pre-W106 audio is
+    # bit-identical until TTS_PROSODY is switched on (house opt-in idiom,
+    # same as VOICEPRINTS / INTEL_LLM). Map: "pcm:0.95:120,yo:0.95:120".
+    tts_prosody: bool = False
+    tts_prosody_map: str = ""
     # SPEC-W74 A1: Qwen3-TTS (nari-labs/nari-qwen3-tts) GPU-tier provider —
     # the published image IS the sidecar (OpenAI-shaped /v1/audio/speech).
     # Requires an NVIDIA H100; engine tested with English as the primary
@@ -780,6 +786,8 @@ def load_settings() -> Settings:
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
         longcat_tts_url=_env("LONGCAT_TTS_URL", "http://longcat-tts:5830"),
+        tts_prosody=_env("TTS_PROSODY", "off").lower() in ("1", "on", "true", "yes"),
+        tts_prosody_map=_env("TTS_PROSODY_MAP", ""),
         qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
         qwen3_tts_model=_env("QWEN3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
         qwen3_tts_voice=_env("QWEN3_TTS_VOICE", "ryan"),

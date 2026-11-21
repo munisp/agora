@@ -17,6 +17,10 @@ e2e-testable with **zero model downloads and no GPU**. Heavy deps
 (torch/transformers/Coqui TTS/CosyVoice/LongCat AudioDiT) are imported
 lazily and only when mock mode is off.
 
+> Per-language speaking-rate, sentence-join pads, and sample-rate
+> normalization live in the runtime **prosody layer** (SPEC-W106, default
+> OFF) — see `docs/voice-prosody.md`.
+
 ## Run
 
 ```bash
