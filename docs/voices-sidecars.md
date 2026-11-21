@@ -128,7 +128,10 @@ GET    /healthz     → {"status": "ok", "mock": true, "voices": N, ...}
 - LongCat-AudioDiT is **MIT for BOTH code and weights (commercial-safe)** —
   Meituan's waveform-latent diffusion TTS with SOTA zero-shot similarity
   (SIM 0.818 ZH / 0.786 EN on the 3.5B-param benchmark). 1B checkpoint
-  ≈2.5 GB; real inference wants ≥8 GB VRAM.
+  ≈2.5 GB; real inference wants ≥8 GB VRAM. A possible pcm/yo fine-tune is
+  a HARD-GATED experiment scaffold (SPEC-W105 — see
+  `docs/longcat-pcm-yo-spike.md`); nothing about it changes the en/zh-only
+  production scope of this sidecar today.
 
 ## Qwen3-TTS GPU server (SPEC-W74 — nari-labs/nari-qwen3-tts)
 

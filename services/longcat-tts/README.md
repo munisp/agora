@@ -23,7 +23,10 @@ drop-in sibling of `cosyvoice`.
 
 - **Languages: English + Chinese ONLY** (the model's benchmarked coverage).
   This is NOT a Nigerian-language (pcm/yo/ha/ig) path — Spitch/MMS remain
-  those routes; `pcm` etc. are rejected 400.
+  those routes; `pcm` etc. are rejected 400. (A possible pcm/yo fine-tune
+  is a HARD-GATED experiment scaffold only — see
+  `docs/longcat-pcm-yo-spike.md` and `scripts/spike_prepare.py`,
+  SPEC-W105.)
 - **Cloning needs the transcript.** Zero-shot cloning concatenates
   `prompt_text + gen_text` and feeds the enrolled sample as prompt audio.
   Enroll WITHOUT `prompt_text` and the real path falls back to plain
