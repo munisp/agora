@@ -426,6 +426,9 @@ class Settings:
     # budget — a turn never fails on grounding.
     knowledge_turn_queries: bool = True
     knowledge_turn_timeout_s: float = 1.5
+    # SPEC-W112: cap distinct tenant label values on grounding metrics;
+    # tenants beyond the cap aggregate under tenant="overflow".
+    grounding_metrics_max_tenants: int = 100
     http_timeout_s: float = 15.0
 
     # SPEC-W46 P1/P2: tenant-context TTL cache (VOICE_TENANT_CTX_TTL_S,
@@ -753,6 +756,7 @@ def load_settings() -> Settings:
         knowledge_turn_queries=_env("KNOWLEDGE_TURN_QUERIES", "on").lower()
         in ("1", "on", "true", "yes"),
         knowledge_turn_timeout_s=float(_env("KNOWLEDGE_TURN_TIMEOUT_S", "1.5")),
+        grounding_metrics_max_tenants=_env_int("GROUNDING_METRICS_MAX_TENANTS", 100),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
         tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),
         tenant_ctx_stale_s=_env_int("VOICE_TENANT_CTX_STALE_S", 300),

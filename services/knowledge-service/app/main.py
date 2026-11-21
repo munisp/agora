@@ -139,6 +139,13 @@ async def lifespan(app: FastAPI):
         await deps.db.ensure_upload_jobs_table()
     except Exception as exc:
         log.error("upload_jobs.bootstrap_failed", error=str(exc))
+    # SPEC-W112: stale-running reaper. One sweep at startup (jobs stranded
+    # by a previous crash/restart), then periodically. Reaper failures are
+    # logged, never fatal to startup or ingest.
+    if settings.doc_intel_reaper_enabled:
+        reaper_task = asyncio.create_task(_reaper_loop(deps))
+        deps.bg_tasks.add(reaper_task)
+        reaper_task.add_done_callback(deps.bg_tasks.discard)
     await deps.search.ensure_index()
     app.state.deps = deps
     log.info("service.started", port=settings.port)
@@ -335,8 +342,8 @@ async def _run_upload_job(
 
     Every failure marks the job row failed with the honest error; nothing
     propagates. CancelledError (shutdown) propagates so the lifespan gather
-    is prompt — the row stays 'running' (honestly resumable-looking; a
-    reaper sweep is a documented follow-up).
+    is prompt — the row stays 'running' and the SPEC-W112 reaper fails it
+    honestly once it goes stale.
     """
     try:
         await deps.upload_jobs.set_running(tenant_id, job_id)
@@ -373,6 +380,30 @@ async def _run_upload_job(
             await deps.upload_jobs.set_failed(tenant_id, job_id, str(exc))
         except Exception as exc2:  # noqa: BLE001 - never raise from a job
             log.error("upload_job.fail_mark_failed", job_id=job_id, error=str(exc2))
+
+
+async def _reaper_loop(deps: AppState) -> None:
+    """SPEC-W112: fail stale `running` upload jobs honestly.
+
+    One sweep immediately (covers jobs stranded by a previous crash or
+    restart — the background task is gone but the row still says running),
+    then one every settings.doc_intel_reaper_interval_s. Only stale running
+    rows are touched; pending and terminal rows are never modified. A sweep
+    failure is logged and retried next interval — the loop only exits on
+    cancellation (shutdown).
+    """
+    while True:
+        try:
+            reaped = await deps.upload_jobs.reap_stale(
+                settings.doc_intel_reaper_stale_s
+            )
+            if reaped:
+                log.warning("upload_reaper.reaped", count=reaped)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reaper never dies on error
+            log.error("upload_reaper.sweep_failed", error=str(exc)[:200])
+        await asyncio.sleep(settings.doc_intel_reaper_interval_s)
 
 
 @app.get("/v1/documents/upload/{job_id}")

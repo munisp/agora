@@ -38,8 +38,28 @@ BEGIN
         CREATE POLICY tenant_isolation ON upload_jobs
             USING (tenant_id = current_setting('app.tenant_id')::uuid);
     END IF;
+    -- SPEC-W112: maintenance-only bypass for the stale-running reaper.
+    -- The reaper connects with app.upload_reaper='on' AND a placeholder
+    -- app.tenant_id so the tenant_isolation expression cannot error; this
+    -- policy widens visibility for that connection only. It is an UPDATE
+    -- policy without WITH CHECK, so the reaper can flip stale rows to
+    -- failed but cannot INSERT rows into arbitrary tenants.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_policies
+        WHERE tablename = 'upload_jobs' AND policyname = 'upload_job_reaper'
+    ) THEN
+        CREATE POLICY upload_job_reaper ON upload_jobs
+            FOR UPDATE
+            USING (current_setting('app.upload_reaper', true) = 'on');
+    END IF;
 END $$;
 """
+
+# SPEC-W112: honest failure text for jobs interrupted mid-run (service
+# restart/crash). The caller is told to resubmit; nothing is silently lost.
+REAPED_ERROR = (
+    "interrupted: service restarted while job was running; resubmit upload"
+)
 
 
 @dataclass(frozen=True)
@@ -115,3 +135,28 @@ class UploadJobsStore:
                 uuid.UUID(job_id), uuid.UUID(tenant_id),
             )
         return _row_to_job(row) if row else None
+
+    async def reap_stale(self, stale_after_s: float) -> int:
+        """SPEC-W112: fail stale `running` jobs honestly.
+
+        A process crash/restart strands jobs in `running` forever — the
+        background task is gone but the row never settles, and the tenant
+        polls a job that will never finish. This sweep marks rows whose
+        updated_at is older than stale_after_s as failed with REAPED_ERROR
+        so the tenant gets an honest terminal state and can resubmit.
+
+        Only stale RUNNING rows are touched: pending jobs may simply not
+        have started yet, and done/failed rows are terminal. Runs on the
+        maintenance connection (app.upload_reaper='on') — see the
+        upload_job_reaper policy in DDL. Returns the number of reaped rows.
+        """
+        async with self._db.reaper_conn() as conn:
+            rows = await conn.fetch(
+                "UPDATE upload_jobs"
+                " SET status = 'failed', error = $1, updated_at = now()"
+                " WHERE status = 'running'"
+                "   AND updated_at < now() - make_interval(secs => $2)"
+                " RETURNING id",
+                REAPED_ERROR, stale_after_s,
+            )
+        return len(rows)

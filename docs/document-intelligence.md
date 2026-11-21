@@ -65,8 +65,21 @@ oracle.
 `upload_jobs` is created idempotently at service startup with RLS enabled and
 forced (kb_suggestions precedent). A bootstrap failure is logged and does not
 break sync uploads; `wait=false` requests will fail honestly until the table
-exists. A reaper for rows interrupted mid-run by shutdown is a documented
-follow-up.
+exists.
+
+### Stale-running reaper (W112)
+
+A crash or restart strands `wait=false` jobs in `running` forever — the
+background task is gone but the row never settles. knowledge-service runs a
+reaper: one sweep at startup, then one every `DOC_INTEL_REAPER_INTERVAL_S`
+(default 60s). Any row still `running` whose `updated_at` is older than
+`DOC_INTEL_REAPER_STALE_S` (default 960s = job timeout + 60s grace) is
+marked `failed` with `interrupted: service restarted while job was running;
+resubmit upload`. Pending rows (the task may not have started) and terminal
+rows are never touched. Because `upload_jobs` uses FORCE RLS, the sweep runs
+on a maintenance connection with `app.upload_reaper=on` (the
+`upload_job_reaper` UPDATE-only policy); request connections remain
+tenant-bound. Set `DOC_INTEL_REAPER_ENABLED=off` to disable.
 
 ## OCR — PaddleOCR models via RapidOCR
 

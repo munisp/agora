@@ -77,13 +77,34 @@ docs/channels-ussd.md. Operators enabling it should watch turn latency.
 Defense in depth: compose_answer never raises (None on any failure) AND the
 W108 grounding block's own fallback net catches anything that escapes.
 
+## Grounding-quality metrics (W112)
+
+Both grounding surfaces emit bounded-cardinality counters so operators can
+see whether the KB actually answers users, per tenant and channel:
+
+- `voice_knowledge_grounding_total{tenant,channel,result}` — one increment
+  per eligible /voice/chat turn lookup; result is `hit` (snippets
+  returned), `miss` (empty), `timeout`, or `error`. Disabled grounding and
+  empty queries are not counted.
+- `conversation_grounding_turns_total{tenant,channel,result}` — one
+  increment per eligible USSD text-mode turn; result is `composed`, `raw`,
+  `compose_fallback`, `ungrounded`, `error`, or `disabled` (flag off).
+  Menu turns and empty first turns are not counted.
+
+Tenant label values are sanitized and capped at
+`GROUNDING_METRICS_MAX_TENANTS` (default 100) distinct tenants; beyond the
+cap all tenants aggregate under `tenant="overflow"` so a multi-tenant
+fleet cannot blow up Prometheus cardinality. A high `miss`/`ungrounded`
+rate means the tenant corpus is thin; a rising `timeout`/`error` rate
+means the knowledge leg is unhealthy. Metrics recording never fails a
+turn.
+
 ## Honest limits
 
 - The bootstrap knowledge leg still runs once per tenant-context TTL with
   the static `KNOWLEDGE_QUERY` — it grounds the session persona; per-turn
   relevance comes from W109.
-- USSD answers are raw KB text, not LLM-composed — good for facts (hours,
-  pricing, policies), terse by design. LLM compression is a documented
-  follow-up.
+- USSD answers default to raw KB text (W110 LLM compose is opt-in) —
+  good for facts (hours, pricing, policies), terse by design.
 - USSD grounding quality depends on the KB corpus: tenants with no
   documents ingest nothing and always get the static ack (grounded=false).

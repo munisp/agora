@@ -25,6 +25,7 @@ from .agent_definition import AgentDefinition
 from .config import Settings
 from .dapr_client import DaprClient, DaprError
 from .logging import get_logger
+from . import metrics
 
 log = get_logger("bootstrap")
 
@@ -267,6 +268,7 @@ async def fetch_turn_knowledge(
     query: str,
     *,
     timeout_s: float,
+    channel: str = "chat",
 ) -> list[str]:
     """SPEC-W109: per-turn knowledge grounding for the chat path.
 
@@ -274,9 +276,14 @@ async def fetch_turn_knowledge(
     header), but q is THIS turn's message instead of the static bootstrap
     query. Best-effort by contract: any error, an empty query, or a timeout
     over the turn budget returns [] — a chat turn NEVER fails on grounding.
+
+    SPEC-W112: every eligible non-empty query increments the bounded
+    voice_knowledge_grounding_total counter with hit|miss|timeout|error.
+    Disabled grounding and empty queries are not eligible and are uncounted.
     """
     if not query.strip():
         return []
+    result = "error"
     try:
         kb = await asyncio.wait_for(
             dapr.invoke_get(
@@ -287,12 +294,29 @@ async def fetch_turn_knowledge(
             ),
             timeout=timeout_s,
         )
+        snippets = _parse_kb_snippets(kb, settings.knowledge_snippet_count)
+        result = "hit" if snippets else "miss"
+        return snippets
+    except TimeoutError:
+        result = "timeout"
+        log.warning("turn knowledge fetch timed out", slug=tenant_slug)
+        return []
     except Exception as exc:  # noqa: BLE001 - grounding is best-effort
+        result = "error"
         log.warning(
             "turn knowledge fetch failed", slug=tenant_slug, error=str(exc)[:200]
         )
         return []
-    return _parse_kb_snippets(kb, settings.knowledge_snippet_count)
+    finally:
+        try:
+            metrics.knowledge_grounding(
+                tenant=tenant_slug,
+                channel=channel,
+                result=result,
+                max_tenants=settings.grounding_metrics_max_tenants,
+            )
+        except Exception as exc:  # noqa: BLE001 - metrics never break a turn
+            log.warning("turn knowledge metric failed", error=str(exc)[:200])
 
 
 async def fetch_tenant_context(

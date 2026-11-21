@@ -167,6 +167,11 @@ class Config:
     ussd_kb_llm_timeout_s: float = 1.2
     ussd_kb_llm_max_tokens: int = 120
 
+    # SPEC-W112: cap distinct tenant label values on
+    # conversation_grounding_turns_total; tenants beyond the cap aggregate
+    # under tenant="overflow" so label cardinality stays bounded.
+    grounding_metrics_max_tenants: int = 100
+
     # OpenSearch indexer (SPEC §10, index `conversations`).
     opensearch_addr: str = "http://opensearch:9200"
     conversations_index: str = "conversations"
@@ -266,6 +271,9 @@ def load() -> Config:
         ussd_kb_llm_api_key=_env("USSD_KB_LLM_API_KEY", _env("LLM_API_KEY", "ollama")),
         ussd_kb_llm_timeout_s=float(_env("USSD_KB_LLM_TIMEOUT_S", "1.2")),
         ussd_kb_llm_max_tokens=int(_env("USSD_KB_LLM_MAX_TOKENS", "120")),
+        grounding_metrics_max_tenants=int(
+            _env("GROUNDING_METRICS_MAX_TENANTS", "100")
+        ),
         ussd_text_mode_reply=_env(
             "USSD_TEXT_MODE_REPLY",
             "Thank you. Your message has been received; an agent will respond shortly.",

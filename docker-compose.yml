@@ -928,6 +928,9 @@ services:
       # grounding).
       KNOWLEDGE_TURN_QUERIES: ${KNOWLEDGE_TURN_QUERIES:-on}
       KNOWLEDGE_TURN_TIMEOUT_S: ${KNOWLEDGE_TURN_TIMEOUT_S:-1.5}
+      # SPEC-W112: cap distinct tenant label values on
+      # voice_knowledge_grounding_total (overflow aggregation beyond cap).
+      GROUNDING_METRICS_MAX_TENANTS: ${GROUNDING_METRICS_MAX_TENANTS:-100}
       DAPR_HOST: daprd-voice
       DAPR_HTTP_PORT: '3500'
       KAFKA_BROKERS: kafka:9092
@@ -1095,6 +1098,9 @@ services:
       USSD_KB_LLM: ${USSD_KB_LLM:-off}
       USSD_KB_LLM_BASE_URL: ${USSD_KB_LLM_BASE_URL:-http://ollama:11434/v1}
       USSD_KB_LLM_MODEL: ${USSD_KB_LLM_MODEL:-qwen3:8b}
+      # SPEC-W112: cap distinct tenant label values on
+      # conversation_grounding_turns_total (overflow beyond cap).
+      GROUNDING_METRICS_MAX_TENANTS: ${GROUNDING_METRICS_MAX_TENANTS:-100}
       USSD_KB_LLM_TIMEOUT_S: ${USSD_KB_LLM_TIMEOUT_S:-1.2}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
@@ -1150,6 +1156,11 @@ services:
       # SPEC-W111: wait=false async ingest polls the docling task API.
       DOC_INTEL_POLL_S: ${DOC_INTEL_POLL_S:-2}
       DOC_INTEL_JOB_TIMEOUT_S: ${DOC_INTEL_JOB_TIMEOUT_S:-900}
+      # SPEC-W112: stale-running upload-job reaper (startup + interval
+      # sweep; fails stranded jobs honestly so tenants can resubmit).
+      DOC_INTEL_REAPER_ENABLED: ${DOC_INTEL_REAPER_ENABLED:-on}
+      DOC_INTEL_REAPER_INTERVAL_S: ${DOC_INTEL_REAPER_INTERVAL_S:-60}
+      DOC_INTEL_REAPER_STALE_S: ${DOC_INTEL_REAPER_STALE_S:-960}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

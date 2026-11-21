@@ -102,6 +102,7 @@ class ChatService:
         conversation_id: str | None,
         session_secret: str | None = None,
         persona_override: str | None = None,
+        channel: str = "web",
     ) -> tuple[SessionState, ToolLayer, list[dict[str, Any]]]:
         """Shared turn setup for the buffered and SSE streaming chat paths
         (SPEC-W3 §3): session, tenant context, multi-agent routing, tool
@@ -160,6 +161,7 @@ class ChatService:
                 ctx.tenant_slug,
                 message,
                 timeout_s=self._settings.knowledge_turn_timeout_s,
+                channel=channel,
             )
             if turn_snippets:
                 merged: list[str] = []
@@ -301,6 +303,7 @@ class ChatService:
             conversation_id=conversation_id,
             session_secret=session_secret,
             persona_override=persona_override,
+            channel=channel,
         )
         # SPEC-W6 Part A: omnichannel inbound — remember which channel the
         # message arrived on (session metadata + turn logging only).

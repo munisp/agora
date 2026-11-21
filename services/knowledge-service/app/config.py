@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     # /v1/documents/upload with wait=false (very large scans).
     doc_intel_poll_s: float = 2.0
     doc_intel_job_timeout_s: float = 900.0
+    # SPEC-W112 stale-running reaper: a crash/restart strands jobs in
+    # `running` forever (the background task is gone). The reaper sweeps on
+    # startup and then every interval, failing jobs whose updated_at is
+    # older than doc_intel_reaper_stale_s (default: job timeout + 60s
+    # grace) with an honest "resubmit" error. Pending and terminal rows
+    # are never touched.
+    doc_intel_reaper_enabled: bool = True
+    doc_intel_reaper_interval_s: float = 60.0
+    doc_intel_reaper_stale_s: float = 960.0
 
     # Text-to-SQL (SPEC-W3 §3, innovation 8): OpenAI-compatible LLM
     # (default qwen3:8b via Ollama) + Trino HTTP API.
