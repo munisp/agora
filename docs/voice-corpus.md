@@ -51,6 +51,24 @@ GET    /v1/export?language=&format=jsonl|ljspeech
                         jsonl: {"audio_path","text","speaker_id","language",
                                 "duration_s","sample_rate"} per line
                         ljspeech: <audio_relpath>|<text>|<speaker_id>
+GET    /v1/export/cosyvoice?language=&valid_pct=5     (SPEC-W104 C1)
+                        CosyVoice-2 fine-tune handoff: {"utt","wav","text",
+                        "spk","split"} per line; split is DETERMINISTIC
+                        (md5(utt) % 100 < valid_pct => "valid") — reruns are
+                        byte-identical, the validation set never drifts
+POST   /v1/eval/runs    {language, model_ref, notes?} → 201   (SPEC-W104 C2)
+                        model_ref REQUIRED — never invent which model made
+                        the samples under review
+POST   /v1/eval/runs/{run_id}/samples  {text, audio_base64} → 201
+                        (404 run · 400 base64/wav · 413 >10 MB)
+POST   /v1/eval/samples/{sample_id}/scores {reviewer, score, notes?} → 201
+                        reviewer REQUIRED (native-speaker pseudonym);
+                        score int 1..5 (422 otherwise)
+GET    /v1/eval/runs · GET /v1/eval/runs/{run_id}
+                        → {run, samples, scores, mos, min, max,
+                           per_reviewer} — mos = plain mean (None unscored)
+GET    /v1/readiness/{language}                       (SPEC-W104 C3)
+                        → {language, ready, gaps[], stats, thresholds}
 GET    /healthz
 ```
 
@@ -81,6 +99,35 @@ fine-tune spend.
 the working rule of thumb before a fine-tune spike is worth its GPU budget —
 a guideline from industry practice, not a guarantee; fewer hours can still
 be useful for a smoke-test run. Track progress with `/v1/stats`.
+
+## The fine-tune track (SPEC-W104)
+
+**Readiness gate** — `GET /v1/readiness/{language}` checks the corpus
+against documented thresholds: **≥10 hours**, **≥3 speakers**, and **≥80%
+tone-mark coverage enforced for Yoruba only** (Igbo tone is inconsistently
+marked in practical orthography, Hausa standard orthography marks no tone,
+pcm has no standard tone orthography — enforcing there would punish correct
+corpora; coverage is still reported for every language). The response lists
+every unmet threshold verbatim in `gaps[]` — `ready` is simply `gaps` empty,
+so the gate can never silently pass.
+
+**Training export** — `GET /v1/export/cosyvoice?language=pcm` emits the
+CosyVoice-2 data-prep jsonl (`{utt, wav, text, spk, split}`) with a
+**deterministic** md5-based train/valid split: reruns are byte-identical,
+so the validation set cannot drift between data-prep runs and leak into
+training.
+
+**Native-speaker eval loop** — after a fine-tune run synthesizes samples:
+`POST /v1/eval/runs` (with the exact `model_ref` — required, never
+invented), `POST .../samples` (wav-QA'd like corpus audio), then collect
+1–5 scores from native-speaker reviewers (`POST .../scores`, reviewer
+pseudonym required so scores stay attributable). `GET /v1/eval/runs/{id}`
+returns the MOS summary. **A MOS is meaningless below n≥10 scores across
+≥3 reviewers** (guideline, not enforced) — and MOS measures naturalness
+only; tone correctness still needs reviewer attention per sample. The loop
+is engine-agnostic: the same endpoints serve a future LongCat spike, which
+is what makes the spike *justifiable* (see
+`docs/longcat-pcm-yo-spike.md`).
 
 ## Operations
 

@@ -441,3 +441,211 @@ class TestPersistence:
         reg = CorpusRegistry(tmp_path)
         assert len(reg.list_speakers()) == 1
         assert len(reg.list_utterances()) == 1
+
+
+# ===========================================================================
+# SPEC-W104: CosyVoice export, eval loop, readiness gate
+# ===========================================================================
+def _seed_corpus(client, speakers=1, per_speaker=4, language="pcm"):
+    ids = []
+    for i in range(speakers):
+        spk = _speaker(client, pseudonym=f"s{i}", languages=[language, "yo", "en"])
+        ids.append(spk["speaker_id"])
+        for j in range(per_speaker):
+            _utterance(
+                client, spk["speaker_id"], language=language,
+                transcript=f"sample {i}-{j}", seconds=1.0 + 0.1 * j,
+            )
+    return ids
+
+
+class TestCosyVoiceExport:
+    def test_shape_and_fields(self, client):
+        (spk,) = _seed_corpus(client)
+        import json
+
+        body = client.get("/v1/export/cosyvoice?language=pcm").text
+        rows = [json.loads(line) for line in body.strip().splitlines()]
+        assert len(rows) == 4
+        row = rows[0]
+        assert set(row) == {"utt", "wav", "text", "spk", "split"}
+        assert row["spk"] == spk
+        assert row["split"] in ("train", "valid")
+        assert row["wav"].startswith("audio/")
+
+    def test_split_is_deterministic(self, client):
+        _seed_corpus(client)
+        a = client.get("/v1/export/cosyvoice?language=pcm&valid_pct=50").text
+        b = client.get("/v1/export/cosyvoice?language=pcm&valid_pct=50").text
+        assert a == b  # no RNG: reruns are byte-identical
+
+    def test_valid_pct_changes_split(self, client):
+        _seed_corpus(client, per_speaker=8)
+        import json
+
+        none = client.get("/v1/export/cosyvoice?valid_pct=0").text
+        half = client.get("/v1/export/cosyvoice?valid_pct=50").text
+        n0 = sum(json.loads(l)["split"] == "valid" for l in none.strip().splitlines())
+        n50 = sum(json.loads(l)["split"] == "valid" for l in half.strip().splitlines())
+        assert n0 == 0
+        assert n50 > 0
+
+    def test_bad_valid_pct_400(self, client):
+        assert client.get("/v1/export/cosyvoice?valid_pct=51").status_code == 400
+
+    def test_bad_language_400(self, client):
+        assert client.get("/v1/export/cosyvoice?language=xx").status_code == 400
+
+
+class TestEvalLoop:
+    def _run(self, client, language="pcm", model_ref="cosyvoice2-pcm-ft-r1"):
+        resp = client.post(
+            "/v1/eval/runs", json={"language": language, "model_ref": model_ref}
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()
+
+    def test_run_lifecycle(self, client):
+        run = self._run(client)
+        assert run["run_id"].startswith("run-")
+        assert run["model_ref"] == "cosyvoice2-pcm-ft-r1"
+        listed = client.get("/v1/eval/runs").json()["runs"]
+        assert [r["run_id"] for r in listed] == [run["run_id"]]
+
+    def test_run_bad_language_400(self, client):
+        resp = client.post(
+            "/v1/eval/runs", json={"language": "xx", "model_ref": "m"}
+        )
+        assert resp.status_code == 400
+
+    def test_run_blank_model_ref_422(self, client):
+        resp = client.post(
+            "/v1/eval/runs", json={"language": "pcm", "model_ref": "  "}
+        )
+        assert resp.status_code == 422
+
+    def test_sample_unknown_run_404(self, client):
+        resp = client.post(
+            "/v1/eval/runs/run-nope/samples",
+            json={"text": "how body", "audio_base64": _b64(_wav())},
+        )
+        assert resp.status_code == 404
+
+    def test_sample_wav_validated(self, client):
+        run = self._run(client)
+        resp = client.post(
+            f"/v1/eval/runs/{run['run_id']}/samples",
+            json={"text": "how body", "audio_base64": _b64(b"not wav")},
+        )
+        assert resp.status_code == 400
+
+    def test_score_bounds(self, client):
+        run = self._run(client)
+        sample = client.post(
+            f"/v1/eval/runs/{run['run_id']}/samples",
+            json={"text": "how body", "audio_base64": _b64(_wav())},
+        ).json()
+        for bad in (0, 6, -1):
+            resp = client.post(
+                f"/v1/eval/samples/{sample['sample_id']}/scores",
+                json={"reviewer": "rev-1", "score": bad},
+            )
+            assert resp.status_code == 422
+        ok = client.post(
+            f"/v1/eval/samples/{sample['sample_id']}/scores",
+            json={"reviewer": "rev-1", "score": 4},
+        )
+        assert ok.status_code == 201
+
+    def test_score_unknown_sample_404(self, client):
+        resp = client.post(
+            "/v1/eval/samples/eva-nope/scores",
+            json={"reviewer": "rev-1", "score": 3},
+        )
+        assert resp.status_code == 404
+
+    def test_summary_mos(self, client):
+        run = self._run(client)
+        s1 = client.post(
+            f"/v1/eval/runs/{run['run_id']}/samples",
+            json={"text": "a", "audio_base64": _b64(_wav())},
+        ).json()
+        s2 = client.post(
+            f"/v1/eval/runs/{run['run_id']}/samples",
+            json={"text": "b", "audio_base64": _b64(_wav())},
+        ).json()
+        client.post(f"/v1/eval/samples/{s1['sample_id']}/scores",
+                    json={"reviewer": "r1", "score": 5})
+        client.post(f"/v1/eval/samples/{s1['sample_id']}/scores",
+                    json={"reviewer": "r2", "score": 3})
+        client.post(f"/v1/eval/samples/{s2['sample_id']}/scores",
+                    json={"reviewer": "r1", "score": 2})
+        summary = client.get(f"/v1/eval/runs/{run['run_id']}").json()
+        assert summary["samples"] == 2
+        assert summary["scores"] == 3
+        assert summary["mos"] == pytest.approx((5 + 3 + 2) / 3, abs=0.001)
+        assert summary["min"] == 2 and summary["max"] == 5
+        assert summary["per_reviewer"] == {"r1": 2, "r2": 1}
+
+    def test_summary_empty_run(self, client):
+        run = self._run(client)
+        summary = client.get(f"/v1/eval/runs/{run['run_id']}").json()
+        assert summary["mos"] is None
+        assert summary["samples"] == 0
+
+    def test_summary_unknown_run_404(self, client):
+        assert client.get("/v1/eval/runs/run-nope").status_code == 404
+
+    def test_eval_persists_across_reload(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("app.main.CORPUS_DIR", str(tmp_path))
+        with TestClient(create_app()) as c:
+            run = self._run(c)
+            sample = c.post(
+                f"/v1/eval/runs/{run['run_id']}/samples",
+                json={"text": "x", "audio_base64": _b64(_wav())},
+            ).json()
+            c.post(f"/v1/eval/samples/{sample['sample_id']}/scores",
+                   json={"reviewer": "r1", "score": 4})
+        from app.registry import CorpusRegistry
+
+        reg = CorpusRegistry(tmp_path)
+        assert len(reg.list_eval_runs()) == 1
+        assert len(reg.list_eval_samples(run["run_id"])) == 1
+        assert len(reg.list_eval_scores(run["run_id"])) == 1
+
+
+class TestReadiness:
+    def test_empty_corpus_not_ready(self, client):
+        data = client.get("/v1/readiness/pcm").json()
+        assert data["ready"] is False
+        assert any(g.startswith("hours") for g in data["gaps"])
+        assert any(g.startswith("speakers") for g in data["gaps"])
+        assert data["stats"]["tone_enforced"] is False
+
+    def test_tone_enforced_for_yoruba(self, client):
+        spk = _speaker(client, languages=["yo"])
+        # Tone-LESS Yoruba transcripts: coverage 0% -> gap even at tiny scale
+        for _ in range(3):
+            _utterance(
+                client, spk["speaker_id"], language="yo",
+                transcript="E kaaro",  # no tone marks
+            )
+        data = client.get("/v1/readiness/yo").json()
+        assert data["ready"] is False
+        assert data["stats"]["tone_enforced"] is True
+        assert any("tone_mark_coverage_pct" in g for g in data["gaps"])
+
+    def test_tone_not_enforced_for_pcm(self, client):
+        spk = _speaker(client, languages=["pcm"])
+        _utterance(client, spk["speaker_id"], language="pcm", transcript="How body")
+        data = client.get("/v1/readiness/pcm").json()
+        assert not any("tone_mark_coverage_pct" in g for g in data["gaps"])
+
+    def test_unknown_language_400(self, client):
+        assert client.get("/v1/readiness/xx").status_code == 400
+
+    def test_thresholds_echoed(self, client):
+        data = client.get("/v1/readiness/yo").json()
+        assert data["thresholds"]["min_hours"] == 10.0
+        assert data["thresholds"]["min_speakers"] == 3
+        assert data["thresholds"]["tone_enforced_languages"] == ["yo"]

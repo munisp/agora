@@ -39,6 +39,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from .registry import (
     CorpusRegistry,
+    EvalRunNotFound,
+    EvalSampleNotFound,
     RegistryError,
     SpeakerNotFound,
     UtteranceNotFound,
@@ -56,6 +58,18 @@ MIN_DURATION_S = 0.5
 MAX_DURATION_S = 30.0
 MAX_AUDIO_BYTES = 10 * 1024 * 1024  # 10 MB decoded ceiling
 MAX_TRANSCRIPT_CHARS = 2000
+
+# SPEC-W104 C3 readiness thresholds. Guideline values from industry
+# practice for a small single-language TTS fine-tune — NOT a guarantee of
+# output quality; a "ready" corpus can still yield a poor model.
+MIN_HOURS = 10.0
+MIN_SPEAKERS = 3
+MIN_TONE_COVERAGE_PCT = 80.0
+# Tone enforcement: Yoruba ONLY. Igbo tone is inconsistently marked in
+# practical orthography, Hausa standard orthography marks no tone, and pcm
+# has no standard tone orthography — enforcing there would punish correct
+# corpora. Coverage is still REPORTED for every language in /v1/stats.
+TONE_ENFORCED = ("yo",)
 
 
 # Combining diacritics that signal TONE in Latin orthographies: grave,
@@ -147,6 +161,65 @@ class UtteranceRequest(BaseModel):
         if not value:
             raise ValueError("transcript must be non-empty")
         return value
+
+
+# SPEC-W104 C2 — eval loop request models.
+class EvalRunRequest(BaseModel):
+    language: str = Field(min_length=1, max_length=16)
+    # Which model produced the samples under review (e.g.
+    # "cosyvoice2-pcm-ft-r3"). Never invented — required, non-blank.
+    model_ref: str = Field(min_length=1, max_length=256)
+    notes: str = Field(default="", max_length=1000)
+
+    @field_validator("model_ref")
+    @classmethod
+    def _model_ref_not_blank(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("model_ref must name the model that made the samples")
+        return value
+
+
+class EvalSampleRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_TRANSCRIPT_CHARS)
+    audio_base64: str = Field(min_length=1)
+
+
+class EvalScoreRequest(BaseModel):
+    # Native-speaker reviewer pseudonym — required so scores are attributable
+    # (and so a reviewer's scores can be discounted if trust breaks).
+    reviewer: str = Field(min_length=1, max_length=64)
+    score: int
+    notes: str = Field(default="", max_length=1000)
+
+    @field_validator("score")
+    @classmethod
+    def _score_in_range(cls, value: int) -> int:
+        if not (1 <= value <= 5):
+            raise ValueError("score must be an integer in [1, 5]")
+        return value
+
+
+def _decode_audio(audio_base64: str) -> tuple[bytes, float]:
+    """Shared audio QA (utterances + eval samples): base64 -> wav probe."""
+    try:
+        audio = base64.b64decode(audio_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail="audio_base64 is not valid base64"
+        ) from exc
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"decoded audio exceeds {MAX_AUDIO_BYTES} bytes",
+        )
+    try:
+        duration_s, _rate, _channels = probe_wav(audio)
+    except (wave.Error, EOFError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"audio is not a decodable wav: {exc}"
+        ) from exc
+    return audio, duration_s
 
 
 def create_app() -> FastAPI:
@@ -328,6 +401,164 @@ def create_app() -> FastAPI:
                     f"{u['audio_relpath']}|{u['transcript']}|{u['speaker_id']}"
                 )
         return PlainTextResponse("\n".join(lines) + ("\n" if lines else ""))
+
+    # ----------------------------------------------- SPEC-W104 C1: ft export
+    @app.get("/v1/export/cosyvoice")
+    def export_cosyvoice(
+        language: str = Query(default=""),
+        valid_pct: int = Query(default=5),
+    ) -> PlainTextResponse:
+        """CosyVoice-2 fine-tune handoff: one jsonl line per utterance —
+        {"utt", "wav", "text", "spk", "split"}. The train/valid split is
+        DETERMINISTIC (md5 of the utterance id) so reruns are byte-identical
+        and the validation set never drifts between data-prep runs.
+        """
+        if not (0 <= valid_pct <= 50):
+            raise HTTPException(
+                status_code=400, detail="valid_pct must be in [0, 50]"
+            )
+        lang = language.strip().lower()
+        if lang and lang not in CORPUS_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported language {lang!r} "
+                f"(CORPUS_LANGUAGES={CORPUS_LANGUAGES})",
+            )
+        import hashlib
+        import json
+
+        lines = []
+        for u in registry.list_utterances(language=lang):
+            bucket = hashlib.md5(u["utterance_id"].encode("utf-8")).digest()[0] % 100
+            lines.append(
+                json.dumps(
+                    {
+                        "utt": u["utterance_id"],
+                        "wav": u["audio_relpath"],
+                        "text": u["transcript"],
+                        "spk": u["speaker_id"],
+                        "split": "valid" if bucket < valid_pct else "train",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return PlainTextResponse("\n".join(lines) + ("\n" if lines else ""))
+
+    # ------------------------------------------------ SPEC-W104 C2: eval loop
+    @app.post("/v1/eval/runs", status_code=201)
+    def add_eval_run(req: EvalRunRequest) -> dict:
+        language = req.language.strip().lower()
+        if language not in CORPUS_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported language {language!r} "
+                f"(CORPUS_LANGUAGES={CORPUS_LANGUAGES})",
+            )
+        try:
+            return registry.add_eval_run(
+                language, req.model_ref, notes=req.notes
+            )
+        except RegistryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/eval/runs")
+    def list_eval_runs() -> dict:
+        return {"runs": registry.list_eval_runs()}
+
+    @app.post("/v1/eval/runs/{run_id}/samples", status_code=201)
+    def add_eval_sample(run_id: str, req: EvalSampleRequest) -> dict:
+        audio, duration_s = _decode_audio(req.audio_base64)
+        try:
+            return registry.add_eval_sample(
+                run_id, req.text, audio, duration_s=duration_s
+            )
+        except EvalRunNotFound as exc:
+            raise HTTPException(status_code=404, detail="unknown run_id") from exc
+
+    @app.post("/v1/eval/samples/{sample_id}/scores", status_code=201)
+    def add_eval_score(sample_id: str, req: EvalScoreRequest) -> dict:
+        try:
+            return registry.add_eval_score(
+                sample_id, req.reviewer, req.score, notes=req.notes
+            )
+        except EvalSampleNotFound as exc:
+            raise HTTPException(
+                status_code=404, detail="unknown sample_id"
+            ) from exc
+        except RegistryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/eval/runs/{run_id}")
+    def eval_run_summary(run_id: str) -> dict:
+        run = registry.get_eval_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="unknown run_id")
+        samples = registry.list_eval_samples(run_id)
+        scores = registry.list_eval_scores(run_id)
+        values = [s["score"] for s in scores]
+        per_reviewer: dict[str, int] = {}
+        for s in scores:
+            per_reviewer[s["reviewer"]] = per_reviewer.get(s["reviewer"], 0) + 1
+        return {
+            "run": run,
+            "samples": len(samples),
+            "scores": len(scores),
+            # Plain mean over all scores. Guideline (docs/voice-corpus.md):
+            # a MOS means nothing below n>=10 across >=3 reviewers.
+            "mos": round(sum(values) / len(values), 3) if values else None,
+            "min": min(values) if values else None,
+            "max": max(values) if values else None,
+            "per_reviewer": per_reviewer,
+        }
+
+    # ------------------------------------------- SPEC-W104 C3: readiness gate
+    @app.get("/v1/readiness/{language}")
+    def readiness(language: str) -> dict:
+        lang = language.strip().lower()
+        if lang not in CORPUS_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported language {lang!r} "
+                f"(CORPUS_LANGUAGES={CORPUS_LANGUAGES})",
+            )
+        utterances = registry.list_utterances(language=lang)
+        seconds = sum(u["duration_s"] for u in utterances)
+        hours = round(seconds / 3600.0, 2)
+        speakers = len({u["speaker_id"] for u in utterances})
+        tone = sum(1 for u in utterances if u["has_tone_marks"])
+        tone_pct = (
+            round(100.0 * tone / len(utterances), 1) if utterances else None
+        )
+        gaps: list[str] = []
+        if hours < MIN_HOURS:
+            gaps.append(f"hours {hours} < {MIN_HOURS}")
+        if speakers < MIN_SPEAKERS:
+            gaps.append(f"speakers {speakers} < {MIN_SPEAKERS}")
+        if lang in TONE_ENFORCED and (
+            tone_pct is None or tone_pct < MIN_TONE_COVERAGE_PCT
+        ):
+            gaps.append(
+                f"tone_mark_coverage_pct {tone_pct} < {MIN_TONE_COVERAGE_PCT} "
+                f"(tone enforced for {lang})"
+            )
+        return {
+            "language": lang,
+            "ready": not gaps,
+            "gaps": gaps,
+            "stats": {
+                "utterances": len(utterances),
+                "hours": hours,
+                "speakers": speakers,
+                "tone_mark_coverage_pct": tone_pct,
+                "tone_enforced": lang in TONE_ENFORCED,
+            },
+            "thresholds": {
+                "min_hours": MIN_HOURS,
+                "min_speakers": MIN_SPEAKERS,
+                "min_tone_coverage_pct": MIN_TONE_COVERAGE_PCT,
+                "tone_enforced_languages": list(TONE_ENFORCED),
+            },
+        }
 
     return app
 

@@ -83,7 +83,9 @@ GET    /healthz     → {"status": "ok", "mock": true, "voices": N, ...}
   base model**; the Naija-TTS pcm fine-tune corpus is the candidate path
   (pre-use license gate — see `docs/voice-licensing.md`). Corpus collection,
   consent, QA, and training-manifest export for that track run through the
-  voice-corpus service (SPEC-W103 — see `docs/voice-corpus.md`). Fine-tuned
+  voice-corpus service (SPEC-W103 — see `docs/voice-corpus.md`), which also
+  provides the CosyVoice training export, native-speaker eval loop, and
+  readiness gate (SPEC-W104). Fine-tuned
   languages can be recorded per voice via the enrollment `languages` field.
 - Same bounds as xtts-tts: unknown `voice_id` → 404; invalid base64 / tiny
   samples (<1000 bytes decoded) → 400; >50 MB decoded → 413; text 1–5000

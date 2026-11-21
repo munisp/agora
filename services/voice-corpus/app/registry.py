@@ -45,6 +45,14 @@ class UtteranceNotFound(RegistryError):
     pass
 
 
+class EvalRunNotFound(RegistryError):
+    pass
+
+
+class EvalSampleNotFound(RegistryError):
+    pass
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -58,6 +66,10 @@ class CorpusRegistry:
         self._lock = threading.Lock()
         self._speakers: Dict[str, dict] = {}
         self._utterances: Dict[str, dict] = {}
+        # SPEC-W104: native-speaker eval loop (runs / samples / scores).
+        self._eval_runs: Dict[str, dict] = {}
+        self._eval_samples: Dict[str, dict] = {}
+        self._eval_scores: Dict[str, List[dict]] = {}
         if self._path.exists():
             try:
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
@@ -69,6 +81,13 @@ class CorpusRegistry:
                 self._speakers[entry["speaker_id"]] = entry
             for entry in raw.get("utterances", []):
                 self._utterances[entry["utterance_id"]] = entry
+            # Additive W104 keys — W103-era registry files simply lack them.
+            for entry in raw.get("eval_runs", []):
+                self._eval_runs[entry["run_id"]] = entry
+            for entry in raw.get("eval_samples", []):
+                self._eval_samples[entry["sample_id"]] = entry
+            for sample_id, scores in raw.get("eval_scores", {}).items():
+                self._eval_scores[sample_id] = list(scores)
 
     # -- persistence -----------------------------------------------------------
     def _persist_locked(self) -> None:
@@ -76,6 +95,9 @@ class CorpusRegistry:
         payload = {
             "speakers": list(self._speakers.values()),
             "utterances": list(self._utterances.values()),
+            "eval_runs": list(self._eval_runs.values()),
+            "eval_samples": list(self._eval_samples.values()),
+            "eval_scores": {k: list(v) for k, v in self._eval_scores.items()},
         }
         tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         os.replace(tmp, self._path)
@@ -216,3 +238,102 @@ class CorpusRegistry:
             del self._utterances[utterance_id]
             self._persist_locked()
             return {"deleted": utterance_id}
+
+    # -- eval loop (SPEC-W104 C2) ------------------------------------------------
+    @property
+    def eval_dir(self) -> Path:
+        return self.dir / "eval"
+
+    def list_eval_runs(self) -> List[dict]:
+        with self._lock:
+            return [dict(r) for r in self._eval_runs.values()]
+
+    def get_eval_run(self, run_id: str) -> Optional[dict]:
+        with self._lock:
+            entry = self._eval_runs.get(run_id)
+            return dict(entry) if entry else None
+
+    def add_eval_run(
+        self, language: str, model_ref: str, *, notes: str = ""
+    ) -> dict:
+        model_ref = (model_ref or "").strip()
+        if not model_ref:
+            # Never invent which model produced the samples under review.
+            raise RegistryError("model_ref is required")
+        with self._lock:
+            run_id = f"run-{uuid.uuid4().hex[:12]}"
+            record = {
+                "run_id": run_id,
+                "language": language,
+                "model_ref": model_ref,
+                "notes": (notes or "").strip(),
+                "created_at": _now(),
+            }
+            self._eval_runs[run_id] = record
+            self._persist_locked()
+            return dict(record)
+
+    def add_eval_sample(
+        self, run_id: str, text: str, audio_bytes: bytes, *, duration_s: float
+    ) -> dict:
+        with self._lock:
+            if run_id not in self._eval_runs:
+                raise EvalRunNotFound(run_id)
+            sample_id = f"eva-{uuid.uuid4().hex[:12]}"
+            run_dir = self.eval_dir / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            path = run_dir / f"{sample_id}.wav"
+            path.write_bytes(audio_bytes)
+            record = {
+                "sample_id": sample_id,
+                "run_id": run_id,
+                "text": text,
+                "duration_s": round(duration_s, 3),
+                "audio_relpath": str(path.relative_to(self.dir)),
+                "created_at": _now(),
+            }
+            self._eval_samples[sample_id] = record
+            self._persist_locked()
+            return dict(record)
+
+    def get_eval_sample(self, sample_id: str) -> Optional[dict]:
+        with self._lock:
+            entry = self._eval_samples.get(sample_id)
+            return dict(entry) if entry else None
+
+    def list_eval_samples(self, run_id: str) -> List[dict]:
+        with self._lock:
+            return [
+                dict(s) for s in self._eval_samples.values()
+                if s["run_id"] == run_id
+            ]
+
+    def add_eval_score(
+        self, sample_id: str, reviewer: str, score: int, *, notes: str = ""
+    ) -> dict:
+        reviewer = (reviewer or "").strip()
+        if not reviewer:
+            raise RegistryError("reviewer is required (native-speaker pseudonym)")
+        if not isinstance(score, int) or not (1 <= score <= 5):
+            raise RegistryError("score must be an integer in [1, 5]")
+        with self._lock:
+            if sample_id not in self._eval_samples:
+                raise EvalSampleNotFound(sample_id)
+            record = {
+                "sample_id": sample_id,
+                "reviewer": reviewer,
+                "score": score,
+                "notes": (notes or "").strip(),
+                "created_at": _now(),
+            }
+            self._eval_scores.setdefault(sample_id, []).append(record)
+            self._persist_locked()
+            return dict(record)
+
+    def list_eval_scores(self, run_id: str) -> List[dict]:
+        with self._lock:
+            out = []
+            for s in self._eval_samples.values():
+                if s["run_id"] == run_id:
+                    out.extend(self._eval_scores.get(s["sample_id"], []))
+            return [dict(sc) for sc in out]

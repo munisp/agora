@@ -59,8 +59,30 @@ GET    /v1/utterances?speaker_id=&language= · DELETE /v1/utterances/{id}
 GET    /v1/stats        per-language {utterances, seconds, speakers,
                                       tone_mark_coverage_pct}
 GET    /v1/export?language=&format=jsonl|ljspeech
+GET    /v1/export/cosyvoice?language=&valid_pct=   (SPEC-W104) CosyVoice-2
+                        fine-tune handoff jsonl {utt,wav,text,spk,split},
+                        deterministic md5 split (no RNG)
+POST   /v1/eval/runs    (SPEC-W104) {language, model_ref, notes?} → 201
+POST   /v1/eval/runs/{run_id}/samples  {text, audio_base64} → 201
+POST   /v1/eval/samples/{sample_id}/scores  {reviewer, score 1..5, notes?} → 201
+GET    /v1/eval/runs    · GET /v1/eval/runs/{run_id}  (MOS summary)
+GET    /v1/readiness/{language}  (SPEC-W104) {ready, gaps[], stats} —
+                        thresholds: ≥10 h, ≥3 speakers, ≥80% tone coverage
+                        (tone enforced for yo only — see docs)
 GET    /healthz
 ```
+
+## The fine-tune track (SPEC-W104)
+
+1. Collect + consent speakers and utterances (above).
+2. Watch `/v1/readiness/{language}` until `ready: true`.
+3. Export the training set: `GET /v1/export/cosyvoice?language=pcm` →
+   CosyVoice-2 data-prep jsonl with a deterministic train/valid split.
+4. Run the fine-tune (separate GPU project — out of scope here).
+5. Close the loop: register the run (`POST /v1/eval/runs` with the exact
+   `model_ref`), upload synthesized samples, collect native-speaker scores
+   (1–5), and read the MOS summary. A MOS means nothing below **n≥10 scores
+   across ≥3 reviewers** (guideline, documented in `docs/voice-corpus.md`).
 
 See `docs/voice-corpus.md` for the full contract and the readiness
 guideline (≈10+ hours per language before a fine-tune spike is a useful
