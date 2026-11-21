@@ -341,6 +341,12 @@ async def _fetch_tenant_context_uncached(
                 settings.knowledge_app_id,
                 "v1/context",
                 params={"tenant": tenant_slug, "q": settings.knowledge_query},
+                # SPEC-W108 Part A: knowledge-service binds every request to
+                # X-Tenant-Slugs (SPEC-W43 C1; 401 without it). Internal
+                # Dapr callers self-pass the header — without it this leg
+                # silently 401'd and ALL grounding (voice + WhatsApp/Telegram
+                # via /voice/chat) was dead with only a warning log.
+                headers={"X-Tenant-Slugs": tenant_slug},
             )
             items = []
             if isinstance(kb, dict):

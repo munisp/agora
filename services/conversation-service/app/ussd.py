@@ -156,6 +156,30 @@ def menu_reply(
     return INVALID_SELECTION_PREFIX + render_menu(menu), True, None
 
 
+def grounded_reply(
+    snippets: list[str], *, max_snippets: int, max_chars: int
+) -> str:
+    """Compose a USSD-sized grounded answer from KB snippets (SPEC-W108).
+
+    Whitespace-collapses and joins the top `max_snippets` snippets, then
+    truncates at a word boundary with an ellipsis when over `max_chars`
+    (hard cut when no space exists in the window). Returns "" when there
+    is nothing to say — callers fall back to the static ack.
+    """
+    cleaned = [" ".join(str(s).split()) for s in snippets]
+    parts = [text for text in cleaned if text][:max_snippets]
+    reply = " ".join(parts).strip()
+    if not reply:
+        return ""
+    if len(reply) <= max_chars:
+        return reply
+    window = reply[: max_chars - 1]
+    cut = window.rfind(" ")
+    if cut > 0:
+        window = window[:cut]
+    return window.rstrip(" .,;:") + "…"
+
+
 def build_reply(
     body: UssdTurnRequest, text_mode_reply: str
 ) -> tuple[str, bool, UssdMenuItem | None]:

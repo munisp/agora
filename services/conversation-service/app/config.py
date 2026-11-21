@@ -143,6 +143,18 @@ class Config:
         "Thank you. Your message has been received; an agent will respond shortly."
     )
 
+    # USSD knowledge grounding (SPEC-W108): in pass-through text mode a
+    # non-empty selection triggers a knowledge-service GET /v1/context
+    # lookup; grounded snippets replace the static ack. The USSD turn
+    # budget is ~1s, so the lookup runs under a tight per-call timeout and
+    # ANY failure (error, timeout, empty) falls back to the static ack —
+    # the callback never fails because of grounding.
+    ussd_kb_grounding: bool = True
+    knowledge_app_id: str = "knowledge"
+    ussd_kb_timeout_s: float = 0.8
+    ussd_kb_max_reply_chars: int = 300
+    ussd_kb_max_snippets: int = 2
+
     # OpenSearch indexer (SPEC §10, index `conversations`).
     opensearch_addr: str = "http://opensearch:9200"
     conversations_index: str = "conversations"
@@ -228,6 +240,12 @@ def load() -> Config:
         outbox_relay_seconds=float(_env("OUTBOX_RELAY_SECONDS", "1")),
         outbox_relay_batch=int(_env("OUTBOX_RELAY_BATCH", "100")),
         ussd_enabled=_env("USSD_ENABLED", "true").lower() == "true",
+        ussd_kb_grounding=_env("USSD_KB_GROUNDING", "on").lower()
+        in ("1", "on", "true", "yes"),
+        knowledge_app_id=_env("KNOWLEDGE_APP_ID", "knowledge"),
+        ussd_kb_timeout_s=float(_env("USSD_KB_TIMEOUT_S", "0.8")),
+        ussd_kb_max_reply_chars=int(_env("USSD_KB_MAX_REPLY_CHARS", "300")),
+        ussd_kb_max_snippets=int(_env("USSD_KB_MAX_SNIPPETS", "2")),
         ussd_text_mode_reply=_env(
             "USSD_TEXT_MODE_REPLY",
             "Thank you. Your message has been received; an agent will respond shortly.",

@@ -590,6 +590,40 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
     reply, continue_session, selected = ussd.build_reply(
         body, st.cfg.ussd_text_mode_reply
     )
+    # SPEC-W108 Part B: knowledge-grounded text-mode replies. Only in
+    # pass-through text mode with a non-empty selection (menu mode is
+    # deterministic; the empty first turn has no query). ANY KB failure —
+    # unreachable, timeout over the tight per-call budget, empty snippets —
+    # falls back to the static ack above; grounding never fails a callback.
+    grounded = False
+    if (
+        st.cfg.ussd_kb_grounding
+        and not body.menu
+        and ussd.parse_last_selection(body.text)
+    ):
+        try:
+            kb = await st.dapr.invoke(
+                st.cfg.knowledge_app_id,
+                "v1/context",
+                params={"tenant": str(tenant_id), "q": ussd.parse_last_selection(body.text)},
+                # Internal Dapr callers self-pass the binding header
+                # (SPEC-W43 C1; voice runtime W108 Part A does the same).
+                headers={"X-Tenant-Slugs": str(tenant_id)},
+                timeout_s=st.cfg.ussd_kb_timeout_s,
+            )
+            snippets = kb.get("snippets") or [] if isinstance(kb, dict) else []
+            grounded_text = ussd.grounded_reply(
+                snippets,
+                max_snippets=st.cfg.ussd_kb_max_snippets,
+                max_chars=st.cfg.ussd_kb_max_reply_chars,
+            )
+            if grounded_text:
+                reply, grounded = grounded_text, True
+        except Exception as exc:  # noqa: BLE001 - grounding is best-effort
+            st.log.warning(
+                "ussd knowledge grounding failed; static ack fallback",
+                error=str(exc)[:200],
+            )
     payload = ussd.response_payload(
         conversation_id=conv_id,
         reply=reply,
@@ -597,6 +631,7 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
         body=body,
         selected=selected,
     )
+    payload["grounded"] = grounded
     # W46-F P5: record the reply as an agent turn (deduped on the same
     # callback key, mirroring the telegram/whatsapp bridge's user-turn →
     # agent-turn pair) in a BACKGROUND task AFTER the response — the USSD

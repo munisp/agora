@@ -1078,6 +1078,12 @@ services:
       # SPEC-W38 F3: capture primitive topic (consumer group
       # conversation-capture; CAPTURE_ENABLED defaults to INTEL_LLM).
       CAPTURE_TOPIC: ${CAPTURE_TOPIC:-opendesk.conversation.captures}
+      # SPEC-W108: USSD text-mode knowledge grounding (tight per-call
+      # timeout; any KB failure falls back to the static ack).
+      KNOWLEDGE_APP_ID: ${KNOWLEDGE_APP_ID:-knowledge}
+      USSD_KB_GROUNDING: ${USSD_KB_GROUNDING:-on}
+      USSD_KB_TIMEOUT_S: ${USSD_KB_TIMEOUT_S:-0.8}
+      USSD_KB_MAX_REPLY_CHARS: ${USSD_KB_MAX_REPLY_CHARS:-300}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

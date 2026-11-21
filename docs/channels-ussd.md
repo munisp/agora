@@ -82,6 +82,12 @@ above; `END` also deletes the session state.
 
 ## Menu mode vs pass-through text mode
 
+> **SPEC-W108**: pass-through text mode is now knowledge-grounded by
+> default — a non-empty free-text selection looks up knowledge-service
+> `/v1/context` (0.8s per-call timeout) and answers with grounded snippets;
+> any failure falls back to the static ack below. See
+> `docs/channel-grounding.md`.
+
 On a new session the gateway fetches the tenant payload from the identity
 packs summary endpoint (`IDENTITY_URL` override, else Dapr invoke app-id
 `identity`): `GET /v1/tenants/{slug}` and reads `pack.ussd.menu` —
