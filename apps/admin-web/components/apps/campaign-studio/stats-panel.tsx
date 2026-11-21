@@ -1,4 +1,5 @@
 "use client";
+import { TableBody } from "@/components/ui/table";
 
 /**
  * Journey stats panel (SPEC-W19 Agent D): enrolled/active/completed/
@@ -78,7 +79,7 @@ export function StatsPanel({
                 <th className="py-1 font-medium">Exited</th>
               </tr>
             </thead>
-            <tbody>
+            <TableBody>
               {stats.per_step.map((s) => (
                 <tr key={s.step_idx} className="border-b last:border-0">
                   <td className="py-1 pr-2">{s.step_idx + 1}</td>
@@ -92,7 +93,7 @@ export function StatsPanel({
                   <td className="py-1">{s.exited}</td>
                 </tr>
               ))}
-            </tbody>
+            </TableBody>
           </table>
         </div>
       ) : null}

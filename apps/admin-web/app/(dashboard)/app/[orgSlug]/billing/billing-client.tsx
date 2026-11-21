@@ -52,9 +52,9 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
   const [creatingBeneficiary, setCreatingBeneficiary] = React.useState(false);
   // W45 K20 / SPEC-W47 UIWEB-20: above-threshold payouts park as
   // `pending_approval` (no rail transfer yet) until POST
-  // /v1/payouts/{id}/approve. There is no payout list endpoint, so the
-  // approval surface covers payouts requested from this session plus a
-  // manual id entry.
+  // /v1/payouts/{id}/approve. The queue loads from GET /v1/payouts
+  // ?state=pending_approval (2026-11-21), so it survives a reload and shows
+  // payouts requested anywhere; manual id entry stays as a fallback.
   const [pendingPayouts, setPendingPayouts] = React.useState<Payout[]>([]);
   const [approveBusyId, setApproveBusyId] = React.useState<string | null>(null);
   const [manualPayoutId, setManualPayoutId] = React.useState("");
@@ -96,10 +96,33 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
     }
   }, [orgSlug]);
 
+  const loadPending = React.useCallback(async () => {
+    try {
+      const rows = await api.get<
+        Array<{ payout_id: string; tenant_id: string; amount_cents: number; currency: string; state: string; dfsp_fsp_id?: string | null; created_at: string }>
+      >(`/api/payments/v1/payouts?tenant_id=${encodeURIComponent(orgSlug)}&state=pending_approval`);
+      setPendingPayouts(
+        (Array.isArray(rows) ? rows : []).map((r) => ({
+          id: r.payout_id,
+          payout_id: r.payout_id,
+          tenant_id: r.tenant_id,
+          amount_cents: r.amount_cents,
+          currency: r.currency,
+          status: r.state,
+          dfsp_fsp_id: r.dfsp_fsp_id ?? null,
+          created_at: r.created_at,
+        })),
+      );
+    } catch {
+      // Older payments-service without the list route: keep session-only behaviour.
+    }
+  }, [orgSlug]);
+
   React.useEffect(() => {
     void load();
     void loadBeneficiaries();
-  }, [load, loadBeneficiaries]);
+    void loadPending();
+  }, [load, loadBeneficiaries, loadPending]);
 
   const createBeneficiary = async (e: React.FormEvent) => {
     e.preventDefault();

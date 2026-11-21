@@ -4,7 +4,7 @@
  * so it is safe to import from server or client components.
  */
 import type { Feature, Geometry, MultiPolygon, Polygon } from "geojson";
-import type { StyleSpecification } from "maplibre-gl";
+import type { RequestParameters, StyleSpecification } from "maplibre-gl";
 import type { ServiceArea } from "@/lib/types";
 
 /**
@@ -27,6 +27,41 @@ export const GEO_STYLE_URL: string =
  * the self-hosted style URL, not the old OSM raster hot-link.
  */
 export const OSM_RASTER_STYLE: string = GEO_STYLE_URL;
+
+/**
+ * 2026-11-20: the geo-service style lists its tiles/glyphs/sprite RELATIVE to
+ * the style document ("tiles/{z}/{x}/{y}.mvt"). MapLibre fetches vector tiles
+ * from a web worker, where a relative URL does not resolve against our site,
+ * so the basemap stayed grey. Resolve every relative URL against the style
+ * URL (string concatenation keeps the {z}/{x}/{y} placeholders unescaped).
+ */
+function styleBase(): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+  const abs = /^[a-z]+:\/\//i.test(GEO_STYLE_URL) ? GEO_STYLE_URL : origin + (GEO_STYLE_URL.startsWith("/") ? "" : "/") + GEO_STYLE_URL;
+  return abs.slice(0, abs.lastIndexOf("/") + 1);
+}
+
+export function absoluteGeoUrl(url: string): string {
+  if (/^([a-z]+:)?\/\//i.test(url) || url.startsWith("data:") || url.startsWith("blob:")) return url;
+  if (url.startsWith("/")) return styleBase().replace(/^([a-z]+:\/\/[^/]+).*$/i, "$1") + url;
+  return styleBase() + url;
+}
+
+/** MapLibre transformRequest for maps given the style as a URL string. */
+export function geoTransformRequest(url: string): RequestParameters {
+  return { url: absoluteGeoUrl(url) };
+}
+
+function absolutizeStyle(style: StyleSpecification): StyleSpecification {
+  for (const src of Object.values(style.sources ?? {})) {
+    const s = src as { tiles?: string[]; url?: string };
+    if (Array.isArray(s.tiles)) s.tiles = s.tiles.map(absoluteGeoUrl);
+    if (typeof s.url === "string") s.url = absoluteGeoUrl(s.url);
+  }
+  if (typeof style.glyphs === "string") style.glyphs = absoluteGeoUrl(style.glyphs);
+  if (typeof style.sprite === "string") style.sprite = absoluteGeoUrl(style.sprite);
+  return style;
+}
 
 /**
  * Fetch and validate the basemap style document. Map components call this
@@ -52,7 +87,7 @@ export async function fetchMapStyle(
   if (!candidate || candidate.version !== 8 || !Array.isArray(candidate.layers)) {
     throw new Error("Map style endpoint did not return a valid style document");
   }
-  return style as StyleSpecification;
+  return absolutizeStyle(style as StyleSpecification);
 }
 
 /** Default world view before any data is fitted. */

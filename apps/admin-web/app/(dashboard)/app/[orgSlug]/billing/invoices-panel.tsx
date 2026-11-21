@@ -482,7 +482,7 @@ function InvoiceRow({
                         <th className="pb-1 text-right font-medium">Amount</th>
                       </tr>
                     </thead>
-                    <tbody>
+                    <TableBody>
                       {lineItems.map((li) => (
                         <tr key={li.metric} className="border-t border-border">
                           <td className="py-1.5 font-medium">{li.metric}</td>
@@ -494,7 +494,7 @@ function InvoiceRow({
                           </td>
                         </tr>
                       ))}
-                    </tbody>
+                    </TableBody>
                   </table>
                 )}
                 {detail?.paid_at ? (

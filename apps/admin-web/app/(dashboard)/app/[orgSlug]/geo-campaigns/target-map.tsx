@@ -17,7 +17,7 @@ import MapLibreDraw from "@telida/maplibre-gl-draw";
 import "maplibre-gl/dist/maplibre-gl.css";
 import "@telida/maplibre-gl-draw/dist/maplibre-gl-draw.css";
 import type { Feature, FeatureCollection, Polygon } from "geojson";
-import { DEFAULT_CENTER, DEFAULT_ZOOM, OSM_RASTER_STYLE } from "@/lib/geo";
+import { DEFAULT_CENTER, DEFAULT_ZOOM, OSM_RASTER_STYLE, geoTransformRequest } from "@/lib/geo";
 
 type DrawEventMap = {
   "draw.create": MapLibreDraw.DrawCreateEvent;
@@ -73,6 +73,7 @@ export default function TargetMap({
     const map = new maplibregl.Map({
       container,
       style: OSM_RASTER_STYLE,
+      transformRequest: geoTransformRequest,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       attributionControl: { compact: true },

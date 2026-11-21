@@ -1,4 +1,5 @@
 "use client";
+import { TableBody } from "@/components/ui/table";
 
 /**
  * SLA policy editor (SPEC-W19 Agent A): list of per-priority-tier policies
@@ -243,7 +244,7 @@ export function SLAPolicyEditor({
                 {canManage ? <th className="px-3 py-2" /> : null}
               </tr>
             </thead>
-            <tbody>
+            <TableBody>
               {policies.map((p) => (
                 <tr key={p.id} className="border-b border-border last:border-0">
                   <td className="px-3 py-2 font-medium">{p.name}</td>
@@ -269,7 +270,7 @@ export function SLAPolicyEditor({
                   ) : null}
                 </tr>
               ))}
-            </tbody>
+            </TableBody>
           </table>
         </div>
       )}

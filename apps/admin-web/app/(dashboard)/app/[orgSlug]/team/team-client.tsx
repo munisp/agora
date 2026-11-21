@@ -178,7 +178,7 @@ export function TeamClient({
               <TableHead className="pr-5 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
-          <TableBody>
+          <TableBody paginate={false}>
             {pagedMembers.length === 0 ? (
               <TableEmpty colSpan={5}>No team members yet.</TableEmpty>
             ) : (

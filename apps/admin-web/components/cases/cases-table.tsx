@@ -112,7 +112,7 @@ export function CasesTable({
             <TableHead>Opened</TableHead>
           </TableRow>
         </TableHeader>
-        <TableBody>
+        <TableBody paginate={false}>
           {cases.map((c) => {
             const reporter = reporterDisplay(c, canRevealReporter);
             const ack = slaCountdown(c.ack_due_at, c.sla_breach_ack, c.acked_at);

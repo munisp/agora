@@ -397,6 +397,7 @@ function captureLead() {
     var place = selectedPlace();
     if (place.state) payload.state = place.state;
     if (place.lga) payload.lga = place.lga;
+    if (place.lga_code) payload.lga_code = place.lga_code;
     if (place.locality) payload.locality = place.locality;
     return enqueue("lead_capture", payload, gps).then(function () {
       document.getElementById("f-name").value = "";
@@ -725,6 +726,9 @@ function selectedPlace() {
     }
     if ($("f-lga").value && li >= 0) {
       out.lga = $("f-lga").options[li].getAttribute("data-name") || $("f-lga").options[li].textContent;
+      // 2026-11-21: the option value IS the gazetteer code (e.g. NG-LAGOS-IKEJA);
+      // the server stores it on the lead for the CAC LGA breakdown.
+      out.lga_code = $("f-lga").value;
     }
     // SPEC-W78: locality is optional — included only when actually picked.
     var locSel = $("f-locality"), oi = locSel ? locSel.selectedIndex : -1;

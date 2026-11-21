@@ -16,7 +16,7 @@ import type {
   MultiPolygon,
   Polygon,
 } from "geojson";
-import { DEFAULT_CENTER, DEFAULT_ZOOM, OSM_RASTER_STYLE } from "@/lib/geo";
+import { DEFAULT_CENTER, DEFAULT_ZOOM, OSM_RASTER_STYLE, geoTransformRequest } from "@/lib/geo";
 import { lgaToFeature, type CacLgaRow } from "@/components/cac/types";
 
 export type LgaMetric = "leads" | "conversions" | "cac_ngn";
@@ -99,6 +99,7 @@ export default function CacLgaMap({
     const map = new maplibregl.Map({
       container,
       style: OSM_RASTER_STYLE,
+      transformRequest: geoTransformRequest,
       center: DEFAULT_CENTER,
       zoom: DEFAULT_ZOOM,
       attributionControl: { compact: true },

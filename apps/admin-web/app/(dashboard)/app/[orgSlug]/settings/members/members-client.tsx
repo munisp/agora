@@ -187,7 +187,7 @@ export function MembersClient({
               <TableHead className="pr-5 text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
-          <TableBody>
+          <TableBody paginate={false}>
             {pagedMembers.length === 0 ? (
               <TableEmpty colSpan={4}>No members found.</TableEmpty>
             ) : (
