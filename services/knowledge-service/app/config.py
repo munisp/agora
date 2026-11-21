@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     doc_intel_timeout_s: float = 300.0
     doc_intel_max_bytes: int = 10 * 1024 * 1024  # decoded upload ceiling -> 413
     doc_intel_max_chars: int = 1_000_000  # extracted-text ceiling -> 413
+    # SPEC-W111 async jobs: poll cadence and overall deadline for
+    # /v1/documents/upload with wait=false (very large scans).
+    doc_intel_poll_s: float = 2.0
+    doc_intel_job_timeout_s: float = 900.0
 
     # Text-to-SQL (SPEC-W3 §3, innovation 8): OpenAI-compatible LLM
     # (default qwen3:8b via Ollama) + Trino HTTP API.

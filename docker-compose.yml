@@ -1147,6 +1147,9 @@ services:
       DOC_INTEL_URL: ${DOC_INTEL_URL:-http://doc-intel:5001}
       DOC_INTEL_API_KEY: ${DOC_INTEL_API_KEY:-}
       DOC_INTEL_TIMEOUT_S: ${DOC_INTEL_TIMEOUT_S:-300}
+      # SPEC-W111: wait=false async ingest polls the docling task API.
+      DOC_INTEL_POLL_S: ${DOC_INTEL_POLL_S:-2}
+      DOC_INTEL_JOB_TIMEOUT_S: ${DOC_INTEL_JOB_TIMEOUT_S:-900}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

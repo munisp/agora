@@ -15,6 +15,7 @@ Routes:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import uuid
@@ -22,7 +23,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
@@ -38,6 +39,7 @@ from .docintel import (
     DocIntelRejected,
     DocIntelUnavailable,
 )
+from .upload_jobs import UploadJobsStore
 from .embeddings import Embedder
 from .logging import configure_logging, get_logger
 from .rrf import reciprocal_rank_fusion
@@ -67,6 +69,10 @@ class UploadRequest(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     content_base64: str = Field(..., min_length=1)
     title: str | None = None
+    # SPEC-W111: wait=false submits an async docling task and returns 202
+    # with a job id (poll GET /v1/documents/upload/{job_id}); the default
+    # keeps the W107 sync path byte-identical.
+    wait: bool = True
 
 
 class AppState:
@@ -75,6 +81,8 @@ class AppState:
     embedder: Embedder
     dapr: DaprClient
     docintel: DocIntelClient
+    upload_jobs: UploadJobsStore
+    bg_tasks: set[asyncio.Task]
 
 
 def get_state(request: Request) -> AppState:
@@ -117,12 +125,20 @@ async def lifespan(app: FastAPI):
         api_key=settings.doc_intel_api_key,
         timeout_s=settings.doc_intel_timeout_s,
     )
+    deps.upload_jobs = UploadJobsStore(deps.db)
+    deps.bg_tasks = set()
     await deps.db.connect()
     # SPEC-W3 §4 innovation 4: kb_suggestions bootstrap DDL (idempotent).
     try:
         await deps.db.ensure_suggestions_table()
     except Exception as exc:
         log.error("kb_suggestions.bootstrap_failed", error=str(exc))
+    # SPEC-W111: upload_jobs bootstrap (idempotent). Failure must NOT break
+    # the sync upload path — logged, and wait=false requests will 503.
+    try:
+        await deps.db.ensure_upload_jobs_table()
+    except Exception as exc:
+        log.error("upload_jobs.bootstrap_failed", error=str(exc))
     await deps.search.ensure_index()
     app.state.deps = deps
     log.info("service.started", port=settings.port)
@@ -130,6 +146,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("service.shutting_down")
+        for task in deps.bg_tasks:
+            task.cancel()
+        if deps.bg_tasks:
+            await asyncio.gather(*deps.bg_tasks, return_exceptions=True)
         await deps.dapr.aclose()
         await deps.search.aclose()
         await deps.db.aclose()
@@ -255,6 +275,29 @@ async def upload_document(
             ),
         )
     tenant_id = await _bound_tenant_id(request, req.tenant, deps)
+    title = req.title or req.filename.rsplit(".", 1)[0]
+    if not req.wait:
+        # SPEC-W111: async ingest for very large scans — submit a docling
+        # task and let a background job poll/ingest; the caller polls the
+        # job row. 202 + job id; the job NEVER propagates failure to other
+        # requests (row marked failed with the honest error).
+        job_id = await deps.upload_jobs.create(tenant_id, req.filename, title)
+        task = asyncio.create_task(
+            _run_upload_job(
+                deps, tenant_id, job_id, req.filename, data, title
+            )
+        )
+        deps.bg_tasks.add(task)
+        task.add_done_callback(deps.bg_tasks.discard)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "pending",
+                "tenant_id": tenant_id,
+                "title": title,
+            },
+        )
     try:
         extraction = await deps.docintel.convert(req.filename, data)
     except DocIntelUnavailable as exc:
@@ -269,7 +312,6 @@ async def upload_document(
                 f"{settings.doc_intel_max_chars}"
             ),
         )
-    title = req.title or req.filename.rsplit(".", 1)[0]
     result = await _ingest_document(
         deps, tenant_id, title, extraction.text, f"upload:{req.filename}"
     )
@@ -279,6 +321,87 @@ async def upload_document(
         "chars": len(extraction.text),
     }
     return result
+
+
+async def _run_upload_job(
+    deps: AppState,
+    tenant_id: str,
+    job_id: str,
+    filename: str,
+    data: bytes,
+    title: str,
+) -> None:
+    """SPEC-W111 background job: submit -> poll -> ingest -> mark done.
+
+    Every failure marks the job row failed with the honest error; nothing
+    propagates. CancelledError (shutdown) propagates so the lifespan gather
+    is prompt — the row stays 'running' (honestly resumable-looking; a
+    reaper sweep is a documented follow-up).
+    """
+    try:
+        await deps.upload_jobs.set_running(tenant_id, job_id)
+        task_id = await deps.docintel.submit(filename, data)
+        deadline = asyncio.get_running_loop().time() + settings.doc_intel_job_timeout_s
+        status = "pending"
+        while status not in ("success", "failure"):
+            if asyncio.get_running_loop().time() > deadline:
+                raise DocIntelUnavailable(
+                    f"doc-intel job timed out after {settings.doc_intel_job_timeout_s}s"
+                )
+            await asyncio.sleep(settings.doc_intel_poll_s)
+            status = await deps.docintel.poll(task_id)
+        if status == "failure":
+            raise DocIntelRejected("doc-intel task reported failure")
+        extraction = await deps.docintel.result(task_id)
+        if len(extraction.text) > settings.doc_intel_max_chars:
+            raise DocIntelRejected(
+                f"extracted text is {len(extraction.text)} chars; limit is "
+                f"{settings.doc_intel_max_chars}"
+            )
+        result = await _ingest_document(
+            deps, tenant_id, title, extraction.text, f"upload:{filename}"
+        )
+        await deps.upload_jobs.set_done(
+            tenant_id, job_id, result["id"], len(extraction.text)
+        )
+        log.info("upload_job.done", job_id=job_id, document_id=result["id"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - job failure is row state
+        log.warning("upload_job.failed", job_id=job_id, error=str(exc)[:200])
+        try:
+            await deps.upload_jobs.set_failed(tenant_id, job_id, str(exc))
+        except Exception as exc2:  # noqa: BLE001 - never raise from a job
+            log.error("upload_job.fail_mark_failed", job_id=job_id, error=str(exc2))
+
+
+@app.get("/v1/documents/upload/{job_id}")
+async def get_upload_job(
+    job_id: str,
+    request: Request,
+    tenant: str = Query(..., description="tenant slug or UUID"),
+    deps: AppState = Depends(get_state),
+):
+    """SPEC-W111: tenant-bound async upload job status (404 cross-tenant)."""
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
+    try:
+        job = await deps.upload_jobs.get(tenant_id, job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="upload job not found") from None
+    if job is None:
+        raise HTTPException(status_code=404, detail="upload job not found")
+    return {
+        "job_id": job.id,
+        "tenant_id": job.tenant_id,
+        "filename": job.filename,
+        "title": job.title,
+        "status": job.status,
+        "document_id": job.document_id,
+        "chars": job.chars,
+        "error": job.error,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+    }
 
 
 @app.get("/v1/documents")

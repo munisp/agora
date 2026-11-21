@@ -1,4 +1,4 @@
-# Document Intelligence (SPEC-W107)
+# Document Intelligence (SPEC-W107 + W111)
 
 How binary documents become conversational knowledge in OpenDesk/Agora.
 
@@ -7,6 +7,8 @@ How binary documents become conversational knowledge in OpenDesk/Agora.
 ```
 POST /v1/documents/upload  (knowledge-service, JSON base64)
   -> tenant binding (SPEC-W43 C1, X-Tenant-Slugs)
+  -> wait=true (default): doc-intel sync convert (W107, unchanged)
+  -> wait=false: upload_jobs row + 202; background submit -> poll -> result (W111)
   -> doc-intel sidecar (docling-serve, infra/compose/doc-intel.compose.yml)
        docling layout-aware parse -> Markdown
        RapidOCR (PaddleOCR ONNX models) for scanned pages / images
@@ -17,8 +19,9 @@ POST /v1/documents/upload  (knowledge-service, JSON base64)
 ```
 
 The sidecar is the **only** extraction engine. There is no in-process
-fallback parser: when the sidecar is unreachable the endpoint answers **503**
-— a silent text-only degradation would be indistinguishable from a mock.
+fallback parser: when the sidecar is unreachable the sync endpoint answers
+**503** — a silent text-only degradation would be indistinguishable from a
+mock. Async jobs record the same failure honestly on the job row.
 
 ## Formats
 
@@ -32,6 +35,38 @@ fallback parser: when the sidecar is unreachable the endpoint answers **503**
 
 Supported extensions (415 otherwise): `pdf docx pptx xlsx html htm md txt
 asciidoc adoc png jpg jpeg tiff tif`.
+
+## Async ingest for very large scans (SPEC-W111)
+
+The W107 sync path remains the default (`wait` omitted or `true`) and is
+byte-identical. For scans that can outlive a request budget, submit with
+`"wait": false`:
+
+```
+POST /v1/documents/upload
+{"tenant": "...", "filename": "annual-report.pdf",
+ "content_base64": "...", "wait": false}
+-> 202 {"job_id": "...", "status": "pending", "tenant_id": "...", "title": "..."}
+
+GET /v1/documents/upload/{job_id}?tenant=...
+-> {"status": "pending|running|done|failed", "document_id": ..., "chars": ...,
+    "error": ...}
+```
+
+The background runner submits docling's `/v1/convert/source/async`, polls
+`/v1/status/poll/{task_id}` every `DOC_INTEL_POLL_S` (default 2s) until
+`DOC_INTEL_JOB_TIMEOUT_S` (default 900s), fetches `/v1/result/{task_id}`, then
+runs the **same unchanged `_ingest_document` pipeline** as sync uploads.
+Terminal failures mark the job `failed` with the honest error; the job never
+throws into unrelated requests. Job status reads are tenant-bound like every
+other knowledge route: another tenant receives **404**, not an existence
+oracle.
+
+`upload_jobs` is created idempotently at service startup with RLS enabled and
+forced (kb_suggestions precedent). A bootstrap failure is logged and does not
+break sync uploads; `wait=false` requests will fail honestly until the table
+exists. A reaper for rows interrupted mid-run by shutdown is a documented
+follow-up.
 
 ## OCR — PaddleOCR models via RapidOCR
 
@@ -55,9 +90,9 @@ at it — do not flip the shared sidecar.
 
 | Surface | Consumer | Status |
 |---|---|---|
-| Voice | voice-agent-runtime `/v1/context` + async_tools `knowledge_search` (filler ack while the slow tool runs) | WIRED |
-| Chat | admin agent wizard `knowledge_packs` tags are config only; runtime grounding rides the voice-agent-runtime text path | PARTIAL |
-| Channels (USSD / messaging) | conversation-service / messaging-gateway | NOT WIRED — queued follow-up wave "channel grounding" (`/v1/context` lookup for channel auto-responses) |
+| Voice | voice-agent-runtime `/v1/context` (X-Tenant-Slugs bound) + async_tools `knowledge_search` (filler ack while the slow tool runs) | WIRED |
+| Chat | voice-agent-runtime text path: per-turn `/v1/context` query merged with bootstrap snippets before prompt build (SPEC-W109) | WIRED |
+| Channels (USSD / messaging) | conversation-service USSD text turns ground from `/v1/context` (SPEC-W108) with optional LLM compression (SPEC-W110); WhatsApp/Telegram ride the voice bridge | WIRED |
 
 All surfaces share the same embeddings — there is one knowledge base, not
 three.
@@ -75,9 +110,12 @@ three.
 
 ## Limits & honest caveats
 
-- Sync conversion only; the sidecar waits up to
-  `DOCLING_SERVE_MAX_SYNC_WAIT=600`s. Very large scans should use docling's
-  async endpoints — a documented follow-up, not wired.
+- Sync conversion waits up to `DOCLING_SERVE_MAX_SYNC_WAIT=600`s on the
+  sidecar and `DOC_INTEL_TIMEOUT_S=300`s in knowledge-service. Very large
+  scans should use `wait=false` (above) instead of stretching HTTP budgets.
+- Async jobs poll every `DOC_INTEL_POLL_S` and give up after
+  `DOC_INTEL_JOB_TIMEOUT_S`; a timeout marks the row `failed`, never retries
+  silently.
 - Tables become **Markdown text** inside chunks — cell-level structure is not
   queryable as data (text-to-SQL analytics is the structured path).
 - Reading order is docling's heuristic; exotic layouts can interleave.
@@ -98,4 +136,5 @@ curl -s http://localhost:9080/... # via gateway; direct port is NOT published (G
 knowledge-service env: `DOC_INTEL_URL` (default `http://doc-intel:5001`),
 `DOC_INTEL_API_KEY` (must match the sidecar's `DOCLING_SERVE_API_KEY` when
 set), `DOC_INTEL_TIMEOUT_S` (300; keep >= the sidecar sync wait),
-`DOC_INTEL_MAX_BYTES`, `DOC_INTEL_MAX_CHARS`.
+`DOC_INTEL_MAX_BYTES`, `DOC_INTEL_MAX_CHARS`, `DOC_INTEL_POLL_S` (2), and
+`DOC_INTEL_JOB_TIMEOUT_S` (900).

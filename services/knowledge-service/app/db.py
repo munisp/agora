@@ -60,6 +60,15 @@ class Database:
             await conn.execute(DDL)
         log.info("kb_suggestions.table_ensured")
 
+    async def ensure_upload_jobs_table(self) -> None:
+        """SPEC-W111: idempotent upload_jobs bootstrap DDL."""
+        from .upload_jobs import DDL
+
+        assert self._pool is not None, "database not connected"
+        async with self._pool.acquire() as conn:
+            await conn.execute(DDL)
+        log.info("upload_jobs.table_ensured")
+
     @asynccontextmanager
     async def tenant_conn(self, tenant_id: str):
         """Yield a connection with `app.tenant_id` set for RLS.

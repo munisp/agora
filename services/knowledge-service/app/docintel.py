@@ -46,8 +46,8 @@ class DocIntelClient:
     def _headers(self) -> dict[str, str]:
         return {"X-Api-Key": self._api_key} if self._api_key else {}
 
-    async def convert(self, filename: str, data: bytes) -> Extraction:
-        payload = {
+    def _payload(self, filename: str, data: bytes) -> dict:
+        return {
             "options": {
                 "to_formats": ["md"],
                 "do_ocr": True,
@@ -65,23 +65,8 @@ class DocIntelClient:
             ],
             "target": {"kind": "inbody"},
         }
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(
-                    f"{self._base}/v1/convert/source",
-                    json=payload,
-                    headers=self._headers(),
-                )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise DocIntelUnavailable(
-                f"doc-intel sidecar unreachable at {self._base}: {exc!r}"
-            ) from exc
-        if resp.status_code != 200:
-            raise DocIntelRejected(
-                f"doc-intel conversion refused (HTTP {resp.status_code}): "
-                f"{resp.text[:500]}"
-            )
-        body = resp.json()
+
+    def _parse_result(self, body: dict) -> Extraction:
         status = body.get("status")
         if status == "failure":
             errors = body.get("errors") or []
@@ -100,6 +85,90 @@ class DocIntelClient:
             text=text,
             processing_time_s=float(body.get("processing_time") or 0.0),
         )
+
+    async def convert(self, filename: str, data: bytes) -> Extraction:
+        payload = self._payload(filename, data)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{self._base}/v1/convert/source",
+                    json=payload,
+                    headers=self._headers(),
+                )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise DocIntelUnavailable(
+                f"doc-intel sidecar unreachable at {self._base}: {exc!r}"
+            ) from exc
+        if resp.status_code != 200:
+            raise DocIntelRejected(
+                f"doc-intel conversion refused (HTTP {resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+        return self._parse_result(resp.json())
+
+    # ---- async task API (SPEC-W111: very large scans outlive the sync
+    # wait; submit -> poll -> result). Same error taxonomy as convert.
+
+    async def submit(self, filename: str, data: bytes) -> str:
+        """POST /v1/convert/source/async; returns the task_id."""
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{self._base}/v1/convert/source/async",
+                    json=self._payload(filename, data),
+                    headers=self._headers(),
+                )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise DocIntelUnavailable(
+                f"doc-intel sidecar unreachable at {self._base}: {exc!r}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise DocIntelRejected(
+                f"doc-intel async submit refused (HTTP {resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+        task_id = str(resp.json().get("task_id") or "")
+        if not task_id:
+            raise DocIntelRejected("doc-intel async submit returned no task_id")
+        return task_id
+
+    async def poll(self, task_id: str) -> str:
+        """GET /v1/status/poll/{task_id}; returns the task_status string."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{self._base}/v1/status/poll/{task_id}",
+                    headers=self._headers(),
+                )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise DocIntelUnavailable(
+                f"doc-intel sidecar unreachable at {self._base}: {exc!r}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise DocIntelRejected(
+                f"doc-intel poll failed (HTTP {resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+        return str(resp.json().get("task_status") or "")
+
+    async def result(self, task_id: str) -> Extraction:
+        """GET /v1/result/{task_id}; same parsing as the sync response."""
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.get(
+                    f"{self._base}/v1/result/{task_id}",
+                    headers=self._headers(),
+                )
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise DocIntelUnavailable(
+                f"doc-intel sidecar unreachable at {self._base}: {exc!r}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise DocIntelRejected(
+                f"doc-intel result fetch failed (HTTP {resp.status_code}): "
+                f"{resp.text[:500]}"
+            )
+        return self._parse_result(resp.json())
 
     async def health(self) -> bool:
         try:
