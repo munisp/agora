@@ -78,6 +78,11 @@ class CacConsumer:
     async def process_value(self, value: Mapping[str, Any]) -> bool:
         """Apply one decoded Kafka value. Returns True when the offset may be
         committed (applied, replay, or intentionally dropped)."""
+        etype = str(value.get("type") or "")
+        if etype and etype != "com.opendesk.cac.FunnelEvent":
+            # 2026-11-21: cac.events also carries ContactCaptured (field leads,
+            # referrals) for graph-sync; not a funnel event, skip quietly.
+            return True
         event = parse_funnel_event(value)
         if event is None:
             self.dropped += 1

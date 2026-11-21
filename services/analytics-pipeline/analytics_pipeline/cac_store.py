@@ -77,6 +77,29 @@ BEGIN
     END IF;
 END $$;
 
+-- 2026-11-21: LGA rollup keyed by the geo gazetteer code (lga_id points into a
+-- gazetteer nothing fills); lga_name is carried for display.
+CREATE TABLE IF NOT EXISTS cac_rollup_lga_code (
+    tenant_id   UUID NOT NULL,
+    day         DATE NOT NULL,
+    lga_code    TEXT NOT NULL,
+    lga_name    TEXT,
+    leads       INTEGER NOT NULL DEFAULT 0,
+    conversions INTEGER NOT NULL DEFAULT 0,
+    revenue_ngn NUMERIC(18,2) NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, day, lga_code)
+);
+ALTER TABLE cac_rollup_lga_code ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cac_rollup_lga_code FORCE ROW LEVEL SECURITY;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'cac_rollup_lga_code' AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON cac_rollup_lga_code
+            USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+    END IF;
+END $$;
+
 -- First-seen campaign -> channel attribution (from funnel events), used by
 -- the summary spend join: booking-service stores spend per campaign, so we
 -- need to know which channel each campaign belongs to.
@@ -258,10 +281,35 @@ class CacStore:
                     conversions,
                     revenue,
                 )
+            if event.lga_code and (leads or conversions or revenue):
+                await conn.execute(
+                    """
+                    INSERT INTO cac_rollup_lga_code
+                        (tenant_id, day, lga_code, lga_name, leads, conversions, revenue_ngn)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (tenant_id, day, lga_code) DO UPDATE SET
+                        lga_name = COALESCE(EXCLUDED.lga_name, cac_rollup_lga_code.lga_name),
+                        leads = cac_rollup_lga_code.leads + EXCLUDED.leads,
+                        conversions = cac_rollup_lga_code.conversions + EXCLUDED.conversions,
+                        revenue_ngn = cac_rollup_lga_code.revenue_ngn + EXCLUDED.revenue_ngn,
+                        updated_at = now()
+                    """,
+                    tenant_uuid,
+                    event.day,
+                    event.lga_code,
+                    event.lga_name,
+                    leads,
+                    conversions,
+                    revenue,
+                )
             return True
 
     # ------------------------------------------------------------------
     # summary path (GET /v1/cac/summary)
+    # 2026-11-21: every read filters tenant_id = $1 explicitly. The uuid was
+    # passed but unused (Postgres: "could not determine data type of
+    # parameter $1" -> 502), and RLS alone does not bind a superuser or
+    # BYPASSRLS login, which would read every tenant's rollups.
     # ------------------------------------------------------------------
 
     async def fetch_channel_rollup(
@@ -276,7 +324,8 @@ class CacStore:
                        SUM(conversions)::int AS conversions,
                        SUM(revenue_ngn) AS revenue_ngn
                 FROM cac_rollup_channel
-                WHERE ($2::date IS NULL OR day >= $2)
+                WHERE tenant_id = $1
+                  AND ($2::date IS NULL OR day >= $2)
                   AND ($3::date IS NULL OR day <= $3)
                 GROUP BY channel
                 ORDER BY channel
@@ -298,10 +347,35 @@ class CacStore:
                        SUM(conversions)::int AS conversions,
                        SUM(revenue_ngn) AS revenue_ngn
                 FROM cac_rollup_lga
-                WHERE ($2::date IS NULL OR day >= $2)
+                WHERE tenant_id = $1
+                  AND ($2::date IS NULL OR day >= $2)
                   AND ($3::date IS NULL OR day <= $3)
                 GROUP BY lga_id
                 ORDER BY lga_id
+                """,
+                uuid.UUID(tenant_id),
+                date_from,
+                date_to,
+            )
+
+    async def fetch_lga_code_rollup(
+        self, tenant_id: str, date_from: date | None, date_to: date | None
+    ) -> list[asyncpg.Record]:
+        """Per gazetteer-LGA totals over [from, to] (2026-11-21)."""
+        async with self._tenant_tx(tenant_id) as conn:
+            return await conn.fetch(
+                """
+                SELECT lga_code,
+                       MAX(lga_name) AS lga_name,
+                       SUM(leads)::int AS leads,
+                       SUM(conversions)::int AS conversions,
+                       SUM(revenue_ngn) AS revenue_ngn
+                FROM cac_rollup_lga_code
+                WHERE tenant_id = $1
+                  AND ($2::date IS NULL OR day >= $2)
+                  AND ($3::date IS NULL OR day <= $3)
+                GROUP BY lga_code
+                ORDER BY lga_code
                 """,
                 uuid.UUID(tenant_id),
                 date_from,
@@ -316,8 +390,10 @@ class CacStore:
                 """
                 SELECT campaign_id, channel
                 FROM cac_campaign_channel
+                WHERE tenant_id = $1
                 ORDER BY first_seen_day, campaign_id
-                """
+                """,
+                uuid.UUID(tenant_id),
             )
 
     async def rollup_day_bounds(self, tenant_id: str) -> tuple[date | None, date | None]:
@@ -326,6 +402,8 @@ class CacStore:
         async with self._tenant_tx(tenant_id) as conn:
             row = await conn.fetchrow(
                 "SELECT MIN(day) AS min_day, MAX(day) AS max_day FROM cac_rollup_channel"
+                " WHERE tenant_id = $1",
+                uuid.UUID(tenant_id),
             )
             if row is None:
                 return (None, None)

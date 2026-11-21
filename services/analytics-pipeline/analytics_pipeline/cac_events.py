@@ -96,6 +96,9 @@ class FunnelEvent:
     lga_id: int | None
     amount_ngn: Decimal | None
     idempotency_key: str
+    # 2026-11-21: geo gazetteer LGA (e.g. NG-LAGOS-IKEJA / "Ikeja") from field captures.
+    lga_code: str | None = None
+    lga_name: str | None = None
 
     @property
     def day(self) -> date:
@@ -172,4 +175,6 @@ def parse_funnel_event(payload: Mapping[str, Any]) -> FunnelEvent | None:
         lga_id=lga_id,
         amount_ngn=_parse_amount(_get(body, "amount_ngn")),
         idempotency_key=str(idem),
+        lga_code=(str(_get(body, "lga_code")).strip()[:64] or None) if _get(body, "lga_code") else None,
+        lga_name=(str(_get(body, "lga_name")).strip()[:120] or None) if _get(body, "lga_name") else None,
     )

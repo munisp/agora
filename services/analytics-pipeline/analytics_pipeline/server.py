@@ -15,6 +15,7 @@ and never treat these values as caller input from an untrusted network."""
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -33,6 +34,14 @@ from .recommendations import fetch_recommendations
 from .tenants import TenantNotFoundError, TenantResolutionError, TenantResolver
 
 log = structlog.get_logger()
+
+
+def _is_uuid(raw: str) -> bool:
+    try:
+        uuid.UUID(raw.strip())
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def _parse_date(raw: str | None, param: str) -> date | None:
@@ -83,11 +92,36 @@ def create_app(
         return PlainTextResponse(generate_latest().decode("utf-8"),
                                  media_type=CONTENT_TYPE_LATEST)
 
+    async def _resolve_tenant(tenant: str | None, x_tenant_slug: str | None) -> str:
+        """2026-11-21: the lakehouse keys rows by tenant UUID, but the
+        dashboard sends the business slug (?tenant=<slug>, plus the BFF's
+        X-Tenant-Slug from the session). Same order as /v1/cac/summary: the
+        header wins; a non-UUID ?tenant= is treated as a slug; a UUID passes."""
+        slug = (x_tenant_slug or "").strip()
+        if not slug and tenant and not _is_uuid(tenant):
+            slug = tenant.strip()
+        if slug:
+            if cac is None:
+                raise HTTPException(status_code=400, detail="tenant must be a UUID (slug resolution unavailable)")
+            try:
+                return str((await cac.tenants.by_slug(slug)).id)
+            except TenantNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="tenant not found") from exc
+            except TenantResolutionError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if tenant:
+            return tenant.strip()
+        raise HTTPException(status_code=400, detail="X-Tenant-Slug header (or ?tenant=) is required")
+
     @app.get("/v1/recommendations")
-    async def recommendations(tenant: str = Query(min_length=1)) -> dict[str, Any]:
+    async def recommendations(
+        tenant: str | None = Query(default=None),
+        x_tenant_slug: str | None = Header(default=None),
+    ) -> dict[str, Any]:
         """Latest pricing recommendations per offering for a tenant
-        (SPEC-W3 §3 innovation 9). `tenant` is the tenant UUID as stored in
-        the lakehouse. Empty list when gold.reco_pricing does not exist yet."""
+        (SPEC-W3 §3 innovation 9). Rows are keyed by tenant UUID (resolved
+        from the slug). Empty list when gold.reco_pricing does not exist yet."""
+        tenant = await _resolve_tenant(tenant, x_tenant_slug)
         try:
             items = await asyncio.to_thread(fetch_recommendations, settings, tenant)
         except Exception as exc:  # noqa: BLE001 — iceberg/MinIO outage
@@ -97,9 +131,10 @@ def create_app(
 
     @app.get("/v1/metering")
     async def metering(
-        tenant: str = Query(min_length=1),
+        tenant: str | None = Query(default=None),
         from_: str | None = Query(default=None, alias="from"),
         to: str | None = None,
+        x_tenant_slug: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Aggregated usage for a tenant (Wave 5 #9): rows of
         {tenant_id, date, metric, total_value} over bronze.usage_events,
@@ -109,6 +144,7 @@ def create_app(
         date_to = _parse_date(to, "to")
         if date_from is not None and date_to is not None and date_from > date_to:
             raise HTTPException(status_code=400, detail="from must be <= to")
+        tenant = await _resolve_tenant(tenant, x_tenant_slug)
         try:
             items = await asyncio.to_thread(
                 fetch_usage, settings, tenant, date_from, date_to

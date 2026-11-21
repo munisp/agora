@@ -30,6 +30,7 @@ period -> null.
 from __future__ import annotations
 
 import asyncio
+import zlib
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
@@ -146,6 +147,7 @@ def build_summary(
     spend_unavailable: bool,
     day_bounds: tuple[date | None, date | None],
     spend_missing_channels: set[str] | frozenset[str] = frozenset(),
+    lga_code_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Pure rollup math — unit-tested without Postgres/Dapr.
 
@@ -218,6 +220,22 @@ def build_summary(
         }
         for row in lga_rows
     ]
+    # 2026-11-21: gazetteer-coded LGAs (field captures). lga_id is a stable
+    # synthetic int (CRC32 of the code) so the dashboard's numeric keys keep
+    # working; lga_code/lga_name are the real identity and label.
+    by_lga += [
+        {
+            "lga_id": lga_synthetic_id(str(row["lga_code"])),
+            "lga_code": str(row["lga_code"]),
+            "lga_name": row.get("lga_name") or str(row["lga_code"]),
+            "leads": int(row["leads"]),
+            "conversions": int(row["conversions"]),
+            "spend_ngn": None,
+            "cac_ngn": None,
+            "geom": None,
+        }
+        for row in (lga_code_rows or [])
+    ]
 
     # MW-H1: when ANY spend lookup failed the total spend is partial — a
     # blended CAC computed over it would be silently understated, so it is
@@ -275,6 +293,9 @@ async def fetch_summary(
     date_to: date | None,
 ) -> dict[str, Any]:
     """Orchestrate store reads + the resilient per-campaign spend join."""
+    lga_code_recs: list[Any] = []
+    if hasattr(store, "fetch_lga_code_rollup"):
+        lga_code_recs = await store.fetch_lga_code_rollup(tenant_id, date_from, date_to)
     channel_recs, lga_recs, campaign_recs, day_bounds = await asyncio.gather(
         store.fetch_channel_rollup(tenant_id, date_from, date_to),
         store.fetch_lga_rollup(tenant_id, date_from, date_to),
@@ -330,8 +351,15 @@ async def fetch_summary(
         date_to=date_to,
         channel_rows=[dict(rec) for rec in channel_recs],
         lga_rows=[dict(rec) for rec in lga_recs],
+        lga_code_rows=[dict(rec) for rec in lga_code_recs],
         spend_by_channel=spend_by_channel,
         spend_unavailable=spend_unavailable,
         day_bounds=day_bounds,
         spend_missing_channels=spend_missing_channels,
     )
+
+
+def lga_synthetic_id(code: str) -> int:
+    """Stable positive int for a gazetteer LGA code (dashboard row key)."""
+    return zlib.crc32(code.encode("utf-8")) & 0x7FFFFFFF
+

@@ -75,7 +75,11 @@ def ensure_target_table(spark: SparkSession) -> None:
     # Partition evolution → spec v2: days(occurred_at). DESCRIBE on a v2/Iceberg table
     # lists partition transform columns; skip if already evolved.
     described = [r.col_name for r in spark.sql(f"DESCRIBE {TARGET_TABLE}").collect()]
-    if PARTITION_FIELD not in described:
+    # 2026-11-21: DESCRIBE does not always list the partition field name, so a re-run tried to add
+    # the same partition again ("Cannot add duplicate partition field"); the table DDL is authoritative.
+    ddl = spark.sql(f"SHOW CREATE TABLE {TARGET_TABLE}").collect()[0][0].lower()
+    already = PARTITION_FIELD in described or f"days({PARTITION_SOURCE_COL})" in ddl
+    if not already:
         spark.sql(f"ALTER TABLE {TARGET_TABLE} ADD PARTITION FIELD days({PARTITION_SOURCE_COL})")
         print(f"[silver] evolved partition spec: + days({PARTITION_SOURCE_COL})")
     else:
