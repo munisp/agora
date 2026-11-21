@@ -1161,6 +1161,13 @@ services:
       DOC_INTEL_REAPER_ENABLED: ${DOC_INTEL_REAPER_ENABLED:-on}
       DOC_INTEL_REAPER_INTERVAL_S: ${DOC_INTEL_REAPER_INTERVAL_S:-60}
       DOC_INTEL_REAPER_STALE_S: ${DOC_INTEL_REAPER_STALE_S:-960}
+      # SPEC-W113: cross-encoder rerank stage after RRF (best-effort —
+      # any error/timeout falls back to RRF order, search never fails).
+      RERANK_ENABLED: ${RERANK_ENABLED:-on}
+      RERANK_MODEL: ${RERANK_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+      RERANK_CANDIDATES: ${RERANK_CANDIDATES:-20}
+      RERANK_TIMEOUT_S: ${RERANK_TIMEOUT_S:-1.0}
+      RERANK_MAX_CHARS: ${RERANK_MAX_CHARS:-2000}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

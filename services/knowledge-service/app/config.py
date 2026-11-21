@@ -91,6 +91,17 @@ class Settings(BaseSettings):
     doc_intel_reaper_interval_s: float = 60.0
     doc_intel_reaper_stale_s: float = 960.0
 
+    # SPEC-W113: cross-encoder rerank stage after RRF fusion. RRF fuses
+    # ranks but never re-scores content against the query; the reranker
+    # fixes paraphrase/terminology misses both legs get wrong. Best-effort:
+    # any error/timeout falls back to RRF order and search never fails.
+    # CPU-feasible model (22M params) — no GPU requirement.
+    rerank_enabled: bool = True
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_candidates: int = 20  # candidate pool the reranker re-scores
+    rerank_timeout_s: float = 1.0
+    rerank_max_chars: int = 2000  # per-chunk content ceiling for scoring
+
     # Text-to-SQL (SPEC-W3 §3, innovation 8): OpenAI-compatible LLM
     # (default qwen3:8b via Ollama) + Trino HTTP API.
     llm_base_url: str = "http://ollama:11434/v1"

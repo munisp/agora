@@ -99,6 +99,10 @@ rate means the tenant corpus is thin; a rising `timeout`/`error` rate
 means the knowledge leg is unhealthy. Metrics recording never fails a
 turn.
 
+Retrieval quality itself is addressed by the W113 cross-encoder rerank
+stage — see docs/rag-reranker.md. Its uplift shows up in these counters as
+falling `miss`/`ungrounded` rates.
+
 ## Honest limits
 
 - The bootstrap knowledge leg still runs once per tenant-context TTL with

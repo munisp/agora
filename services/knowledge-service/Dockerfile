@@ -19,6 +19,9 @@ RUN pip install --upgrade pip==24.3.1 && pip install /src
 # Pre-download all-MiniLM-L6-v2 into a cache dir copied into the runtime image.
 ENV SENTENCE_TRANSFORMERS_HOME=/models/hf
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2', device='cpu')"
+# SPEC-W113: pre-download the cross-encoder reranker (22M params, CPU) into
+# the same cache — runtime reranking never needs HF Hub either.
+RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2', device='cpu')"
 
 # ---- runtime stage
 FROM python:3.12-slim
@@ -32,6 +35,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /models /models
 COPY app /app/app
+# SPEC-W113: reranker evaluation harness runnable in-container
+# (python3 eval/rerank_eval.py --require as a release gate).
+COPY eval /app/eval
 
 RUN useradd --create-home --uid 10001 opendesk && chown -R opendesk /app /models
 USER opendesk

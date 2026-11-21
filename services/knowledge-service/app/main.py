@@ -42,6 +42,7 @@ from .docintel import (
 from .upload_jobs import UploadJobsStore
 from .embeddings import Embedder
 from .logging import configure_logging, get_logger
+from .reranker import CrossEncoderReranker
 from .rrf import reciprocal_rank_fusion
 from .search import SearchStore
 
@@ -82,6 +83,7 @@ class AppState:
     dapr: DaprClient
     docintel: DocIntelClient
     upload_jobs: UploadJobsStore
+    reranker: CrossEncoderReranker
     bg_tasks: set[asyncio.Task]
 
 
@@ -126,6 +128,11 @@ async def lifespan(app: FastAPI):
         timeout_s=settings.doc_intel_timeout_s,
     )
     deps.upload_jobs = UploadJobsStore(deps.db)
+    deps.reranker = CrossEncoderReranker(
+        settings.rerank_model,
+        cache_dir=settings.sentence_transformers_home,
+        max_chars=settings.rerank_max_chars,
+    )
     deps.bg_tasks = set()
     await deps.db.connect()
     # SPEC-W3 §4 innovation 4: kb_suggestions bootstrap DDL (idempotent).
@@ -522,14 +529,33 @@ async def delete_document(
 
 async def _hybrid(
     deps: AppState, tenant_id: str, q: str, k: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     fetch_k = max(k * 2, 10)  # over-fetch each leg before fusion
     bm25_hits = await deps.search.bm25_search(tenant_id, q, fetch_k)
     [vector] = await deps.embedder.embed([q])
     knn_hits = await deps.search.knn_search(tenant_id, vector, fetch_k)
-    return reciprocal_rank_fusion(
-        [bm25_hits, knn_hits], rrf_k=settings.rrf_k, size=k
+    # SPEC-W113: over-fuse to the rerank candidate pool so the cross-encoder
+    # re-scores a real pool, not just the final k. Disabled config keeps the
+    # W112 behavior byte-identical (fuse straight to k, reranker untouched).
+    fused = reciprocal_rank_fusion(
+        [bm25_hits, knn_hits],
+        rrf_k=settings.rrf_k,
+        size=max(k, settings.rerank_candidates) if settings.rerank_enabled else k,
     )
+    if not settings.rerank_enabled:
+        return fused, False
+    candidates = fused[: settings.rerank_candidates]
+    try:
+        reranked = await asyncio.wait_for(
+            deps.reranker.rerank(q, candidates),
+            timeout=settings.rerank_timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - reranking is best-effort
+        # Timeout, model-load failure, OOM — anything: keep the RRF order
+        # and log. Search NEVER fails because of reranking.
+        log.warning("rerank.failed_rrf_fallback", error=str(exc)[:200])
+        return fused[:k], False
+    return reranked[:k], True
 
 
 @app.get("/v1/search")
@@ -541,7 +567,7 @@ async def search(
     deps: AppState = Depends(get_state),
 ):
     tenant_id = await _bound_tenant_id(request, tenant, deps)
-    hits = await _hybrid(deps, tenant_id, q, k)
+    hits, reranked = await _hybrid(deps, tenant_id, q, k)
 
     # Self-improving KB (SPEC-W3 §4, innovation 4): weak answer to a
     # question-shaped query -> record a suggestion for staff review.
@@ -561,6 +587,7 @@ async def search(
     return {
         "query": q,
         "tenant_id": tenant_id,
+        "reranked": reranked,
         "results": [
             {
                 "chunk_id": h["_id"],
@@ -568,6 +595,9 @@ async def search(
                 "title": h["_source"].get("title"),
                 "content": h["_source"]["content"],
                 "rrf_score": h["_rrf_score"],
+                # SPEC-W113: present only when the hit was cross-encoder
+                # reranked; consumers must tolerate its absence.
+                **({"rerank_score": h["_rerank_score"]} if "_rerank_score" in h else {}),
             }
             for h in hits
         ],
@@ -584,7 +614,7 @@ async def context(
 ):
     """Top snippets formatted for injection into an agent system prompt."""
     tenant_id = await _bound_tenant_id(request, tenant, deps)
-    hits = await _hybrid(deps, tenant_id, q, k)
+    hits, _reranked = await _hybrid(deps, tenant_id, q, k)
     snippets = [h["_source"]["content"] for h in hits]
     prompt_block = "\n".join(f"- {s}" for s in snippets)
     return {
