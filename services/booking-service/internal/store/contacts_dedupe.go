@@ -267,7 +267,7 @@ func (s *Store) GetContactByPhone(ctx context.Context, tenantID uuid.UUID, phone
 	var c Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts
+			`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts
 			 WHERE tenant_id=$1 AND phone=$2 ORDER BY id LIMIT 1`,
 			tenantID, phone).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)
 	})

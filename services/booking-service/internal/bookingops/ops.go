@@ -7,6 +7,7 @@ package bookingops
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"errors"
 	"fmt"
 	"time"
@@ -152,6 +153,11 @@ type CreateInput struct {
 	// captured alongside Industry the same way. When unset, startSaga
 	// falls back to BookingPolicy.SLAAnchor (same mirror rationale).
 	SLAAnchor string `json:"sla_anchor,omitempty"`
+	// CreatedBy (2026-11-21) is the staff user id (JWT sub) for bookings a
+	// team member creates from the dashboard; empty for public/voice/API
+	// bookings. Rides the BookingCreated event as created_by (graph-sync →
+	// fraud engine D6 ghost-booking detector); not stored on the row.
+	CreatedBy string `json:"created_by,omitempty"`
 }
 
 // Create validates and inserts a booking transactionally with its outbox
@@ -257,6 +263,11 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (store.Booking, er
 	payload, err := MarshalBookingEvent("com.opendesk.booking.BookingCreated", in.TenantSlug, booking, offering, contact)
 	if err != nil {
 		return store.Booking{}, err
+	}
+	if by := strings.TrimSpace(in.CreatedBy); by != "" {
+		if payload, err = withEventField(payload, "created_by", by); err != nil {
+			return store.Booking{}, err
+		}
 	}
 	guard := store.SlotGuard{
 		Buffer:   time.Duration(offering.BufferMin) * time.Minute,
@@ -521,4 +532,19 @@ func loadLocation(tz string) (*time.Location, error) {
 		return nil, fmt.Errorf("%w: unknown timezone %q", ErrInvalidInput, tz)
 	}
 	return loc, nil
+}
+
+// withEventField adds one field to a marshalled CloudEvent's data object.
+func withEventField(payload []byte, key string, value any) ([]byte, error) {
+	var evt map[string]any
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		return nil, err
+	}
+	data, _ := evt["data"].(map[string]any)
+	if data == nil {
+		data = map[string]any{}
+	}
+	data[key] = value
+	evt["data"] = data
+	return json.Marshal(evt)
 }

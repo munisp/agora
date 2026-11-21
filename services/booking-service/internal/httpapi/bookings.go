@@ -80,6 +80,8 @@ func (s *server) createBooking(w http.ResponseWriter, r *http.Request) {
 	if in.Source == "" {
 		in.Source = "api"
 	}
+	// 2026-11-21: staff attribution for the BookingCreated event (D6).
+	in.CreatedBy = callerIdentityFrom(r.Context()).UserID
 	booking, err := s.d.Ops.Create(r.Context(), in)
 	if err != nil {
 		s.mapOpError(w, err)

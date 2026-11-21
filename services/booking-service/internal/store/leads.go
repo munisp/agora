@@ -31,11 +31,16 @@ type Lead struct {
 	PromoCode           *string        `json:"promo_code"`
 	UTM                 map[string]any `json:"utm,omitempty"`
 	LgaID               *int           `json:"lga_id"`
-	Status              string         `json:"status"`
-	ConsentID           *uuid.UUID     `json:"consent_id"`
-	DedupeKey           string         `json:"dedupe_key"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
+	// LgaCode/LgaName (2026-11-21): the geo gazetteer LGA (e.g. NG-LAGOS-IKEJA,
+	// "Ikeja") picked at capture. They ride every funnel event of the lead so
+	// the CAC LGA breakdown works (lga_id points into a gazetteer nothing fills).
+	LgaCode   *string    `json:"lga_code,omitempty"`
+	LgaName   *string    `json:"lga_name,omitempty"`
+	Status    string     `json:"status"`
+	ConsentID *uuid.UUID `json:"consent_id"`
+	DedupeKey string     `json:"dedupe_key"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 // PromoCode mirrors booking.promo_codes (contract SPEC-W13 §6).
@@ -137,6 +142,8 @@ CREATE TABLE IF NOT EXISTS leads (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, dedupe_key)
 );
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS lga_code TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS lga_name TEXT;
 CREATE INDEX IF NOT EXISTS idx_leads_tenant_status ON leads (tenant_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_tenant_campaign ON leads (tenant_id, campaign_id);
 CREATE INDEX IF NOT EXISTS idx_leads_tenant_channel ON leads (tenant_id, channel_of_first_touch, created_at);
@@ -246,13 +253,17 @@ END $$;`
 // Leads
 // ---------------------------------------------------------------------------
 
-const leadCols = `id, tenant_id, phone_e164, channel_of_first_touch, campaign_id, promo_code, utm, lga_id, status, consent_id, dedupe_key, created_at, updated_at`
+// leadInsertCols is the INSERT column list (positional VALUES); leadCols adds
+// the 2026-11-21 lga_code/lga_name columns for every read / RETURNING.
+const leadInsertCols = `id, tenant_id, phone_e164, channel_of_first_touch, campaign_id, promo_code, utm, lga_id, status, consent_id, dedupe_key, created_at, updated_at`
+
+const leadCols = leadInsertCols + `, lga_code, lga_name`
 
 func scanLead(row pgx.Row) (Lead, error) {
 	var l Lead
 	err := row.Scan(&l.ID, &l.TenantID, &l.PhoneE164, &l.ChannelOfFirstTouch,
 		&l.CampaignID, &l.PromoCode, &l.UTM, &l.LgaID, &l.Status, &l.ConsentID,
-		&l.DedupeKey, &l.CreatedAt, &l.UpdatedAt)
+		&l.DedupeKey, &l.CreatedAt, &l.UpdatedAt, &l.LgaCode, &l.LgaName)
 	return l, err
 }
 
@@ -264,7 +275,7 @@ func (s *Store) InsertLead(ctx context.Context, in *Lead) (created bool, err err
 	if in.ID == uuid.Nil {
 		in.ID = uuid.New()
 	}
-	const q = `INSERT INTO leads (` + leadCols + `)
+	const q = `INSERT INTO leads (` + leadInsertCols + `)
 		           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'new',$9,$10,now(),now())
 		           ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
 		           RETURNING created_at, updated_at`
@@ -289,6 +300,12 @@ func (s *Store) InsertLead(ctx context.Context, in *Lead) (created bool, err err
 		}
 		in.Status = "new"
 		created = true
+		if in.LgaCode != nil || in.LgaName != nil {
+			if _, err := tx.Exec(ctx, `UPDATE leads SET lga_code=$3, lga_name=$4 WHERE tenant_id=$1 AND id=$2`,
+				in.TenantID, in.ID, in.LgaCode, in.LgaName); err != nil {
+				return fmt.Errorf("set lead lga: %w", err)
+			}
+		}
 		return nil
 	})
 	return created, err
@@ -617,7 +634,7 @@ func (s *Store) RedeemPromoTx(ctx context.Context, tenantID uuid.UUID, code, pho
 		}
 		// First-touch lead insert (same ON CONFLICT semantics as InsertLead).
 		scanErr = tx.QueryRow(ctx,
-			`INSERT INTO leads (`+leadCols+`)
+			`INSERT INTO leads (`+leadInsertCols+`)
 			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'new',$9,$10,now(),now())
 			 ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
 			 RETURNING id`,

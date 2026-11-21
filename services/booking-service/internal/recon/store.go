@@ -194,6 +194,15 @@ func (s *Store) Close() {
 // key per SPEC item 2.
 func (s *Store) ensureSchema(ctx context.Context) error {
 	const ddl = `
+-- 2026-11-20: tenant ids that hold receipt captures. field_captures is
+-- FORCE RLS and the booking login is its owner without BYPASSRLS, so the
+-- recon sweep could never enumerate tenants across it (it always scanned
+-- 0). Ids only, no RLS; each tenant's receipts are still read under
+-- withTenant.
+CREATE TABLE IF NOT EXISTS recon_receipt_tenants (
+    tenant_id       UUID PRIMARY KEY,
+    last_receipt_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS receipt_recon_findings (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id             UUID NOT NULL,
@@ -263,24 +272,55 @@ func (s *Store) withTenant(ctx context.Context, tenantID uuid.UUID, fn func(tx p
 // NOTE (RLS): sweep enumeration is a superuser batch path — same posture
 // as store.ExpireStaleWaitlist; per-tenant work then runs under withTenant.
 func (s *Store) TenantsWithReceiptCaptures(ctx context.Context, since time.Time) ([]uuid.UUID, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT tenant_id FROM field_captures
-		  WHERE receipt_document_id IS NOT NULL
-		    AND (server_received_at >= $1 OR captured_at >= $1)
-		  ORDER BY tenant_id`, since)
+	// 2026-11-20: field_captures is FORCE RLS, so a cross-tenant SELECT here
+	// saw no rows. Candidates come from RLS-free tenant lists (the receipt
+	// registry + sites, which covers receipts attached before the registry
+	// existed); each candidate is then confirmed under its own withTenant.
+	var hasSites bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('public.sites') IS NOT NULL`).Scan(&hasSites); err != nil {
+		return nil, fmt.Errorf("enumerate receipt tenants: %w", err)
+	}
+	// The direct field_captures read still works where RLS does not bind
+	// (superuser / BYPASSRLS roles, tests); under RLS it adds nothing.
+	candidatesSQL := `SELECT tenant_id FROM recon_receipt_tenants
+		  UNION SELECT DISTINCT tenant_id FROM field_captures WHERE receipt_document_id IS NOT NULL`
+	if hasSites {
+		candidatesSQL += ` UNION SELECT tenant_id FROM sites WHERE tenant_id IS NOT NULL`
+	}
+	rows, err := s.pool.Query(ctx, candidatesSQL+` ORDER BY 1`)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate receipt tenants: %w", err)
 	}
-	defer rows.Close()
-	var out []uuid.UUID
+	var candidates []uuid.UUID
 	for rows.Next() {
 		var id uuid.UUID
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		out = append(out, id)
+		candidates = append(candidates, id)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []uuid.UUID
+	for _, id := range candidates {
+		var has bool
+		err := s.withTenant(ctx, id, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM field_captures
+				  WHERE receipt_document_id IS NOT NULL
+				    AND (server_received_at >= $1 OR captured_at >= $1))`, since).Scan(&has)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("check receipts for tenant %s: %w", id, err)
+		}
+		if has {
+			out = append(out, id)
+		}
+	}
+	return out, nil
 }
 
 // receiptCaptures returns the tenant's receipt-bearing captures inside the

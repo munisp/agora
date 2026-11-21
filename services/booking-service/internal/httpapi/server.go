@@ -1186,6 +1186,9 @@ func (s *server) fieldCaptureHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "field capture unavailable")
 		return
 	}
+	// 2026-11-21: the capturing agent (resolved JWT sub) rides the context
+	// to the ContactCaptured event, on both the plain and enriched paths.
+	r = r.WithContext(fieldcapture.WithAgent(r.Context(), userFrom(r.Context())))
 	if s.d.GeoEnrich.Enabled() {
 		s.d.FieldCapture.CaptureEnriched(w, r, tenantFrom(r.Context()), geoEnricherAdapter{c: s.d.GeoEnrich})
 		return

@@ -668,7 +668,7 @@ func (s *Store) ListContacts(ctx context.Context, tenantID uuid.UUID) ([]Contact
 	var out []Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts WHERE tenant_id=$1 ORDER BY name LIMIT 1000`, tenantID)
+			`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts WHERE tenant_id=$1 ORDER BY name LIMIT 1000`, tenantID)
 		if err != nil {
 			return err
 		}
@@ -690,7 +690,7 @@ func (s *Store) GetContact(ctx context.Context, tenantID, id uuid.UUID) (Contact
 	var c Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts WHERE tenant_id=$1 AND id=$2`,
+			`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts WHERE tenant_id=$1 AND id=$2`,
 			tenantID, id).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

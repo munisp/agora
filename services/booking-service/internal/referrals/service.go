@@ -105,7 +105,50 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Referral, bool, e
 		return ref, false, err
 	}
 	created, err := s.Store.InsertReferral(ctx, &ref)
+	if err == nil && created {
+		s.emitReferralCapture(ctx, ref, "")
+	}
 	return ref, created, err
+}
+
+// emitReferralCapture (2026-11-21) tells the graph who referred whom: a
+// ContactCaptured event for the referee carrying referred_by_person_id =
+// the referrer's contact id (graph person ids are contact ids), which
+// graph-sync wires as (referrer)-[:REFERRED]->(referee) — the edge the
+// fraud engine's D1 referral-ring detector walks. Sent on create (a ring
+// is visible before any bounty is paid) and again on verify (idempotent
+// MERGE). Contact referrers only: agents/staff are not graph persons.
+func (s *Service) emitReferralCapture(ctx context.Context, ref Referral, tenantSlug string) {
+	if s.CACEventsTopic == "" || s.Store == nil || ref.ReferrerType != "contact" {
+		return
+	}
+	data := map[string]any{
+		"lead_id":               ref.ID.String(),
+		"phone":                 ref.RefereePhone,
+		"channel":               ChannelReferral,
+		"source":                "referral",
+		"captured_at":           ref.CreatedAt.UTC().Format(time.RFC3339Nano),
+		"referred_by_person_id": ref.ReferrerID,
+		"referral_program":      "referral",
+	}
+	if ref.CreatedAt.IsZero() {
+		data["captured_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if c, err := s.Store.GetContactByPhone(ctx, ref.TenantID, ref.RefereePhone); err == nil {
+		data["contact_id"] = c.ID.String()
+		data["name"] = c.Name
+	}
+	if ref.CampaignID != nil {
+		data["referral_program"] = "campaign:" + ref.CampaignID.String()
+	}
+	payload, err := json.Marshal(events.New("booking-service", "com.opendesk.identity.ContactCaptured", tenantSlug, ref.TenantID.String(), data))
+	if err != nil {
+		return
+	}
+	if err := s.Store.EnqueueOutbox(ctx, ref.ID, s.CACEventsTopic, payload); err != nil {
+		s.log().Warn("referral capture enqueue failed; graph misses this referral edge",
+			zap.String("referral_id", ref.ID.String()), zap.Error(err))
+	}
 }
 
 // VerifyResult is the outcome of POST /v1/referrals/{id}/verify.
@@ -191,6 +234,7 @@ func (s *Service) Verify(ctx context.Context, tenantID, referralID uuid.UUID, tr
 	// SPEC-W14 Agent D (additive): one referral_verified usage outbox row
 	// per NON-idempotent verify (metering.go).
 	s.meterReferralVerified(ctx, updated, tenantSlug)
+	s.emitReferralCapture(ctx, updated, tenantSlug)
 
 	return VerifyResult{Referral: updated, Awards: awards}, nil
 }

@@ -143,7 +143,10 @@ type LeadCapturePayload struct {
 	UTM        map[string]any `json:"utm,omitempty"`
 	CampaignID *uuid.UUID     `json:"campaign_id,omitempty"`
 	LgaID      *int           `json:"lga_id,omitempty"`
-	ConsentID  *uuid.UUID     `json:"consent_id,omitempty"`
+	// 2026-11-21: the field app's gazetteer pick (option value = code).
+	LgaCode   string     `json:"lga_code,omitempty"`
+	LGA       string     `json:"lga,omitempty"`
+	ConsentID *uuid.UUID `json:"consent_id,omitempty"`
 }
 
 // CheckinPayload is the kind=checkin payload schema: an optional contact

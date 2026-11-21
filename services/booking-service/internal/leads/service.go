@@ -48,7 +48,10 @@ type CreateInput struct {
 	RefQR      string
 	CampaignID *uuid.UUID
 	LgaID      *int
-	ConsentID  *uuid.UUID
+	// LgaCode/LgaName: geo gazetteer LGA (2026-11-21, CAC LGA breakdown).
+	LgaCode   *string
+	LgaName   *string
+	ConsentID *uuid.UUID
 }
 
 // Create persists a lead with first-touch attribution (§3) and the 24h
@@ -74,6 +77,8 @@ func (s *Service) Create(ctx context.Context, in CreateInput, tenantSlug string)
 		PromoCode:           promo,
 		UTM:                 utm,
 		LgaID:               in.LgaID,
+		LgaCode:             in.LgaCode,
+		LgaName:             in.LgaName,
 		ConsentID:           in.ConsentID,
 	}
 	lead.DedupeKey = DedupeKey(lead.TenantID, lead.PhoneE164, lead.ChannelOfFirstTouch, time.Now())
