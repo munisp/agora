@@ -1,8 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { Check, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
+import { Check, FileUp, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import {
+  chooseUploadMode,
+  pollDelayMs,
+  reduceJobStatus,
+  validateUploadFile,
+  UPLOAD_EXTENSIONS,
+  UPLOAD_MAX_BYTES,
+} from "@/lib/knowledge-upload";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +36,7 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
   const [error, setError] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);
   const [scanning, setScanning] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
   /** SPEC-W53: OCR-extracted draft that pre-fills the add dialog. */
   const [prefill, setPrefill] = React.useState<{
     title: string;
@@ -142,6 +151,9 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
           <div className="flex gap-2">
             <Button size="sm" variant="outline" onClick={() => setScanning(true)}>
               <Upload className="h-4 w-4" /> Upload scan
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setUploading(true)}>
+              <FileUp className="h-4 w-4" /> Upload document
             </Button>
             <Button size="sm" onClick={() => setAdding(true)}>
               <Plus className="h-4 w-4" /> Add document
@@ -262,6 +274,15 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
           setScanning(false);
           setPrefill(draft);
           setAdding(true);
+        }}
+      />
+      <DoclingUploadDialog
+        orgSlug={orgSlug}
+        open={uploading}
+        onClose={() => setUploading(false)}
+        onDone={() => {
+          setUploading(false);
+          void load();
         }}
       />
       <ConfirmDialog
@@ -887,6 +908,256 @@ function ScanUploadDialog({
               <Button type="submit" disabled={!file || busy}>
                 <Upload className="h-4 w-4" />
                 {busy ? "Extracting…" : "Extract text"}
+              </Button>
+            </DialogFooter>
+          </form>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------------ */
+/* SPEC-W114: direct document upload via the docling pipeline (W107/W111).  */
+/* PDF/DOCX/PPTX/XLSX/HTML/MD/TXT + scanned images; tables become Markdown. */
+/* Files above ASYNC_THRESHOLD_BYTES submit wait=false (W111 job) and the   */
+/* dialog polls the tenant-bound job status endpoint until done/failed.     */
+/* Distinct from the W53 "Upload scan" flow (review OCR text BEFORE add).   */
+/* ------------------------------------------------------------------------ */
+
+type UploadJob = {
+  job_id: string;
+  status: string;
+  document_id: string | null;
+  chars: number | null;
+  error: string | null;
+};
+
+/** Honest message for the knowledge-service upload failure contract. */
+function uploadErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    const detail =
+      typeof err.body === "object" && err.body !== null && "detail" in err.body
+        ? String((err.body as { detail: unknown }).detail)
+        : null;
+    if (detail) return detail;
+    switch (err.status) {
+      case 413:
+        return "The file is too large for the document pipeline — compress or split it and retry.";
+      case 415:
+        return "Unsupported file type for the document pipeline.";
+      case 422:
+        return "The document pipeline could not extract any text from this file.";
+      case 503:
+        return "The document-intelligence service is offline — try again in a few minutes.";
+      default:
+        return err.message;
+    }
+  }
+  return err instanceof Error ? err.message : "Upload failed.";
+}
+
+function readFileBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read the file."));
+    reader.onload = () => {
+      const url = String(reader.result ?? "");
+      const comma = url.indexOf(",");
+      resolve(comma >= 0 ? url.slice(comma + 1) : url);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function DoclingUploadDialog({
+  orgSlug,
+  open,
+  onClose,
+  onDone,
+}: {
+  orgSlug: string;
+  open: boolean;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [file, setFile] = React.useState<File | null>(null);
+  const [title, setTitle] = React.useState("");
+  const [error, setError] = React.useState<string | null>(null);
+  /** pick -> uploading -> processing (async job) -> done */
+  const [phase, setPhase] = React.useState<"pick" | "uploading" | "processing" | "done">("pick");
+  const [doneDetail, setDoneDetail] = React.useState<string | null>(null);
+  const cancelRef = React.useRef(false);
+
+  React.useEffect(() => {
+    if (open) {
+      cancelRef.current = false;
+      setFile(null);
+      setTitle("");
+      setError(null);
+      setPhase("pick");
+      setDoneDetail(null);
+    }
+    return () => {
+      cancelRef.current = true; // closing stops polling; the job is server-side
+    };
+  }, [open]);
+
+  const pick = (f: File | null) => {
+    setError(null);
+    if (!f) {
+      setFile(null);
+      return;
+    }
+    const v = validateUploadFile(f.name, f.size);
+    if (!v.ok) {
+      setFile(null);
+      setError(v.error);
+      return;
+    }
+    setFile(f);
+    setTitle(f.name.replace(/\.[^.]+$/, ""));
+  };
+
+  const pollJob = async (jobId: string) => {
+    for (let attempt = 0; ; attempt += 1) {
+      if (cancelRef.current) return;
+      await new Promise((r) => setTimeout(r, pollDelayMs(attempt)));
+      if (cancelRef.current) return;
+      const job = await api.get<UploadJob>(
+        `/api/knowledge/v1/documents/upload/${jobId}`,
+        { tenant: orgSlug },
+      );
+      const state = reduceJobStatus(job.status);
+      if (state === "done") {
+        setDoneDetail(
+          job.chars !== null
+            ? `${job.chars.toLocaleString()} characters extracted`
+            : null,
+        );
+        setPhase("done");
+        return;
+      }
+      if (state === "failed") {
+        throw new Error(
+          job.error ?? "The document pipeline marked this upload as failed.",
+        );
+      }
+    }
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!file || phase === "uploading" || phase === "processing") return;
+    setError(null);
+    const mode = chooseUploadMode(file.size);
+    setPhase("uploading");
+    try {
+      const contentBase64 = await readFileBase64(file);
+      const resp = await api.post<
+        { job_id?: string } & ({ id?: string; chunk_count?: number } | Record<string, never>)
+      >(
+        "/api/knowledge/v1/documents/upload",
+        {
+          tenant: orgSlug,
+          filename: file.name,
+          content_base64: contentBase64,
+          title: title.trim() || undefined,
+          wait: mode === "sync",
+        },
+        { tenant: orgSlug },
+      );
+      if (mode === "async" && resp.job_id) {
+        setPhase("processing");
+        await pollJob(resp.job_id);
+      } else {
+        const n = typeof resp.chunk_count === "number" ? resp.chunk_count : null;
+        setDoneDetail(n !== null ? `indexed into ${n} chunks` : null);
+        setPhase("done");
+      }
+    } catch (err) {
+      setError(uploadErrorMessage(err));
+      setPhase("pick");
+    }
+  };
+
+  const busy = phase === "uploading" || phase === "processing";
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent onClose={onClose} className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Upload a document</DialogTitle>
+        </DialogHeader>
+        <p className="mb-4 text-sm text-muted-foreground">
+          Upload a PDF, Word, PowerPoint, Excel, HTML, Markdown or text file —
+          or a scanned image. The document-intelligence pipeline extracts the
+          text (layout-aware; tables become Markdown; scans go through OCR
+          models) and indexes it into the knowledge base immediately.
+        </p>
+
+        {error ? <ErrorNote message={error} /> : null}
+
+        {phase === "done" ? (
+          <div className="space-y-4">
+            <div className="rounded-md border border-border bg-accent px-3 py-2 text-sm">
+              <p className="font-medium">
+                Document indexed
+                {doneDetail !== null ? ` — ${doneDetail}` : ""}
+                . The receptionist can use it right away.
+              </p>
+            </div>
+            <DialogFooter>
+              <Button onClick={onDone}>Done</Button>
+            </DialogFooter>
+          </div>
+        ) : (
+          <form onSubmit={(e) => void submit(e)} className="space-y-4">
+            <div className="grid gap-1.5">
+              <Label htmlFor="doc-file">Document file</Label>
+              <Input
+                id="doc-file"
+                type="file"
+                accept={UPLOAD_EXTENSIONS.map((e) => `.${e}`).join(",")}
+                disabled={busy}
+                onChange={(e) => pick(e.target.files?.[0] ?? null)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {UPLOAD_EXTENSIONS.join(", ")} · up to{" "}
+                {UPLOAD_MAX_BYTES / (1024 * 1024)} MB. Larger files are
+                processed as a background job and indexed when ready.
+              </p>
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="doc-title">Title (optional)</Label>
+              <Input
+                id="doc-title"
+                value={title}
+                disabled={busy}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Defaults to the file name"
+              />
+            </div>
+            {phase === "uploading" ? (
+              <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Uploading and extracting… the document pipeline runs on CPU and
+                can take a minute or more per page. Don&apos;t close this dialog.
+              </p>
+            ) : null}
+            {phase === "processing" ? (
+              <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                Processing in the background… this large file runs as an upload
+                job; the dialog polls until it is indexed. Closing the dialog
+                does not cancel the job.
+              </p>
+            ) : null}
+            <DialogFooter>
+              <Button variant="outline" onClick={onClose} disabled={phase === "uploading"}>
+                {phase === "processing" ? "Close (job continues)" : "Cancel"}
+              </Button>
+              <Button type="submit" disabled={!file || busy}>
+                <FileUp className="h-4 w-4" />
+                {busy ? "Uploading…" : "Upload &amp; index"}
               </Button>
             </DialogFooter>
           </form>

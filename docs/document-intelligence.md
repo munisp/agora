@@ -1,4 +1,4 @@
-# Document Intelligence (SPEC-W107 + W111)
+# Document Intelligence (SPEC-W107 + W111 + W114)
 
 How binary documents become conversational knowledge in OpenDesk/Agora.
 
@@ -67,8 +67,20 @@ forced (kb_suggestions precedent). A bootstrap failure is logged and does not
 break sync uploads; `wait=false` requests will fail honestly until the table
 exists.
 
-### Stale-running reaper (W112)
+## Admin UI (SPEC-W114)
 
+The dashboard knowledge page (**App → Knowledge → Upload document**) exposes
+this pipeline without curl: pick a file (all formats above, ≤ 10 MB), set an
+optional title, upload. Files above 3 MB submit with `wait=false` and the
+dialog polls the job status endpoint with backoff until `done` (characters
+extracted shown) or `failed` (the honest error — including the W112 reaper's
+resubmit message — is surfaced). Closing the dialog stops polling but never
+cancels the server-side job. Service errors are translated honestly
+(413 too large, 415 type, 422 no extractable text, 503 sidecar offline).
+The W53 **Upload scan** review flow (OCR → review text → add) is unchanged —
+different use case.
+
+### Stale-running reaper (W112)
 A crash or restart strands `wait=false` jobs in `running` forever — the
 background task is gone but the row never settles. knowledge-service runs a
 reaper: one sweep at startup, then one every `DOC_INTEL_REAPER_INTERVAL_S`
