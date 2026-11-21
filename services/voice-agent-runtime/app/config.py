@@ -593,6 +593,9 @@ class Settings:
     # Per-language naija-speech voices for the other Nigerian languages, "yo=yoruba_male1,ig=igbo_male2" (unset
     # languages: the service's default voice for that language).
     naija_language_voices: dict = field(default_factory=dict)
+    # Yoruba/Hausa/Igbo calls: the model reasons and uses its tools in English and each reply is translated just
+    # before it is spoken (a model answering in Yoruba stopped calling its tools and claimed bookings it never made).
+    naija_think_in_english: bool = False
     cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
     # SPEC-W74 A1: Qwen3-TTS (nari-labs/nari-qwen3-tts) GPU-tier provider —
     # the published image IS the sidecar (OpenAI-shaped /v1/audio/speech).
@@ -815,6 +818,7 @@ def load_settings() -> Settings:
                                     else "nigerian" if _env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() == "nigerian"
                                     else "off"),
         naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
+        naija_think_in_english=_env("NAIJA_THINK_IN_ENGLISH", "0").strip().lower() in ("1", "true", "yes", "on"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
         qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
         qwen3_tts_model=_env("QWEN3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),

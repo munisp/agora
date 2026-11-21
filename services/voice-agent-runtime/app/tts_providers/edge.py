@@ -69,7 +69,7 @@ class EdgeTTS:
         return _mp3_to_wav(bytes(mp3), self.sample_rate)
 
     async def list_voices(self) -> list[Voice]:
-        return [Voice(id=v, languages=[lang], gender=g, labels=["edge", "demo"]) for v, (lang, g) in EDGE_VOICES.items()]
+        return [Voice(id=v, languages=[lang], gender=g, labels={"tags": ["edge", "demo"]}) for v, (lang, g) in EDGE_VOICES.items()]
 
     async def available(self) -> bool:
         try:

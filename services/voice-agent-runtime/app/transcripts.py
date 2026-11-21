@@ -115,6 +115,8 @@ class TranscriptRecorder:
                 body: dict[str, Any] = {"role": turn["role"], "text": text}
                 if turn.get("tool_calls"):
                     body["tool_calls"] = turn["tool_calls"]
+                if turn.get("translation_en"):
+                    body["translation_en"] = turn["translation_en"]
                 resp = await self._http().post(
                     f"{self.base_url}/v1/conversations/{conv_id}/turns",
                     headers={"X-Tenant-Slugs": tenant_id, "Idempotency-Key": str(uuid.uuid4())},

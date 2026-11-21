@@ -7,6 +7,12 @@ service resamples to ``sample_rate`` — the call pipeline plays one fixed rate,
 """
 from __future__ import annotations
 
+import asyncio
+import base64
+import difflib
+import os
+import unicodedata
+
 import httpx
 
 from .base import Voice, labels_of
@@ -16,10 +22,16 @@ from .spoken import spoken
 class NaijaSpeechTTS:
     name = "naija"
 
+    # Yoruba/Hausa/Igbo YarnGPT voices garble a sentence now and then: the same line in the same voice scored 0.16 on
+    # one take and 0.80 on the next (2026-11-20, scored by recognising the voice's own audio). For those languages
+    # several takes are made in one batch and the one the recogniser hears closest to the text is played.
+    BEST_OF_LANGUAGES = ("yo", "ha", "ig")
+
     def __init__(self, base_url: str, *, sample_rate: int = 22050, timeout_s: float = 30.0,
-                 client: httpx.AsyncClient | None = None) -> None:
+                 client: httpx.AsyncClient | None = None, takes: int | None = None) -> None:
         self.base_url = (base_url or "").rstrip("/")
         self.sample_rate = sample_rate
+        self.takes = max(1, takes if takes is not None else int(os.environ.get("NAIJA_TTS_TAKES", "3") or 3))
         self.default_voice = ""  # the service picks the language's best voice
         self._timeout = timeout_s
         self._client = client
@@ -48,6 +60,11 @@ class NaijaSpeechTTS:
         body = {"text": text, "language": lang, "sample_rate": self.sample_rate}
         if voice and voice.strip() and voice.strip() != "auto":  # "auto": the service's best voice for the language
             body["voice"] = voice.strip()
+        if self.takes > 1 and lang in self.BEST_OF_LANGUAGES:
+            try:
+                return await self._best_take(body)
+            except Exception:  # noqa: BLE001 - one plain take below
+                pass
         try:
             resp = await self._http().post(f"{self.base_url}/tts", json=body)
         except httpx.TransportError:
@@ -56,6 +73,26 @@ class NaijaSpeechTTS:
             resp = await self._http().post(f"{self.base_url}/tts", json=body)
         resp.raise_for_status()
         return resp.content
+
+    async def _best_take(self, body: dict) -> bytes:
+        resp = await self._http().post(f"{self.base_url}/tts_batch", json={"items": [body] * self.takes})
+        resp.raise_for_status()
+        wavs = [base64.b64decode(b) for b in resp.json()["wavs"]]
+        if len(wavs) == 1:
+            return wavs[0]
+        target = _letters(body["text"])
+
+        async def score(wav: bytes) -> float:
+            try:
+                r = await self._http().post(f"{self.base_url}/asr", params={"language": body["language"]},
+                                            content=wav, headers={"content-type": "audio/wav"})
+                r.raise_for_status()
+                return difflib.SequenceMatcher(None, target, _letters(r.json().get("text", ""))).ratio()
+            except Exception:  # noqa: BLE001 - an unscored take ranks last
+                return -1.0
+
+        scores = await asyncio.gather(*(score(w) for w in wavs))
+        return wavs[max(range(len(wavs)), key=lambda i: scores[i])]
 
     async def list_voices(self) -> list[Voice]:
         if not self.base_url:
@@ -75,3 +112,10 @@ class NaijaSpeechTTS:
             return resp.status_code == 200 and resp.json().get("status") == "ok"
         except Exception:  # noqa: BLE001 - probe must never raise
             return False
+
+
+def _letters(text: str) -> str:
+    """Lowercase letters and spaces, tone marks stripped: the recogniser rarely gets tone marks right."""
+    t = unicodedata.normalize("NFD", (text or "").lower())
+    t = "".join(c for c in t if unicodedata.category(c)[0] in "LZ" and unicodedata.category(c) != "Mn")
+    return " ".join(t.split())

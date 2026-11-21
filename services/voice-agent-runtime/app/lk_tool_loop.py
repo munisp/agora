@@ -85,10 +85,14 @@ import re
 
 # "I have booked your visit", "your appointment is confirmed for Tuesday", "you're all set for 9:00"
 _BOOKED_CLAIM = re.compile(
-    r"\b(i(?:'ve| have)? (?:now )?(?:booked|scheduled|reserved|confirmed)|(?:is|has been|now) (?:booked|scheduled|confirmed)"
+    r"\b(i(?:'ve| have)? (?:now )?(?:booked|scheduled|reserved|confirmed)|i(?:'ve| have) (?:now |already )?(?:set up|arranged|fixed)|(?:is|has been|now) (?:booked|scheduled|confirmed)"
     r"|(?:booking|appointment|visit|call) (?:is |has been )?(?:confirmed|booked)|you(?:'re| are) (?:all )?(?:booked|set for)"
     # Nigerian Pidgin: "I don book am", "e don book", "I don confirm your appointment"
     r"|\b(?:i|we|e|e?m) (?:don|done) (?:book|fix|confirm|schedule)\w*"
+    # "Your appointment … don set for Tuesday" (Pidgin), "your appointment is set/fixed", "you're all set": a
+    # Pidgin call said this after the caller confirmed, with no booking made (2026-11-19).
+    r"|\b(?:appointment|booking|visit|call|consultation|session)\b[^.!?]{0,90}?\b(?:don|is|has been|now) (?:set|fixed|ready)\b"
+    r"|\ball set\b"
     # A promise to book now ("I go book it for you now", "I will book that", "let me book…") ends the turn without
     # booking: the model then waits for the caller. Treated like a claim: the booking is made in this same turn.
     r"|\b(?:i(?:'ll| will| go| dey| am going to)|let me|we(?:'ll| will| go)) (?:now |just |go ahead and )?(?:book|fix|schedule|reserve)\b)",

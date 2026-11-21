@@ -48,7 +48,7 @@ def test_tts_provider_asks_for_the_call_sample_rate():
         seen.update(json.loads(request.content))
         return httpx.Response(200, content=_wav(), headers={"content-type": "audio/wav"})
 
-    tts = NaijaSpeechTTS("http://naija:5820", sample_rate=22050,
+    tts = NaijaSpeechTTS("http://naija:5820", sample_rate=22050, takes=1,  # one take: best-of-N has its own tests
                          client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     wav = asyncio.run(tts.synthesize("Nnọọ!", "", "ig"))
     assert wav.startswith(b"RIFF")

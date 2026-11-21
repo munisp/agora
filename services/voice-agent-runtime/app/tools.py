@@ -475,6 +475,22 @@ def _verification_unavailable_payload() -> dict[str, Any]:
 
 
 
+def known_id(value: str, candidates: list[str]) -> str:
+    """The real id the model meant. It copies long UUIDs out of the prompt and sometimes slips a character
+    ("4a5dca9a-3663-…" for "…-3963-…"): the booking service then 400s and the caller hears "trouble reaching our
+    booking system". An id that is not known exactly but is ≥ 0.9 similar to exactly one known id is that id."""
+    import difflib
+
+    v = str(value or "").strip()
+    if not v or v in candidates or not candidates:
+        return v
+    scored = sorted(((difflib.SequenceMatcher(None, v, c).ratio(), c) for c in candidates), reverse=True)
+    best = scored[0]
+    if best[0] >= 0.9 and (len(scored) == 1 or scored[1][0] < best[0] - 0.05):
+        return best[1]
+    return v
+
+
 def _rfc3339(value: str, tz_name: str | None) -> str:
     """The booking API needs RFC3339 (with an offset). The model often sends a bare local time ("2026-11-18T08:00:00"),
     which booking rejected with 400 "from must be RFC3339" and the caller heard "trouble reaching our booking system".
@@ -487,7 +503,15 @@ def _rfc3339(value: str, tz_name: str | None) -> str:
     except ValueError:
         return raw
     if dt.tzinfo is not None:
-        return raw  # already RFC3339 with an offset (e.g. "...Z"): pass through unchanged
+        # A UTC time from the model is a local time with the wrong marker: a receptionist in Lagos asked for "12 noon"
+        # sent "...T12:00:00Z" and booked 1pm. Read UTC wall-clock times in the business's zone; real offsets
+        # ("+01:00") pass through unchanged.
+        if dt.utcoffset() == timedelta(0) and (tz_name or "UTC") not in ("UTC", "Etc/UTC", "GMT"):
+            try:
+                return dt.replace(tzinfo=ZoneInfo(tz_name)).isoformat()
+            except Exception:  # noqa: BLE001
+                return raw
+        return raw
     if dt.tzinfo is None:
         try:
             dt = dt.replace(tzinfo=ZoneInfo(tz_name or "UTC"))
@@ -868,9 +892,15 @@ class ToolLayer:
         await self._emit_tool_event("get_business_info", "ok", {})
         return result
 
+    def _real_ids(self, offering_id: str, team_member_id: str) -> tuple[str, str]:
+        offerings = [str(o.get("id")) for o in (self._ctx.offerings or []) if o.get("id")]
+        team = [str(m.get("id")) for m in (self._ctx.team_members or []) if m.get("id")]
+        return known_id(offering_id, offerings), known_id(team_member_id, team)
+
     async def get_availability(
         self, offering_id: str, team_member_id: str, from_iso: str, to_iso: str
     ) -> dict[str, Any]:
+        offering_id, team_member_id = self._real_ids(offering_id, team_member_id)
         # A window that ends before today cannot have free slots; the model sometimes guesses the wrong year. Say so
         # (with today's date) instead of returning an empty list it reads as "fully booked".
         past = _past_window_note(to_iso, self._ctx.timezone)
@@ -909,6 +939,7 @@ class ToolLayer:
         contact_name: str | None = None,
         email: str | None = None,
     ) -> dict[str, Any]:
+        offering_id, team_member_id = self._real_ids(offering_id, team_member_id)
         # The model often sends a bare local time; booking dead-lettered "bad starts_at" and the caller had been told
         # the visit was booked. Read it in the business's time zone, as for availability.
         starts_at = _rfc3339(starts_at, self._ctx.timezone)
