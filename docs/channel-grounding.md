@@ -62,6 +62,21 @@ latency budget is sub-second and the prompt is built at session start; the
 `knowledge_search` slow tool (filler ack + 4s tool timeout) covers explicit
 lookups there.
 
+## LLM-compressed USSD answers (W110)
+
+Raw snippet text is accurate but terse. With `USSD_KB_LLM=on` (default
+**off**) the grounded snippets are composed into a short natural answer by
+an OpenAI-compatible LLM (`USSD_KB_LLM_MODEL`, default qwen3:8b via Ollama,
+temperature 0, ≤120 tokens, facts-only prompt). The fallback chain is
+**LLM answer → raw snippet → static ack**; the response payload gains
+`"composed": true|false`.
+
+Why default off: the compose call runs AFTER the 0.8s KB fetch and a cold
+model can stretch the turn toward the ~2s aggregator budget documented in
+docs/channels-ussd.md. Operators enabling it should watch turn latency.
+Defense in depth: compose_answer never raises (None on any failure) AND the
+W108 grounding block's own fallback net catches anything that escapes.
+
 ## Honest limits
 
 - The bootstrap knowledge leg still runs once per tenant-context TTL with

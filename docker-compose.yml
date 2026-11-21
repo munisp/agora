@@ -1089,6 +1089,13 @@ services:
       USSD_KB_GROUNDING: ${USSD_KB_GROUNDING:-on}
       USSD_KB_TIMEOUT_S: ${USSD_KB_TIMEOUT_S:-0.8}
       USSD_KB_MAX_REPLY_CHARS: ${USSD_KB_MAX_REPLY_CHARS:-300}
+      # SPEC-W110: LLM-compressed USSD answers (DEFAULT OFF — the compose
+      # call runs after the 0.8s KB fetch and can stretch the turn toward
+      # the ~2s aggregator budget; fallback chain LLM -> raw -> static ack).
+      USSD_KB_LLM: ${USSD_KB_LLM:-off}
+      USSD_KB_LLM_BASE_URL: ${USSD_KB_LLM_BASE_URL:-http://ollama:11434/v1}
+      USSD_KB_LLM_MODEL: ${USSD_KB_LLM_MODEL:-qwen3:8b}
+      USSD_KB_LLM_TIMEOUT_S: ${USSD_KB_LLM_TIMEOUT_S:-1.2}
     # GF4 (SPEC-W34): no host port published — backends are reachable only on the
     # opendesk docker network (inter-service by name) and through APISIX :9080.
     # Publishing bypassed gateway authN entirely (any host process could call the

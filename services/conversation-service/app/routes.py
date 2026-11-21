@@ -9,7 +9,7 @@ from typing import Annotated, Any
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
-from . import events, incidents, intel, models, redact, ussd
+from . import events, incidents, intel, kb_compose, models, redact, ussd
 from .db import NotFoundError
 from .tenants import TenantNotFoundError, TenantResolutionError
 
@@ -596,6 +596,7 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
     # unreachable, timeout over the tight per-call budget, empty snippets —
     # falls back to the static ack above; grounding never fails a callback.
     grounded = False
+    composed_flag = False
     if (
         st.cfg.ussd_kb_grounding
         and not body.menu
@@ -619,6 +620,19 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
             )
             if grounded_text:
                 reply, grounded = grounded_text, True
+                # SPEC-W110: optionally compress the raw snippets into a
+                # short natural answer (default OFF — latency). Any compose
+                # failure keeps the raw grounded text; the static ack remains
+                # the final fallback from the outer block.
+                if st.cfg.ussd_kb_llm:
+                    composed = await kb_compose.compose_answer(
+                        ussd.parse_last_selection(body.text),
+                        snippets,
+                        st.cfg,
+                    )
+                    if composed:
+                        reply = composed
+                        composed_flag = True
         except Exception as exc:  # noqa: BLE001 - grounding is best-effort
             st.log.warning(
                 "ussd knowledge grounding failed; static ack fallback",
@@ -632,6 +646,7 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
         selected=selected,
     )
     payload["grounded"] = grounded
+    payload["composed"] = composed_flag
     # W46-F P5: record the reply as an agent turn (deduped on the same
     # callback key, mirroring the telegram/whatsapp bridge's user-turn →
     # agent-turn pair) in a BACKGROUND task AFTER the response — the USSD

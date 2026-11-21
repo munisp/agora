@@ -155,6 +155,18 @@ class Config:
     ussd_kb_max_reply_chars: int = 300
     ussd_kb_max_snippets: int = 2
 
+    # LLM-compressed USSD answers (SPEC-W110): compose the grounded snippets
+    # into a short natural answer via an OpenAI-compatible LLM. DEFAULT OFF:
+    # the compose call runs after the 0.8s KB fetch and a cold model can
+    # stretch the turn toward the ~2s aggregator budget. Fallback chain when
+    # on: LLM answer -> raw snippet -> static ack (never fails a callback).
+    ussd_kb_llm: bool = False
+    ussd_kb_llm_base_url: str = "http://ollama:11434/v1"
+    ussd_kb_llm_model: str = "qwen3:8b"
+    ussd_kb_llm_api_key: str = "ollama"
+    ussd_kb_llm_timeout_s: float = 1.2
+    ussd_kb_llm_max_tokens: int = 120
+
     # OpenSearch indexer (SPEC §10, index `conversations`).
     opensearch_addr: str = "http://opensearch:9200"
     conversations_index: str = "conversations"
@@ -246,6 +258,14 @@ def load() -> Config:
         ussd_kb_timeout_s=float(_env("USSD_KB_TIMEOUT_S", "0.8")),
         ussd_kb_max_reply_chars=int(_env("USSD_KB_MAX_REPLY_CHARS", "300")),
         ussd_kb_max_snippets=int(_env("USSD_KB_MAX_SNIPPETS", "2")),
+        ussd_kb_llm=_env("USSD_KB_LLM", "off").lower() in ("1", "on", "true", "yes"),
+        ussd_kb_llm_base_url=_env(
+            "USSD_KB_LLM_BASE_URL", _env("LLM_BASE_URL", "http://ollama:11434/v1")
+        ),
+        ussd_kb_llm_model=_env("USSD_KB_LLM_MODEL", _env("LLM_MODEL", "qwen3:8b")),
+        ussd_kb_llm_api_key=_env("USSD_KB_LLM_API_KEY", _env("LLM_API_KEY", "ollama")),
+        ussd_kb_llm_timeout_s=float(_env("USSD_KB_LLM_TIMEOUT_S", "1.2")),
+        ussd_kb_llm_max_tokens=int(_env("USSD_KB_LLM_MAX_TOKENS", "120")),
         ussd_text_mode_reply=_env(
             "USSD_TEXT_MODE_REPLY",
             "Thank you. Your message has been received; an agent will respond shortly.",
