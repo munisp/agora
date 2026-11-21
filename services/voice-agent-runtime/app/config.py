@@ -574,6 +574,10 @@ class Settings:
     mms_tts_url: str = "http://mms-tts:5800"
     xtts_tts_url: str = "http://xtts-tts:5810"
     cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
+    # SPEC-W102 C3: LongCat-AudioDiT (Meituan, MIT code + weights) GPU-tier
+    # provider via the longcat-tts sidecar — ZH+EN only (NOT a Nigerian
+    # language path); zero-shot cloning needs the sample transcript.
+    longcat_tts_url: str = "http://longcat-tts:5830"
     # SPEC-W74 A1: Qwen3-TTS (nari-labs/nari-qwen3-tts) GPU-tier provider —
     # the published image IS the sidecar (OpenAI-shaped /v1/audio/speech).
     # Requires an NVIDIA H100; engine tested with English as the primary
@@ -775,6 +779,7 @@ def load_settings() -> Settings:
         mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
+        longcat_tts_url=_env("LONGCAT_TTS_URL", "http://longcat-tts:5830"),
         qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
         qwen3_tts_model=_env("QWEN3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
         qwen3_tts_voice=_env("QWEN3_TTS_VOICE", "ryan"),

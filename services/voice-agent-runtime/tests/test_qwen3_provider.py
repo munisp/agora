@@ -212,8 +212,9 @@ async def test_qwen3_list_voices_static_default():
 # ---------------------------------------------------------------------------
 def test_qwen3_in_provider_names():
     assert "qwen3" in PROVIDER_NAMES
+    # SPEC-W102 C3: "longcat" appended to the provider registry.
     assert PROVIDER_NAMES == (
-        "piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3"
+        "piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3", "longcat"
     )
 
 

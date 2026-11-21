@@ -1,0 +1,8 @@
+# GPU (real inference) extra deps — used by the CUDA Dockerfile variant.
+# Base image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime (torch preinstalled).
+# LongCat-AudioDiT (MIT — code AND weights); not on PyPI, install from source:
+git+https://github.com/meituan-longcat/LongCat-AudioDiT.git@main
+transformers>=4.48,<5
+librosa>=0.10,<0.12
+# Model weights are pulled from HuggingFace (meituan-longcat/LongCat-AudioDiT-1B,
+# ~2.5GB) — set HF_TOKEN when the repo requires auth, or pre-pull into a volume.

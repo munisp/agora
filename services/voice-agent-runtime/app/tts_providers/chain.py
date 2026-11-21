@@ -36,6 +36,7 @@ from ..pipeline.tts import PiperTTS, TtsLruCache, _wav_to_pcm, split_sentences
 from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
 from .cosyvoice import CosyVoiceTTS
+from .longcat import LongCatTTS
 from .mms import MmsTTS
 from .qwen3 import Qwen3TTS
 from .spitch import SpitchTTS
@@ -44,7 +45,7 @@ from .xtts import XttsTTS
 log = get_logger("tts.chain")
 
 #: Providers buildable from Settings (chain names).
-PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3")
+PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3", "longcat")
 
 
 class PiperProvider:
@@ -381,6 +382,8 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
         )
     if name == "cosyvoice":
         return CosyVoiceTTS(settings.cosyvoice_tts_url)
+    if name == "longcat":
+        return LongCatTTS(settings.longcat_tts_url)
     if name == "qwen3":
         return Qwen3TTS(
             settings.qwen3_tts_url,

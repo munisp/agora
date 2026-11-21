@@ -75,6 +75,32 @@ services:
       timeout: 5s
       retries: 3
 
+  # LongCat-AudioDiT voice-cloning sidecar (SPEC-W102 C1, Meituan, MIT code
+  # + weights). MOCK DEFAULT here (LONGCAT_MOCK=1): deterministic per-voice
+  # sine wav, no GPU, no model download — real LongCat-AudioDiT inference is
+  # GPU-gated (>=8GB VRAM; build the CUDA variant per
+  # services/longcat-tts/Dockerfile and set LONGCAT_MOCK=0). Benchmarked
+  # ZH+EN ONLY (NOT a Nigerian-language path); zero-shot cloning needs the
+  # enrolled sample's transcript (prompt_text) — without it the sidecar
+  # honestly falls back to plain TTS. Enrollment is fail-closed on
+  # consent_basis (services/longcat-tts).
+  longcat-tts:
+    build:
+      context: ../longcat-tts
+    image: opendesk/longcat-tts:dev
+    profiles: ["voice"]
+    networks: [opendesk]
+    environment:
+      LONGCAT_MOCK: ${LONGCAT_MOCK:-1}
+      VOICES_DIR: /data
+    volumes:
+      - longcat-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5830/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # Qwen3-TTS GPU-tier TTS server (SPEC-W74 A1, nari-labs/nari-qwen3-tts,
   # Apache-2.0). The published image IS the sidecar — the voice runtime's
   # `qwen3` provider POSTs OpenAI-shaped /v1/audio/speech directly to it.
@@ -179,6 +205,8 @@ services:
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
       # SPEC-W72: CosyVoice-2 sidecar (cosyvoice TTS provider, A2).
       COSYVOICE_TTS_URL: ${COSYVOICE_TTS_URL:-http://cosyvoice-tts:5820}
+      # SPEC-W102 C3: LongCat-AudioDiT sidecar (longcat TTS provider).
+      LONGCAT_TTS_URL: ${LONGCAT_TTS_URL:-http://longcat-tts:5830}
       # SPEC-W74 A1: Qwen3-TTS GPU-tier provider (opt-in "voice-gpu" profile;
       # add "qwen3" to TTS_PROVIDER_CHAIN only on an H100 host).
       QWEN3_TTS_URL: ${QWEN3_TTS_URL:-http://qwen3-tts:8000}
@@ -229,6 +257,8 @@ services:
       PHONE_HASH_SALT: ${PHONE_HASH_SALT:-}
       # SPEC-W72: CosyVoice-2 sidecar (cosyvoice TTS provider, A2).
       COSYVOICE_TTS_URL: ${COSYVOICE_TTS_URL:-http://cosyvoice-tts:5820}
+      # SPEC-W102 C3: LongCat-AudioDiT sidecar (longcat TTS provider).
+      LONGCAT_TTS_URL: ${LONGCAT_TTS_URL:-http://longcat-tts:5830}
       # SPEC-W74 A1: Qwen3-TTS GPU-tier provider (opt-in "voice-gpu" profile;
       # add "qwen3" to TTS_PROVIDER_CHAIN only on an H100 host).
       QWEN3_TTS_URL: ${QWEN3_TTS_URL:-http://qwen3-tts:8000}
@@ -255,7 +285,7 @@ services:
       - ./ops:/ops:ro
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      VOICE_WATCHDOG_TARGETS: ${VOICE_WATCHDOG_TARGETS:-piper=http://piper:5500,mms=http://mms-tts:5800,xtts=http://xtts-tts:5810,cosyvoice=http://cosyvoice-tts:5820,ollama=http://ollama:11434}
+      VOICE_WATCHDOG_TARGETS: ${VOICE_WATCHDOG_TARGETS:-piper=http://piper:5500,mms=http://mms-tts:5800,xtts=http://xtts-tts:5810,cosyvoice=http://cosyvoice-tts:5820,longcat=http://longcat-tts:5830,ollama=http://ollama:11434}
       VOICE_WATCHDOG_INTERVAL_S: ${VOICE_WATCHDOG_INTERVAL_S:-30}
       VOICE_WATCHDOG_FAIL_THRESHOLD: ${VOICE_WATCHDOG_FAIL_THRESHOLD:-3}
       VOICE_WATCHDOG_PROBE_TIMEOUT_S: ${VOICE_WATCHDOG_PROBE_TIMEOUT_S:-10}
@@ -266,6 +296,7 @@ services:
       - piper
       - ollama
       - cosyvoice-tts
+      - longcat-tts
     restart: unless-stopped
 
   # Dapr sidecar companion (SPEC §3: app talks to daprd-voice:3500).
@@ -293,6 +324,7 @@ volumes:
   piper-voices:
   whisper-models:
   cosyvoice-data:
+  longcat-data:
   qwen3-cache:
 
 networks:
