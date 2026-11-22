@@ -58,7 +58,8 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
           heroTitle: s.theme?.heroTitle ?? "",
           heroSubtitle: s.theme?.heroSubtitle ?? s.theme?.hero_blurb ?? "",
           template: s.theme?.template ?? "classic",
-          tagline: s.tagline ?? "",
+          // booking-service keeps no tagline column: it lives in the theme jsonb (2026-11-22; the top-level field was dropped).
+          tagline: (s.theme as { tagline?: string } | undefined)?.tagline ?? s.tagline ?? "",
           published: s.published,
           brandName: s.theme?.brandName ?? s.theme?.brand_name ?? "",
           customDomain: s.theme?.customDomain ?? "",
@@ -91,6 +92,7 @@ export function PublicSiteClient({ orgSlug }: { orgSlug: string }) {
             heroTitle: form.heroTitle.trim() || undefined,
             heroSubtitle: form.heroSubtitle.trim() || undefined,
             template: form.template,
+            tagline: form.tagline.trim() || undefined,
             accent: form.primaryColor,
             hero_blurb: form.heroSubtitle.trim() || undefined,
             logo_url: form.logoUrl.trim() || undefined,

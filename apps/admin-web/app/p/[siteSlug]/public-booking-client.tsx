@@ -160,8 +160,8 @@ export function PublicBookingClient({
               <h1 className={cn("leading-tight", compact ? "text-2xl" : "mt-1 text-4xl sm:text-5xl")}>
                 {brandName}
               </h1>
-              {site.tagline ? (
-                <p className="mt-1 text-paper/75">{site.tagline}</p>
+              {(site.theme as { tagline?: string } | undefined)?.tagline || site.tagline ? (
+                <p className="mt-1 text-paper/75">{(site.theme as { tagline?: string } | undefined)?.tagline || site.tagline}</p>
               ) : null}
             </div>
           </div>
