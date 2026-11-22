@@ -56,6 +56,7 @@ import binascii
 import hmac
 import json
 import re
+import time
 import uuid
 from datetime import timedelta
 from typing import Any, Literal
@@ -64,7 +65,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import call_language, metrics, outbound, sip, verification
+from . import call_language, metrics, outbound, outbound_script, sip, verification
 from . import visitor as visitor_mod
 from .visitor import Visitor
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
@@ -162,6 +163,13 @@ class OutboundCallRequest(BaseModel):
     purpose: Literal["confirm_appointment", "waitlist_offer", "no_show_rebook", "callback"] | None = None
     contact_name: str | None = Field(default=None, max_length=120)
     context: dict[str, str] = Field(default_factory=dict, max_length=8)
+    # 2026-11-22: ring the business's browser "demo phone" (/app/<slug>/demo-phone) instead of dialing out — for demos
+    # without a carrier. Honoured on POST /voice-admin/calls only.
+    demo_phone: bool = False
+
+
+class DemoPhoneAction(BaseModel):
+    call_id: str = Field(min_length=8, max_length=64)
 
 
 class VoiceSessionResponse(BaseModel):
@@ -756,6 +764,87 @@ def create_app(
         log.info("brand voice enrolled", tenant=req.tenant, voice_id=voice_id)
         return {"voice_id": voice_id}
 
+    # ------------------------------------------------------------------
+    # 2026-11-22: the DEMO PHONE — a browser page (/app/<slug>/demo-phone) that stands in for the contributor's phone so
+    # outbound calls can be shown live without a carrier. A dashboard call with demo_phone=true leaves a ring here for
+    # that business (one at a time, 45 s); the page polls, rings, and on Answer joins the outcall- room as the callee
+    # with the call brief in its metadata (outbound.build_outbound_call_context reads it). The receptionist, prompt,
+    # tools and transcript are exactly those of a real outbound call. In-memory: the voice control plane runs 1 replica.
+    # ------------------------------------------------------------------
+    DEMO_RING_S = 45.0
+    demo_rings: dict[str, dict[str, Any]] = {}
+
+    def _tenant_staff(request: Request, site: str) -> None:
+        if not (_caller_roles(request) & TENANT_ADMIN_ROLES and _caller_tenant(request) == site):
+            _require_admin_access(request)
+
+    def _ring_demo_phone(site: str, number: str, req: OutboundCallRequest, request: Request) -> dict[str, Any]:
+        call_id = uuid.uuid4().hex
+        room = outbound.outbound_room_name(site, call_id)
+        attrs = outbound_script.to_attributes(req.purpose, req.contact_name, req.context)
+        attrs[outbound_script.ATTR_PREFIX + "phone"] = number
+        demo_rings[site] = {
+            "call_id": call_id, "room": room, "site_slug": site, "phone_number": number,
+            "contact_name": req.contact_name or "", "purpose": req.purpose or "general", "attributes": attrs,
+            "expires_at": time.time() + DEMO_RING_S,
+        }
+        log.info("demo phone ringing", site_slug=site, purpose=req.purpose or "general",
+                 by=request.headers.get("X-User-Id", "internal"), room=room)
+        return {"room": room, "call_id": call_id, "status": "ringing_demo_phone", "site_slug": site,
+                "phone_number": number, "purpose": req.purpose or "general"}
+
+    def _current_ring(site: str) -> dict[str, Any] | None:
+        ring = demo_rings.get(site)
+        if ring and ring["expires_at"] < time.time():
+            demo_rings.pop(site, None)
+            return None
+        return ring
+
+    @app.get("/voice-admin/demo-phone/ring")
+    async def demo_phone_ring(request: Request) -> dict[str, Any]:
+        site = _caller_tenant(request) or ""
+        if not site:
+            raise HTTPException(status_code=400, detail="tenant required")
+        _tenant_staff(request, site)
+        ring = _current_ring(site)
+        if not ring:
+            return {"ringing": False}
+        return {"ringing": True, **{k: ring[k] for k in ("call_id", "contact_name", "phone_number", "purpose")},
+                "seconds_left": max(0, int(ring["expires_at"] - time.time()))}
+
+    @app.post("/voice-admin/demo-phone/answer")
+    async def demo_phone_answer(body: DemoPhoneAction, request: Request) -> dict[str, Any]:
+        site = _caller_tenant(request) or ""
+        _tenant_staff(request, site)
+        ring = _current_ring(site)
+        if not ring or ring["call_id"] != body.call_id:
+            raise HTTPException(status_code=410, detail="this call is no longer ringing")
+        demo_rings.pop(site, None)
+        from livekit import api as lk_api
+
+        token = (
+            lk_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+            .with_identity(outbound.DEMO_IDENTITY_PREFIX + body.call_id[:12])
+            .with_name(ring["contact_name"] or "Demo phone")
+            .with_metadata(json.dumps({"agora_outbound": ring["attributes"]}))
+            .with_grants(lk_api.VideoGrants(room_join=True, room=ring["room"], can_publish=True, can_subscribe=True))
+            .with_ttl(timedelta(minutes=30))
+            .to_jwt()
+        )
+        log.info("demo phone answered", site_slug=site, room=ring["room"])
+        return {"room": ring["room"], "url": settings.livekit_public_url or settings.livekit_url, "token": token,
+                "ice_servers": await ice_source.get()}
+
+    @app.post("/voice-admin/demo-phone/decline")
+    async def demo_phone_decline(body: DemoPhoneAction, request: Request) -> dict[str, Any]:
+        site = _caller_tenant(request) or ""
+        _tenant_staff(request, site)
+        ring = _current_ring(site)
+        if ring and ring["call_id"] == body.call_id:
+            demo_rings.pop(site, None)
+            log.info("demo phone declined", site_slug=site, room=ring["room"])
+        return {"declined": True}
+
     @app.post("/voice-admin/calls")
     async def place_staff_outbound_call(req: OutboundCallRequest, request: Request) -> dict[str, Any]:
         """2026-11-22: the dashboard's call buttons (Call to confirm / Call to rebook / Offer slot by phone / Call back).
@@ -763,11 +852,12 @@ def create_app(
         owner/admin may call for their own business only; agency staff (or the internal token) for any. Local Nigerian
         numbers (0803...) are dialed as +234..., the form contacts and bookings store them in."""
         site = req.site_slug.strip().lower()
-        if not (_caller_roles(request) & TENANT_ADMIN_ROLES and _caller_tenant(request) == site):
-            _require_admin_access(request)
+        _tenant_staff(request, site)
         number = re.sub(r"[\s().-]", "", req.phone_number)
         if re.fullmatch(r"0[789]\d{9}", number):
             number = "+234" + number[1:]
+        if req.demo_phone:
+            return _ring_demo_phone(site, number, req, request)
         await outbound_pacer.acquire()
         try:
             call = await outbound.place_outbound_call(

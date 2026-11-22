@@ -23,6 +23,7 @@ fallback philosophy). Tests drive fakes through the same seam.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -155,6 +156,10 @@ def build_outbound_call_context(
     if slug is None:
         return None
     callee, _, attrs = sip.extract_call_info(room_name, participants)
+    if not callee and not attrs:
+        demo = demo_callee(participants)
+        if demo is not None:
+            callee, attrs = demo
     return sip.InboundCallContext(
         site_slug=slug,
         caller_phone=callee,
@@ -162,6 +167,26 @@ def build_outbound_call_context(
         tenant_source="outbound",
         attributes=attrs,
     )
+
+
+# 2026-11-22: the dashboard's browser DEMO PHONE answers outcall- rooms as this identity, with the call brief (the
+# same agora.* keys the SIP dial sets as attributes, plus agora.phone) in its participant metadata.
+DEMO_IDENTITY_PREFIX = "out-demo-"
+
+
+def demo_callee(participants: Any) -> tuple[str, dict[str, str]] | None:
+    """(callee phone, brief attributes) from a demo-phone participant, or None when there is none."""
+    for p in participants or ():
+        if not (getattr(p, "identity", "") or "").startswith(DEMO_IDENTITY_PREFIX):
+            continue
+        try:
+            meta = json.loads(getattr(p, "metadata", "") or "{}")
+        except ValueError:
+            meta = {}
+        raw = meta.get("agora_outbound") if isinstance(meta, dict) else None
+        attrs = {str(k): str(v) for k, v in (raw or {}).items()} if isinstance(raw, dict) else {}
+        return sip.normalize_phone(attrs.get("agora.phone", "")), attrs
+    return None
 
 
 async def _create_sip_participant(api: Any, request: Any) -> Any:

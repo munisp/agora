@@ -2268,6 +2268,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     sip_call: sip.InboundCallContext | None = None
     direction: str | None = None
     participants = list(getattr(ctx.room, "remote_participants", {}).values())
+    # 2026-11-22: an outbound room joined before its callee (the browser demo phone joins on Answer): wait for them, so
+    # the call brief is there before the opening line.
+    if room_name.startswith(outbound.OUTBOUND_ROOM_PREFIX) and not participants:
+        try:
+            await asyncio.wait_for(ctx.wait_for_participant(), timeout=15)
+        except Exception:  # noqa: BLE001 - no callee: fall through to a general outbound call
+            pass
+        participants = list(getattr(ctx.room, "remote_participants", {}).values())
     # SPEC-W101 C4: OUTBOUND call — the platform dialed the customer (see
     # app/outbound.py build_outbound_call_context; R3).
     out_ctx = outbound.build_outbound_call_context(room_name, participants)

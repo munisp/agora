@@ -64,24 +64,68 @@ function preview(t: CallTarget): string {
   }
 }
 
-async function placeCall(orgSlug: string, t: CallTarget) {
+async function placeCall(orgSlug: string, t: CallTarget, demoPhone: boolean) {
   return api.post<{ status: string; room: string }>(
     "/api/voice-admin/calls",
-    { site_slug: orgSlug, phone_number: t.phone, purpose: t.purpose, contact_name: t.name || undefined, context: t.context ?? {} },
+    { site_slug: orgSlug, phone_number: t.phone, purpose: t.purpose, contact_name: t.name || undefined, context: t.context ?? {},
+      demo_phone: demoPhone },
     { tenant: orgSlug },
+  );
+}
+
+const DEMO_KEY = "agora.callDemoPhone";
+
+/** "Ring the demo phone" (the browser page at /app/<slug>/demo-phone) instead of the contributor's real phone.
+ *  Remembered per browser; on by default while no carrier is connected. */
+function useDemoPhone(): [boolean, (v: boolean) => void] {
+  const [on, setOn] = React.useState(true);
+  React.useEffect(() => {
+    try {
+      const v = window.localStorage.getItem(DEMO_KEY);
+      if (v !== null) setOn(v === "1");
+    } catch {
+      /* storage blocked: keep the default */
+    }
+  }, []);
+  const set = (v: boolean) => {
+    setOn(v);
+    try {
+      window.localStorage.setItem(DEMO_KEY, v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  };
+  return [on, set];
+}
+
+function DemoPhoneToggle({ orgSlug, on, onChange }: { orgSlug: string; on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className="flex items-start gap-2 rounded-md border border-dashed px-3 py-2 text-sm">
+      <input type="checkbox" className="mt-0.5" checked={on} onChange={(e) => onChange(e.target.checked)} />
+      <span>
+        Ring the demo phone instead of their real phone
+        <span className="block text-xs text-muted-foreground">
+          Open <a className="underline" href={`/app/${orgSlug}/demo-phone`} target="_blank" rel="noreferrer">the demo phone</a> on
+          another device and switch it on first.
+        </span>
+      </span>
+    </label>
   );
 }
 
 function useCall(orgSlug: string, onDone: () => void) {
   const { toast } = useToast();
   const [busy, setBusy] = React.useState(false);
+  const [demoPhone, setDemoPhone] = useDemoPhone();
   const call = async (t: CallTarget) => {
     setBusy(true);
     try {
-      await placeCall(orgSlug, t);
+      await placeCall(orgSlug, t, demoPhone);
       toast({
-        title: `Calling ${t.name || t.phone}…`,
-        description: "The receptionist is dialing now. The call and its transcript appear in Conversations when it ends.",
+        title: demoPhone ? "The demo phone is ringing…" : `Calling ${t.name || t.phone}…`,
+        description: demoPhone
+          ? `Answer it on the demo phone (as ${t.name || t.phone}) within 45 seconds. The transcript appears in Conversations.`
+          : "The receptionist is dialing now. The call and its transcript appear in Conversations when it ends.",
         variant: "success",
       });
       onDone();
@@ -95,7 +139,7 @@ function useCall(orgSlug: string, onDone: () => void) {
       setBusy(false);
     }
   };
-  return { busy, call };
+  return { busy, call, demoPhone, setDemoPhone };
 }
 
 /** Small row button that opens the call dialog. */
@@ -110,7 +154,7 @@ export function CallButton({ purpose, onClick, disabled }: { purpose: CallPurpos
 
 /** Confirm-and-call dialog for confirm / rebook / call-back (call-back lets staff say what it's about). */
 export function PhoneCallDialog({ orgSlug, target, onClose }: { orgSlug: string; target: CallTarget | null; onClose: () => void }) {
-  const { busy, call } = useCall(orgSlug, onClose);
+  const { busy, call, demoPhone, setDemoPhone } = useCall(orgSlug, onClose);
   const [reason, setReason] = React.useState("");
   React.useEffect(() => setReason(target?.context?.reason ?? ""), [target]);
   if (!target) return null;
@@ -135,6 +179,7 @@ export function PhoneCallDialog({ orgSlug, target, onClose }: { orgSlug: string;
           </div>
         ) : null}
         <p className="text-sm text-muted-foreground">{preview(t)}</p>
+        <DemoPhoneToggle orgSlug={orgSlug} on={demoPhone} onChange={setDemoPhone} />
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>Not now</Button>
           <Button onClick={() => void call(t)} disabled={busy}>
@@ -165,7 +210,7 @@ interface OfferableSlot extends AvailabilitySlot {
  * one by one and runs out of steps before it can book), so staff pick one of the free slots in the person's window.
  */
 export function OfferSlotCallDialog({ orgSlug, target, onClose }: { orgSlug: string; target: WaitlistCallTarget | null; onClose: () => void }) {
-  const { busy, call } = useCall(orgSlug, onClose);
+  const { busy, call, demoPhone, setDemoPhone } = useCall(orgSlug, onClose);
   const [slots, setSlots] = React.useState<OfferableSlot[] | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [picked, setPicked] = React.useState<number | null>(null);
@@ -247,6 +292,7 @@ export function OfferSlotCallDialog({ orgSlug, target, onClose }: { orgSlug: str
           </fieldset>
         ) : null}
         {callTarget ? <p className="text-sm text-muted-foreground">{preview(callTarget)}</p> : null}
+        <DemoPhoneToggle orgSlug={orgSlug} on={demoPhone} onChange={setDemoPhone} />
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>Not now</Button>
           <Button onClick={() => callTarget && void call(callTarget)} disabled={busy || !callTarget}>

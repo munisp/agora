@@ -472,3 +472,47 @@ class TestStaffCallsEndpoint:
             r = await c.post("/voice-admin/calls", json={**self.BODY, "purpose": "sell_things"},
                              headers={"X-User-Roles": "staff"})
         assert r.status_code == 422 and dialed == []
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-22: the browser DEMO PHONE (stands in for the contributor's phone)
+# ---------------------------------------------------------------------------
+class TestDemoPhone:
+    OWNER = {"X-User-Roles": "owner", "X-Tenant-Slugs": "acme", "X-User-Id": "u1"}
+    BODY = {"site_slug": "acme", "phone_number": "08035550001", "purpose": "confirm_appointment",
+            "contact_name": "Ngozi Okafor", "context": {"when": "Tuesday at 9 a.m."}, "demo_phone": True}
+
+    def test_demo_participant_becomes_the_callee_with_its_brief(self):
+        import json as _json
+        p = types.SimpleNamespace(identity="out-demo-abc123", kind=0, attributes={},
+                                  metadata=_json.dumps({"agora_outbound": {"agora.purpose": "callback", "agora.phone": "+2348035550001"}}))
+        ctx = outbound.build_outbound_call_context("outcall-acme-" + "f" * 32, [p])
+        assert ctx.caller_phone == "+2348035550001" and ctx.attributes["agora.purpose"] == "callback"
+        assert outbound.demo_callee([types.SimpleNamespace(identity="web-1", metadata="")]) is None
+
+    async def test_ring_then_answer_gives_a_room_token_and_clears_the_ring(self, monkeypatch):
+        async def never_dial(*a, **k):
+            raise AssertionError("the demo phone must not dial the carrier")
+
+        monkeypatch.setattr(outbound, "place_outbound_call", never_dial)
+        settings = _cp_settings(livekit_url="ws://livekit:7880", livekit_api_key="devkey", livekit_api_secret="s" * 32)
+        async with _client(settings) as c:
+            r = await c.post("/voice-admin/calls", json=self.BODY, headers=self.OWNER)
+            assert r.status_code == 200 and r.json()["status"] == "ringing_demo_phone"
+            call_id = r.json()["call_id"]
+            ring = (await c.get("/voice-admin/demo-phone/ring", headers=self.OWNER)).json()
+            assert ring["ringing"] and ring["call_id"] == call_id and ring["contact_name"] == "Ngozi Okafor"
+            assert ring["phone_number"] == "+2348035550001"
+            other = await c.get("/voice-admin/demo-phone/ring", headers={"X-User-Roles": "owner", "X-Tenant-Slugs": "other"})
+            assert other.status_code == 401 or other.json() == {"ringing": False}
+            a = await c.post("/voice-admin/demo-phone/answer", json={"call_id": call_id}, headers=self.OWNER)
+            assert a.status_code == 200 and a.json()["room"] == f"outcall-acme-{call_id}" and a.json()["token"]
+            assert (await c.get("/voice-admin/demo-phone/ring", headers=self.OWNER)).json() == {"ringing": False}
+            stale = await c.post("/voice-admin/demo-phone/answer", json={"call_id": call_id}, headers=self.OWNER)
+            assert stale.status_code == 410
+
+    async def test_decline_clears_the_ring(self):
+        async with _client(_cp_settings()) as c:
+            call_id = (await c.post("/voice-admin/calls", json=self.BODY, headers=self.OWNER)).json()["call_id"]
+            await c.post("/voice-admin/demo-phone/decline", json={"call_id": call_id}, headers=self.OWNER)
+            assert (await c.get("/voice-admin/demo-phone/ring", headers=self.OWNER)).json() == {"ringing": False}
