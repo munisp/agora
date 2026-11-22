@@ -4,6 +4,7 @@ import { serverApi } from "@/lib/server-api";
 import { ApiError } from "@/lib/api";
 import { WaitlistClient } from "./waitlist-client";
 import type { Offering, PublicSite, WaitlistEntry } from "@/lib/types";
+import { listFrom } from "@/lib/utils";
 
 export const metadata = { title: "Waitlist" };
 
@@ -50,9 +51,8 @@ export default async function WaitlistPage({
       "/api/bookings/v1/offerings",
       { query: { tenant: orgSlug } },
     );
-    initialOfferings = Array.isArray(offerings)
-      ? offerings
-      : (offerings.items ?? []);
+    // booking-service answers {offerings: [...]}; the old array/items-only read left the add form empty (2026-11-22).
+    initialOfferings = listFrom<Offering>(offerings);
   } catch {
     initialOfferings = [];
   }

@@ -14,6 +14,7 @@ import { Select, Label } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableEmpty, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useNavLabels } from "@/components/terminology-provider";
 import { cn, formatDateTime } from "@/lib/utils";
+import { CallButton, PhoneCallDialog, type CallTarget } from "@/components/phone-call";
 
 export interface ConversationSummary {
   id: string;
@@ -75,6 +76,7 @@ export function ConversationsClient({
   const [loading, setLoading] = React.useState(false);
   const [channel, setChannel] = React.useState("");
   const [open, setOpen] = React.useState<ConversationSummary | null>(null);
+  const [callTarget, setCallTarget] = React.useState<CallTarget | null>(null); // 2026-11-22: "Call back"
   const [turns, setTurns] = React.useState<Turn[] | null>(null);
   const [turnsError, setTurnsError] = React.useState<string | null>(null);
   const [translating, setTranslating] = React.useState(false);
@@ -225,9 +227,19 @@ export function ConversationsClient({
                   {contributorOf(open) ? ` · ${contributorOf(open)}` : ""}
                 </p>
               </div>
-              <Button variant="ghost" size="sm" aria-label="Close transcript" onClick={() => setOpen(null)}>
-                <X className="h-4 w-4" />
-              </Button>
+              <div className="flex items-center gap-1">
+                {open.contact_phone || open.caller_phone ? (
+                  <CallButton
+                    purpose="callback"
+                    onClick={() =>
+                      setCallTarget({ purpose: "callback", phone: (open.contact_phone || open.caller_phone) as string, name: open.contact_name })
+                    }
+                  />
+                ) : null}
+                <Button variant="ghost" size="sm" aria-label="Close transcript" onClick={() => setOpen(null)}>
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>
               {turnsError ? <ErrorNote message={turnsError} /> : null}
@@ -272,6 +284,7 @@ export function ConversationsClient({
           </Card>
         ) : null}
       </div>
+      <PhoneCallDialog orgSlug={orgSlug} target={callTarget} onClose={() => setCallTarget(null)} />
     </div>
   );
 }

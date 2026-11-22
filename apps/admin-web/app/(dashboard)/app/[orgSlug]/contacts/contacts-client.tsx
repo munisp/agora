@@ -28,6 +28,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
+import { CallButton, PhoneCallDialog, type CallTarget } from "@/components/phone-call";
 import type { Contact } from "@/lib/types";
 
 const EMPTY_FORM = { name: "", phone: "", email: "", notes: "" };
@@ -47,6 +48,7 @@ export function ContactsClient({
   const [error, setError] = React.useState<string | null>(initialError);
   const [loading, setLoading] = React.useState(false);
   const [editing, setEditing] = React.useState<Contact | null>(null);
+  const [callTarget, setCallTarget] = React.useState<CallTarget | null>(null); // 2026-11-22: "Call back"
   const [createOpen, setCreateOpen] = React.useState(false);
   const [deleting, setDeleting] = React.useState<Contact | null>(null);
   const [busy, setBusy] = React.useState(false);
@@ -279,6 +281,9 @@ export function ContactsClient({
                           Conversations
                         </Link>
                       ) : null}
+                      {c.phone ? (
+                        <CallButton purpose="callback" onClick={() => setCallTarget({ purpose: "callback", phone: c.phone, name: c.name })} />
+                      ) : null}
                       <Button variant="ghost" size="sm" onClick={() => openEdit(c)}>
                         <Pencil className="h-3.5 w-3.5" />
                         Edit
@@ -363,6 +368,7 @@ export function ContactsClient({
         busy={busy}
         onConfirm={() => void remove()}
       />
+      <PhoneCallDialog orgSlug={orgSlug} target={callTarget} onClose={() => setCallTarget(null)} />
     </div>
   );
 }

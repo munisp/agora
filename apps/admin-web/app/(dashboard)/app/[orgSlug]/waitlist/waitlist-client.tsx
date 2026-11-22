@@ -20,6 +20,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
+import { CallButton, OfferSlotCallDialog, type WaitlistCallTarget } from "@/components/phone-call";
 import { formatDateTime } from "@/lib/utils";
 import type { Offering, WaitlistEntry } from "@/lib/types";
 
@@ -88,6 +89,8 @@ export function WaitlistClient({
   const [creating, setCreating] = React.useState(false);
   const [showCreate, setShowCreate] = React.useState(false);
   const [busyId, setBusyId] = React.useState<string | null>(null);
+  // 2026-11-22: the receptionist phones the person and offers a free slot in their window.
+  const [offerTarget, setOfferTarget] = React.useState<WaitlistCallTarget | null>(null);
   const [expireTarget, setExpireTarget] = React.useState<WaitlistEntry | null>(
     null,
   );
@@ -446,6 +449,21 @@ export function WaitlistClient({
                           Copy claim link
                         </Button>
                       ) : null}
+                      {LINKABLE.has(w.status) && w.contact_phone ? (
+                        <CallButton
+                          purpose="waitlist_offer"
+                          onClick={() =>
+                            setOfferTarget({
+                              name: w.contact_name,
+                              phone: w.contact_phone,
+                              offeringId: w.offering_id,
+                              offeringName: offeringName(w.offering_id),
+                              windowStart: w.window_start,
+                              windowEnd: w.window_end,
+                            })
+                          }
+                        />
+                      ) : null}
                       {NOTIFYABLE.has(w.status) ? (
                         <Button
                           variant="outline"
@@ -553,6 +571,7 @@ export function WaitlistClient({
         Claimed entries are linked to the resulting booking.
       </p>
 
+      <OfferSlotCallDialog orgSlug={orgSlug} target={offerTarget} onClose={() => setOfferTarget(null)} />
       <ConfirmDialog
         open={expireTarget !== null}
         onOpenChange={(open) => {

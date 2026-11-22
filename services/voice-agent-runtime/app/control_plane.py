@@ -55,6 +55,7 @@ import base64
 import binascii
 import hmac
 import json
+import re
 import uuid
 from datetime import timedelta
 from typing import Any, Literal
@@ -754,6 +755,30 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         log.info("brand voice enrolled", tenant=req.tenant, voice_id=voice_id)
         return {"voice_id": voice_id}
+
+    @app.post("/voice-admin/calls")
+    async def place_staff_outbound_call(req: OutboundCallRequest, request: Request) -> dict[str, Any]:
+        """2026-11-22: the dashboard's call buttons (Call to confirm / Call to rebook / Offer slot by phone / Call back).
+        Same dial path as POST /v1/calls, reached through the signed-in APISIX /api/voice-admin/* route: a business's
+        owner/admin may call for their own business only; agency staff (or the internal token) for any. Local Nigerian
+        numbers (0803...) are dialed as +234..., the form contacts and bookings store them in."""
+        site = req.site_slug.strip().lower()
+        if not (_caller_roles(request) & TENANT_ADMIN_ROLES and _caller_tenant(request) == site):
+            _require_admin_access(request)
+        number = re.sub(r"[\s().-]", "", req.phone_number)
+        if re.fullmatch(r"0[789]\d{9}", number):
+            number = "+234" + number[1:]
+        await outbound_pacer.acquire()
+        try:
+            call = await outbound.place_outbound_call(
+                settings, site, number, purpose=req.purpose, contact_name=req.contact_name, context=req.context,
+            )
+        except outbound.OutboundError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        log.info("staff outbound call", site_slug=site, purpose=req.purpose or "general",
+                 by=request.headers.get("X-User-Id", "internal"), room=call.room)
+        return {"room": call.room, "call_id": call.call_id, "status": "dialing", "site_slug": call.site_slug,
+                "phone_number": call.phone_number, "purpose": req.purpose or "general"}
 
     @app.post("/voice-admin/escalations/{conversation_id}/staff-token")
     async def mint_escalation_staff_token(

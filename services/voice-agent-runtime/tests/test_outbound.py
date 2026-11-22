@@ -421,3 +421,54 @@ class TestOutboundTrunkYaml:
         sh = (SIP_DIR / "setup.sh").read_text()
         assert "sip outbound create" in sh
         assert "OUTBOUND_TRUNK_ID" in sh
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-22: POST /voice-admin/calls — the dashboard call buttons
+# ---------------------------------------------------------------------------
+class TestStaffCallsEndpoint:
+    BODY = {"site_slug": "acme", "phone_number": "0803 555 0001", "purpose": "confirm_appointment",
+            "contact_name": "Ngozi Okafor", "context": {"team_member": "Aisha Bello", "when": "Tuesday at 9 a.m."}}
+
+    @pytest.fixture()
+    def dialed(self, monkeypatch):
+        calls: list[dict] = []
+
+        async def fake_place(settings, slug, number, **kw):
+            calls.append({"slug": slug, "number": number, **kw})
+            return outbound.OutboundCall(room=outbound.outbound_room_name(slug, "e" * 32), call_id="e" * 32,
+                                         site_slug=slug, phone_number=number)
+
+        monkeypatch.setattr(outbound, "place_outbound_call", fake_place)
+        return calls
+
+    async def test_owner_calls_for_own_business_with_local_number_as_e164(self, dialed):
+        async with _client(_cp_settings()) as c:
+            r = await c.post("/voice-admin/calls", json=self.BODY,
+                             headers={"X-User-Roles": "owner", "X-Tenant-Slugs": "acme", "X-User-Id": "u1"})
+        assert r.status_code == 200 and r.json()["purpose"] == "confirm_appointment"
+        assert dialed == [{"slug": "acme", "number": "+2348035550001", "purpose": "confirm_appointment",
+                           "contact_name": "Ngozi Okafor",
+                           "context": {"team_member": "Aisha Bello", "when": "Tuesday at 9 a.m."}}]
+
+    async def test_owner_of_another_business_is_refused(self, dialed):
+        async with _client(_cp_settings()) as c:
+            r = await c.post("/voice-admin/calls", json=self.BODY,
+                             headers={"X-User-Roles": "owner", "X-Tenant-Slugs": "other-biz"})
+        assert r.status_code == 401 and dialed == []
+
+    async def test_signed_out_is_refused(self, dialed):
+        async with _client(_cp_settings()) as c:
+            r = await c.post("/voice-admin/calls", json=self.BODY)
+        assert r.status_code == 401 and dialed == []
+
+    async def test_agency_staff_may_call_for_any_business(self, dialed):
+        async with _client(_cp_settings()) as c:
+            r = await c.post("/voice-admin/calls", json=self.BODY, headers={"X-User-Roles": "staff"})
+        assert r.status_code == 200 and dialed[0]["slug"] == "acme"
+
+    async def test_unknown_purpose_is_rejected_before_dialing(self, dialed):
+        async with _client(_cp_settings()) as c:
+            r = await c.post("/voice-admin/calls", json={**self.BODY, "purpose": "sell_things"},
+                             headers={"X-User-Roles": "staff"})
+        assert r.status_code == 422 and dialed == []
