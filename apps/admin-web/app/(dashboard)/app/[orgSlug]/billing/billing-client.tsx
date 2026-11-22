@@ -535,6 +535,32 @@ export function BillingClient({ orgSlug }: { orgSlug: string }) {
  * (APISIX has no analytics route). Recommendations are human-review only —
  * nothing is auto-applied.
  */
+/** The analytics-pipeline row (gold.reco_pricing) as served; older builds used the PricingRecommendation names. */
+type RawRecommendation = Partial<PricingRecommendation> & {
+  offering_id: string;
+  suggested_peak_multiplier?: number;
+  no_show_rate?: number;
+  computed_at?: string;
+};
+
+/**
+ * Map a served row onto the table's shape (2026-11-21): the pipeline sends suggested_peak_multiplier /
+ * no_show_rate / computed_at, and reading peak_hour_multiplier.toFixed on it crashed the whole Billing page.
+ */
+function normalizeRecommendation(r: RawRecommendation, names: Map<string, string>): PricingRecommendation {
+  const rate = typeof r.no_show_rate === "number" ? r.no_show_rate : null;
+  return {
+    tenant_id: r.tenant_id ?? "",
+    offering_id: r.offering_id,
+    offering_name: r.offering_name ?? names.get(r.offering_id),
+    peak_hour_multiplier: Number(r.peak_hour_multiplier ?? r.suggested_peak_multiplier ?? 1),
+    suggested_deposit_pct: Number(r.suggested_deposit_pct ?? 0),
+    no_show_risk_band:
+      r.no_show_risk_band ?? (rate === null ? undefined : rate >= 0.25 ? "high" : rate >= 0.1 ? "medium" : "low"),
+    generated_at: r.generated_at ?? r.computed_at,
+  };
+}
+
 function RecommendationsCard({ orgSlug }: { orgSlug: string }) {
   const [recs, setRecs] = React.useState<PricingRecommendation[] | null>(null);
   const [unavailable, setUnavailable] = React.useState<string | null>(null);
@@ -542,10 +568,14 @@ function RecommendationsCard({ orgSlug }: { orgSlug: string }) {
   React.useEffect(() => {
     (async () => {
       try {
-        const data = await api.get<
-          PricingRecommendation[] | { items: PricingRecommendation[] }
-        >("/api/analytics/v1/recommendations", { tenant: orgSlug });
-        setRecs(listFrom(data));
+        const [data, offeringsRaw] = await Promise.all([
+          api.get<unknown>("/api/analytics/v1/recommendations", { tenant: orgSlug }),
+          api.get<unknown>("/api/bookings/v1/offerings", { tenant: orgSlug }).catch(() => []),
+        ]);
+        const names = new Map(
+          listFrom<{ id: string; name: string }>(offeringsRaw).map((o) => [o.id, o.name]),
+        );
+        setRecs(listFrom<RawRecommendation>(data).map((r) => normalizeRecommendation(r, names)));
       } catch (e) {
         setUnavailable(
           e instanceof ApiError

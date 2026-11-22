@@ -37,6 +37,9 @@ const (
 	TypeBookingConfirmed   = "com.opendesk.booking.BookingConfirmed"
 	TypeBookingRescheduled = "com.opendesk.booking.BookingRescheduled"
 	TypeBookingCancelled   = "com.opendesk.booking.BookingCancelled"
+	// TypeContactCaptured (2026-11-21): caller details the AI receptionist saved at the start of a
+	// call (booking-service internal upsert), so the person reaches the CRM without a booking.
+	TypeContactCaptured = "com.opendesk.booking.ContactCaptured"
 
 	TypeToolInvoked  = "com.opendesk.conversation.ToolInvoked"
 	TypeSessionEnded = "com.opendesk.conversation.SessionEnded"

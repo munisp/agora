@@ -61,7 +61,14 @@ PHONE-CONFIRMATION POLICY (hard rule, enforced server-side)
   same number.
 - Never claim a booking exists until the tool confirms it was accepted.
 
-CALLER DETAILS (every booking)
+CALLER DETAILS (start of every call, and every booking)
+- Unless VISITOR DETAILS are given below, the opening line has already asked
+  for the caller's full name, email and phone number: take them FIRST, at the
+  start of the call, before helping with anything else. If the caller starts
+  with a question, say you'll help right after, and take the details first.
+  Read them back once (as below). As soon as the caller confirms them, call
+  save_caller_details (name, phone, email) so they are in the CRM even if
+  they never book, then ask how you can help.
 - Before booking, collect the caller's first name, last name, email address
   and phone number. Ask for whichever is missing, one at a time, in a
   friendly way. Pass "First Last" as contact_name and the email as email to
@@ -166,7 +173,7 @@ def truncate_knowledge_snippets(
     return out
 
 
-def build_greeting(ctx: TenantContext, menu_line: str | None = None) -> str:
+def build_greeting(ctx: TenantContext, menu_line: str | None = None, ask_details: bool = False) -> str:
     """Session-opening greeting, with the SPEC-W11 Part C §5 disclosure.
 
     Default (no pack ``disclosure`` block on the tenant context) is
@@ -183,9 +190,11 @@ def build_greeting(ctx: TenantContext, menu_line: str | None = None) -> str:
     None/"" everywhere else) is appended LAST — recency: the keypad menu
     is the final thing the caller hears. Byte-identical when absent.
     """
+    # ask_details (2026-11-21): the caller filled no form, so the opening line asks for their details first.
     greeting = (
         f"Hello, thank you for calling {ctx.display_name}. "
-        "How can I help you today?"
+        + ("Before we start, may I have your full name, your email and your phone number?"
+           if ask_details else "How can I help you today?")
     )
     disclosure = getattr(ctx, "disclosure", None)
     if isinstance(disclosure, dict) and disclosure.get("spokenAiDisclosure"):
@@ -232,6 +241,7 @@ def build_system_prompt(
     language: str | None = None,
     caller_phone: str | None = None,
     keypad_menu_hint: str | None = None,
+    visitor: dict[str, str] | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -313,7 +323,11 @@ def build_system_prompt(
     # number (prompt hint + emergency location capture); the OTP gate still
     # applies to lookup/reschedule/cancel and the read-back policy to new
     # bookings.
-    if caller_phone:
+    # 2026-11-21: details from the public page's form (app/visitor.py); they replace the SIP caller-ID hint.
+    if visitor:
+        from .visitor import prompt_block
+        prompt += prompt_block(visitor)
+    elif caller_phone:
         prompt += (
             f"\nCALLER ID (SIP, unverified)\n- The caller appears to be "
             f"phoning from {caller_phone}. You may use this number when the "

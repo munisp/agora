@@ -31,6 +31,15 @@ _GREETINGS = {
     "ig": "Nnọọ na {name}! Kedu ka m ga-esi nyere gị aka taa?",
 }
 
+# 2026-11-21: when the caller filled no form (phone lines, or a web call without it), the opening line asks for the
+# caller's name, email and phone number first, in the call's language.
+_GREETINGS_ASK_DETAILS = {
+    "pcm": "Welcome to {name}! Before we start, abeg tell me your name, your email and your phone number.",
+    "yo": "Ẹ kú àbọ̀ sí {name}! Kí a tó bẹ̀rẹ̀, ẹ jọ̀wọ́ ẹ sọ orúkọ yín, ímeèlì yín àti nọ́mbà fóònù yín fún mi.",
+    "ha": "Barka da zuwa {name}! Kafin mu fara, don Allah faɗa mini sunanka, imel ɗinka da lambar wayarka.",
+    "ig": "Nnọọ na {name}! Tupu anyị amalite, biko gwa m aha gị, email gị na nọmba ekwentị gị.",
+}
+
 
 def allowed(setting: str) -> list[str]:
     """CALL_LANGUAGES -> known codes, English always first."""
@@ -70,10 +79,10 @@ RECORDING_NOTICES = {
 }
 
 
-def greeting(language: str, business: str, english_greeting: str) -> str:
+def greeting(language: str, business: str, english_greeting: str, ask_details: bool = False) -> str:
     """The opening line in the chosen language, starting with the recording notice (the business's own English
-    greeting otherwise, which starts with its own notice)."""
-    tpl = _GREETINGS.get(language)
+    greeting otherwise, which starts with its own notice). ``ask_details``: ask for name, email and phone first."""
+    tpl = (_GREETINGS_ASK_DETAILS if ask_details else _GREETINGS).get(language)
     if tpl and business:
         return f"{RECORDING_NOTICES.get(language, '')} {tpl.format(name=business)}".strip()
     return english_greeting

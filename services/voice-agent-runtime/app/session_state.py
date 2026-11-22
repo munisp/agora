@@ -73,6 +73,9 @@ class SessionState:
     # bypass (OOS-03).
     claimed_phone: str | None = None
     caller_name: str | None = None
+    # 2026-11-21: details from the public page's pre-chat form (app/visitor.py). Self-reported.
+    caller_email: str | None = None
+    visitor_form: bool = False
     # SPEC-W96 IVR-A: the session's parsed IVR menu (ivr_menu.IvrEntry
     # tuple), set by build_voice_agent for PSTN sessions when the menu is
     # enabled; None everywhere else. Typed Any to keep this module free of
@@ -170,6 +173,8 @@ class SessionState:
             "verified_phone": self.verified_phone,
             "claimed_phone": self.claimed_phone,
             "caller_name": self.caller_name,
+            "caller_email": self.caller_email,
+            "visitor_form": self.visitor_form,
             "last_booking_ids": list(self.last_booking_ids),
             "active_agent": self.active_agent,
             "escalation_room": self.escalation_room,
@@ -204,6 +209,8 @@ class SessionState:
         session.verified_phone = _str("verified_phone")
         session.claimed_phone = _str("claimed_phone")
         session.caller_name = _str("caller_name")
+        session.caller_email = _str("caller_email")
+        session.visitor_form = bool(data.get("visitor_form"))
         ids = data.get("last_booking_ids")
         session.last_booking_ids = (
             [x for x in ids if isinstance(x, str)] if isinstance(ids, list) else []

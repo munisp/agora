@@ -428,3 +428,11 @@ def test_asking_for_english_inside_a_yoruba_call_switches():
     stt = SwitchingLanguageSTT(Naija(), Whisper(), "yo", ["en", "pcm", "yo", "ha", "ig"], switched.append)
     asyncio.run(stt.transcribe_pcm(b"\0\0" * 16000 * 3, sample_rate=16000))
     assert stt.language == "en" and switched == ["en"]
+
+
+def test_speakable_decodes_byte_fallback_tokens():
+    """2026-11-21: '<0xC7><0xB8>' is the UTF-8 for 'Ǹ' (decoded back); a lone '<0xA0>' is dropped; NBSP -> space."""
+    from app.livekit_worker import speakable
+    assert speakable("zero, zero. <0xC7><0xB8>jẹ́ èyí tòótọ́?") == "zero, zero. Ǹjẹ́ èyí tòótọ́?"
+    assert speakable("<0xA0> <0xC2><0xA0>Note: checking") == "Note: checking"
+    assert speakable("plain <b>text</b>") == "plain text"

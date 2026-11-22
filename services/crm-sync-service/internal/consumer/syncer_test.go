@@ -651,3 +651,44 @@ func TestTenantDeletedDisablesSyncMap(t *testing.T) {
 		t.Error("TenantDeleted without tenant_id must error (DLQ)")
 	}
 }
+
+// 2026-11-21: details the AI receptionist saved at the start of a call become a CRM person, no task.
+func TestHandleContactCapturedCreatesPersonWithoutTask(t *testing.T) {
+	s, fm, stub := newTestSyncer(t)
+	tenantID := uuid.NewString()
+	evt := bookingEvent(events.TypeContactCaptured, map[string]any{
+		"contact_id":   uuid.NewString(),
+		"contact_name": "Ngozi Okafor",
+		"phone":        "08065553108",
+		"email":        "ngozi.okafor@gmail.com",
+		"channel":      "voice",
+		"source":       "ai_receptionist",
+	})
+	evt.TenantID = tenantID
+	if err := s.HandleBooking(context.Background(), evt); err != nil {
+		t.Fatal(err)
+	}
+	var person, task bool
+	for _, r := range stub.requests {
+		if r.method == http.MethodPost && r.path == "/rest/people" {
+			person = true
+		}
+		if r.method == http.MethodPost && r.path == "/rest/tasks" {
+			task = true
+		}
+	}
+	if !person || task {
+		t.Fatalf("person created = %v (want true), task created = %v (want false)", person, task)
+	}
+	_ = fm
+	// no phone and no e-mail: acked, nothing sent
+	s2, _, stub2 := newTestSyncer(t)
+	if err := s2.HandleBooking(context.Background(), bookingEvent(events.TypeContactCaptured, map[string]any{"contact_name": "X"})); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range stub2.requests {
+		if r.method == http.MethodPost {
+			t.Fatalf("unexpected write %s %s", r.method, r.path)
+		}
+	}
+}

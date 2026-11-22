@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import metrics
+from . import visitor as visitor_mod
 from .async_tools import AsyncToolRunner, ToolAckPolicy
 from .codeswitch import instruction as codeswitch_instruction
 from .config import Settings
@@ -106,6 +107,7 @@ class ChatService:
         conversation_id: str | None,
         session_secret: str | None = None,
         persona_override: str | None = None,
+        visitor: Any = None,
     ) -> tuple[SessionState, ToolLayer, list[dict[str, Any]]]:
         """Shared turn setup for the buffered and SSE streaming chat paths
         (SPEC-W3 §3): session, tenant context, multi-agent routing, tool
@@ -118,6 +120,8 @@ class ChatService:
         session = await store_get_or_create(
             self._sessions, conversation_id, site_slug, session_secret=session_secret
         )
+        # 2026-11-21: the public page's pre-chat form (name/phone/email, self-reported; app/visitor.py).
+        visitor_mod.apply(session, visitor)
         ctx = await fetch_tenant_context(self._dapr, self._settings, site_slug)
 
         # Wave 5 #8 A/B prompt testing: swap the tenant persona for the
@@ -211,6 +215,7 @@ class ChatService:
             # Wave 5 #3: honor a previously detected caller language (voice
             # path sets it via whisper; None keeps the tenant default).
             language=session.active_language,
+            visitor=visitor_mod.from_session(session),
         )
         # SPEC-W9 Part B: tell the agent it may drive the visitor's UI — but
         # only when the UI action tools are registered for this turn.
@@ -291,6 +296,7 @@ class ChatService:
         persona_override: str | None = None,
         channel: str = "web",
         pin_verified_identity: str | None = None,
+        visitor: Any = None,
     ) -> dict[str, Any]:
         session, tool_layer, history = await self._prepare_turn(
             site_slug=site_slug,
@@ -298,6 +304,7 @@ class ChatService:
             conversation_id=conversation_id,
             session_secret=session_secret,
             persona_override=persona_override,
+            visitor=visitor,
         )
         # SPEC-W6 Part A: omnichannel inbound — remember which channel the
         # message arrived on (session metadata + turn logging only).
@@ -397,6 +404,7 @@ class ChatService:
         conversation_id: str | None,
         session_secret: str | None = None,
         persona_override: str | None = None,
+        visitor: Any = None,
     ):
         """SSE streaming chat (SPEC-W3 §3): async generator of event dicts.
 
@@ -414,6 +422,7 @@ class ChatService:
             conversation_id=conversation_id,
             session_secret=session_secret,
             persona_override=persona_override,
+            visitor=visitor,
         )
 
         # VOICE-SCALING §5 async tools (chat path): an immediate {"ack": ...}

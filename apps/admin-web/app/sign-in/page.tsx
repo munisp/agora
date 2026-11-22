@@ -33,7 +33,7 @@ export default async function SignInPage({
           </Link>
           <blockquote className="max-w-md">
             <p className="font-display text-3xl leading-snug">
-              &ldquo;Booked for Saturday at ten. See you then!&rdquo;
+              &ldquo;You&apos;re booked for Tuesday at ten. See you then!&rdquo;
             </p>
             <p className="mt-3 text-sm text-paper/75">Your receptionist, at 11 pm, while you sleep.</p>
           </blockquote>
@@ -47,7 +47,7 @@ export default async function SignInPage({
             <AgoraWordmark />
           </Link>
           <p className="eyebrow mt-10 lg:mt-0">Welcome back</p>
-          <h1 className="mt-3 text-4xl leading-tight text-umber">Sign in to your front desk</h1>
+          <h1 className="mt-3 text-4xl leading-tight text-umber">Sign in to Agora</h1>
           <p className="mt-4 leading-relaxed text-muted-foreground">
             See today&apos;s bookings, the conversations your receptionist had, and what it learned about your
             business.
@@ -74,7 +74,7 @@ export default async function SignInPage({
           <div className="mt-12 border-t border-border pt-6 text-sm text-muted-foreground">
             New to Agora?{" "}
             <Link href="/p/acme" className="font-medium text-umber underline-offset-4 hover:underline">
-              Try the receptionist on a demo salon
+              Try the receptionist on a demo business
             </Link>
           </div>
         </div>

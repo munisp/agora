@@ -225,8 +225,7 @@ export function PacksClient({
         <CardHeader>
           <CardTitle>Current pack</CardTitle>
           <CardDescription>
-            Resolved live from identity-service
-            {" (GET /v1/tenants/{slug})"}.
+            The industry setup this business runs on: its services, rules, greetings and disclosures.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -270,9 +269,7 @@ export function PacksClient({
             </div>
           </div>
           <p className="mb-2 text-xs text-muted-foreground">
-            {visible.length} of {PACK_CATALOG.length} packs — catalog snapshot
-            from the industries/ registry shipped with this build
-            (identity-service has no GET /v1/packs catalog endpoint yet).
+            {visible.length} of {PACK_CATALOG.length} ready-made industry setups.
           </p>
           <div className="max-h-[36rem] space-y-2 overflow-y-auto pr-1">
             {visible.map((entry) => (

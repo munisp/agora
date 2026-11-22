@@ -22,6 +22,15 @@ export interface ConversationSummary {
   contact_phone?: string | null;
   started_at: string;
   ended_at?: string | null;
+  contact_name?: string | null;
+  caller_phone?: string | null;
+}
+
+/** Who the conversation was with: the stored contact marker, else the name/phone the caller gave when booking. */
+function contributorOf(c: ConversationSummary): string | null {
+  const phone = c.contact_phone || c.caller_phone || null;
+  if (c.contact_name && phone) return `${c.contact_name} · ${phone}`;
+  return c.contact_name || phone;
 }
 
 interface Turn {
@@ -39,6 +48,8 @@ const CHANNEL: Record<string, { label: string; icon: typeof MessageCircle }> = {
   chat: { label: "Web chat", icon: MessageCircle },
   voice: { label: "Voice call", icon: PhoneCall },
   phone: { label: "Phone call", icon: Phone },
+  whatsapp: { label: "WhatsApp", icon: MessageCircle },
+  telegram: { label: "Telegram", icon: MessageCircle },
   ussd: { label: "USSD", icon: Phone },
   api: { label: "API", icon: MessageCircle },
 };
@@ -90,7 +101,7 @@ export function ConversationsClient({
     try {
       const data = await api.get<{ conversations?: ConversationSummary[] }>("/api/conversations/v1/conversations", {
         tenant: orgSlug,
-        limit: 100,
+        limit: 200, // the API maximum: the channel filter works on what is loaded (100 hid older WhatsApp chats)
         ...(contact ? { contact } : {}),
       });
       setRows(data.conversations ?? []);
@@ -157,6 +168,8 @@ export function ConversationsClient({
             <option value="chat">Web chat</option>
             <option value="voice">Voice call</option>
             <option value="phone">Phone call</option>
+            <option value="whatsapp">WhatsApp</option>
+            <option value="telegram">Telegram</option>
           </Select>
         </div>
         {contact ? (
@@ -194,7 +207,7 @@ export function ConversationsClient({
                           <Icon className="h-4 w-4" /> {ch.label}
                         </span>
                       </TableCell>
-                      <TableCell>{c.contact_phone || <span className="text-muted-foreground">Not given</span>}</TableCell>
+                      <TableCell>{contributorOf(c) || <span className="text-muted-foreground">Not given</span>}</TableCell>
                     </TableRow>
                   );
                 })
@@ -209,7 +222,7 @@ export function ConversationsClient({
                 <CardTitle>{channelOf(open.channel).label}</CardTitle>
                 <p className="text-sm text-muted-foreground">
                   {formatDateTime(open.started_at)}
-                  {open.contact_phone ? ` · ${open.contact_phone}` : ""}
+                  {contributorOf(open) ? ` · ${contributorOf(open)}` : ""}
                 </p>
               </div>
               <Button variant="ghost" size="sm" aria-label="Close transcript" onClick={() => setOpen(null)}>

@@ -513,13 +513,29 @@ class Database:
         """List conversations, optionally filtered by the GDPR contact
         marker (SPEC-W3 §2 ?contact= filter; None = no filter)."""
         async with self._tenant_tx(tenant_id) as conn:
+            # contact_name / caller_phone: the newest tool turn whose arguments name the caller (the booking
+            # tool records contact_name + phone); last_activity_at: the newest turn. Display-only (see
+            # models.Conversation); both are per-row LATERAL lookups on turns' conversation_id index.
             return await conn.fetch(
                 """
-                SELECT id, tenant_id, site_slug, channel, contact_phone,
-                       started_at, ended_at
-                FROM conversations
-                WHERE ($3::text IS NULL OR contact_phone = $3)
-                ORDER BY started_at DESC
+                SELECT c.id, c.tenant_id, c.site_slug, c.channel, c.contact_phone,
+                       c.started_at, c.ended_at,
+                       who.contact_name, who.caller_phone, last.ts AS last_activity_at
+                FROM conversations c
+                LEFT JOIN LATERAL (
+                    SELECT NULLIF(btrim(tc->'arguments'->>'contact_name'), '') AS contact_name,
+                           NULLIF(btrim(tc->'arguments'->>'phone'), '') AS caller_phone
+                    FROM turns t, jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(t.tool_calls) = 'array' THEN t.tool_calls ELSE '[]'::jsonb END) tc
+                    WHERE t.conversation_id = c.id AND t.role = 'tool'
+                      AND (tc->'arguments' ? 'contact_name' OR tc->'arguments' ? 'phone')
+                    ORDER BY t.seq DESC LIMIT 1
+                ) who ON true
+                LEFT JOIN LATERAL (
+                    SELECT max(t.ts) AS ts FROM turns t WHERE t.conversation_id = c.id
+                ) last ON true
+                WHERE ($3::text IS NULL OR c.contact_phone = $3)
+                ORDER BY c.started_at DESC
                 LIMIT $1 OFFSET $2
                 """,
                 limit,

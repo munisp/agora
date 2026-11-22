@@ -17,7 +17,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { cn, formatMoney } from "@/lib/utils";
+import { cn, formatMoney, listFrom } from "@/lib/utils";
 import type {
   Booking,
   Conversation,
@@ -115,12 +115,10 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
           { tenant: orgSlug },
         ),
       ]);
-      const bookings = Array.isArray(bookingsRaw)
-        ? bookingsRaw
-        : (bookingsRaw.items ?? []);
-      const offerings = Array.isArray(offeringsRaw)
-        ? offeringsRaw
-        : (offeringsRaw.items ?? []);
+      // booking-service wraps lists under the resource name ({"bookings": [...]}); reading only arrays or
+      // .items made every KPI 0. listFrom handles all three shapes.
+      const bookings = listFrom<Booking>(bookingsRaw);
+      const offerings = listFrom<Offering>(offeringsRaw);
       const priceByOffering = new Map(
         offerings.map((o) => [o.id, o.price_cents]),
       );
@@ -169,15 +167,19 @@ export function KpiDashboard({ orgSlug }: { orgSlug: string }) {
         );
         for (const c of inPeriod) {
           channelCounts[channelBucket(c.channel)] += 1;
+          // Browser voice calls are never closed (ended_at stays null), so fall back to the last turn's time.
+          const endedAt = c.ended_at ?? c.last_activity_at;
           if (
-            c.ended_at &&
+            endedAt &&
             (channelBucket(c.channel) === "voice" ||
               c.channel === "phone")
           ) {
-            callMinutes +=
-              (new Date(c.ended_at).getTime() -
+            callMinutes += Math.max(
+              0,
+              (new Date(endedAt).getTime() -
                 new Date(c.started_at).getTime()) /
-              60000;
+                60000,
+            );
           }
         }
         // Sentiment: average scored turns across a capped sample of the

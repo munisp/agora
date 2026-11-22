@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Check, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
+import { Check, FileText, Plus, Search, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { PageHeader } from "@/components/page-header";
 import { ErrorNote } from "@/components/error-note";
@@ -29,6 +29,7 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
   const [error, setError] = React.useState<string | null>(null);
   const [adding, setAdding] = React.useState(false);
   const [scanning, setScanning] = React.useState(false);
+  const [uploadingPolicy, setUploadingPolicy] = React.useState(false);
   /** SPEC-W53: OCR-extracted draft that pre-fills the add dialog. */
   const [prefill, setPrefill] = React.useState<{
     title: string;
@@ -143,6 +144,9 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
         description="Documents that ground the receptionist's answers (hybrid BM25 + vector search)."
         actions={
           <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setUploadingPolicy(true)}>
+              <FileText className="h-4 w-4" /> Upload policy document
+            </Button>
             <Button size="sm" variant="outline" onClick={() => setScanning(true)}>
               <Upload className="h-4 w-4" /> Upload scan
             </Button>
@@ -256,6 +260,20 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
           setPrefill(null);
         }}
         onAdd={add}
+      />
+      <PolicyUploadDialog
+        orgSlug={orgSlug}
+        open={uploadingPolicy}
+        onClose={() => setUploadingPolicy(false)}
+        onUploaded={(title, chunks) => {
+          setUploadingPolicy(false);
+          toast({
+            title: "Document added",
+            description: `${title}: ${chunks} searchable section${chunks === 1 ? "" : "s"}. The receptionist can now answer questions about it.`,
+            variant: "success",
+          });
+          void load();
+        }}
       />
       <ScanUploadDialog
         orgSlug={orgSlug}
@@ -894,6 +912,125 @@ function ScanUploadDialog({
             </DialogFooter>
           </form>
         )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+
+/**
+ * 2026-11-21: upload a policy document (PDF with a text layer, Word .docx, .txt or .md). knowledge-service extracts
+ * the text and ingests it like a typed document (chunk -> embed -> index), so contributors can ask the receptionist
+ * questions about it in chat or on a call. Scanned PDFs get a pointer to "Upload scan" (OCR). Multipart goes through
+ * the BFF binary passthrough, mirroring ScanUploadDialog's fetch.
+ */
+const POLICY_ACCEPT = ".pdf,.docx,.txt,.md";
+function PolicyUploadDialog({
+  orgSlug,
+  open,
+  onClose,
+  onUploaded,
+}: {
+  orgSlug: string;
+  open: boolean;
+  onClose: () => void;
+  onUploaded: (title: string, chunks: number) => void;
+}) {
+  const [file, setFile] = React.useState<File | null>(null);
+  const [title, setTitle] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (open) {
+      setFile(null);
+      setTitle("");
+      setError(null);
+    }
+  }, [open]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!file || busy) return;
+    if (file.size > SCAN_MAX_BYTES) {
+      setError("File exceeds the 25 MB upload cap — compress or split it and retry.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("tenant", orgSlug);
+      form.append("file", file);
+      if (title.trim()) form.append("title", title.trim());
+      const res = await fetch("/api/knowledge/v1/documents/upload", {
+        method: "POST",
+        headers: { "x-tenant-slug": orgSlug, accept: "application/json" },
+        body: form,
+        cache: "no-store",
+      });
+      const text = await res.text();
+      let data: unknown = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = text;
+      }
+      if (!res.ok) {
+        const detail =
+          typeof data === "object" && data !== null && "detail" in data
+            ? String((data as { detail: unknown }).detail)
+            : null;
+        throw detail ? new Error(detail) : new ApiError(res.status, data);
+      }
+      const d = (data ?? {}) as { title?: string; chunks?: number; chunk_count?: number };
+      onUploaded(d.title ?? (title.trim() || file.name), Number(d.chunks ?? d.chunk_count ?? 0));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Upload failed — the knowledge service may be offline.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent onClose={onClose} className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Upload policy document</DialogTitle>
+        </DialogHeader>
+        <form onSubmit={submit} className="grid gap-4">
+          <p className="text-sm text-muted-foreground">
+            Upload a policy, product guide or FAQ. The receptionist reads it and answers contributors&apos; questions
+            from it in chat and on calls. PDF, Word (.docx), .txt or .md, up to 25 MB.
+          </p>
+          <div className="grid gap-1.5">
+            <Label htmlFor="policy-file">Document</Label>
+            <Input
+              id="policy-file"
+              type="file"
+              accept={POLICY_ACCEPT}
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            />
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="policy-title">Title (optional)</Label>
+            <Input
+              id="policy-title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="e.g. Contributor benefits policy 2026"
+            />
+          </div>
+          {error ? <ErrorNote message={error} /> : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={onClose} disabled={busy}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={!file || busy}>
+              {busy ? "Reading document…" : "Upload"}
+            </Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );

@@ -556,7 +556,7 @@ export function SegmentBuilder({
 
         <details className="rounded-md border border-border bg-card px-3 py-2 text-xs">
           <summary className="cursor-pointer font-medium text-muted-foreground">
-            Segment definition (DSL sent to the graph service)
+            How this audience is defined
           </summary>
           <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-relaxed">
             {JSON.stringify(dsl, null, 2)}

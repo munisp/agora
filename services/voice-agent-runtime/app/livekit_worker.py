@@ -48,6 +48,7 @@ from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
 from . import dtmf, emergency, ivr_menu, metrics, sip
+from . import visitor as visitor_mod
 from . import dead_mic, greeting_prerender
 from .async_tools import (
     SLOW_TOOLS,
@@ -781,9 +782,22 @@ _TAG = re.compile(r"</?[a-zA-Z][^>]{0,80}>")
 _MARKDOWN = re.compile(r"[*_#`~|]+")
 
 
+# Byte-fallback tokens the model sometimes emits instead of a character ("<0xC7><0xB8>jẹ́", "<0xA0> Note"): a run
+# of them is the UTF-8 encoding of the real text, so it is decoded back; bytes that do not form a character
+# (a lone "<0xA0>") are dropped. They showed up raw in Hausa/Yoruba captions and transcripts (2026-11-21).
+_BYTE_TOKENS = re.compile(r"(?:<0x[0-9A-Fa-f]{2}>)+")
+
+
+def _decode_byte_tokens(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        raw = bytes(int(h, 16) for h in re.findall(r"<0x([0-9A-Fa-f]{2})>", m.group(0)))
+        return raw.decode("utf-8", errors="ignore").replace("\u00a0", " ")
+    return _BYTE_TOKENS.sub(repl, text)
+
+
 def speakable(text: str) -> str:
     """What the voice should say: the model sometimes writes HTML ("</li><li>") or markdown, which was read aloud."""
-    out = _MARKDOWN.sub("", _TAG.sub(" ", text or ""))
+    out = _MARKDOWN.sub("", _TAG.sub(" ", _decode_byte_tokens(text or "")))
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
@@ -1171,6 +1185,19 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
 
     @lk_llm.ai_callable(
         description=(
+            "Save the caller's name, email and phone number to the CRM as soon as they have CONFIRMED the "
+            "read-back at the start of the call, so the business can always reach them, even if they never "
+            "book. Call it once, right after the caller says the details are correct."
+        )
+    )
+    async def save_caller_details(self, name: str, phone: str, email: str = "") -> str:
+        import json
+
+        result = await self._tools.save_caller_details(name=name, phone=phone, email=email or None)
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
             "Save the caller's location to their contact record (emergency / "
             "location-first flow). Pass the spoken address in address_text; "
             "pass lat and lng only when the caller gave exact coordinates."
@@ -1522,6 +1549,7 @@ async def build_voice_agent(
     sip_call: "sip.InboundCallContext | None" = None,
     caller_language: str = "",
     dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
+    visitor: "visitor_mod.Visitor | None" = None,
 ) -> tuple[VoicePipelineAgent, TenantContext, SessionState]:
     """Bootstrap tenant context and assemble the VoicePipelineAgent.
 
@@ -1555,6 +1583,9 @@ async def build_voice_agent(
         # K15(c): claimed (unverified) hint only — never confirmed.
         sip.attach_caller_id(session, sip_call.caller_phone)
         caller_phone = session.claimed_phone or ""
+    else:
+        # 2026-11-21: the web caller's pre-call form (self-reported; app/visitor.py).
+        visitor_mod.apply(session, visitor)
     # SPEC-W96 IVR-A: parse the keypad menu for PSTN sessions when enabled
     # ("" env -> DEFAULT_MENU; "none" -> disabled; web/non-SIP -> none).
     # Stashed on the session for the entrypoint's greeting line + buffer
@@ -1580,6 +1611,7 @@ async def build_voice_agent(
         conversation_id=conversation_id,
         caller_phone=caller_phone or None,
         keypad_menu_hint=keypad_hint,
+        visitor=visitor_mod.from_session(session),
     )
 
     # A Nigerian language the caller chose on the call page: the call starts in it; the caller may switch later.
@@ -1725,6 +1757,7 @@ async def build_voice_agent(
             language=ml_state.active_language,
             caller_phone=session.confirmed_phone or session.claimed_phone,
             keypad_menu_hint=keypad_hint,
+            visitor=visitor_mod.from_session(session),
         )
         try:
             msgs = agent.chat_ctx.messages
@@ -1812,6 +1845,7 @@ async def build_voice_agent(
                 language=lang,
                 caller_phone=session.confirmed_phone or session.claimed_phone,
                 keypad_menu_hint=keypad_hint,
+                visitor=visitor_mod.from_session(session),
             )
             if inbound.code_switch:
                 ctx.code_switch = True
@@ -2119,6 +2153,16 @@ def keep_listening_after_reconnect(agent: Any, room: Any) -> None:
         log.warning("reconnect hook unavailable", error=str(exc)[:200])
 
 
+async def _caller_visitor(ctx: agents.JobContext, timeout_s: float = 8.0) -> "visitor_mod.Visitor | None":
+    """The web caller's pre-call form (token metadata, app/visitor.py); None when they filled none."""
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=timeout_s)
+        return visitor_mod.from_metadata(getattr(participant, "metadata", ""))
+    except Exception as exc:  # noqa: BLE001 - no form = the receptionist asks as before
+        log.info("caller visitor details not read", error=str(exc)[:120])
+        return None
+
+
 async def _caller_language(ctx: agents.JobContext, timeout_s: float = 8.0) -> str:
     """The language the web caller chose (token metadata, app/call_language.py); "" = English / not chosen."""
     try:
@@ -2232,6 +2276,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             sip_call=sip_call,
             caller_language=await _caller_language(ctx) if sip_call is None else "",
             dtmf_buffer=dtmf_buffer,
+            visitor=await _caller_visitor(ctx) if sip_call is None else None,
         )
     except DaprError as exc:
         log.error("session bootstrap failed", site_slug=site_slug, error=str(exc))
@@ -2287,9 +2332,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # disclosure lines) so the shortcuts are the caller's last heard
     # instruction; None when the menu is disabled or the call is non-SIP.
     menu_line = ivr_menu.menu_line(session.ivr_menu) if session.ivr_menu else None
+    # 2026-11-21: name, email and phone are taken at the start of the call unless the caller's form gave them.
+    ask_first_known = visitor_mod.from_session(session) is not None
     await agent.say(
         call_language.greeting(getattr(agent, "agora_call_language", ""), getattr(tenant_ctx, "display_name", ""),
-                               build_greeting(tenant_ctx, menu_line=menu_line)),
+                               build_greeting(tenant_ctx, menu_line=menu_line, ask_details=not ask_first_known),
+                               ask_details=not ask_first_known),
         allow_interruptions=True,
     )
     # SPEC-W71 P6: warm the TTS LRU mid-call with the tool-ack/filler phrases

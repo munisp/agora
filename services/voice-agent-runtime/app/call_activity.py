@@ -33,6 +33,7 @@ _LABELS = {
     "verify_caller_code": "Checking the code",
     "request_human": "Fetching a colleague",
     "capture_location": "Noting the location",
+    "save_caller_details": "Saving your details",
     "prefill_booking": "Filling in the form",
     "navigate_to_page": "Opening the page",
     "highlight_element": "Pointing it out",

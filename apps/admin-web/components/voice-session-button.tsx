@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { useVisitor, VisitorForm, type VisitorDetails } from "@/components/visitor-form";
 import { playRemoteAudio, unlockCallAudio } from "@/lib/call-audio";
 import { ReceptionistVideo, type CallActivity } from "@/components/receptionist-video";
 import { Languages, Mic, PhoneOff } from "lucide-react";
@@ -74,6 +75,9 @@ export function VoiceSessionButton({
   accent?: string;
 }) {
   const [state, setState] = React.useState<CallState>("idle");
+  // 2026-11-21: name/phone/email asked once before the first call (components/visitor-form.tsx).
+  const [visitor, setVisitor] = useVisitor(tenant);
+  const [askDetails, setAskDetails] = React.useState(false);
   // The language the caller speaks; the receptionist hears, thinks and answers in it (voice runtime CALL_LANGUAGES).
   const [language, setLanguage] = React.useState("en");
   const [error, setError] = React.useState<string | null>(null);
@@ -112,7 +116,8 @@ export function VoiceSessionButton({
     };
   }, []);
 
-  const start = async () => {
+  const start = async (who: VisitorDetails | null = visitor) => {
+    setAskDetails(false);
     setState("joining");
     setError(null);
     setCallLanguage(language);
@@ -123,6 +128,7 @@ export function VoiceSessionButton({
         tenant,
         site_slug: siteSlug,
         ...(language !== "en" ? { language } : {}),
+        ...(who ? { visitor: who } : {}),
       });
 
       // 2a. ElevenLabs backend: connect the ConvAI signed URL directly
@@ -284,7 +290,7 @@ export function VoiceSessionButton({
     <span className="inline-flex flex-col items-start gap-1">
       <span className="inline-flex flex-wrap items-center gap-2">
         <button
-          onClick={() => void start()}
+          onClick={() => (visitor ? void start(visitor) : setAskDetails(true))}
           className="inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium cursor-pointer"
           style={{ backgroundColor: accent, color: readableOn(accent) }}
         >
@@ -309,6 +315,18 @@ export function VoiceSessionButton({
           </select>
         </label>
       </span>
+      {askDetails ? (
+        <div className="mt-2 w-full max-w-sm rounded-xl border border-border bg-card text-foreground shadow-lg">
+          <VisitorForm
+            submitLabel="Start call"
+            intro="Before the call, tell us who you are so the receptionist can help you faster."
+            onSubmit={(v) => {
+              setVisitor(v);
+              void start(v);
+            }}
+          />
+        </div>
+      ) : null}
       {state === "error" && error ? (
         <span className="text-xs text-destructive">{error}</span>
       ) : null}

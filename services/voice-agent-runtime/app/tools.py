@@ -243,6 +243,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "save_caller_details",
+            "description": (
+                "Save the caller's name, email and phone number to the CRM as soon as they have CONFIRMED the "
+                "read-back at the start of the call, so the business can always reach them, even if they never "
+                "book. Call it once, right after the caller says the details are correct."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Caller's full name, e.g. 'Ngozi Okafor'"},
+                    "phone": {"type": "string", "description": "Caller's phone number as digits, e.g. '08065553108'"},
+                    "email": {"type": "string", "description": "Caller's email, e.g. 'ngozi.okafor@gmail.com' (empty if none)"},
+                },
+                "required": ["name", "phone"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "capture_location",
             "description": (
                 "Save the caller's location to their contact record "
@@ -1282,6 +1302,55 @@ class ToolLayer:
             "booking_id": booking_id,
         }
 
+    # ------------------------------------- caller details to the CRM (2026-11-21)
+    async def save_caller_details(
+        self, name: str, phone: str, email: str | None = None
+    ) -> dict[str, Any]:
+        """Save the details the caller gave (and confirmed) at the start of the call as a contact, so the
+        business can reach them even without a booking. booking-service ``POST /internal/contacts/upsert``
+        with ``capture_channel``: it matches an existing contact by phone or e-mail and, for these
+        self-reported details, only FILLS blank fields (a caller can claim any number, so an existing
+        contact's name/e-mail is never overwritten); it then publishes ContactCaptured so crm-sync adds the
+        person to the CRM. Also remembers the details on the session for the rest of the call.
+
+        NEVER raises: failures resolve to a payload the model can carry on from (the call must go on)."""
+        name = (name or "").strip()
+        email = (email or "").strip()
+        # the same form book_appointment sends (the model's digits, stripped), so a later booking for this
+        # caller matches the contact saved here instead of creating a second one
+        phone_n = (phone or "").strip()
+        if not name or not phone_n:
+            return {"status": "error", "message": "save_caller_details needs the caller's name and phone number."}
+        self._session.caller_name = name
+        if email:
+            self._session.caller_email = email
+        if not self._session.claimed_phone:
+            self._session.claimed_phone = phone_n
+        headers = {"X-Tenant-Slug": self._ctx.tenant_slug}
+        if self._settings.voice_booking_internal_token:
+            headers["X-Internal-Token"] = self._settings.voice_booking_internal_token
+        try:
+            res = await self._dapr.invoke_post(
+                self._settings.booking_app_id,
+                "internal/contacts/upsert",
+                payload={"name": name, "phone": phone_n, "email": email,
+                         "capture_channel": self._session.channel or "voice"},
+                headers=headers,
+            )
+            contact = (res or {}).get("contact") or {}
+            contact_id = str(contact.get("id") or "")
+            await self._emit_tool_event(
+                "save_caller_details", "ok",
+                {"contact_id": contact_id, "created": bool((res or {}).get("created")), **self._event_phone_detail(phone_n)},
+            )
+            log.info("caller details saved", conversation_id=self._session.conversation_id, contact_id=contact_id)
+            return {"status": "ok", "contact_id": contact_id,
+                    "message": "Saved. Now ask how you can help them today."}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("save_caller_details failed", error=str(exc)[:200])
+            await self._emit_tool_event("save_caller_details", "error", {"error": str(exc)[:200]})
+            return {"status": "error", "message": "The details could not be saved just now; carry on helping the caller."}
+
     # -------------------------------------------- location capture (W11 C)
     async def capture_location(
         self,
@@ -1593,6 +1662,11 @@ class ToolLayer:
                 booking_id=str(arguments.get("booking_id", "")),
                 phone=str(arguments.get("phone", "")),
                 reason=arguments.get("reason"),
+            ),
+            "save_caller_details": lambda: self.save_caller_details(
+                name=str(arguments.get("name", "")),
+                phone=str(arguments.get("phone", "")),
+                email=arguments.get("email"),
             ),
             "capture_location": lambda: self.capture_location(
                 address_text=arguments.get("address_text"),

@@ -33,6 +33,13 @@ class Conversation(BaseModel):
     contact_phone: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
+    # 2026-11-21 (list view only): who the caller said they were, read from the call's own booking tool turn
+    # (contact_name / phone arguments), and the time of the last turn. Browser voice calls carry no
+    # contact_phone and are never closed (ended_at stays NULL), so the dashboard showed every caller as
+    # "Not given" and 0 call minutes. Display-only: the stored contact_phone marker (GDPR) is unchanged.
+    contact_name: str | None = None
+    caller_phone: str | None = None
+    last_activity_at: datetime | None = None
 
 
 class TurnCreate(BaseModel):

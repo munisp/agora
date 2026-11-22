@@ -85,6 +85,9 @@ DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
     "verify_caller_code": TIER_LOW,
     # SPEC-W86: passive keypad listener — no identity required.
     "read_keypad_entry": TIER_LOW,
+    # 2026-11-21: self-reported caller details to the CRM at the start of a call. Tier 0 like the web
+    # form: booking-service only fills blank fields on an existing contact, so it can't take one over.
+    "save_caller_details": TIER_LOW,
     # Tier 1 — MEDIUM (confirmed identity)
     "book_appointment": TIER_MEDIUM,
     "capture_location": TIER_MEDIUM,

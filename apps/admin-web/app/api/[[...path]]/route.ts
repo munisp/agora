@@ -242,7 +242,10 @@ async function proxy(
     );
   }
 
-  const body = await upstream.arrayBuffer();
+  // 204/205/304 must have a null body: passing even an empty buffer makes the Response constructor throw, so every
+  // successful DELETE (booking-service answers 204) reached the browser as a 500 (2026-11-21).
+  const nullBody = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
+  const body = nullBody ? null : await upstream.arrayBuffer();
   const res = new NextResponse(body, { status: upstream.status });
   const contentType = upstream.headers.get("content-type");
   if (contentType) res.headers.set("content-type", contentType);

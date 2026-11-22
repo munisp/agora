@@ -246,6 +246,12 @@ func (s *Service) emitContactCaptured(ctx context.Context, tenant bookingops.Ten
 	if it.GPS != nil {
 		data["lat"], data["lon"] = it.GPS.Lat, it.GPS.Lng
 	}
+	// 2026-11-21: the LGA picked in the field app, so graph-sync links the contact to (Location {lga}) and
+	// LGA-filtered segments ("Ikeja customers") can match field leads; before this only GPS travelled.
+	if name := lgaNameOf(p); name != nil {
+		data["lga"] = *name
+		data["lga_code"] = *lgaCodeOf(p)
+	}
 	if agent := agentFrom(ctx); agent != "" {
 		data["captured_by"] = agent
 	}

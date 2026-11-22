@@ -154,7 +154,17 @@ export default function CacLgaMap({
       setReady(true);
     });
 
+    // The card can still be settling its width when maplibre measures the
+    // container, which left a blank strip down one side and an off-centre
+    // fitBounds. Re-measure whenever the container changes size.
+    const ro =
+      typeof ResizeObserver !== "undefined"
+        ? new ResizeObserver(() => map.resize())
+        : null;
+    ro?.observe(container);
+
     return () => {
+      ro?.disconnect();
       mapRef.current = null;
       setReady(false);
       map.remove();

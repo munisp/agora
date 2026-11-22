@@ -397,6 +397,10 @@ export interface Conversation {
   contact_phone?: string | null;
   started_at: string;
   ended_at?: string | null;
+  /** List view: caller name/phone from the call's booking turn, and the last turn's time (2026-11-21). */
+  contact_name?: string | null;
+  caller_phone?: string | null;
+  last_activity_at?: string | null;
 }
 
 /** Conversation detail including scored turns (GET /v1/conversations/{id}). */

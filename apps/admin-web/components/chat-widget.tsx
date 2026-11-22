@@ -3,6 +3,7 @@
 import * as React from "react";
 import { Maximize2, MessageCircle, Minimize2, Send, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import { useVisitor, VisitorForm } from "@/components/visitor-form";
 import { cn } from "@/lib/utils";
 import type { ChatResponse } from "@/lib/types";
 
@@ -191,6 +192,8 @@ export function ChatWidget({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [full]);
+  // 2026-11-21: name/phone/email asked once before the first message (components/visitor-form.tsx).
+  const [visitor, setVisitor] = useVisitor(tenant);
   const [turns, setTurns] = React.useState<Turn[]>([]);
   const [draft, setDraft] = React.useState("");
   const [conversationId, setConversationId] = React.useState<string | undefined>();
@@ -233,6 +236,7 @@ export function ChatWidget({
       conversation_id: conversationId,
       // K15(b): resume credential in the body (current runtime contract).
       session_secret: sessionSecret,
+      ...(visitor ? { visitor } : {}),
     };
     try {
       // 1. Streaming path: append an empty agent turn and fill it as deltas arrive.
@@ -332,6 +336,17 @@ export function ChatWidget({
               </button>
             </div>
           </div>
+          {!visitor ? (
+            <div
+              className={cn(
+                "min-h-0 flex-1 overflow-y-auto bg-muted/30",
+                full && "px-[max(0.75rem,calc((100%-32rem)/2))] py-6",
+              )}
+            >
+              <VisitorForm onSubmit={setVisitor} submitLabel="Start chat" />
+            </div>
+          ) : (
+          <>
           <div
             ref={scrollRef}
             className={cn(
@@ -341,8 +356,8 @@ export function ChatWidget({
           >
             {turns.length === 0 ? (
               <p className="py-6 text-center text-xs text-muted-foreground">
-                Hi! Ask me about services, hours, or say “book me in Friday
-                morning”.
+                Hi {visitor.name.split(" ")[0]}! Ask me about services, hours,
+                or say “book me in Friday morning”.
               </p>
             ) : (
               turns.map((t, i) => (
@@ -391,6 +406,8 @@ export function ChatWidget({
               <Send className="h-4 w-4" />
             </button>
           </form>
+          </>
+          )}
         </div>
       ) : null}
       {open && full ? null : (

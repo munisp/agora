@@ -35,6 +35,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+import httpx
 import structlog
 
 from . import metrics
@@ -148,6 +149,7 @@ def build_summary(
     day_bounds: tuple[date | None, date | None],
     spend_missing_channels: set[str] | frozenset[str] = frozenset(),
     lga_code_rows: list[dict[str, Any]] | None = None,
+    lga_geoms: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure rollup math — unit-tested without Postgres/Dapr.
 
@@ -232,7 +234,9 @@ def build_summary(
             "conversions": int(row["conversions"]),
             "spend_ngn": None,
             "cac_ngn": None,
-            "geom": None,
+            # GeoJSON geometry from geo-service reference boundaries, keyed
+            # by gazetteer code; null (table only) when unknown/unavailable.
+            "geom": (lga_geoms or {}).get(str(row["lga_code"])),
         }
         for row in (lga_code_rows or [])
     ]
@@ -345,6 +349,10 @@ async def fetch_summary(
             tenant_id=tenant_id,
         )
 
+    lga_geoms = await fetch_lga_geoms(
+        settings, [str(rec["lga_code"]) for rec in lga_code_recs]
+    )
+
     return build_summary(
         tenant_id=tenant_id,
         date_from=date_from,
@@ -352,6 +360,7 @@ async def fetch_summary(
         channel_rows=[dict(rec) for rec in channel_recs],
         lga_rows=[dict(rec) for rec in lga_recs],
         lga_code_rows=[dict(rec) for rec in lga_code_recs],
+        lga_geoms=lga_geoms,
         spend_by_channel=spend_by_channel,
         spend_unavailable=spend_unavailable,
         day_bounds=day_bounds,
@@ -363,3 +372,37 @@ def lga_synthetic_id(code: str) -> int:
     """Stable positive int for a gazetteer LGA code (dashboard row key)."""
     return zlib.crc32(code.encode("utf-8")) & 0x7FFFFFFF
 
+
+
+async def fetch_lga_geoms(
+    settings: Settings, codes: list[str], client: httpx.AsyncClient | None = None
+) -> dict[str, Any]:
+    """LGA polygons by gazetteer code from geo-service (2026-11-21).
+
+    Fail-open: any error returns {} and the rows stay table-only, so the
+    summary never fails because the map data is unavailable."""
+    base = getattr(settings, "geo_base_url", "")
+    wanted = sorted({c for c in codes if c})
+    if not base or not wanted:
+        return {}
+    own = client is None
+    http = client or httpx.AsyncClient(timeout=5.0)
+    try:
+        resp = await http.get(
+            f"{base}/v1/geo/boundaries",
+            params={"kind": "lga", "codes": ",".join(wanted)},
+        )
+        resp.raise_for_status()
+        out: dict[str, Any] = {}
+        for feat in resp.json().get("features") or []:
+            code = (feat.get("properties") or {}).get("code")
+            geom = feat.get("geometry")
+            if code and isinstance(geom, dict):
+                out[str(code)] = geom
+        return out
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("cac.lga_geoms_unavailable", error=str(exc), codes=len(wanted))
+        return {}
+    finally:
+        if own:
+            await http.aclose()

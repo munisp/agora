@@ -99,6 +99,14 @@ interface KycDocumentListItem {
   created_at?: string | null;
 }
 
+/** Plain-language processing status for the queue (the raw value stays for anything unmapped). */
+const STATUS_LABELS: Record<string, string> = {
+  extracted: "Details read",
+  uploaded: "Uploaded",
+  processing: "Reading",
+  failed: "Could not read",
+};
+
 type ReviewStateFilter = "" | "pending_review" | "approved" | "rejected";
 
 const REVIEW_STATE_FILTERS: { value: ReviewStateFilter; label: string }[] = [
@@ -415,11 +423,15 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
                       {d.created_at ? formatDateTime(d.created_at) : "—"}
                     </TableCell>
                     <TableCell>
+                      {/* a readable label, not the raw id (the full id stays in the tooltip and the detail view) */}
                       <span
-                        className="font-mono text-xs text-primary underline-offset-2 hover:underline"
+                        className="text-sm font-medium text-primary underline-offset-2 hover:underline"
                         title={d.document_id}
                       >
-                        {d.document_id}
+                        Open document
+                      </span>
+                      <span className="ml-2 font-mono text-xs text-muted-foreground">
+                        #{d.document_id.replace(/-/g, "").slice(0, 8).toUpperCase()}
                       </span>
                     </TableCell>
                     <TableCell className="font-mono text-xs">
@@ -431,7 +443,7 @@ export function KycReviewClient({ orgSlug }: { orgSlug: string }) {
                     </TableCell>
                     <TableCell>
                       <Badge variant={statusVariant(d.status)}>
-                        {d.status ?? "—"}
+                        {STATUS_LABELS[d.status ?? ""] ?? d.status ?? "—"}
                       </Badge>
                     </TableCell>
                     <TableCell className="pr-5">

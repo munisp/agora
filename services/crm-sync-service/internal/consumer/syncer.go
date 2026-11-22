@@ -147,6 +147,9 @@ func (s *Syncer) handleTenantDeleted(ctx context.Context, evt events.CloudEvent)
 
 // HandleBooking processes opendesk.booking.events.
 func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error {
+	if evt.Type == events.TypeContactCaptured {
+		return s.handleContactCaptured(ctx, evt)
+	}
 	switch evt.Type {
 	case events.TypeBookingCreated, events.TypeBookingConfirmed,
 		events.TypeBookingRescheduled, events.TypeBookingCancelled:
@@ -180,6 +183,33 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 	default: // BookingCreated / BookingConfirmed
 		return s.handleBookingUpsert(ctx, d, tenantUUID)
 	}
+}
+
+// handleContactCaptured (2026-11-21) creates or updates the CRM person for details the AI receptionist
+// saved at the start of a call: the same tenant-scoped syncPerson path a booking uses (so the later
+// booking for this caller finds the same person), without a task. No phone and no e-mail: nothing to key
+// a person on — skip and ack.
+func (s *Syncer) handleContactCaptured(ctx context.Context, evt events.CloudEvent) error {
+	d, err := events.DataAs[events.BookingData](evt)
+	if err != nil {
+		return permanent(err)
+	}
+	if d.Phone == "" && d.Email == "" {
+		s.Log.Debug("ContactCaptured without phone or email; skipping")
+		return nil
+	}
+	tenantUUID := parseUUID(evt.TenantID)
+	personID, err := s.syncPerson(ctx, d, tenantUUID)
+	if err != nil {
+		return err
+	}
+	if personID != "" && d.Phone != "" {
+		if err := s.Map.Put(ctx, syncmap.KindContactPhone, d.Phone, personID, tenantUUID); err != nil {
+			return err
+		}
+	}
+	s.Log.Info("receptionist contact synced to CRM", zap.String("person_id", personID), zap.String("contact_id", d.ContactID))
+	return nil
 }
 
 // handleBookingUpsert syncs the contact (Person) and the appointment (Task).

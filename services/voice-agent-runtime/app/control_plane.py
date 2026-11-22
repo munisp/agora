@@ -64,6 +64,8 @@ from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import call_language, metrics, sip, verification
+from . import visitor as visitor_mod
+from .visitor import Visitor
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
 from .config import Settings, load_settings
@@ -94,6 +96,8 @@ class SessionRequest(BaseModel):
     participant_name: str | None = None
     # Language the caller chose on the call page (app/call_language.py); unknown or not offered = English.
     language: str | None = None
+    # 2026-11-21: the pre-call form (app/visitor.py); rides the caller's token metadata to the worker.
+    visitor: Visitor | None = None
 
 
 class ChatRequest(BaseModel):
@@ -108,6 +112,8 @@ class ChatRequest(BaseModel):
     # accepted via the X-Session-Secret request header (web widget resume;
     # the body field wins when both are present).
     session_secret: str | None = None
+    # 2026-11-21: the pre-chat form (name/phone/email, self-reported; app/visitor.py).
+    visitor: Visitor | None = None
     # SPEC-W3 §3: stream=true switches the response to text/event-stream.
     stream: bool = False
     # Wave 5 #8 A/B prompt testing: candidate persona for eval/ab_test.py.
@@ -297,8 +303,9 @@ def create_app(
             )
             .with_ttl(timedelta(minutes=30))
         )
-        if caller_language:
-            token = token.with_metadata(call_language.token_metadata(caller_language))
+        metadata = visitor_mod.token_metadata(caller_language, req.visitor)
+        if metadata:
+            token = token.with_metadata(metadata)
         token = token.to_jwt()
         log.info("livekit session token minted", room=room, identity=identity, language=caller_language or "en")
 
@@ -482,6 +489,7 @@ def create_app(
                         message=req.message,
                         conversation_id=req.conversation_id,
                         session_secret=session_secret,
+                        visitor=req.visitor,
                     ):
                         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 except Exception as exc:  # noqa: BLE001
@@ -502,6 +510,7 @@ def create_app(
                 persona_override=req.persona_override,
                 channel=req.channel,
                 pin_verified_identity=pin,
+                visitor=req.visitor,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("chat failed", site_slug=req.site_slug, error=str(exc))
