@@ -77,23 +77,6 @@ export function DemoPhoneClient({ orgSlug, businessName }: { orgSlug: string; bu
   const audioCtx = React.useRef<AudioContext | null>(null);
   const stopRing = React.useRef<(() => void) | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
-  // Where the receptionist's WhatsApp confirmation goes during a demo (the demoer's own phone). Remembered here.
-  const [whatsapp, setWhatsapp] = React.useState("");
-  React.useEffect(() => {
-    try {
-      setWhatsapp(window.localStorage.getItem("agora.demoPhoneWhatsApp") ?? "");
-    } catch {
-      /* storage blocked */
-    }
-  }, []);
-  const saveWhatsapp = (v: string) => {
-    setWhatsapp(v);
-    try {
-      window.localStorage.setItem("agora.demoPhoneWhatsApp", v);
-    } catch {
-      /* ignore */
-    }
-  };
 
   const silence = () => {
     stopRing.current?.();
@@ -175,11 +158,7 @@ export function DemoPhoneClient({ orgSlug, businessName }: { orgSlug: string; bu
     setCaptions([]);
     setError(null);
     try {
-      const a = await api.post<Answer>(
-        "/api/voice-admin/demo-phone/answer",
-        { call_id: ring.call_id, ...(whatsapp.trim() ? { whatsapp: whatsapp.trim() } : {}) },
-        { tenant: orgSlug },
-      );
+      const a = await api.post<Answer>("/api/voice-admin/demo-phone/answer", { call_id: ring.call_id }, { tenant: orgSlug });
       const { Room, RoomEvent, Track } = await import("livekit-client");
       const room = new Room();
       roomRef.current = room;
@@ -259,17 +238,6 @@ export function DemoPhoneClient({ orgSlug, businessName }: { orgSlug: string; bu
                 <Power className="h-8 w-8" />
               </button>
               <p className="mt-3 text-xs text-[#e3d6c3]/60">Switch on (allows sound and the microphone)</p>
-              <label className="mt-8 w-full text-left text-xs text-[#e3d6c3]/80">
-                Your WhatsApp number, for the confirmation message (optional)
-                <input
-                  type="tel"
-                  inputMode="tel"
-                  value={whatsapp}
-                  onChange={(e) => saveWhatsapp(e.target.value)}
-                  placeholder="e.g. 0705 225 6260"
-                  className="mt-1 w-full rounded-md border border-[#c9a574]/40 bg-black/20 px-3 py-2 text-sm text-[#faf7f1] placeholder:text-[#e3d6c3]/40"
-                />
-              </label>
             </>
           ) : null}
 
@@ -278,9 +246,6 @@ export function DemoPhoneClient({ orgSlug, businessName }: { orgSlug: string; bu
               <div className="mt-10 h-3 w-3 animate-pulse rounded-full bg-emerald-400" />
               <p className="mt-4 text-lg font-semibold">Waiting for a call</p>
               <p className="mt-2 text-sm text-[#e3d6c3]/80">Keep this screen open. It rings when {caller} calls.</p>
-              {whatsapp.trim() ? (
-                <p className="mt-4 text-xs text-[#e3d6c3]/60">WhatsApp confirmations go to {whatsapp.trim()}</p>
-              ) : null}
             </>
           ) : null}
 

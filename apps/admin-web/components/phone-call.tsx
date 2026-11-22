@@ -11,7 +11,7 @@
  * app/outbound_script.py).
  */
 import * as React from "react";
-import { PhoneOutgoing } from "lucide-react";
+import { MessageCircle, PhoneOutgoing } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -298,6 +298,124 @@ export function OfferSlotCallDialog({ orgSlug, target, onClose }: { orgSlug: str
           <Button onClick={() => callTarget && void call(callTarget)} disabled={busy || !callTarget}>
             <PhoneOutgoing className="h-3.5 w-3.5" />
             {busy ? "Dialing…" : "Place the call"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// WhatsApp reminder (2026-11-22): a separate option from the call buttons. Staff choose the number and see the exact
+// message before sending. POST /api/voice-admin/whatsapp (same access rule as calls); the server composes the same
+// text (voice-agent-runtime app/whatsapp_messages.py).
+// ---------------------------------------------------------------------------------------------------------------
+export interface WhatsAppTarget {
+  phone: string;
+  name?: string | null;
+  offering: string;
+  teamMember?: string | null;
+  when: string;
+}
+
+const MY_WA_KEY = "agora.myWhatsAppNumber";
+
+function reminderText(business: string, t: WhatsAppTarget): string {
+  const first = (t.name ?? "").trim().split(/\s+/)[0] ?? "";
+  const what = `${t.offering}${t.teamMember ? ` with ${t.teamMember}` : ""}`;
+  return `Hello${first ? ` ${first}` : ""}, this is ${business}.\n\n⏰ Reminder: your ${what} is on ${t.when}. Reply here if you need to change anything.`;
+}
+
+export function WhatsAppButton({ onClick }: { onClick: () => void }) {
+  return (
+    <Button variant="outline" size="sm" onClick={onClick}>
+      <MessageCircle className="h-3.5 w-3.5" />
+      WhatsApp reminder
+    </Button>
+  );
+}
+
+export function WhatsAppDialog({ orgSlug, target, onClose }: {
+  orgSlug: string;
+  target: WhatsAppTarget | null;
+  onClose: () => void;
+}) {
+  const { toast } = useToast();
+  const [businessName, setBusinessName] = React.useState(orgSlug);
+  React.useEffect(() => {
+    api.get<{ business_name?: string }>(`/api/bookings/public/sites/${encodeURIComponent(orgSlug)}`)
+      .then((s) => s.business_name && setBusinessName(s.business_name))
+      .catch(() => undefined);
+  }, [orgSlug]);
+  const [to, setTo] = React.useState("");
+  const [mine, setMine] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  React.useEffect(() => {
+    if (!target) return;
+    setTo(target.phone);
+    try {
+      setMine(window.localStorage.getItem(MY_WA_KEY) ?? "");
+    } catch {
+      /* storage blocked */
+    }
+  }, [target]);
+  if (!target) return null;
+  const send = async () => {
+    setBusy(true);
+    try {
+      await api.post(
+        "/api/voice-admin/whatsapp",
+        { site_slug: orgSlug, to, kind: "reminder", contact_name: target.name || undefined, offering: target.offering,
+          team_member: target.teamMember || undefined, when: target.when },
+        { tenant: orgSlug },
+      );
+      if (to.trim() !== target.phone.trim()) {
+        try {
+          window.localStorage.setItem(MY_WA_KEY, to.trim());
+        } catch {
+          /* ignore */
+        }
+      }
+      toast({ title: "WhatsApp reminder sent", description: `Sent to ${to.trim()}.`, variant: "success" });
+      onClose();
+    } catch (e) {
+      toast({
+        title: "The WhatsApp could not be sent",
+        description: e instanceof ApiError ? e.message : "Please try again in a moment.",
+        variant: "destructive",
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onClose={onClose}>
+        <DialogHeader>
+          <DialogTitle>WhatsApp reminder</DialogTitle>
+          <DialogDescription>{target.name ? `${target.name} · ` : ""}{target.phone}</DialogDescription>
+        </DialogHeader>
+        <div className="space-y-1.5">
+          <Label htmlFor="wa-to">Send to</Label>
+          <Input id="wa-to" type="tel" value={to} onChange={(e) => setTo(e.target.value)} />
+          <div className="flex flex-wrap gap-2 text-xs">
+            {mine && mine !== to.trim() ? (
+              <button type="button" className="underline" onClick={() => setTo(mine)}>Use my number ({mine})</button>
+            ) : null}
+            {to.trim() !== target.phone.trim() ? (
+              <button type="button" className="underline" onClick={() => setTo(target.phone)}>Use their number</button>
+            ) : null}
+          </div>
+          <p className="text-xs text-muted-foreground">For a demo, send it to your own WhatsApp: demo contacts may be real people&apos;s numbers.</p>
+        </div>
+        <div className="whitespace-pre-line rounded-lg bg-[#dcf8c6] px-3 py-2 text-sm text-[#111b21]" aria-label="Message preview">
+          {reminderText(businessName, target)}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>Not now</Button>
+          <Button onClick={() => void send()} disabled={busy || to.trim().length < 7}>
+            <MessageCircle className="h-3.5 w-3.5" />
+            {busy ? "Sending…" : "Send WhatsApp"}
           </Button>
         </DialogFooter>
       </DialogContent>

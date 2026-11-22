@@ -168,6 +168,18 @@ class OutboundCallRequest(BaseModel):
     demo_phone: bool = False
 
 
+class WhatsAppSendRequest(BaseModel):
+    """2026-11-22: the dashboard's "WhatsApp reminder" button (separate from the call buttons)."""
+
+    site_slug: str = Field(min_length=1, max_length=64)
+    to: str = Field(min_length=5, max_length=32)
+    kind: Literal["reminder", "confirmation"] = "reminder"
+    contact_name: str | None = Field(default=None, max_length=120)
+    offering: str = Field(min_length=1, max_length=120)
+    team_member: str | None = Field(default=None, max_length=80)
+    when: str = Field(min_length=1, max_length=80)
+
+
 class DemoPhoneAction(BaseModel):
     call_id: str = Field(min_length=8, max_length=64)
     # Answer only: the WhatsApp number confirmations go to (the person demoing, not the contributor on the booking).
@@ -838,7 +850,8 @@ def create_app(
             .with_ttl(timedelta(minutes=30))
             .to_jwt()
         )
-        log.info("demo phone answered", site_slug=site, room=ring["room"])
+        log.info("demo phone answered", site_slug=site, room=ring["room"],
+                 whatsapp=bool(ring["attributes"].get(outbound_script.ATTR_PREFIX + "whatsapp")))
         return {"room": ring["room"], "url": settings.livekit_public_url or settings.livekit_url, "token": token,
                 "ice_servers": await ice_source.get()}
 
@@ -851,6 +864,37 @@ def create_app(
             demo_rings.pop(site, None)
             log.info("demo phone declined", site_slug=site, room=ring["room"])
         return {"declined": True}
+
+    @app.post("/voice-admin/whatsapp")
+    async def send_staff_whatsapp(req: WhatsAppSendRequest, request: Request) -> dict[str, Any]:
+        """Send one appointment WhatsApp (reminder/confirmation) to the number staff chose, through the messaging-gateway.
+        Same access rule as the call buttons. The text is composed from the facts (app/whatsapp_messages.py)."""
+        from .whatsapp_messages import appointment_text
+        import httpx
+
+        site = req.site_slug.strip().lower()
+        _tenant_staff(request, site)
+        to = re.sub(r"[\s().-]", "", req.to)
+        if re.fullmatch(r"0[789]\d{9}", to):
+            to = "+234" + to[1:]
+        if not re.fullmatch(r"\+?\d{8,15}", to):
+            raise HTTPException(status_code=422, detail="not a phone number")
+        business = site
+        try:
+            async with httpx.AsyncClient(timeout=settings.http_timeout_s) as client:
+                r = await client.get(f"{settings.booking_url.rstrip('/')}/public/sites/{site}")
+                if r.status_code == 200:
+                    business = (r.json() or {}).get("business_name") or site
+                text = appointment_text(req.kind, business, req.contact_name, req.offering, req.when, req.team_member)
+                g = await client.post(f"{settings.messaging_gateway_url.rstrip('/')}/v1/whatsapp/send",
+                                      json={"to": to, "message": text})
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"WhatsApp could not be reached: {exc}") from exc
+        if g.status_code >= 400:
+            detail = "WhatsApp is not switched on for this business" if g.status_code == 503 else f"WhatsApp refused it ({g.status_code})"
+            raise HTTPException(status_code=502, detail=detail)
+        log.info("staff whatsapp sent", site_slug=site, kind=req.kind, by=request.headers.get("X-User-Id", "internal"))
+        return {"status": "sent", "to": to, "message": text}
 
     @app.post("/voice-admin/calls")
     async def place_staff_outbound_call(req: OutboundCallRequest, request: Request) -> dict[str, Any]:

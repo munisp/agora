@@ -26,7 +26,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
-import { CallButton, PhoneCallDialog, spokenWhen, type CallTarget } from "@/components/phone-call";
+import { CallButton, PhoneCallDialog, spokenWhen, WhatsAppButton, WhatsAppDialog, type CallTarget, type WhatsAppTarget } from "@/components/phone-call";
 import { addDays, formatDateTime, minutesToTime, titleCase, toISODate, listFrom } from "@/lib/utils";
 import { type BookingLabels } from "@/lib/terminology";
 import type { Booking, BookingEvent, EscalationRequestedEvent, WsEvent } from "@/lib/types";
@@ -75,6 +75,7 @@ export function BookingsClient({
   const [cancelTarget, setCancelTarget] = React.useState<Booking | null>(null);
   // 2026-11-22: the receptionist phones the contributor (confirm an upcoming booking / rebook a no-show).
   const [callTarget, setCallTarget] = React.useState<CallTarget | null>(null);
+  const [waTarget, setWaTarget] = React.useState<WhatsAppTarget | null>(null); // 2026-11-22: separate WhatsApp option
   const callFor = (b: Booking, purpose: "confirm_appointment" | "no_show_rebook") =>
     setCallTarget({
       purpose,
@@ -332,6 +333,19 @@ export function BookingsClient({
                         {actionable && b.contact_phone && new Date(b.starts_at).getTime() > Date.now() ? (
                           <CallButton purpose="confirm_appointment" onClick={() => callFor(b, "confirm_appointment")} />
                         ) : null}
+                        {actionable && b.contact_phone && new Date(b.starts_at).getTime() > Date.now() ? (
+                          <WhatsAppButton
+                            onClick={() =>
+                              setWaTarget({
+                                phone: b.contact_phone ?? "",
+                                name: b.contact_name,
+                                offering: b.offering_name ?? "appointment",
+                                teamMember: b.team_member_name,
+                                when: spokenWhen(b.starts_at),
+                              })
+                            }
+                          />
+                        ) : null}
                         {b.status === "no_show" && b.contact_phone ? (
                           <CallButton purpose="no_show_rebook" onClick={() => callFor(b, "no_show_rebook")} />
                         ) : null}
@@ -378,6 +392,7 @@ export function BookingsClient({
       ) : null}
 
       <PhoneCallDialog orgSlug={orgSlug} target={callTarget} onClose={() => setCallTarget(null)} />
+      <WhatsAppDialog orgSlug={orgSlug} target={waTarget} onClose={() => setWaTarget(null)} />
       <RescheduleDialog
         booking={rescheduleTarget}
         busy={busy}

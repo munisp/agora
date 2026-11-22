@@ -1385,13 +1385,10 @@ class ToolLayer:
         team_member = " ".join((team_member or "").split())[:80]
         if not to or not offering or not when:
             return {"status": "error", "message": "No WhatsApp number for this call; do not mention WhatsApp, carry on."}
-        first = (self._session.caller_name or "").split()[0] if (self._session.caller_name or "").strip() else ""
-        business = self._ctx.display_name or self._ctx.site_slug
-        text = (
-            f"Hello{(' ' + first) if first else ''}, this is {business}.\n\n"
-            f"\u2705 Your {offering}{(' with ' + team_member) if team_member else ''} on {when} is confirmed.\n\n"
-            "We'll send you a reminder before it. Reply here if you need to change anything."
-        )
+        from .whatsapp_messages import appointment_text
+
+        text = appointment_text("confirmation", self._ctx.display_name or self._ctx.site_slug, self._session.caller_name,
+                                offering, when, team_member)
         try:
             import httpx
 
