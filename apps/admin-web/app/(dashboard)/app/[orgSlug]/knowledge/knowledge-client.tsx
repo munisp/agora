@@ -134,7 +134,15 @@ export function KnowledgeClient({ orgSlug }: { orgSlug: string }) {
         "/api/knowledge/v1/search",
         { tenant: orgSlug, q: query.trim() },
       );
-      setHits(listFrom(data));
+      // 2026-11-22: the search API returns { results: [{ rrf_score, content, ... }] }, not score/snippet; reading
+      // h.score.toFixed on undefined crashed the whole page ("Application error") on every test search.
+      setHits(
+        listFrom<KnowledgeSearchHit & { rrf_score?: number; content?: string }>(data).map((h) => ({
+          ...h,
+          score: typeof h.score === "number" ? h.score : (h.rrf_score ?? 0),
+          snippet: h.snippet ?? (h.content ? (h.content.length > 280 ? `${h.content.slice(0, 280)}…` : h.content) : ""),
+        })),
+      );
     } catch (err) {
       toast({
         title: "Search failed",
