@@ -69,6 +69,39 @@ class Settings(BaseSettings):
     # (IDENTITY_INTERNAL_TOKEN env; empty = header not sent).
     identity_internal_token: str = ""
 
+    # Document intelligence (SPEC-W107): docling doc-intel sidecar is the
+    # ONLY extraction engine for POST /v1/documents/upload. No local
+    # fallback parser — sidecar down => 503, never silent text-only.
+    doc_intel_url: str = "http://doc-intel:5001"
+    doc_intel_api_key: str = ""  # X-Api-Key when the sidecar sets DOCLING_SERVE_API_KEY
+    doc_intel_timeout_s: float = 300.0
+    doc_intel_max_bytes: int = 10 * 1024 * 1024  # decoded upload ceiling -> 413
+    doc_intel_max_chars: int = 1_000_000  # extracted-text ceiling -> 413
+    # SPEC-W111 async jobs: poll cadence and overall deadline for
+    # /v1/documents/upload with wait=false (very large scans).
+    doc_intel_poll_s: float = 2.0
+    doc_intel_job_timeout_s: float = 900.0
+    # SPEC-W112 stale-running reaper: a crash/restart strands jobs in
+    # `running` forever (the background task is gone). The reaper sweeps on
+    # startup and then every interval, failing jobs whose updated_at is
+    # older than doc_intel_reaper_stale_s (default: job timeout + 60s
+    # grace) with an honest "resubmit" error. Pending and terminal rows
+    # are never touched.
+    doc_intel_reaper_enabled: bool = True
+    doc_intel_reaper_interval_s: float = 60.0
+    doc_intel_reaper_stale_s: float = 960.0
+
+    # SPEC-W113: cross-encoder rerank stage after RRF fusion. RRF fuses
+    # ranks but never re-scores content against the query; the reranker
+    # fixes paraphrase/terminology misses both legs get wrong. Best-effort:
+    # any error/timeout falls back to RRF order and search never fails.
+    # CPU-feasible model (22M params) — no GPU requirement.
+    rerank_enabled: bool = True
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_candidates: int = 20  # candidate pool the reranker re-scores
+    rerank_timeout_s: float = 1.0
+    rerank_max_chars: int = 2000  # per-chunk content ceiling for scoring
+
     # Text-to-SQL (SPEC-W3 §3, innovation 8): OpenAI-compatible LLM
     # (default qwen3:8b via Ollama) + Trino HTTP API.
     llm_base_url: str = "http://ollama:11434/v1"

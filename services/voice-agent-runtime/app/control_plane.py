@@ -63,7 +63,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import call_language, metrics, sip, verification
+from . import call_language, metrics, outbound, sip, verification
 from . import visitor as visitor_mod
 from .visitor import Visitor
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
@@ -149,6 +149,13 @@ class VoiceEnrollRequest(BaseModel):
     name: str = Field(min_length=1)
     sample_base64: str = Field(min_length=1)
     tenant: str = Field(min_length=1)
+
+
+class OutboundCallRequest(BaseModel):
+    """SPEC-W101 C3: place an outbound PSTN call (internal callers only)."""
+
+    site_slug: str = Field(min_length=1, max_length=64)
+    phone_number: str = Field(min_length=2, max_length=32)
 
 
 class VoiceSessionResponse(BaseModel):
@@ -438,6 +445,48 @@ def create_app(
                 status_code=401,
                 detail="admin access required (X-Internal-Token or staff gateway role)",
             )
+
+    # SPEC-W101 C2/C3: POST /v1/calls — dial OUT over the LiveKit SIP
+    # outbound trunk. Internal service-to-service endpoint (campaigns,
+    # ops tooling): the gateway never routes it (no APISIX change), so the
+    # X-Internal-Token path is the ONLY authorization — same fail-closed
+    # posture as the voice-admin token path. Every dial is paced through
+    # the token bucket BEFORE the carrier sees a call start (CPS is the
+    # binding constraint; R1).
+    outbound_pacer = outbound.OutboundPacer(cps=settings.outbound_cps)
+    app.state.outbound_pacer = outbound_pacer
+
+    @app.post("/v1/calls")
+    async def place_outbound_call_endpoint(
+        req: OutboundCallRequest, request: Request
+    ) -> dict[str, Any]:
+        if not settings.voice_admin_internal_token:
+            log.error(
+                "/v1/calls hit but VOICE_ADMIN_INTERNAL_TOKEN is unset (fail closed)"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="outbound calls not configured (VOICE_ADMIN_INTERNAL_TOKEN unset)",
+            )
+        supplied = request.headers.get("X-Internal-Token", "")
+        if not supplied or not hmac.compare_digest(
+            supplied, settings.voice_admin_internal_token
+        ):
+            raise HTTPException(status_code=401, detail="internal token required")
+        await outbound_pacer.acquire()
+        try:
+            call = await outbound.place_outbound_call(
+                settings, req.site_slug, req.phone_number
+            )
+        except outbound.OutboundError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        return {
+            "room": call.room,
+            "call_id": call.call_id,
+            "status": "dialing",
+            "site_slug": call.site_slug,
+            "phone_number": call.phone_number,
+        }
 
     @app.post("/voice/chat")
     async def voice_chat(req: ChatRequest, request: Request) -> Any:

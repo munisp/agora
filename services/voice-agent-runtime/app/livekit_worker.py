@@ -47,7 +47,7 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
-from . import dtmf, emergency, ivr_menu, metrics, sip
+from . import dtmf, outbound, emergency, ivr_menu, metrics, sip
 from . import visitor as visitor_mod
 from . import dead_mic, greeting_prerender
 from .async_tools import (
@@ -1508,6 +1508,7 @@ async def _publish_lifecycle(
     quality: dict[str, Any] | None = None,
     agent_id: str | None = None,
     stored_conversation_id: str | None = None,
+    direction: str | None = None,
 ) -> None:
     event = new_cloudevent(
         type_=type_,
@@ -1520,6 +1521,7 @@ async def _publish_lifecycle(
             quality=quality,
             agent_id=agent_id,
             stored_conversation_id=stored_conversation_id,
+            direction=direction,
         ),
     )
     await dapr.publish_best_effort(
@@ -2238,8 +2240,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # dialed number (TENANT_PHONE_MAP) instead of the `site-{slug}` web
     # convention; the caller ID becomes the confirmed phone (app/sip.py).
     sip_call: sip.InboundCallContext | None = None
+    direction: str | None = None
     participants = list(getattr(ctx.room, "remote_participants", {}).values())
-    if sip.is_sip_room(room_name) or any(sip.is_sip_participant(p) for p in participants):
+    # SPEC-W101 C4: OUTBOUND call — the platform dialed the customer (see
+    # app/outbound.py build_outbound_call_context; R3).
+    out_ctx = outbound.build_outbound_call_context(room_name, participants)
+    if out_ctx is not None:
+        sip_call = out_ctx
+        site_slug = out_ctx.site_slug
+        direction = "outbound"
+    elif sip.is_sip_room(room_name) or any(sip.is_sip_participant(p) for p in participants):
         try:
             # SPEC-W38 F1: registry-first dialed-number resolution (agents
             # registry), fail-open to the legacy TENANT_PHONE_MAP path.
@@ -2259,6 +2269,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         room=room_name,
         site_slug=site_slug,
         channel="phone" if sip_call is not None else "web",
+        direction=direction or "inbound",
     )
 
     # SPEC-W86: PSTN calls get a DTMF keypad-capture buffer (OTP entry via
@@ -2315,6 +2326,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         tenant_ctx,
         "com.opendesk.conversation.SessionStarted",
         conversation_id,
+        direction=direction,
     )
     metrics.get_registry().active_sessions.inc()
 

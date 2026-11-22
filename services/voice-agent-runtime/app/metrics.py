@@ -30,16 +30,39 @@ Series:
 - voice_translation_total        (counter, labels direction,source_lang,target_lang,provider) — SPEC-W82 A5
 - voice_translation_errors_total (counter, label provider) — SPEC-W82 A5
 - voice_language_detected_total  (counter, labels lang,path) — SPEC-W82 A5
+- voice_knowledge_grounding_total (counter, labels tenant,channel,result) — SPEC-W112
 """
 
 from __future__ import annotations
 
 import contextvars
+import hashlib
+import re
 import threading
 import time
 from typing import Any
 
 DEFAULT_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+_SAFE_LABEL_CHARS = re.compile(r"[^a-zA-Z0-9_.-]+")
+_GROUNDING_CHANNELS = frozenset(
+    {"web", "whatsapp", "telegram", "ussd", "voice", "phone", "bootstrap", "other"}
+)
+
+
+def _bounded_label_value(value: Any, *, max_len: int) -> str:
+    """Safe, length-bounded Prometheus label value (stable hash on truncation)."""
+    raw = str(value or "unknown").strip().lower()
+    cleaned = _SAFE_LABEL_CHARS.sub("_", raw).strip("_") or "unknown"
+    if len(cleaned) <= max_len:
+        return cleaned
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{cleaned[: max_len - 13].rstrip('_')}-{digest}"
+
+
+def _grounding_channel_label(channel: Any) -> str:
+    label = _bounded_label_value(channel, max_len=32)
+    return label if label in _GROUNDING_CHANNELS else "other"
 
 
 def _labels_key(labels: dict[str, str]) -> tuple[tuple[str, str], ...]:
@@ -333,6 +356,38 @@ class Registry:
             "Dapr session-store operations by outcome (SPEC-W97 G8).",
             ("op", "result"),
         )
+        # SPEC-W112: per-turn knowledge grounding quality. Tenant labels are
+        # cardinality-capped by record_knowledge_grounding; result is
+        # hit|miss|timeout|error, channel is the bounded request channel.
+        self.knowledge_grounding = Counter(
+            "voice_knowledge_grounding_total",
+            "Per-turn knowledge grounding outcomes by tenant and channel.",
+            ("tenant", "channel", "result"),
+        )
+        self._grounding_tenants: set[str] = set()
+        self._grounding_tenant_lock = threading.Lock()
+
+    def record_knowledge_grounding(
+        self,
+        *,
+        tenant: str,
+        channel: str,
+        result: str,
+        max_tenants: int = 100,
+    ) -> None:
+        """Record one eligible grounding lookup with bounded tenant labels."""
+        tenant_label = _bounded_label_value(tenant, max_len=64)
+        with self._grounding_tenant_lock:
+            if tenant_label not in self._grounding_tenants:
+                if max_tenants <= 0 or len(self._grounding_tenants) >= max_tenants:
+                    tenant_label = "overflow"
+                else:
+                    self._grounding_tenants.add(tenant_label)
+        self.knowledge_grounding.inc(
+            tenant=tenant_label,
+            channel=_grounding_channel_label(channel),
+            result=_bounded_label_value(result, max_len=32),
+        )
 
     def render(self) -> str:
         lines: list[str] = []
@@ -365,6 +420,7 @@ class Registry:
             self.dtmf_timeouts,
             self.ivr_menu_digits,
             self.session_store_ops,
+            self.knowledge_grounding,
         ):
             lines.extend(metric.render())
         return "\n".join(lines) + "\n"
@@ -559,6 +615,15 @@ def session_store_op(op: str, result: str) -> None:
     """SPEC-W97 G8: one Dapr session-store op (load | save | history_load |
     history_save) by result (ok | miss | error)."""
     _registry.session_store_ops.inc(op=op, result=result)
+
+
+def knowledge_grounding(
+    *, tenant: str, channel: str, result: str, max_tenants: int = 100
+) -> None:
+    """SPEC-W112: one eligible per-turn grounding lookup outcome."""
+    _registry.record_knowledge_grounding(
+        tenant=tenant, channel=channel, result=result, max_tenants=max_tenants
+    )
 
 
 def translation(

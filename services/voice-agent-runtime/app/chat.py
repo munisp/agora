@@ -28,7 +28,7 @@ from .session_state import (
     store_save_history,
     store_save_session,
 )
-from .tenant_context import fetch_tenant_context
+from .tenant_context import fetch_tenant_context, fetch_turn_knowledge
 from .tools import UI_ACTION_TOOL_NAMES, ToolLayer
 from .translation import (
     TranslatorInterface,
@@ -108,6 +108,7 @@ class ChatService:
         session_secret: str | None = None,
         persona_override: str | None = None,
         visitor: Any = None,
+        channel: str = "web",
     ) -> tuple[SessionState, ToolLayer, list[dict[str, Any]]]:
         """Shared turn setup for the buffered and SSE streaming chat paths
         (SPEC-W3 §3): session, tenant context, multi-agent routing, tool
@@ -155,6 +156,29 @@ class ChatService:
                 ctx.code_switch = True
                 ctx.code_switch_segments = list(inbound.segments)
         message = inbound.text
+
+        # SPEC-W109: per-turn knowledge grounding. The query is the
+        # POST-translation message (the KB embeddings are English-centric).
+        # Turn snippets lead, bootstrap snippets follow; ctx is a per-turn
+        # deepcopy so the merge never leaks across turns. Best-effort: an
+        # empty/failed fetch keeps the bootstrap snippets exactly.
+        if self._settings.knowledge_turn_queries:
+            turn_snippets = await fetch_turn_knowledge(
+                self._dapr,
+                self._settings,
+                ctx.tenant_slug,
+                message,
+                timeout_s=self._settings.knowledge_turn_timeout_s,
+                channel=channel,
+            )
+            if turn_snippets:
+                merged: list[str] = []
+                for s in [*turn_snippets, *ctx.knowledge_snippets]:
+                    if s not in merged:
+                        merged.append(s)
+                ctx.knowledge_snippets = merged[
+                    : self._settings.knowledge_snippet_count
+                ]
 
         # Multi-agent crews (SPEC-W3 §4, innovation 6): score the message
         # against the pack agents' intent keywords. A match swaps the active
@@ -305,6 +329,7 @@ class ChatService:
             session_secret=session_secret,
             persona_override=persona_override,
             visitor=visitor,
+            channel=channel,
         )
         # SPEC-W6 Part A: omnichannel inbound — remember which channel the
         # message arrived on (session metadata + turn logging only).

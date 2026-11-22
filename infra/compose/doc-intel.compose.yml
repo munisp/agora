@@ -1,0 +1,70 @@
+# Docling doc-intel sidecar (SPEC-W107) — OPTIONAL compose overlay.
+#
+# Adds the `doc-intel` docling-serve container consumed by knowledge-service
+# via DOC_INTEL_URL (default http://doc-intel:5001). NOT part of the base
+# stack; start as an overlay on the root compose (ocr.compose.yml precedent):
+#
+#   docker compose -f docker-compose.yml -f infra/compose/doc-intel.compose.yml up -d
+#
+# What it provides (docs/document-intelligence.md):
+#   - docling layout-aware parsing -> Markdown (reading order, table
+#     structure via TableFormer) for pdf/docx/pptx/xlsx/html/md.
+#   - OCR for scanned PDFs and image uploads through docling's `rapidocr`
+#     engine (ONNX build of the PaddleOCR models) — knowledge-service always
+#     requests ocr_engine=rapidocr.
+#   - Optional VLM pipeline (granite-docling preset) for hard layouts —
+#     NOT enabled here; see docs/document-intelligence.md §VLM before
+#     turning it on (heavy CPU cost).
+#
+# Model provisioning: docling downloads its layout/TableFormer/RapidOCR
+# models from Hugging Face ONCE into the `doc-intel-models` volume on first
+# conversion. For air-gapped deploys pre-seed that volume
+# (`docling-tools models download` on a connected host, then copy in) — the
+# container never requires network at request time after seeding.
+#
+# GF4: no host port published — reachable only on the opendesk network.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+# docling layout models + TableFormer + RapidOCR on CPU need real headroom
+# (vendor guidance: 4 cores / 8-16GB comfortable for standard pipeline).
+x-deploy-limits: &default-limits
+  resources:
+    limits:
+      cpus: "4.0"
+      memory: 8G
+
+services:
+  doc-intel:
+    logging: *default-logging
+    deploy: *default-limits
+    # Pinned docling-serve image (re-verify the tag against
+    # https://github.com/docling-project/docling-serve/releases before
+    # deploy; CPU variant — use docling-serve-cu128 for GPU nodes).
+    image: quay.io/docling-project/docling-serve:v1.21.0
+    environment:
+      # Sync requests wait up to this; knowledge-service DOC_INTEL_TIMEOUT_S
+      # must be >= this value.
+      DOCLING_SERVE_MAX_SYNC_WAIT: "600"
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "2"
+      UVICORN_WORKERS: "1"
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      # Set to enable X-Api-Key auth; knowledge-service sends it via
+      # DOC_INTEL_API_KEY. Empty = no auth (network-isolated default).
+      DOCLING_SERVE_API_KEY: ${DOC_INTEL_API_KEY:-}
+      DOCLING_SERVE_ARTIFACTS_PATH: /models
+    volumes:
+    - doc-intel-models:/models
+    networks:
+    - opendesk
+
+networks:
+  opendesk:
+    external: true
+
+volumes:
+  doc-intel-models:

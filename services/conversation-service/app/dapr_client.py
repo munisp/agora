@@ -38,12 +38,19 @@ class DaprClient:
         *,
         params: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        timeout_s: float | None = None,
     ) -> Any:
         """GET-invoke `method` on `app_id` via the sidecar (service
         invocation building block). Raises DaprError on non-2xx so callers
-        can map 404 vs outage (mirrors analytics-pipeline's client)."""
+        can map 404 vs outage (mirrors analytics-pipeline's client).
+
+        SPEC-W108: optional per-call timeout override (httpx per-request
+        timeout) for latency-budgeted paths like the USSD turn (~1s);
+        default None keeps the client-level 15s timeout unchanged."""
         url = f"{self._base}/v1.0/invoke/{app_id}/method/{method.lstrip('/')}"
-        resp = await self._client.get(url, params=params, headers=headers)
+        resp = await self._client.get(
+            url, params=params, headers=headers, timeout=timeout_s
+        )
         if resp.status_code >= 400:
             raise DaprError(
                 f"invoke {app_id}/{method}: {resp.status_code} {resp.text[:400]}",

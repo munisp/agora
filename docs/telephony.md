@@ -88,13 +88,66 @@ tenant — the server, never the model (`app/sip.resolve_tenant`).
   Anonymous/withheld caller IDs get no bypass; the normal confirmation
   applies.
 
-## Outbound calls (note)
+## Outbound calls (SPEC-W101)
 
-Outbound campaigns (waitlist backfill, no-show rebook) use the same trunk
-plane in the other direction. Carrier **CPS is the binding constraint** — the
-existing `OutboundPacer` (`OUTBOUND_CPS`, default 1/s, see
-runbooks/capacity-planning.md §4) paces call starts to stay under the
-carrier's start-rate limit; channels then cap concurrency as usual.
+Platform-dialed calls (waitlist backfill, no-show rebook, ops callbacks)
+use the same trunk plane in the other direction:
+
+```
+POST /v1/calls (X-Internal-Token; notification-worker / ops)
+        │  OutboundPacer token bucket (OUTBOUND_CPS, default 1/s)
+        ▼
+app/outbound.py — CreateSIPParticipant via SIP OUTBOUND trunk
+        │  room `outcall-{site_slug}-{call_id}`
+        ▼
+agents worker entrypoint (C4: tenant from the ROOM NAME — the callee's
+number is the customer's, never a registry/TENANT_PHONE_MAP key)
+        ▼
+receptionist session; SessionStarted carries direction="outbound"
+```
+
+### Provisioning
+
+```bash
+# 1. create the outbound trunk (see outbound-trunk-config.example.yaml —
+#    carrier SBC address + OUR caller-ID numbers + optional digest auth)
+deploy/livekit-sip/setup.sh          # also prints `lk sip outbound list`
+
+# 2. configure the voice worker
+OUTBOUND_TRUNK_ID=<trunk id from lk sip outbound list>
+OUTBOUND_CPS=1                        # at/below the carrier's CPS limit
+VOICE_ADMIN_INTERNAL_TOKEN=...        # the /v1/calls credential
+
+# 3. dial (internal callers only — the gateway never routes /v1/calls)
+curl -X POST http://voice-agent-runtime:8080/v1/calls \
+  -H 'X-Internal-Token: ...' -H 'content-type: application/json' \
+  -d '{"site_slug":"acme","phone_number":"+2348030000000"}'
+# 200 {"room":"outcall-acme-<id>","call_id":"<id>","status":"dialing",...}
+```
+
+### Honest failure surface
+
+| Condition | Status |
+|---|---|
+| `OUTBOUND_TRUNK_ID` unset | 503 (trunk not provisioned) |
+| `VOICE_ADMIN_INTERNAL_TOKEN` unset | 503 (fail closed) |
+| wrong/missing `X-Internal-Token` | 401 |
+| number not E.164 / unsafe slug | 422 (nothing dialed) |
+| LiveKit SIP API failure | 502 |
+
+The 200 `status` is always `"dialing"` — answer, decline, voicemail and
+carrier errors are asynchronous SIP outcomes surfaced through the room
+lifecycle (SessionStarted/SessionEnded with `direction="outbound"`), never
+invented at dial time.
+
+### Capacity discipline
+
+Carrier **CPS is the binding constraint** (capacity-planning §4): the
+endpoint paces every call start through a token bucket (`OUTBOUND_CPS`,
+default 1/s, capacity 1 — bursts serialize). Channels then cap concurrency
+as usual. Campaign callers (e.g. the WaitlistBackfill workflow) loop the
+endpoint and inherit the pacing for free; per-campaign number rotation for
+spam-reputation lives at the trunk (`numbers` list).
 
 ## Failure modes
 

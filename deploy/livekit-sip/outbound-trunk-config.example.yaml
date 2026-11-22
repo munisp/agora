@@ -1,0 +1,26 @@
+# LiveKit SIP OUTBOUND trunk (SIPOutboundTrunkInfo) — SPEC-W101 C1.
+#
+# Apply with the LiveKit CLI (see setup.sh):
+#   lk sip outbound create deploy/livekit-sip/outbound-trunk-config.example.yaml
+#
+# The trunk ORIGINATES calls toward the carrier SBC (the reverse of the
+# inbound trunk): the voice runtime's POST /v1/calls dials through it via
+# CreateSIPParticipant (app/outbound.py). Copy this file, fill in the
+# carrier values, and set the created trunk id as OUTBOUND_TRUNK_ID on the
+# voice worker (printed by setup.sh / `lk sip outbound list`).
+name: opendesk-outbound
+# Carrier SBC signalling address (host[:port]) that terminates our outbound
+# calls — get it from the carrier's trunking order form.
+address: sip.carrier.example.com:5060
+# OUR caller-ID numbers (E.164) the carrier bills/permits for origination.
+# The callee sees one of these; rotate per campaign for spam-reputation
+# (VOICE-SCALING §"Outbound CPS pacer").
+numbers:
+  - "+15551234567"
+# Optional (production):
+# transport: SIP_TRANSPORT_TCP   # or UDP/TLS per carrier
+# auth_username: opendesk-out    # digest auth toward the carrier
+# auth_password: changeme
+# headers:                       # extra SIP headers on the INVITE
+#   X-Campaign: waitlist-backfill
+metadata: "opendesk SPEC-W101 outbound campaign trunk"

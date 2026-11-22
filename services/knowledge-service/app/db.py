@@ -60,6 +60,15 @@ class Database:
             await conn.execute(DDL)
         log.info("kb_suggestions.table_ensured")
 
+    async def ensure_upload_jobs_table(self) -> None:
+        """SPEC-W111: idempotent upload_jobs bootstrap DDL."""
+        from .upload_jobs import DDL
+
+        assert self._pool is not None, "database not connected"
+        async with self._pool.acquire() as conn:
+            await conn.execute(DDL)
+        log.info("upload_jobs.table_ensured")
+
     @asynccontextmanager
     async def tenant_conn(self, tenant_id: str):
         """Yield a connection with `app.tenant_id` set for RLS.
@@ -72,6 +81,27 @@ class Database:
             async with conn.transaction():
                 await conn.execute(
                     "SELECT set_config('app.tenant_id', $1, true)", tenant_id
+                )
+                yield conn
+
+    @asynccontextmanager
+    async def reaper_conn(self):
+        """SPEC-W112: maintenance connection for the upload-job reaper.
+
+        Sets app.upload_reaper='on' (activates the upload_job_reaper RLS
+        policy) plus a placeholder app.tenant_id so the tenant_isolation
+        policy expression cannot error during evaluation. SET LOCAL inside
+        a transaction — the flags never leak to pooled request connections.
+        """
+        assert self._pool is not None, "database not connected"
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT set_config('app.upload_reaper', 'on', true)"
+                )
+                await conn.execute(
+                    "SELECT set_config('app.tenant_id', $1, true)",
+                    "00000000-0000-0000-0000-000000000000",
                 )
                 yield conn
 

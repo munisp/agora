@@ -2,6 +2,7 @@
 
 Routes:
   POST   /v1/documents          ingest: store, chunk (~500 tokens), embed, bulk index
+  POST   /v1/documents/upload   file ingest via docling doc-intel sidecar (SPEC-W107)
   GET    /v1/documents          tenant-scoped document list from Postgres (SPEC-W47)
   DELETE /v1/documents/{id}     delete doc + chunks from Postgres and OpenSearch
   GET    /v1/search             hybrid BM25 + kNN with reciprocal rank fusion
@@ -14,12 +15,15 @@ Routes:
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
@@ -30,8 +34,16 @@ from .chunking import chunk_text
 from .config import settings
 from .dapr_client import DaprClient
 from .db import Database, bind_tenant_value, parse_tenant_slugs, resolve_tenant_id
+from .docintel import (
+    DocIntelClient,
+    DocIntelEmpty,
+    DocIntelRejected,
+    DocIntelUnavailable,
+)
+from .upload_jobs import UploadJobsStore
 from .embeddings import Embedder
 from .logging import configure_logging, get_logger
+from .reranker import CrossEncoderReranker
 from .rrf import reciprocal_rank_fusion
 from .search import SearchStore
 
@@ -46,11 +58,34 @@ class IngestRequest(BaseModel):
     source_url: str | None = None
 
 
+# SPEC-W107: extensions the docling doc-intel sidecar can convert. Images go
+# through the OCR path (RapidOCR / PaddleOCR ONNX models).
+ALLOWED_UPLOAD_EXTENSIONS = frozenset({
+    "pdf", "docx", "pptx", "xlsx", "html", "htm", "md", "txt",
+    "asciidoc", "adoc", "png", "jpg", "jpeg", "tiff", "tif",
+})
+
+
+class UploadRequest(BaseModel):
+    tenant: str = Field(..., description="tenant slug or UUID")
+    filename: str = Field(..., min_length=1, max_length=255)
+    content_base64: str = Field(..., min_length=1)
+    title: str | None = None
+    # SPEC-W111: wait=false submits an async docling task and returns 202
+    # with a job id (poll GET /v1/documents/upload/{job_id}); the default
+    # keeps the W107 sync path byte-identical.
+    wait: bool = True
+
+
 class AppState:
     db: Database
     search: SearchStore
     embedder: Embedder
     dapr: DaprClient
+    docintel: DocIntelClient
+    upload_jobs: UploadJobsStore
+    reranker: CrossEncoderReranker
+    bg_tasks: set[asyncio.Task]
 
 
 def get_state(request: Request) -> AppState:
@@ -88,12 +123,37 @@ async def lifespan(app: FastAPI):
     )
     deps.embedder = Embedder(settings.embed_model, settings.sentence_transformers_home)
     deps.dapr = DaprClient(settings.dapr_host, settings.dapr_http_port)
+    deps.docintel = DocIntelClient(
+        settings.doc_intel_url,
+        api_key=settings.doc_intel_api_key,
+        timeout_s=settings.doc_intel_timeout_s,
+    )
+    deps.upload_jobs = UploadJobsStore(deps.db)
+    deps.reranker = CrossEncoderReranker(
+        settings.rerank_model,
+        cache_dir=settings.sentence_transformers_home,
+        max_chars=settings.rerank_max_chars,
+    )
+    deps.bg_tasks = set()
     await deps.db.connect()
     # SPEC-W3 §4 innovation 4: kb_suggestions bootstrap DDL (idempotent).
     try:
         await deps.db.ensure_suggestions_table()
     except Exception as exc:
         log.error("kb_suggestions.bootstrap_failed", error=str(exc))
+    # SPEC-W111: upload_jobs bootstrap (idempotent). Failure must NOT break
+    # the sync upload path — logged, and wait=false requests will 503.
+    try:
+        await deps.db.ensure_upload_jobs_table()
+    except Exception as exc:
+        log.error("upload_jobs.bootstrap_failed", error=str(exc))
+    # SPEC-W112: stale-running reaper. One sweep at startup (jobs stranded
+    # by a previous crash/restart), then periodically. Reaper failures are
+    # logged, never fatal to startup or ingest.
+    if settings.doc_intel_reaper_enabled:
+        reaper_task = asyncio.create_task(_reaper_loop(deps))
+        deps.bg_tasks.add(reaper_task)
+        reaper_task.add_done_callback(deps.bg_tasks.discard)
     await deps.search.ensure_index()
     app.state.deps = deps
     log.info("service.started", port=settings.port)
@@ -101,6 +161,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         log.info("service.shutting_down")
+        for task in deps.bg_tasks:
+            task.cancel()
+        if deps.bg_tasks:
+            await asyncio.gather(*deps.bg_tasks, return_exceptions=True)
         await deps.dapr.aclose()
         await deps.search.aclose()
         await deps.db.aclose()
@@ -195,6 +259,164 @@ async def ingest_document(
 
 @app.post("/v1/documents/upload", status_code=201)
 async def upload_document(
+    req: UploadRequest, request: Request, deps: AppState = Depends(get_state)
+):
+    """SPEC-W107: binary document ingest via the docling doc-intel sidecar.
+
+    The sidecar (docling layout-aware parsing; RapidOCR/PaddleOCR models for
+    scanned content; tables -> Markdown) is the ONLY extraction engine. There
+    is no silent local fallback: sidecar down -> 503, conversion refused or
+    empty -> 422, oversized -> 413, unsupported type -> 415.
+    """
+    ext = req.filename.rsplit(".", 1)[-1].lower() if "." in req.filename else ""
+    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"unsupported file type '.{ext or '(none)'}'; allowed: "
+                f"{sorted(ALLOWED_UPLOAD_EXTENSIONS)}"
+            ),
+        )
+    try:
+        data = base64.b64decode(req.content_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid base64: {exc}") from exc
+    if len(data) > settings.doc_intel_max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"decoded upload is {len(data)} bytes; limit is "
+                f"{settings.doc_intel_max_bytes}"
+            ),
+        )
+    tenant_id = await _bound_tenant_id(request, req.tenant, deps)
+    title = req.title or req.filename.rsplit(".", 1)[0]
+    if not req.wait:
+        # SPEC-W111: async ingest for very large scans — submit a docling
+        # task and let a background job poll/ingest; the caller polls the
+        # job row. 202 + job id; the job NEVER propagates failure to other
+        # requests (row marked failed with the honest error).
+        job_id = await deps.upload_jobs.create(tenant_id, req.filename, title)
+        task = asyncio.create_task(
+            _run_upload_job(
+                deps, tenant_id, job_id, req.filename, data, title
+            )
+        )
+        deps.bg_tasks.add(task)
+        task.add_done_callback(deps.bg_tasks.discard)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "pending",
+                "tenant_id": tenant_id,
+                "title": title,
+            },
+        )
+    try:
+        extraction = await deps.docintel.convert(req.filename, data)
+    except DocIntelUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (DocIntelRejected, DocIntelEmpty) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if len(extraction.text) > settings.doc_intel_max_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"extracted text is {len(extraction.text)} chars; limit is "
+                f"{settings.doc_intel_max_chars}"
+            ),
+        )
+    result = await _ingest_document(
+        deps, tenant_id, title, extraction.text, f"upload:{req.filename}"
+    )
+    result["extraction"] = {
+        "engine": "docling",
+        "processing_time_s": extraction.processing_time_s,
+        "chars": len(extraction.text),
+    }
+    return result
+
+
+async def _run_upload_job(
+    deps: AppState,
+    tenant_id: str,
+    job_id: str,
+    filename: str,
+    data: bytes,
+    title: str,
+) -> None:
+    """SPEC-W111 background job: submit -> poll -> ingest -> mark done.
+
+    Every failure marks the job row failed with the honest error; nothing
+    propagates. CancelledError (shutdown) propagates so the lifespan gather
+    is prompt — the row stays 'running' and the SPEC-W112 reaper fails it
+    honestly once it goes stale.
+    """
+    try:
+        await deps.upload_jobs.set_running(tenant_id, job_id)
+        task_id = await deps.docintel.submit(filename, data)
+        deadline = asyncio.get_running_loop().time() + settings.doc_intel_job_timeout_s
+        status = "pending"
+        while status not in ("success", "failure"):
+            if asyncio.get_running_loop().time() > deadline:
+                raise DocIntelUnavailable(
+                    f"doc-intel job timed out after {settings.doc_intel_job_timeout_s}s"
+                )
+            await asyncio.sleep(settings.doc_intel_poll_s)
+            status = await deps.docintel.poll(task_id)
+        if status == "failure":
+            raise DocIntelRejected("doc-intel task reported failure")
+        extraction = await deps.docintel.result(task_id)
+        if len(extraction.text) > settings.doc_intel_max_chars:
+            raise DocIntelRejected(
+                f"extracted text is {len(extraction.text)} chars; limit is "
+                f"{settings.doc_intel_max_chars}"
+            )
+        result = await _ingest_document(
+            deps, tenant_id, title, extraction.text, f"upload:{filename}"
+        )
+        await deps.upload_jobs.set_done(
+            tenant_id, job_id, result["id"], len(extraction.text)
+        )
+        log.info("upload_job.done", job_id=job_id, document_id=result["id"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - job failure is row state
+        log.warning("upload_job.failed", job_id=job_id, error=str(exc)[:200])
+        try:
+            await deps.upload_jobs.set_failed(tenant_id, job_id, str(exc))
+        except Exception as exc2:  # noqa: BLE001 - never raise from a job
+            log.error("upload_job.fail_mark_failed", job_id=job_id, error=str(exc2))
+
+
+async def _reaper_loop(deps: AppState) -> None:
+    """SPEC-W112: fail stale `running` upload jobs honestly.
+
+    One sweep immediately (covers jobs stranded by a previous crash or
+    restart — the background task is gone but the row still says running),
+    then one every settings.doc_intel_reaper_interval_s. Only stale running
+    rows are touched; pending and terminal rows are never modified. A sweep
+    failure is logged and retried next interval — the loop only exits on
+    cancellation (shutdown).
+    """
+    while True:
+        try:
+            reaped = await deps.upload_jobs.reap_stale(
+                settings.doc_intel_reaper_stale_s
+            )
+            if reaped:
+                log.warning("upload_reaper.reaped", count=reaped)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - reaper never dies on error
+            log.error("upload_reaper.sweep_failed", error=str(exc)[:200])
+        await asyncio.sleep(settings.doc_intel_reaper_interval_s)
+
+
+
+@app.post("/v1/documents/upload-file", status_code=201)
+async def upload_document_file(
     request: Request,
     tenant: str = Form(..., description="tenant slug or UUID"),
     file: UploadFile = File(..., description="PDF, Word (.docx), .txt or .md"),
@@ -214,6 +436,35 @@ async def upload_document(
     doc_title = (title or "").strip()[:300] or name.rsplit(".", 1)[0].replace("_", " ").strip() or "Uploaded document"
     out = await _ingest_document(deps, tenant_id, doc_title, text, f"upload:{name}")
     return {**out, "file_name": name, "pages": pages, "characters": len(text)}
+
+
+@app.get("/v1/documents/upload/{job_id}")
+async def get_upload_job(
+    job_id: str,
+    request: Request,
+    tenant: str = Query(..., description="tenant slug or UUID"),
+    deps: AppState = Depends(get_state),
+):
+    """SPEC-W111: tenant-bound async upload job status (404 cross-tenant)."""
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
+    try:
+        job = await deps.upload_jobs.get(tenant_id, job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="upload job not found") from None
+    if job is None:
+        raise HTTPException(status_code=404, detail="upload job not found")
+    return {
+        "job_id": job.id,
+        "tenant_id": job.tenant_id,
+        "filename": job.filename,
+        "title": job.title,
+        "status": job.status,
+        "document_id": job.document_id,
+        "chars": job.chars,
+        "error": job.error,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+    }
 
 
 @app.get("/v1/documents")
@@ -303,14 +554,33 @@ async def delete_document(
 
 async def _hybrid(
     deps: AppState, tenant_id: str, q: str, k: int
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     fetch_k = max(k * 2, 10)  # over-fetch each leg before fusion
     bm25_hits = await deps.search.bm25_search(tenant_id, q, fetch_k)
     [vector] = await deps.embedder.embed([q])
     knn_hits = await deps.search.knn_search(tenant_id, vector, fetch_k)
-    return reciprocal_rank_fusion(
-        [bm25_hits, knn_hits], rrf_k=settings.rrf_k, size=k
+    # SPEC-W113: over-fuse to the rerank candidate pool so the cross-encoder
+    # re-scores a real pool, not just the final k. Disabled config keeps the
+    # W112 behavior byte-identical (fuse straight to k, reranker untouched).
+    fused = reciprocal_rank_fusion(
+        [bm25_hits, knn_hits],
+        rrf_k=settings.rrf_k,
+        size=max(k, settings.rerank_candidates) if settings.rerank_enabled else k,
     )
+    if not settings.rerank_enabled:
+        return fused, False
+    candidates = fused[: settings.rerank_candidates]
+    try:
+        reranked = await asyncio.wait_for(
+            deps.reranker.rerank(q, candidates),
+            timeout=settings.rerank_timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001 - reranking is best-effort
+        # Timeout, model-load failure, OOM — anything: keep the RRF order
+        # and log. Search NEVER fails because of reranking.
+        log.warning("rerank.failed_rrf_fallback", error=str(exc)[:200])
+        return fused[:k], False
+    return reranked[:k], True
 
 
 @app.get("/v1/search")
@@ -322,7 +592,7 @@ async def search(
     deps: AppState = Depends(get_state),
 ):
     tenant_id = await _bound_tenant_id(request, tenant, deps)
-    hits = await _hybrid(deps, tenant_id, q, k)
+    hits, reranked = await _hybrid(deps, tenant_id, q, k)
 
     # Self-improving KB (SPEC-W3 §4, innovation 4): weak answer to a
     # question-shaped query -> record a suggestion for staff review.
@@ -342,6 +612,7 @@ async def search(
     return {
         "query": q,
         "tenant_id": tenant_id,
+        "reranked": reranked,
         "results": [
             {
                 "chunk_id": h["_id"],
@@ -349,6 +620,9 @@ async def search(
                 "title": h["_source"].get("title"),
                 "content": h["_source"]["content"],
                 "rrf_score": h["_rrf_score"],
+                # SPEC-W113: present only when the hit was cross-encoder
+                # reranked; consumers must tolerate its absence.
+                **({"rerank_score": h["_rerank_score"]} if "_rerank_score" in h else {}),
             }
             for h in hits
         ],
@@ -365,7 +639,7 @@ async def context(
 ):
     """Top snippets formatted for injection into an agent system prompt."""
     tenant_id = await _bound_tenant_id(request, tenant, deps)
-    hits = await _hybrid(deps, tenant_id, q, k)
+    hits, _reranked = await _hybrid(deps, tenant_id, q, k)
     snippets = [h["_source"]["content"] for h in hits]
     prompt_block = "\n".join(f"- {s}" for s in snippets)
     return {

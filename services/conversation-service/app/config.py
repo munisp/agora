@@ -148,6 +148,35 @@ class Config:
         "Thank you. Your message has been received; an agent will respond shortly."
     )
 
+    # USSD knowledge grounding (SPEC-W108): in pass-through text mode a
+    # non-empty selection triggers a knowledge-service GET /v1/context
+    # lookup; grounded snippets replace the static ack. The USSD turn
+    # budget is ~1s, so the lookup runs under a tight per-call timeout and
+    # ANY failure (error, timeout, empty) falls back to the static ack —
+    # the callback never fails because of grounding.
+    ussd_kb_grounding: bool = True
+    knowledge_app_id: str = "knowledge"
+    ussd_kb_timeout_s: float = 0.8
+    ussd_kb_max_reply_chars: int = 300
+    ussd_kb_max_snippets: int = 2
+
+    # LLM-compressed USSD answers (SPEC-W110): compose the grounded snippets
+    # into a short natural answer via an OpenAI-compatible LLM. DEFAULT OFF:
+    # the compose call runs after the 0.8s KB fetch and a cold model can
+    # stretch the turn toward the ~2s aggregator budget. Fallback chain when
+    # on: LLM answer -> raw snippet -> static ack (never fails a callback).
+    ussd_kb_llm: bool = False
+    ussd_kb_llm_base_url: str = "http://ollama:11434/v1"
+    ussd_kb_llm_model: str = "qwen3:8b"
+    ussd_kb_llm_api_key: str = "ollama"
+    ussd_kb_llm_timeout_s: float = 1.2
+    ussd_kb_llm_max_tokens: int = 120
+
+    # SPEC-W112: cap distinct tenant label values on
+    # conversation_grounding_turns_total; tenants beyond the cap aggregate
+    # under tenant="overflow" so label cardinality stays bounded.
+    grounding_metrics_max_tenants: int = 100
+
     # OpenSearch indexer (SPEC §10, index `conversations`).
     opensearch_addr: str = "http://opensearch:9200"
     conversations_index: str = "conversations"
@@ -236,6 +265,23 @@ def load() -> Config:
         outbox_relay_seconds=float(_env("OUTBOX_RELAY_SECONDS", "1")),
         outbox_relay_batch=int(_env("OUTBOX_RELAY_BATCH", "100")),
         ussd_enabled=_env("USSD_ENABLED", "true").lower() == "true",
+        ussd_kb_grounding=_env("USSD_KB_GROUNDING", "on").lower()
+        in ("1", "on", "true", "yes"),
+        knowledge_app_id=_env("KNOWLEDGE_APP_ID", "knowledge"),
+        ussd_kb_timeout_s=float(_env("USSD_KB_TIMEOUT_S", "0.8")),
+        ussd_kb_max_reply_chars=int(_env("USSD_KB_MAX_REPLY_CHARS", "300")),
+        ussd_kb_max_snippets=int(_env("USSD_KB_MAX_SNIPPETS", "2")),
+        ussd_kb_llm=_env("USSD_KB_LLM", "off").lower() in ("1", "on", "true", "yes"),
+        ussd_kb_llm_base_url=_env(
+            "USSD_KB_LLM_BASE_URL", _env("LLM_BASE_URL", "http://ollama:11434/v1")
+        ),
+        ussd_kb_llm_model=_env("USSD_KB_LLM_MODEL", _env("LLM_MODEL", "qwen3:8b")),
+        ussd_kb_llm_api_key=_env("USSD_KB_LLM_API_KEY", _env("LLM_API_KEY", "ollama")),
+        ussd_kb_llm_timeout_s=float(_env("USSD_KB_LLM_TIMEOUT_S", "1.2")),
+        ussd_kb_llm_max_tokens=int(_env("USSD_KB_LLM_MAX_TOKENS", "120")),
+        grounding_metrics_max_tenants=int(
+            _env("GROUNDING_METRICS_MAX_TENANTS", "100")
+        ),
         ussd_text_mode_reply=_env(
             "USSD_TEXT_MODE_REPLY",
             "Thank you. Your message has been received; an agent will respond shortly.",

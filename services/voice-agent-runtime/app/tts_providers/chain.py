@@ -36,9 +36,18 @@ from ..pipeline.tts import PiperTTS, TtsLruCache, _wav_to_pcm, split_sentences
 from .azure import AzureTTS
 from .base import TTSProvider, Voice, split_voice_spec
 from .cosyvoice import CosyVoiceTTS
+from .longcat import LongCatTTS
 from .mms import MmsTTS
 from .edge import EdgeTTS
 from .naija import NaijaSpeechTTS
+from .prosody import (
+    ProsodyPolicy,
+    apply_prosody,
+    parse_prosody_map,
+    pcm16_pad,
+    pcm16_resample_linear,
+    policy_for,
+)
 from .qwen3 import Qwen3TTS
 from .spitch import SpitchTTS
 from .xtts import XttsTTS
@@ -46,7 +55,7 @@ from .xtts import XttsTTS
 log = get_logger("tts.chain")
 
 #: Providers buildable from Settings (chain names).
-PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3", "edge")
+PROVIDER_NAMES = ("piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3", "edge", "longcat")
 
 
 class PiperProvider:
@@ -97,6 +106,7 @@ class FallbackTTS:
         clock: Callable[[], float] = time.monotonic,
         sample_rate: int = 22050,
         cache_size: int = 256,
+        prosody_map: dict[str, ProsodyPolicy] | None = None,
     ) -> None:
         self._providers = dict(providers)
         # Stable chain order: configured order first, then any implicit
@@ -116,6 +126,12 @@ class FallbackTTS:
         # SPEC-W46 P4: chain-level LRU keyed (voice, text, format) covering
         # every provider (the piper adapter additionally caches internally).
         self._cache = TtsLruCache(cache_size)
+        # SPEC-W106 C2: prosody layer. None == pre-W106 behavior, bit-exact
+        # (the factory passes None unless TTS_PROSODY is on). When a map is
+        # active, provider wav at a foreign sample rate is NORMALIZED to the
+        # chain rate (previously warn-only, "audio may be pitched") and the
+        # language policy's time-stretch is applied before caching.
+        self._prosody_map = prosody_map
 
     # ------------------------------------------------------------- accessors
     @property
@@ -249,13 +265,24 @@ class FallbackTTS:
                 pcm, rate = _wav_to_pcm(wav)
         finally:
             metrics.session_tts()  # per-session quality accumulator
-        self._cache.set(cache_key, pcm)
         if rate != self.sample_rate:
+            if self._prosody_map is not None:
+                # SPEC-W106 C2: normalize instead of shipping pitched audio.
+                pcm = pcm16_resample_linear(pcm, rate, self.sample_rate)
             log.warning(
-                "tts sample rate mismatch; audio may be pitched",
+                "tts sample rate mismatch; audio may be pitched"
+                if self._prosody_map is None
+                else "tts sample rate mismatch; normalized to chain rate",
                 expected=self.sample_rate,
                 got=rate,
             )
+        if self._prosody_map is not None:
+            policy = policy_for(self.language, self._prosody_map)
+            if policy is not None:
+                pcm = apply_prosody(pcm, policy, self.sample_rate)
+        # SPEC-W106: cache stores the POST-prosody pcm so repeated
+        # utterances get bit-identical audio.
+        self._cache.set(cache_key, pcm)
         return pcm
 
     async def stream_pcm(self, text: str) -> AsyncIterator[bytes]:
@@ -313,6 +340,15 @@ class FallbackTTS:
                 yield pcm
             return
         parts: list[bytes] = []
+        # SPEC-W106 C2: real silence between streamed sentence chunks so
+        # prosodic boundaries breathe (the "choppy joins" complaint). Pad
+        # segments are yielded between chunks only and are part of the
+        # cached full-utterance entry.
+        join_pad = b""
+        if self._prosody_map is not None:
+            policy = policy_for(self.language, self._prosody_map)
+            if policy is not None and policy.join_pad_ms > 0:
+                join_pad = pcm16_pad(policy.join_pad_ms, self.sample_rate)
         next_task: asyncio.Task | None = asyncio.ensure_future(
             self.synthesize_pcm(chunks[0])
         )
@@ -327,6 +363,9 @@ class FallbackTTS:
                     )
                 pcm = await task  # this chunk's error surfaces at ITS index
                 if pcm:
+                    if parts and join_pad:
+                        parts.append(join_pad)
+                        yield join_pad
                     parts.append(pcm)
                     _mark_first_chunk()
                     yield pcm
@@ -393,6 +432,8 @@ def build_provider(name: str, settings: Any) -> TTSProvider:
         )
     if name == "cosyvoice":
         return CosyVoiceTTS(settings.cosyvoice_tts_url)
+    if name == "longcat":
+        return LongCatTTS(settings.longcat_tts_url)
     if name == "qwen3":
         return Qwen3TTS(
             settings.qwen3_tts_url,
@@ -435,4 +476,11 @@ def build_fallback_tts(settings: Any) -> FallbackTTS:
         cooldown_s=settings.tts_cb_cooldown_s,
         sample_rate=settings.piper_sample_rate,
         cache_size=getattr(settings, "tts_cache_size", 256),
+        # SPEC-W106 C3: prosody layer is opt-in (TTS_PROSODY=on) — None
+        # keeps pre-W106 audio bit-identical.
+        prosody_map=(
+            parse_prosody_map(settings.tts_prosody_map)
+            if getattr(settings, "tts_prosody", False)
+            else None
+        ),
     )

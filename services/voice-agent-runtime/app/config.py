@@ -431,6 +431,16 @@ class Settings:
     # Session bootstrap
     knowledge_snippet_count: int = 3
     knowledge_query: str = "opening hours services pricing"
+    # SPEC-W109: per-turn knowledge queries on the chat path (the bootstrap
+    # query above grounds the session persona; these ground EACH turn's
+    # message). Default ON; KNOWLEDGE_TURN_QUERIES=0 restores pre-W109
+    # bootstrap-only grounding. The fetch is best-effort under a tight
+    # budget — a turn never fails on grounding.
+    knowledge_turn_queries: bool = True
+    knowledge_turn_timeout_s: float = 1.5
+    # SPEC-W112: cap distinct tenant label values on grounding metrics;
+    # tenants beyond the cap aggregate under tenant="overflow".
+    grounding_metrics_max_tenants: int = 100
     http_timeout_s: float = 15.0
 
     # SPEC-W46 P1/P2: tenant-context TTL cache (VOICE_TENANT_CTX_TTL_S,
@@ -546,6 +556,14 @@ class Settings:
     tenant_phone_map: dict = field(default_factory=dict)
     sip_default_site: str = ""
 
+    # SIP telephony OUTBOUND (SPEC-W101, app/outbound.py): the LiveKit SIP
+    # outbound trunk id created by deploy/livekit-sip/setup.sh (empty = the
+    # dial endpoint answers an honest 503) and the token-bucket call-START
+    # rate (OUTBOUND_CPS calls/second; the carrier's CPS limit is the
+    # binding constraint — see docs/telephony.md "Outbound calls").
+    outbound_trunk_id: str = ""
+    outbound_cps: float = 1.0
+
     # Agents registry (SPEC-W38 F1, app/agents_registry.py): dialed-number ->
     # agent resolution via conversation-service (internal, no APISIX). The
     # static TENANT_PHONE_MAP above remains the fallback when the registry
@@ -600,6 +618,16 @@ class Settings:
     # before it is spoken (a model answering in Yoruba stopped calling its tools and claimed bookings it never made).
     naija_think_in_english: bool = False
     cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
+    # SPEC-W102 C3: LongCat-AudioDiT (Meituan, MIT code + weights) GPU-tier
+    # provider via the longcat-tts sidecar — ZH+EN only (NOT a Nigerian
+    # language path); zero-shot cloning needs the sample transcript.
+    longcat_tts_url: str = "http://longcat-tts:5830"
+    # SPEC-W106 C3: runtime prosody layer (chain-level time-stretch, join
+    # pads, sample-rate normalization). OFF by default — pre-W106 audio is
+    # bit-identical until TTS_PROSODY is switched on (house opt-in idiom,
+    # same as VOICEPRINTS / INTEL_LLM). Map: "pcm:0.95:120,yo:0.95:120".
+    tts_prosody: bool = False
+    tts_prosody_map: str = ""
     # SPEC-W74 A1: Qwen3-TTS (nari-labs/nari-qwen3-tts) GPU-tier provider —
     # the published image IS the sidecar (OpenAI-shaped /v1/audio/speech).
     # Requires an NVIDIA H100; engine tested with English as the primary
@@ -773,6 +801,10 @@ def load_settings() -> Settings:
         in ("1", "true", "yes", "on"),
         knowledge_snippet_count=_env_int("KNOWLEDGE_SNIPPET_COUNT", 3),
         knowledge_query=_env("KNOWLEDGE_QUERY", "opening hours services pricing"),
+        knowledge_turn_queries=_env("KNOWLEDGE_TURN_QUERIES", "on").lower()
+        in ("1", "on", "true", "yes"),
+        knowledge_turn_timeout_s=float(_env("KNOWLEDGE_TURN_TIMEOUT_S", "1.5")),
+        grounding_metrics_max_tenants=_env_int("GROUNDING_METRICS_MAX_TENANTS", 100),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
         tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),
         tenant_ctx_stale_s=_env_int("VOICE_TENANT_CTX_STALE_S", 300),
@@ -802,6 +834,8 @@ def load_settings() -> Settings:
         voiceprint_threshold=float(os.environ.get("VOICEPRINT_THRESHOLD", "0.75")),
         tenant_phone_map=parse_tenant_phone_map(_env("TENANT_PHONE_MAP", "")),
         sip_default_site=_env("SIP_DEFAULT_SITE", ""),
+        outbound_trunk_id=_env("OUTBOUND_TRUNK_ID", ""),
+        outbound_cps=_env_float("OUTBOUND_CPS", 1.0),
         agents_registry_url=_env("AGENTS_REGISTRY_URL", "http://conversation:7007"),
         conversation_url=_env("CONVERSATION_URL", "http://conversation:7007"),
         agents_cache_ttl_s=_env_int("AGENTS_CACHE_TTL_S", 30),
@@ -823,6 +857,9 @@ def load_settings() -> Settings:
         naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
         naija_think_in_english=_env("NAIJA_THINK_IN_ENGLISH", "0").strip().lower() in ("1", "true", "yes", "on"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
+        longcat_tts_url=_env("LONGCAT_TTS_URL", "http://longcat-tts:5830"),
+        tts_prosody=_env("TTS_PROSODY", "off").lower() in ("1", "on", "true", "yes"),
+        tts_prosody_map=_env("TTS_PROSODY_MAP", ""),
         qwen3_tts_url=_env("QWEN3_TTS_URL", "http://qwen3-tts:8000"),
         qwen3_tts_model=_env("QWEN3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
         qwen3_tts_voice=_env("QWEN3_TTS_VOICE", "ryan"),

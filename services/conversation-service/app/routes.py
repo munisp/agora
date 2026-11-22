@@ -9,7 +9,7 @@ from typing import Annotated, Any
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 
-from . import events, incidents, intel, models, redact, ussd
+from . import events, grounding_metrics, incidents, intel, kb_compose, models, redact, ussd
 from .db import NotFoundError
 from .tenants import TenantNotFoundError, TenantResolutionError
 
@@ -645,6 +645,75 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
     reply, continue_session, selected = ussd.build_reply(
         body, st.cfg.ussd_text_mode_reply
     )
+    # SPEC-W108 Part B: knowledge-grounded text-mode replies. Only in
+    # pass-through text mode with a non-empty selection (menu mode is
+    # deterministic; the empty first turn has no query). ANY KB failure —
+    # unreachable, timeout over the tight per-call budget, empty snippets —
+    # falls back to the static ack above; grounding never fails a callback.
+    grounded = False
+    composed_flag = False
+    # SPEC-W112: exactly one conversation_grounding_turns_total increment
+    # per ELIGIBLE turn (text mode, non-empty query). "disabled" counts
+    # turns that would have been eligible had grounding been on; menu
+    # turns and empty first turns stay uncounted.
+    grounding_result: str | None = None
+    if not body.menu and ussd.parse_last_selection(body.text):
+        if not st.cfg.ussd_kb_grounding:
+            grounding_result = "disabled"
+        else:
+            try:
+                kb = await st.dapr.invoke(
+                    st.cfg.knowledge_app_id,
+                    "v1/context",
+                    params={"tenant": str(tenant_id), "q": ussd.parse_last_selection(body.text)},
+                    # Internal Dapr callers self-pass the binding header
+                    # (SPEC-W43 C1; voice runtime W108 Part A does the same).
+                    headers={"X-Tenant-Slugs": str(tenant_id)},
+                    timeout_s=st.cfg.ussd_kb_timeout_s,
+                )
+                snippets = kb.get("snippets") or [] if isinstance(kb, dict) else []
+                grounded_text = ussd.grounded_reply(
+                    snippets,
+                    max_snippets=st.cfg.ussd_kb_max_snippets,
+                    max_chars=st.cfg.ussd_kb_max_reply_chars,
+                )
+                if grounded_text:
+                    reply, grounded = grounded_text, True
+                    grounding_result = "raw"
+                    # SPEC-W110: optionally compress the raw snippets into a
+                    # short natural answer (default OFF — latency). Any compose
+                    # failure keeps the raw grounded text; the static ack remains
+                    # the final fallback from the outer block.
+                    if st.cfg.ussd_kb_llm:
+                        composed = await kb_compose.compose_answer(
+                            ussd.parse_last_selection(body.text),
+                            snippets,
+                            st.cfg,
+                        )
+                        if composed:
+                            reply = composed
+                            composed_flag = True
+                            grounding_result = "composed"
+                        else:
+                            grounding_result = "compose_fallback"
+                else:
+                    grounding_result = "ungrounded"
+            except Exception as exc:  # noqa: BLE001 - grounding is best-effort
+                grounding_result = "error"
+                st.log.warning(
+                    "ussd knowledge grounding failed; static ack fallback",
+                    error=str(exc)[:200],
+                )
+    if grounding_result is not None:
+        try:
+            grounding_metrics.record_grounding_turn(
+                tenant=str(tenant_id),
+                channel="ussd",
+                result=grounding_result,
+                max_tenants=st.cfg.grounding_metrics_max_tenants,
+            )
+        except Exception as exc:  # noqa: BLE001 - metrics never fail a turn
+            st.log.warning("grounding metric failed", error=str(exc)[:200])
     payload = ussd.response_payload(
         conversation_id=conv_id,
         reply=reply,
@@ -652,6 +721,8 @@ async def ussd_turn(body: ussd.UssdTurnRequest, request: Request) -> dict[str, A
         body=body,
         selected=selected,
     )
+    payload["grounded"] = grounded
+    payload["composed"] = composed_flag
     # W46-F P5: record the reply as an agent turn (deduped on the same
     # callback key, mirroring the telegram/whatsapp bridge's user-turn →
     # agent-turn pair) in a BACKGROUND task AFTER the response — the USSD
