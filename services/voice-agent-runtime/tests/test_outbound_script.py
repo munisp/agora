@@ -56,6 +56,8 @@ def test_prompt_block_rules():
     assert "Do NOT ask for their name, phone number or email" in p
     assert "Number we dialed: +2348035550000" in p and "With: Aisha Bello" in p
     assert "never blame them" in p and "share no details" in p
+    assert "Do not offer or mention WhatsApp" in p and "send_whatsapp_confirmation" not in p
+    assert "send_whatsapp_confirmation once" in os_.prompt_block(brief(), "+2348035550000", whatsapp=True)
 
 
 def test_system_prompt_uses_outbound_block_instead_of_caller_id():

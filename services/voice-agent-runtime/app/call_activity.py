@@ -34,6 +34,7 @@ _LABELS = {
     "request_human": "Fetching a colleague",
     "capture_location": "Noting the location",
     "save_caller_details": "Saving your details",
+    "send_whatsapp_confirmation": "Sending you a WhatsApp",
     "prefill_booking": "Filling in the form",
     "navigate_to_page": "Opening the page",
     "highlight_element": "Pointing it out",

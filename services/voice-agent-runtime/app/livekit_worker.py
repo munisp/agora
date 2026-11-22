@@ -1198,6 +1198,19 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
 
     @lk_llm.ai_callable(
         description=(
+            "Send the person a WhatsApp message confirming their appointment (service, with whom, when). Call it "
+            "once, right after they confirm an appointment or you book one. Mention the WhatsApp only if this "
+            "returns status sent."
+        )
+    )
+    async def send_whatsapp_confirmation(self, offering: str, when: str, team_member: str = "") -> str:
+        import json
+
+        result = await self._tools.send_whatsapp_confirmation(offering=offering, when=when, team_member=team_member or None)
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
             "Save the caller's location to their contact record (emergency / "
             "location-first flow). Pass the spoken address in address_text; "
             "pass lat and lng only when the caller gave exact coordinates."
@@ -1594,8 +1607,12 @@ async def build_voice_agent(
             # identity verification: lookups/changes of existing bookings still need the one-time code.
             if caller_phone:
                 session.confirmed_phone = caller_phone
+            # WhatsApp confirmations: the number typed into the demo phone; the number we reached only when
+            # WHATSAPP_CONFIRMATIONS=on (demo contacts carry realistic numbers that may be real people's).
+            session.whatsapp_to = (sip_call.attributes or {}).get("agora.whatsapp") or (
+                caller_phone if settings.whatsapp_confirmations == "on" else "") or None
+            session.outbound_prompt = outbound_script.prompt_block(brief, caller_phone, whatsapp=bool(session.whatsapp_to))
             session.outbound_greeting = outbound_script.greeting(ctx, brief)
-            session.outbound_prompt = outbound_script.prompt_block(brief, caller_phone)
             log.info("outbound call brief", purpose=brief.purpose or "general", named=bool(brief.contact_name),
                      facts=sorted(brief.context))
     else:

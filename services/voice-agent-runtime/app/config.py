@@ -88,6 +88,7 @@ DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
     # 2026-11-21: self-reported caller details to the CRM at the start of a call. Tier 0 like the web
     # form: booking-service only fills blank fields on an existing contact, so it can't take one over.
     "save_caller_details": TIER_LOW,
+    "send_whatsapp_confirmation": TIER_LOW,
     # Tier 1 — MEDIUM (confirmed identity)
     "book_appointment": TIER_MEDIUM,
     "capture_location": TIER_MEDIUM,
@@ -572,6 +573,12 @@ class Settings:
     agents_registry_url: str = "http://conversation:7007"
     # conversation-service base for transcripts (app/transcripts.py); "" disables recording.
     conversation_url: str = "http://conversation:7007"
+    # 2026-11-22: WhatsApp confirmations after a call (send_whatsapp_confirmation -> POST /v1/whatsapp/send).
+    messaging_gateway_url: str = "http://messaging-gateway:7011"
+    # Who send_whatsapp_confirmation may message: "demo_only" (default) = only the number typed into the browser demo
+    # phone (Leadway's demo contacts have realistic numbers that may belong to real people); "on" = also the person an
+    # outbound call reached. Inbound calls never send.
+    whatsapp_confirmations: str = "demo_only"
     agents_cache_ttl_s: int = 30
 
     # Multilingual receptionist (Wave 5 #3, app/multilang.py): language ->
@@ -838,6 +845,8 @@ def load_settings() -> Settings:
         outbound_cps=_env_float("OUTBOUND_CPS", 1.0),
         agents_registry_url=_env("AGENTS_REGISTRY_URL", "http://conversation:7007"),
         conversation_url=_env("CONVERSATION_URL", "http://conversation:7007"),
+        messaging_gateway_url=_env("MESSAGING_GATEWAY_URL", "http://messaging-gateway:7011"),
+        whatsapp_confirmations=_env("WHATSAPP_CONFIRMATIONS", "demo_only"),
         agents_cache_ttl_s=_env_int("AGENTS_CACHE_TTL_S", 30),
         piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
         tts_cache_size=_env_int("VOICE_TTS_CACHE_SIZE", 256),

@@ -243,6 +243,26 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "send_whatsapp_confirmation",
+            "description": (
+                "Send the person a WhatsApp message confirming their appointment (service, with whom, when). Call it "
+                "once, right after they confirm an appointment or you book one. Mention the WhatsApp only if this "
+                "returns status sent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "offering": {"type": "string", "description": "The service, e.g. 'RSA Registration and Onboarding Call'"},
+                    "team_member": {"type": "string", "description": "Who it is with, e.g. 'Aisha Bello' (empty if unknown)"},
+                    "when": {"type": "string", "description": "Day and time as you said it, e.g. 'Tuesday 24 November at 9:00 am'"},
+                },
+                "required": ["offering", "when"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_caller_details",
             "description": (
                 "Save the caller's name, email and phone number to the CRM as soon as they have CONFIRMED the "
@@ -1351,6 +1371,43 @@ class ToolLayer:
             await self._emit_tool_event("save_caller_details", "error", {"error": str(exc)[:200]})
             return {"status": "error", "message": "The details could not be saved just now; carry on helping the caller."}
 
+    # ------------------------------------ WhatsApp confirmation (2026-11-22)
+    async def send_whatsapp_confirmation(
+        self, offering: str, when: str, team_member: str | None = None
+    ) -> dict[str, Any]:
+        """WhatsApp the person their appointment details via the messaging-gateway (POST /v1/whatsapp/send). The text is
+        composed HERE from the arguments (no free-form model text reaches the customer). Sent to the session's WhatsApp
+        number (session.whatsapp_to: the demo phone's chosen number, or the callee when WHATSAPP_CONFIRMATIONS=on).
+        NEVER raises: a failure tells the model to carry on (the call must go on)."""
+        # only the number the call set up for this (demo phone's number, or the callee when enabled) — never a guess
+        to = (self._session.whatsapp_to or "").strip()
+        offering, when = " ".join((offering or "").split())[:120], " ".join((when or "").split())[:80]
+        team_member = " ".join((team_member or "").split())[:80]
+        if not to or not offering or not when:
+            return {"status": "error", "message": "No WhatsApp number for this call; do not mention WhatsApp, carry on."}
+        first = (self._session.caller_name or "").split()[0] if (self._session.caller_name or "").strip() else ""
+        business = self._ctx.display_name or self._ctx.site_slug
+        text = (
+            f"Hello{(' ' + first) if first else ''}, this is {business}.\n\n"
+            f"\u2705 Your {offering}{(' with ' + team_member) if team_member else ''} on {when} is confirmed.\n\n"
+            "We'll send you a reminder before it. Reply here if you need to change anything."
+        )
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self._settings.http_timeout_s) as client:
+                r = await client.post(f"{self._settings.messaging_gateway_url.rstrip('/')}/v1/whatsapp/send",
+                                      json={"to": to, "message": text})
+            if r.status_code >= 400:
+                raise RuntimeError(f"messaging-gateway {r.status_code}: {r.text[:160]}")
+            await self._emit_tool_event("send_whatsapp_confirmation", "ok", self._event_phone_detail(to))
+            log.info("whatsapp confirmation sent", conversation_id=self._session.conversation_id)
+            return {"status": "sent", "message": "Sent. Tell them a WhatsApp confirmation is on its way."}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("whatsapp confirmation failed", error=str(exc)[:200])
+            await self._emit_tool_event("send_whatsapp_confirmation", "error", {"error": str(exc)[:200]})
+            return {"status": "error", "message": "The WhatsApp message could not be sent just now; do not mention it."}
+
     # -------------------------------------------- location capture (W11 C)
     async def capture_location(
         self,
@@ -1662,6 +1719,11 @@ class ToolLayer:
                 booking_id=str(arguments.get("booking_id", "")),
                 phone=str(arguments.get("phone", "")),
                 reason=arguments.get("reason"),
+            ),
+            "send_whatsapp_confirmation": lambda: self.send_whatsapp_confirmation(
+                offering=str(arguments.get("offering", "")),
+                when=str(arguments.get("when", "")),
+                team_member=arguments.get("team_member"),
             ),
             "save_caller_details": lambda: self.save_caller_details(
                 name=str(arguments.get("name", "")),

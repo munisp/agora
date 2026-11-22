@@ -136,7 +136,7 @@ _PURPOSE_RULES = {
 }
 
 
-def prompt_block(brief: OutboundBrief, callee_phone: str = "") -> str:
+def prompt_block(brief: OutboundBrief, callee_phone: str = "", whatsapp: bool = False) -> str:
     """System-prompt block for an outbound call (appended to the normal receptionist prompt)."""
     facts = [f"- Person we are calling: {brief.contact_name}" if brief.contact_name else "- Person we are calling: (name not given)"]
     if callee_phone:
@@ -158,5 +158,9 @@ def prompt_block(brief: OutboundBrief, callee_phone: str = "") -> str:
         "- Never say \"thank you for calling\". Do NOT ask for their name, phone number or email: you already "
         "have them below (offer to update the email only if they bring it up).\n"
         + "\n".join(facts) + "\n" + identity + "\n" + _PURPOSE_RULES.get(brief.purpose, _PURPOSE_RULES[""]) + "\n"
-        "- Keep it short: this person did not plan to be on the phone now. If it is a bad time, offer to call back.\n"
+        + ("- Once they confirm the appointment or you book one, call send_whatsapp_confirmation once with the service, "
+           "who it is with and the day and time. Only if it answers \"sent\", tell them a WhatsApp confirmation is on "
+           "its way; never mention WhatsApp before that.\n" if whatsapp else
+           "- Do not offer or mention WhatsApp messages on this call.\n")
+        + "- Keep it short: this person did not plan to be on the phone now. If it is a bad time, offer to call back.\n"
     )

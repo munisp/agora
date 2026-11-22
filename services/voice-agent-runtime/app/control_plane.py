@@ -170,6 +170,8 @@ class OutboundCallRequest(BaseModel):
 
 class DemoPhoneAction(BaseModel):
     call_id: str = Field(min_length=8, max_length=64)
+    # Answer only: the WhatsApp number confirmations go to (the person demoing, not the contributor on the booking).
+    whatsapp: str | None = Field(default=None, max_length=32)
 
 
 class VoiceSessionResponse(BaseModel):
@@ -820,6 +822,11 @@ def create_app(
         if not ring or ring["call_id"] != body.call_id:
             raise HTTPException(status_code=410, detail="this call is no longer ringing")
         demo_rings.pop(site, None)
+        wa = re.sub(r"[\s().-]", "", body.whatsapp or "")
+        if re.fullmatch(r"0[789]\d{9}", wa):
+            wa = "+234" + wa[1:]
+        if re.fullmatch(r"\+?\d{8,15}", wa):
+            ring["attributes"][outbound_script.ATTR_PREFIX + "whatsapp"] = wa if wa.startswith("+") else "+" + wa
         from livekit import api as lk_api
 
         token = (

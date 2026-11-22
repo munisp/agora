@@ -85,6 +85,8 @@ class SessionState:
     # from the SIP attributes (not persisted, like ivr_menu).
     outbound_greeting: str | None = None
     outbound_prompt: str | None = None
+    # WhatsApp number for send_whatsapp_confirmation (the demo phone may name a different one than the number called)
+    whatsapp_to: str | None = None
     last_booking_ids: list[str] = field(default_factory=list)
     # Multi-agent crews (SPEC-W3 §4, innovation 6): id of the specialist
     # agent currently steering the persona, or None for the base persona.
