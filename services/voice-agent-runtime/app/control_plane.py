@@ -57,7 +57,7 @@ import hmac
 import json
 import uuid
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
@@ -156,6 +156,11 @@ class OutboundCallRequest(BaseModel):
 
     site_slug: str = Field(min_length=1, max_length=64)
     phone_number: str = Field(min_length=2, max_length=32)
+    # 2026-11-22 (app/outbound_script.py): why we are calling and what to say. All optional; without a purpose the
+    # receptionist introduces itself and asks how it can help.
+    purpose: Literal["confirm_appointment", "waitlist_offer", "no_show_rebook", "callback"] | None = None
+    contact_name: str | None = Field(default=None, max_length=120)
+    context: dict[str, str] = Field(default_factory=dict, max_length=8)
 
 
 class VoiceSessionResponse(BaseModel):
@@ -476,7 +481,8 @@ def create_app(
         await outbound_pacer.acquire()
         try:
             call = await outbound.place_outbound_call(
-                settings, req.site_slug, req.phone_number
+                settings, req.site_slug, req.phone_number,
+                purpose=req.purpose, contact_name=req.contact_name, context=req.context,
             )
         except outbound.OutboundError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -486,6 +492,7 @@ def create_app(
             "status": "dialing",
             "site_slug": call.site_slug,
             "phone_number": call.phone_number,
+            "purpose": req.purpose or "general",
         }
 
     @app.post("/voice/chat")

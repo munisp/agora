@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from . import sip
+from . import outbound_script, sip
 from .logging import get_logger
 
 log = get_logger("outbound")
@@ -169,7 +169,8 @@ async def _create_sip_participant(api: Any, request: Any) -> Any:
     return await api.sip.create_sip_participant(request)
 
 
-def _build_participant_request(trunk_id: str, room: str, call_to: str, identity: str) -> Any:
+def _build_participant_request(trunk_id: str, room: str, call_to: str, identity: str,
+                               attributes: dict[str, str] | None = None) -> Any:
     """Construct the CreateSIPParticipant request for the INSTALLED
     livekit-api (lazy import — tests stub livekit.protocol.sip)."""
     from livekit.protocol import sip as proto_sip  # noqa: PLC0415 - lazy by design
@@ -184,6 +185,8 @@ def _build_participant_request(trunk_id: str, room: str, call_to: str, identity:
             "room_name": room,
             "participant_identity": identity,
         }
+        if attributes:  # 2026-11-22: the call's purpose + facts (app/outbound_script.py)
+            kwargs["participant_attributes"] = dict(attributes)
         try:
             return cls(**kwargs)
         except TypeError:
@@ -200,6 +203,9 @@ async def place_outbound_call(
     site_slug: str,
     phone_number: str,
     *,
+    purpose: str | None = None,
+    contact_name: str | None = None,
+    context: dict[str, Any] | None = None,
     api: Any | None = None,
 ) -> OutboundCall:
     """Dial ``phone_number`` (E.164) on behalf of ``site_slug``.
@@ -233,7 +239,8 @@ async def place_outbound_call(
         close_api = True
     try:
         request = _build_participant_request(
-            trunk_id, room, callee, identity=f"out-{callee}"
+            trunk_id, room, callee, identity=f"out-{callee}",
+            attributes=outbound_script.to_attributes(purpose, contact_name, context),
         )
         await _create_sip_participant(api, request)
     except OutboundError:
@@ -251,5 +258,6 @@ async def place_outbound_call(
         site_slug=slug,
         callee=callee,
         trunk_id=trunk_id,
+        purpose=purpose or "general",
     )
     return OutboundCall(room=room, call_id=call_id, site_slug=slug, phone_number=callee)

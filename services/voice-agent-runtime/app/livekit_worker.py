@@ -47,7 +47,7 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
-from . import dtmf, outbound, emergency, ivr_menu, metrics, sip
+from . import dtmf, outbound, outbound_script, emergency, ivr_menu, metrics, sip
 from . import visitor as visitor_mod
 from . import dead_mic, greeting_prerender
 from .async_tools import (
@@ -1585,6 +1585,19 @@ async def build_voice_agent(
         # K15(c): claimed (unverified) hint only — never confirmed.
         sip.attach_caller_id(session, sip_call.caller_phone)
         caller_phone = session.claimed_phone or ""
+        if sip_call.tenant_source == "outbound":
+            # 2026-11-22: we placed this call (app/outbound_script.py): who we called and why, from the dialer.
+            brief = outbound_script.from_attributes(sip_call.attributes)
+            session.caller_name = brief.contact_name or None
+            # We dialed this number and the person answered on it, so it is their phone for the booking read-back
+            # policy (unlike an inbound caller ID, which can be spoofed — K15(c) stays as is for inbound). This is NOT
+            # identity verification: lookups/changes of existing bookings still need the one-time code.
+            if caller_phone:
+                session.confirmed_phone = caller_phone
+            session.outbound_greeting = outbound_script.greeting(ctx, brief)
+            session.outbound_prompt = outbound_script.prompt_block(brief, caller_phone)
+            log.info("outbound call brief", purpose=brief.purpose or "general", named=bool(brief.contact_name),
+                     facts=sorted(brief.context))
     else:
         # 2026-11-21: the web caller's pre-call form (self-reported; app/visitor.py).
         visitor_mod.apply(session, visitor)
@@ -1614,6 +1627,7 @@ async def build_voice_agent(
         caller_phone=caller_phone or None,
         keypad_menu_hint=keypad_hint,
         visitor=visitor_mod.from_session(session),
+        outbound=session.outbound_prompt,
     )
 
     # A Nigerian language the caller chose on the call page: the call starts in it; the caller may switch later.
@@ -1760,6 +1774,7 @@ async def build_voice_agent(
             caller_phone=session.confirmed_phone or session.claimed_phone,
             keypad_menu_hint=keypad_hint,
             visitor=visitor_mod.from_session(session),
+            outbound=session.outbound_prompt,
         )
         try:
             msgs = agent.chat_ctx.messages
@@ -1848,6 +1863,7 @@ async def build_voice_agent(
                 caller_phone=session.confirmed_phone or session.claimed_phone,
                 keypad_menu_hint=keypad_hint,
                 visitor=visitor_mod.from_session(session),
+                outbound=session.outbound_prompt,
             )
             if inbound.code_switch:
                 ctx.code_switch = True
@@ -2095,6 +2111,13 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
             return
         _said("agent")(msg)
 
+    def _agent_interrupted(msg, *_a, **_k) -> None:
+        text = _message_text(msg)
+        if spoken_pairs:
+            spoken_pairs.clear()  # the translated pieces of a cut-off reply must not pile into the next bubble
+        if text and text.strip():
+            _send([{"role": "agent", "text": text.rstrip() + " …"}])
+
     def _tools(called, *_a, **_k) -> None:
         turns = []
         for fn in called or []:
@@ -2109,6 +2132,9 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
     try:
         agent.on("user_speech_committed", _user_said)
         agent.on("agent_speech_committed", _agent_said)
+        # livekit-agents 0.10 never commits an interrupted reply, so on phone calls (people talk over each other)
+        # whole receptionist turns were missing from Conversations (2026-11-22): store what was said, marked "…".
+        agent.on("agent_speech_interrupted", _agent_interrupted)
         agent.on("function_calls_finished", _tools)
         llm = getattr(agent, "_llm", None)
         if hasattr(llm, "on_extra_tools"):
@@ -2346,12 +2372,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     menu_line = ivr_menu.menu_line(session.ivr_menu) if session.ivr_menu else None
     # 2026-11-21: name, email and phone are taken at the start of the call unless the caller's form gave them.
     ask_first_known = visitor_mod.from_session(session) is not None
-    await agent.say(
-        call_language.greeting(getattr(agent, "agora_call_language", ""), getattr(tenant_ctx, "display_name", ""),
-                               build_greeting(tenant_ctx, menu_line=menu_line, ask_details=not ask_first_known),
-                               ask_details=not ask_first_known),
-        allow_interruptions=True,
-    )
+    # 2026-11-22: a call WE placed opens with who is calling and an identity check, never "thank you for calling".
+    opening = session.outbound_greeting or call_language.greeting(
+        getattr(agent, "agora_call_language", ""), getattr(tenant_ctx, "display_name", ""),
+        build_greeting(tenant_ctx, menu_line=menu_line, ask_details=not ask_first_known),
+        ask_details=not ask_first_known)
+    await agent.say(opening, allow_interruptions=True)
     # SPEC-W71 P6: warm the TTS LRU mid-call with the tool-ack/filler phrases
     # (derived from this tenant's ToolAckPolicy) + standard closers. Scheduled
     # AFTER session start and the greeting — fire-and-forget; failures log.

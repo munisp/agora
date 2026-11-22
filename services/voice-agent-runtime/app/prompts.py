@@ -242,6 +242,7 @@ def build_system_prompt(
     caller_phone: str | None = None,
     keypad_menu_hint: str | None = None,
     visitor: dict[str, str] | None = None,
+    outbound: str | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -324,7 +325,10 @@ def build_system_prompt(
     # applies to lookup/reschedule/cancel and the read-back policy to new
     # bookings.
     # 2026-11-21: details from the public page's form (app/visitor.py); they replace the SIP caller-ID hint.
-    if visitor:
+    if outbound:
+        # 2026-11-22: a call the platform placed (app/outbound_script.prompt_block): replaces the caller-ID hint.
+        prompt += outbound
+    elif visitor:
         from .visitor import prompt_block
         prompt += prompt_block(visitor)
     elif caller_phone:

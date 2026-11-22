@@ -227,6 +227,19 @@ class TestPlaceOutboundCall:
         assert req.kwargs["sip_call_to"] == "+2348030000000"
         assert req.kwargs["room_name"] == call.room
         assert req.kwargs["participant_identity"] == "out-+2348030000000"
+        assert "participant_attributes" not in req.kwargs  # no purpose given -> a general call, nothing attached
+
+    async def test_purpose_and_facts_ride_as_participant_attributes(self, sip_proto_stub):
+        # 2026-11-22: the receptionist reads these back (app/outbound_script.py) for its opening line and prompt.
+        api = _FakeApi()
+        await outbound.place_outbound_call(
+            _dial_settings(), "acme", "+2348030000000", api=api, purpose="confirm_appointment",
+            contact_name="Ngozi Okafor", context={"team_member": "Aisha Bello", "when": "Tuesday at 9 a.m."},
+        )
+        assert api.sip.requests[0].kwargs["participant_attributes"] == {
+            "agora.purpose": "confirm_appointment", "agora.contact_name": "Ngozi Okafor",
+            "agora.team_member": "Aisha Bello", "agora.when": "Tuesday at 9 a.m.",
+        }
 
     async def test_missing_proto_type_is_honest_502(self, monkeypatch):
         # livekit-api without the request type: honest 502, never a crash.
