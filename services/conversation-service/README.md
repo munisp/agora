@@ -150,3 +150,44 @@ docs/compliance/ndpa.md):
   did not cover. Conversation shells are kept (referential integrity); only
   turn content is deleted. Indexed copies in OpenSearch are NOT covered —
   see docs/compliance/ndpa.md for the indexer caveat.
+
+## Advanced search (SPEC-W117)
+
+`GET /v1/conversations/search` (`app/search.py`) is the OpenSearch-backed
+advanced search over the turn-level `conversations` index (mapping +
+TranscriptIndexer from the Indexer section above — no re-index, no mapping
+change).
+
+- **Auth**: identical to the list endpoint (`_require_tenant` — the
+  X-Tenant-Slugs gateway binding). The resolved tenant is a **mandatory
+  `term` filter, always the first filter in the bool query** — tenant
+  isolation is enforced at the query level, never post-filtered
+  client-side.
+- **Params**: `q` (full-text, optional; `match` on `text` with
+  `operator=and`, `fuzziness=AUTO`), `channel`, `site_slug`,
+  `role` (user|agent|tool|system), `conversation_id` (uuid),
+  `from_ts`/`to_ts` (ISO-8601; invalid => 400; `from>to` => 400),
+  `limit` (1..100, default 25), `offset` (>=0, default 0,
+  `limit+offset <= 10000` result window).
+- **Pure builder**: `build_search_query()` assembles the whole body
+  without touching a cluster — unit-tested standalone; endpoint tests use
+  a fake async OpenSearch client and assert the exact query that reached
+  the cluster (including the tenant term).
+- **Fail closed**: when OpenSearch is not configured (or the cluster
+  errors) the route answers **503 — no silent Postgres LIKE fallback**.
+  A degraded duplicate of the index is worse than a loud gap.
+- **Response**: `{hits: [{conversation_id, site_slug, channel, role,
+  text, audio_url, ts}], total, limit, offset}` sorted by `ts` desc.
+- `OPENSEARCH_ADDR` is read at startup; a boot-time client-construction
+  failure is non-fatal (the rest of the service keeps working; only
+  search 503s).
+
+**Admin surface**: `apps/admin-web/app/app/[orgSlug]/conversations/` (SPEC
+-W117 §5) gates on `canViewConversations` (owner/admin/staff), uses the
+reusable `components/advanced-search-bar.tsx` + pure
+`lib/advanced-search.ts` (chips, inclusive day bounds, paging clamps) and
+calls the endpoint through the existing `/api/conversations/*` APISIX
+wildcard. On 503 the screen shows a loud "search temporarily unavailable"
+note and renders **no substitute list**. Follow-on data-heavy screens
+(bookings/contacts/leads) adopt the same bar + lib once their Go backends
+grow search endpoints (V-FUNDS).

@@ -36,6 +36,7 @@ import {
   ContactRound,
   Siren,
   Inbox,
+  Search,
   Scale,
   Fingerprint,
 } from "lucide-react";
@@ -73,6 +74,8 @@ const items: NavItem[] = [
   { segment: "leads", label: "Leads", icon: Magnet },
   { segment: "contacts", label: "Contacts", icon: ContactRound },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
+  // SPEC-W117: OpenSearch advanced search across transcripts.
+  { segment: "conversations", label: "Conversations", icon: Search },
   { segment: "voice-agent", label: "Voice Agent", icon: Mic },
   // SPEC-W38: self-serve agents registry (wizard + capture records).
   { segment: "agents", label: "Agents", icon: Bot },

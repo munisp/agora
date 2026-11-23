@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "next lint",
     "test:kb-upload": "sh scripts/test-knowledge-upload.sh",
-    "test:chat-upload": "sh scripts/test-chat-upload.sh"
+    "test:chat-upload": "sh scripts/test-chat-upload.sh",
+    "test:advanced-search": "sh scripts/test-advanced-search.sh"
   },
   "dependencies": {
     "@telida/maplibre-gl-draw": "^1.4.1",
