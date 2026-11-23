@@ -32,6 +32,13 @@ CREATE DATABASE kyc;
 -- (services/ocr-service/app/store.py ensure* idiom; roles/grants in
 -- 05-app-roles.sql).
 CREATE DATABASE ocr;
+-- W118 (SPEC-W118): chatwoot-bridge mapping/link registry
+-- (32-chatwoot-bridge-schema.sql + service boot bootstrap; roles in
+-- 05-app-roles.sql) and the Chatwoot rails application's own database
+-- (third-party app, uses the superuser DSN like Twenty — see
+-- infra/docker-compose.crm.yml).
+CREATE DATABASE chatwoot_bridge;
+CREATE DATABASE chatwoot;
 -- W47 (SPEC-W47 / A-DB DB-01 CRIT): payments-service database. Previously the
 -- tenant-scoped money tables (payout_beneficiaries, deposit_provenance,
 -- payout_attempts, rail_attempts) lived in the default superuser database

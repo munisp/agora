@@ -40,11 +40,16 @@ def conversation_turn_event(
     ts: datetime,
     audio_url: str | None = None,
     redacted: bool = False,
+    origin: str | None = None,
 ) -> dict[str, Any]:
     """ConversationTurn event for opendesk.conversation.transcripts (SPEC §4).
 
     ``redacted`` marks that ``text`` has already been PII-redacted
     (SPEC-W34 GF3) so downstream consumers know not to expect raw PII.
+
+    SPEC-W118: ``origin`` (default None) tags bridge-appended turns
+    (e.g. "chatwoot") so consumers can break echo loops. None => the
+    event payload is byte-identical to pre-W118 (no "origin" key).
     """
     data: dict[str, Any] = {
         "conversationId": str(conversation_id),
@@ -56,6 +61,8 @@ def conversation_turn_event(
     }
     if audio_url:
         data["audioUrl"] = audio_url
+    if origin:
+        data["origin"] = origin
     return cloud_event(
         "com.opendesk.conversation.ConversationTurn",
         subject=site_slug,

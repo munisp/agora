@@ -323,6 +323,7 @@ async def _persist_turn(
     tool_calls: list[dict[str, Any]] | None = None,
     audio_url: str | None = None,
     idempotency_key: str | None = None,
+    origin: str | None = None,
 ) -> tuple[models.Turn, bool]:
     """Enrich + persist + fan out one turn; returns (turn, created).
 
@@ -376,6 +377,7 @@ async def _persist_turn(
             ts=turn_row["ts"],
             audio_url=audio_url,
             redacted=True,
+            origin=origin,
         )
         event_holder["event"] = event
         return event

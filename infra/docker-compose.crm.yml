@@ -12,6 +12,8 @@ networks:
 volumes:
   twenty-local-storage:
   twenty-redis-data:
+  chatwoot-storage:
+  chatwoot-redis-data:
 
 x-twenty-env: &twenty-env
   NODE_PORT: "3000"
@@ -31,6 +33,23 @@ x-twenty-env: &twenty-env
   MESSAGE_QUEUE_TYPE: bull-mq
   STORAGE_TYPE: local
   SIGN_IN_PREFILLED: "true"
+
+x-chatwoot-env: &chatwoot-env
+  # SPEC-W118: Chatwoot CE (human-agent console). Uses the SHARED postgres
+  # with its own database (third-party app, same trust model as Twenty) +
+  # a dedicated Redis. DEV ONLY secret default matches .env.example —
+  # production MUST override via the secrets store.
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DATABASE: chatwoot
+  POSTGRES_USERNAME: opendesk
+  POSTGRES_PASSWORD: opendesk
+  REDIS_URL: redis://chatwoot-redis:6379
+  SECRET_KEY_BASE: ${CHATWOOT_SECRET_KEY_BASE:-opendesk-chatwoot-secret-key-base-dev-change-in-prod-0123456789abcdef0123456789abcdef}
+  RAILS_ENV: production
+  NODE_ENV: production
+  RAILS_LOG_TO_STDOUT: "true"
+  FRONTEND_URL: ${CHATWOOT_FRONTEND_URL:-http://localhost:3120}
 
 # ---------------------------------------------------------------------------
 # W46-I (P-DATA C-01/C-02): shared anchors applied to EVERY service below.
@@ -126,3 +145,93 @@ services:
       timeout: 3s
       retries: 20
     networks: [opendesk]
+
+  # ---------------- Chatwoot rails (SPEC-W118): agent console UI ----------------
+  chatwoot-rails:
+    logging: *default-logging
+    deploy: *default-limits
+    image: chatwoot/chatwoot:v4.18.0
+    container_name: chatwoot-rails
+    restart: unless-stopped
+    environment: *chatwoot-env
+    # Third-party UI app (like Twenty :3100) — the ONLY published port of
+    # the W118 stack; the bridge itself stays network-internal (GF4).
+    ports:
+      - "3120:3000"
+    volumes:
+      - chatwoot-storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chatwoot-redis:
+        condition: service_healthy
+      chatwoot-prepare:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 >/dev/null 2>&1 || curl -fsS http://localhost:3000 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    networks: [opendesk]
+
+  # ---------------- Chatwoot sidekiq (jobs: webhooks, mailers) ----------------
+  chatwoot-sidekiq:
+    logging: *default-logging
+    deploy: *default-limits
+    image: chatwoot/chatwoot:v4.18.0
+    container_name: chatwoot-sidekiq
+    restart: unless-stopped
+    command: ["bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    environment: *chatwoot-env
+    volumes:
+      - chatwoot-storage:/app/storage
+    depends_on:
+      chatwoot-rails:
+        condition: service_started
+      chatwoot-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f sidekiq >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks: [opendesk]
+
+  # ---------------- Chatwoot one-shot DB prepare (migrations + seed) ----------------
+  chatwoot-prepare:
+    logging: *default-logging
+    image: chatwoot/chatwoot:v4.18.0
+    container_name: chatwoot-prepare
+    restart: "no"
+    command: ["bundle", "exec", "rails", "db:chatwoot_prepare"]
+    environment: *chatwoot-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chatwoot-redis:
+        condition: service_healthy
+    networks: [opendesk]
+
+  # ---------------- Dedicated Redis for Chatwoot (sidekiq + cache) ----------------
+  chatwoot-redis:
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    image: redis:7-alpine
+    container_name: chatwoot-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - chatwoot-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [opendesk]
+

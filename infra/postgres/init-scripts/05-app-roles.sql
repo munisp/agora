@@ -549,6 +549,59 @@ $$;
 \endif
 
 -- ---------------------------------------------------------------------------
+-- Wave 118 (SPEC-W118): chatwoot-bridge role. Same NOLOGIN group + LOGIN
+-- member pattern as app_ocr; the group holds the grants so FORCE ROW LEVEL
+-- SECURITY binds the runtime DSN (the opendesk superuser bypasses RLS).
+-- ---------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_chatwoot_bridge') THEN
+        CREATE ROLE app_chatwoot_bridge NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_chatwoot_bridge_login') THEN
+        CREATE ROLE app_chatwoot_bridge_login LOGIN PASSWORD 'app_chatwoot_bridge_dev_password' IN ROLE app_chatwoot_bridge;
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- chatwoot_bridge database (tables created by 32-chatwoot-bridge-schema.sql
+-- and, on pre-existing/standalone clusters, idempotently by the service at
+-- boot via app/store.py ensure_schema)
+-- ---------------------------------------------------------------------------
+SELECT EXISTS (SELECT FROM pg_database WHERE datname = 'chatwoot_bridge') AS chatwoot_bridge_db_exists\gset
+\if :chatwoot_bridge_db_exists
+\c chatwoot_bridge
+
+GRANT CONNECT ON DATABASE chatwoot_bridge TO app_chatwoot_bridge;
+GRANT USAGE ON SCHEMA public TO app_chatwoot_bridge;
+-- BOOTSTRAP EXCEPTION (documented, ocr idiom): chatwoot-bridge has no
+-- separate migration runner — app/store.py ensure_schema (CREATE TABLE IF
+-- NOT EXISTS + RLS) runs at boot on the runtime DSN, so the role needs
+-- CREATE on a fresh database (a no-op once 32-chatwoot-bridge-schema.sql
+-- has provisioned the tables). Revoke once a migration-runner split lands.
+GRANT CREATE ON SCHEMA public TO app_chatwoot_bridge;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_chatwoot_bridge;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_chatwoot_bridge;
+DO $$
+DECLARE
+    bootstrap TEXT;
+BEGIN
+    FOREACH bootstrap IN ARRAY ARRAY['opendesk', 'postgres', 'app_chatwoot_bridge_login'] LOOP
+        IF EXISTS (SELECT FROM pg_roles WHERE rolname = bootstrap) THEN
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_chatwoot_bridge', bootstrap);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public '
+                'GRANT USAGE, SELECT ON SEQUENCES TO app_chatwoot_bridge', bootstrap);
+        END IF;
+    END LOOP;
+END
+$$;
+\else
+\echo '05-app-roles: database chatwoot_bridge absent — skipping its grants section'
+\endif
+
+-- ---------------------------------------------------------------------------
 -- Wave 38 (SPEC-W38 F1/F3): agents registry + capture tables
 -- ---------------------------------------------------------------------------
 -- Explicit grants on the three W38 tables (created by
