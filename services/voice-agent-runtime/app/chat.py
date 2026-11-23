@@ -21,7 +21,7 @@ from .logging import get_logger
 from .transcripts import TranscriptRecorder, exchange_turns
 from .pipeline.llm import LLMInterface, run_tool_loop, run_tool_loop_stream
 from .plugin_tools import build_plugin_tools
-from .prompts import build_system_prompt
+from .prompts import build_system_prompt, is_tail_message, split_prompt
 from .session_state import (
     SessionState,
     SessionStore,
@@ -299,10 +299,17 @@ class ChatService:
         # the locale addendum tells the LLM to answer in the same register.
         if ctx.code_switch:
             system_prompt = f"{system_prompt}{codeswitch_instruction()}"
+        body, tail = split_prompt(system_prompt)
         if history and history[0].get("role") == "system":
-            history[0] = {"role": "system", "content": system_prompt}
+            history[0] = {"role": "system", "content": body}
         else:
-            history.insert(0, {"role": "system", "content": system_prompt})
+            history.insert(0, {"role": "system", "content": body})
+        # The per-conversation tail is its own system message right after the body (after the tool list in the
+        # model's template), so the body + tools stay byte-identical and cached.
+        if len(history) > 1 and history[1].get("role") == "system" and is_tail_message(str(history[1].get("content") or "")):
+            history[1] = {"role": "system", "content": tail}
+        elif tail:
+            history.insert(1, {"role": "system", "content": tail})
         # 2026-11-23 latency: this turn's knowledge rides the user's message for THIS request only (restored to the
         # plain message after the reply, see _strip_turn_knowledge), so the system prompt never changes per turn.
         content = message

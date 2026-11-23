@@ -80,6 +80,8 @@ from .prompts import (
     EMERGENCY_LOCATION_FIRST_ADDENDUM,
     build_greeting,
     build_system_prompt,
+    is_tail_message,
+    split_prompt,
 )
 from .session_state import SessionState
 from .tenant_context import TenantContext, fetch_tenant_context
@@ -269,6 +271,23 @@ def _openai_client(settings: Settings) -> Any:
     )
 
 
+def _set_system_prompt(msgs: list[Any], text: str) -> None:
+    """Swap the call's system prompt: stable body in message 0, per-conversation tail in message 1 (split_prompt)."""
+    if not msgs or msgs[0].role != "system":
+        return
+    body, tail = split_prompt(text)
+    msgs[0].content = body if isinstance(msgs[0].content, str) else [body]
+    second = msgs[1] if len(msgs) > 1 else None
+    second_text = ""
+    if second is not None and second.role == "system":
+        c = second.content
+        second_text = c if isinstance(c, str) else " ".join(x for x in (c or []) if isinstance(x, str))
+    if second is not None and second.role == "system" and is_tail_message(second_text):
+        second.content = tail if isinstance(second.content, str) else [tail]
+    elif tail:
+        msgs.insert(1, lk_llm.ChatMessage.create(text=tail, role="system"))
+
+
 def _worker_llm(settings: Settings) -> Any:
     # The plugin refuses to start without api_key even when handed a client.
     # ToolLoopLLM: the 0.10 pipeline drops tool calls made in the answer round (a second lookup = silence).
@@ -420,8 +439,10 @@ class SwitchingLanguageSTT:
             self._switch(code, 1.0)
 
     async def _identify(self, pcm: bytes, sample_rate: int, channels: int) -> tuple[str, float]:
+        t0 = time.monotonic()
         try:
             out = await self._naija.identify(pcm, sample_rate=sample_rate, channels=channels, candidates=self._allowed)
+            log.info("timing language id", ms=int((time.monotonic() - t0) * 1000))
         except Exception as exc:  # noqa: BLE001 - keep the current language
             log.warning("language identification failed", error=str(exc)[:200])
             return "", 0.0
@@ -459,6 +480,15 @@ class SwitchingLanguageSTT:
 
     async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
                              language: str | None = None, initial_prompt: str | None = None) -> str:
+        t0 = time.monotonic()
+        try:
+            return await self._transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, initial_prompt=initial_prompt)
+        finally:
+            log.info("timing speech recognition", ms=int((time.monotonic() - t0) * 1000),
+                     audio_s=round(len(pcm) / (2 * max(1, channels) * max(1, sample_rate)), 1), language=self.language)
+
+    async def _transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
+                              initial_prompt: str | None = None) -> str:
         english_turn = await self._maybe_switch(pcm, sample_rate, channels)
         extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
         if english_turn:
@@ -530,11 +560,21 @@ def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any,
     return voice_spec(code if code != "pcm" else "en"), ""
 
 
-def _naija_tts(node: "PiperTTSNode") -> Any:
+# English replies use a fast voice (first audio in ~0.3 s): waiting for 60 characters made a short opener ("I can help
+# with that.") wait for the whole next sentence to be generated, ~2 s of silence (2026-11-23 latency timeline).
+ENGLISH_MIN_CHUNK_CHARS = 20
+
+
+def chunk_chars_for(language: str | None) -> int:
+    return ENGLISH_MIN_CHUNK_CHARS if (language or "en") in ("", "en") else NAIJA_MIN_CHUNK_CHARS
+
+
+def _naija_tts(node: "PiperTTSNode", tokenizer: Any = None) -> Any:
     from livekit.agents import tokenize as lk_tokenize
 
     return lk_tts.StreamAdapter(
-        tts=node, sentence_tokenizer=lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS)
+        tts=node,
+        sentence_tokenizer=tokenizer or lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS),
     )
 
 
@@ -935,6 +975,15 @@ class PiperTTSNode(lk_tts.TTS):
             yield lk_tts.SynthesizedAudio(request_id=request_id, segment_id=segment_id, frame=frame)
 
     async def _stream(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
+        # 2026-11-23 latency timeline: how long this chunk took from text to its first audio.
+        t0, first = time.monotonic(), True
+        async for audio in self._stream_inner(text):
+            if first:
+                first = False
+                log.info("timing tts first audio", ms=int((time.monotonic() - t0) * 1000), chars=len(text))
+            yield audio
+
+    async def _stream_inner(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         # SPEC-W82 A3/A4.3/A4.5: pre-TTS transform (outbound translation,
         # normalization, pronunciation) BEFORE provider dispatch; fail-open
         # to the original text on any error.
@@ -1652,7 +1701,10 @@ async def build_voice_agent(
     chosen = caller_language if caller_language in call_language.NIGERIAN and settings.naija_speech_url else ""
     base_prompt = system_prompt
     system_prompt += call_language.prompt_instruction(chosen, think_in_english=settings.naija_think_in_english)
-    chat_ctx = lk_llm.ChatContext().append(role="system", text=system_prompt)
+    _body, _tail = split_prompt(system_prompt)
+    chat_ctx = lk_llm.ChatContext().append(role="system", text=_body)
+    if _tail:
+        chat_ctx.append(role="system", text=_tail)
     runner = AsyncToolRunner(
         timeout_s=settings.tool_timeout_s,
         ack_grace_ms=settings.tool_ack_grace_ms,
@@ -1740,7 +1792,17 @@ async def build_voice_agent(
     # A Nigerian-accented English voice (NAIJA_ENGLISH_VOICE): English and Pidgin are spoken by it, not piper/MMS.
     english_voice = settings.naija_english_voice if (settings.naija_speech_url or ":" in settings.naija_english_voice) else ""
 
+    from livekit.agents import tokenize as lk_tokenize
+
+    # The reply chunker follows the spoken language: short chunks for the fast English voice, longer ones for the
+    # Nigerian-language voices (they make about one sentence in real time).
+    chunker = lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS)
+
     def _set_voice(code: str) -> None:
+        try:
+            chunker._config.min_sentence_len = chunk_chars_for(code)
+        except Exception:  # noqa: BLE001 - keep the default chunking
+            pass
         tts_impl.voice, tts_impl.language = call_voice(code, english_voice=english_voice,
                                                        naija=bool(settings.naija_speech_url), voice_spec=_voice_spec,
                                                        language_voices=settings.naija_language_voices)
@@ -1795,9 +1857,7 @@ async def build_voice_agent(
             outbound=session.outbound_prompt,
         )
         try:
-            msgs = agent.chat_ctx.messages
-            if msgs and msgs[0].role == "system":
-                msgs[0].content = [new_prompt]
+            _set_system_prompt(agent.chat_ctx.messages, new_prompt)
         except Exception as exc:  # noqa: BLE001 - prompt stays at default
             log.warning("locale instruction swap failed", error=str(exc)[:200])
 
@@ -1810,8 +1870,7 @@ async def build_voice_agent(
         prompt = base_prompt + call_language.prompt_instruction(code, think_in_english=settings.naija_think_in_english)
         try:
             msgs = agent.chat_ctx.messages
-            if msgs and msgs[0].role == "system":
-                msgs[0].content = prompt if isinstance(msgs[0].content, str) else [prompt]
+            _set_system_prompt(msgs, prompt)
             # The opening system prompt alone lost to the recent turns: after Hausa turns the model answered an Igbo
             # turn in Hausa. A note at the end of the conversation, right before the reply, is followed reliably.
             name = call_language.NAMES.get(code, (code, code))[0]
@@ -1887,9 +1946,7 @@ async def build_voice_agent(
                 ctx.code_switch = True
                 ctx.code_switch_segments = list(inbound.segments)
                 new_prompt = f"{new_prompt}{codeswitch_instruction()}"
-            msgs = agent.chat_ctx.messages
-            if msgs and msgs[0].role == "system":
-                msgs[0].content = [new_prompt]
+            _set_system_prompt(agent.chat_ctx.messages, new_prompt)
         except Exception as exc:  # noqa: BLE001 - prompt stays at default
             log.warning("locale instruction swap failed", error=str(exc)[:200])
         return inbound.text
@@ -2003,7 +2060,8 @@ async def build_voice_agent(
         # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
         llm=_worker_llm(settings),
         tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked,
-                                    on_text=_speak_in_caller_language if speak_translator is not None else None))
+                                    on_text=_speak_in_caller_language if speak_translator is not None else None),
+                       chunker)
         if (switching_stt is not None or english_voice)
         else PiperTTSNode(tts_impl, chunked=settings.tts_chunked, on_text=_prepare_tts_text if w82_hooks else None),
         chat_ctx=chat_ctx,
@@ -2151,6 +2209,9 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
 
     try:
         agent.on("user_speech_committed", _user_said)
+        # 2026-11-23 latency timeline (worker logs): caller stops -> transcript -> receptionist audio.
+        for _ev in ("user_stopped_speaking", "user_speech_committed", "agent_started_speaking"):
+            agent.on(_ev, (lambda name: (lambda *_a, **_k: log.info("timing event", event_name=name)))(_ev))
         agent.on("agent_speech_committed", _agent_said)
         # livekit-agents 0.10 never commits an interrupted reply, so on phone calls (people talk over each other)
         # whole receptionist turns were missing from Conversations (2026-11-22): store what was said, marked "…".

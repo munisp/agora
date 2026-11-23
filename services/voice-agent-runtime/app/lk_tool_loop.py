@@ -12,6 +12,7 @@ is unchanged. Listeners hear about the extra calls (call activity on screen, tra
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable
 
 from livekit.agents import llm as lk_llm
@@ -134,12 +135,17 @@ class _ClaimGuardStream(lk_llm.LLMStream):
     async def _run(self) -> None:
         owner = self._owner
         try:
+            t0 = time.monotonic()
             stream = owner.inner.chat(chat_ctx=self._chat_ctx, fnc_ctx=self._fnc_ctx, **self._kwargs)
             held: list[Any] = []
             text = ""
             claimed = False
+            first = True
             try:
                 async for chunk in stream:
+                    if first:
+                        first = False
+                        log.info("timing llm first token", ms=int((time.monotonic() - t0) * 1000))
                     delta = "".join((getattr(c.delta, "content", None) or "") for c in getattr(chunk, "choices", []) or [])
                     held.append(chunk)
                     text += delta

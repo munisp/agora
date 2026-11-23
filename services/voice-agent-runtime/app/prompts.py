@@ -206,6 +206,24 @@ def build_greeting(ctx: TenantContext, menu_line: str | None = None, ask_details
     return f"{RECORDING_NOTICE_LINE} {greeting}"
 
 
+# 2026-11-23 latency: the model's chat template renders the TOOL list right after the first system message, so a
+# varying tail inside that message pushed ~2,000 tokens of tools out of the GPU server's prompt cache on every call.
+# Callers send the stable body and the per-conversation tail as two separate system messages (split_prompt).
+TAIL_MARK = "\n\nTHIS CONVERSATION\n"
+
+
+def split_prompt(text: str) -> tuple[str, str]:
+    """(stable body, per-conversation tail) of a build_system_prompt result; tail "" when there is none."""
+    if TAIL_MARK not in text:
+        return text, ""
+    body, tail = text.split(TAIL_MARK, 1)
+    return body, TAIL_MARK.lstrip("\n") + tail
+
+
+def is_tail_message(text: str) -> bool:
+    return text.startswith(TAIL_MARK.lstrip("\n"))
+
+
 def today_line(tz_name: str | None, now: datetime | None = None, *, clock_only: bool = False) -> str:
     """Today's date in the business's time zone. Without it the model guessed the year from its training data and
     asked for availability in the past (e.g. 2025), then told customers nothing was free."""
@@ -281,7 +299,7 @@ def build_system_prompt(
     # a short per-conversation TAIL (date/time, ids, caller details, language, active specialist, this turn's
     # knowledge). The GPU server can then resume from a saved point inside the body instead of re-reading ~5,000
     # tokens on every turn (gemma's sliding-window cache only resumes from checkpoints taken near a prompt's end).
-    tail = ("\n\nTHIS CONVERSATION\n" + today_line(ctx.timezone, clock_only=True)
+    tail = (TAIL_MARK + today_line(ctx.timezone, clock_only=True)
             + f"\n- conversation_id: {conversation_id}\n- site: {ctx.site_slug}\n")
     if turn_knowledge:
         tail += ("\nKNOWLEDGE FOR THE LATEST QUESTION (use it with the KNOWLEDGE above)\n"
