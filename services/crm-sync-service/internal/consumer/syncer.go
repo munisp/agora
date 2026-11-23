@@ -72,6 +72,9 @@ type Syncer struct {
 	// Summary writes the plain-language sentences of the call-summary note
 	// (nil or unconfigured: the note carries the structured facts only).
 	Summary CallSummarizer
+	// BookingURL (2026-11-23): booking-service base, for advisor names in person fields.
+	BookingURL string
+	teams      teamNames
 }
 
 // CallSummarizer turns a conversation into a short plain-language summary
@@ -247,6 +250,8 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 	if err != nil {
 		return err
 	}
+	s.fillPersonFields(ctx, tenantUUID, personID,
+		twentyc.PersonFacts{Channel: d.Source, Offering: d.OfferingName}, d.TeamMemberID)
 	if personID != "" && d.Phone != "" {
 		// Phone -> person edge: lets the SessionEnded call-quality note path
 		// resolve the caller when the Twenty phone lookup misses.
@@ -618,6 +623,7 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	s.fillPersonFields(ctx, tenantUUID, personID, callFacts(d.Quality), "")
 	noteID, err := s.tw(tenantUUID).CreateNote(ctx,
 		twentyc.CallSummaryNoteTitleFor(*d.Quality), twentyc.CallSummaryNote(*d.Quality, summary), personID)
 	if err != nil {
@@ -705,6 +711,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	s.fillPersonFields(ctx, tenantUUID, personID, callFacts(&q), "")
 	noteID, err := s.tw(tenantUUID).CreateNote(ctx, twentyc.CallSummaryNoteTitleFor(q), body, personID)
 	if err != nil {
 		return fmt.Errorf("create enriched call summary note: %w", err)
@@ -929,4 +936,17 @@ func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string
 		add(rec.ID, c)
 	}
 	return ids, nil
+}
+
+// callFacts: what a finished call says about the caller (2026-11-23). Only phone calls count as a channel (a website
+// voice call has no matching "how they reached us" choice).
+func callFacts(q *events.CallQuality) twentyc.PersonFacts {
+	if q == nil {
+		return twentyc.PersonFacts{}
+	}
+	f := twentyc.PersonFacts{Language: q.Language}
+	if q.Channel == "phone" {
+		f.Channel = "phone"
+	}
+	return f
 }

@@ -2693,6 +2693,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if session.caller_name:
                 quality["contact_name"] = session.caller_name
             quality["channel"] = "phone" if sip_call is not None else "web"
+            # 2026-11-23: the language the call ended in (the CRM's "preferred language").
+            if getattr(session, "active_language", None):
+                quality["language"] = session.active_language
         asyncio.get_event_loop().create_task(
             _publish_lifecycle(
                 dapr,

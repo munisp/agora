@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/opendesk/crm-sync-service/internal/twentyc"
 	"os"
 	"strconv"
 	"strings"
@@ -64,6 +65,7 @@ type Config struct {
 	GatewayURL         string // MESSAGING_GATEWAY_URL (WhatsApp/Telegram sends)
 	InboxWebhookSecret string // INBOX_WEBHOOK_SECRET (path secret of Chatwoot's webhook)
 	ConversationToken  string // CONVERSATION_INTERNAL_TOKEN (conversation-service internal routes)
+	BookingURL         string // BOOKING_URL (booking-service base, advisor names for person fields)
 }
 
 // TwentyRoute is one business-specific Twenty instance (see Config.TwentyRoutes).
@@ -74,8 +76,10 @@ type TwentyRoute struct {
 	APIKeyEnv        string   `json:"api_key_env"`
 	WebhookSecretEnv string   `json:"webhook_secret_env"`
 	WorkspaceID      string   `json:"workspace_id"`
-	APIKey           string   `json:"-"`
-	WebhookSecret    string   `json:"-"`
+	// PersonFields (2026-11-23): this business's own contact fields filled from bookings and calls.
+	PersonFields  *twentyc.PersonFields `json:"person_fields,omitempty"`
+	APIKey        string                `json:"-"`
+	WebhookSecret string                `json:"-"`
 }
 
 // Load reads configuration from the environment.
@@ -134,6 +138,7 @@ func Load() (Config, error) {
 	cfg.GatewayURL = envStr("MESSAGING_GATEWAY_URL", "")
 	cfg.InboxWebhookSecret = envStr("INBOX_WEBHOOK_SECRET", "")
 	cfg.ConversationToken = envStr("CONVERSATION_INTERNAL_TOKEN", "")
+	cfg.BookingURL = envStr("BOOKING_URL", "")
 	if raw := strings.TrimSpace(os.Getenv("TWENTY_ROUTES")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.TwentyRoutes); err != nil {
 			return cfg, fmt.Errorf("TWENTY_ROUTES is not valid JSON: %w", err)

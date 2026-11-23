@@ -111,12 +111,13 @@ func run() error {
 		c := twentyc.New(rt.URL, rt.APIKey, cfg.TwentyRatePerMin)
 		c.Observe = reg.ObserveTwentyCall
 		router.Add(rt.Tenants, rt.WorkspaceID, c)
+		router.SetFields(rt.Tenants, rt.PersonFields)
 		extraSecrets = append(extraSecrets, rt.WebhookSecret)
 		logger.Info("twenty route", zap.String("name", rt.Name), zap.String("url", rt.URL),
 			zap.Strings("tenants", rt.Tenants), zap.String("workspace_id", rt.WorkspaceID))
 	}
 
-	syncer := &consumer.Syncer{Twenty: twenty, Router: router, Map: st, Metrics: reg, Log: logger}
+	syncer := &consumer.Syncer{Twenty: twenty, Router: router, Map: st, Metrics: reg, Log: logger, BookingURL: cfg.BookingURL}
 	if cfg.ConversationURL != "" && cfg.SummaryLLMURL != "" {
 		syncer.Summary = callsummary.New(cfg.ConversationURL, cfg.SummaryLLMURL, cfg.SummaryLLMModel, cfg.SummaryTimeout)
 		logger.Info("call-summary sentences enabled", zap.String("model", cfg.SummaryLLMModel))
