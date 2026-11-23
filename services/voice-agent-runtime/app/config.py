@@ -624,6 +624,10 @@ class Settings:
     # Yoruba/Hausa/Igbo calls: the model reasons and uses its tools in English and each reply is translated just
     # before it is spoken (a model answering in Yoruba stopped calling its tools and claimed bookings it never made).
     naija_think_in_english: bool = False
+    # 2026-11-23: with think-in-English on, the receptionist still writes Yoruba/Hausa/Igbo replies DIRECTLY (one
+    # model round instead of reply + translation per sentence); the caller's words are still translated to English
+    # for it, and an English reply is still translated as a fallback. NAIJA_REPLY_DIRECT=1.
+    naija_reply_direct: bool = False
     cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
     # SPEC-W102 C3: LongCat-AudioDiT (Meituan, MIT code + weights) GPU-tier
     # provider via the longcat-tts sidecar — ZH+EN only (NOT a Nigerian
@@ -869,6 +873,7 @@ def load_settings() -> Settings:
                                     else "off"),
         naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
         naija_think_in_english=_env("NAIJA_THINK_IN_ENGLISH", "0").strip().lower() in ("1", "true", "yes", "on"),
+        naija_reply_direct=_env("NAIJA_REPLY_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
         longcat_tts_url=_env("LONGCAT_TTS_URL", "http://longcat-tts:5830"),
         tts_prosody=_env("TTS_PROSODY", "off").lower() in ("1", "on", "true", "yes"),

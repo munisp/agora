@@ -439,6 +439,7 @@ class SwitchingLanguageSTT:
     # A language the caller asked for in words sticks: an English-sounding half of the same sentence ("…I feel more
     # comfortable speaking Hausa") once flipped the call straight back to Pidgin. Only another spoken request moves it.
     _pinned = False
+    _pending: str | None = None  # a language heard once by sound, switched to only if heard again next turn
 
     def _follow_request(self, text: str) -> None:
         m = self._ASKS_FOR_LANGUAGE.search(text or "")
@@ -484,11 +485,24 @@ class SwitchingLanguageSTT:
             return confidence >= self.CODE_SWITCH_MIN_CONFIDENCE
         if seconds < self.MIN_SWITCH_S:
             return False
+        if self._pinned:
+            return False  # the caller ASKED for this language: only another spoken request moves the call
         target = self._target(detected)
         needed = (self.MIN_CONFIDENCE_FROM_ENGLISH
                   if self.language in _ENGLISH_FAMILY and target not in _ENGLISH_FAMILY else self.MIN_CONFIDENCE)
-        if target and confidence >= needed:
+        if not target or confidence < needed:
+            self._pending = None
+            return False
+        # 2026-11-23: one Yorùbá question was identified as Hausa and the receptionist answered in Hausa. Between
+        # languages by sound alone, a switch needs the same language on two turns in a row (a caller who really
+        # switches keeps speaking it), unless identification is near certain. Asking in words still switches at once.
+        if confidence >= self.MIN_CONFIDENCE_FROM_ENGLISH or self._pending == target:
+            self._pending = None
             self._switch(target, confidence)
+        else:
+            log.info("language change heard once; waiting for a second turn", current=self.language, heard=target,
+                     confidence=round(confidence, 3))
+            self._pending = target
         return False
 
     async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
@@ -607,7 +621,7 @@ class PrefetchStreamAdapter(lk_tts.StreamAdapter):
     synthesize) as soon as it is complete in the reply, up to PREFETCH sentences at once; audio is still played in
     the reply's order."""
 
-    PREFETCH = 3
+    PREFETCH = 2  # every sentence in flight shares the one GPU with the model and speech recognition
 
     def stream(self) -> Any:
         return _PrefetchStream(tts=self._tts, sentence_tokenizer=self._sentence_tokenizer, depth=self.PREFETCH)
@@ -1011,6 +1025,38 @@ class WhisperSTTNode(lk_stt.STT):
         )
 
 
+_CLAUSE_BREAK = re.compile(r"(?<=[,;:])\s+")
+VOICE_PIECE_MIN_CHARS = 25
+VOICE_SPLIT_FROM_CHARS = 60
+VOICE_PIECE_MAX_CHARS = 70
+
+
+def voice_pieces(text: str) -> list[str]:
+    """A long Nigerian-language sentence split at commas/semicolons into pieces of at least VOICE_PIECE_MIN_CHARS
+    (short clauses join their neighbour); short text stays whole."""
+    text = (text or "").strip()
+    if len(text) <= VOICE_SPLIT_FROM_CHARS:
+        return [text] if text else []
+    out: list[str] = []
+    for part in _CLAUSE_BREAK.split(text):
+        if out and (len(out[-1]) < VOICE_PIECE_MIN_CHARS or len(part) < VOICE_PIECE_MIN_CHARS):
+            out[-1] = f"{out[-1]} {part}"
+        else:
+            out.append(part)
+    # A long stretch with no comma (a 127-character sentence took 9 s to voice) is halved at the space nearest
+    # its middle until no piece is longer than VOICE_PIECE_MAX_CHARS.
+    done: list[str] = []
+    while out:
+        piece = out.pop(0)
+        if len(piece) <= VOICE_PIECE_MAX_CHARS or " " not in piece:
+            done.append(piece)
+            continue
+        mid = len(piece) // 2
+        cut = min((i for i, ch in enumerate(piece) if ch == " "), key=lambda i: abs(i - mid))
+        out[:0] = [piece[:cut].strip(), piece[cut:].strip()]
+    return [p for p in done if p]
+
+
 class PiperTTSNode(lk_tts.TTS):
     """Bridge a TTSInterface stage into the LiveKit pipeline (chunked
     synthesis). Since SPEC-W10 the impl is the FallbackTTS provider chain
@@ -1078,6 +1124,21 @@ class PiperTTSNode(lk_tts.TTS):
                 text = await self._on_text(text)
             except Exception as exc:  # noqa: BLE001 - never break TTS
                 log.warning("pre-TTS transform failed", error=str(exc)[:200])
+        pieces = voice_pieces(text) if (getattr(self._impl, "voice", "") or "").startswith("naija:") else [text]
+        if len(pieces) > 1:
+            # 2026-11-23: a naija voice only returns audio once the whole text is made (slower than real time: a
+            # 132-character Yoruba sentence took 7.4 s before anything played). Long sentences are voiced in clause
+            # pieces, all requested at once (the service batches them), and played in order as they arrive.
+            tasks = [asyncio.create_task(self._impl.synthesize_pcm(p)) for p in pieces]
+            try:
+                for task in tasks:
+                    pcm = await task
+                    for audio in self._audio_frames(self._clean(pcm)):
+                        yield audio
+            finally:
+                for task in tasks:
+                    task.cancel()
+            return
         stream_pcm = getattr(self._impl, "stream_pcm", None)
         if self._chunked and stream_pcm is not None:
             async for pcm in stream_pcm(text):
@@ -1793,7 +1854,8 @@ async def build_voice_agent(
     # A Nigerian language the caller chose on the call page: the call starts in it; the caller may switch later.
     chosen = caller_language if caller_language in call_language.NIGERIAN and settings.naija_speech_url else ""
     base_prompt = system_prompt
-    system_prompt += call_language.prompt_instruction(chosen, think_in_english=settings.naija_think_in_english)
+    replies_in_english = settings.naija_think_in_english and not settings.naija_reply_direct
+    system_prompt += call_language.prompt_instruction(chosen, think_in_english=replies_in_english)
     _body, _tail = split_prompt(system_prompt)
     chat_ctx = lk_llm.ChatContext().append(role="system", text=_body)
     if _tail:
@@ -1960,14 +2022,14 @@ async def build_voice_agent(
     def _switch_language(code: str) -> None:
         session.active_language = code
         _set_voice(code)
-        prompt = base_prompt + call_language.prompt_instruction(code, think_in_english=settings.naija_think_in_english)
+        prompt = base_prompt + call_language.prompt_instruction(code, think_in_english=replies_in_english)
         try:
             msgs = agent.chat_ctx.messages
             _set_system_prompt(msgs, prompt)
             # The opening system prompt alone lost to the recent turns: after Hausa turns the model answered an Igbo
             # turn in Hausa. A note at the end of the conversation, right before the reply, is followed reliably.
             name = call_language.NAMES.get(code, (code, code))[0]
-            if settings.naija_think_in_english and code in call_language.SPOKEN_BY_TRANSLATION:
+            if replies_in_english and code in call_language.SPOKEN_BY_TRANSLATION:
                 note = (f"{SWITCH_NOTE_MARK} The caller asked to continue in {name}. Your NEXT reply must be exactly "
                         f"this, and nothing else: \"{call_language.agreement_en(code)}\" Then wait for what they want. "
                         f"Never repeat it in later replies. Keep writing in plain English: it is translated into {name} "
