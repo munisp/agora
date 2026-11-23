@@ -183,12 +183,36 @@ func (t TaskCreate) MarshalJSON() ([]byte, error) {
 // TaskFromBooking maps a booking event -> Task create body linked to a person.
 func TaskFromBooking(d events.BookingData) TaskCreate {
 	return TaskCreate{
-		Title: TaskTitle(d.OfferingName, d.StartsAt),
-		Body: fmt.Sprintf("OpenDesk booking %s (%s) — contact %s, source %s, price %d %s.",
-			d.BookingID, d.Status, d.ContactName, d.Source, d.PriceCents, d.Currency),
+		Title:  TaskTitle(d.OfferingName, d.StartsAt),
+		Body:   BookingTaskBody(d.Status, d.ContactName, d.Source, d.PriceCents, d.Currency),
 		DueAt:  FormatTime(d.StartsAt),
 		Status: "TODO",
 	}
+}
+
+// BookingTaskBody is the plain-language task body a business reads (2026-11-23: it used to read
+// "OpenDesk booking <uuid> (confirmed) — contact X, source voice, price 0 NGN", exposing the platform's internals).
+func BookingTaskBody(status, contact, source string, priceCents int64, currency string) string {
+	st := strings.TrimSpace(status)
+	if st == "" {
+		st = "new"
+	}
+	st = strings.ToUpper(st[:1]) + strings.ReplaceAll(st[1:], "_", " ")
+	who := strings.TrimSpace(contact)
+	if who == "" {
+		who = "a customer"
+	}
+	via := map[string]string{"voice": "on a call with the receptionist", "phone": "on a call with the receptionist",
+		"web": "on the booking page", "chat": "in a web chat", "whatsapp": "on WhatsApp", "telegram": "on Telegram",
+		"staff": "by staff", "admin": "by staff", "field": "by a field agent", "ussd": "by USSD"}[strings.ToLower(strings.TrimSpace(source))]
+	if via == "" {
+		via = "online"
+	}
+	price := "Free consultation."
+	if priceCents > 0 {
+		price = fmt.Sprintf("Price: %s %.2f.", strings.ToUpper(currency), float64(priceCents)/100)
+	}
+	return fmt.Sprintf("%s booking for %s, made %s. %s", st, who, via, price)
 }
 
 // CancelNote renders the note appended to a task body on BookingCancelled.
@@ -196,7 +220,7 @@ func CancelNote(reason string) string {
 	if reason == "" {
 		reason = "no reason given"
 	}
-	return "Booking cancelled in OpenDesk: " + reason
+	return "Booking cancelled: " + reason
 }
 
 // AIBookingNote is the Note body for AI-receptionist bookings (SPEC-CRM §B).

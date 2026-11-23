@@ -118,10 +118,21 @@ func TestTaskFromBooking(t *testing.T) {
 }
 
 func TestCancelNote(t *testing.T) {
-	if got := CancelNote("sick"); got != "Booking cancelled in OpenDesk: sick" {
+	if got := CancelNote("sick"); got != "Booking cancelled: sick" {
 		t.Fatalf("CancelNote = %q", got)
 	}
-	if got := CancelNote(""); got != "Booking cancelled in OpenDesk: no reason given" {
+	if got := CancelNote(""); got != "Booking cancelled: no reason given" {
 		t.Fatalf("CancelNote empty = %q", got)
+	}
+}
+
+func TestBookingTaskBodyIsPlainLanguage(t *testing.T) {
+	got := BookingTaskBody("confirmed", "Ngozi Okafor", "voice", 0, "NGN")
+	want := "Confirmed booking for Ngozi Okafor, made on a call with the receptionist. Free consultation."
+	if got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	if b := BookingTaskBody("no_show", "", "web", 250000, "ngn"); b != "No show booking for a customer, made on the booking page. Price: NGN 2500.00." {
+		t.Fatalf("body = %q", b)
 	}
 }

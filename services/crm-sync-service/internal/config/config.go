@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -50,6 +51,23 @@ type Config struct {
 	// value. Reuses booking-service's EXISTING env name verbatim. Empty =>
 	// header omitted, peer fails closed (warned at boot).
 	BookingInternalToken string
+	// TwentyRoutes (TWENTY_ROUTES, 2026-11-23): businesses with their own Twenty instance, as a JSON list
+	// [{"name","tenants":[id or slug...],"url","api_key_env","webhook_secret_env","workspace_id"}]. The key and
+	// webhook secret are read from the named env vars (never written into the JSON). Unrouted businesses keep
+	// the default instance above.
+	TwentyRoutes []TwentyRoute
+}
+
+// TwentyRoute is one business-specific Twenty instance (see Config.TwentyRoutes).
+type TwentyRoute struct {
+	Name             string   `json:"name"`
+	Tenants          []string `json:"tenants"`
+	URL              string   `json:"url"`
+	APIKeyEnv        string   `json:"api_key_env"`
+	WebhookSecretEnv string   `json:"webhook_secret_env"`
+	WorkspaceID      string   `json:"workspace_id"`
+	APIKey           string   `json:"-"`
+	WebhookSecret    string   `json:"-"`
 }
 
 // Load reads configuration from the environment.
@@ -101,6 +119,25 @@ func Load() (Config, error) {
 		// Not fatal: the service starts (health/metrics work) but Twenty calls
 		// will fail fast with a clear error until a real key is configured.
 		cfg.TwentyAPIKey = "opendesk-dev-twenty-api-key"
+	}
+	if raw := strings.TrimSpace(os.Getenv("TWENTY_ROUTES")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &cfg.TwentyRoutes); err != nil {
+			return cfg, fmt.Errorf("TWENTY_ROUTES is not valid JSON: %w", err)
+		}
+		for i := range cfg.TwentyRoutes {
+			r := &cfg.TwentyRoutes[i]
+			r.URL = strings.TrimRight(r.URL, "/")
+			if r.URL == "" || len(r.Tenants) == 0 || r.APIKeyEnv == "" {
+				return cfg, fmt.Errorf("TWENTY_ROUTES[%d] (%s) needs url, tenants and api_key_env", i, r.Name)
+			}
+			r.APIKey = os.Getenv(r.APIKeyEnv)
+			if r.APIKey == "" {
+				return cfg, fmt.Errorf("TWENTY_ROUTES[%d] (%s): env %s is empty", i, r.Name, r.APIKeyEnv)
+			}
+			if r.WebhookSecretEnv != "" {
+				r.WebhookSecret = os.Getenv(r.WebhookSecretEnv)
+			}
+		}
 	}
 	return cfg, nil
 }

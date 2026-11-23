@@ -102,8 +102,19 @@ func run() error {
 	twenty := twentyc.New(cfg.TwentyAPIURL, cfg.TwentyAPIKey, cfg.TwentyRatePerMin)
 	twenty.Observe = reg.ObserveTwentyCall
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
+	// 2026-11-23: businesses with their own Twenty instance (TWENTY_ROUTES).
+	router := twentyc.NewRouter(twenty)
+	var extraSecrets []string
+	for _, rt := range cfg.TwentyRoutes {
+		c := twentyc.New(rt.URL, rt.APIKey, cfg.TwentyRatePerMin)
+		c.Observe = reg.ObserveTwentyCall
+		router.Add(rt.Tenants, rt.WorkspaceID, c)
+		extraSecrets = append(extraSecrets, rt.WebhookSecret)
+		logger.Info("twenty route", zap.String("name", rt.Name), zap.String("url", rt.URL),
+			zap.Strings("tenants", rt.Tenants), zap.String("workspace_id", rt.WorkspaceID))
+	}
 
-	syncer := &consumer.Syncer{Twenty: twenty, Map: st, Metrics: reg, Log: logger}
+	syncer := &consumer.Syncer{Twenty: twenty, Router: router, Map: st, Metrics: reg, Log: logger}
 	if cfg.ConversationURL != "" && cfg.SummaryLLMURL != "" {
 		syncer.Summary = callsummary.New(cfg.ConversationURL, cfg.SummaryLLMURL, cfg.SummaryLLMModel, cfg.SummaryTimeout)
 		logger.Info("call-summary sentences enabled", zap.String("model", cfg.SummaryLLMModel))
@@ -114,6 +125,7 @@ func run() error {
 	// independently of the forward consumers.
 	reverse := &consumer.ReverseSyncer{
 		Twenty:               twenty,
+		Router:               router,
 		Map:                  st,
 		Invoker:              daprClient,
 		BookingAppID:         cfg.BookingAppID,
@@ -167,17 +179,19 @@ func run() error {
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.Port),
 		Handler: (&httpapi.Server{
-			Twenty:         twenty,
-			Dapr:           daprClient,
-			PubSubName:     cfg.PubSubName,
-			CRMEventsTopic: cfg.CRMEventsTopic,
-			WebhookSecret:  cfg.TwentyWebhookSecret,
-			DB:             st,
-			Map:            st,
-			Dedupe:         st, // SPEC-W43 K-13: webhook_events_seen replay guard
-			Metrics:        reg,
-			InternalToken:  cfg.InternalToken,
-			Log:            logger,
+			Twenty:              twenty,
+			TwentyRouter:        router,
+			ExtraWebhookSecrets: extraSecrets,
+			Dapr:                daprClient,
+			PubSubName:          cfg.PubSubName,
+			CRMEventsTopic:      cfg.CRMEventsTopic,
+			WebhookSecret:       cfg.TwentyWebhookSecret,
+			DB:                  st,
+			Map:                 st,
+			Dedupe:              st, // SPEC-W43 K-13: webhook_events_seen replay guard
+			Metrics:             reg,
+			InternalToken:       cfg.InternalToken,
+			Log:                 logger,
 		}).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

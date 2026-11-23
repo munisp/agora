@@ -59,7 +59,9 @@ type MapStore interface {
 
 // Syncer applies CloudEvents to Twenty via the REST client + sync_map.
 type Syncer struct {
-	Twenty  *twentyc.Client
+	Twenty *twentyc.Client
+	// Router (2026-11-23) sends a business with its own Twenty instance there; nil = everything to Twenty.
+	Router  *twentyc.Router
 	Map     MapStore
 	Metrics *metrics.Registry
 	Log     *zap.Logger
@@ -72,6 +74,14 @@ type Syncer struct {
 // ("" when unavailable). Implemented by callsummary.Summarizer.
 type CallSummarizer interface {
 	Summarize(ctx context.Context, conversationID, tenantID string) string
+}
+
+// tw is the Twenty client for a tenant: its own instance when routed, else the default.
+func (s *Syncer) tw(tenantID *uuid.UUID) *twentyc.Client {
+	if s.Router != nil {
+		return s.Router.ForTenant(tenantID)
+	}
+	return s.Twenty
 }
 
 func (s *Syncer) summarize(ctx context.Context, conversationID, tenantID string) string {
@@ -103,7 +113,7 @@ func (s *Syncer) handleTenantProvisioned(ctx context.Context, evt events.CloudEv
 		return permanent(fmt.Errorf("TenantProvisioned missing slug/name"))
 	}
 	tenantUUID := parseUUID(d.TenantID)
-	companyID, err := s.Twenty.UpsertCompany(ctx, d.Name, d.Slug)
+	companyID, err := s.tw(tenantUUID).UpsertCompany(ctx, d.Name, d.Slug)
 	if err != nil {
 		return fmt.Errorf("upsert company: %w", err)
 	}
@@ -227,7 +237,7 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 	}
 	if m, err := s.Map.Get(ctx, KindBooking, d.BookingID, tenantUUID); err == nil {
 		// Task already exists: keep it current (confirmed / re-created paths).
-		if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{
+		if err := s.tw(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{
 			"title": twentyc.TaskTitle(d.OfferingName, d.StartsAt),
 			"dueAt": twentyc.FormatTime(d.StartsAt),
 		}); err != nil {
@@ -243,7 +253,7 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 	} else if !errors.Is(err, syncmap.ErrNotFound) {
 		return err
 	}
-	taskID, err := s.Twenty.CreateTask(ctx, twentyc.TaskFromBooking(d), personID)
+	taskID, err := s.tw(tenantUUID).CreateTask(ctx, twentyc.TaskFromBooking(d), personID)
 	if err != nil {
 		// SPEC-W80 A3: CreateTask returns a NON-EMPTY task id when the task
 		// was created in Twenty but the person link (taskTarget) failed.
@@ -305,7 +315,7 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	if d.ContactID != "" {
 		if m, err := s.Map.Get(ctx, KindContact, d.ContactID, tenantUUID); err == nil {
 			// Keep the person record fresh (name/phone may have changed).
-			if err := s.Twenty.UpdatePerson(ctx, m.TwentyID,
+			if err := s.tw(tenantUUID).UpdatePerson(ctx, m.TwentyID,
 				twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone)); err != nil {
 				s.Log.Warn("person update failed; keeping existing mapping",
 					zap.String("person_id", m.TwentyID), zap.Error(err))
@@ -324,7 +334,7 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	if personID, err := s.findTenantPerson(ctx, d.Email, d.Phone, tenantUUID); err != nil {
 		return "", err
 	} else if personID != "" {
-		if err := s.Twenty.UpdatePerson(ctx, personID,
+		if err := s.tw(tenantUUID).UpdatePerson(ctx, personID,
 			twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone)); err != nil {
 			s.Log.Warn("person update failed; keeping existing record",
 				zap.String("person_id", personID), zap.Error(err))
@@ -338,7 +348,7 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	}
 	// No mapping for this tenant: CREATE a new person (never merge into
 	// another tenant's record).
-	personID, err := s.Twenty.CreatePerson(ctx, twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone))
+	personID, err := s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone))
 	if err != nil {
 		return "", fmt.Errorf("create person: %w", err)
 	}
@@ -407,11 +417,11 @@ func (s *Syncer) handleBookingCancelled(ctx context.Context, d events.BookingDat
 	}
 	// Twenty task statuses are TODO/IN_PROGRESS/DONE: a cancelled appointment
 	// is closed out as DONE with an explanatory note (SPEC-CRM §B).
-	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{"status": "DONE"}); err != nil {
+	if err := s.tw(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{"status": "DONE"}); err != nil {
 		return fmt.Errorf("patch task status: %w", err)
 	}
 	if personID, perr := s.findPersonForNote(ctx, d.Phone, d.Email, tenantUUID); perr == nil && personID != "" {
-		if _, nerr := s.Twenty.CreateNote(ctx, "Booking cancelled", twentyc.CancelNote(d.Reason), personID); nerr != nil {
+		if _, nerr := s.tw(tenantUUID).CreateNote(ctx, "Booking cancelled", twentyc.CancelNote(d.Reason), personID); nerr != nil {
 			s.Log.Warn("cancel note failed (task already closed)", zap.Error(nerr))
 		}
 	}
@@ -430,7 +440,7 @@ func (s *Syncer) handleBookingRescheduled(ctx context.Context, d events.BookingD
 	// SPEC-W80 A2: the title embeds the start time ("{offering} appointment
 	// at {starts_at}"), so a dueAt-only patch leaves a STALE title after a
 	// reschedule — patch both.
-	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{
+	if err := s.tw(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{
 		"title": twentyc.TaskTitle(d.OfferingName, d.StartsAt),
 		"dueAt": twentyc.FormatTime(d.StartsAt),
 	}); err != nil {
@@ -476,7 +486,7 @@ func (s *Syncer) HandleConversation(ctx context.Context, evt events.CloudEvent) 
 	if personID == "" {
 		return nil // person not synced yet; note is best-effort
 	}
-	if _, err := s.Twenty.CreateNote(ctx, "AI receptionist", twentyc.AIBookingNote, personID); err != nil {
+	if _, err := s.tw(parseUUID(evt.TenantID)).CreateNote(ctx, "AI receptionist", twentyc.AIBookingNote, personID); err != nil {
 		return fmt.Errorf("create AI booking note: %w", err)
 	}
 	s.Log.Info("AI booking note added", zap.String("person_id", personID))
@@ -571,7 +581,7 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	noteID, err := s.Twenty.CreateNote(ctx,
+	noteID, err := s.tw(tenantUUID).CreateNote(ctx,
 		twentyc.CallSummaryNoteTitle, twentyc.CallSummaryNote(*d.Quality, s.summarize(ctx, firstNonEmpty(d.StoredConversationID, d.ConversationID), evt.TenantID)), personID)
 	if err != nil {
 		return fmt.Errorf("create call summary note: %w", err)
@@ -637,7 +647,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			return fmt.Errorf("lookup quality_note mapping: %w", err)
 		}
 		if err == nil && m.TwentyID != "" {
-			if err := s.Twenty.UpdateNote(ctx, m.TwentyID, twentyc.CallSummaryNoteTitle, body); err != nil {
+			if err := s.tw(tenantUUID).UpdateNote(ctx, m.TwentyID, twentyc.CallSummaryNoteTitle, body); err != nil {
 				return fmt.Errorf("patch call summary note with sentiment: %w", err)
 			}
 			s.Log.Info("AI call summary note enriched with sentiment",
@@ -655,7 +665,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	noteID, err := s.Twenty.CreateNote(ctx, twentyc.CallSummaryNoteTitle, body, personID)
+	noteID, err := s.tw(tenantUUID).CreateNote(ctx, twentyc.CallSummaryNoteTitle, body, personID)
 	if err != nil {
 		return fmt.Errorf("create enriched call summary note: %w", err)
 	}
@@ -761,8 +771,9 @@ func (s *Syncer) HandlePrivacy(ctx context.Context, evt events.CloudEvent) error
 			zap.String("event_id", evt.ID))
 		return nil
 	}
-	for _, personID := range personIDs {
-		if err := s.Twenty.DeletePerson(ctx, personID); err != nil {
+	for _, ref := range personIDs {
+		personID := ref.id
+		if err := ref.client.DeletePerson(ctx, personID); err != nil {
 			return fmt.Errorf("delete Twenty person %s: %w", personID, err)
 		}
 		removed, err := s.Map.DeleteByTwentyID(ctx, personID)
@@ -801,13 +812,19 @@ func firstNonEmpty(vals ...string) string {
 // created out-of-band), the global FindPerson first-match is still erased
 // so such records are not stranded — but any mapped match takes precedence
 // and short-circuits the global find.
-func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string) ([]string, error) {
+// personRef is a Twenty person and the instance (client) that holds it.
+type personRef struct {
+	id     string
+	client *twentyc.Client
+}
+
+func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string) ([]personRef, error) {
 	seen := map[string]bool{}
-	var ids []string
-	add := func(id string) {
+	var ids []personRef
+	add := func(id string, c *twentyc.Client) {
 		if id != "" && !seen[id] {
 			seen[id] = true
-			ids = append(ids, id)
+			ids = append(ids, personRef{id: id, client: c})
 		}
 	}
 	for _, k := range personNaturalKeys(email, phone) {
@@ -816,7 +833,7 @@ func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string
 			return nil, err
 		}
 		for _, m := range rows {
-			add(m.TwentyID)
+			add(m.TwentyID, s.tw(m.TenantID))
 		}
 	}
 	if p := strings.TrimSpace(phone); p != "" {
@@ -825,20 +842,26 @@ func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string
 			return nil, err
 		}
 		for _, m := range rows {
-			add(m.TwentyID)
+			add(m.TwentyID, s.tw(m.TenantID))
 		}
 	}
 	if len(ids) > 0 {
 		return ids, nil
 	}
-	// Legacy fallback: no sync_map trace of the identity at all.
-	rec, err := s.Twenty.FindPerson(ctx, email, phone)
-	if errors.Is(err, twentyc.ErrNotFound) {
-		return nil, nil
+	// Legacy fallback: no sync_map trace of the identity at all — look in every instance.
+	clients := []*twentyc.Client{s.Twenty}
+	if s.Router != nil {
+		clients = s.Router.All()
 	}
-	if err != nil {
-		return nil, err
+	for _, c := range clients {
+		rec, err := c.FindPerson(ctx, email, phone)
+		if errors.Is(err, twentyc.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		add(rec.ID, c)
 	}
-	add(rec.ID)
 	return ids, nil
 }

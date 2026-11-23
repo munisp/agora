@@ -85,7 +85,7 @@ export default async function OrgLayout({
         </div>
         <div className="woven-band opacity-80" />
         <div className="flex-1 overflow-y-auto py-3">
-          <OrgNav orgSlug={orgSlug} roles={session.realmRoles ?? []} labels={labels} externalLinks={externalLinks()} />
+          <OrgNav orgSlug={orgSlug} roles={session.realmRoles ?? []} labels={labels} externalLinks={externalLinks(orgSlug)} />
         </div>
         <div className="space-y-1 border-t border-paper/10 p-3">
           <Link
@@ -119,7 +119,7 @@ export default async function OrgLayout({
             roles={session.realmRoles ?? []}
             tenantName={tenant?.name ?? orgSlug}
             labels={labels}
-            externalLinks={externalLinks()}
+            externalLinks={externalLinks(orgSlug)}
           />
           <AgoraMark tone="light" />
           <p className="min-w-0 flex-1 truncate font-display text-base">
