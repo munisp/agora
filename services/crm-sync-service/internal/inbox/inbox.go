@@ -163,8 +163,15 @@ func (b *Bridge) openForStaff(ctx context.Context, rt *Route, tenant, stored, re
 	if reason != "" {
 		note += " (" + reason + ")"
 	}
-	note += ". Your reply goes straight to the customer, and the receptionist stays quiet from then on. " +
-		"Resolve the conversation to hand it back to the receptionist."
+	var sc storedConversation
+	if err := b.conversationJSON(ctx, http.MethodGet, "/v1/conversations/"+url.PathEscape(stored), tenant, nil, &sc); err == nil && isCall(sc.Channel) {
+		// A phone/voice caller cannot read a typed reply (2026-11-23): staff call them back.
+		note += ". This was a phone call: call them back on " + firstNonEmpty(sc.ContactPhone, "the number in Agora") +
+			". Replies typed here do not reach a caller. Resolve the conversation once you have spoken to them."
+	} else {
+		note += ". Your reply goes straight to the customer, and the receptionist stays quiet from then on. " +
+			"Resolve the conversation to hand it back to the receptionist."
+	}
 	if err := b.post(ctx, rt, rt.BotToken, cw, note, "outgoing", true); err != nil {
 		return err
 	}
