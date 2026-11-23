@@ -84,7 +84,8 @@ class TranscriptRecorder:
             old, _ = self._ids.popitem(last=False)
             self._locks.pop(old, None)
 
-    async def _ensure(self, key: str, *, tenant_id: str, site_slug: str, channel: str, contact_phone: str | None) -> str:
+    async def _ensure(self, key: str, *, tenant_id: str, site_slug: str, channel: str, contact_phone: str | None,
+                      contact_name: str | None = None) -> str:
         conv_id = self._ids.get(key)
         if conv_id:
             return conv_id
@@ -92,7 +93,7 @@ class TranscriptRecorder:
             f"{self.base_url}/v1/conversations",
             headers={"X-Tenant-Slugs": tenant_id},
             json={"tenant_id": tenant_id, "site_slug": site_slug, "channel": conversation_channel(channel),
-                  "contact_phone": contact_phone or None},
+                  "contact_phone": contact_phone or None, "contact_name": contact_name or None},
         )
         resp.raise_for_status()
         conv_id = str(resp.json()["id"])
@@ -120,14 +121,14 @@ class TranscriptRecorder:
         return bool(isinstance(handoff, dict) and handoff.get("active"))
 
     async def add_turns(self, key: str, turns: list[dict[str, Any]], *, tenant_id: str, site_slug: str,
-                        channel: str, contact_phone: str | None = None) -> str | None:
+                        channel: str, contact_phone: str | None = None, contact_name: str | None = None) -> str | None:
         """Append turns ({role, text, tool_calls?}) to the session's stored conversation, creating it first."""
         if not self.enabled or not tenant_id or not turns:
             return None
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             conv_id = await self._ensure(key, tenant_id=tenant_id, site_slug=site_slug, channel=channel,
-                                         contact_phone=contact_phone)
+                                         contact_phone=contact_phone, contact_name=contact_name)
             for turn in turns:
                 text = str(turn.get("text") or "").strip()
                 if not text:

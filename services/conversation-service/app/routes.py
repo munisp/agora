@@ -170,6 +170,9 @@ async def create_conversation(
     row = await db.create_conversation(
         tenant_id, body.site_slug, body.channel, body.contact_phone
     )
+    name = (body.contact_name or "").strip()
+    if name and hasattr(db, "merge_call_details"):
+        await db.merge_call_details(row["id"], tenant_id, {"contact_name": name})
     return models.Conversation(**dict(row))
 
 

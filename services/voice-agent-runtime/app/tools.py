@@ -312,7 +312,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "Escalate the conversation to a human staff member (warm "
                 "handoff). Creates a LiveKit escalation room, notifies staff "
                 "and confirms to the caller. Use when the caller asks for a "
-                "human, is distressed, or the request cannot be resolved."
+                "human, is distressed, or the request cannot be resolved. "
+                "Tell the customer exactly what the result's message says "
+                "(in a typed chat staff reply in the chat; never mention a call)."
             ),
             "parameters": {
                 "type": "object",
@@ -1589,8 +1591,12 @@ class ToolLayer:
             "status": "escalated",
             "room": room,
             "room_created": room_created,
+            # 2026-11-23: a typed chat is answered in the same chat (human inbox), not on a call.
             "message": (
-                "I'm connecting you with a member of our team right now. "
+                "I've passed this conversation to a member of our team. They will reply right here in this "
+                "chat shortly, so please keep this chat open."
+                if getattr(self._session, "text_chat", False)
+                else "I'm connecting you with a member of our team right now. "
                 "They've been notified and will join shortly; I'll stay on "
                 "the line to help in the meantime."
             ),

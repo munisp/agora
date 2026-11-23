@@ -2099,7 +2099,8 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
 
     def _send(turns: list[dict[str, Any]]) -> None:
         rec.record(key, turns, tenant_id=str(getattr(tenant_ctx, "tenant_id", "") or ""), site_slug=site_slug,
-                   channel=channel, contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone)
+                   channel=channel, contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
+                   contact_name=getattr(session, "caller_name", None))
 
     def _said(role: str):
         return lambda msg, *_a, **_k: (lambda t: _send([{"role": role, "text": t}]) if t else None)(_message_text(msg))

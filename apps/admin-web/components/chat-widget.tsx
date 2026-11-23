@@ -147,7 +147,9 @@ async function sendStreaming(
         reply += evt.delta;
         onDelta(reply);
       }
-      if (typeof evt.reply === "string" && !reply) {
+      // The terminal frame's reply replaces what streamed: a translation, or the text cleaned of model
+      // template tokens (2026-11-23).
+      if (typeof evt.reply === "string" && evt.reply && (!reply || evt.done)) {
         reply = evt.reply;
         onDelta(reply);
       }

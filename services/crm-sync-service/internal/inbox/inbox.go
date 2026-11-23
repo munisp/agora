@@ -111,12 +111,21 @@ func (b *Bridge) HandleTurn(ctx context.Context, evt events.CloudEvent) error {
 	tenant := firstNonEmpty(str(evt.Data["tenantId"]), evt.TenantID)
 	role, _ := evt.Data["role"].(string)
 	text := strings.TrimSpace(str(evt.Data["text"]))
-	if convID == "" || text == "" || (role != "user" && role != "agent") {
-		return nil // tool/system lines stay in Agora; staff lines came FROM Chatwoot
+	if convID == "" || text == "" {
+		return nil
 	}
 	rt := b.route(tenant)
 	if rt == nil {
 		return nil
+	}
+	// The receptionist's request_human tool line (chats and calls both record it) opens the conversation for
+	// staff. It always belongs to the right stored conversation, unlike the EscalationRequested event, which has
+	// no stored id when the customer asks for a person in their very first message.
+	if role == "tool" && strings.HasPrefix(text, "request_human(") {
+		return b.openForStaff(ctx, rt, tenant, convID, escalationReason(text))
+	}
+	if role != "user" && role != "agent" {
+		return nil // other tool/system lines stay in Agora; staff lines came FROM Chatwoot
 	}
 	cw, err := b.ensureConversation(ctx, rt, tenant, convID, false)
 	if err != nil || cw == 0 {
@@ -141,16 +150,33 @@ func (b *Bridge) HandleEscalation(ctx context.Context, evt events.CloudEvent) er
 			zap.String("conversation_id", str(evt.Data["conversation_id"])))
 		return nil
 	}
+	return b.openForStaff(ctx, rt, tenant, stored, strings.ReplaceAll(firstNonEmpty(str(evt.Data["reason"]), "caller requested"), "_", " "))
+}
+
+// openForStaff opens the stored conversation's Chatwoot conversation with a private note for the staff member.
+func (b *Bridge) openForStaff(ctx context.Context, rt *Route, tenant, stored, reason string) error {
 	cw, err := b.ensureConversation(ctx, rt, tenant, stored, true)
 	if err != nil || cw == 0 {
 		return err
 	}
-	reason := strings.ReplaceAll(firstNonEmpty(str(evt.Data["reason"]), "caller_requested"), "_", " ")
-	if err := b.post(ctx, rt, rt.BotToken, cw, "The customer asked to speak to a person ("+reason+"). The receptionist "+
-		"has stepped back: your reply goes straight to the customer. Resolve the conversation to hand it back.", "outgoing", true); err != nil {
+	note := "The customer asked to speak to a person"
+	if reason != "" {
+		note += " (" + reason + ")"
+	}
+	note += ". Your reply goes straight to the customer, and the receptionist stays quiet from then on. " +
+		"Resolve the conversation to hand it back to the receptionist."
+	if err := b.post(ctx, rt, rt.BotToken, cw, note, "outgoing", true); err != nil {
 		return err
 	}
+	b.Log.Info("inbox conversation opened for staff", zap.String("conversation_id", stored), zap.Int("inbox_conversation", cw))
 	return b.status(ctx, rt, cw, "open")
+}
+
+// escalationReason pulls the reason out of a "request_human(reason: ...)" tool line.
+func escalationReason(text string) string {
+	r := strings.TrimSuffix(strings.TrimPrefix(text, "request_human("), ")")
+	r = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r), "reason:"))
+	return strings.TrimSuffix(r, ".")
 }
 
 type storedConversation struct {
@@ -248,6 +274,10 @@ func (b *Bridge) ensureContact(ctx context.Context, rt *Route, tenant, stored, n
 	}
 	if m, err := b.Map.Get(ctx, KindContact, key, tp); err == nil && m.TwentyID != "" {
 		_, id := parseRef(m.TwentyID)
+		if strings.TrimSpace(name) != "" {
+			// A known number gave a name this time (web form): name the contact (best effort).
+			_ = b.cw(ctx, rt, rt.Token, http.MethodPut, fmt.Sprintf("/contacts/%d", id), map[string]any{"name": name}, nil)
+		}
 		return id, nil
 	}
 	if name == "" {

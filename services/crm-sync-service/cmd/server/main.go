@@ -137,7 +137,8 @@ func run() error {
 		}
 		inboxBridge = &inbox.Bridge{Routes: routes, Map: st, ConversationURL: cfg.ConversationURL,
 			InternalToken: cfg.ConversationToken, GatewayURL: cfg.GatewayURL, Log: logger.Named("inbox")}
-		syncer.Inbox = inboxBridge
+		// Escalations are opened from the transcript's request_human tool line (HandleTurn), which always has the
+		// stored conversation id; the EscalationRequested event path (syncer.Inbox) is left unwired to avoid a second note.
 		logger.Info("human inbox bridge enabled", zap.Int("routes", len(routes)))
 	}
 

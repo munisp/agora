@@ -78,6 +78,8 @@ class SessionState:
     # 2026-11-23: returns the stored transcript's id (conversation-service) — set by the chat service / voice worker,
     # read by request_human so the human inbox knows which conversation to open. Never persisted.
     stored_id_lookup: Any = field(default=None, repr=False, compare=False)
+    # 2026-11-23: True for typed chats (set by the chat service every turn), False for calls. Never persisted.
+    text_chat: bool = field(default=False, repr=False, compare=False)
     # 2026-11-21: details from the public page's pre-chat form (app/visitor.py). Self-reported.
     caller_email: str | None = None
     visitor_form: bool = False

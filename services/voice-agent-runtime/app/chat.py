@@ -4,6 +4,8 @@ audio stages."""
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,6 +52,22 @@ UI_ACTION_PROMPT_ADDENDUM = (
     "pre-select a service in the booking form using the navigate_to_page, "
     "highlight_element and prefill_booking tools."
 )
+
+
+# 2026-11-23: gemma sometimes ends a tool turn by echoing its chat-template tokens ("<tool_call|><|tool_response>")
+# instead of a sentence. They are stripped; when nothing human is left, the last tool's own message is the reply.
+_TEMPLATE_TOKEN = re.compile(r"<\|[^<>|\s]*\|?>|<[a-z_]+\|>")
+
+
+def clean_reply(reply: str, trace: list[dict[str, Any]] | None) -> str:
+    cleaned = _TEMPLATE_TOKEN.sub("", reply or "").strip()
+    if cleaned:
+        return cleaned
+    for entry in reversed(trace or []):
+        result = entry.get("result")
+        if isinstance(result, dict) and isinstance(result.get("message"), str) and result["message"].strip():
+            return result["message"].strip()
+    return cleaned
 
 
 @dataclass
@@ -122,6 +140,7 @@ class ChatService:
         session = await store_get_or_create(
             self._sessions, conversation_id, site_slug, session_secret=session_secret
         )
+        session.text_chat = True
         if channel in ("whatsapp", "telegram") and conversation_id:
             # The messaging gateway records these chats and sends its stored conversation id as conversation_id.
             session.stored_id_lookup = lambda: conversation_id
@@ -315,6 +334,7 @@ class ChatService:
             f"chat:{session.conversation_id}", exchange_turns(message, reply, trace),
             tenant_id=tenant_id, site_slug=session.site_slug, channel=getattr(session, "channel", None) or "web",
             contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
+            contact_name=getattr(session, "caller_name", None),
         )
 
     def _stored_key(self, session: SessionState) -> str:
@@ -334,6 +354,7 @@ class ChatService:
             self._stored_key(session), [{"role": "user", "text": message}],
             tenant_id=tenant_id, site_slug=session.site_slug, channel=getattr(session, "channel", None) or "web",
             contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
+            contact_name=getattr(session, "caller_name", None),
         )
         await self._persist_turn(session)
         log.info("chat turn left for staff (human handoff active)", conversation_id=session.conversation_id)
@@ -421,6 +442,7 @@ class ChatService:
             tools=tool_layer.schemas(),
             dispatch=self._tool_runner.wrap_dispatch(tool_layer.dispatch),
         )
+        reply = clean_reply(reply, trace)
         history.append({"role": "assistant", "content": reply})
         # SPEC-W82 A3 (outbound translation): the caller-visible reply is
         # translated en -> active_language; the HISTORY keeps the English
@@ -552,6 +574,8 @@ class ChatService:
                     reply = event["text"]
                     trace = event["trace"]
 
+            streamed = reply
+            reply = clean_reply(reply, trace)
             history.append({"role": "assistant", "content": reply})
             # SPEC-W82 A3 (outbound translation, SSE path): the deltas already
             # streamed in English, so the translated reply rides the terminal
@@ -584,7 +608,7 @@ class ChatService:
                 # 2026-11-23: the widget starts fetching staff replies (human inbox) once a chat is escalated.
                 "escalated": session.escalation_room is not None,
             }
-            if outbound_reply != reply:
+            if outbound_reply != streamed:  # translated, or cleaned of template tokens
                 # SPEC-W82 A3 (additive): translated reply for non-English
                 # sessions (the deltas above streamed the English original).
                 done_frame["reply"] = outbound_reply

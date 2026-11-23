@@ -80,3 +80,12 @@ func TestIsNotFound(t *testing.T) {
 		t.Fatal("isNotFound misclassifies")
 	}
 }
+
+func TestEscalationReason(t *testing.T) {
+	if got := escalationReason("request_human(reason: Caller has a complicated RSA transfer question.)"); got != "Caller has a complicated RSA transfer question" {
+		t.Fatalf("got %q", got)
+	}
+	if got := escalationReason("request_human()"); got != "" {
+		t.Fatalf("got %q", got)
+	}
+}

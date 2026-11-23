@@ -24,6 +24,9 @@ class ConversationCreate(BaseModel):
     # the caller knows the visitor's phone (or e-mail); enables ?contact=
     # filtering and privacy erasure. Nullable — anonymous sessions stay NULL.
     contact_phone: str | None = Field(default=None, max_length=64)
+    # 2026-11-23: the name the visitor gave (web chat pre-chat form); kept in call_details.contact_name so the
+    # dashboard list and the human inbox show a name instead of a number.
+    contact_name: str | None = Field(default=None, max_length=128)
 
 
 class Conversation(BaseModel):
