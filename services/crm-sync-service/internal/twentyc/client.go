@@ -340,6 +340,30 @@ func (c *Client) FindPerson(ctx context.Context, email, phone string) (Record, e
 	return Record{}, ErrNotFound
 }
 
+// FindPersonByUniqueName returns the one Person whose first and last name match exactly (case-insensitive). Two or
+// more matches (or none) return ErrNotFound: a name alone must never pick between namesakes.
+func (c *Client) FindPersonByUniqueName(ctx context.Context, first, last string) (Record, error) {
+	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
+	if first == "" || last == "" {
+		return Record{}, ErrNotFound
+	}
+	filter := AndExpr(Expr("name.firstName", OpIlike, first), Expr("name.lastName", OpIlike, last))
+	var env envelope
+	if err := c.do(ctx, http.MethodGet, "/rest/people", Query(filter, 2).Encode(), nil, &env); err != nil {
+		return Record{}, err
+	}
+	for _, raw := range env.Data {
+		var arr []Record
+		if err := json.Unmarshal(raw, &arr); err == nil {
+			if len(arr) == 1 && arr[0].ID != "" {
+				return arr[0], nil
+			}
+			return Record{}, ErrNotFound
+		}
+	}
+	return Record{}, ErrNotFound
+}
+
 // CreatePerson creates a Person record.
 func (c *Client) CreatePerson(ctx context.Context, p PersonUpsert) (string, error) {
 	return c.create(ctx, "people", p)

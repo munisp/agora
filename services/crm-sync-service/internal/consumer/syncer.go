@@ -583,6 +583,11 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	// 2026-11-23: every call gets its plain-language summary on the stored conversation (the dashboard shows it), even
+	// when no phone was confirmed and so no CRM note can follow.
+	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
+	summary := s.summarize(ctx, convID, evt.TenantID)
+	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
 	if phone == "" {
 		s.Log.Debug("SessionEnded without confirmed_phone; skipping call-summary note",
@@ -606,9 +611,6 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
-	summary := s.summarize(ctx, convID, evt.TenantID)
-	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	noteID, err := s.tw(tenantUUID).CreateNote(ctx,
 		twentyc.CallSummaryNoteTitleFor(*d.Quality), twentyc.CallSummaryNote(*d.Quality, summary), personID)
 	if err != nil {
@@ -656,6 +658,9 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
+	summary := s.summarize(ctx, convID, evt.TenantID)
+	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
 	if phone == "" {
 		s.Log.Debug("CallQualityEnriched without confirmed_phone; skipping note",
@@ -668,9 +673,6 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 		q.AvgSentiment = d.AvgSentiment
 	}
 	tenantUUID := parseUUID(evt.TenantID)
-	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
-	summary := s.summarize(ctx, convID, evt.TenantID)
-	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	body := twentyc.CallSummaryNote(q, summary)
 	if d.ConversationID != "" {
 		m, err := s.Map.Get(ctx, KindQualityNote, d.ConversationID, tenantUUID)
@@ -758,6 +760,12 @@ func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantU
 	name := strings.TrimSpace(q.ContactName)
 	if q.Direction != "outbound" || name == "" {
 		return "", nil
+	}
+	// The number may be new to the CRM while the person is not (we dialled them from a booking): one exact namesake
+	// gets the call; otherwise a new Person is created.
+	split := twentyc.SplitName(name)
+	if rec, err := s.tw(tenantUUID).FindPersonByUniqueName(ctx, split.FirstName, split.LastName); err == nil && rec.ID != "" {
+		return rec.ID, nil
 	}
 	personID, err = s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(name, "", phone))
 	if err != nil {
