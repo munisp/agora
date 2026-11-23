@@ -168,9 +168,28 @@ ALTER TABLE payout_attempts DROP CONSTRAINT IF EXISTS payout_attempts_state_chec
 ALTER TABLE payout_attempts ADD CONSTRAINT payout_attempts_state_check
     CHECK (state IN
         ('unknown','failed','committed','resolved_committed','resolved_failed','pending_approval'));
--- SPEC-W100 C2: marketplace DFSP provenance (nullable; NULL = legacy rail).
+-- SPEC-W100 C2: marketplace DFSP provenance (nullable — NULL means the legacy rail).
 ALTER TABLE payout_attempts ADD COLUMN IF NOT EXISTS dfsp_fsp_id TEXT;
 "#;
+
+/// Split a bootstrap DDL block into statements, stripping `--` comment
+/// lines FIRST so a semicolon inside a comment can never fracture a
+/// statement. Latent W100 bug: the dfsp_fsp_id provenance comment
+/// "(nullable; NULL = legacy rail)" split mid-comment and the trailing
+/// fragment `NULL = legacy rail).` executed as SQL — every payments boot
+/// against Postgres failed with `syntax error at or near "NULL"` until
+/// W119's V-FUNDS run exercised it.
+pub(crate) fn bootstrap_statements(ddl: &str) -> Vec<String> {
+    ddl.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 pub struct PgPayoutAttemptStore {
     pool: sqlx::PgPool,
@@ -292,8 +311,8 @@ impl PgPayoutAttemptStore {
     }
 
     async fn bootstrap(&self) -> Result<(), String> {
-        for stmt in BOOTSTRAP_DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            sqlx::query(stmt)
+        for stmt in bootstrap_statements(BOOTSTRAP_DDL) {
+            sqlx::query(&stmt)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| format!("payout_attempts bootstrap failed: {e}"))?;

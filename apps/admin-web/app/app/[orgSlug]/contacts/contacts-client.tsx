@@ -27,6 +27,8 @@ import {
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/toast";
 import type { Contact } from "@/lib/types";
+import { EntitySearchPanel } from "@/components/entity-search-panel";
+import { CONTACTS_DESCRIPTOR } from "@/lib/entity-search";
 
 const EMPTY_FORM = { name: "", phone: "", email: "", notes: "" };
 
@@ -236,6 +238,29 @@ export function ContactsClient({
         }
       />
       {error ? <ErrorNote message={error} /> : null}
+
+      {/* SPEC-W119: OpenSearch advanced search (indexed; alphabetical).
+          Contacts carry no date filters — the table has no timestamps. */}
+      <div className="mb-4">
+        <EntitySearchPanel
+          orgSlug={orgSlug}
+          descriptor={CONTACTS_DESCRIPTOR}
+          title="Advanced search"
+          description="Searches the OpenSearch contacts index by name, email or notes, with an optional source filter."
+          columns={["Name", "Phone", "Email", "Notes"]}
+          hitKey={(h) => String(h.contact_id ?? JSON.stringify(h))}
+          renderRow={(h) => (
+            <>
+              <TableCell className="pl-5 font-medium">{String(h.name ?? "—")}</TableCell>
+              <TableCell>{String(h.phone ?? "") || "—"}</TableCell>
+              <TableCell>{String(h.email ?? "") || "—"}</TableCell>
+              <TableCell className="max-w-64 truncate text-xs text-muted-foreground">
+                {String(h.notes ?? "") || "—"}
+              </TableCell>
+            </>
+          )}
+        />
+      </div>
 
       {/* SPEC-W82 B1.2: table on ≥sm, stacked cards below. */}
       <Card className="hidden sm:block">

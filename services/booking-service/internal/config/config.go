@@ -99,6 +99,13 @@ type Config struct {
 	// booking contact carries a contact_locations point. Default false keeps
 	// every create path byte-identical to pre-W52 behavior (opt-in).
 	BookingGeoEnforce bool
+	// OpenSearch advanced search (SPEC-W119). OpenSearchAddr empty keeps
+	// boot byte-identical to pre-W119: no searcher, no syncer, and the
+	// search endpoints answer 503 search_unavailable (fail-closed).
+	OpenSearchAddr string // OPENSEARCH_ADDR (default "")
+	// SearchSyncIntervalSeconds is the projection-sync poll interval
+	// (SEARCH_SYNC_INTERVAL_SECONDS, default 30; <=0 disables the syncer).
+	SearchSyncIntervalSeconds int
 	// Receipt OCR (SPEC-W53 Scope B): booking→ocr-service internal extract
 	// calls for POST /v1/field/captures/{id}/receipt.
 	OCRServiceURL string // OCR_SERVICE_URL (default "" = receipt endpoint fails closed 503)
@@ -261,6 +268,10 @@ func Load() (Config, error) {
 		// + public-booking coverage-zone enforcement (default off = inert).
 		GeoServiceURL:     envStr("GEO_SERVICE_URL", ""),
 		BookingGeoEnforce: envStr("BOOKING_GEO_ENFORCE", "false") == "true",
+		// SPEC-W119: OpenSearch advanced search (empty addr = boot
+		// byte-identical to pre-W119; endpoints fail closed 503).
+		OpenSearchAddr:            envStr("OPENSEARCH_ADDR", ""),
+		SearchSyncIntervalSeconds: envInt("SEARCH_SYNC_INTERVAL_SECONDS", 30),
 		// SPEC-W53 Scope B: receipt OCR via ocr-service. Both default empty —
 		// the receipt endpoint then answers 503 (fail closed, never a silent
 		// unauthenticated call).

@@ -28,7 +28,9 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { addDays, formatDateTime, minutesToTime, titleCase, toISODate } from "@/lib/utils";
 import { type BookingLabels } from "@/lib/terminology";
-import type { Booking, BookingEvent, EscalationRequestedEvent, WsEvent } from "@/lib/types";
+import type { Booking, BookingEvent, BookingStatus, EscalationRequestedEvent, WsEvent } from "@/lib/types";
+import { EntitySearchPanel } from "@/components/entity-search-panel";
+import { BOOKINGS_DESCRIPTOR } from "@/lib/entity-search";
 
 type Range = "today" | "upcoming" | "past";
 
@@ -252,6 +254,38 @@ export function BookingsClient({
         }
       />
       {error ? <ErrorNote message={error} /> : null}
+
+      {/* SPEC-W119: OpenSearch advanced search (indexed; newest starts
+          first). The bounded list below is unaffected when search is
+          unavailable. */}
+      <div className="mb-4">
+        <EntitySearchPanel
+          orgSlug={orgSlug}
+          descriptor={BOOKINGS_DESCRIPTOR}
+          title="Advanced search"
+          description="Searches the OpenSearch bookings index by contact name or reference, with status, source and date filters."
+          columns={["Reference", "Contact", "Phone", "Status", "Source", "Starts"]}
+          hitKey={(h) => String(h.booking_id ?? JSON.stringify(h))}
+          renderRow={(h) => (
+            <>
+              <TableCell className="pl-5 font-mono text-xs">
+                {String(h.public_ref ?? "—")}
+              </TableCell>
+              <TableCell>{String(h.contact_name ?? "—")}</TableCell>
+              <TableCell>{String(h.contact_phone ?? "—")}</TableCell>
+              <TableCell>
+                <BookingStatusBadge status={String(h.status ?? "") as BookingStatus} />
+              </TableCell>
+              <TableCell>
+                <Badge variant="outline">{titleCase(String(h.source ?? ""))}</Badge>
+              </TableCell>
+              <TableCell className="whitespace-nowrap text-xs">
+                {h.starts_at ? formatDateTime(String(h.starts_at)) : "—"}
+              </TableCell>
+            </>
+          )}
+        />
+      </div>
 
       <Tabs value={range} onValueChange={(v) => setRange(v as Range)}>
         <TabsList>
