@@ -122,7 +122,9 @@ def test_worst_verdict_wins():
 
 
 def test_unknown_kind_is_never_claimed_validated():
-    for kind in ("receipt", "document", "knowledge_scan", "kyc_passport"):
+    # SPEC-W116 (sanctioned change, NOTES.md): receipt + document gained
+    # dedicated validators and moved out of this list.
+    for kind in ("knowledge_scan", "kyc_passport"):
         verdict, reasons = validate_document(kind, {"vendor": "x"})
         assert verdict == NEEDS_REVIEW
         assert reasons == ["no_validator_for_kind"]
@@ -149,3 +151,91 @@ def test_registry_duplicate_never_downgrades_rejected():
     )
     assert verdict == REJECTED
     assert "duplicate_seen_cross_tenant" in reasons
+
+
+# --- SPEC-W116: receipt + generic document validators ------------------------
+GOOD_RECEIPT = {
+    "vendor": "SHOPRITE",
+    "amount": 12500.0,
+    "currency": "NGN",
+    "date": "2026-11-20",
+    "items": [{"name": "Rice", "quantity": 1, "price": 12500.0}],
+}
+
+
+def test_consistent_receipt_validates():
+    verdict, reasons = validate_document("receipt", dict(GOOD_RECEIPT))
+    assert verdict == VALIDATED
+    assert reasons == []
+
+
+def test_receipt_amount_unusable():
+    for bad in (None, 0, -5, "not-a-number"):
+        fields = dict(GOOD_RECEIPT, amount=bad)
+        verdict, reasons = validate_document("receipt", fields)
+        assert verdict == NEEDS_REVIEW
+        assert "amount_unusable" in reasons
+
+
+def test_receipt_vendor_missing():
+    fields = dict(GOOD_RECEIPT, vendor="  ")
+    verdict, reasons = validate_document("receipt", fields)
+    assert verdict == NEEDS_REVIEW
+    assert "vendor_missing" in reasons
+
+
+def test_receipt_date_rules():
+    # absent date is NOT a fault
+    fields = dict(GOOD_RECEIPT, date=None)
+    verdict, reasons = validate_document("receipt", fields)
+    assert verdict == VALIDATED
+    # unparseable date IS
+    fields = dict(GOOD_RECEIPT, date="20/11/2026")
+    verdict, reasons = validate_document("receipt", fields)
+    assert verdict == NEEDS_REVIEW
+    assert "date_unparseable" in reasons
+
+
+def test_receipt_currency_malformed_only_when_present():
+    fields = dict(GOOD_RECEIPT, currency=None)
+    verdict, _ = validate_document("receipt", fields)
+    assert verdict == VALIDATED
+    fields = dict(GOOD_RECEIPT, currency="Naira")
+    verdict, reasons = validate_document("receipt", fields)
+    assert verdict == NEEDS_REVIEW
+    assert "currency_malformed" in reasons
+
+
+def test_receipt_never_rejects():
+    # every rule outcome is at most needs_review (SPEC-W116 C1 pin)
+    worst = {"vendor": None, "amount": None, "currency": "xx", "date": "garbage"}
+    verdict, _ = validate_document("receipt", worst)
+    assert verdict == NEEDS_REVIEW
+
+
+def test_generic_document_validates_on_any_content():
+    for fields in (
+        {"title": "Employment Letter", "date": None, "summary": None},
+        {"title": None, "date": "2026-01-01", "summary": None},
+        {"title": None, "date": None, "summary": "A utility bill."},
+    ):
+        verdict, reasons = validate_document("document", fields)
+        assert verdict == VALIDATED
+        assert reasons == []
+
+
+def test_generic_document_empty_extraction_needs_review():
+    verdict, reasons = validate_document(
+        "document", {"title": None, "date": None, "summary": None}
+    )
+    assert verdict == NEEDS_REVIEW
+    assert reasons == ["no_readable_content"]
+    verdict, reasons = validate_document("document", {})
+    assert verdict == NEEDS_REVIEW
+
+
+def test_knowledge_scan_stays_unwired():
+    # SPEC-W116 C3: admin-surface kind, honestly unvalidated
+    verdict, reasons = validate_document("knowledge_scan", {"title": "x"})
+    assert verdict == NEEDS_REVIEW
+    assert reasons == ["no_validator_for_kind"]

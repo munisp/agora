@@ -60,6 +60,13 @@ test("verdictSummary rejected humanizes the first reason", () => {
   );
 });
 
+test("verdictSummary labels receipt (SPEC-W116)", () => {
+  assert.equal(
+    verdictSummary("receipt", "validated", []),
+    "Your receipt was received and passed all consistency checks.",
+  );
+});
+
 test("verdictSummary needs_review and fallback", () => {
   assert.equal(
     verdictSummary("document", "needs_review", []),

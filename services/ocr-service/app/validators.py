@@ -119,6 +119,50 @@ def _validate_pay_stub(fields: dict[str, Any]) -> tuple[Verdict, list[str]]:
     return _worst(verdicts), reasons
 
 
+def _validate_receipt(fields: dict[str, Any]) -> tuple[Verdict, list[str]]:
+    """Receipt consistency rules (SPEC-W116 C1). Receipts never REJECT —
+    a receipt has no self-contradiction the extractor can prove; the worst
+    honest outcome is needs_review."""
+    verdicts: list[Verdict] = []
+    reasons: list[str] = []
+
+    amount = _as_number(fields.get("amount"))
+    if amount is None or amount <= 0:
+        verdicts.append(NEEDS_REVIEW)
+        reasons.append("amount_unusable")
+
+    vendor = fields.get("vendor")
+    if not isinstance(vendor, str) or not vendor.strip():
+        verdicts.append(NEEDS_REVIEW)
+        reasons.append("vendor_missing")
+
+    raw_date = fields.get("date")
+    if raw_date and _iso_date_tuple(raw_date) is None:
+        verdicts.append(NEEDS_REVIEW)
+        reasons.append("date_unparseable")
+
+    currency = fields.get("currency")
+    if currency is not None and (
+        not isinstance(currency, str) or not _CURRENCY_RE.match(currency.strip())
+    ):
+        verdicts.append(NEEDS_REVIEW)
+        reasons.append("currency_malformed")
+
+    return _worst(verdicts), reasons
+
+
+def _validate_generic_document(fields: dict[str, Any]) -> tuple[Verdict, list[str]]:
+    """Generic document rules (SPEC-W116 C2). 'validated' here means exactly
+    'readable + classified' — never 'authentic'."""
+    has_content = any(
+        isinstance(fields.get(name), str) and fields.get(name, "").strip()
+        for name in ("title", "date", "summary")
+    )
+    if not has_content:
+        return NEEDS_REVIEW, ["no_readable_content"]
+    return VALIDATED, []
+
+
 def validate_document(
     kind: str,
     extracted_fields: dict[str, Any] | None,
@@ -136,6 +180,10 @@ def validate_document(
     fields = extracted_fields if isinstance(extracted_fields, dict) else {}
     if kind == "pay_stub":
         verdict, reasons = _validate_pay_stub(fields)
+    elif kind == "receipt":
+        verdict, reasons = _validate_receipt(fields)
+    elif kind == "document":
+        verdict, reasons = _validate_generic_document(fields)
     else:
         # Kinds without a dedicated validator are honestly unverifiable —
         # never claim "validated" for something nobody checked.

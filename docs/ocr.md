@@ -709,3 +709,21 @@ re-validation tooling, unit-tested but unwired in the live path.
 `OCR_SERVICE_URL` + `OCR_INTERNAL_TOKEN` are set (link minting additionally
 requires `VOICE_DOCUMENT_LINK_SECRET`). The erasure tombstone NULLs the
 verdict columns (they derive from erased PII fields).
+
+### Generalized to any caller document (SPEC-W116)
+
+Pay stub was the example, not the feature. Every non-KYC kind is now
+caller-shareable on the web widget and voice share-link surfaces
+(`CALLER_DOCUMENT_KINDS = pay_stub | receipt | document`), and receipt +
+generic document have dedicated validators:
+
+- **receipt** — `amount_unusable` (missing/non-numeric/≤0),
+  `vendor_missing`, `date_unparseable` (only when a date IS present),
+  `currency_malformed` (only when present). Receipt rules never reject:
+  a receipt has no self-contradiction the extractor can prove.
+- **document** — `validated` means exactly "readable + classified" (any
+  of title/date/summary extracted); a fully empty extraction is
+  `no_readable_content` (needs_review). Never "authentic".
+- **knowledge_scan** stays honestly unwired (`no_validator_for_kind`).
+
+The widget kind picker is now Pay stub / Receipt / Other document.

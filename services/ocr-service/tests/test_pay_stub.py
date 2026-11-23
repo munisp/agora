@@ -81,14 +81,25 @@ def test_get_tenant_scoped_404(client):
     assert got.status_code == 404
 
 
-def test_legacy_kinds_get_needs_review_verdict(client):
+def test_unwired_kinds_get_needs_review_verdict(client):
+    # SPEC-W116 (sanctioned change, NOTES.md): receipt + document gained
+    # dedicated validators; knowledge_scan remains the unwired kind that
+    # must honestly report needs_review, never a blanket "validated".
+    resp = _post(client, kind="knowledge_scan")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["validation_verdict"] == "needs_review"
+    assert body["validation_reasons"] == ["no_validator_for_kind"]
+
+
+def test_receipt_mock_fixture_now_validates(client):
+    # SPEC-W116: the deterministic receipt fixture passes the receipt
+    # validator (vendor + positive amount + ISO date + currency).
     resp = _post(client, kind="receipt")
     assert resp.status_code == 200
     body = resp.json()
-    # no dedicated validator for receipt: honest needs_review, never a
-    # blanket "validated"
-    assert body["validation_verdict"] == "needs_review"
-    assert body["validation_reasons"] == ["no_validator_for_kind"]
+    assert body["validation_verdict"] == "validated"
+    assert body["validation_reasons"] == []
 
 
 def test_erasure_nulls_verdict_columns(client, deps):

@@ -15,8 +15,9 @@ export const CHAT_UPLOAD_EXTENSIONS = [
 /** Keep in lockstep with voice-agent-runtime VOICE_MAX_DOCUMENT_BYTES. */
 export const CHAT_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
 
-/** Caller-shareable kinds (voice runtime CALLER_DOCUMENT_KINDS mirror). */
-export const CHAT_DOC_KINDS = ["pay_stub", "document"] as const;
+/** Caller-shareable kinds (voice runtime CALLER_DOCUMENT_KINDS mirror,
+ * SPEC-W116: all non-KYC kinds). */
+export const CHAT_DOC_KINDS = ["pay_stub", "receipt", "document"] as const;
 export type ChatDocKind = (typeof CHAT_DOC_KINDS)[number];
 
 export type Verdict = "validated" | "needs_review" | "rejected";
@@ -91,7 +92,8 @@ export function verdictSummary(
   verdict: string,
   reasons: string[],
 ): string {
-  const label = kind === "pay_stub" ? "pay stub" : "document";
+  const label =
+    kind === "pay_stub" ? "pay stub" : kind === "receipt" ? "receipt" : "document";
   if (verdict === "validated") {
     return `Your ${label} was received and passed all consistency checks.`;
   }

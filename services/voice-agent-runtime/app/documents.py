@@ -40,11 +40,12 @@ from .session_state import store_get, store_save_session
 
 log = get_logger("documents")
 
-#: Caller-shareable kinds (C5). KYC kinds are NEVER caller-shareable here —
-#: they keep their own consent-gated intake (kyc-service, SPEC-W58).
-CALLER_DOCUMENT_KINDS = ("pay_stub", "document")
+#: Caller-shareable kinds (SPEC-W116 §4: ALL non-KYC kinds — pay stub was
+#: the example, not the feature). KYC kinds are NEVER caller-shareable
+#: here — they keep their own consent-gated intake (kyc-service, SPEC-W58).
+CALLER_DOCUMENT_KINDS = ("pay_stub", "receipt", "document")
 
-_KIND_LABELS = {"pay_stub": "pay stub", "document": "document"}
+_KIND_LABELS = {"pay_stub": "pay stub", "receipt": "receipt", "document": "document"}
 
 #: Magic-byte prefixes -> declared mime (fail-fast pre-check before the
 #: bytes ever leave the process; ocr-service re-validates authoritatively).

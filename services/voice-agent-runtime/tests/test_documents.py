@@ -111,6 +111,21 @@ def test_upload_happy_path_forwards_to_ocr():
     assert call["source_channel"] == "web"
 
 
+def test_upload_accepts_all_non_kyc_kinds():
+    # SPEC-W116 §4: pay stub was the example — every non-KYC kind is
+    # caller-shareable now.
+    ocr = FakeOcr()
+    client = TestClient(_app(_settings(), ocr=ocr))
+    for kind in ("pay_stub", "receipt", "document"):
+        resp = client.post(
+            "/voice/documents/upload",
+            files={"file": ("doc.png", PNG, "image/png")},
+            data={"kind": kind, "site_slug": "acme"},
+        )
+        assert resp.status_code == 200, (kind, resp.text)
+    assert [c["kind"] for c in ocr.calls] == ["pay_stub", "receipt", "document"]
+
+
 def test_upload_rejects_oversize_and_bad_mime_and_kind():
     client = TestClient(_app(_settings(max_document_bytes=8)))
     big = PNG + b"\x00" * 64

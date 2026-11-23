@@ -447,6 +447,7 @@ export function ChatWidget({
               >
                 <option value="document">Other document</option>
                 <option value="pay_stub">Pay stub</option>
+                <option value="receipt">Receipt</option>
               </select>
               <button
                 type="button"
