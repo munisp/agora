@@ -84,6 +84,21 @@ func (s *Syncer) tw(tenantID *uuid.UUID) *twentyc.Client {
 	return s.Twenty
 }
 
+// saveSummary stores the call's AI summary on the conversation (2026-11-23) so the dashboard shows the same summary
+// as the CRM note. Best effort: needs the summarizer's conversation URL and CONVERSATION_INTERNAL_TOKEN.
+func (s *Syncer) saveSummary(ctx context.Context, conversationID, tenantID, summary string) {
+	if strings.TrimSpace(summary) == "" || conversationID == "" || tenantID == "" {
+		return
+	}
+	if saver, ok := s.Summary.(interface {
+		SaveSummary(ctx context.Context, conversationID, tenantID, summary string) error
+	}); ok {
+		if err := saver.SaveSummary(ctx, conversationID, tenantID, summary); err != nil {
+			s.Log.Warn("call summary not saved to the conversation", zap.String("conversation_id", conversationID), zap.Error(err))
+		}
+	}
+}
+
 func (s *Syncer) summarize(ctx context.Context, conversationID, tenantID string) string {
 	if s.Summary == nil {
 		return ""
@@ -511,13 +526,23 @@ func (s *Syncer) findPersonForNote(ctx context.Context, phone, email string, ten
 	if personID != "" {
 		return personID, nil
 	}
-	if p := strings.TrimSpace(phone); p != "" {
+	for _, p := range syncmap.PhoneVariants(phone) {
 		m, err := s.Map.Get(ctx, syncmap.KindContactPhone, p, tenantUUID)
 		if err == nil && m.TwentyID != "" {
 			return m.TwentyID, nil
 		}
 		if err != nil && !errors.Is(err, syncmap.ErrNotFound) {
 			return "", fmt.Errorf("lookup contact_phone mapping: %w", err)
+		}
+	}
+	// 2026-11-23: a business with its OWN Twenty instance holds only its own people, so the instance itself can be
+	// searched by phone (the shared instance can't: that would match another business's person).
+	if s.Router != nil && s.Router.ForTenant(tenantUUID) != s.Router.Default {
+		for _, p := range syncmap.PhoneVariants(phone) {
+			rec, err := s.tw(tenantUUID).FindPerson(ctx, email, p)
+			if err == nil && rec.ID != "" {
+				return rec.ID, nil
+			}
 		}
 	}
 	return "", nil
@@ -581,8 +606,11 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
+	summary := s.summarize(ctx, convID, evt.TenantID)
+	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	noteID, err := s.tw(tenantUUID).CreateNote(ctx,
-		twentyc.CallSummaryNoteTitle, twentyc.CallSummaryNote(*d.Quality, s.summarize(ctx, firstNonEmpty(d.StoredConversationID, d.ConversationID), evt.TenantID)), personID)
+		twentyc.CallSummaryNoteTitleFor(*d.Quality), twentyc.CallSummaryNote(*d.Quality, summary), personID)
 	if err != nil {
 		return fmt.Errorf("create call summary note: %w", err)
 	}
@@ -640,14 +668,17 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 		q.AvgSentiment = d.AvgSentiment
 	}
 	tenantUUID := parseUUID(evt.TenantID)
-	body := twentyc.CallSummaryNote(q, s.summarize(ctx, d.ConversationID, evt.TenantID))
+	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
+	summary := s.summarize(ctx, convID, evt.TenantID)
+	s.saveSummary(ctx, convID, evt.TenantID, summary)
+	body := twentyc.CallSummaryNote(q, summary)
 	if d.ConversationID != "" {
 		m, err := s.Map.Get(ctx, KindQualityNote, d.ConversationID, tenantUUID)
 		if err != nil && !errors.Is(err, syncmap.ErrNotFound) {
 			return fmt.Errorf("lookup quality_note mapping: %w", err)
 		}
 		if err == nil && m.TwentyID != "" {
-			if err := s.tw(tenantUUID).UpdateNote(ctx, m.TwentyID, twentyc.CallSummaryNoteTitle, body); err != nil {
+			if err := s.tw(tenantUUID).UpdateNote(ctx, m.TwentyID, twentyc.CallSummaryNoteTitleFor(q), body); err != nil {
 				return fmt.Errorf("patch call summary note with sentiment: %w", err)
 			}
 			s.Log.Info("AI call summary note enriched with sentiment",
@@ -665,7 +696,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	noteID, err := s.tw(tenantUUID).CreateNote(ctx, twentyc.CallSummaryNoteTitle, body, personID)
+	noteID, err := s.tw(tenantUUID).CreateNote(ctx, twentyc.CallSummaryNoteTitleFor(q), body, personID)
 	if err != nil {
 		return fmt.Errorf("create enriched call summary note: %w", err)
 	}

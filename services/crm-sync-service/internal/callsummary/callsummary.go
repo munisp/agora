@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -53,6 +54,31 @@ const systemPrompt = "You write the call summary a business owner reads in their
 type turn struct {
 	Role string `json:"role"`
 	Text string `json:"text"`
+}
+
+// SaveSummary stores the summary on the conversation (conversation-service internal route, 2026-11-23) so the
+// dashboard shows the same summary as the CRM note. Token: CONVERSATION_INTERNAL_TOKEN.
+func (s *Summarizer) SaveSummary(ctx context.Context, conversationID, tenantID, summary string) error {
+	if s == nil || s.ConversationURL == "" {
+		return nil
+	}
+	body, _ := json.Marshal(map[string]any{"tenant_id": tenantID, "details": map[string]string{"summary": summary}})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		s.ConversationURL+"/internal/conversations/"+url.PathEscape(conversationID)+"/call-details", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Token", os.Getenv("CONVERSATION_INTERNAL_TOKEN"))
+	resp, err := s.HC.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("save summary: HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // Summarize returns the summary sentences for a conversation, or "".

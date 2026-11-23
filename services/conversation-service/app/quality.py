@@ -57,6 +57,9 @@ def build_enriched_event(
         "avg_sentiment": avg_sentiment,
         "turn_sentiment_count": turn_sentiment_count,
     }
+    # 2026-11-23: the stored transcript's id (the runtime session id differs) so crm-sync can summarise the call
+    if data.get("storedConversationId"):
+        payload["storedConversationId"] = data.get("storedConversationId")
     return cloud_event(
         EVENT_TYPE_CALL_QUALITY_ENRICHED,
         subject=str(env.get("subject") or data.get("siteSlug") or ""),
@@ -133,6 +136,34 @@ class CallQualityEnricher:
                         pass
                     self._consumer = None
 
+    async def _save_call_details(self, env: dict, data: dict, quality: dict) -> None:
+        """2026-11-23: keep the call's facts on the stored conversation (the dashboard shows them; the CRM note
+        carries the same). Best effort: a failure here never blocks the enrichment."""
+        stored = data.get("storedConversationId") or data.get("conversationId")
+        try:
+            conversation_id = uuid.UUID(str(stored))
+            tenant_id = uuid.UUID(str(env.get("tenantid")))
+        except (ValueError, AttributeError, TypeError):
+            return
+        tools = quality.get("tool_calls") or {}
+        outcome = ("booked" if tools.get("book_appointment") else "rescheduled" if tools.get("reschedule_appointment")
+                   else "cancelled" if tools.get("cancel_appointment") else "none")
+        details = {k: v for k, v in {
+            "direction": quality.get("direction") or data.get("direction") or "inbound",
+            "purpose": quality.get("purpose"),
+            "contact_name": quality.get("contact_name"),
+            "channel": quality.get("channel") or data.get("channel"),
+            "duration_s": quality.get("duration_s"),
+            "outcome": outcome,
+            "escalated": bool(quality.get("escalated")),
+            "confirmed_phone": quality.get("confirmed_phone") or None,
+            "whatsapp_sent": bool(tools.get("send_whatsapp_confirmation")),
+        }.items() if v is not None}
+        try:
+            await self._db.merge_call_details(conversation_id, tenant_id, details, ended=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("call details not saved", error=str(exc)[:200])
+
     async def _process(self, value: bytes) -> bool:
         """Handle one event. Returns True when the offset may be committed
         (processed, enriched or deliberately skipped); False to retry later
@@ -148,6 +179,7 @@ class CallQualityEnricher:
         quality = data.get("quality")
         if not isinstance(quality, dict) or not quality:
             return True  # session recorded no signals — nothing to enrich
+        await self._save_call_details(env, data, quality)
         phone = str(quality.get("confirmed_phone") or "").strip()
         if not phone:
             return True  # CRM note path skips too; enrichment would be wasted
@@ -168,6 +200,11 @@ class CallQualityEnricher:
                     )
                     return True
                 await self._sink.publish(build_enriched_event(env, avg, count))
+                try:
+                    stored = data.get("storedConversationId") or data.get("conversationId")
+                    await self._db.merge_call_details(uuid.UUID(str(stored)), tenant_id, {"avg_sentiment": avg})
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("call mood not saved", error=str(exc)[:200])
                 log.info(
                     "call quality enriched with sentiment",
                     conversation_id=str(conversation_id),

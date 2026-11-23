@@ -244,11 +244,48 @@ const CallSummaryNoteTitle = "📞 Call summary"
 //
 // Engineering signals (turn counts, tool names, latencies, speech-engine call
 // counts) stay out of the CRM: they live in the call-quality metrics.
+// PurposeLabel turns an outbound call purpose into plain words.
+func PurposeLabel(p string) string {
+	switch strings.TrimSpace(p) {
+	case "confirm_appointment":
+		return "Confirm appointment"
+	case "waitlist_offer":
+		return "Waiting-list slot offer"
+	case "no_show_rebook":
+		return "Rebook a missed appointment"
+	case "callback":
+		return "Call back"
+	case "", "general":
+		return "General call"
+	}
+	return strings.ReplaceAll(p, "_", " ")
+}
+
+// CallSummaryNoteTitleFor names the note by the kind of call (2026-11-23): "📞 Outbound call — Confirm appointment",
+// "📞 Inbound call", "💻 Web call". Notes from events without a direction keep the old generic title.
+func CallSummaryNoteTitleFor(q events.CallQuality) string {
+	switch {
+	case q.Direction == "outbound":
+		return "📞 Outbound call — " + PurposeLabel(q.Purpose)
+	case q.Channel == "web":
+		return "💻 Web call"
+	case q.Direction == "inbound":
+		return "📞 Inbound call"
+	}
+	return CallSummaryNoteTitle
+}
+
 func CallSummaryNote(q events.CallQuality, summary string) string {
 	var b strings.Builder
 	if s := strings.TrimSpace(summary); s != "" {
 		b.WriteString(s)
 		b.WriteString("\n\n")
+	}
+	switch q.Direction {
+	case "outbound":
+		fmt.Fprintf(&b, "- Call: outbound (we called) — %s\n", PurposeLabel(q.Purpose))
+	case "inbound":
+		fmt.Fprintf(&b, "- Call: inbound (they called)\n")
 	}
 	fmt.Fprintf(&b, "- Call length: %s\n", callLength(q.DurationS))
 	if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {

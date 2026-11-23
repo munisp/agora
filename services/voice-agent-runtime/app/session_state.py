@@ -73,6 +73,8 @@ class SessionState:
     # bypass (OOS-03).
     claimed_phone: str | None = None
     caller_name: str | None = None
+    # 2026-11-23: an outbound call's purpose (confirm_appointment, waitlist_offer, no_show_rebook, callback, general)
+    outbound_purpose: str | None = None
     # 2026-11-21: details from the public page's pre-chat form (app/visitor.py). Self-reported.
     caller_email: str | None = None
     visitor_form: bool = False

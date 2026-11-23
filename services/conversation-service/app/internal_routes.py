@@ -97,3 +97,27 @@ async def gdpr_erase(body: GdprEraseRequest, request: Request) -> dict[str, Any]
         "conversations_matched": convs,
         "turns_deleted": turns,
     }
+
+
+
+@router.post("/internal/conversations/{conversation_id}/call-details")
+async def merge_call_details(conversation_id: str, request: Request) -> dict:
+    """2026-11-23: crm-sync saves the call's AI summary here so the dashboard shows the same summary as the CRM
+    note. Body: {"tenant_id": "<uuid>", "details": {"summary": "..."}}. X-Internal-Token gated."""
+    _require_internal_token(request)
+    import uuid as _uuid
+    from fastapi import HTTPException
+
+    body = await request.json()
+    try:
+        cid, tid = _uuid.UUID(conversation_id), _uuid.UUID(str(body.get("tenant_id")))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="conversation id and tenant_id must be UUIDs")
+    details = body.get("details") or {}
+    if not isinstance(details, dict) or not details:
+        raise HTTPException(status_code=422, detail="details must be a non-empty object")
+    allowed = {k: v for k, v in details.items() if k in ("summary", "purpose", "contact_name")}
+    ok = await request.app.state.db.merge_call_details(cid, tid, allowed)
+    if not ok:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"updated": True}

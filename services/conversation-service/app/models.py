@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import field_validator, BaseModel, Field
 
 Role = Literal["user", "agent", "system", "tool"]
 # SPEC-W12 contract §2: "ussd" joins the channel enum (DB CHECK widened at
@@ -40,6 +40,20 @@ class Conversation(BaseModel):
     contact_name: str | None = None
     caller_phone: str | None = None
     last_activity_at: datetime | None = None
+    # 2026-11-23: direction, purpose, length, outcome, mood and the AI summary of a call (also in its CRM note)
+    call_details: dict | None = None
+
+    @field_validator("call_details", mode="before")
+    @classmethod
+    def _parse_call_details(cls, v):  # asyncpg hands JSONB back as text
+        if isinstance(v, str):
+            import json
+
+            try:
+                return json.loads(v)
+            except ValueError:
+                return None
+        return v
 
 
 class TurnCreate(BaseModel):

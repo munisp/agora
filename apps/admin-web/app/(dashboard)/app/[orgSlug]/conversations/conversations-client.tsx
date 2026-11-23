@@ -25,6 +25,64 @@ export interface ConversationSummary {
   ended_at?: string | null;
   contact_name?: string | null;
   caller_phone?: string | null;
+  /** 2026-11-23: the call's facts, the same ones the CRM note shows (conversation-service call_details). */
+  call_details?: CallDetails | null;
+}
+
+export interface CallDetails {
+  direction?: "inbound" | "outbound";
+  purpose?: string;
+  contact_name?: string;
+  channel?: string;
+  duration_s?: number;
+  outcome?: "booked" | "rescheduled" | "cancelled" | "none";
+  escalated?: boolean;
+  confirmed_phone?: string;
+  avg_sentiment?: number;
+  whatsapp_sent?: boolean;
+  summary?: string;
+}
+
+const PURPOSE_LABEL: Record<string, string> = {
+  confirm_appointment: "Confirm appointment",
+  waitlist_offer: "Waiting-list slot offer",
+  no_show_rebook: "Rebook a missed appointment",
+  callback: "Call back",
+  general: "General call",
+};
+
+/** The same facts, in the same words, as the CRM call note (crm-sync twentyc.CallSummaryNote). */
+function CallDetailsBox({ d }: { d: CallDetails }) {
+  const length = typeof d.duration_s === "number"
+    ? d.duration_s < 60 ? `${Math.round(d.duration_s)} s` : `${Math.floor(d.duration_s / 60)} min ${Math.round(d.duration_s % 60)} s`
+    : null;
+  const outcome = { booked: "Yes", rescheduled: "Rescheduled", cancelled: "Cancelled", none: "No" }[d.outcome ?? "none"];
+  const mood = typeof d.avg_sentiment === "number"
+    ? d.avg_sentiment >= 0.25 ? "Positive" : d.avg_sentiment <= -0.25 ? "Negative" : "Neutral"
+    : null;
+  const rows: [string, string][] = [];
+  if (d.direction === "outbound") rows.push(["Call", `Outbound (we called) — ${PURPOSE_LABEL[d.purpose ?? "general"] ?? d.purpose}`]);
+  else if (d.direction === "inbound") rows.push(["Call", "Inbound (they called)"]);
+  if (length) rows.push(["Call length", length]);
+  if (d.confirmed_phone) rows.push(["Phone confirmed", d.confirmed_phone]);
+  rows.push(["Appointment booked", outcome]);
+  rows.push(["Passed to a person", d.escalated ? "Yes" : "No"]);
+  if (d.whatsapp_sent) rows.push(["WhatsApp confirmation", "Sent"]);
+  if (mood) rows.push(["Caller's mood", mood]);
+  return (
+    <div className="mb-4 rounded-md border border-border bg-muted/40 p-3 text-sm" aria-label="Call details">
+      <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Call details</p>
+      {d.summary ? <p className="mb-2">{d.summary}</p> : null}
+      <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1">
+        {rows.map(([k, v]) => (
+          <React.Fragment key={k}>
+            <dt className="text-muted-foreground">{k}</dt>
+            <dd>{v}</dd>
+          </React.Fragment>
+        ))}
+      </dl>
+    </div>
+  );
 }
 
 /** Who the conversation was with: the stored contact marker, else the name/phone the caller gave when booking. */
@@ -242,6 +300,7 @@ export function ConversationsClient({
               </div>
             </CardHeader>
             <CardContent>
+              {open.call_details ? <CallDetailsBox d={open.call_details} /> : null}
               {turnsError ? <ErrorNote message={turnsError} /> : null}
               {turns === null && !turnsError ? <p className="text-sm text-muted-foreground">Loading the transcript…</p> : null}
               {translating ? <p className="text-xs text-muted-foreground">Translating into English…</p> : null}

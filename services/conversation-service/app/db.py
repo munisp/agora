@@ -189,6 +189,11 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_conversations_contact_phone "
                 "ON conversations (tenant_id, contact_phone)"
             )
+            # 2026-11-23: the call's details (direction, purpose, length, outcome, mood, AI summary) — one record
+            # both the dashboard and the CRM note read, so they always show the same facts.
+            await conn.execute(
+                "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS call_details JSONB"
+            )
         log.info("conversation contact_phone column ensured")
 
     async def ensure_ussd_channel(self) -> None:
@@ -519,8 +524,9 @@ class Database:
             return await conn.fetch(
                 """
                 SELECT c.id, c.tenant_id, c.site_slug, c.channel, c.contact_phone,
-                       c.started_at, c.ended_at,
-                       who.contact_name, who.caller_phone, last.ts AS last_activity_at
+                       c.started_at, c.ended_at, c.call_details,
+                       COALESCE(NULLIF(btrim(c.call_details->>'contact_name'), ''), who.contact_name) AS contact_name,
+                       who.caller_phone, last.ts AS last_activity_at
                 FROM conversations c
                 LEFT JOIN LATERAL (
                     SELECT NULLIF(btrim(tc->'arguments'->>'contact_name'), '') AS contact_name,
@@ -543,6 +549,28 @@ class Database:
                 contact,
             )
 
+    async def merge_call_details(
+        self, conversation_id: uuid.UUID, tenant_id: uuid.UUID, details: dict, ended: bool = False
+    ) -> bool:
+        """Merge keys into conversations.call_details (2026-11-23); ended=True also closes the conversation.
+        Returns False when the conversation does not exist (e.g. a call that stored no transcript)."""
+        import json as _json
+
+        async with self._tenant_tx(tenant_id) as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE conversations
+                   SET call_details = COALESCE(call_details, '{}'::jsonb) || $2::jsonb,
+                       ended_at = CASE WHEN $3 THEN COALESCE(ended_at, now()) ELSE ended_at END
+                 WHERE id = $1
+                RETURNING id
+                """,
+                conversation_id,
+                _json.dumps(details),
+                ended,
+            )
+            return row is not None
+
     async def get_conversation(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> asyncpg.Record:
@@ -550,7 +578,7 @@ class Database:
             row = await conn.fetchrow(
                 """
                 SELECT id, tenant_id, site_slug, channel, contact_phone,
-                       started_at, ended_at
+                       started_at, ended_at, call_details
                 FROM conversations WHERE id = $1
                 """,
                 conversation_id,

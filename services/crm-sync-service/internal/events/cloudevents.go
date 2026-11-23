@@ -121,12 +121,14 @@ type SessionEndedData struct {
 // "turn_sentiment_count"}. quality.avg_sentiment is also set; the top-level
 // fields exist so consumers need not re-derive them.
 type CallQualityEnrichedData struct {
-	ConversationID    string       `json:"conversationId"`
-	Channel           string       `json:"channel"`
-	SiteSlug          string       `json:"siteSlug"`
-	Quality           *CallQuality `json:"quality"`
-	AvgSentiment      *float64     `json:"avg_sentiment"`
-	TurnSentimentCount int         `json:"turn_sentiment_count"`
+	ConversationID string       `json:"conversationId"`
+	Channel        string       `json:"channel"`
+	SiteSlug       string       `json:"siteSlug"`
+	Quality        *CallQuality `json:"quality"`
+	AvgSentiment   *float64     `json:"avg_sentiment"`
+	// StoredConversationID (2026-11-23): conversation-service's id of the call's transcript.
+	StoredConversationID string `json:"storedConversationId,omitempty"`
+	TurnSentimentCount   int    `json:"turn_sentiment_count"`
 }
 
 // CaptureExtractedData mirrors conversation-service app/capture.py
@@ -160,6 +162,11 @@ type CallQuality struct {
 	Escalated       bool           `json:"escalated"`
 	ConfirmedPhone  string         `json:"confirmed_phone"`
 	AvgSentiment    *float64       `json:"avg_sentiment,omitempty"`
+	// 2026-11-23 (voice-agent-runtime): who called whom and why, carried inside quality.
+	Direction   string `json:"direction,omitempty"`
+	Purpose     string `json:"purpose,omitempty"`
+	ContactName string `json:"contact_name,omitempty"`
+	Channel     string `json:"channel,omitempty"`
 }
 
 // Parse unmarshals one Kafka message value into a CloudEvent envelope.

@@ -1602,6 +1602,7 @@ async def build_voice_agent(
             # 2026-11-22: we placed this call (app/outbound_script.py): who we called and why, from the dialer.
             brief = outbound_script.from_attributes(sip_call.attributes)
             session.caller_name = brief.contact_name or None
+            session.outbound_purpose = brief.purpose or "general"
             # We dialed this number and the person answered on it, so it is their phone for the booking read-back
             # policy (unlike an inbound caller ID, which can be spoofed — K15(c) stays as is for inbound). This is NOT
             # identity verification: lookups/changes of existing bookings still need the one-time code.
@@ -2425,6 +2426,15 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             escalated=session.escalation_room is not None,
             confirmed_phone=session.confirmed_phone,
         )
+        # 2026-11-23: who we called and why ride inside `quality` (conversation-service copies that object into
+        # CallQualityEnriched as is), so the web app and the CRM can both say "Outbound call — confirm appointment".
+        if quality is not None:
+            quality["direction"] = direction or "inbound"
+            if getattr(session, "outbound_purpose", None):
+                quality["purpose"] = session.outbound_purpose
+            if session.caller_name:
+                quality["contact_name"] = session.caller_name
+            quality["channel"] = "phone" if sip_call is not None else "web"
         asyncio.get_event_loop().create_task(
             _publish_lifecycle(
                 dapr,
@@ -2435,6 +2445,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 quality=quality,
                 agent_id=session.resolved_agent_id,
                 stored_conversation_id=_TRANSCRIPTS.stored_id(f"voice:{conversation_id}") if _TRANSCRIPTS else None,
+                direction=direction,
             )
         )
 
