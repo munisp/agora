@@ -76,6 +76,7 @@ from .multilang import (
 )
 from .pipeline.stt import FasterWhisperSTT
 from .pipeline.tts import TTSInterface
+from .deburst import deburst_pcm
 from .prompts import (
     EMERGENCY_LOCATION_FIRST_ADDENDUM,
     build_greeting,
@@ -376,14 +377,19 @@ class SwitchingLanguageSTT:
     follow). English and Pidgin are one family here: identification cannot tell them apart reliably.
     The turn is then transcribed with MMS for a Nigerian language, whisper (pinned) for English."""
 
+    LANGUAGE_HINT = "The caller may ask to speak Yoruba, Hausa, Igbo or Pidgin instead of English."
     MIN_SWITCH_S = 3.0
     MIN_CONFIDENCE = 0.65  # Igbo came back right at 0.72 on a clean clip
     # Leaving English/Pidgin for Yorùbá, Hausa or Igbo needs much more: Pidgin lines were taken for Igbo at 0.78 and
     # 0.95 (the receptionist then answered a Pidgin caller in Igbo), while real switches came back at 0.99-1.00.
     MIN_CONFIDENCE_FROM_ENGLISH = 0.97
 
-    def __init__(self, naija: NaijaSpeechSTT, whisper: Any, start: str, allowed: list[str], on_switch: Any) -> None:
+    def __init__(self, naija: NaijaSpeechSTT, whisper: Any, start: str, allowed: list[str], on_switch: Any,
+                 detect_by_sound: bool = True) -> None:
         self._naija, self._whisper = naija, whisper
+        # False (calls that start in English, VOICE_AUTO_LANGUAGE_SWITCH=nigerian): the SOUND of a turn never moves the
+        # call (Nigerian-accented English was taken for Yoruba), but asking for a language in words still does.
+        self._detect_by_sound = detect_by_sound
         self.language = start or "en"
         # The call's own language: English said inside a call that STARTED in Yoruba/Hausa/Igbo is code-switching
         # (details given in English); a caller who started in English/Pidgin and moved away returns home with it.
@@ -407,17 +413,22 @@ class SwitchingLanguageSTT:
     # A caller asking in words ("can I switch to Hausa? I feel more comfortable speaking Hausa") gets that language
     # for certain; detecting it from the sound alone missed requests made in the new language.
     # The Pidgin recogniser spells phonetically: "please kan i swish to housa i feel more komfortabol", "switch to ebol".
-    _LANG_WORD = r"((?:hau|hou)sa\w*|ausa\w*|yor[uo]\w*|yorùbá|igb\w*|ibo\w*|ebo\w*|ebu\w*|ebl\w*|pidg\w*|pij\w*)"
+    # 2026-11-23: whisper (English) writes "Yoruba" as "Yeruba", "Yoroba", "Yarba"; "I'm speaking Yeruba" was missed.
+    _LANG_WORD = (r"((?:hau|hou)sa\w*|ausa\w*|yor[uo]\w*|yorùbá|y[eaou]r[uoa]b[aá]|yarba|yorba|igb\w*|ibo\w*|ebo\w*"
+                  r"|ebu\w*|ebl\w*|pidg\w*|pij\w*)")
     _ASKS_FOR_LANGUAGE = re.compile(
-        r"\b(?:switch|swich|swish|swits?h|change|chenj|speak|spik|talk|tok|continue|go)\b.{0,25}?\b" + _LANG_WORD + r"\b"
-        r"|\b[ck]omf\w*\s+(?:speaking\s+|speakin\s+|in\s+|en\s+|with\s+)?" + _LANG_WORD + r"\b", re.I)
+        r"\b(?:switch\w*|swich|swish|swits?h|change|chenj|speak\w*|spik\w*|talk\w*|tok|continue|go|use|in)\b.{0,25}?\b"
+        + _LANG_WORD + r"\b"
+        r"|\b[ck]omf\w*\s+(?:speaking\s+|speakin\s+|in\s+|en\s+|with\s+)?" + _LANG_WORD + r"\b"
+        # A turn that is little more than the language's name ("Yoruba.", "Yoruba please", "Hausa, abeg").
+        r"|^\W*(?:\w+\W+)?" + _LANG_WORD + r"\W*(?:\w+\W*){0,2}$", re.I)
 
     @staticmethod
     def _language_code(word: str) -> str | None:
         w = word.lower()
         if w.startswith(("ha", "ho", "au")):
             return "ha"
-        if w.startswith("yo"):
+        if w.startswith("y"):
             return "yo"
         if w.startswith(("ig", "ib", "eb")):
             return "ig"
@@ -433,7 +444,7 @@ class SwitchingLanguageSTT:
         m = self._ASKS_FOR_LANGUAGE.search(text or "")
         if not m:
             return
-        code = self._language_code(m.group(1) or m.group(2) or "")
+        code = self._language_code(next((g for g in m.groups() if g), ""))
         if code and code != self.language and code in self._allowed:
             self._pinned = code not in _ENGLISH_FAMILY
             self._switch(code, 1.0)
@@ -464,6 +475,8 @@ class SwitchingLanguageSTT:
         (code-switching): transcribe it in English without changing the call's language."""
         seconds = len(pcm) / (2 * max(1, channels) * max(1, sample_rate))
         in_nigerian = self.language not in _ENGLISH_FAMILY and (self._home not in _ENGLISH_FAMILY or self._pinned)
+        if not self._detect_by_sound and not in_nigerian:
+            return False
         if len(self._allowed) < 2 or seconds < (self.CODE_SWITCH_MIN_S if in_nigerian else self.MIN_SWITCH_S):
             return False
         detected, confidence = await self._identify(pcm, sample_rate, channels)
@@ -490,7 +503,9 @@ class SwitchingLanguageSTT:
     async def _transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
                               initial_prompt: str | None = None) -> str:
         english_turn = await self._maybe_switch(pcm, sample_rate, channels)
-        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
+        # 2026-11-23: without a hint whisper wrote "continue in Yoruba" as "continue in your Uber" and the request to
+        # switch was missed. The hint names the call's languages so whisper spells them.
+        extra = {"initial_prompt": initial_prompt or self.LANGUAGE_HINT}
         if english_turn:
             text = await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en", **extra)
             if self._ASKS_FOR_ENGLISH.search(text or ""):
@@ -565,17 +580,88 @@ def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any,
 ENGLISH_MIN_CHUNK_CHARS = 20
 
 
+# Nigerian-language replies: the first chunk is translated and voiced before anything plays, so it stays short; the
+# sentences after it are prepared while it plays (PrefetchStreamAdapter).
+NIGERIAN_FIRST_CHUNK_CHARS = 30
+
+
 def chunk_chars_for(language: str | None) -> int:
-    return ENGLISH_MIN_CHUNK_CHARS if (language or "en") in ("", "en") else NAIJA_MIN_CHUNK_CHARS
+    return ENGLISH_MIN_CHUNK_CHARS if (language or "en") in ("", "en") else NIGERIAN_FIRST_CHUNK_CHARS
 
 
 def _naija_tts(node: "PiperTTSNode", tokenizer: Any = None) -> Any:
     from livekit.agents import tokenize as lk_tokenize
 
-    return lk_tts.StreamAdapter(
+    return PrefetchStreamAdapter(
         tts=node,
         sentence_tokenizer=tokenizer or lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS),
     )
+
+
+class PrefetchStreamAdapter(lk_tts.StreamAdapter):
+    """livekit's StreamAdapter, but sentences are prepared AHEAD (2026-11-23).
+
+    The stock adapter synthesizes one sentence, plays it, then starts the next. A Yorùbá/Hausa/Igbo sentence first
+    goes through translation (~1-5 s) and then the naija voice (slower than real time), so callers heard 10-15 s of
+    silence before a long first sentence and gaps between sentences. Here every sentence starts (translate +
+    synthesize) as soon as it is complete in the reply, up to PREFETCH sentences at once; audio is still played in
+    the reply's order."""
+
+    PREFETCH = 3
+
+    def stream(self) -> Any:
+        return _PrefetchStream(tts=self._tts, sentence_tokenizer=self._sentence_tokenizer, depth=self.PREFETCH)
+
+
+class _PrefetchStream(lk_tts.SynthesizeStream):
+    def __init__(self, *, tts: Any, sentence_tokenizer: Any, depth: int) -> None:
+        super().__init__()
+        self._tts = tts
+        self._sent_stream = sentence_tokenizer.stream()
+        self._depth = max(1, depth)
+
+    async def _main_task(self) -> None:
+        end = object()
+        order: asyncio.Queue = asyncio.Queue()
+        slots = asyncio.Semaphore(self._depth)
+        workers: list[asyncio.Task] = []
+
+        async def _forward_input() -> None:
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    self._sent_stream.flush()
+                    continue
+                self._sent_stream.push_text(item)
+            self._sent_stream.end_input()
+
+        async def _produce(text: str, out: asyncio.Queue) -> None:
+            try:
+                async for audio in self._tts.synthesize(text):
+                    out.put_nowait(audio)
+            except Exception as exc:  # noqa: BLE001 - one sentence lost, not the whole reply
+                log.warning("sentence synthesis failed", error=str(exc)[:200])
+            finally:
+                out.put_nowait(end)
+                slots.release()
+
+        async def _schedule() -> None:
+            async for ev in self._sent_stream:
+                await slots.acquire()  # at most `depth` sentences in flight
+                out: asyncio.Queue = asyncio.Queue()
+                workers.append(asyncio.create_task(_produce(ev.token, out)))
+                await order.put(out)
+            await order.put(None)
+
+        async def _emit() -> None:
+            while (out := await order.get()) is not None:
+                while (audio := await out.get()) is not end:
+                    self._event_ch.send_nowait(audio)
+
+        tasks = [asyncio.create_task(_forward_input()), asyncio.create_task(_schedule()), asyncio.create_task(_emit())]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await lk_utils.aio.gracefully_cancel(*tasks, *workers)
 
 
 _YES = re.compile(r"\b(yes|yeah|yep|correct|that'?s right|right|exactly|e correct|na so|ehen|bẹ́ẹ̀ni|beeni|bẹẹni|haka ne|haka|ee|eh|ọ dị mma)\b", re.I)
@@ -995,12 +1081,19 @@ class PiperTTSNode(lk_tts.TTS):
         stream_pcm = getattr(self._impl, "stream_pcm", None)
         if self._chunked and stream_pcm is not None:
             async for pcm in stream_pcm(text):
-                for audio in self._audio_frames(pcm):
+                for audio in self._audio_frames(self._clean(pcm)):
                     yield audio
             return
         pcm = await self._impl.synthesize_pcm(text)
-        for audio in self._audio_frames(pcm):
+        for audio in self._audio_frames(self._clean(pcm)):
             yield audio
+
+    def _clean(self, pcm: bytes) -> bytes:
+        """2026-11-23: the naija voices (YarnGPT) end each line with a loud burst, heard as a bleep after every
+        Yorùbá/Hausa/Igbo sentence: cut it (app/deburst.py, same method as the films)."""
+        if (getattr(self._impl, "voice", "") or "").startswith("naija:"):
+            return deburst_pcm(pcm, self._impl.sample_rate)
+        return pcm
 
 
 # ---------------------------------------------------------------------------
@@ -1898,9 +1991,11 @@ async def build_voice_agent(
     switching_stt = (
         SwitchingLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen or "en",
                              call_language.allowed(settings.call_languages)
-                             if (settings.voice_language_switch_mode == "on"
-                                 or (settings.voice_language_switch_mode == "nigerian" and chosen in call_language.NIGERIAN))
-                             else [chosen or "en"], _switch_language)
+                             if settings.voice_language_switch_mode in ("on", "nigerian") else [chosen or "en"],
+                             _switch_language,
+                             # "nigerian": an English-started call switches only when the caller ASKS (2026-11-23)
+                             detect_by_sound=(settings.voice_language_switch_mode == "on"
+                                              or chosen in call_language.NIGERIAN))
         if settings.naija_speech_url and caller_language is not None and sip_call is None else None
     )
 
@@ -1996,7 +2091,8 @@ async def build_voice_agent(
     # through. What was said, and the English it came from, are kept for the transcript.
     spoken_pairs: list = []
     session.spoken_pairs = spoken_pairs  # read by _record_voice_transcript
-    speak_translator = (LLMTranslator(settings.llm_base_url, settings.llm_model, api_key=settings.llm_api_key,
+    speak_translator = (LLMTranslator(settings.translate_llm_base_url or settings.llm_base_url, settings.llm_model,
+                                      api_key=settings.llm_api_key,
                                       extra_body=settings.llm_extra_body or None)
                         if settings.naija_think_in_english else None)
 
@@ -2011,14 +2107,27 @@ async def build_voice_agent(
         except Exception as exc:  # noqa: BLE001 - never block speech on this
             log.warning("weekday/date check skipped", error=str(exc)[:160])
         lang = session.active_language
+        # 2026-11-23: the receptionist answered in Yoruba while the call was still in English (the caller had asked for
+        # Yoruba, but the request was missed): the Yoruba was read by the English voice, with English intonation. A
+        # reply written in Yoruba/Hausa/Igbo now moves the call (voice, recognition, prompt) to that language first.
+        written = detect_language(text)
+        if (switching_stt is not None and written in ("yo", "ha", "ig") and lang in _ENGLISH_FAMILY
+                and written in getattr(switching_stt, "_allowed", ())):
+            log.info("reply written in another language; call follows it", language=written)
+            switching_stt._pinned = True
+            switching_stt._switch(written, 1.0)
+            lang = session.active_language
         if speak_translator is None or lang not in call_language.SPOKEN_BY_TRANSLATION or not text.strip():
             return text
-        if detect_language(text) != "en":
+        if written != "en":
             return text
         # Numbers stay digits into translation: the model says times, dates and amounts in the language, and phone
         # numbers are then spoken digit by digit with the language's own number words. (English number words
         # inside a Yoruba/Hausa/Igbo sentence were where the voices mumbled.)
         out = native_digits((await speak_translator.translate(digit_words_to_digits(text), "en", lang)).text, lang)
+        if detect_language(out) == "en":
+            # Translation failed open (timeout / error): this English would be read by the Nigerian-language voice.
+            log.warning("reply translation fell back to english", language=lang, chars=len(text))
         if out != text:
             spoken_pairs.append((text, out))
             session.last_agent_en = text  # the caller's next words are read against this (inbound translation)

@@ -612,7 +612,7 @@ def build_translator(settings: Any) -> TranslatorInterface:
     provider = (getattr(settings, "translate_provider", "mock") or "mock").strip().lower()
     if provider == "llm":
         return LLMTranslator(
-            getattr(settings, "llm_base_url", ""),
+            getattr(settings, "translate_llm_base_url", "") or getattr(settings, "llm_base_url", ""),
             getattr(settings, "translate_llm_model", "") or getattr(settings, "llm_model", ""),
             api_key=getattr(settings, "llm_api_key", ""),
             timeout_s=max(getattr(settings, "translate_timeout_s", 3.0), 20.0),

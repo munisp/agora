@@ -673,6 +673,10 @@ class Settings:
     translate_url: str = ""
     translate_api_key: str = ""
     translate_timeout_s: float = 3.0
+    # 2026-11-23: where the LLM translators run (live Yoruba/Hausa/Igbo calls translate every reply sentence). The
+    # second Ollama server on ghana keeps these small requests from evicting the receptionist's cached prompt on the
+    # main one. Empty = llm_base_url.
+    translate_llm_base_url: str = ""
 
     # SPEC-W82 A4.4: per-tenant STT hints (VOICE_STT_HINTS JSON keyed by
     # site/tenant slug) — a forced whisper language= and an initial_prompt
@@ -891,6 +895,7 @@ def load_settings() -> Settings:
         translate_url=_env("TRANSLATE_URL", ""),
         translate_api_key=_env("TRANSLATE_API_KEY", ""),
         translate_timeout_s=_env_float("TRANSLATE_TIMEOUT_S", 3.0),
+        translate_llm_base_url=_env("TRANSLATE_LLM_BASE_URL", ""),
         # SPEC-W82 A4.4/A4.5 per-tenant hints + pronunciation lexicon.
         voice_stt_hints=parse_stt_hints(_env("VOICE_STT_HINTS", "")),
         voice_pronunciation_lexicon=parse_tenant_lexicons(
