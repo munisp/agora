@@ -2212,6 +2212,12 @@ async def build_voice_agent(
         english = (inbound.text or "").strip()
         if not english or english == text:
             return text
+        # 2026-11-23: given an unreadable line ("[?]") the translator answered with chatter ("Please provide the
+        # transcript...") and the receptionist replied to that. A "translation" far longer than what was heard is not
+        # one: the receptionist gets the caller's own words and asks again if it can't follow them.
+        if len(english) > 4 * len(text) + 40:
+            log.warning("caller translation discarded (not a translation)", heard=text[:80], english=english[:120])
+            return text
         session.caller_heard[english] = text
         log.info("caller understood", language=lang, heard=text[:160], english=english[:160])
         return english

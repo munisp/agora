@@ -115,6 +115,23 @@ class Engines:
             self.asr_proc = AutoProcessor.from_pretrained("facebook/mms-1b-all")
             self.asr = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all", torch_dtype=torch.float16).to("cuda").eval()
             self.asr_lang: Optional[str] = None
+            # 2026-11-23: Yorùbá speech recognition by a Whisper large-v3-turbo fine-tuned on Yorùbá (Apache-2.0).
+            # On 25 real FLEURS yo_ng sentences: WER 38.6% with tone marks / 21.8% without, vs MMS-1B-all's 53.3% /
+            # 30.3%. YO_ASR_MODEL="" keeps MMS for Yorùbá too; MMS stays the fallback on any error.
+            self.yo_whisper = None
+            yo_model = os.environ.get("YO_ASR_MODEL", "Africanvoice/african_voices_yoruba_turbo").strip()
+            if yo_model:
+                try:
+                    from transformers import WhisperForConditionalGeneration, WhisperProcessor
+                    self.yo_proc = WhisperProcessor.from_pretrained(
+                        os.environ.get("YO_ASR_PROCESSOR", "openai/whisper-large-v3-turbo"))
+                    self.yo_whisper = WhisperForConditionalGeneration.from_pretrained(
+                        yo_model, torch_dtype=torch.float16).to("cuda").eval()
+                    print(f"yoruba asr: {yo_model}", flush=True)
+                except Exception as exc:  # noqa: BLE001 - MMS still serves Yorùbá
+                    print(f"yoruba asr model not loaded ({exc}); using MMS", flush=True)
+                    self.yo_whisper = None
+            self.yo_lock = threading.Lock()
             self.vits = {k: (VitsModel.from_pretrained(m).to("cuda").eval(), AutoTokenizer.from_pretrained(m))
                          for k, m in MMS_TTS.items()}
             from transformers import Wav2Vec2ForSequenceClassification, AutoFeatureExtractor
@@ -227,6 +244,10 @@ class Engines:
     # ------------------------------------------------------------------ ASR
     def transcribe(self, audio: np.ndarray, rate: int, lang: str) -> str:
         audio = resample(audio, rate, 16000)
+        if lang == "yor" and self.yo_whisper is not None:
+            text = self._transcribe_yo(audio)
+            if text is not None:
+                return text
         with self.mms_lock, torch.no_grad():
             if self.asr_lang != lang:
                 self.asr_proc.tokenizer.set_target_lang(lang)
@@ -234,6 +255,29 @@ class Engines:
                 self.asr_lang = lang
             inp = self.asr_proc(audio, sampling_rate=16000, return_tensors="pt").to("cuda")
             return self.asr_proc.decode(self.asr(inp.input_values.half()).logits[0].argmax(-1)).strip()
+
+    def _transcribe_yo(self, audio: np.ndarray) -> Optional[str]:
+        """Yorùbá through the fine-tuned Whisper; None (= use MMS) on an error or a runaway repetition."""
+        try:
+            with self.yo_lock, torch.no_grad():
+                feats = self.yo_proc(audio, sampling_rate=16000, return_tensors="pt").input_features
+                ids = self.yo_whisper.generate(feats.to("cuda", torch.float16), max_new_tokens=200)
+                text = self.yo_proc.batch_decode(ids, skip_special_tokens=True)[0].strip()
+            return None if _runaway(text) else text
+        except Exception as exc:  # noqa: BLE001
+            print(f"yoruba whisper failed ({exc}); using MMS", flush=True)
+            return None
+
+
+def _runaway(text: str) -> bool:
+    """Whisper output not worth passing on: a loop on noise or silence ("ó ó ó ó ..." — a long output made of very few
+    distinct words), or only placeholder tokens such as "[?]" / "(music)" with hardly any letters (a live call passed
+    "[?]" on and the translator answered it with chatter)."""
+    words = text.split()
+    if len(words) >= 12 and len(set(words)) / len(words) < 0.35:
+        return True
+    letters = sum(ch.isalpha() for ch in re.sub(r"[\[(][^\])]*[\])]", "", text))
+    return letters < 3
 
 
 class TTSRequest(BaseModel):
