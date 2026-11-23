@@ -2281,6 +2281,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     await ctx.connect()
     room_name = ctx.room.name or ""
+    if room_name.startswith("escalation-"):
+        # 2026-11-23: a staff handoff room (request_human): people talk there, not the receptionist.
+        log.info("staff escalation room; receptionist not joining", room=room_name)
+        await dapr.aclose()
+        return
     # Wave 5 #1 SIP inbound: `call-*` rooms (dispatch-rule.yaml) or rooms
     # joined by a SIP participant are PSTN calls. Resolve the tenant from the
     # dialed number (TENANT_PHONE_MAP) instead of the `site-{slug}` web

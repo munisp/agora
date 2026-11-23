@@ -71,7 +71,11 @@ async def test_turn_fetch_timeout_returns_empty():
 
 # ------------------------------------------------- chat path integration
 class _StubLLM:
+    def __init__(self) -> None:
+        self.seen: list[list[dict]] = []  # the messages of every request, copied as sent
+
     async def chat_with_tools(self, messages, tools):
+        self.seen.append([dict(m) for m in messages])
         return SimpleNamespace(content="Sure!", tool_calls=[])
 
     async def stream_with_tools(self, messages, tools):
@@ -120,11 +124,16 @@ async def test_chat_turn_grounded_by_per_turn_query(monkeypatch):
     assert len(kb_calls) == 1
     assert kb_calls[0][2]["q"] == "what is your refund policy?"
     assert kb_calls[0][3] == {"X-Tenant-Slugs": "acme"}
-    # turn snippet leads, bootstrap snippet follows in the system prompt
+    # 2026-11-23: the bootstrap snippet stays in the stable system prompt; this turn's snippet rides the user's
+    # message for that request only (the system prompt never changes per turn, so the GPU server can reuse it) ...
     prompt = _system_prompt(service, result["conversation_id"])
-    turn_at = prompt.index("turn: refunds within 30 days")
-    boot_at = prompt.index("bootstrap: we open 9am-5pm")
-    assert 0 <= turn_at < boot_at
+    assert "bootstrap: we open 9am-5pm" in prompt
+    assert "turn: refunds within 30 days" not in prompt
+    sent_user = [m for m in service._llm.seen[-1] if m["role"] == "user"][-1]["content"]
+    assert sent_user.startswith("what is your refund policy?") and "turn: refunds within 30 days" in sent_user
+    # ... and the stored history keeps exactly what the customer typed.
+    history = service._histories.messages[result["conversation_id"]]
+    assert [m["content"] for m in history if m["role"] == "user"][-1] == "what is your refund policy?"
 
 
 async def test_chat_turn_kb_failure_keeps_bootstrap_grounding(monkeypatch):

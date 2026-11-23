@@ -70,6 +70,27 @@ def clean_reply(reply: str, trace: list[dict[str, Any]] | None) -> str:
     return cleaned
 
 
+TURN_KNOWLEDGE_MARK = "\n\n[Business knowledge that may help answer this message — not written by the customer]"
+
+
+def _strip_turn_knowledge(history: list[dict[str, Any]]) -> None:
+    """Put the latest user message back to what the customer wrote (drop this turn's knowledge block)."""
+    for entry in reversed(history):
+        content = entry.get("content")
+        if entry.get("role") == "user" and isinstance(content, str) and TURN_KNOWLEDGE_MARK in content:
+            entry["content"] = content.split(TURN_KNOWLEDGE_MARK, 1)[0]
+            return
+
+
+CHAT_TEXT_ADDENDUM = (
+    "TYPED CHAT\n"
+    "- This is a typed chat on the website, not a phone call: the customer reads your replies. Write phone numbers, "
+    "emails, dates and amounts normally (for example 0803 555 1212, kemi.ojo@gmail.com, Tuesday 24 November at "
+    "9:00 am) — never spell digits out as words and never say \"dot\" or \"at\" for an email. When confirming "
+    "details, list them once in that written form. Never mention a call, the line, hearing or speaking."
+)
+
+
 @dataclass
 class ChatHistory:
     """Bounded per-conversation message history (dev-grade, in-memory)."""
@@ -188,6 +209,7 @@ class ChatService:
         # Turn snippets lead, bootstrap snippets follow; ctx is a per-turn
         # deepcopy so the merge never leaks across turns. Best-effort: an
         # empty/failed fetch keeps the bootstrap snippets exactly.
+        turn_knowledge: list[str] = []
         if self._settings.knowledge_turn_queries:
             turn_snippets = await fetch_turn_knowledge(
                 self._dapr,
@@ -198,11 +220,10 @@ class ChatService:
                 channel=channel,
             )
             if turn_snippets:
-                merged: list[str] = []
-                for s in [*turn_snippets, *ctx.knowledge_snippets]:
-                    if s not in merged:
-                        merged.append(s)
-                ctx.knowledge_snippets = merged[
+                # 2026-11-23 latency: this turn's snippets ride the prompt's per-conversation tail
+                # (it rides the user message for this request); the KNOWLEDGE block keeps the bootstrap snippets so the
+                # prompt body stays identical across turns and the GPU server can reuse it.
+                turn_knowledge = [s for s in turn_snippets if s not in ctx.knowledge_snippets][
                     : self._settings.knowledge_snippet_count
                 ]
 
@@ -267,6 +288,8 @@ class ChatService:
             language=session.active_language,
             visitor=visitor_mod.from_session(session),
         )
+        # 2026-11-23: a typed chat reads, it is not heard — write details normally.
+        system_prompt = f"{system_prompt}\n{CHAT_TEXT_ADDENDUM}"
         # SPEC-W9 Part B: tell the agent it may drive the visitor's UI — but
         # only when the UI action tools are registered for this turn.
         registered = {t["function"]["name"] for t in tool_layer.schemas()}
@@ -280,7 +303,13 @@ class ChatService:
             history[0] = {"role": "system", "content": system_prompt}
         else:
             history.insert(0, {"role": "system", "content": system_prompt})
-        history.append({"role": "user", "content": message})
+        # 2026-11-23 latency: this turn's knowledge rides the user's message for THIS request only (restored to the
+        # plain message after the reply, see _strip_turn_knowledge), so the system prompt never changes per turn.
+        content = message
+        if turn_knowledge:
+            content = (f"{message}{TURN_KNOWLEDGE_MARK}\n"
+                       + "\n".join(f"- {s}" for s in turn_knowledge))
+        history.append({"role": "user", "content": content})
         return session, tool_layer, history
 
     async def _persist_turn(self, session: SessionState) -> None:
@@ -443,6 +472,7 @@ class ChatService:
             dispatch=self._tool_runner.wrap_dispatch(tool_layer.dispatch),
         )
         reply = clean_reply(reply, trace)
+        _strip_turn_knowledge(history)
         history.append({"role": "assistant", "content": reply})
         # SPEC-W82 A3 (outbound translation): the caller-visible reply is
         # translated en -> active_language; the HISTORY keeps the English
@@ -576,6 +606,7 @@ class ChatService:
 
             streamed = reply
             reply = clean_reply(reply, trace)
+            _strip_turn_knowledge(history)
             history.append({"role": "assistant", "content": reply})
             # SPEC-W82 A3 (outbound translation, SSE path): the deltas already
             # streamed in English, so the translated reply rides the terminal

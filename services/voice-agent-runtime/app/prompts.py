@@ -101,10 +101,6 @@ CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
   with verify_caller_code.
 - If a tool answers "verification_unavailable", apologize and explain that
   booking changes are temporarily unavailable; do NOT keep retrying.
-
-CALLER CONTEXT
-- conversation_id: {conversation_id}
-- site: {site_slug}
 """
 
 
@@ -210,7 +206,7 @@ def build_greeting(ctx: TenantContext, menu_line: str | None = None, ask_details
     return f"{RECORDING_NOTICE_LINE} {greeting}"
 
 
-def today_line(tz_name: str | None, now: datetime | None = None) -> str:
+def today_line(tz_name: str | None, now: datetime | None = None, *, clock_only: bool = False) -> str:
     """Today's date in the business's time zone. Without it the model guessed the year from its training data and
     asked for availability in the past (e.g. 2025), then told customers nothing was free."""
     try:
@@ -225,8 +221,10 @@ def today_line(tz_name: str | None, now: datetime | None = None) -> str:
     fmt = lambda d: f"{d.strftime('%A')} {d.day} {d.strftime('%B')}"
     calendar = ", ".join(fmt(d) for d in days[1:])
     nxt = "; ".join(f"next {d.strftime('%A')} = {d.day} {d.strftime('%B')}" for d in days[1:8])
-    return (f"Today is {local.strftime('%A')}, {local.day} {local.strftime('%B %Y')}; the local time is "
-            f"{local.strftime('%H:%M')} ({tz.key}). Tomorrow is {fmt(days[1])}. The coming days: {calendar}. "
+    if clock_only:
+        return f"- The local time now is {local.strftime('%H:%M')} ({tz.key})."
+    return (f"Today is {local.strftime('%A')}, {local.day} {local.strftime('%B %Y')} ({tz.key}; the current local "
+            f"time is under THIS CONVERSATION below). Tomorrow is {fmt(days[1])}. The coming days: {calendar}. "
             f"When a caller says \"next\" with a weekday it means the first such day after today: {nxt}. "
             f"Use exactly these weekday/date pairs, and never check or book a date in the past.")
 
@@ -243,6 +241,7 @@ def build_system_prompt(
     keypad_menu_hint: str | None = None,
     visitor: dict[str, str] | None = None,
     outbound: str | None = None,
+    turn_knowledge: list[str] | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -275,9 +274,19 @@ def build_system_prompt(
         if snippets
         else "- (no extra knowledge available)"
     )
-    if active_agent is not None:
-        agent_name = str(active_agent.get("name") or agent_name)
+    # 2026-11-23 latency: the first line no longer names the active specialist (it changed the prompt's very start
+    # when chat routing switched desks); the SPECIALIST AGENT ACTIVE block in the tail says who is speaking.
     extra_names = "".join(f", {n}" for n in (extra_tool_names or []))
+    # 2026-11-23 latency: the prompt is a STABLE body (identical for every conversation of this business) followed by
+    # a short per-conversation TAIL (date/time, ids, caller details, language, active specialist, this turn's
+    # knowledge). The GPU server can then resume from a saved point inside the body instead of re-reading ~5,000
+    # tokens on every turn (gemma's sliding-window cache only resumes from checkpoints taken near a prompt's end).
+    tail = ("\n\nTHIS CONVERSATION\n" + today_line(ctx.timezone, clock_only=True)
+            + f"\n- conversation_id: {conversation_id}\n- site: {ctx.site_slug}\n")
+    if turn_knowledge:
+        tail += ("\nKNOWLEDGE FOR THE LATEST QUESTION (use it with the KNOWLEDGE above)\n"
+                 + "\n".join(f"- {s}" for s in turn_knowledge) + "\n")
+    # The date and the two-week calendar change once a day: they lead the stable body.
     prompt = today_line(ctx.timezone) + "\n\n" + _TEMPLATE.format(
         agent_name=agent_name,
         business_name=ctx.display_name or ctx.site_slug,
@@ -312,6 +321,8 @@ def build_system_prompt(
     # SPEC-W70 A3: global spoken-fluency block for every language, BEFORE
     # the per-turn locale instruction so the language rule lands last.
     prompt += "\n" + SPOKEN_STYLE_BLOCK + "\n"
+    # Everything below varies per conversation or turn: it is collected after the stable body (see tail above).
+    stable, prompt = prompt, ""
     # Wave 5 #3: per-turn locale instruction when the caller speaks a
     # non-default language (whisper detection -> MultilangState).
     if language:
@@ -354,16 +365,16 @@ def build_system_prompt(
                 f"for this part of the conversation; the base receptionist "
                 f"rules above still apply.\n{persona}\n"
             )
-    elif ctx.agents:
+    if ctx.agents:
         roster = "\n".join(
             f"- {a.get('name')} (id {a.get('id')}): handles {', '.join(str(i) for i in (a.get('intents') or [])[:6])}"
             for a in ctx.agents
             if isinstance(a, dict)
         )
         if roster:
-            prompt += (
+            stable += (
                 "\nSPECIALIST AGENTS (the platform routes the conversation "
                 "automatically when the caller's intent matches; you do not "
                 "need to transfer explicitly)\n" + roster + "\n"
             )
-    return prompt
+    return stable + tail + prompt
