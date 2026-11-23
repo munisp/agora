@@ -518,6 +518,12 @@ def create_app(
             "purpose": req.purpose or "general",
         }
 
+    @app.get("/voice/chat/staff-messages")
+    async def voice_chat_staff_messages(conversation_id: str, request: Request, after: int = 0) -> Any:
+        """2026-11-23: replies a person sent from the human inbox (Chatwoot) to this web chat; the widget polls it
+        while a handoff is active. Same resume credential as the chat itself (X-Session-Secret)."""
+        return await chat_service.staff_messages(conversation_id, request.headers.get("X-Session-Secret"), after)
+
     @app.post("/voice/chat")
     async def voice_chat(req: ChatRequest, request: Request) -> Any:
         # SPEC-W47 (K15(b), UIMOB-04 service side): the web widget may carry

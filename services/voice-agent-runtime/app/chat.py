@@ -23,6 +23,7 @@ from .prompts import build_system_prompt
 from .session_state import (
     SessionState,
     SessionStore,
+    store_get,
     store_get_or_create,
     store_load_history,
     store_save_history,
@@ -121,6 +122,12 @@ class ChatService:
         session = await store_get_or_create(
             self._sessions, conversation_id, site_slug, session_secret=session_secret
         )
+        if channel in ("whatsapp", "telegram") and conversation_id:
+            # The messaging gateway records these chats and sends its stored conversation id as conversation_id.
+            session.stored_id_lookup = lambda: conversation_id
+        elif self._transcripts is not None:
+            key = f"chat:{session.conversation_id}"
+            session.stored_id_lookup = lambda: self._transcripts.stored_id(key)
         # 2026-11-21: the public page's pre-chat form (name/phone/email, self-reported; app/visitor.py).
         visitor_mod.apply(session, visitor)
         ctx = await fetch_tenant_context(self._dapr, self._settings, site_slug)
@@ -310,6 +317,58 @@ class ChatService:
             contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
         )
 
+    def _stored_key(self, session: SessionState) -> str:
+        return f"chat:{session.conversation_id}"
+
+    async def _human_reply(self, session: SessionState, tool_layer: Any, message: str) -> dict[str, Any] | None:
+        """The turn's response while staff own the conversation (web chat only; WhatsApp/Telegram are gated in the
+        messaging gateway, which records those conversations). None = the receptionist answers as usual."""
+        if self._transcripts is None or (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram"):
+            return None
+        stored = self._transcripts.stored_id(self._stored_key(session))
+        ctx = getattr(tool_layer, "tenant_context", None)
+        tenant_id = str(getattr(ctx, "tenant_id", "") or "")
+        if not stored or not tenant_id or not await self._transcripts.handoff_active(stored, tenant_id):
+            return None
+        self._transcripts.record(
+            self._stored_key(session), [{"role": "user", "text": message}],
+            tenant_id=tenant_id, site_slug=session.site_slug, channel=getattr(session, "channel", None) or "web",
+            contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
+        )
+        await self._persist_turn(session)
+        log.info("chat turn left for staff (human handoff active)", conversation_id=session.conversation_id)
+        return {
+            "conversation_id": session.conversation_id,
+            "session_secret": session.session_secret,
+            "reply": "",
+            "tool_calls": [],
+            "phone_confirmed": session.confirmed_phone is not None,
+            "phone_verified": session.verified_phone is not None,
+            "active_agent": session.active_agent,
+            "escalated": True,
+            "human": True,
+            "ui_actions": [],
+            "request_contact": False,
+        }
+
+    async def staff_messages(self, conversation_id: str, session_secret: str | None, after: int = 0) -> dict[str, Any]:
+        """2026-11-23: replies a person sent from the human inbox to this web chat (the widget polls this).
+        Requires the session's resume secret, like resuming the chat itself."""
+        session = await store_get(self._sessions, conversation_id)
+        if session is None or not session.check_secret(session_secret) or self._transcripts is None:
+            return {"messages": [], "human": False}
+        stored = self._transcripts.stored_id(self._stored_key(session))
+        if not stored:
+            return {"messages": [], "human": False}
+        ctx = await fetch_tenant_context(self._dapr, self._settings, session.site_slug)
+        conv = await self._transcripts.conversation(stored, str(ctx.tenant_id))
+        if not conv:
+            return {"messages": [], "human": False}
+        handoff = (conv.get("call_details") or {}).get("handoff") or {}
+        msgs = [{"seq": t["seq"], "text": t["text"], "ts": t.get("ts"), "agent": handoff.get("agent") or "Staff"}
+                for t in conv.get("turns") or [] if t.get("role") == "staff" and int(t.get("seq") or 0) > after]
+        return {"messages": msgs, "human": bool(handoff.get("active"))}
+
     async def handle_message(
         self,
         *,
@@ -349,6 +408,12 @@ class ChatService:
                 conversation_id=session.conversation_id,
                 channel=channel,
             )
+
+        # 2026-11-23: a person took this chat over in the human inbox — record the customer's message (the inbox
+        # bridge shows it to the staff member) and let the receptionist stay quiet.
+        human = await self._human_reply(session, tool_layer, message)
+        if human is not None:
+            return human
 
         reply, trace = await run_tool_loop(
             self._llm,
@@ -449,6 +514,12 @@ class ChatService:
             persona_override=persona_override,
             visitor=visitor,
         )
+        # 2026-11-23: staff own this chat (human inbox): record the message, stay quiet, tell the widget.
+        human = await self._human_reply(session, tool_layer, message)
+        if human is not None:
+            yield {"done": True, "human": True, "conversation_id": session.conversation_id,
+                   "session_secret": session.session_secret}
+            return
 
         # VOICE-SCALING §5 async tools (chat path): an immediate {"ack": ...}
         # SSE event precedes every slow tool execution; the tool call itself
@@ -510,6 +581,8 @@ class ChatService:
                 "done": True,
                 "conversation_id": session.conversation_id,
                 "session_secret": session.session_secret,
+                # 2026-11-23: the widget starts fetching staff replies (human inbox) once a chat is escalated.
+                "escalated": session.escalation_room is not None,
             }
             if outbound_reply != reply:
                 # SPEC-W82 A3 (additive): translated reply for non-English

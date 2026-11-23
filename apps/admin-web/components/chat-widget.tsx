@@ -8,14 +8,19 @@ import { cn } from "@/lib/utils";
 import type { ChatResponse } from "@/lib/types";
 
 interface Turn {
-  role: "user" | "agent";
+  role: "user" | "agent" | "staff";
   text: string;
+  /** staff turns: who replied from the human inbox */
+  agent?: string;
 }
 
 interface ChatResult {
   reply: string;
   conversationId?: string;
   sessionSecret?: string;
+  /** 2026-11-23: handed to a person (escalated) / a person owns the chat (human) */
+  escalated?: boolean;
+  human?: boolean;
 }
 
 /**
@@ -115,6 +120,8 @@ async function sendStreaming(
   let conversationId: string | undefined;
   let secret: string | undefined;
   let sawDone = false;
+  let escalated = false;
+  let human = false;
 
   const handleEvent = (data: string) => {
     if (!data || data === "[DONE]") return;
@@ -125,7 +132,11 @@ async function sendStreaming(
         reply?: string;
         conversation_id?: string;
         session_secret?: string;
+        escalated?: boolean;
+        human?: boolean;
       };
+      if (evt.escalated) escalated = true;
+      if (evt.human) human = true;
       if (typeof evt.conversation_id === "string") {
         conversationId = evt.conversation_id;
       }
@@ -162,7 +173,7 @@ async function sendStreaming(
     handleEvent(buffer.trim().slice(5).trim());
   }
   if (!reply && !sawDone) return null;
-  return { reply, conversationId, sessionSecret: secret };
+  return { reply, conversationId, sessionSecret: secret, escalated, human };
 }
 
 /**
@@ -199,7 +210,40 @@ export function ChatWidget({
   const [conversationId, setConversationId] = React.useState<string | undefined>();
   const [sessionSecret, setSessionSecret] = React.useState<string | undefined>();
   const [sending, setSending] = React.useState(false);
+  // 2026-11-23: human inbox — once a person is involved, fetch their replies every few seconds.
+  const [withStaff, setWithStaff] = React.useState(false);
+  const lastStaffSeq = React.useRef(0);
   const scrollRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (!withStaff || !conversationId || !sessionSecret) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `/voice/chat/staff-messages?conversation_id=${encodeURIComponent(conversationId)}&after=${lastStaffSeq.current}`,
+          { headers: { "x-session-secret": sessionSecret }, cache: "no-store" },
+        );
+        if (!res.ok || stopped) return;
+        const body = (await res.json()) as {
+          messages?: { seq: number; text: string; agent?: string }[];
+        };
+        const fresh = (body.messages ?? []).filter((m) => m.seq > lastStaffSeq.current);
+        if (fresh.length) {
+          lastStaffSeq.current = Math.max(...fresh.map((m) => m.seq));
+          setTurns((t) => [...t, ...fresh.map((m) => ({ role: "staff" as const, text: m.text, agent: m.agent }))]);
+        }
+      } catch {
+        // offline for a moment — the next poll catches up
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 5000); // 12/min: the /voice/* route allows 30 per visitor
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [withStaff, conversationId, sessionSecret]);
 
   React.useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -260,6 +304,8 @@ export function ChatWidget({
             streamed.sessionSecret ?? sessionSecret,
           );
         }
+        if (streamed.escalated || streamed.human) setWithStaff(true);
+        if (streamed.human) return; // a person is answering; their reply arrives through the poll
         if (!streamed.reply) {
           // Stream ended without content — drop the placeholder turn.
           setTurns((t) => t.filter((_, i) => i !== streamedIdx));
@@ -276,7 +322,8 @@ export function ChatWidget({
         sessionSecret ? { "x-session-secret": sessionSecret } : undefined,
       );
       rememberSession(res.conversation_id, res.session_secret ?? sessionSecret);
-      setTurns((t) => [...t, { role: "agent", text: res.reply }]);
+      if (res.escalated || res.human) setWithStaff(true);
+      if (!res.human) setTurns((t) => [...t, { role: "agent", text: res.reply }]);
     } catch (err) {
       setTurns((t) => [
         ...t,
@@ -373,6 +420,11 @@ export function ChatWidget({
                     t.role === "user" ? { backgroundColor: accent } : undefined
                   }
                 >
+                  {t.role === "staff" ? (
+                    <span className="mb-0.5 block text-xs font-medium text-muted-foreground">
+                      {t.agent || "Staff"}
+                    </span>
+                  ) : null}
                   {t.text}
                 </div>
               ))

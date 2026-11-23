@@ -194,6 +194,12 @@ class Database:
             await conn.execute(
                 "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS call_details JSONB"
             )
+            # 2026-11-23: "staff" turns — a person replying from the human inbox (Chatwoot) after a handoff.
+            await conn.execute(
+                "ALTER TABLE turns DROP CONSTRAINT IF EXISTS turns_role_check; "
+                "ALTER TABLE turns ADD CONSTRAINT turns_role_check "
+                "CHECK (role IN ('user', 'agent', 'system', 'tool', 'staff')) NOT VALID"
+            )
         log.info("conversation contact_phone column ensured")
 
     async def ensure_ussd_channel(self) -> None:

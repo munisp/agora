@@ -56,6 +56,14 @@ type Config struct {
 	// webhook secret are read from the named env vars (never written into the JSON). Unrouted businesses keep
 	// the default instance above.
 	TwentyRoutes []TwentyRoute
+
+	// Human inbox (Chatwoot, 2026-11-23). INBOX_ROUTES is a JSON list of inbox.Route (parsed in main); empty = off.
+	InboxRoutesJSON    string // INBOX_ROUTES
+	TranscriptsTopic   string // TRANSCRIPTS_TOPIC (ConversationTurn events)
+	InboxGroup         string // INBOX_CONSUMER_GROUP
+	GatewayURL         string // MESSAGING_GATEWAY_URL (WhatsApp/Telegram sends)
+	InboxWebhookSecret string // INBOX_WEBHOOK_SECRET (path secret of Chatwoot's webhook)
+	ConversationToken  string // CONVERSATION_INTERNAL_TOKEN (conversation-service internal routes)
 }
 
 // TwentyRoute is one business-specific Twenty instance (see Config.TwentyRoutes).
@@ -120,6 +128,12 @@ func Load() (Config, error) {
 		// will fail fast with a clear error until a real key is configured.
 		cfg.TwentyAPIKey = "opendesk-dev-twenty-api-key"
 	}
+	cfg.InboxRoutesJSON = strings.TrimSpace(os.Getenv("INBOX_ROUTES"))
+	cfg.TranscriptsTopic = envStr("TRANSCRIPTS_TOPIC", "opendesk.conversation.transcripts")
+	cfg.InboxGroup = envStr("INBOX_CONSUMER_GROUP", "crm-sync-inbox")
+	cfg.GatewayURL = envStr("MESSAGING_GATEWAY_URL", "")
+	cfg.InboxWebhookSecret = envStr("INBOX_WEBHOOK_SECRET", "")
+	cfg.ConversationToken = envStr("CONVERSATION_INTERNAL_TOKEN", "")
 	if raw := strings.TrimSpace(os.Getenv("TWENTY_ROUTES")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &cfg.TwentyRoutes); err != nil {
 			return cfg, fmt.Errorf("TWENTY_ROUTES is not valid JSON: %w", err)

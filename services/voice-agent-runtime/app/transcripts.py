@@ -99,6 +99,26 @@ class TranscriptRecorder:
         self._remember(key, conv_id)
         return conv_id
 
+    async def conversation(self, conv_id: str, tenant_id: str) -> dict[str, Any] | None:
+        """The stored conversation with its turns (None when unknown or the service is unreachable)."""
+        if not self.enabled or not conv_id or not tenant_id:
+            return None
+        try:
+            resp = await self._http().get(f"{self.base_url}/v1/conversations/{conv_id}",
+                                          headers={"X-Tenant-ID": tenant_id, "X-Tenant-Slugs": tenant_id})
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001 - fail-open: the receptionist keeps answering
+            log.warning("stored conversation not read", conversation_id=conv_id, error=str(exc)[:200])
+            return None
+
+    async def handoff_active(self, conv_id: str, tenant_id: str) -> bool:
+        """2026-11-23: True while a person owns the conversation in the human inbox (call_details.handoff.active)."""
+        conv = await self.conversation(conv_id, tenant_id)
+        handoff = ((conv or {}).get("call_details") or {}).get("handoff") or {}
+        return bool(isinstance(handoff, dict) and handoff.get("active"))
+
     async def add_turns(self, key: str, turns: list[dict[str, Any]], *, tenant_id: str, site_slug: str,
                         channel: str, contact_phone: str | None = None) -> str | None:
         """Append turns ({role, text, tool_calls?}) to the session's stored conversation, creating it first."""

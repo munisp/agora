@@ -398,6 +398,14 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 		return err
 	}
 
+	// 2026-11-23: a person took this conversation over in the human inbox (Chatwoot): the customer's message is
+	// recorded above (the inbox bridge mirrors it to the staff member) and the receptionist stays quiet.
+	if b.humanHandling(ctx, convID, site.TenantID) {
+		b.markDone(msg)
+		log.Info("inbound message left for staff (human handoff active)", zap.String("conversation_id", convID))
+		return nil
+	}
+
 	reply, requestContact, err := b.agentReply(ctx, site, convID, msg)
 	if err != nil {
 		log.Warn("agent reply failed", zap.Error(err))
@@ -518,6 +526,24 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 		return "", fmt.Errorf("create conversation: empty id in response")
 	}
 	return created.ID, nil
+}
+
+// humanHandling reports whether staff own the conversation (call_details.handoff.active, set by the human inbox
+// bridge). Fail-open to the receptionist: any lookup error answers false.
+func (b *Bridge) humanHandling(ctx context.Context, convID, tenantID string) bool {
+	var conv struct {
+		CallDetails struct {
+			Handoff struct {
+				Active bool `json:"active"`
+			} `json:"handoff"`
+		} `json:"call_details"`
+	}
+	hdr := map[string]string{"X-Tenant-ID": tenantID, "X-Tenant-Slugs": tenantID}
+	u := fmt.Sprintf("%s/v1/conversations/%s", b.ConversationURL, url.PathEscape(convID))
+	if err := b.doJSON(ctx, http.MethodGet, u, nil, hdr, &conv); err != nil {
+		return false
+	}
+	return conv.CallDetails.Handoff.Active
 }
 
 // recordTurn appends one turn with tenant + idempotency headers (SPEC-W6

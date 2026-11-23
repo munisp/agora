@@ -61,7 +61,11 @@ type MapStore interface {
 type Syncer struct {
 	Twenty *twentyc.Client
 	// Router (2026-11-23) sends a business with its own Twenty instance there; nil = everything to Twenty.
-	Router  *twentyc.Router
+	Router *twentyc.Router
+	// Inbox (2026-11-23): the human inbox bridge; EscalationRequested opens the conversation there. Nil = off.
+	Inbox interface {
+		HandleEscalation(ctx context.Context, evt events.CloudEvent) error
+	}
 	Map     MapStore
 	Metrics *metrics.Registry
 	Log     *zap.Logger
@@ -469,6 +473,9 @@ func (s *Syncer) handleBookingRescheduled(ctx context.Context, d events.BookingD
 func (s *Syncer) HandleConversation(ctx context.Context, evt events.CloudEvent) error {
 	if evt.Type == events.TypeSessionEnded {
 		return s.handleSessionEnded(ctx, evt)
+	}
+	if evt.Type == "com.opendesk.conversation.EscalationRequested" && s.Inbox != nil {
+		return s.Inbox.HandleEscalation(ctx, evt)
 	}
 	switch evt.Type {
 	case events.TypeToolInvoked:

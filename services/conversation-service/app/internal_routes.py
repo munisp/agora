@@ -116,7 +116,9 @@ async def merge_call_details(conversation_id: str, request: Request) -> dict:
     details = body.get("details") or {}
     if not isinstance(details, dict) or not details:
         raise HTTPException(status_code=422, detail="details must be a non-empty object")
-    allowed = {k: v for k, v in details.items() if k in ("summary", "purpose", "contact_name")}
+    # "handoff" (2026-11-23): {"active": bool, "agent": "<name>", "inbox_conversation_id": n} — set by the human inbox
+    # bridge; while active the receptionist stays quiet on this conversation.
+    allowed = {k: v for k, v in details.items() if k in ("summary", "purpose", "contact_name", "handoff")}
     ok = await request.app.state.db.merge_call_details(cid, tid, allowed)
     if not ok:
         raise HTTPException(status_code=404, detail="conversation not found")

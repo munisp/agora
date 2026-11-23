@@ -1561,6 +1561,9 @@ class ToolLayer:
                 "site_slug": self._ctx.site_slug,
                 "room": room,
                 "reason": reason or "caller_requested",
+                # 2026-11-23: the stored transcript's id, so the human inbox opens the right conversation.
+                "stored_conversation_id": (self._session.stored_id_lookup() if callable(
+                    getattr(self._session, "stored_id_lookup", None)) else None),
                 # K15(e): staff join via the internal staff-token endpoint.
                 "staff_token_endpoint": (
                     f"/voice-admin/escalations/{self._session.conversation_id}"

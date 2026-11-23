@@ -538,6 +538,10 @@ export interface ChatResponse {
    * back in the body and as X-Session-Secret.
    */
   session_secret?: string;
+  /** 2026-11-23: the chat was handed to a person (request_human). */
+  escalated?: boolean;
+  /** 2026-11-23: a person owns this chat in the human inbox; the receptionist stayed quiet (reply is ""). */
+  human?: boolean;
 }
 
 /**

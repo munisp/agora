@@ -2095,6 +2095,7 @@ def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, se
     if not rec.enabled:
         return
     key = f"voice:{conversation_id}"
+    session.stored_id_lookup = lambda: rec.stored_id(key)
 
     def _send(turns: list[dict[str, Any]]) -> None:
         rec.record(key, turns, tenant_id=str(getattr(tenant_ctx, "tenant_id", "") or ""), site_slug=site_slug,

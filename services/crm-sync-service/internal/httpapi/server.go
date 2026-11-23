@@ -72,7 +72,10 @@ type Server struct {
 	// gate on the service-to-service /v1 surface — 503 fail-closed when
 	// unset, 401 missing/wrong (identity-service K2 pattern).
 	InternalToken string
-	Log           *zap.Logger
+	// Human inbox (Chatwoot) webhook, mounted at /webhooks/chatwoot/{secret} (2026-11-23). Nil = not mounted.
+	InboxWebhook       http.Handler
+	InboxWebhookSecret string
+	Log                *zap.Logger
 }
 
 // Router builds the chi router.
@@ -81,6 +84,15 @@ func (s *Server) Router() http.Handler {
 	r.Get("/healthz", s.healthz)
 	r.Get("/metrics", s.metricsHandler)
 	r.Post("/webhooks/twenty", s.twentyWebhook)
+	if s.InboxWebhook != nil && s.InboxWebhookSecret != "" {
+		r.Post("/webhooks/chatwoot/{secret}", func(w http.ResponseWriter, r *http.Request) {
+			if subtle.ConstantTimeCompare([]byte(chi.URLParam(r, "secret")), []byte(s.InboxWebhookSecret)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			s.InboxWebhook.ServeHTTP(w, r)
+		})
+	}
 	// SPEC-W45 K21 (OOS-09): the /v1 helper surface is internal-only.
 	r.Group(func(r chi.Router) {
 		r.Use(s.internauth)
