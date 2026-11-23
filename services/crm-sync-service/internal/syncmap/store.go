@@ -159,10 +159,12 @@ func PhoneVariants(phone string) []string {
 		add("+" + d)
 		add("0" + d[3:])
 		add(d)
+		add(d[3:]) // national form, as Twenty stores primaryPhoneNumber
 	case strings.HasPrefix(d, "0") && len(d) == 11:
 		add(d)
 		add("+234" + d[1:])
 		add("234" + d[1:])
+		add(d[1:])
 	default:
 		add(d)
 	}

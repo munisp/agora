@@ -597,7 +597,7 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID)
+	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID, *d.Quality)
 	if err != nil {
 		return fmt.Errorf("resolve person for call summary: %w", err)
 	}
@@ -687,7 +687,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			return nil
 		}
 	}
-	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID)
+	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID, q)
 	if err != nil {
 		return fmt.Errorf("resolve person for call summary: %w", err)
 	}
@@ -747,8 +747,27 @@ func (s *Syncer) rememberQualityNote(ctx context.Context, conversationID, noteID
 // confirmed number and the natural key recorded at booking sync). The
 // legacy global Twenty people lookup is gone: it could resolve the caller
 // to ANOTHER tenant's person record when two tenants share a number.
-func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantUUID *uuid.UUID) (string, error) {
-	return s.findPersonForNote(ctx, phone, "", tenantUUID)
+//
+// 2026-11-23: an OUTBOUND call reached someone we chose to dial, by name; when no Person has that number yet the
+// call creates one (name + phone) so the call is never lost from the CRM. Inbound strangers are still skipped.
+func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantUUID *uuid.UUID, q events.CallQuality) (string, error) {
+	personID, err := s.findPersonForNote(ctx, phone, "", tenantUUID)
+	if err != nil || personID != "" {
+		return personID, err
+	}
+	name := strings.TrimSpace(q.ContactName)
+	if q.Direction != "outbound" || name == "" {
+		return "", nil
+	}
+	personID, err = s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(name, "", phone))
+	if err != nil {
+		return "", fmt.Errorf("create person for outbound call: %w", err)
+	}
+	if err := s.rememberTenantPerson(ctx, personID, "", phone, tenantUUID); err != nil {
+		return "", err
+	}
+	s.Log.Info("person created for outbound call", zap.String("person_id", personID))
+	return personID, nil
 }
 
 func parseUUID(v string) *uuid.UUID {

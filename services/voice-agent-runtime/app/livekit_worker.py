@@ -2413,10 +2413,23 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # (helper above; None when disabled). Cancelled on room disconnect below.
     dead_mic_monitor = start_dead_mic_monitor(settings, agent, session, ctx.room)
 
+    ended = {"done": False}
+
+    # 2026-11-23: an outbound callee hanging up never fired the room's "disconnected" (the job simply exits), so no
+    # SessionEnded went out and the call never reached the CRM or the dashboard. End the session once, on whichever
+    # comes first: our own disconnect, or the last caller leaving the room.
+    @ctx.room.on("participant_disconnected")
+    def _on_caller_left(*args) -> None:  # noqa: ARG001
+        if not getattr(ctx.room, "remote_participants", {}):
+            _on_disconnected()
+
     @ctx.room.on("disconnected")
     def _on_disconnected(*args) -> None:  # noqa: ARG001
         import asyncio
 
+        if ended["done"]:
+            return
+        ended["done"] = True
         if dead_mic_monitor is not None:
             dead_mic_monitor.cancel()  # no orphan watchdog past session end
         metrics.get_registry().active_sessions.dec()
