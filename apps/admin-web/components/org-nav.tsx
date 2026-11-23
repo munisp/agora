@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { DEFAULT_NAV_LABELS, type NavLabels } from "@/lib/terminology";
 import { DEV_EXTERNAL_LINKS, type ExternalLinks } from "@/lib/external-links";
 import {
+  Headphones,
   LayoutDashboard,
   LayoutGrid,
   CalendarCheck,
@@ -112,6 +113,8 @@ const items: NavItem[] = [
   { segment: "voices", label: "Voices", icon: AudioLines },
   // SPEC-W82 B1.1: labelled to tell the external Twenty console apart from the in-app CRM 360 console.
   { external: "crm", label: "CRM", icon: UsersRound },
+  // 2026-11-23: the human agents' inbox (Chatwoot): chats handed over by the receptionist, answered by staff.
+  { external: "inbox", label: "Inbox", icon: Headphones },
   { external: "grafana", label: "Grafana", icon: LineChart },
   // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
   // roles (read-only); the page hides provision/enable/disable/config
