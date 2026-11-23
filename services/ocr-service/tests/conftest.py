@@ -242,6 +242,11 @@ class FakeDB:
         row["extracted_fields"] = None
         # SPEC-W65 G2 tombstone hygiene: NULL the PII locator too.
         row["subject_phone"] = None
+        # SPEC-W115 (sanctioned change, NOTES.md): the verdict columns
+        # derive from the erased PII fields — NULLed in lockstep with the
+        # store.py tombstone UPDATE.
+        row["validation_verdict"] = None
+        row["validation_reasons"] = None
         row["status"] = "erased"
         row["error"] = None
         self.transitions.append((str(document_id), "erased"))

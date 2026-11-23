@@ -80,6 +80,7 @@ from .pipeline.stt_stream import (
     BackpressureError,
     StreamingSTTEngine,
 )
+from . import documents, tenant_context
 from .session_state import DaprSessionStore, SessionStore, store_get
 from .tts_providers.chain import build_fallback_tts
 
@@ -217,6 +218,22 @@ def create_app(
     # Exposed for in-process tests/embedding (K15(b) session credentials for
     # /v1/stt/stream auth are minted here); not part of the HTTP surface.
     app.state.session_store = sessions
+
+    # SPEC-W115 C5: caller document intake (web chat attachments + voice
+    # mid-call share links). Tenant resolution reuses the cached
+    # tenant-context fetch (site_slug -> tenant uuid); the endpoints
+    # fail closed (503) when OCR_SERVICE_URL / OCR_INTERNAL_TOKEN are
+    # unset — see app/documents.py.
+    async def _document_tenant_resolver(site_slug: str) -> str:
+        ctx = await tenant_context.fetch_tenant_context(dapr, settings, site_slug)
+        return ctx.tenant_id
+
+    documents.wire_document_routes(
+        app,
+        settings=settings,
+        sessions=sessions,
+        tenant_resolver=_document_tenant_resolver,
+    )
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:

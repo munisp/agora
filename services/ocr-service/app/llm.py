@@ -136,8 +136,21 @@ _KYC_PROMPT_HEADER = (
 # SPEC-W58 A3/P9: kind -> prompt. The extraction model only transcribes; MRZ
 # check-digit VALIDATION is deterministic code (parse layer, P7), never the
 # model — the passport prompt asks for the raw MRZ lines, not a verdict.
+_PAY_STUB_PROMPT = (
+    "You are an OCR engine. Transcribe the pay stub (payslip) page image(s) "
+    "into markdown. Then, on the LAST line, emit ONLY a JSON object with "
+    'the structured fields {"employer_name": str|null, "employee_name": '
+    'str|null, "pay_period_start": "YYYY-MM-DD"|null, "pay_period_end": '
+    '"YYYY-MM-DD"|null, "pay_date": "YYYY-MM-DD"|null, "gross_pay": '
+    'number|null, "net_pay": number|null, "deductions_total": number|null, '
+    '"currency": str|null}. Use null for any field you cannot read. Never '
+    "invent values."
+)
+
 EXTRACTION_PROMPTS: dict[str, str] = {
     "receipt": _EXTRACTION_PROMPT,
+    # SPEC-W115 C1: caller-document pay stub kind.
+    "pay_stub": _PAY_STUB_PROMPT,
     "document": _EXTRACTION_PROMPT,
     "knowledge_scan": _EXTRACTION_PROMPT,
     "kyc_nin_slip": (
@@ -186,6 +199,20 @@ def mock_extraction(kind: str, data: bytes, mime: str, model: str) -> Extraction
     text = MOCK_TEXT
     if kind == "receipt":
         fields = dict(MOCK_RECEIPT_FIELDS)
+    elif kind == "pay_stub":
+        # SPEC-W115: deterministic fixture — arithmetic-consistent so the
+        # mock-mode verdict is "validated" (exercised by tests).
+        fields = {
+            "employer_name": "ACME STORES LTD",
+            "employee_name": "ADA LOVELACE",
+            "pay_period_start": "2024-01-01",
+            "pay_period_end": "2024-01-31",
+            "pay_date": "2024-01-31",
+            "gross_pay": 250000.0,
+            "net_pay": 210000.0,
+            "deductions_total": 40000.0,
+            "currency": "NGN",
+        }
     elif kind in MOCK_KYC_FIELDS:
         text = MOCK_KYC_TEXT
         fields = dict(MOCK_KYC_FIELDS[kind])
@@ -407,6 +434,21 @@ def parse_model_answer(answer: str, kind: str) -> tuple[str, dict[str, Any]]:
             # MRZ itself is NOT retained in the fields payload.
             parsed_kyc["mrz_valid"] = validate_mrz(fields.get("mrz"))
         fields = parsed_kyc
+    elif kind == "pay_stub":
+        # SPEC-W115: whitelist + tolerant coercion (numbers may arrive as
+        # strings with thousands separators; dates pass through raw for the
+        # deterministic validator to judge).
+        fields = {
+            "employer_name": fields.get("employer_name") or None,
+            "employee_name": fields.get("employee_name") or None,
+            "pay_period_start": fields.get("pay_period_start") or None,
+            "pay_period_end": fields.get("pay_period_end") or None,
+            "pay_date": fields.get("pay_date") or None,
+            "gross_pay": _as_number(fields.get("gross_pay")),
+            "net_pay": _as_number(fields.get("net_pay")),
+            "deductions_total": _as_number(fields.get("deductions_total")),
+            "currency": fields.get("currency") or None,
+        }
     elif kind == "receipt":
         items = fields.get("items")
         fields = {

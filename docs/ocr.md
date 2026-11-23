@@ -641,3 +641,71 @@ redaction/TTL regression ONLY. It is offline-deterministic by design — it
 does NOT measure, and must not be cited as, live-model extraction accuracy
 on real Nigerian document layouts, which remains UNVERIFIED and
 environment-blocked.
+
+## Caller document intake + content validation (SPEC-W115)
+
+Callers can now share documents **mid-conversation** — web chat attachment,
+voice-call share link, or (existing W60 funnel) WhatsApp media — and every
+extraction is paired with a **deterministic content-validation verdict**.
+The extraction model only transcribes; validation is code (the SPEC-W58 P7
+MRZ ruling generalized to all kinds).
+
+### New kind: `pay_stub`
+
+First caller-document kind. Extraction whitelist: `employer_name`,
+`employee_name`, `pay_period_start`, `pay_period_end`, `pay_date`,
+`gross_pay`, `net_pay`, `deductions_total`, `currency` (numbers tolerantly
+coerced; dates judged by the validator, never the model).
+
+### Validation verdicts (`app/validators.py`)
+
+Every `POST /v1/ocr/extract` response (and `GET /v1/ocr/documents/{id}`)
+carries `validation_verdict` + `validation_reasons`:
+
+| verdict | meaning |
+| --- | --- |
+| `validated` | every applicable consistency check passed |
+| `needs_review` | extraction succeeded but something is off or unverifiable (also: kinds with no dedicated validator — never a blanket "validated") |
+| `rejected` | the document contradicts itself or is unusable for its declared purpose |
+
+pay_stub rules (worst-of wins): required fields missing ⇒ **rejected**
+(`missing_required_field:<name>`); `net_pay > gross_pay` ⇒ **rejected**
+(`net_exceeds_gross`); `|gross − deductions − net| > 1% of gross` ⇒
+needs_review (`arithmetic_inconsistent`); inverted period ⇒ **rejected**
+(`period_inverted`); unparseable period ⇒ needs_review
+(`period_unparseable`); missing/non-ISO currency ⇒ needs_review
+(`currency_missing`).
+
+**These are heuristic consistency checks, not forgery-proof
+authentication.** The verdict language in every caller-visible surface
+says exactly that ("passed all consistency checks", never "authentic").
+
+**Disclosure gate (SPEC-W67 G5):** the cross-tenant fingerprint match is
+NEVER wired into the caller-visible verdict — the extract response stays
+invariant to registry matches; staff learn via the W67 alert channel. The
+pure validator accepts a `registry_duplicate` input for staff-side
+re-validation tooling, unit-tested but unwired in the live path.
+
+### Intake channels
+
+- **Web chat** — the chat widget (`apps/admin-web/components/chat-widget.tsx`)
+  has a paperclip attachment flow: jpg/jpeg/png/webp/pdf ≤ 10 MB, kind
+  picker (pay stub / other document), uploads to
+  `POST /voice/documents/upload` and renders the verdict as a chip
+  (Checks passed / Under review / Not accepted) with the summary sentence.
+- **Voice call** — `POST /voice/sessions/{id}/document-link` (session-secret
+  authorized) mints an HMAC-signed, expiring (default 15 min) upload URL;
+  the caller opens it on their phone and uploads to
+  `POST /voice/documents/claim/{token}`. The document is correlated to the
+  live session (`SessionState.shared_documents`), readable by the agent via
+  `GET /voice/sessions/{id}/documents` (session-secret authorized).
+- **WhatsApp** — unchanged W60/W61 funnel (media ⇒ OCR ⇒ media inbox).
+  Pay-stub kind-hinting on WhatsApp captions is deferred (SPEC-W116).
+
+`POST /v1/ocr/extract` also accepts an optional `source_channel`
+(`web|whatsapp|voice|admin`) persisted on the document row.
+
+**Fail-closed:** the voice-runtime endpoints answer 503 unless
+`OCR_SERVICE_URL` + `OCR_INTERNAL_TOKEN` are set (link minting additionally
+requires `VOICE_DOCUMENT_LINK_SECRET`). The erasure tombstone NULLs the
+verdict columns (they derive from erased PII fields).

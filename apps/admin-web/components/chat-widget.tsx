@@ -1,14 +1,38 @@
 "use client";
 
 import * as React from "react";
-import { MessageCircle, Send, X } from "lucide-react";
+import { MessageCircle, Paperclip, Send, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { ChatResponse } from "@/lib/types";
+import {
+  CHAT_UPLOAD_EXTENSIONS,
+  validateChatUpload,
+  verdictChip,
+  type ChatDocKind,
+} from "@/lib/chat-upload";
 
 interface Turn {
   role: "user" | "agent";
   text: string;
+  /** SPEC-W115 C8: verdict chip on document-attachment turns. */
+  chip?: { label: string; tone: "success" | "warning" | "danger" | "neutral" };
+}
+
+const CHIP_TONE_CLASSES: Record<string, string> = {
+  success: "bg-emerald-100 text-emerald-800",
+  warning: "bg-amber-100 text-amber-800",
+  danger: "bg-red-100 text-red-800",
+  neutral: "bg-muted text-muted-foreground",
+};
+
+/** SPEC-W115 C8: upload response shape from POST /voice/documents/upload. */
+interface DocumentUploadResult {
+  document_id?: string;
+  kind: string;
+  validation_verdict: string;
+  validation_reasons: string[];
+  summary: string;
 }
 
 interface ChatResult {
@@ -185,6 +209,12 @@ export function ChatWidget({
   const [conversationId, setConversationId] = React.useState<string | undefined>();
   const [sessionSecret, setSessionSecret] = React.useState<string | undefined>();
   const [sending, setSending] = React.useState(false);
+  // SPEC-W115 C8: caller document sharing. `pendingFile` is the staged
+  // attachment shown in the bar above the input until uploaded/cancelled.
+  const [pendingFile, setPendingFile] = React.useState<File | null>(null);
+  const [pendingKind, setPendingKind] = React.useState<ChatDocKind>("document");
+  const [uploading, setUploading] = React.useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
   React.useEffect(() => {
@@ -207,6 +237,70 @@ export function ChatWidget({
     },
     [tenant, siteSlug],
   );
+
+  // SPEC-W115 C8: stage an attachment after client-side validation; the
+  // OCR + content validation happens server-side on upload.
+  const stageFile = (file: File | undefined) => {
+    if (!file) return;
+    const verdict = validateChatUpload(file);
+    if (!verdict.ok) {
+      setTurns((t) => [...t, { role: "agent", text: verdict.error }]);
+      return;
+    }
+    setPendingKind("document");
+    setPendingFile(file);
+  };
+
+  const uploadPendingFile = async () => {
+    const file = pendingFile;
+    if (!file || uploading) return;
+    setUploading(true);
+    const form = new FormData();
+    form.append("file", file);
+    form.append("kind", pendingKind);
+    form.append("site_slug", siteSlug);
+    if (conversationId) form.append("session_id", conversationId);
+    try {
+      const res = await fetch("/voice/documents/upload", {
+        method: "POST",
+        body: form,
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        const detail =
+          res.status === 413
+            ? "That file is too large."
+            : res.status === 415
+              ? "That file type is not supported."
+              : res.status === 503
+                ? "Document sharing is not available right now."
+                : "The upload failed.";
+        throw new Error(detail);
+      }
+      const result = (await res.json()) as DocumentUploadResult;
+      setTurns((t) => [
+        ...t,
+        { role: "user", text: `Attached: ${file.name}` },
+        {
+          role: "agent",
+          text: result.summary,
+          chip: verdictChip(result.validation_verdict),
+        },
+      ]);
+      setPendingFile(null);
+    } catch (err) {
+      setTurns((t) => [
+        ...t,
+        {
+          role: "agent",
+          text: `Sorry, I couldn't process that document (${err instanceof Error ? err.message : "upload failed"}).`,
+        },
+      ]);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
 
   const send = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -320,6 +414,16 @@ export function ChatWidget({
                     t.role === "user" ? { backgroundColor: accent } : undefined
                   }
                 >
+                  {t.chip ? (
+                    <span
+                      className={cn(
+                        "mb-1 inline-block rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                        CHIP_TONE_CLASSES[t.chip.tone],
+                      )}
+                    >
+                      {t.chip.label}
+                    </span>
+                  ) : null}
                   {t.text}
                 </div>
               ))
@@ -330,7 +434,60 @@ export function ChatWidget({
               </div>
             ) : null}
           </div>
+          {pendingFile ? (
+            <div className="flex items-center gap-2 border-t border-border bg-muted/40 px-2 py-1.5 text-xs">
+              <span className="min-w-0 flex-1 truncate font-medium">
+                {pendingFile.name}
+              </span>
+              <select
+                value={pendingKind}
+                onChange={(e) => setPendingKind(e.target.value as ChatDocKind)}
+                aria-label="Document type"
+                className="h-7 rounded-md border border-input bg-card px-1 text-xs"
+              >
+                <option value="document">Other document</option>
+                <option value="pay_stub">Pay stub</option>
+              </select>
+              <button
+                type="button"
+                onClick={uploadPendingFile}
+                disabled={uploading}
+                className="rounded-md px-2 py-1 text-white disabled:opacity-50 cursor-pointer"
+                style={{ backgroundColor: accent }}
+              >
+                {uploading ? "Uploading…" : "Upload"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingFile(null)}
+                aria-label="Cancel attachment"
+                className="rounded p-1 hover:bg-muted cursor-pointer"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : null}
           <form onSubmit={send} className="flex gap-2 border-t border-border p-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={CHAT_UPLOAD_EXTENSIONS.map((e) => `.${e}`).join(",")}
+              className="hidden"
+              onChange={(e) => {
+                stageFile(e.target.files?.[0]);
+                e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending || uploading}
+              aria-label="Attach a document"
+              title="Share a document (pay stub, PDF…)"
+              className="flex h-9 w-9 items-center justify-center rounded-md border border-input text-muted-foreground hover:bg-muted disabled:opacity-50 cursor-pointer"
+            >
+              <Paperclip className="h-4 w-4" />
+            </button>
             <input
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
