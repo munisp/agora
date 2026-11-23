@@ -105,8 +105,10 @@ export function VoiceAgentClient({ orgSlug }: { orgSlug: string }) {
     setTurns((t) => [...t, { role: "user", text: message }]);
     setSending(true);
     try {
+      // 2026-11-23: the voice service's ChatRequest requires site_slug (sending only `tenant` was a 422 on every message).
       const res = await api.post<ChatResponse>("/voice/chat", {
         tenant: orgSlug,
+        site_slug: orgSlug,
         message,
         conversation_id: conversationId,
       });
