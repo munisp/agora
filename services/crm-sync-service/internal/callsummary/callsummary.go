@@ -51,6 +51,23 @@ const systemPrompt = "You write the call summary a business owner reads in their
 	"and summarise in English. Never repeat a BVN, NIN, PIN, OTP or card number. No headings, no bullet points, " +
 	"no preamble."
 
+// 2026-11-24: web chat / WhatsApp / Telegram conversations reach the CRM too; their summary speaks of a chat.
+const chatSystemPrompt = "You write the chat summary a business owner reads in their CRM after the AI receptionist " +
+	"handled a text conversation (web chat or WhatsApp). Write two or three short sentences of plain English, in the " +
+	"third person (\"The customer ...\"). Say what the customer wanted, what the receptionist did, and any " +
+	"appointment booked — the service, the day, the date and the time exactly as written in the chat. If the chat " +
+	"was not in English, say which language it was in and summarise in English. Never repeat a BVN, NIN, PIN, OTP " +
+	"or card number. No headings, no bullet points, no preamble."
+
+type textChatKey struct{}
+
+// WithTextChat marks the summary as one of a text chat rather than a call.
+func WithTextChat(ctx context.Context) context.Context {
+	return context.WithValue(ctx, textChatKey{}, true)
+}
+
+func isTextChat(ctx context.Context) bool { v, _ := ctx.Value(textChatKey{}).(bool); return v }
+
 type turn struct {
 	Role string `json:"role"`
 	Text string `json:"text"`
@@ -99,6 +116,9 @@ func (s *Summarizer) Summarize(ctx context.Context, conversationID, tenantID str
 	var b strings.Builder
 	for _, t := range turns {
 		who := "Caller"
+		if isTextChat(ctx) {
+			who = "Customer"
+		}
 		if t.Role == "agent" || t.Role == "assistant" {
 			who = "Receptionist"
 		} else if t.Role != "user" {
@@ -115,7 +135,11 @@ func (s *Summarizer) Summarize(ctx context.Context, conversationID, tenantID str
 	if len(transcript) > 12000 {
 		transcript = transcript[len(transcript)-12000:]
 	}
-	out, err := s.complete(ctx, transcript)
+	prompt := systemPrompt
+	if isTextChat(ctx) {
+		prompt = chatSystemPrompt
+	}
+	out, err := s.complete(ctx, prompt, transcript)
 	if err != nil {
 		return ""
 	}
@@ -146,11 +170,11 @@ func (s *Summarizer) turns(ctx context.Context, conversationID, tenantID string)
 	return body.Turns, nil
 }
 
-func (s *Summarizer) complete(ctx context.Context, transcript string) (string, error) {
+func (s *Summarizer) complete(ctx context.Context, prompt, transcript string) (string, error) {
 	payload, _ := json.Marshal(map[string]any{
 		"model": s.Model,
 		"messages": []map[string]string{
-			{"role": "system", "content": systemPrompt},
+			{"role": "system", "content": prompt},
 			{"role": "user", "content": transcript},
 		},
 		"temperature":      0.2,

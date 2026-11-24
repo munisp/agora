@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/opendesk/crm-sync-service/internal/callsummary"
 	"github.com/opendesk/crm-sync-service/internal/events"
 	"github.com/opendesk/crm-sync-service/internal/metrics"
 	"github.com/opendesk/crm-sync-service/internal/syncmap"
@@ -106,9 +107,12 @@ func (s *Syncer) saveSummary(ctx context.Context, conversationID, tenantID, summ
 	}
 }
 
-func (s *Syncer) summarize(ctx context.Context, conversationID, tenantID string) string {
+func (s *Syncer) summarize(ctx context.Context, conversationID, tenantID string, q *events.CallQuality) string {
 	if s.Summary == nil {
 		return ""
+	}
+	if q != nil && q.IsTextChannel() {
+		ctx = callsummary.WithTextChat(ctx) // "The customer wrote in ..." instead of "The caller ..."
 	}
 	return s.Summary.Summarize(ctx, conversationID, tenantID)
 }
@@ -598,7 +602,7 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 	// 2026-11-23: every call gets its plain-language summary on the stored conversation (the dashboard shows it), even
 	// when no phone was confirmed and so no CRM note can follow.
 	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
-	summary := s.summarize(ctx, convID, evt.TenantID)
+	summary := s.summarize(ctx, convID, evt.TenantID, d.Quality)
 	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
 	if phone == "" {
@@ -672,7 +676,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 		return nil
 	}
 	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
-	summary := s.summarize(ctx, convID, evt.TenantID)
+	summary := s.summarize(ctx, convID, evt.TenantID, d.Quality)
 	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
 	if phone == "" {
@@ -772,6 +776,15 @@ func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantU
 		return personID, err
 	}
 	name := strings.TrimSpace(q.ContactName)
+	// 2026-11-24: a text chat (web chat / WhatsApp / Telegram) from a number the CRM doesn't have yet creates the
+	// contact, as an outbound call with a name does — chats that never booked used to leave no trace in the CRM.
+	// Without a name the number is the name, so the record is still findable.
+	if q.IsTextChannel() {
+		if name == "" {
+			name = phone
+		}
+		return s.createPersonForConversation(ctx, name, strings.TrimSpace(q.ContactEmail), phone, tenantUUID, "text chat")
+	}
 	if q.Direction != "outbound" || name == "" {
 		return "", nil
 	}
@@ -781,14 +794,19 @@ func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantU
 	if rec, err := s.tw(tenantUUID).FindPersonByUniqueName(ctx, split.FirstName, split.LastName); err == nil && rec.ID != "" {
 		return rec.ID, nil
 	}
-	personID, err = s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(name, "", phone))
+	return s.createPersonForConversation(ctx, name, "", phone, tenantUUID, "outbound call")
+}
+
+// createPersonForConversation creates (and remembers) the CRM person a call or chat note belongs to.
+func (s *Syncer) createPersonForConversation(ctx context.Context, name, email, phone string, tenantUUID *uuid.UUID, what string) (string, error) {
+	personID, err := s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(name, email, phone))
 	if err != nil {
-		return "", fmt.Errorf("create person for outbound call: %w", err)
+		return "", fmt.Errorf("create person for %s: %w", what, err)
 	}
-	if err := s.rememberTenantPerson(ctx, personID, "", phone, tenantUUID); err != nil {
+	if err := s.rememberTenantPerson(ctx, personID, email, phone, tenantUUID); err != nil {
 		return "", err
 	}
-	s.Log.Info("person created for outbound call", zap.String("person_id", personID))
+	s.Log.Info("person created for "+what, zap.String("person_id", personID))
 	return personID, nil
 }
 

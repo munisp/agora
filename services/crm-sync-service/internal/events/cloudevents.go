@@ -169,6 +169,18 @@ type CallQuality struct {
 	Channel     string `json:"channel,omitempty"`
 	Language    string `json:"language,omitempty"`     // call language code at the end of the call (2026-11-23)
 	CallOutcome string `json:"call_outcome,omitempty"` // outbound result: confirmed, declined, ... (2026-11-23)
+	// 2026-11-24: text conversations (web chat / WhatsApp / Telegram) end too; the pre-chat form's e-mail rides along.
+	ContactEmail string `json:"contact_email,omitempty"`
+}
+
+// IsTextChannel reports whether the conversation was a text chat (channel "chat", "whatsapp" or "telegram") rather
+// than a call.
+func (q CallQuality) IsTextChannel() bool {
+	switch q.Channel {
+	case "chat", "whatsapp", "telegram":
+		return true
+	}
+	return false
 }
 
 // Parse unmarshals one Kafka message value into a CloudEvent envelope.

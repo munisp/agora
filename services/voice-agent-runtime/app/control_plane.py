@@ -70,6 +70,7 @@ from . import visitor as visitor_mod
 from .visitor import Visitor
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
+from .chat_end import ChatEndTracker
 from .config import Settings, load_settings
 from .dapr_client import DaprClient
 from .elevenlabs_adapter import ElevenLabsBackend
@@ -244,8 +245,11 @@ def create_app(
     # Primary LLM endpoint + optional circuit-broken fallback chain
     # (LLM_FALLBACK_* envs, VOICE-SCALING §3).
     llm = build_llm(settings)
+    # 2026-11-24: text conversations end after CHAT_END_IDLE_S quiet seconds (0 = never) and reach the CRM like calls.
+    chat_end = (ChatEndTracker(dapr=dapr, settings=settings, idle_s=settings.chat_end_idle_s)
+                if settings.chat_end_idle_s > 0 else None)
     chat_service = ChatService(settings=settings, dapr=dapr, llm=llm, sessions=sessions,
-                               transcripts=TranscriptRecorder(settings.conversation_url))
+                               transcripts=TranscriptRecorder(settings.conversation_url), chat_end=chat_end)
     # SPEC-W10 Part A: TTS provider fallback chain (default "piper" =
     # pre-W10 behavior). Backs the /voice/voices, /voice/tts-preview and
     # /voice/voices/enroll endpoints below.
@@ -278,8 +282,16 @@ def create_app(
         tenant_resolver=_document_tenant_resolver,
     )
 
+    if chat_end is not None:
+
+        @app.on_event("startup")
+        async def _start_chat_end() -> None:
+            chat_end.start()
+
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        if chat_end is not None:
+            await chat_end.stop()
         await dapr.aclose()
         await tts_chain.aclose()
         if elevenlabs is not None:

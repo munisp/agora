@@ -704,6 +704,8 @@ class Settings:
     ocr_timeout_s: float = 150.0
     document_link_secret: str = ""
     document_link_ttl_s: int = 900
+    # 2026-11-24: quiet seconds before a text chat ends and goes to the CRM (0 = never).
+    chat_end_idle_s: float = 600.0
     max_document_bytes: int = 10 * 1024 * 1024
 
     extra: dict = field(default_factory=dict)
@@ -837,6 +839,7 @@ def load_settings() -> Settings:
         ocr_timeout_s=_env_float("VOICE_OCR_TIMEOUT_S", 150.0),
         document_link_secret=_env("VOICE_DOCUMENT_LINK_SECRET", ""),
         document_link_ttl_s=_env_int("VOICE_DOCUMENT_LINK_TTL_S", 900),
+        chat_end_idle_s=float(_env("CHAT_END_IDLE_S", "600")),
         max_document_bytes=_env_int("VOICE_MAX_DOCUMENT_BYTES", 10 * 1024 * 1024),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
         tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),

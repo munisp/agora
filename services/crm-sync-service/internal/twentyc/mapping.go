@@ -265,6 +265,12 @@ func PurposeLabel(p string) string {
 // "📞 Inbound call", "💻 Web call". Notes from events without a direction keep the old generic title.
 func CallSummaryNoteTitleFor(q events.CallQuality) string {
 	switch {
+	case q.Channel == "whatsapp":
+		return "💬 WhatsApp chat"
+	case q.Channel == "telegram":
+		return "💬 Telegram chat"
+	case q.Channel == "chat":
+		return "💬 Web chat"
 	case q.Direction == "outbound":
 		return "📞 Outbound call — " + PurposeLabel(q.Purpose)
 	case q.Channel == "web":
@@ -290,15 +296,28 @@ func CallSummaryNote(q events.CallQuality, summary string) string {
 		b.WriteString(s)
 		b.WriteString("\n\n")
 	}
-	switch q.Direction {
-	case "outbound":
-		fmt.Fprintf(&b, "- Call: outbound (we called) — %s\n", PurposeLabel(q.Purpose))
-	case "inbound":
-		fmt.Fprintf(&b, "- Call: inbound (they called)\n")
-	}
-	fmt.Fprintf(&b, "- Call length: %s\n", callLength(q.DurationS))
-	if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
-		fmt.Fprintf(&b, "- Phone confirmed: %s\n", spacedPhone(p))
+	if q.IsTextChannel() {
+		// 2026-11-24: chats and WhatsApp conversations are written as such, not as calls.
+		fmt.Fprintf(&b, "- Conversation: %s (they wrote in)\n", map[string]string{
+			"chat": "web chat", "whatsapp": "WhatsApp", "telegram": "Telegram"}[q.Channel])
+		fmt.Fprintf(&b, "- Messages from the customer: %d\n", q.TurnCount)
+		if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
+			fmt.Fprintf(&b, "- Phone: %s\n", spacedPhone(p))
+		}
+		if e := strings.TrimSpace(q.ContactEmail); e != "" {
+			fmt.Fprintf(&b, "- Email: %s\n", e)
+		}
+	} else {
+		switch q.Direction {
+		case "outbound":
+			fmt.Fprintf(&b, "- Call: outbound (we called) — %s\n", PurposeLabel(q.Purpose))
+		case "inbound":
+			fmt.Fprintf(&b, "- Call: inbound (they called)\n")
+		}
+		fmt.Fprintf(&b, "- Call length: %s\n", callLength(q.DurationS))
+		if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
+			fmt.Fprintf(&b, "- Phone confirmed: %s\n", spacedPhone(p))
+		}
 	}
 	booked := "No"
 	switch {

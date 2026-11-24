@@ -119,8 +119,11 @@ class ChatService:
         escalation: LiveKitEscalation | None = None,
         transcripts: TranscriptRecorder | None = None,
         translator: TranslatorInterface | None = None,
+        chat_end: Any = None,
     ) -> None:
         self._settings = settings
+        # 2026-11-24: app.chat_end.ChatEndTracker — ends quiet text conversations so they reach the CRM.
+        self._chat_end = chat_end
         self._dapr = dapr
         self._llm = llm
         self._sessions = sessions
@@ -358,6 +361,8 @@ class ChatService:
         return False
 
     def _record(self, session: SessionState, tool_layer: Any, message: str, reply: str, trace: list[dict[str, Any]]) -> None:
+        if self._chat_end is not None:  # every channel, before the early returns below
+            self._chat_end.touch(session, getattr(tool_layer, "tenant_context", None), trace)
         if self._transcripts is None:
             return
         # WhatsApp/Telegram: the messaging gateway's bridge records the conversation (keyed by the customer's number);
