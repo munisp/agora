@@ -165,7 +165,7 @@ class ChatService:
             self._sessions, conversation_id, site_slug, session_secret=session_secret
         )
         session.text_chat = True
-        if channel in ("whatsapp", "telegram") and conversation_id:
+        if channel in ("whatsapp", "telegram", "email") and conversation_id:
             # The messaging gateway records these chats and sends its stored conversation id as conversation_id.
             session.stored_id_lookup = lambda: conversation_id
         elif self._transcripts is not None:
@@ -367,7 +367,7 @@ class ChatService:
             return
         # WhatsApp/Telegram: the messaging gateway's bridge records the conversation (keyed by the customer's number);
         # recording here as well listed every message twice, in two conversations.
-        if (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram"):
+        if (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram", "email"):
             return
         ctx = getattr(tool_layer, "tenant_context", None)
         tenant_id = str(getattr(ctx, "tenant_id", "") or "")
@@ -384,7 +384,7 @@ class ChatService:
     async def _human_reply(self, session: SessionState, tool_layer: Any, message: str) -> dict[str, Any] | None:
         """The turn's response while staff own the conversation (web chat only; WhatsApp/Telegram are gated in the
         messaging gateway, which records those conversations). None = the receptionist answers as usual."""
-        if self._transcripts is None or (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram"):
+        if self._transcripts is None or (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram", "email"):
             return None
         stored = self._transcripts.stored_id(self._stored_key(session))
         ctx = getattr(tool_layer, "tenant_context", None)
@@ -460,7 +460,11 @@ class ChatService:
         # request was authorized with the internal token AND the channel's
         # provider supplies a verified identity — a public web caller can
         # never set it. Pinned identity satisfies the OTP gate.
-        if pin_verified_identity:
+        if pin_verified_identity and channel == "email":
+            # 2026-11-24: the email channel's verified identity is the sender's address (the messaging gateway
+            # received the mail from it), not a phone: it is the customer's e-mail, never a verified phone.
+            session.caller_email = pin_verified_identity
+        elif pin_verified_identity:
             pinned = session.mark_verified(pin_verified_identity)
             session.claimed_phone = session.claimed_phone or pinned
             # SPEC-W81 A3: a channel-pinned identity IS a completed step-up.

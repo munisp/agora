@@ -411,7 +411,7 @@ def create_app(
 
     # SPEC-W45 K15(c): channels whose provider cryptographically verifies
     # the sender identity (WhatsApp wa_id via the messaging-gateway).
-    PROVIDER_VERIFIED_CHANNELS = frozenset({"whatsapp", "telegram"})
+    PROVIDER_VERIFIED_CHANNELS = frozenset({"whatsapp", "telegram", "email"})
 
     def _valid_internal_token(request: Request) -> bool:
         """Constant-time check against VOICE_ADMIN_INTERNAL_TOKEN. False
@@ -584,7 +584,12 @@ def create_app(
             # and booking-side contact resolution are form-independent.
             # Non-conforming identities pin NOTHING (supersedes the W85
             # leniency; both production gateway paths conform).
-            pin = verification.canonical_e164(req.channel_identity) or None
+            if req.channel == "email":
+                # 2026-11-24: the email channel pins the sender's address (lower-cased), not a phone.
+                addr = req.channel_identity.strip().lower()
+                pin = addr if "@" in addr and " " not in addr and len(addr) <= 254 else None
+            else:
+                pin = verification.canonical_e164(req.channel_identity) or None
             if pin is None:
                 log.warning(
                     "channel_identity present but not E.164-conforming; ignoring",

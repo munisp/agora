@@ -605,7 +605,8 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 	summary := s.summarize(ctx, convID, evt.TenantID, d.Quality)
 	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
-	if phone == "" {
+	// 2026-11-24: an e-mail conversation may carry only the sender's address — that identifies the person too.
+	if phone == "" && !(d.Quality.IsTextChannel() && strings.TrimSpace(d.Quality.ContactEmail) != "") {
 		s.Log.Debug("SessionEnded without confirmed_phone; skipping call-summary note",
 			zap.String("conversation_id", d.ConversationID))
 		return nil
@@ -679,7 +680,8 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 	summary := s.summarize(ctx, convID, evt.TenantID, d.Quality)
 	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
-	if phone == "" {
+	// 2026-11-24: an e-mail conversation may carry only the sender's address — that identifies the person too.
+	if phone == "" && !(d.Quality.IsTextChannel() && strings.TrimSpace(d.Quality.ContactEmail) != "") {
 		s.Log.Debug("CallQualityEnriched without confirmed_phone; skipping note",
 			zap.String("conversation_id", d.ConversationID))
 		return nil
@@ -771,7 +773,11 @@ func (s *Syncer) rememberQualityNote(ctx context.Context, conversationID, noteID
 // 2026-11-23: an OUTBOUND call reached someone we chose to dial, by name; when no Person has that number yet the
 // call creates one (name + phone) so the call is never lost from the CRM. Inbound strangers are still skipped.
 func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantUUID *uuid.UUID, q events.CallQuality) (string, error) {
-	personID, err := s.findPersonForNote(ctx, phone, "", tenantUUID)
+	email := ""
+	if q.IsTextChannel() {
+		email = strings.ToLower(strings.TrimSpace(q.ContactEmail))
+	}
+	personID, err := s.findPersonForNote(ctx, phone, email, tenantUUID)
 	if err != nil || personID != "" {
 		return personID, err
 	}
@@ -781,9 +787,9 @@ func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantU
 	// Without a name the number is the name, so the record is still findable.
 	if q.IsTextChannel() {
 		if name == "" {
-			name = phone
+			name = firstNonEmpty(phone, email)
 		}
-		return s.createPersonForConversation(ctx, name, strings.TrimSpace(q.ContactEmail), phone, tenantUUID, "text chat")
+		return s.createPersonForConversation(ctx, name, email, phone, tenantUUID, "text chat")
 	}
 	if q.Direction != "outbound" || name == "" {
 		return "", nil

@@ -53,7 +53,7 @@ const systemPrompt = "You write the call summary a business owner reads in their
 
 // 2026-11-24: web chat / WhatsApp / Telegram conversations reach the CRM too; their summary speaks of a chat.
 const chatSystemPrompt = "You write the chat summary a business owner reads in their CRM after the AI receptionist " +
-	"handled a text conversation (web chat or WhatsApp). Write two or three short sentences of plain English, in the " +
+	"handled a text conversation (web chat, WhatsApp or e-mail). Write two or three short sentences of plain English, in the " +
 	"third person (\"The customer ...\"). Say what the customer wanted, what the receptionist did, and any " +
 	"appointment booked — the service, the day, the date and the time exactly as written in the chat. If the chat " +
 	"was not in English, say which language it was in and summarise in English. Never repeat a BVN, NIN, PIN, OTP " +

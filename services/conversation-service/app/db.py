@@ -218,7 +218,7 @@ class Database:
             await conn.execute(
                 "ALTER TABLE conversations "
                 "ADD CONSTRAINT conversations_channel_check "
-                "CHECK (channel IN ('voice','chat','phone','api','ussd','whatsapp','telegram')) NOT VALID"
+                "CHECK (channel IN ('voice','chat','phone','api','ussd','whatsapp','telegram','email')) NOT VALID"
             )
         log.info("conversation ussd channel check ensured")
 

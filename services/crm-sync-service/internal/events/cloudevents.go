@@ -177,7 +177,7 @@ type CallQuality struct {
 // than a call.
 func (q CallQuality) IsTextChannel() bool {
 	switch q.Channel {
-	case "chat", "whatsapp", "telegram":
+	case "chat", "whatsapp", "telegram", "email":
 		return true
 	}
 	return false

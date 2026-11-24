@@ -13,7 +13,7 @@ Role = Literal["user", "agent", "system", "tool", "staff"]
 # SPEC-W12 contract §2: "ussd" joins the channel enum (DB CHECK widened at
 # startup via Database.ensure_ussd_channel).
 # The messaging-gateway bridge records WhatsApp/Telegram chats under their own channel.
-Channel = Literal["voice", "chat", "phone", "api", "ussd", "whatsapp", "telegram"]
+Channel = Literal["voice", "chat", "phone", "api", "ussd", "whatsapp", "telegram", "email"]
 
 
 class ConversationCreate(BaseModel):

@@ -7,11 +7,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -80,6 +82,7 @@ func run() error {
 		WhatsAppMock:          cfg.WhatsAppMock,
 		TelegramBotUsername:   cfg.TelegramBotUsername,
 		TelegramWebhookSecret: cfg.TelegramWebhookSecret,
+		EmailInboundSecret:    cfg.EmailInboundSecret,
 		Metrics:               reg,
 		Log:                   logger,
 	}
@@ -100,6 +103,14 @@ func run() error {
 	siteMap, err := channel.ParseSiteMap(cfg.ChannelSiteMap)
 	if err != nil {
 		return err
+	}
+	// 2026-11-24: e-mail routes live in EMAIL_SITE_MAP (address -> site), merged as "email:<address>".
+	emailSites, err := channel.ParseSiteMap(cfg.EmailSiteMap)
+	if err != nil {
+		return fmt.Errorf("EMAIL_SITE_MAP: %w", err)
+	}
+	for addr, site := range emailSites {
+		siteMap["email:"+strings.ToLower(strings.TrimSpace(addr))] = site
 	}
 	// SPEC-W45 ORPH O2: resolve the internal upstream bases once and log
 	// them — with no Dapr sidecar (the compose posture) these are the
@@ -123,6 +134,15 @@ func run() error {
 	// SPEC-W81 C1: K2 machine token for the WhatsApp channel_identity pin
 	// on /voice/chat (mirrors the voice block's VOICE_ADMIN_INTERNAL_TOKEN).
 	bridge.VoiceInternalToken = cfg.VoiceInternalToken
+	// Inbound e-mail replies (2026-11-24): SMTP relay (Mailpit on the dev cluster).
+	bridge.Email = &provider.Email{Host: cfg.EmailSMTPHost, Port: cfg.EmailSMTPPort,
+		Username: cfg.EmailSMTPUsername, Password: cfg.EmailSMTPPassword}
+	if cfg.EmailFromNames != "" {
+		if err := json.Unmarshal([]byte(cfg.EmailFromNames), &bridge.EmailFromName); err != nil {
+			logger.Warn("EMAIL_FROM_NAMES is not a JSON object; replies use the site slug", zap.Error(err))
+		}
+	}
+	logger.Info("email channel", zap.Bool("inbound", cfg.EmailInboundSecret != ""), zap.Bool("smtp", cfg.EmailSMTPHost != ""))
 	srv.Bridge = bridge
 	logger.Info("inbound bridge bases resolved",
 		zap.String("conversation_base", convBase),

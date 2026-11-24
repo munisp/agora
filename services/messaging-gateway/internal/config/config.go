@@ -36,6 +36,16 @@ type Config struct {
 	TelegramWebhookSecret string // TELEGRAM_WEBHOOK_SECRET (optional setWebhook secret_token)
 	TelegramBaseURL       string // TELEGRAM_BASE_URL override (tests), default https://api.telegram.org
 	ChannelSiteMap        string // CHANNEL_SITE_MAP raw JSON (channel identity → site/tenant)
+	// Inbound e-mail channel (2026-11-24).
+	EmailInboundSecret string // EMAIL_INBOUND_SECRET
+	EmailSMTPHost      string // EMAIL_SMTP_HOST (empty = e-mail replies disabled)
+	EmailSMTPPort      string // EMAIL_SMTP_PORT (default 25)
+	EmailSMTPUsername  string // EMAIL_SMTP_USERNAME (optional)
+	EmailSMTPPassword  string // EMAIL_SMTP_PASSWORD (optional)
+	EmailFromNames     string // EMAIL_FROM_NAMES JSON {"<site slug>": "<display name>"} (optional)
+	// EMAIL_SITE_MAP JSON {"<business address>": {"site_slug": ..., "tenant_id": ...}}: kept apart from
+	// CHANNEL_SITE_MAP, which the WhatsApp borrow/restore scripts rewrite.
+	EmailSiteMap string
 
 	// WhatsApp inbound media -> OCR funnel (SPEC-W60, Option A).
 	// OCRServiceURL / OCRInternalToken reuse the SAME shared env vars as
@@ -166,6 +176,13 @@ func Load() Config {
 		TelegramWebhookSecret:      os.Getenv("TELEGRAM_WEBHOOK_SECRET"),
 		TelegramBaseURL:            envStr("TELEGRAM_BASE_URL", "https://api.telegram.org"),
 		ChannelSiteMap:             os.Getenv("CHANNEL_SITE_MAP"),
+		EmailInboundSecret:         os.Getenv("EMAIL_INBOUND_SECRET"),
+		EmailSMTPHost:              os.Getenv("EMAIL_SMTP_HOST"),
+		EmailSMTPPort:              os.Getenv("EMAIL_SMTP_PORT"),
+		EmailSMTPUsername:          os.Getenv("EMAIL_SMTP_USERNAME"),
+		EmailSMTPPassword:          os.Getenv("EMAIL_SMTP_PASSWORD"),
+		EmailFromNames:             os.Getenv("EMAIL_FROM_NAMES"),
+		EmailSiteMap:               os.Getenv("EMAIL_SITE_MAP"),
 		ConversationURL:            os.Getenv("CONVERSATION_URL"),
 		VoiceRuntimeURL:            os.Getenv("VOICE_RUNTIME_URL"),
 		DaprHTTPPort:               envInt("DAPR_HTTP_PORT", 3500),

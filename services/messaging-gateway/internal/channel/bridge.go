@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,11 @@ type InboundMessage struct {
 	MessageID string `json:"message_id"` // provider message id (idempotency)
 	Text      string `json:"text"`
 	Timestamp int64  `json:"timestamp"` // unix seconds (telegram: message.date)
+	// Email channel (2026-11-24): From is the sender's address; To is the business address written to (the site
+	// map route and the reply's From); Subject/FromName thread and address the reply.
+	To       string `json:"to,omitempty"`
+	Subject  string `json:"subject,omitempty"`
+	FromName string `json:"from_name,omitempty"`
 }
 
 // Site is one CHANNEL_SITE_MAP entry: the tenant + site a channel identity
@@ -87,6 +93,10 @@ type Bridge struct {
 
 	WhatsApp *provider.WhatsApp
 	Telegram *provider.Telegram
+	// Email replies over SMTP (2026-11-24); nil/unconfigured = inbound e-mail is recorded but not answered.
+	Email *provider.Email
+	// EmailFromName is the display name on e-mail replies, by site slug (falls back to the slug).
+	EmailFromName map[string]string
 
 	HC  *http.Client
 	Log *zap.Logger
@@ -585,7 +595,8 @@ func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg I
 	// chat pins nothing — the request stays byte-identical to the pre-W85
 	// shape, so the W81 telegram byte-compat guarantee holds.
 	pin := ""
-	if msg.Channel == "whatsapp" {
+	if msg.Channel == "whatsapp" || msg.Channel == "email" {
+		// whatsapp: the wa_id; email: the sender's address (the voice runtime pins it as the customer's e-mail).
 		pin = msg.From
 	} else if msg.Channel == "telegram" {
 		pin = b.telegramBoundPhoneCtx(ctx, msg.From)
@@ -633,9 +644,26 @@ func (b *Bridge) sendReply(ctx context.Context, msg InboundMessage, reply string
 		}
 		_, _, err := b.Telegram.SendMessage(ctx, msg.From, reply)
 		return err
+	case "email":
+		if b.Email == nil || !b.Email.Configured() {
+			return fmt.Errorf("email provider not configured")
+		}
+		_, err := b.Email.SendReply(ctx, msg.To, b.emailFromName(msg.To), msg.From, msg.Subject, reply, msg.MessageID)
+		return err
 	default:
 		return fmt.Errorf("unknown channel %q", msg.Channel)
 	}
+}
+
+// emailFromName is the reply's display name for the business address written to.
+func (b *Bridge) emailFromName(to string) string {
+	if site, ok := b.Sites["email:"+strings.ToLower(strings.TrimSpace(to))]; ok {
+		if n := b.EmailFromName[site.SiteSlug]; n != "" {
+			return n
+		}
+		return site.SiteSlug
+	}
+	return ""
 }
 
 // doJSON performs one JSON request/response against an internal service.

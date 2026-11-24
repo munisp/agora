@@ -41,7 +41,7 @@ class ChatEndTracker:
         try:
             cid = str(session.conversation_id)
             lookup = getattr(session, "stored_id_lookup", None)
-            if (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram") and callable(lookup):
+            if (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram", "email") and callable(lookup):
                 # The messaging gateway names its stored conversation (one per customer) on every message; the
                 # runtime session id may differ per message, so the stored id keys the conversation.
                 cid = str(lookup() or cid)

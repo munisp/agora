@@ -265,6 +265,8 @@ func PurposeLabel(p string) string {
 // "📞 Inbound call", "💻 Web call". Notes from events without a direction keep the old generic title.
 func CallSummaryNoteTitleFor(q events.CallQuality) string {
 	switch {
+	case q.Channel == "email":
+		return "✉️ Email"
 	case q.Channel == "whatsapp":
 		return "💬 WhatsApp chat"
 	case q.Channel == "telegram":
@@ -299,7 +301,7 @@ func CallSummaryNote(q events.CallQuality, summary string) string {
 	if q.IsTextChannel() {
 		// 2026-11-24: chats and WhatsApp conversations are written as such, not as calls.
 		fmt.Fprintf(&b, "- Conversation: %s (they wrote in)\n", map[string]string{
-			"chat": "web chat", "whatsapp": "WhatsApp", "telegram": "Telegram"}[q.Channel])
+			"chat": "web chat", "whatsapp": "WhatsApp", "telegram": "Telegram", "email": "e-mail"}[q.Channel])
 		fmt.Fprintf(&b, "- Messages from the customer: %d\n", q.TurnCount)
 		if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
 			fmt.Fprintf(&b, "- Phone: %s\n", spacedPhone(p))

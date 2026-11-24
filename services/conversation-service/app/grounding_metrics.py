@@ -34,7 +34,7 @@ from typing import Any
 from prometheus_client import Counter
 
 _SAFE_LABEL_CHARS = re.compile(r"[^a-zA-Z0-9_.-]+")
-_KNOWN_CHANNELS = frozenset({"ussd", "web", "whatsapp", "telegram", "voice"})
+_KNOWN_CHANNELS = frozenset({"ussd", "web", "whatsapp", "telegram", "voice", "email"})
 
 
 def _bounded_label_value(value: Any, *, max_len: int) -> str:
