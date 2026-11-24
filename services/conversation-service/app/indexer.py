@@ -81,7 +81,8 @@ class TranscriptIndexer:
             index=self._cfg.conversations_index,
         )
         pending: list[dict[str, Any]] = []
-        last_flush = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        last_flush = loop.time()
         try:
             while not self._stop.is_set():
                 try:
@@ -107,6 +108,9 @@ class TranscriptIndexer:
                     pending.clear()
                     last_flush = now
                     await consumer.commit()
+        except Exception as exc:
+            log.error("transcript indexer crashed", error=repr(exc))
+            raise
         finally:
             if pending:
                 with contextlib.suppress(Exception):
