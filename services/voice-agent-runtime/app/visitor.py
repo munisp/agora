@@ -89,12 +89,13 @@ def prompt_block(details: dict[str, str] | None) -> str:
              f"- Phone: {details['phone']}" if details.get("phone") else "",
              f"- Email: {details['email']}" if details.get("email") else ""]
     return (
-        "\nVISITOR DETAILS (given in a form before this conversation; self-reported, not verified)\n"
+        "\nVISITOR DETAILS (known before this conversation: a pre-chat form, or the address an e-mail came from; "
+        "self-reported, not verified)\n"
         + "\n".join(line for line in lines if line)
-        + "\n- Greet them by first name. Do NOT ask for their name, phone number or email again: use these "
-        "details for any booking. Before booking, read them back once and ask the visitor to confirm, and use "
-        "any correction they give. Looking up, changing or cancelling an existing booking still needs the "
-        "one-time-code verification.\n"
+        + "\n- Greet them by first name when it is listed. Do NOT ask again for any detail listed above: use it for "
+        "any booking. Ask only for what is missing and needed (for example a phone number before booking). Before "
+        "booking, read the details back once and ask the visitor to confirm, and use any correction they give. "
+        "Looking up, changing or cancelling an existing booking still needs the one-time-code verification.\n"
     )
 
 

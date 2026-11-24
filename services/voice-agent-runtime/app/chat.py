@@ -464,6 +464,7 @@ class ChatService:
             # 2026-11-24: the email channel's verified identity is the sender's address (the messaging gateway
             # received the mail from it), not a phone: it is the customer's e-mail, never a verified phone.
             session.caller_email = pin_verified_identity
+            session.visitor_form = True  # the prompt then lists the known address and does not ask for it again
         elif pin_verified_identity:
             pinned = session.mark_verified(pin_verified_identity)
             session.claimed_phone = session.claimed_phone or pinned
