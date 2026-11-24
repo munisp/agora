@@ -49,6 +49,10 @@ class _FakeDB:
         self.erase_calls.append((tenant_id, phone, email))
         return (2, 7)
 
+    async def erase_contact_conversations(self, tenant_id, phone, email):
+        self.erase_calls.append((tenant_id, phone, email))
+        return ([uuid.uuid4(), uuid.uuid4()], 7)
+
     async def purge_tenant_data(self, tenant_id):
         self.purge_calls.append(tenant_id)
         return (5, 42)

@@ -600,16 +600,25 @@ class Database:
     async def erase_contact_data(
         self, tenant_id: uuid.UUID, phone: str | None, email: str | None
     ) -> tuple[int, int]:
+        """See erase_contact_conversations; returns (conversations_matched,
+        turns_deleted)."""
+        ids, deleted = await self.erase_contact_conversations(tenant_id, phone, email)
+        return (len(ids), deleted)
+
+    async def erase_contact_conversations(
+        self, tenant_id: uuid.UUID, phone: str | None, email: str | None
+    ) -> tuple[list[uuid.UUID], int]:
         """Right-to-erasure tombstone: delete all turns of conversations
         whose contact_phone matches the given phone or e-mail, then clear the
         contact_phone marker itself (conversation shells are kept so booking
         history and analytics stay referentially intact).
 
-        Returns (conversations_matched, turns_deleted).
+        Returns (matched conversation ids, turns_deleted); the ids let the
+        caller drop the same turns from the search index.
         """
         refs = [r for r in (phone, email) if r]
         if not refs:
-            return (0, 0)
+            return ([], 0)
         async with self._tenant_tx(tenant_id) as conn:
             convs = await conn.fetch(
                 "SELECT id FROM conversations WHERE contact_phone = ANY($1::text[])",
@@ -617,7 +626,7 @@ class Database:
             )
             ids = [r["id"] for r in convs]
             if not ids:
-                return (0, 0)
+                return ([], 0)
             deleted = await conn.fetchval(
                 "WITH d AS (DELETE FROM turns WHERE conversation_id = ANY($1::uuid[]) "
                 "RETURNING 1) SELECT count(*) FROM d",
@@ -627,7 +636,7 @@ class Database:
                 "UPDATE conversations SET contact_phone = NULL WHERE id = ANY($1::uuid[])",
                 ids,
             )
-            return (len(ids), int(deleted or 0))
+            return (ids, int(deleted or 0))
 
     async def export_contact_conversations(
         self, tenant_id: uuid.UUID, contact: str
@@ -939,6 +948,48 @@ class Database:
                     "SELECT 1 FROM conversations WHERE id = $1", conversation_id
                 )
             )
+
+    async def turn_index_meta(
+        self, conversation_id: uuid.UUID, tenant_id: uuid.UUID, ts: datetime, role: str
+    ) -> dict[str, Any] | None:
+        """Indexer lookup: the conversation's site_slug/channel plus whether
+        the turn (conversation, ts, role) still exists. None when the
+        conversation itself is gone. The turn event is published after the
+        insert commits and carries the row's own ts, so a live turn always
+        matches; a missing one was deleted (erase, retention, reset)."""
+        async with self._tenant_tx(tenant_id) as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT c.site_slug, c.channel,
+                       EXISTS (SELECT 1 FROM turns t
+                               WHERE t.conversation_id = c.id AND t.ts = $2 AND t.role = $3)
+                           AS turn_exists
+                FROM conversations c WHERE c.id = $1
+                """,
+                conversation_id, ts, role,
+            )
+            return dict(row) if row else None
+
+    async def existing_conversation_ids(
+        self, tenant_id: uuid.UUID, conversation_ids: list[str]
+    ) -> set[str]:
+        """Which of these conversation ids still exist for the tenant
+        (search-index prune). Non-UUID ids are treated as gone."""
+        ids: list[uuid.UUID] = []
+        for c in conversation_ids:
+            try:
+                ids.append(uuid.UUID(c))
+            except ValueError:
+                continue
+        found: set[str] = set()
+        async with self._tenant_tx(tenant_id) as conn:
+            for start in range(0, len(ids), 1000):
+                rows = await conn.fetch(
+                    "SELECT id FROM conversations WHERE id = ANY($1::uuid[])",
+                    ids[start:start + 1000],
+                )
+                found.update(str(r["id"]) for r in rows)
+        return found
 
     async def conversation_meta(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID

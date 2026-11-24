@@ -28,6 +28,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from .config import Config
 from .db import Database
@@ -39,9 +40,11 @@ log = get_logger(__name__)
 class RetentionSweeper:
     """Background task: hourly hard-delete of turns older than N days."""
 
-    def __init__(self, cfg: Config, db: Database) -> None:
+    def __init__(self, cfg: Config, db: Database, search_index: Any = None) -> None:
         self._cfg = cfg
         self._db = db
+        # app.search_index.SearchIndex (optional): mirrors the delete in OpenSearch.
+        self._search_index = search_index
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -95,6 +98,12 @@ class RetentionSweeper:
                 log.error("retention sweep failed for tenant",
                           tenant_id=str(tenant_id), error=str(exc))
                 continue
+            if self._search_index is not None:
+                # Independent of n: docs can outlive their turns (deleted
+                # out of band), and the range delete is cheap when empty.
+                await self._search_index.delete_older_than(
+                    tenant_id, self._cfg.retention_days
+                )
             if n:
                 deleted[str(tenant_id)] = n
                 log.info("retention sweep deleted aged turns",

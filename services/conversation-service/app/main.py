@@ -25,6 +25,7 @@ from .agent_routes import router as agent_router
 from .capture import CaptureExtractor
 from .helpdesk import HelpdeskAutomation
 from .indexer import TranscriptIndexer
+from .search_index import SearchIndex
 from . import incidents as incidents_mod
 from .internal_routes import router as internal_router
 from .logging import get_logger, setup
@@ -173,9 +174,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                   error=str(exc))
         quality_sink = _NullSink()
 
+    # Mirrors Postgres deletes into the OpenSearch `conversations` index
+    # (only meaningful when the indexer feeds that index).
+    search_index: SearchIndex | None = SearchIndex(cfg) if cfg.indexer_enabled else None
+
     indexer: TranscriptIndexer | None = None
     if cfg.indexer_enabled:
-        indexer = TranscriptIndexer(cfg, db)
+        indexer = TranscriptIndexer(cfg, db, search_index)
         indexer.start()
 
     quality_enricher: CallQualityEnricher | None = None
@@ -198,7 +203,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:
             log.error("contact column bootstrap failed; privacy erase will fail",
                       error=str(exc))
-        privacy = PrivacyEraseConsumer(cfg, db)
+        privacy = PrivacyEraseConsumer(cfg, db, search_index)
         privacy.start()
 
     # SPEC-W43 Y-08: conversation_outbox relay — republishes unsent turn
@@ -219,7 +224,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (RETENTION_DAYS, default 365; NDPA profile sets 180).
     retention: RetentionSweeper | None = None
     if cfg.retention_enabled:
-        retention = RetentionSweeper(cfg, db)
+        retention = RetentionSweeper(cfg, db, search_index)
         retention.start()
 
     # SPEC-W45 UC helpdesk automation: human-escalation turns open a real
@@ -234,7 +239,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
 
     # SPEC-W45 K9: TenantDeleted cascade — purge tenant sessions/history.
-    tenant_lifecycle = TenantLifecycleConsumer(cfg, db)
+    tenant_lifecycle = TenantLifecycleConsumer(cfg, db, search_index)
     tenant_lifecycle.start()
 
     # SPEC-W117: app-lifetime OpenSearch client for the conversations
@@ -255,6 +260,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.cfg = cfg
     app.state.db = db
     app.state.search_os = search_os
+    app.state.search_index = search_index
     app.state.agent_store = agent_store
     app.state.intel_client = intel_client
     app.state.dapr = dapr
@@ -281,6 +287,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("conversation-service shutting down")
         if indexer is not None:
             await indexer.stop()
+        if search_index is not None:
+            await search_index.close()
         if quality_enricher is not None:
             with contextlib.suppress(Exception):
                 await quality_enricher.stop()

@@ -184,6 +184,9 @@ class Config:
     indexer_group: str = "conversation-service-indexer"
     indexer_bulk_size: int = 100
     indexer_bulk_flush_seconds: float = 2.0
+    # Reconcile the index with Postgres (drop docs of deleted conversations)
+    # every N seconds; 0 disables.
+    indexer_prune_seconds: int = 3600
 
     @property
     def database_dsn(self) -> str:
@@ -234,6 +237,7 @@ def load() -> Config:
         indexer_group=_env("INDEXER_GROUP", "conversation-service-indexer"),
         indexer_bulk_size=int(_env("INDEXER_BULK_SIZE", "100")),
         indexer_bulk_flush_seconds=float(_env("INDEXER_BULK_FLUSH_SECONDS", "2")),
+        indexer_prune_seconds=int(_env("INDEXER_PRUNE_SECONDS", "3600")),
         quality_enrich_enabled=_env("QUALITY_ENRICH_ENABLED", "true").lower() == "true",
         conversation_events_topic=_env(
             "CONVERSATION_EVENTS_TOPIC", "opendesk.conversation.events"
