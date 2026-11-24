@@ -153,6 +153,8 @@ class ChatService:
         visitor: Any = None,
         channel: str = "web",
         trusted_resume: bool = False,
+        pin_identity: str | None = None,
+        pinned_name: str | None = None,
     ) -> tuple[SessionState, ToolLayer, list[dict[str, Any]]]:
         """Shared turn setup for the buffered and SSE streaming chat paths
         (SPEC-W3 §3): session, tenant context, multi-agent routing, tool
@@ -174,6 +176,16 @@ class ChatService:
                 self._sessions, conversation_id, site_slug, session_secret=session_secret
             )
         session.text_chat = True
+        if pin_identity:
+            # 2026-11-24: the gateway-verified sender is known BEFORE the prompt is built (it used to be attached
+            # after, so the first reply asked for the name and number it already had).
+            if pinned_name and not getattr(session, "caller_name", None):
+                session.caller_name = pinned_name
+            if channel == "email":
+                session.caller_email = pin_identity
+            else:
+                session.claimed_phone = session.claimed_phone or pin_identity
+            session.visitor_form = True
         if channel in ("whatsapp", "telegram", "email") and conversation_id:
             # The messaging gateway records these chats and sends its stored conversation id as conversation_id.
             session.stored_id_lookup = lambda: conversation_id
@@ -455,6 +467,8 @@ class ChatService:
     ) -> dict[str, Any]:
         session, tool_layer, history = await self._prepare_turn(
             trusted_resume=bool(pin_verified_identity),
+            pin_identity=pin_verified_identity,
+            pinned_name=pinned_name,
             site_slug=site_slug,
             message=message,
             conversation_id=conversation_id,
