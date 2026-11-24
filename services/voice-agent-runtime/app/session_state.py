@@ -75,6 +75,8 @@ class SessionState:
     caller_name: str | None = None
     # 2026-11-23: an outbound call's purpose (confirm_appointment, waitlist_offer, no_show_rebook, callback, general)
     outbound_purpose: str | None = None
+    # 2026-11-23: how an outbound call ended (record_call_outcome): "confirmed", "declined", ... (None = not recorded)
+    call_outcome: str | None = None
     # 2026-11-23: returns the stored transcript's id (conversation-service) — set by the chat service / voice worker,
     # read by request_human so the human inbox knows which conversation to open. Never persisted.
     stored_id_lookup: Any = field(default=None, repr=False, compare=False)

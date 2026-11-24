@@ -275,6 +275,15 @@ func CallSummaryNoteTitleFor(q events.CallQuality) string {
 	return CallSummaryNoteTitle
 }
 
+// CallOutcomeLabel is the plain wording of an outbound call's recorded result ("" for none/unknown).
+func CallOutcomeLabel(outcome string) string {
+	return map[string]string{
+		"confirmed": "Confirmed they will attend", "declined": "Declined", "rescheduled": "Rescheduled",
+		"resolved": "Request handled", "call_back_later": "Asked us to call back later",
+		"wrong_person": "Reached someone else", "no_answer": "No answer (voicemail)",
+	}[outcome]
+}
+
 func CallSummaryNote(q events.CallQuality, summary string) string {
 	var b strings.Builder
 	if s := strings.TrimSpace(summary); s != "" {
@@ -300,7 +309,12 @@ func CallSummaryNote(q events.CallQuality, summary string) string {
 	case q.ToolCalls["cancel_appointment"] > 0:
 		booked = "Cancelled"
 	}
-	fmt.Fprintf(&b, "- Appointment booked: %s\n", booked)
+	if label := CallOutcomeLabel(q.CallOutcome); booked == "No" && label != "" {
+		// 2026-11-23: an outbound call's recorded result says more than "not booked" (e.g. they confirmed).
+		fmt.Fprintf(&b, "- Outcome: %s\n", label)
+	} else {
+		fmt.Fprintf(&b, "- Appointment booked: %s\n", booked)
+	}
 	fmt.Fprintf(&b, "- Passed to a person: %s", strings.Title(yesNo(q.Escalated))) //nolint:staticcheck // ASCII yes/no
 	if q.AvgSentiment != nil {
 		mood := "Neutral"

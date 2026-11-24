@@ -167,7 +167,8 @@ type CallQuality struct {
 	Purpose     string `json:"purpose,omitempty"`
 	ContactName string `json:"contact_name,omitempty"`
 	Channel     string `json:"channel,omitempty"`
-	Language    string `json:"language,omitempty"` // call language code at the end of the call (2026-11-23)
+	Language    string `json:"language,omitempty"`     // call language code at the end of the call (2026-11-23)
+	CallOutcome string `json:"call_outcome,omitempty"` // outbound result: confirmed, declined, ... (2026-11-23)
 }
 
 // Parse unmarshals one Kafka message value into a CloudEvent envelope.

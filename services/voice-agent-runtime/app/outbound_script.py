@@ -163,4 +163,6 @@ def prompt_block(brief: OutboundBrief, callee_phone: str = "", whatsapp: bool = 
            "its way; never mention WhatsApp before that.\n" if whatsapp else
            "- Do not offer or mention WhatsApp messages on this call.\n")
         + "- Keep it short: this person did not plan to be on the phone now. If it is a bad time, offer to call back.\n"
+        + "- Just before you say goodbye, call record_call_outcome once: confirmed, declined, rescheduled, resolved, "
+          "call_back_later, wrong_person or no_answer (voicemail).\n"
     )

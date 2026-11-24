@@ -35,7 +35,7 @@ export interface CallDetails {
   contact_name?: string;
   channel?: string;
   duration_s?: number;
-  outcome?: "booked" | "rescheduled" | "cancelled" | "none";
+  outcome?: string; // booked | rescheduled | cancelled | none, or an outbound call's recorded result (confirmed, ...)
   escalated?: boolean;
   confirmed_phone?: string;
   avg_sentiment?: number;
@@ -56,7 +56,14 @@ function CallDetailsBox({ d }: { d: CallDetails }) {
   const length = typeof d.duration_s === "number"
     ? d.duration_s < 60 ? `${Math.round(d.duration_s)} s` : `${Math.floor(d.duration_s / 60)} min ${Math.round(d.duration_s % 60)} s`
     : null;
-  const outcome = { booked: "Yes", rescheduled: "Rescheduled", cancelled: "Cancelled", none: "No" }[d.outcome ?? "none"];
+  const booking: Record<string, string> = { booked: "Yes", rescheduled: "Rescheduled", cancelled: "Cancelled", none: "No" };
+  // 2026-11-23: an outbound call's recorded result (record_call_outcome), shown instead of "Appointment booked: No".
+  const result: Record<string, string> = {
+    confirmed: "Confirmed they will attend", declined: "Declined", resolved: "Request handled",
+    call_back_later: "Asked us to call back later", wrong_person: "Reached someone else", no_answer: "No answer (voicemail)",
+  };
+  const outcomeKey = d.outcome ?? "none";
+  const outcome = booking[outcomeKey] ?? result[outcomeKey] ?? "No";
   const mood = typeof d.avg_sentiment === "number"
     ? d.avg_sentiment >= 0.25 ? "Positive" : d.avg_sentiment <= -0.25 ? "Negative" : "Neutral"
     : null;
@@ -65,7 +72,7 @@ function CallDetailsBox({ d }: { d: CallDetails }) {
   else if (d.direction === "inbound") rows.push(["Call", "Inbound (they called)"]);
   if (length) rows.push(["Call length", length]);
   if (d.confirmed_phone) rows.push(["Phone confirmed", d.confirmed_phone]);
-  rows.push(["Appointment booked", outcome]);
+  rows.push([outcomeKey in result ? "Outcome" : "Appointment booked", outcome]);
   rows.push(["Passed to a person", d.escalated ? "Yes" : "No"]);
   if (d.whatsapp_sent) rows.push(["WhatsApp confirmation", "Sent"]);
   if (mood) rows.push(["Caller's mood", mood]);

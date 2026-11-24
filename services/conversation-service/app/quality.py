@@ -148,6 +148,10 @@ class CallQualityEnricher:
         tools = quality.get("tool_calls") or {}
         outcome = ("booked" if tools.get("book_appointment") else "rescheduled" if tools.get("reschedule_appointment")
                    else "cancelled" if tools.get("cancel_appointment") else "none")
+        # 2026-11-23: an outbound call's recorded result ("confirmed" attendance, "declined", ...) when no booking
+        # tool decided the outcome.
+        if outcome == "none" and quality.get("call_outcome"):
+            outcome = str(quality["call_outcome"])
         details = {k: v for k, v in {
             "direction": quality.get("direction") or data.get("direction") or "inbound",
             "purpose": quality.get("purpose"),

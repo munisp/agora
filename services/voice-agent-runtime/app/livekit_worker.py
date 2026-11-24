@@ -1399,6 +1399,28 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         result = await self._tools.save_caller_details(name=name, phone=phone, email=email or None)
         return json.dumps(result, ensure_ascii=False)
 
+    CALL_OUTCOMES = ("confirmed", "declined", "rescheduled", "resolved", "call_back_later", "wrong_person", "no_answer")
+
+    @lk_llm.ai_callable(
+        description=(
+            "Outbound calls only: record how the call ended, once, just before you say goodbye. outcome is one of: "
+            "confirmed (they will attend the appointment), declined (they will not / turned the offer down), "
+            "rescheduled (moved to another time), resolved (their call-back request was handled), call_back_later "
+            "(bad time, call again), wrong_person (someone else answered), no_answer (voicemail or answering machine)."
+        )
+    )
+    async def record_call_outcome(self, outcome: str, note: str = "") -> str:
+        import json
+
+        value = (outcome or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if value not in self.CALL_OUTCOMES:
+            return json.dumps({"status": "error", "error": f"outcome must be one of {', '.join(self.CALL_OUTCOMES)}"})
+        session = getattr(self._tools, "_session", None)
+        if session is not None:
+            session.call_outcome = value
+        log.info("call outcome recorded", outcome=value, note=(note or "")[:120])
+        return json.dumps({"status": "recorded", "outcome": value})
+
     @lk_llm.ai_callable(
         description=(
             "Send the person a WhatsApp message confirming their appointment (service, with whom, when). Call it "
@@ -2693,6 +2715,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if session.caller_name:
                 quality["contact_name"] = session.caller_name
             quality["channel"] = "phone" if sip_call is not None else "web"
+            if getattr(session, "call_outcome", None):
+                quality["call_outcome"] = session.call_outcome  # 2026-11-23: outbound result (record_call_outcome)
             # 2026-11-23: the language the call ended in (the CRM's "preferred language").
             if getattr(session, "active_language", None):
                 quality["language"] = session.active_language

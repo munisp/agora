@@ -2,7 +2,10 @@ package twentyc
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"github.com/opendesk/crm-sync-service/internal/events"
 )
 
 const leadwayFields = `{"advisor":"assignedAdvisor",
@@ -33,5 +36,16 @@ func TestPersonFieldPatches(t *testing.T) {
 	var none *PersonFields
 	if l, e := none.Patches(PersonFacts{Advisor: "x", Language: "en"}); len(l) != 0 || len(e) != 0 {
 		t.Fatal("nil fields should patch nothing")
+	}
+}
+
+func TestCallSummaryNoteOutcome(t *testing.T) {
+	q := events.CallQuality{Direction: "outbound", Purpose: "confirm_appointment", CallOutcome: "confirmed"}
+	if n := CallSummaryNote(q, ""); !strings.Contains(n, "- Outcome: Confirmed they will attend") || strings.Contains(n, "Appointment booked") {
+		t.Fatalf("confirm call note:\n%s", n)
+	}
+	q.ToolCalls = map[string]int{"book_appointment": 1} // a booking made on the call still reads as booked
+	if n := CallSummaryNote(q, ""); !strings.Contains(n, "- Appointment booked: Yes") {
+		t.Fatalf("booked call note:\n%s", n)
 	}
 }
