@@ -326,9 +326,10 @@ class _NullSink:
 
 
 app = FastAPI(title="OpenDesk conversation-service", version="0.1.0", lifespan=lifespan)
+# search first: its literal /v1/conversations/search must win over /v1/conversations/{conversation_id}
+app.include_router(search_router)
 app.include_router(router)
 app.include_router(agent_router)
-app.include_router(search_router)
 # SPEC-W45 K19: internauth-gated service-to-service routes (/internal/gdpr/*).
 app.include_router(internal_router)
 
