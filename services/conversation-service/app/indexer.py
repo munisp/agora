@@ -154,15 +154,16 @@ class TranscriptIndexer:
         return doc
 
     async def _flush(self, os_client: Any, docs: list[dict[str, Any]]) -> None:
-        actions = [
-            {
-                "_op_type": "index",
+        # The raw bulk API takes alternating action and source lines (the
+        # "_op_type"/"_index"-inside-the-doc shape is only for helpers.async_bulk;
+        # sent here it was rejected with a 400 and stopped the indexer).
+        actions: list[dict[str, Any]] = []
+        for d in docs:
+            actions.append({"index": {
                 "_index": self._cfg.conversations_index,
                 "_id": f"{d['conversation_id']}:{d['ts']}:{d['role']}",
-                **d,
-            }
-            for d in docs
-        ]
+            }})
+            actions.append(d)
         resp = await os_client.bulk(body=actions)
         if resp.get("errors"):
             failed = [i for i in resp.get("items", []) if "error" in i.get("index", {})]
