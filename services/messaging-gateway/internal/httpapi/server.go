@@ -40,6 +40,9 @@ type Server struct {
 	TelegramBotUsername   string // TELEGRAM_BOT_USERNAME (site-map route key)
 	TelegramWebhookSecret string // TELEGRAM_WEBHOOK_SECRET (optional shared secret)
 	EmailInboundSecret    string // EMAIL_INBOUND_SECRET (path secret of /webhooks/email/{secret}; empty = 503)
+	ResendWebhookSecret   string // RESEND_WEBHOOK_SECRET (whsec_…, Svix) for /webhooks/resend
+	ResendAPIKey          string // RESEND_API_KEY (fetching received mail)
+	ResendBaseURL         string // tests only
 
 	// IoT incident ingest (SPEC-W11 Part B §6).
 	IncidentSecrets map[string]string // INCIDENT_WEBHOOK_SECRETS parsed (tenant slug|id → secret)
@@ -125,6 +128,8 @@ func (s *Server) Router() http.Handler {
 		r.Post("/telegram", s.handleTelegramWebhook)
 		// Inbound e-mail (2026-11-24): a mail forwarder posts each customer e-mail; path secret = EMAIL_INBOUND_SECRET.
 		r.Post("/email/{secret}", s.handleEmailWebhook)
+		// Resend inbound (2026-11-24): Svix-signed account webhook; only Agora's addresses are taken.
+		r.Post("/resend", s.handleResendWebhook)
 		// IoT incident trigger (SPEC-W11 Part B §6): public via the same
 		// APISIX /webhooks/* route, authenticated by the per-tenant shared
 		// secret in the body.

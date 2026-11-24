@@ -46,6 +46,13 @@ type Config struct {
 	// EMAIL_SITE_MAP JSON {"<business address>": {"site_slug": ..., "tenant_id": ...}}: kept apart from
 	// CHANNEL_SITE_MAP, which the WhatsApp borrow/restore scripts rewrite.
 	EmailSiteMap string
+	// Resend (2026-11-24): RESEND_API_KEY sends replies and fetches received mail; RESEND_WEBHOOK_SECRET verifies
+	// the account webhook (/webhooks/resend).
+	ResendAPIKey        string
+	ResendWebhookSecret string
+	// EMAIL_SEND_VIA_RESEND=1 sends replies through Resend (the reply address must be on a Resend-verified domain);
+	// otherwise replies go by SMTP (EMAIL_SMTP_HOST).
+	EmailSendViaResend bool
 
 	// WhatsApp inbound media -> OCR funnel (SPEC-W60, Option A).
 	// OCRServiceURL / OCRInternalToken reuse the SAME shared env vars as
@@ -183,6 +190,9 @@ func Load() Config {
 		EmailSMTPPassword:          os.Getenv("EMAIL_SMTP_PASSWORD"),
 		EmailFromNames:             os.Getenv("EMAIL_FROM_NAMES"),
 		EmailSiteMap:               os.Getenv("EMAIL_SITE_MAP"),
+		ResendAPIKey:               os.Getenv("RESEND_API_KEY"),
+		ResendWebhookSecret:        os.Getenv("RESEND_WEBHOOK_SECRET"),
+		EmailSendViaResend:         envBool("EMAIL_SEND_VIA_RESEND", false),
 		ConversationURL:            os.Getenv("CONVERSATION_URL"),
 		VoiceRuntimeURL:            os.Getenv("VOICE_RUNTIME_URL"),
 		DaprHTTPPort:               envInt("DAPR_HTTP_PORT", 3500),

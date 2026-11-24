@@ -96,8 +96,15 @@ func (s *Server) handleEmailWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "empty message")
 		return
 	}
-	subject := strings.TrimSpace(in.Subject)
-	msgID := strings.TrimSpace(in.MessageID)
+	msgID := s.acceptInboundEmail(from, strings.TrimSpace(in.FromName), to, in.Subject, text, in.MessageID)
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "message_id": msgID})
+}
+
+// acceptInboundEmail hands one customer e-mail (already authenticated, addresses lower-cased, quoted thread cut) to
+// the bridge in the background and returns its message id. Shared by the generic webhook and the Resend webhook.
+func (s *Server) acceptInboundEmail(from, fromName, to, subject, text, messageID string) string {
+	subject = strings.TrimSpace(subject)
+	msgID := strings.TrimSpace(messageID)
 	if msgID == "" {
 		sum := sha256.Sum256([]byte(from + "\x00" + to + "\x00" + subject + "\x00" + text))
 		msgID = "sha256-" + hex.EncodeToString(sum[:16])
@@ -107,7 +114,7 @@ func (s *Server) handleEmailWebhook(w http.ResponseWriter, r *http.Request) {
 		body = "Subject: " + subject + "\n\n" + text // the first mail's subject is often the question itself
 	}
 	msg := channel.InboundMessage{
-		Channel: "email", From: from, To: to, Subject: subject, FromName: strings.TrimSpace(in.FromName),
+		Channel: "email", From: from, To: to, Subject: subject, FromName: strings.TrimSpace(fromName),
 		MessageID: msgID, Text: body, Timestamp: time.Now().Unix(),
 	}
 	s.Log.Info("inbound e-mail accepted", zap.String("to", to), zap.String("message_id", msgID))
@@ -122,5 +129,5 @@ func (s *Server) handleEmailWebhook(w http.ResponseWriter, r *http.Request) {
 			s.Log.Warn("inbound e-mail failed", zap.String("to", to), zap.Error(err))
 		}
 	}()
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted", "message_id": msgID})
+	return msgID
 }

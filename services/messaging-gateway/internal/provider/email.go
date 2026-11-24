@@ -8,27 +8,35 @@ package provider
 // sent mail; a real relay needs its host and credentials.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"mime"
 	"net"
+	"net/http"
 	"net/smtp"
 	"strings"
 	"time"
 )
 
 type Email struct {
-	Host     string
-	Port     string
-	Username string
-	Password string
+	// ResendAPIKey (RESEND_API_KEY): when set, replies go through Resend's API instead of SMTP (real delivery from
+	// a Resend-verified domain). ResendBaseURL overrides https://api.resend.com (tests).
+	ResendAPIKey  string
+	ResendBaseURL string
+	Host          string
+	Port          string
+	Username      string
+	Password      string
 	// send is swappable in tests.
 	send func(addr string, a smtp.Auth, from string, to []string, msg []byte) error
 }
 
-func (e *Email) Configured() bool { return e != nil && e.Host != "" }
+func (e *Email) Configured() bool { return e != nil && (e.Host != "" || e.ResendAPIKey != "") }
 
 // headerSafe drops CR/LF so a subject or address can never inject headers.
 func headerSafe(s string) string {
@@ -86,6 +94,9 @@ func (e *Email) SendReply(ctx context.Context, from, fromName, to, subject, body
 	if !strings.Contains(to, "@") || !strings.Contains(from, "@") {
 		return "", fmt.Errorf("email reply needs both addresses")
 	}
+	if e.ResendAPIKey != "" {
+		return e.sendResend(ctx, from, fromName, to, subject, body, inReplyTo)
+	}
 	port := e.Port
 	if port == "" {
 		port = "25"
@@ -111,4 +122,49 @@ func (e *Email) SendReply(ctx context.Context, from, fromName, to, subject, body
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+}
+
+// sendResend posts the reply to Resend's API (POST /emails), threaded with In-Reply-To/References.
+func (e *Email) sendResend(ctx context.Context, from, fromName, to, subject, body, inReplyTo string) (string, error) {
+	fromHdr := headerSafe(from)
+	if n := headerSafe(fromName); n != "" {
+		fromHdr = fmt.Sprintf("%s <%s>", strings.ReplaceAll(n, `"`, ""), headerSafe(from))
+	}
+	payload := map[string]any{
+		"from":    fromHdr,
+		"to":      []string{headerSafe(to)},
+		"subject": ReplySubject(subject),
+		"text":    body,
+	}
+	if r := headerSafe(inReplyTo); r != "" {
+		if !strings.HasPrefix(r, "<") {
+			r = "<" + r + ">"
+		}
+		payload["headers"] = map[string]string{"In-Reply-To": r, "References": r}
+	}
+	raw, _ := json.Marshal(payload)
+	base := e.ResendBaseURL
+	if base == "" {
+		base = "https://api.resend.com"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/emails", bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+e.ResendAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return "", fmt.Errorf("resend send: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("resend send: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(b, &out)
+	return out.ID, nil
 }

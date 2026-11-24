@@ -83,6 +83,8 @@ func run() error {
 		TelegramBotUsername:   cfg.TelegramBotUsername,
 		TelegramWebhookSecret: cfg.TelegramWebhookSecret,
 		EmailInboundSecret:    cfg.EmailInboundSecret,
+		ResendWebhookSecret:   cfg.ResendWebhookSecret,
+		ResendAPIKey:          cfg.ResendAPIKey,
 		Metrics:               reg,
 		Log:                   logger,
 	}
@@ -135,14 +137,19 @@ func run() error {
 	// on /voice/chat (mirrors the voice block's VOICE_ADMIN_INTERNAL_TOKEN).
 	bridge.VoiceInternalToken = cfg.VoiceInternalToken
 	// Inbound e-mail replies (2026-11-24): SMTP relay (Mailpit on the dev cluster).
-	bridge.Email = &provider.Email{Host: cfg.EmailSMTPHost, Port: cfg.EmailSMTPPort,
+	sendKey := ""
+	if cfg.EmailSendViaResend {
+		sendKey = cfg.ResendAPIKey
+	}
+	bridge.Email = &provider.Email{ResendAPIKey: sendKey, Host: cfg.EmailSMTPHost, Port: cfg.EmailSMTPPort,
 		Username: cfg.EmailSMTPUsername, Password: cfg.EmailSMTPPassword}
 	if cfg.EmailFromNames != "" {
 		if err := json.Unmarshal([]byte(cfg.EmailFromNames), &bridge.EmailFromName); err != nil {
 			logger.Warn("EMAIL_FROM_NAMES is not a JSON object; replies use the site slug", zap.Error(err))
 		}
 	}
-	logger.Info("email channel", zap.Bool("inbound", cfg.EmailInboundSecret != ""), zap.Bool("smtp", cfg.EmailSMTPHost != ""))
+	logger.Info("email channel", zap.Bool("inbound", cfg.EmailInboundSecret != ""), zap.Bool("smtp", cfg.EmailSMTPHost != ""),
+		zap.Bool("resend_send", cfg.EmailSendViaResend && cfg.ResendAPIKey != ""), zap.Bool("resend_inbound", cfg.ResendWebhookSecret != "" && cfg.ResendAPIKey != ""))
 	srv.Bridge = bridge
 	logger.Info("inbound bridge bases resolved",
 		zap.String("conversation_base", convBase),
