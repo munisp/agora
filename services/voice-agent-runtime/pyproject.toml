@@ -27,6 +27,8 @@ dependencies = [
     "edge-tts==7.*",
     # Control plane
     "fastapi==0.115.*",
+    # W115 document upload: FastAPI needs it to read multipart forms (without it /voice/documents/upload answered 500).
+    "python-multipart>=0.0.9",
     "uvicorn==0.30.*",
     # Dapr HTTP client / outbound HTTP
     "httpx==0.27.*",
