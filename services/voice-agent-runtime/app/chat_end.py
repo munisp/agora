@@ -40,6 +40,11 @@ class ChatEndTracker:
         """Record one finished turn of a text conversation (never raises)."""
         try:
             cid = str(session.conversation_id)
+            lookup = getattr(session, "stored_id_lookup", None)
+            if (getattr(session, "channel", None) or "web") in ("whatsapp", "telegram") and callable(lookup):
+                # The messaging gateway names its stored conversation (one per customer) on every message; the
+                # runtime session id may differ per message, so the stored id keys the conversation.
+                cid = str(lookup() or cid)
             now = self._clock()
             rec = self._open.get(cid)
             if rec is None:
@@ -58,7 +63,6 @@ class ChatEndTracker:
             rec["language"] = getattr(session, "active_language", None)
             rec["escalated"] = bool(getattr(session, "escalation_room", None))
             rec["agent_id"] = getattr(session, "resolved_agent_id", None)
-            lookup = getattr(session, "stored_id_lookup", None)
             rec["lookup"] = lookup if callable(lookup) else None
             if tenant_ctx is not None:
                 rec["tenant_id"] = str(getattr(tenant_ctx, "tenant_id", "") or "")

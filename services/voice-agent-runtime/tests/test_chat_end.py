@@ -75,3 +75,13 @@ def test_no_business_no_event_and_bad_session_never_raises():
     clock.t += 601
     asyncio.run(tr.sweep_once())
     assert dapr.sent == []
+
+
+def test_whatsapp_messages_with_fresh_sessions_are_one_conversation():
+    tr, dapr, clock = _tracker()
+    tr.touch(_session(conversation_id="sess-a"), _CTX, [])
+    clock.t += 60
+    tr.touch(_session(conversation_id="sess-b"), _CTX, [])  # new runtime session, same stored conversation
+    clock.t += 601
+    assert asyncio.run(tr.sweep_once()) == 1
+    assert dapr.sent[0][1]["data"]["quality"]["turn_count"] == 2
