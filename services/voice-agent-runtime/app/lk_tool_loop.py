@@ -12,6 +12,7 @@ is unchanged. Listeners hear about the extra calls (call activity on screen, tra
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, Callable
 
@@ -22,6 +23,71 @@ from .logging import get_logger
 log = get_logger("tool-loop")
 
 _END = object()
+
+
+def _content(chunk: Any) -> str:
+    if isinstance(chunk, str):
+        return chunk
+    return "".join((getattr(c.delta, "content", None) or "") for c in getattr(chunk, "choices", []) or [])
+
+
+class _ThoughtPrefix:
+    """Drops a reasoning marker the model leaks at the very start of a reply, before it is spoken or saved.
+
+    gemma4 with thinking off sometimes still opens a reply with its thinking channel; with the special tokens
+    stripped only the bare word is left ("thought No problem. Talk to you soon. Goodbye!", an outbound call
+    2026-11-24, right after record_call_outcome). The caller heard "thought". Only the lowercase marker counts:
+    a real sentence starting with "Thought ..." is capitalised and passes untouched. The first few characters
+    are held only while they could still be the marker."""
+
+    _MARKERS = ("thought", "<|channel>thought", "<|channel|>thought")
+    _RE = re.compile(r"^\s*(?:<\|channel\|?>\s*)?thought(?:\s+|$)")
+
+    def __init__(self) -> None:
+        self._held: list[Any] = []
+        self._text = ""
+        self._done = False
+
+    def _undecided(self) -> bool:
+        s = self._text.lstrip()
+        # Could still become "<marker><whitespace>": wait for the next character.
+        return any(m.startswith(s) or (s.startswith(m) and len(s) == len(m)) for m in self._MARKERS)
+
+    def feed(self, chunk: Any) -> list[Any]:
+        if self._done:
+            return [chunk]
+        self._held.append(chunk)
+        self._text += _content(chunk)
+        if self._undecided():
+            return []
+        return self.flush()
+
+    def flush(self) -> list[Any]:
+        if self._done:
+            return []
+        self._done = True
+        held, self._held = self._held, []
+        m = self._RE.match(self._text)
+        if not m:
+            return held
+        log.warning("leaked reasoning marker dropped", said=self._text[:80])
+        rest, out = self._text[m.end():], []
+        for chunk in held:  # the cleaned text goes in the first chunk that carried text, the others lose theirs
+            if not _content(chunk):
+                out.append(chunk)
+            elif isinstance(chunk, str):
+                if rest:
+                    out.append(rest)
+                rest = ""
+            else:
+                first = True
+                for c in getattr(chunk, "choices", []) or []:
+                    if getattr(c.delta, "content", None):
+                        c.delta.content = rest if first else ""
+                        first = False
+                rest = ""
+                out.append(chunk)
+        return out
 
 
 def _is_answer_round(chat_ctx: Any) -> bool:
@@ -43,9 +109,13 @@ class _ToolLoopStream(lk_llm.LLMStream):
             for round_no in range(owner.max_rounds + 1):
                 last = round_no == owner.max_rounds  # out of rounds: answer without tools
                 stream = owner.inner.chat(chat_ctx=ctx, fnc_ctx=None if last else self._fnc_ctx)
+                lead = _ThoughtPrefix()
                 try:
                     async for chunk in stream:
-                        await self._queue.put(chunk)  # the pipeline speaks only the text in these
+                        for c in lead.feed(chunk):
+                            await self._queue.put(c)  # the pipeline speaks only the text in these
+                    for c in lead.flush():
+                        await self._queue.put(c)
                     calls = list(stream.function_calls or [])
                 finally:
                     await stream.aclose()
@@ -81,8 +151,6 @@ class _ToolLoopStream(lk_llm.LLMStream):
                 pass
         await super().aclose()
 
-
-import re
 
 # "I have booked your visit", "your appointment is confirmed for Tuesday", "you're all set for 9:00"
 _BOOKED_CLAIM = re.compile(
@@ -139,6 +207,7 @@ class _ClaimGuardStream(lk_llm.LLMStream):
             stream = owner.inner.chat(chat_ctx=self._chat_ctx, fnc_ctx=self._fnc_ctx, **self._kwargs)
             held: list[Any] = []
             text = ""
+            lead = _ThoughtPrefix()
             claimed = False
             first = True
             try:
@@ -154,14 +223,18 @@ class _ClaimGuardStream(lk_llm.LLMStream):
                             claimed = True
                             break
                         for c in held:
-                            await self._queue.put(c)
+                            for out in lead.feed(c):
+                                await self._queue.put(out)
                         held, text = [], ""
                 if not claimed:
                     if held and booking_claim(text) and not _booked_in(self._chat_ctx) and not stream.function_calls:
                         claimed = True
                     else:
                         for c in held:
-                            await self._queue.put(c)
+                            for out in lead.feed(c):
+                                await self._queue.put(out)
+                        for out in lead.flush():
+                            await self._queue.put(out)
                         self._function_calls_info = list(stream.function_calls or [])
                         return
             finally:

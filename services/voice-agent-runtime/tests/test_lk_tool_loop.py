@@ -145,3 +145,36 @@ def test_rounds_are_capped_and_last_round_has_no_tools():
     assert ran == ["get_availability", "get_availability"]
     assert out == ["Done."]
     assert inner.tool_flags == [True, True, False]
+
+
+# --- leaked reasoning marker (2026-11-24: "thought No problem. Talk to you soon. Goodbye!") -----------------------
+
+def _answer_after_tool(chunks):
+    async def run():
+        inner = _ScriptedLLM([(chunks, [])])
+        return await _collect(ToolLoopLLM(inner).chat(chat_ctx=_answer_round_ctx(), fnc_ctx=_fnc_ctx([])))
+    return _text(asyncio.run(run()))
+
+
+def test_leaked_thought_marker_is_dropped_after_a_tool_call():
+    assert _answer_after_tool([_chunk("thought"), _chunk(" No problem."), _chunk(" Goodbye!")]) == "No problem. Goodbye!"
+
+
+def test_marker_split_across_chunks_and_channel_form_are_dropped():
+    assert _answer_after_tool([_chunk("tho"), _chunk("ught\nNo problem.")]) == "No problem."
+    assert _answer_after_tool([_chunk("<|channel>thought "), _chunk("Bye.")]) == "Bye."
+
+
+def test_real_sentences_pass_untouched():
+    assert _answer_after_tool([_chunk("Thought you'd like "), _chunk("an earlier slot.")]) == "Thought you'd like an earlier slot."
+    assert _answer_after_tool([_chunk("tha"), _chunk("nks for calling.")]) == "thanks for calling."
+    assert _answer_after_tool([_chunk("thoughtful of you to call.")]) == "thoughtful of you to call."
+
+
+def test_marker_on_first_round_reply_is_dropped():
+    async def run():
+        inner = _ScriptedLLM([([_chunk("thought Hello, "), _chunk("how can I help?")], [])])
+        ctx = lk_llm.ChatContext().append(role="user", text="hello")
+        return await _collect(ToolLoopLLM(inner).chat(chat_ctx=ctx, fnc_ctx=_fnc_ctx([])))
+
+    assert _text(asyncio.run(run())) == "Hello, how can I help?"
