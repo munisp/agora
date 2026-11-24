@@ -13,6 +13,16 @@ Mounted endpoints:
       addition to the PrivacyEraseRequested tombstone (which remains the
       fan-out for booking/crm-sync). erase_contact_data is idempotent, so a
       tombstone redelivery after a direct purge is a no-op.
+
+- GET  /internal/conversations/{conversation_id}?tenant_id=
+      SPEC-W118: conversation row (channel/contact_phone/site_slug) for the
+      chatwoot-bridge link-creation path.
+- POST /internal/conversations/{conversation_id}/turns
+      SPEC-W118: append a human-agent reply arriving FROM Chatwoot as an
+      agent turn. role is restricted to "agent" (least privilege) and the
+      turn is published with data.origin="chatwoot" so the bridge's
+      outbound consumer skips its own echo (loop breaker). Idempotent via
+      the caller-supplied idempotency_key.
 """
 
 from __future__ import annotations
@@ -24,7 +34,9 @@ from typing import Annotated, Any
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
+from .db import NotFoundError
 from .logging import get_logger
+from .routes import _persist_turn
 
 log = get_logger(__name__)
 
@@ -123,3 +135,71 @@ async def merge_call_details(conversation_id: str, request: Request) -> dict:
     if not ok:
         raise HTTPException(status_code=404, detail="conversation not found")
     return {"updated": True}
+
+
+class BridgeTurnRequest(BaseModel):
+    tenant_id: uuid.UUID
+    role: str
+    text: str
+    idempotency_key: str | None = None
+
+
+@router.get("/internal/conversations/{conversation_id}")
+async def bridge_get_conversation(
+    conversation_id: uuid.UUID,
+    request: Request,
+    tenant_id: Annotated[uuid.UUID, Query()],
+) -> dict[str, Any]:
+    """SPEC-W118: conversation row for the chatwoot-bridge link-creation
+    path (channel + contact_phone drive Chatwoot contact creation)."""
+    _require_internal_token(request)
+    db = request.app.state.db
+    try:
+        conv = await db.get_conversation(conversation_id, tenant_id)
+    except NotFoundError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"conversation {conversation_id} not found",
+        ) from None
+    return dict(conv)
+
+
+@router.post("/internal/conversations/{conversation_id}/turns")
+async def bridge_append_turn(
+    conversation_id: uuid.UUID,
+    body: BridgeTurnRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """SPEC-W118: append a Chatwoot human-agent reply as an agent turn.
+
+    The turn is published with data.origin="chatwoot" so the bridge's
+    outbound consumer skips its own echo. role is restricted to "agent" —
+    the bridge never speaks for the customer.
+    """
+    _require_internal_token(request)
+    if body.role != "agent":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "bridge turns must have role 'agent'",
+        )
+    if not body.text.strip():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "text must be non-empty"
+        )
+    turn, created = await _persist_turn(
+        request.app.state,
+        conversation_id,
+        body.tenant_id,
+        "agent",
+        body.text,
+        idempotency_key=body.idempotency_key,
+        origin="chatwoot",
+    )
+    return {
+        "id": str(turn.id),
+        "conversation_id": str(turn.conversation_id),
+        "seq": turn.seq,
+        "role": turn.role,
+        "ts": turn.ts.isoformat(),
+        "created": created,
+    }

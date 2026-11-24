@@ -35,12 +35,17 @@ def test_mock_extract_happy_path_schema_and_fixture(client, deps):
     body = resp.json()
     # A<->B / A<->C contract keys, exactly (extracted_text added by W53-D —
     # C's knowledge flow consumes it; B codes against the original four).
+    # SPEC-W115 C3 (sanctioned change, recorded in NOTES.md): two additive
+    # keys — validation_verdict + validation_reasons, the deterministic
+    # content-validation verdict computed on every extract.
     assert set(body) == {
         "document_id",
         "status",
         "extracted_fields",
         "page_count",
         "extracted_text",
+        "validation_verdict",
+        "validation_reasons",
     }
     assert body["status"] == "extracted"
     assert body["page_count"] == 1

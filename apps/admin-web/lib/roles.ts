@@ -94,6 +94,24 @@ export function canEnrollVoices(
 /** Agents registry (SPEC-W38) — operational staff can manage agents. */
 export const AGENTS_ROLES: readonly RealmRole[] = ["owner", "admin", "staff"];
 
+/**
+ * Conversations transcript search (SPEC-W117) — operational data, same
+ * staff-grade gate as the agents registry: owner/admin/staff. Viewers,
+ * analysts and billing never see raw transcripts.
+ */
+export const CONVERSATIONS_ROLES: readonly RealmRole[] = [
+  "owner",
+  "admin",
+  "staff",
+];
+
+/** owner/admin/staff — viewers, analysts and billing never see transcripts. */
+export function canViewConversations(
+  roles: readonly string[] | undefined | null,
+): boolean {
+  return hasAnyRole(roles, CONVERSATIONS_ROLES);
+}
+
 /** owner/admin/staff — viewers, analysts and billing never see the agents section. */
 export function canViewAgents(
   roles: readonly string[] | undefined | null,

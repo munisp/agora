@@ -68,7 +68,14 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
 from . import erasure, events, registry, sweeper
 from .av import AvClient, AvUnavailable, Infected, InfectedError
-from .config import ALLOWED_MIMES, DOCUMENT_KINDS, is_kyc_kind, settings
+from .config import (
+    ALLOWED_MIMES,
+    DOCUMENT_KINDS,
+    SOURCE_CHANNELS,
+    is_kyc_kind,
+    settings,
+)
+from .validators import validate_document
 from .dapr_client import DaprClient
 from .llm import OcrClient, OcrUpstreamError, mock_extraction
 from .logging import configure_logging, get_logger
@@ -294,9 +301,9 @@ async def _authenticate(request: Request, explicit_tenant: str | None, deps: App
 # ---------------------------------------------------------------------------
 async def _read_upload(
     request: Request,
-) -> tuple[str, bytes, str | None, str | None, Any, str | None]:
+) -> tuple[str, bytes, str | None, str | None, Any, str | None, str | None]:
     """Extract (filename, data, kind, tenant, expires_in_hours raw,
-    subject_phone) from multipart OR JSON body.
+    subject_phone, source_channel) from multipart OR JSON body.
 
     The tenant selector is `tenant_id` (A<->B contract; the booking-service
     fieldcapture client sends it as a form field alongside X-Tenant-Slug);
@@ -315,10 +322,11 @@ async def _read_upload(
         tenant = _as_str(form.get("tenant_id")) or _as_str(form.get("tenant"))
         expires_raw = form.get("expires_in_hours")
         subject_phone = _as_str(form.get("subject_phone"))
+        source_channel = _as_str(form.get("source_channel"))
         if upload is None or not getattr(upload, "filename", None):
             raise HTTPException(status_code=400, detail="multipart field 'file' required")
         data = await upload.read()
-        return upload.filename, data, _as_str(kind), tenant, expires_raw, subject_phone
+        return upload.filename, data, _as_str(kind), tenant, expires_raw, subject_phone, source_channel
     try:
         body = await request.json()
     except Exception:
@@ -333,10 +341,11 @@ async def _read_upload(
     tenant = _as_str(body.get("tenant_id")) or _as_str(body.get("tenant"))
     expires_raw = body.get("expires_in_hours")
     subject_phone = _as_str(body.get("subject_phone"))
+    source_channel = _as_str(body.get("source_channel"))
     if not url or not isinstance(url, str):
         raise HTTPException(status_code=400, detail="document_url required")
     filename, data = await _fetch_document_url(url)
-    return filename, data, _as_str(kind), tenant, expires_raw, subject_phone
+    return filename, data, _as_str(kind), tenant, expires_raw, subject_phone, source_channel
 
 
 def _parse_expires_in_hours(raw: Any) -> int | None:
@@ -614,6 +623,7 @@ async def _run_extraction(
     data: bytes,
     expires_in_hours: int | None = None,
     subject_phone: str | None = None,
+    source_channel: str | None = None,
 ) -> dict[str, Any]:
     ext, mime = validate_upload(filename, data, max_bytes=settings.ocr_max_bytes)
     digest = sha256_hex(data)
@@ -671,6 +681,8 @@ async def _run_extraction(
                 "page_count": page_count_hint,
                 "expires_at": expires_at,
                 "subject_phone": subject_phone,  # kyc_* only (SPEC-W65 G2)
+                # SPEC-W115 C3: intake channel (validated at the route).
+                "source_channel": source_channel,
             },
         )
 
@@ -705,6 +717,15 @@ async def _run_extraction(
     # full transcript — it is pure PII with no downstream consumer (the
     # knowledge-scan flow is the only extracted_text consumer). Fields stay
     # persisted (TTL-bound) so the consent-gated review surface works.
+    # SPEC-W115 C2: deterministic content validation (never the model's
+    # claim). Computed BEFORE persistence so the verdict lands atomically
+    # with the extraction. SPEC-W67 G5 disclosure gate: registry_duplicate
+    # is NEVER wired here — the caller-visible response must be invariant
+    # to cross-tenant fingerprint matches (staff learn via the W67 alert
+    # channel instead).
+    validation_verdict, validation_reasons = validate_document(
+        kind, extraction.fields
+    )
     async with deps.db.tenant_conn(tenant_id) as conn:
         await deps.db.mark_extracted(
             conn,
@@ -713,6 +734,8 @@ async def _run_extraction(
             model_version=extraction.model_version,
             extracted_text=None if kyc else extraction.text,
             extracted_fields=extraction.fields,
+            validation_verdict=validation_verdict,
+            validation_reasons=validation_reasons,
         )
         # SPEC-W67: the registry's first_seen MUST be the document row's
         # created_at (true chronology for the backfill), never wall-clock.
@@ -763,17 +786,29 @@ async def _run_extraction(
         # suppressed ("") for kyc_* kinds — transcript is never persisted
         # nor echoed for KYC PII.
         "extracted_text": "" if kyc else extraction.text,
+        # SPEC-W115 C3 additive keys: the deterministic validation verdict.
+        "validation_verdict": validation_verdict,
+        "validation_reasons": validation_reasons,
     }
 
 
 @app.post("/v1/ocr/extract", status_code=200)
 async def extract_document(request: Request, deps: AppState = Depends(get_state)):
     try:
-        filename, data, kind, tenant, expires_raw, subject_phone = await _read_upload(request)
+        filename, data, kind, tenant, expires_raw, subject_phone, source_channel = (
+            await _read_upload(request)
+        )
         if kind not in DOCUMENT_KINDS:
             raise HTTPException(
                 status_code=400,
                 detail=f"kind must be one of {list(DOCUMENT_KINDS)}",
+            )
+        # SPEC-W115 C3: optional intake channel; invalid => 400 (same
+        # pre-side-effect posture as kind/expires_in_hours).
+        if source_channel is not None and source_channel not in SOURCE_CHANNELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"source_channel must be one of {list(SOURCE_CHANNELS)}",
             )
         # SPEC-W61 G2: optional TTL field, validated BEFORE any side effect.
         expires_in_hours = _parse_expires_in_hours(expires_raw)
@@ -781,6 +816,7 @@ async def extract_document(request: Request, deps: AppState = Depends(get_state)
         return await _run_extraction(
             deps, tenant_id=tenant_id, kind=kind, filename=filename, data=data,
             expires_in_hours=expires_in_hours, subject_phone=subject_phone,
+            source_channel=source_channel,
         )
     except ValidationError as exc:
         msg = str(exc)
@@ -843,6 +879,10 @@ async def get_document(
         "error": row["error"],
         "extracted_text": row["extracted_text"],
         "extracted_fields": row["extracted_fields"],
+        # SPEC-W115 C3 additive keys (NULL for pre-W115 rows).
+        "validation_verdict": row.get("validation_verdict"),
+        "validation_reasons": row.get("validation_reasons"),
+        "source_channel": row.get("source_channel"),
         "expires_at": row["expires_at"].isoformat() if row.get("expires_at") else None,
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),

@@ -38,6 +38,7 @@ import (
 	"github.com/opendesk/booking-service/internal/permify"
 	"github.com/opendesk/booking-service/internal/recon"     // SPEC-W56 Scope A (additive import)
 	"github.com/opendesk/booking-service/internal/referrals" // SPEC-W14 Agent B (additive import)
+	"github.com/opendesk/booking-service/internal/search"    // SPEC-W119 (additive import)
 	"github.com/opendesk/booking-service/internal/socialpub"
 	"github.com/opendesk/booking-service/internal/socialpub/provider" // SPEC-W21 integrator (additive imports)
 	"github.com/opendesk/booking-service/internal/store"
@@ -454,6 +455,34 @@ func run() error {
 		}
 	}
 	// SPEC-W56 Scope A — END
+
+	// SPEC-W119 — BEGIN (additive): OpenSearch advanced search for
+	// bookings/contacts/leads. When OPENSEARCH_ADDR is empty the boot is
+	// byte-identical to pre-W119: no client, no syncer, Deps.Searcher nil
+	// (the endpoints fail closed 503). The syncer NEVER blocks serving.
+	var searcher httpapi.Searcher
+	if cfg.OpenSearchAddr != "" {
+		osClient := search.NewClient(cfg.OpenSearchAddr)
+		searcher = &search.Handlers{OS: osClient}
+		if cfg.SearchSyncIntervalSeconds > 0 {
+			syncer := &search.Syncer{
+				Store:    st,
+				OS:       osClient,
+				Log:      logger,
+				Interval: time.Duration(cfg.SearchSyncIntervalSeconds) * time.Second,
+			}
+			go syncer.Run(ctx)
+			logger.Info("OpenSearch entity search enabled",
+				zap.String("addr", cfg.OpenSearchAddr),
+				zap.Int("sync_interval_seconds", cfg.SearchSyncIntervalSeconds))
+		} else {
+			logger.Info("OpenSearch entity search enabled (syncer disabled, SEARCH_SYNC_INTERVAL_SECONDS<=0)",
+				zap.String("addr", cfg.OpenSearchAddr))
+		}
+	} else {
+		logger.Warn("OPENSEARCH_ADDR unset — /v1/{bookings,contacts,leads}/search fails closed (503)")
+	}
+	// SPEC-W119 — END
 
 	// SPEC-W19 integrator — BEGIN (additive): the helpdesk, field-service
 	// and loyalty app stores (campaign-studio is hoisted above for the
@@ -907,6 +936,7 @@ func run() error {
 		Loyalty:       loyaltyDeps,          // SPEC-W19 integrator (additive): /v1/loyalty gated behind app "loyalty-wallet" (opt-in)
 		Studio:        studioDeps,           // SPEC-W19 integrator (additive): /v1/studio gated behind app "campaign-studio" (opt-in)
 		CRM360:        crm360Deps,           // SPEC-W20 integrator (additive): /v1/crm gated behind app "crm-360" (opt-in)
+		Searcher:      searcher,             // SPEC-W119 (additive): /v1/{bookings,contacts,leads}/search — nil → 503 fail-closed
 		Surveys:       surveysDeps,          // SPEC-W20 integrator (additive): /v1/surveys gated behind app "surveys-voc" (opt-in; respond stays public)
 		Lending:       lendingDeps,          // SPEC-W20 integrator (additive): /v1/lending gated behind app "lending" (opt-in)
 		Workforce:     workforceDeps,        // SPEC-W20 integrator (additive): /v1/workforce gated behind app "workforce" (opt-in)

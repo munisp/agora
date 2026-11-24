@@ -22,6 +22,8 @@ import { useToast } from "@/components/ui/toast";
 import { formatDateTime, titleCase } from "@/lib/utils";
 import { downloadCSV, toCSV, type CsvColumn } from "@/lib/export";
 import type { Lead } from "@/lib/types";
+import { EntitySearchPanel } from "@/components/entity-search-panel";
+import { LEADS_DESCRIPTOR } from "@/lib/entity-search";
 
 /** SPEC-W82 B1.5: CSV columns for the filtered leads export. */
 const LEAD_CSV_COLUMNS: CsvColumn<Lead>[] = [
@@ -214,6 +216,42 @@ export function LeadsClient({
         }
       />
       {error ? <ErrorNote message={error} /> : null}
+
+      {/* SPEC-W119: OpenSearch advanced search (indexed; newest captured
+          first). The debounced prefix search below is unaffected. */}
+      <div className="mb-4">
+        <EntitySearchPanel
+          orgSlug={orgSlug}
+          descriptor={LEADS_DESCRIPTOR}
+          title="Advanced search"
+          description="Searches the OpenSearch leads index by phone number or promo code, with status, channel and capture-date filters."
+          columns={["Phone", "Channel", "Status", "Promo", "Captured"]}
+          hitKey={(h) => String(h.lead_id ?? JSON.stringify(h))}
+          renderRow={(h) => (
+            <>
+              <TableCell className="pl-5 font-medium">
+                {String(h.phone_e164 ?? "—")}
+              </TableCell>
+              <TableCell>
+                <Badge variant="outline">
+                  {titleCase(String(h.channel_of_first_touch ?? ""))}
+                </Badge>
+              </TableCell>
+              <TableCell>
+                <Badge variant={statusVariant(String(h.status ?? ""))}>
+                  {String(h.status ?? "—")}
+                </Badge>
+              </TableCell>
+              <TableCell className="text-xs text-muted-foreground">
+                {String(h.promo_code ?? "—")}
+              </TableCell>
+              <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                {h.created_at ? formatDateTime(String(h.created_at)) : "—"}
+              </TableCell>
+            </>
+          )}
+        />
+      </div>
 
       {showCreate ? (
         <Card className="mb-4">

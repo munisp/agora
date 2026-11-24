@@ -695,6 +695,17 @@ class Settings:
     # app/pronunciation.merge_lexicons and applied pre-TTS.
     voice_pronunciation_lexicon: dict = field(default_factory=dict)
 
+    # SPEC-W115 C4: caller document intake (web chat attachments + voice
+    # mid-call share links). FAIL-CLOSED: the document endpoints answer 503
+    # unless ocr_service_url AND ocr_internal_token are both set, and the
+    # share-link endpoint additionally requires document_link_secret.
+    ocr_service_url: str = ""
+    ocr_internal_token: str = ""
+    ocr_timeout_s: float = 150.0
+    document_link_secret: str = ""
+    document_link_ttl_s: int = 900
+    max_document_bytes: int = 10 * 1024 * 1024
+
     extra: dict = field(default_factory=dict)
 
     @property
@@ -820,6 +831,13 @@ def load_settings() -> Settings:
         in ("1", "on", "true", "yes"),
         knowledge_turn_timeout_s=float(_env("KNOWLEDGE_TURN_TIMEOUT_S", "1.5")),
         grounding_metrics_max_tenants=_env_int("GROUNDING_METRICS_MAX_TENANTS", 100),
+        # SPEC-W115 C4
+        ocr_service_url=_env("OCR_SERVICE_URL", ""),
+        ocr_internal_token=_env("OCR_INTERNAL_TOKEN", ""),
+        ocr_timeout_s=_env_float("VOICE_OCR_TIMEOUT_S", 150.0),
+        document_link_secret=_env("VOICE_DOCUMENT_LINK_SECRET", ""),
+        document_link_ttl_s=_env_int("VOICE_DOCUMENT_LINK_TTL_S", 900),
+        max_document_bytes=_env_int("VOICE_MAX_DOCUMENT_BYTES", 10 * 1024 * 1024),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
         tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),
         tenant_ctx_stale_s=_env_int("VOICE_TENANT_CTX_STALE_S", 300),

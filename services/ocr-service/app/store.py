@@ -27,7 +27,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS ocr_documents (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id        UUID NOT NULL,
-    kind             TEXT NOT NULL CHECK (kind IN ('receipt','document','knowledge_scan','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document')),
+    kind             TEXT NOT NULL CHECK (kind IN ('receipt','document','knowledge_scan','pay_stub','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document')),
     storage_bucket   TEXT NOT NULL,
     storage_key      TEXT NOT NULL,
     mime             TEXT NOT NULL CHECK (mime IN ('image/jpeg','image/png','image/webp','application/pdf')),
@@ -52,7 +52,17 @@ CREATE TABLE IF NOT EXISTS ocr_documents (
 -- metadata-only widenings — existing rows cannot violate them.
 ALTER TABLE ocr_documents DROP CONSTRAINT IF EXISTS ocr_documents_kind_check;
 ALTER TABLE ocr_documents ADD CONSTRAINT ocr_documents_kind_check
-    CHECK (kind IN ('receipt','document','knowledge_scan','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document'));
+    CHECK (kind IN ('receipt','document','knowledge_scan','pay_stub','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document'));
+
+-- SPEC-W115 C3 (additive, nullable — existing rows carry NULL = "never
+-- validated / channel unknown", which reads honestly next to the W115
+-- verdict semantics):
+--   validation_verdict  validated | needs_review | rejected (NULL pre-W115)
+--   validation_reasons  machine-readable reason list (JSONB array)
+--   source_channel      web | whatsapp | voice | admin (intake channel)
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS validation_verdict TEXT;
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS validation_reasons JSONB;
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS source_channel TEXT;
 ALTER TABLE ocr_documents DROP CONSTRAINT IF EXISTS ocr_documents_status_check;
 ALTER TABLE ocr_documents ADD CONSTRAINT ocr_documents_status_check
     CHECK (status IN ('uploaded','extracted','failed','erased'));
@@ -204,9 +214,9 @@ class Database:
             INSERT INTO ocr_documents
                 (id, tenant_id, kind, storage_bucket, storage_key, mime,
                  bytes, sha256, phash, page_count, status, expires_at,
-                 subject_phone)
+                 subject_phone, source_channel)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'uploaded', $11,
-                    $12)
+                    $12, $13)
             """,
             doc["id"],
             uuid.UUID(doc["tenant_id"]),
@@ -222,6 +232,8 @@ class Database:
             # SPEC-W65 G2: set ONLY for kyc_* kinds (caller-enforced);
             # the erasure tombstone NULLs it again.
             doc.get("subject_phone"),
+            # SPEC-W115 C3: intake channel (web|whatsapp|voice|admin|NULL).
+            doc.get("source_channel"),
         )
 
     @staticmethod
@@ -233,6 +245,8 @@ class Database:
         model_version: str,
         extracted_text: str | None,
         extracted_fields: dict[str, Any],
+        validation_verdict: str | None = None,
+        validation_reasons: list[str] | None = None,
     ) -> None:
         import json as _json
 
@@ -241,6 +255,7 @@ class Database:
             UPDATE ocr_documents
                SET status = 'extracted', page_count = $2, model_version = $3,
                    extracted_text = $4, extracted_fields = $5::jsonb,
+                   validation_verdict = $6, validation_reasons = $7::jsonb,
                    error = NULL, updated_at = now()
              WHERE id = $1
             """,
@@ -249,6 +264,9 @@ class Database:
             model_version,
             extracted_text,
             _json.dumps(extracted_fields),
+            # SPEC-W115 C3: NULL for pre-W115 rows; set on every new extract.
+            validation_verdict,
+            _json.dumps(validation_reasons) if validation_reasons is not None else None,
         )
 
     @staticmethod
@@ -270,6 +288,7 @@ class Database:
             SELECT id, tenant_id, kind, storage_bucket, storage_key, mime,
                    bytes, sha256, phash, page_count, model_version,
                    extracted_text, extracted_fields, status, error,
+                   validation_verdict, validation_reasons, source_channel,
                    expires_at, created_at, updated_at
               FROM ocr_documents
              WHERE id = $1
@@ -387,6 +406,7 @@ class Database:
             UPDATE ocr_documents
                SET extracted_text = NULL, extracted_fields = NULL,
                    subject_phone = NULL,
+                   validation_verdict = NULL, validation_reasons = NULL,
                    status = 'erased', error = NULL, updated_at = now()
              WHERE id = $1
             """,

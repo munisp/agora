@@ -156,6 +156,10 @@ type Deps struct {
 	// app's routes are not registered (partial deployments stay intact).
 	// CRM360 serves /v1/crm (appgate app_id "crm-360").
 	CRM360 *crm360.Deps
+	// Searcher serves the SPEC-W119 OpenSearch advanced-search endpoints
+	// (/v1/bookings/search, /v1/contacts/search, /v1/leads/search).
+	// Nil → all three answer 503 search_unavailable (fail-closed).
+	Searcher Searcher
 	// Surveys serves /v1/surveys (appgate app_id "surveys-voc"). The
 	// package itself registers POST /v1/surveys/respond OUTSIDE the gated
 	// group (public token-resolved submit path — see surveys/handlers.go).
@@ -354,6 +358,9 @@ func NewRouter(d Deps) http.Handler {
 		r.Route("/contacts", func(r chi.Router) {
 			r.Get("/", s.listContacts)
 			r.With(s.require("manage_bookings")).Post("/", s.createContact)
+			// SPEC-W119: OpenSearch advanced search — chi static-over-wildcard
+			// beats /{id} regardless of registration order.
+			r.Get("/search", s.searchContacts)
 			r.Get("/{id}", s.getContact)
 			r.With(s.require("manage_bookings")).Put("/{id}", s.updateContact)
 			r.With(s.require("manage_bookings")).Delete("/{id}", s.deleteContact)
@@ -374,6 +381,9 @@ func NewRouter(d Deps) http.Handler {
 			r.Get("/campaigns/{id}", s.geoHandler((*geo.Handlers).GetGeoCampaign))
 		})
 		r.Route("/bookings", func(r chi.Router) {
+			// SPEC-W119: OpenSearch advanced search (same auth posture as
+			// listBookings); static /search beats the /{id} wildcard.
+			r.Get("/search", s.searchBookings)
 			r.With(s.require("manage_bookings")).Post("/", s.createBooking)
 			r.Get("/", s.listBookings)
 			r.Get("/{id}", s.getBooking)
@@ -457,6 +467,9 @@ func NewRouter(d Deps) http.Handler {
 			if s.d.AppGate != nil {
 				r.Use(s.d.AppGate.Middleware("cac"))
 			}
+			// SPEC-W119: OpenSearch advanced search — same view_analytics
+			// posture as listLeads; static /search beats /{id}.
+			r.With(s.require("view_analytics")).Get("/search", s.searchLeads)
 			r.With(s.require("view_analytics")).Get("/", s.listLeads)
 			r.With(s.require("manage_bookings")).Post("/", s.createLead)
 			r.With(s.require("view_analytics")).Get("/{id}", s.getLead)

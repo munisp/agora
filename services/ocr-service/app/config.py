@@ -28,7 +28,15 @@ KYC_DOCUMENT_KINDS = (
 )
 
 #: Document kinds accepted by POST /v1/ocr/extract (CHECK constraint mirrors).
-DOCUMENT_KINDS = ("receipt", "document", "knowledge_scan") + KYC_DOCUMENT_KINDS
+#: SPEC-W115 C1: pay_stub is the first CALLER-DOCUMENT kind — shared by a
+#: caller mid-conversation (web chat / voice share-link / whatsapp) and
+#: content-validated by app/validators.py. It is NOT a kyc_ kind: no NDPA
+#: TTL/consent gating applies (retention stays the platform default).
+DOCUMENT_KINDS = ("receipt", "document", "knowledge_scan", "pay_stub") + KYC_DOCUMENT_KINDS
+
+#: SPEC-W115 C3: intake channels a caller document can arrive on. Validated
+#: on POST /v1/ocr/extract (invalid => 400); persisted for analytics.
+SOURCE_CHANNELS = ("web", "whatsapp", "voice", "admin")
 
 
 def is_kyc_kind(kind: str) -> bool:

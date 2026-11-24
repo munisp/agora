@@ -12,7 +12,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS ocr_documents (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id        UUID NOT NULL,
-    kind             TEXT NOT NULL CHECK (kind IN ('receipt','document','knowledge_scan','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document')),
+    kind             TEXT NOT NULL CHECK (kind IN ('receipt','document','knowledge_scan','pay_stub','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document')),
     storage_bucket   TEXT NOT NULL,
     storage_key      TEXT NOT NULL,
     mime             TEXT NOT NULL CHECK (mime IN ('image/jpeg','image/png','image/webp','application/pdf')),
@@ -37,7 +37,18 @@ CREATE TABLE IF NOT EXISTS ocr_documents (
 -- widenings — existing rows cannot violate them. Safe to re-run.
 ALTER TABLE ocr_documents DROP CONSTRAINT IF EXISTS ocr_documents_kind_check;
 ALTER TABLE ocr_documents ADD CONSTRAINT ocr_documents_kind_check
-    CHECK (kind IN ('receipt','document','knowledge_scan','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document'));
+    CHECK (kind IN ('receipt','document','knowledge_scan','pay_stub','kyc_nin_slip','kyc_drivers_license','kyc_passport','kyc_voters_card','kyc_cac_document'));
+
+-- SPEC-W115 (C1/C3): caller-document intake + content validation.
+-- pay_stub joins the kind enum above; three additive nullable columns carry
+-- the deterministic validation verdict (validated|needs_review|rejected),
+-- its machine-readable reasons, and the intake channel
+-- (web|whatsapp|voice|admin). NULL on pre-W115 rows = never validated,
+-- which reads honestly. The erasure tombstone NULLs the verdict columns
+-- (they derive from erased PII fields).
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS validation_verdict TEXT;
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS validation_reasons JSONB;
+ALTER TABLE ocr_documents ADD COLUMN IF NOT EXISTS source_channel TEXT;
 ALTER TABLE ocr_documents DROP CONSTRAINT IF EXISTS ocr_documents_status_check;
 ALTER TABLE ocr_documents ADD CONSTRAINT ocr_documents_status_check
     CHECK (status IN ('uploaded','extracted','failed','erased'));

@@ -115,6 +115,11 @@ class SessionState:
     # so the SessionEnded lifecycle event can emit it as `agentId`; None for
     # web sessions and legacy TENANT_PHONE_MAP calls.
     resolved_agent_id: str | None = None
+    # SPEC-W115 C6: documents the caller shared mid-conversation (web chat
+    # attachment or voice share-link claim). Each entry:
+    # {document_id, kind, validation_verdict, validation_reasons, channel,
+    #  shared_at}. Additive; the agent reads it to speak the verdict.
+    shared_documents: list[dict] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     touched_at: float = field(default_factory=time.time)
 
@@ -196,6 +201,7 @@ class SessionState:
             "active_language": self.active_language,
             "channel": self.channel,
             "resolved_agent_id": self.resolved_agent_id,
+            "shared_documents": [dict(d) for d in self.shared_documents],
             "created_at": self.created_at,
             "touched_at": self.touched_at,
         }
@@ -236,6 +242,15 @@ class SessionState:
         channel = data.get("channel")
         session.channel = channel if isinstance(channel, str) and channel else "web"
         session.resolved_agent_id = _str("resolved_agent_id")
+        # SPEC-W115 C6: tolerate pre-W115 envelopes (absent) and junk
+        # (non-list / non-dict entries dropped, never a crash — from_dict's
+        # standing miss-not-crash discipline).
+        docs = data.get("shared_documents")
+        session.shared_documents = (
+            [dict(d) for d in docs if isinstance(d, dict)]
+            if isinstance(docs, list)
+            else []
+        )
         for key in ("created_at", "touched_at"):
             value = data.get(key)
             if isinstance(value, (int, float)):

@@ -127,9 +127,85 @@ req PUT /_index_template/bookings-analytics-template '{
 }'
 
 # ---------------------------------------------------------------------------
+# SPEC-W119 (additive): entity-search templates for the booking-service
+# advanced-search surface (/v1/{bookings,contacts,leads}/search). Exact
+# single-index patterns — a "bookings*" glob would collide with the
+# bookings-analytics template above (same priority 100).
+# ---------------------------------------------------------------------------
+echo ">> creating index template bookings-template"
+req PUT /_index_template/bookings-template '{
+  "index_patterns": ["bookings"],
+  "priority": 100,
+  "template": {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+      "properties": {
+        "tenant_id": {"type": "keyword"},
+        "booking_id": {"type": "keyword"},
+        "public_ref": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+        "status": {"type": "keyword"},
+        "source": {"type": "keyword"},
+        "contact_name": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+        "contact_phone": {"type": "keyword"},
+        "offering_id": {"type": "keyword"},
+        "team_member_id": {"type": "keyword"},
+        "starts_at": {"type": "date"},
+        "ends_at": {"type": "date"},
+        "created_at": {"type": "date"},
+        "updated_at": {"type": "date"}
+      }
+    }
+  }
+}'
+
+echo ">> creating index template contacts-template"
+req PUT /_index_template/contacts-template '{
+  "index_patterns": ["contacts"],
+  "priority": 100,
+  "template": {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+      "properties": {
+        "tenant_id": {"type": "keyword"},
+        "contact_id": {"type": "keyword"},
+        "name": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+        "phone": {"type": "keyword"},
+        "email": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+        "notes": {"type": "text"},
+        "source": {"type": "keyword"},
+        "external_id": {"type": "keyword"},
+        "synced_at": {"type": "date"}
+      }
+    }
+  }
+}'
+
+echo ">> creating index template leads-template"
+req PUT /_index_template/leads-template '{
+  "index_patterns": ["leads"],
+  "priority": 100,
+  "template": {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+      "properties": {
+        "tenant_id": {"type": "keyword"},
+        "lead_id": {"type": "keyword"},
+        "phone_e164": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+        "channel_of_first_touch": {"type": "keyword"},
+        "status": {"type": "keyword"},
+        "campaign_id": {"type": "keyword"},
+        "promo_code": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+        "created_at": {"type": "date"},
+        "updated_at": {"type": "date"}
+      }
+    }
+  }
+}'
+
+# ---------------------------------------------------------------------------
 # Concrete indices (templates apply on creation)
 # ---------------------------------------------------------------------------
-for idx in kb-chunks conversations bookings-analytics; do
+for idx in kb-chunks conversations bookings-analytics bookings contacts leads; do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$OS_HOST/$idx")
   if [ "$code" = "404" ]; then
     echo ">> creating index $idx"

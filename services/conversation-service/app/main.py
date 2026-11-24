@@ -33,6 +33,7 @@ from .quality import CallQualityEnricher
 from .outbox import OutboxRelay
 from .retention import RetentionSweeper
 from .routes import router
+from .search import router as search_router
 from .sinks import TranscriptSink, build_sink
 from .tenant_lifecycle import TenantLifecycleConsumer
 from .tenants import TenantResolver
@@ -236,8 +237,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     tenant_lifecycle = TenantLifecycleConsumer(cfg, db)
     tenant_lifecycle.start()
 
+    # SPEC-W117: app-lifetime OpenSearch client for the conversations
+    # advanced-search route (app/search.py). Separate from the indexer's
+    # private client (that one lives inside the streaming loop); lazy
+    # import mirrors indexer.py so the service boots without the dep when
+    # only non-search paths run. Failures here are non-fatal at boot —
+    # the route fails closed (503) per-request instead.
+    search_os = None
+    try:
+        from opensearchpy import AsyncOpenSearch as _AsyncOpenSearch
+
+        search_os = _AsyncOpenSearch(hosts=[cfg.opensearch_addr])
+    except Exception as exc:  # noqa: BLE001
+        log.error("search client bootstrap failed; /v1/conversations/search "
+                  "will answer 503", error=str(exc))
+
     app.state.cfg = cfg
     app.state.db = db
+    app.state.search_os = search_os
     app.state.agent_store = agent_store
     app.state.intel_client = intel_client
     app.state.dapr = dapr
@@ -255,6 +272,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     try:
         yield
+        if search_os is not None:
+            try:
+                await search_os.close()
+            except Exception:  # noqa: BLE001
+                pass
     finally:
         log.info("conversation-service shutting down")
         if indexer is not None:
@@ -306,6 +328,7 @@ class _NullSink:
 app = FastAPI(title="OpenDesk conversation-service", version="0.1.0", lifespan=lifespan)
 app.include_router(router)
 app.include_router(agent_router)
+app.include_router(search_router)
 # SPEC-W45 K19: internauth-gated service-to-service routes (/internal/gdpr/*).
 app.include_router(internal_router)
 

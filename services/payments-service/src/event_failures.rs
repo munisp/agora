@@ -168,8 +168,8 @@ impl PgEventFailureStore {
     }
 
     async fn bootstrap(&self) -> Result<(), String> {
-        for stmt in BOOTSTRAP_DDL.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            sqlx::query(stmt)
+        for stmt in crate::payouts::bootstrap_statements(BOOTSTRAP_DDL) {
+            sqlx::query(&stmt)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| format!("payment_event_failures bootstrap failed: {e}"))?;
