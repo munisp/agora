@@ -604,6 +604,9 @@ func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg I
 	var headers map[string]string
 	if pin != "" {
 		body["channel_identity"] = pin
+		if n := strings.TrimSpace(msg.FromName); n != "" {
+			body["contact_name"] = n // WhatsApp profile / e-mail From name (honored only with the pin)
+		}
 		if b.VoiceInternalToken != "" {
 			headers = map[string]string{"X-Internal-Token": b.VoiceInternalToken}
 		}

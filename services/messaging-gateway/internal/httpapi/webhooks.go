@@ -110,7 +110,14 @@ type waWebhook struct {
 				Metadata struct {
 					PhoneNumberID string `json:"phone_number_id"`
 				} `json:"metadata"`
-				Messages []waMessage       `json:"messages"`
+				Messages []waMessage `json:"messages"`
+				// 2026-11-24: the sender's WhatsApp profile name (contacts[].profile.name, keyed by wa_id).
+				Contacts []struct {
+					WaID    string `json:"wa_id"`
+					Profile struct {
+						Name string `json:"name"`
+					} `json:"profile"`
+				} `json:"contacts"`
 				Statuses []json.RawMessage `json:"statuses"`
 			} `json:"value"`
 		} `json:"changes"`
@@ -214,6 +221,11 @@ func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 						MessageID: m.ID,
 						Text:      m.Text.Body,
 						Timestamp: ts,
+					}
+					for _, c := range v.Contacts {
+						if c.WaID == m.From {
+							in.FromName = c.Profile.Name
+						}
 					}
 					if whatsappBridgeAsync {
 						// Ack Meta now and answer in the background: an LLM reply can

@@ -152,6 +152,7 @@ class ChatService:
         persona_override: str | None = None,
         visitor: Any = None,
         channel: str = "web",
+        trusted_resume: bool = False,
     ) -> tuple[SessionState, ToolLayer, list[dict[str, Any]]]:
         """Shared turn setup for the buffered and SSE streaming chat paths
         (SPEC-W3 §3): session, tenant context, multi-agent routing, tool
@@ -161,9 +162,17 @@ class ChatService:
         conversation_id alone NEVER recovers confirmed/verified phone,
         history or escalation state (SessionStore starts fresh instead).
         """
-        session = await store_get_or_create(
-            self._sessions, conversation_id, site_slug, session_secret=session_secret
-        )
+        session = None
+        if trusted_resume and conversation_id:
+            # 2026-11-24: the messaging gateway (internal token, provider-verified sender) names the customer's stored
+            # conversation on every WhatsApp/Telegram/e-mail message but never holds the session secret, so each
+            # message used to start a fresh session: no memory between messages ("Hello!" and the same questions
+            # again). A trusted channel call resumes by conversation id; public callers still need the secret.
+            session = await store_get(self._sessions, conversation_id)
+        if session is None:
+            session = await store_get_or_create(
+                self._sessions, conversation_id, site_slug, session_secret=session_secret
+            )
         session.text_chat = True
         if channel in ("whatsapp", "telegram", "email") and conversation_id:
             # The messaging gateway records these chats and sends its stored conversation id as conversation_id.
@@ -442,8 +451,10 @@ class ChatService:
         channel: str = "web",
         pin_verified_identity: str | None = None,
         visitor: Any = None,
+        pinned_name: str | None = None,
     ) -> dict[str, Any]:
         session, tool_layer, history = await self._prepare_turn(
+            trusted_resume=bool(pin_verified_identity),
             site_slug=site_slug,
             message=message,
             conversation_id=conversation_id,
@@ -460,6 +471,8 @@ class ChatService:
         # request was authorized with the internal token AND the channel's
         # provider supplies a verified identity — a public web caller can
         # never set it. Pinned identity satisfies the OTP gate.
+        if pin_verified_identity and pinned_name and not getattr(session, "caller_name", None):
+            session.caller_name = pinned_name  # WhatsApp profile / e-mail From name (gateway-supplied)
         if pin_verified_identity and channel == "email":
             # 2026-11-24: the email channel's verified identity is the sender's address (the messaging gateway
             # received the mail from it), not a phone: it is the customer's e-mail, never a verified phone.
@@ -468,6 +481,7 @@ class ChatService:
         elif pin_verified_identity:
             pinned = session.mark_verified(pin_verified_identity)
             session.claimed_phone = session.claimed_phone or pinned
+            session.visitor_form = True  # the prompt lists the known number and does not ask for it again
             # SPEC-W81 A3: a channel-pinned identity IS a completed step-up.
             metrics.stepup_verified("channel")
             log.info(

@@ -135,6 +135,9 @@ class ChatRequest(BaseModel):
     # tokens) AND channel names a provider-verified source. Otherwise
     # silently ignored — the caller faces the normal OTP gate.
     channel_identity: str | None = None
+    # 2026-11-24: the sender's display name on a provider-verified channel (WhatsApp profile name, e-mail From
+    # name); honored only together with a pinned channel_identity (internal token), like channel_identity.
+    contact_name: str | None = Field(default=None, max_length=120)
 
 
 class TtsPreviewRequest(BaseModel):
@@ -630,6 +633,7 @@ def create_app(
                 channel=req.channel,
                 pin_verified_identity=pin,
                 visitor=req.visitor,
+                pinned_name=(req.contact_name or "").strip() or None if pin else None,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("chat failed", site_slug=req.site_slug, error=str(exc))
