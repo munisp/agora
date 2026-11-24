@@ -83,7 +83,9 @@ export function ConversationsClient({ orgSlug }: { orgSlug: string }) {
       setUnavailable(false);
       try {
         const params = buildSearchParams(next);
-        const query: Record<string, string> = {};
+        // The business is named explicitly: a login with several businesses
+        // (agency staff) got 400 "must name one" without it (2026-11-24).
+        const query: Record<string, string> = { tenant: orgSlug };
         params.forEach((value, key) => {
           query[key] = value;
         });
@@ -108,7 +110,7 @@ export function ConversationsClient({ orgSlug }: { orgSlug: string }) {
         setSearching(false);
       }
     },
-    [],
+    [orgSlug],
   );
 
   const onSearch = React.useCallback(() => {

@@ -935,6 +935,15 @@ func (s *server) tenantMiddleware(next http.Handler) http.Handler {
 
 		slug := r.Header.Get("X-Tenant-Slug")
 		if slug == "" {
+			// The public gateway strips client-sent x-tenant-* headers, so the
+			// dashboard names the business in ?tenant=<slug> (as it does for
+			// conversation-service). Without this, a login with several
+			// businesses always got the FIRST one's bookings, contacts and
+			// leads, whichever business page was open (2026-11-24). The
+			// entitlement check below still applies to this value.
+			slug = strings.TrimSpace(r.URL.Query().Get("tenant"))
+		}
+		if slug == "" {
 			slug = claims.firstTenant()
 		}
 		if slug == "" {
