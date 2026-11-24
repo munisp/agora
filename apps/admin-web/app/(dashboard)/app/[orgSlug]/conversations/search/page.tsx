@@ -1,9 +1,9 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
 import { canViewConversations } from "@/lib/roles";
-import { ConversationsClient } from "./conversations-client";
+import { ConversationsClient } from "./search-client";
 
-export const metadata = { title: "Conversations" };
+export const metadata = { title: "Search transcripts" };
 
 /**
  * SPEC-W117: OpenSearch-backed advanced search across conversation

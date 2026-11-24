@@ -76,7 +76,8 @@ const items: NavItem[] = [
   { segment: "conversations", label: "Conversations", icon: MessageCircle },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
   // SPEC-W117: OpenSearch advanced search across transcripts.
-  { segment: "conversations", label: "Conversations", icon: Search },
+  // 2026-11-24 merge: lives under /conversations/search (the Conversations list keeps /conversations).
+  { segment: "conversations/search", label: "Search transcripts", icon: Search },
   { segment: "voice-agent", label: "Voice Agent", icon: Mic },
   // SPEC-W38: self-serve agents registry (wizard + capture records).
   { segment: "agents", label: "Agents", icon: Bot },

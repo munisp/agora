@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { MessageCircle, Phone, PhoneCall, RefreshCw, Wrench, X } from "lucide-react";
+import { MessageCircle, Phone, PhoneCall, RefreshCw, Search, Wrench, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { describeToolLine, type NameLookup } from "@/lib/tool-lines";
 import { PageHeader } from "@/components/page-header";
@@ -221,9 +221,16 @@ export function ConversationsClient({
             : `Every web chat and voice call your receptionist handled, with the full transcript: what each ${customerWord} asked, what it answered and what it did.`
         }
         actions={
-          <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
-            <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} /> Refresh
-          </Button>
+          <div className="flex gap-2">
+            <Link href={`/app/${orgSlug}/conversations/search`}>
+              <Button variant="outline">
+                <Search className="h-4 w-4" /> Search transcripts
+              </Button>
+            </Link>
+            <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
+              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} /> Refresh
+            </Button>
+          </div>
         }
       />
       {error ? <ErrorNote message={error} /> : null}
