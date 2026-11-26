@@ -132,3 +132,28 @@ CREATE POLICY registry_internal_access ON ocr_doc_registry_tenants
 
 CREATE INDEX IF NOT EXISTS idx_ocr_registry_tenants_first_seen
     ON ocr_doc_registry_tenants (first_seen);
+
+-- 2026-11-26: policy rules. A business's policy document, the rules drafted from it (app/policy.py vocabulary) and
+-- whether they are on. Tenant-scoped exactly like ocr_documents.
+CREATE TABLE IF NOT EXISTS ocr_policies (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id   UUID NOT NULL,
+    title       TEXT NOT NULL,
+    filename    TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'reading' CHECK (status IN ('reading','draft','active','off','failed')),
+    rules       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    error       TEXT,
+    pages       INTEGER NOT NULL DEFAULT 0,
+    chars       INTEGER NOT NULL DEFAULT 0,
+    created_by  TEXT,
+    activated_by TEXT,
+    activated_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ocr_policies_tenant ON ocr_policies (tenant_id, created_at DESC);
+ALTER TABLE ocr_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ocr_policies FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON ocr_policies;
+CREATE POLICY tenant_isolation ON ocr_policies
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);

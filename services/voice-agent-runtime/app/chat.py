@@ -90,6 +90,22 @@ CHAT_TEXT_ADDENDUM = (
     "details, list them once in that written form. Never mention a call, the line, hearing or speaking."
 )
 
+# 2026-11-26: how a person shares a document depends on the channel; said outright so the model never improvises
+# (a web chat was offered "a secure link via WhatsApp"). The tool gives the same answer when it is called.
+CHAT_DOCUMENTS_WEB = (
+    "- Documents in this chat: when they want to send one (a payslip, a receipt, a letter), tell them to tap the "
+    "paperclip button beside the message box, pick the file, choose its type in the list (Pay stub, Receipt or Other "
+    "document) and press Upload; it is checked in about "
+    "two minutes and the result appears in the chat. Never offer a link, WhatsApp or e-mail for a document here."
+)
+CHAT_DOCUMENTS_WHATSAPP = (
+    "- Documents in this chat: when they want to send one, ask them to send a clear photo of it here in WhatsApp."
+)
+
+
+def chat_documents_line(channel: str | None) -> str:
+    return CHAT_DOCUMENTS_WHATSAPP if (channel or "") == "whatsapp" else CHAT_DOCUMENTS_WEB
+
 
 @dataclass
 class ChatHistory:
@@ -314,7 +330,8 @@ class ChatService:
             shared_documents=list(getattr(session, "shared_documents", None) or []),
         )
         # 2026-11-23: a typed chat reads, it is not heard — write details normally.
-        system_prompt = f"{system_prompt}\n{CHAT_TEXT_ADDENDUM}"
+        system_prompt = (f"{system_prompt}\n{CHAT_TEXT_ADDENDUM}\n"
+                         f"{chat_documents_line(getattr(session, 'channel', None))}")
         # SPEC-W9 Part B: tell the agent it may drive the visitor's UI — but
         # only when the UI action tools are registered for this turn.
         registered = {t["function"]["name"] for t in tool_layer.schemas()}

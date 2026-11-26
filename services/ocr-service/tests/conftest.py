@@ -322,6 +322,59 @@ class FakeDB:
             del self.rows[k]
         return len(doomed)
 
+    # 2026-11-26: policy rules (ocr_policies), tenant-isolated like the rows.
+    async def insert_policy(self, scope, *, tenant_id, title, filename, created_by):
+        import datetime as _dt
+        import uuid as _uuid
+        pid = _uuid.uuid4()
+        now = _dt.datetime.now(_dt.UTC)
+        row = {"id": pid, "tenant_id": scope.tenant_id, "title": title, "filename": filename, "status": "reading",
+               "rules": [], "error": None, "pages": 0, "chars": 0, "created_by": created_by, "activated_by": None,
+               "activated_at": None, "created_at": now, "updated_at": now}
+        self.policies = getattr(self, "policies", {})
+        self.policies[str(pid)] = row
+        return {k: v for k, v in row.items() if k != "tenant_id"}
+
+    def _policy_row(self, scope, policy_id):
+        row = getattr(self, "policies", {}).get(str(policy_id))
+        return row if row is not None and row["tenant_id"] == scope.tenant_id else None
+
+    async def finish_policy(self, scope, policy_id, *, status, rules=None, error=None, pages=0, chars=0):
+        row = self._policy_row(scope, policy_id)
+        if row is not None:
+            row.update(status=status, error=error, pages=pages, chars=chars)
+            if rules is not None:
+                row["rules"] = rules
+
+    async def list_policies(self, scope):
+        rows = [r for r in getattr(self, "policies", {}).values() if r["tenant_id"] == scope.tenant_id]
+        return [{k: v for k, v in r.items() if k != "tenant_id"} for r in rows]
+
+    async def get_policy(self, scope, policy_id):
+        row = self._policy_row(scope, policy_id)
+        return None if row is None else {k: v for k, v in row.items() if k != "tenant_id"}
+
+    async def set_policy(self, scope, policy_id, *, status, rules, actor):
+        row = self._policy_row(scope, policy_id)
+        if row is None:
+            return None
+        row.update(status=status, rules=rules, activated_by=actor if status == "active" else row["activated_by"])
+        return {k: v for k, v in row.items() if k != "tenant_id"}
+
+    async def delete_policy(self, scope, policy_id):
+        row = self._policy_row(scope, policy_id)
+        if row is None:
+            return False
+        del self.policies[str(policy_id)]
+        return True
+
+    async def active_policy_rules(self, scope, kind):
+        out = []
+        for r in getattr(self, "policies", {}).values():
+            if r["tenant_id"] == scope.tenant_id and r["status"] == "active":
+                out += [x for x in r["rules"] if x.get("kind") == kind and x.get("enabled", True)]
+        return out
+
     def _owned(self, scope, document_id, missing_ok=False):
         row = self.rows.get(str(document_id))
         if row is None or row["tenant_id"] != scope.tenant_id:

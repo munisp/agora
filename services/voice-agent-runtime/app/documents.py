@@ -65,7 +65,16 @@ def documents_in_words(docs: list[dict[str, Any]]) -> list[str]:
         elif verdict == "validated":
             out.append(f"a {kind}: received and passed the consistency checks")
         else:
-            out.append(f"a {kind}: received; a team member will review it")
+            rule = _policy_rule(d.get("validation_reasons") or [])
+            if rule and rule[0] == "policy" and verdict == "rejected":
+                out.append(f"a {kind}: not accepted -- it does not meet the policy: {_sentence(rule[1])}")
+            elif rule and rule[0] == "policy":
+                out.append(f"a {kind}: received but it does not meet the policy: {_sentence(rule[1])} "
+                           "A team member will review it")
+            elif verdict == "rejected":
+                out.append(f"a {kind}: not accepted -- ask them for a complete, readable copy")
+            else:
+                out.append(f"a {kind}: received; a team member will review it")
     return out
 
 #: Caller-shareable kinds (SPEC-W116 §4: ALL non-KYC kinds — pay stub was
@@ -198,7 +207,26 @@ _REASON_PHRASES = {
 }
 
 
+def _policy_rule(reasons: list[str]) -> tuple[str, str] | None:
+    """2026-11-26: the first business-policy reason ("policy:<rule>" broken, "policy_unchecked:<rule>" not checkable),
+    as (kind, rule sentence). The rule is the business's own wording, not a detail read from the document."""
+    for r in reasons or []:
+        for prefix in ("policy:", "policy_unchecked:"):
+            if isinstance(r, str) and r.startswith(prefix) and r[len(prefix):].strip():
+                return prefix[:-1], r[len(prefix):].strip()
+    return None
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
 def _human_reason(reason: str) -> str:
+    if reason.startswith("policy:"):
+        return f"it does not meet our policy ({reason.split(':', 1)[1].strip().rstrip('.')})"
+    if reason.startswith("policy_unchecked:"):
+        return f"we could not confirm part of our policy ({reason.split(':', 1)[1].strip().rstrip('.')})"
     if reason.startswith("missing_required_field:"):
         field = reason.split(":", 1)[1].replace("_", " ")
         return f"the {field} is missing"
@@ -211,10 +239,19 @@ def verdict_summary(kind: str, verdict: str, reasons: list[str]) -> str:
     label = _KIND_LABELS.get(kind, "document")
     if verdict == "validated":
         return f"Your {label} was received and passed all consistency checks."
+    rule = _policy_rule(reasons)
     if verdict == "rejected":
+        if rule and rule[0] == "policy":
+            return f"We could not accept this {label}. Our policy says: {_sentence(rule[1])}"
         detail = f": {_human_reason(reasons[0])}" if reasons else ""
         return f"We could not accept this {label}{detail}."
     # needs_review
+    if rule and rule[0] == "policy":
+        return (f"Your {label} was received, but it does not meet our policy: {_sentence(rule[1])} "
+                "A team member will review it shortly.")
+    if rule:
+        return (f"Your {label} was received; we could not confirm this part of our policy: {_sentence(rule[1])} "
+                "A team member will review it shortly.")
     return f"Your {label} was received; a team member will review it shortly."
 
 

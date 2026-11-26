@@ -392,3 +392,29 @@ def test_async_claim_link_and_unknown_job():
         assert client.get("/voice/documents/jobs/" + "0" * 32).status_code == 404
     assert done["status"] == "done" and ocr.calls[0]["source_channel"] == "voice"
     assert session.shared_documents[0]["channel"] == "voice"
+
+
+def test_policy_reasons_in_words_and_summary():
+    """2026-11-26: a business's own policy rule is named (its wording, never a detail read from the document)."""
+    from app.documents import documents_in_words, verdict_summary
+
+    rule = "policy:Pay stubs must be from the last 3 months."
+    assert verdict_summary("pay_stub", "rejected", [rule, "currency_missing"]) == (
+        "We could not accept this pay stub. Our policy says: Pay stubs must be from the last 3 months.")
+    review = verdict_summary("pay_stub", "needs_review", ["policy:Gross monthly pay must be at least ₦70,000"])
+    assert review.startswith("Your pay stub was received, but it does not meet our policy: Gross monthly pay must "
+                             "be at least ₦70,000.") and "team member" in review
+    unchecked = verdict_summary("pay_stub", "needs_review", ["policy_unchecked:Pay stubs must show the pay date."])
+    assert "could not confirm" in unchecked
+    words = documents_in_words([
+        {"kind": "pay_stub", "status": "done", "validation_verdict": "rejected", "validation_reasons": [rule]},
+        {"kind": "pay_stub", "status": "done", "validation_verdict": "needs_review",
+         "validation_reasons": ["policy:Gross monthly pay must be at least ₦70,000."]},
+        {"kind": "pay_stub", "status": "done", "validation_verdict": "rejected", "validation_reasons": ["net_exceeds_gross"]},
+    ])
+    assert words == [
+        "a pay stub: not accepted -- it does not meet the policy: Pay stubs must be from the last 3 months.",
+        "a pay stub: received but it does not meet the policy: Gross monthly pay must be at least ₦70,000. "
+        "A team member will review it",
+        "a pay stub: not accepted -- ask them for a complete, readable copy",
+    ]

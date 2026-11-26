@@ -153,3 +153,11 @@ def test_prompt_lists_shared_documents_in_the_tail_and_the_rule_in_the_body():
     assert "DOCUMENTS THEY SHARED IN THIS CONVERSATION" in tail
     assert "a pay stub: received; a team member will review it" in tail
     assert "DOCUMENTS THEY SHARED" not in build_system_prompt(_ctx(), conversation_id="c1")
+
+
+def test_chat_prompt_says_how_to_share_a_document_on_each_channel():
+    from app.chat import chat_documents_line
+
+    assert "paperclip" in chat_documents_line("web") and "Never offer a link" in chat_documents_line("web")
+    assert "paperclip" in chat_documents_line(None)
+    assert "photo" in chat_documents_line("whatsapp") and "paperclip" not in chat_documents_line("whatsapp")

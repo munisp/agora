@@ -43,6 +43,7 @@ import {
   Search,
   Scale,
   Fingerprint,
+  FileCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -75,6 +76,8 @@ const items: NavItem[] = [
   { segment: "contacts", label: "Contacts", icon: ContactRound },
   { segment: "conversations", label: "Conversations", icon: MessageCircle },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
+  // 2026-11-26: policy rules -- the business's own checks on documents callers share.
+  { segment: "document-checks", label: "Document checks", icon: FileCheck },
   // SPEC-W117: OpenSearch advanced search across transcripts.
   // 2026-11-24 merge: lives under /conversations/search (the Conversations list keeps /conversations).
   { segment: "conversations/search", label: "Search transcripts", icon: Search },
