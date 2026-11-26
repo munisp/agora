@@ -70,6 +70,20 @@ export function describeToolLine(text: string, names: NameLookup): string {
     case "request_human":
     case "escalate_to_human":
       return "Asked a member of staff to take over";
+    // 2026-11-26: documents, call outcomes and details.
+    case "send_document_upload_link": {
+      const docs: Record<string, string> = { pay_stub: "a payslip", receipt: "a receipt" };
+      const doc = docs[args.document_type] ?? "a document";
+      return `Sent a secure link to upload ${doc}`;
+    }
+    case "check_shared_documents":
+      return "Checked the documents the caller shared";
+    case "save_caller_details":
+      return "Saved the caller's details";
+    case "send_whatsapp_confirmation":
+      return "Sent a WhatsApp confirmation";
+    case "record_call_outcome":
+      return `Recorded the call's outcome${args.outcome ? `: ${String(args.outcome).replace(/_/g, " ")}` : ""}`;
     default: {
       const words = name.replace(/_/g, " ");
       return words.charAt(0).toUpperCase() + words.slice(1);

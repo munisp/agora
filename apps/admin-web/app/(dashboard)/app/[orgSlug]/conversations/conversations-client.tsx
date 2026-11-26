@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { MessageCircle, Phone, PhoneCall, RefreshCw, Search, Wrench, X } from "lucide-react";
+import { Mail, MessageCircle, Phone, PhoneCall, RefreshCw, Search, Wrench, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { describeToolLine, type NameLookup } from "@/lib/tool-lines";
 import { PageHeader } from "@/components/page-header";
@@ -116,6 +116,7 @@ const CHANNEL: Record<string, { label: string; icon: typeof MessageCircle }> = {
   phone: { label: "Phone call", icon: Phone },
   whatsapp: { label: "WhatsApp", icon: MessageCircle },
   telegram: { label: "Telegram", icon: MessageCircle },
+  email: { label: "E-mail", icon: Mail },
   ussd: { label: "USSD", icon: Phone },
   api: { label: "API", icon: MessageCircle },
 };
@@ -244,6 +245,7 @@ export function ConversationsClient({
             <option value="phone">Phone call</option>
             <option value="whatsapp">WhatsApp</option>
             <option value="telegram">Telegram</option>
+            <option value="email">E-mail</option>
           </Select>
         </div>
         {contact ? (

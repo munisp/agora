@@ -179,8 +179,10 @@ def booking_claim(text: str) -> bool:
 # 2026-11-26: "I will send a WhatsApp upload link for your pay stub right now" -- said on a live call with no tool call
 # (no link was ever sent). A promise or claim of sending a link is held back like a booking claim.
 _LINK_CLAIM = re.compile(
-    r"\b(?:send|sent|sending|text|texting|whatsapp|share|sharing)\b[^.!?]{0,80}?\blink\b"
-    r"|\blink\b[^.!?]{0,60}?\b(?:on its way|sent|coming|is ready|ready for you)\b", re.I)
+    r"\b(?:send|sent|sending|text|texting|whatsapp|share|sharing|prepare|preparing|get|getting|generate|generating)\b"
+    r"[^.!?]{0,80}?\blink\b"
+    r"|\blink\b[^.!?]{0,60}?\b(?:on its way|sent|coming|is ready|ready for you|via whatsapp|on whatsapp|by whatsapp)\b",
+    re.I)
 
 
 def link_claim(text: str) -> bool:

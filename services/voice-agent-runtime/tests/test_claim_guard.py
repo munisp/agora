@@ -41,6 +41,7 @@ def test_upload_link_claims_are_held_until_the_tool_runs():
     said = ("Please hold on while I get the link ready for you. I will send a WhatsApp upload link for your pay stub "
             "right now.")
     assert link_claim(said) and link_claim("The upload link is on its way to your WhatsApp.")
+    assert link_claim("Please hold on a moment while I prepare a secure link for you to upload the document via WhatsApp.")
     assert not link_claim("You can upload it on our website.") and not link_claim("Would you like me to help?")
     empty = NS(messages=[])
     tools = NS(ai_functions={"send_document_upload_link": object()})
