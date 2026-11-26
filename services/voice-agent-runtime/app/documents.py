@@ -28,6 +28,7 @@ import base64
 import hashlib
 import hmac
 import json
+import asyncio
 import time
 import uuid
 from typing import Any, Awaitable, Callable
@@ -39,6 +40,9 @@ from .logging import get_logger
 from .session_state import store_get, store_save_session
 
 log = get_logger("documents")
+
+#: How long an accepted upload's status is kept for polling (seconds).
+JOB_TTL_S = 3600
 
 #: Caller-shareable kinds (SPEC-W116 §4: ALL non-KYC kinds — pay stub was
 #: the example, not the feature). KYC kinds are NEVER caller-shareable
@@ -250,6 +254,89 @@ def wire_document_routes(
             )
         return upload.filename, data, kind, mime
 
+    # 2026-11-26: reading a document takes ~2 minutes on the GPU host, past the
+    # ~100 s an edge proxy (Cloudflare) holds a request open. A caller-facing
+    # upload can ask for `respond=async`: the file is validated and accepted at
+    # once (202 + job_id), the read finishes in the background and lands on the
+    # session; the browser polls GET /voice/documents/jobs/{job_id}. Single
+    # replica (voice), so jobs live in this process; a restart loses only the
+    # job's status -- the OCR row and the session entry are the durable record.
+    jobs: dict[str, dict[str, Any]] = {}
+    app.state.document_jobs = jobs
+    background: set[asyncio.Task] = set()
+
+    def _prune_jobs() -> None:
+        cutoff = time.time() - JOB_TTL_S
+        for jid in [j for j, v in jobs.items() if v.get("created_at", 0) < cutoff]:
+            jobs.pop(jid, None)
+
+    def _wants_async(form: Any) -> bool:
+        return str(form.get("respond") or "").strip().lower() == "async"
+
+    async def _update_session_entry(session_id: str, job_id: str, update: dict[str, Any]) -> None:
+        session = await store_get(sessions, session_id)
+        if session is None:
+            return
+        for entry in session.shared_documents:
+            if entry.get("job_id") == job_id:
+                entry.update(update)
+                break
+        else:
+            session.shared_documents.append({"job_id": job_id, **update})
+        session.touch()
+        try:
+            await store_save_session(sessions, session)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("documents.session_save_failed", error=str(exc)[:200])
+
+    def _start_job(*, tenant_id: str, kind: str, filename: str, data: bytes, mime: str,
+                   channel: str, session_id: str | None) -> str:
+        _prune_jobs()
+        job_id = uuid.uuid4().hex
+        jobs[job_id] = {"status": "processing", "kind": kind, "created_at": time.time()}
+
+        async def run() -> None:
+            try:
+                result = await ocr_client.extract(
+                    tenant_id=tenant_id, kind=kind, filename=filename,
+                    data=data, mime=mime, source_channel=channel,
+                )
+                verdict = result.get("validation_verdict") or "needs_review"
+                reasons = result.get("validation_reasons") or []
+                done = {"status": "done", "document_id": result.get("document_id"), "kind": kind,
+                        "validation_verdict": verdict, "validation_reasons": reasons,
+                        "summary": verdict_summary(kind, verdict, reasons)}
+            except Exception as exc:  # noqa: BLE001 -- reported to the poller, never raised
+                log.warning("documents.ocr_background_failed", error=str(exc)[:200])
+                done = {"status": "failed", "kind": kind,
+                        "summary": "Sorry, I couldn't read that document. Please try again, or send a clearer copy."}
+            jobs[job_id] = {**jobs.get(job_id, {}), **done}
+            if session_id:
+                await _update_session_entry(session_id, job_id, {
+                    k: done.get(k) for k in ("status", "document_id", "kind", "validation_verdict", "validation_reasons")
+                } | {"channel": channel, "shared_at": time.time()})
+
+        task = asyncio.create_task(run())
+        background.add(task)
+        task.add_done_callback(background.discard)
+        return job_id
+
+    def _accepted(job_id: str, kind: str) -> Any:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "job_id": job_id, "status": "processing", "kind": kind,
+            "summary": "Got it — I'm checking your document now. This usually takes about two minutes.",
+        })
+
+    @app.get("/voice/documents/jobs/{job_id}")
+    async def document_job(job_id: str) -> dict[str, Any]:
+        """The status of an accepted upload (public; the job id is an unguessable
+        128-bit token and the answer carries only the verdict, never the fields)."""
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return {k: v for k, v in job.items() if k != "created_at"} | {"job_id": job_id}
+
     async def _attach_to_session(session_id: str, entry: dict[str, Any]) -> bool:
         """Append the shared-document ref to the session (fail-open on
         save errors — the OCR row is the durable record)."""
@@ -275,6 +362,15 @@ def wire_document_routes(
             raise HTTPException(status_code=400, detail="site_slug required")
         filename, data, kind, mime = await _read_caller_upload(request)
         tenant_id = await _resolve_tenant(site_slug)
+        if _wants_async(form):
+            sid = form.get("session_id")
+            sid = sid if isinstance(sid, str) and sid else None
+            job_id = _start_job(tenant_id=tenant_id, kind=kind, filename=filename, data=data,
+                                mime=mime, channel="web", session_id=sid)
+            if sid:
+                await _update_session_entry(sid, job_id, {"status": "processing", "kind": kind,
+                                                           "channel": "web", "shared_at": time.time()})
+            return _accepted(job_id, kind)
         try:
             result = await ocr_client.extract(
                 tenant_id=tenant_id, kind=kind, filename=filename,
@@ -350,6 +446,12 @@ def wire_document_routes(
         if await store_get(sessions, session_id) is None:
             # honest: the whole point of the link is session correlation
             raise HTTPException(status_code=404, detail="session not found")
+        if _wants_async(await request.form()):
+            job_id = _start_job(tenant_id=payload["t"], kind=kind, filename=filename, data=data,
+                                mime=mime, channel="voice", session_id=session_id)
+            await _update_session_entry(session_id, job_id, {"status": "processing", "kind": kind,
+                                                              "channel": "voice", "shared_at": time.time()})
+            return _accepted(job_id, kind)
         try:
             result = await ocr_client.extract(
                 tenant_id=payload["t"], kind=kind, filename=filename,

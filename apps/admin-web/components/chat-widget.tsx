@@ -36,6 +36,26 @@ interface DocumentUploadResult {
   validation_verdict: string;
   validation_reasons: string[];
   summary: string;
+  /** 2026-11-26: async intake -- "processing" with a job_id, then "done" / "failed" from the job endpoint */
+  status?: string;
+  job_id?: string;
+}
+
+/** Reading a document takes ~2 minutes: poll the accepted upload's job until it is read (or give up after ~6). */
+async function pollDocumentJob(jobId: string): Promise<DocumentUploadResult | null> {
+  for (let i = 0; i < 72; i += 1) {
+    await new Promise((r) => setTimeout(r, 5000));
+    try {
+      const res = await fetch(`/voice/documents/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" });
+      if (res.status === 404) return null;
+      if (!res.ok) continue;
+      const job = (await res.json()) as DocumentUploadResult;
+      if (job.status && job.status !== "processing") return job;
+    } catch {
+      /* a dropped poll: try again */
+    }
+  }
+  return null;
 }
 
 interface ChatResult {
@@ -319,6 +339,7 @@ export function ChatWidget({
     form.append("file", file);
     form.append("kind", pendingKind);
     form.append("site_slug", siteSlug);
+    form.append("respond", "async"); // accepted at once; the read finishes in the background (2026-11-26)
     if (conversationId) form.append("session_id", conversationId);
     try {
       const res = await fetch("/voice/documents/upload", {
@@ -338,6 +359,20 @@ export function ChatWidget({
         throw new Error(detail);
       }
       const result = (await res.json()) as DocumentUploadResult;
+      if (result.status === "processing" && result.job_id) {
+        // Accepted: say so now, then post the verdict when the read is done.
+        setTurns((t) => [...t, { role: "user", text: `Attached: ${file.name}` }, { role: "agent", text: result.summary }]);
+        setPendingFile(null);
+        void pollDocumentJob(result.job_id).then((done) => {
+          setTurns((t) => [
+            ...t,
+            done && done.status === "done"
+              ? { role: "agent", text: done.summary, chip: verdictChip(done.validation_verdict) }
+              : { role: "agent", text: done?.summary || "I couldn't finish checking that document. Please try sending it again." },
+          ]);
+        });
+        return;
+      }
       setTurns((t) => [
         ...t,
         { role: "user", text: `Attached: ${file.name}` },

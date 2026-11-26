@@ -300,3 +300,70 @@ def test_verdict_summary_sentences():
     assert "team member will review" in review
     missing = verdict_summary("pay_stub", "rejected", ["missing_required_field:employer_name"])
     assert "employer name is missing" in missing
+
+
+# --- async intake (2026-11-26): accept at once, read in the background --------
+class SlowFailOcr:
+    async def extract(self, **kw):
+        raise RuntimeError("model timed out")
+
+
+def _poll(client, job_id, tries=50):
+    for _ in range(tries):
+        r = client.get(f"/voice/documents/jobs/{job_id}")
+        assert r.status_code == 200, r.text
+        if r.json()["status"] != "processing":
+            return r.json()
+        time.sleep(0.02)
+    raise AssertionError("job never finished")
+
+
+def test_async_upload_accepts_then_reports_the_verdict():
+    store = SessionStore()
+    session = store.get_or_create(None, site_slug="acme")
+    ocr = FakeOcr()
+    with TestClient(_app(_settings(), ocr=ocr, sessions=store)) as client:
+        resp = client.post(
+            "/voice/documents/upload",
+            files={"file": ("stub.png", PNG, "image/png")},
+            data={"kind": "pay_stub", "site_slug": "acme", "respond": "async",
+                  "session_id": session.conversation_id},
+        )
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["status"] == "processing" and body["job_id"] and "checking your document" in body["summary"]
+        done = _poll(client, body["job_id"])
+    assert done["status"] == "done" and done["validation_verdict"] == "validated"
+    assert "passed all consistency checks" in done["summary"]
+    assert ocr.calls[0]["source_channel"] == "web"
+    docs = session.shared_documents
+    assert len(docs) == 1 and docs[0]["job_id"] == body["job_id"]
+    assert docs[0]["status"] == "done" and docs[0]["validation_verdict"] == "validated"
+
+
+def test_async_upload_failure_is_reported_not_raised():
+    with TestClient(_app(_settings(), ocr=SlowFailOcr())) as client:
+        resp = client.post(
+            "/voice/documents/upload",
+            files={"file": ("stub.png", PNG, "image/png")},
+            data={"kind": "pay_stub", "site_slug": "acme", "respond": "async"},
+        )
+        assert resp.status_code == 202
+        done = _poll(client, resp.json()["job_id"])
+    assert done["status"] == "failed" and "couldn't read" in done["summary"]
+
+
+def test_async_claim_link_and_unknown_job():
+    store = SessionStore()
+    session = store.get_or_create(None, site_slug="acme")
+    ocr = FakeOcr()
+    with TestClient(_app(_settings(), ocr=ocr, sessions=store)) as client:
+        url = client.post(f"/voice/sessions/{session.conversation_id}/document-link",
+                          json={"session_secret": session.session_secret}).json()["upload_url"]
+        resp = client.post(url, files={"file": ("stub.png", PNG, "image/png")},
+                           data={"kind": "pay_stub", "respond": "async"})
+        assert resp.status_code == 202, resp.text
+        done = _poll(client, resp.json()["job_id"])
+        assert client.get("/voice/documents/jobs/" + "0" * 32).status_code == 404
+    assert done["status"] == "done" and ocr.calls[0]["source_channel"] == "voice"
+    assert session.shared_documents[0]["channel"] == "voice"
