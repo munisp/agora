@@ -20,7 +20,9 @@ import (
 	"github.com/opendesk/messaging-gateway/internal/provider"
 )
 
-const testWhsec = "whsec_dGVzdC1zZWNyZXQtMTIzNDU2Nzg5MA=="
+// A dummy Svix signing secret, built at run time: a literal "whsec_..." string looks like a real webhook secret to
+// secret scanners (GitHub flagged the old constant as a Stripe key). Decodes to "test-secret-1234567890".
+var testWhsec = "whsec_" + base64.StdEncoding.EncodeToString([]byte("test-secret-1234567890"))
 
 func svixHeaders(t *testing.T, body []byte) http.Header {
 	t.Helper()
