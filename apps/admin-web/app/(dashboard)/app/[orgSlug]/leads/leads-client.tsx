@@ -375,7 +375,7 @@ export function LeadsClient({
               <TableHead>Promo</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Captured</TableHead>
-              <TableHead className="pr-5 text-right">Move to</TableHead>
+              <TableHead className="pr-5 text-right" sortable={false}>Move to</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>

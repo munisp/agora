@@ -266,6 +266,7 @@ export function InvoicesPanel({ orgSlug }: { orgSlug: string }) {
                 invoices.map((inv) => (
                   <InvoiceRow
                     key={inv.id}
+                    sortValues={[null, inv.period, inv.status, inv.subtotal_cents, inv.created_at]}
                     invoice={inv}
                     open={openId === inv.id}
                     onToggle={() =>
@@ -305,6 +306,8 @@ function InvoiceRow({
   onChanged,
 }: {
   invoice: Invoice;
+  /** read by the table to sort (2026-11-26) */
+  sortValues?: unknown[];
   open: boolean;
   onToggle: () => void;
   headers: () => Record<string, string> | undefined;

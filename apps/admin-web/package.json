@@ -10,7 +10,8 @@
     "lint": "next lint",
     "test:kb-upload": "sh scripts/test-knowledge-upload.sh",
     "test:chat-upload": "sh scripts/test-chat-upload.sh",
-    "test:advanced-search": "sh scripts/test-advanced-search.sh"
+    "test:advanced-search": "sh scripts/test-advanced-search.sh",
+    "test:table-sort": "sh scripts/test-table-sort.sh"
   },
   "dependencies": {
     "@telida/maplibre-gl-draw": "^1.4.1",

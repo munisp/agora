@@ -313,6 +313,7 @@ export function IncidentsClient({
               incidents.map((inc) => (
                 <IncidentRow
                   key={inc.id}
+                  sortValues={[null, inc.reference_number || inc.id, inc.incident_type, inc.severity, inc.status, inc.created_at]}
                   orgSlug={orgSlug}
                   incident={inc}
                   open={openId === inc.id}
@@ -467,6 +468,8 @@ function IncidentRow({
 }: {
   orgSlug: string;
   incident: Incident;
+  /** read by the table to sort (2026-11-26) */
+  sortValues?: unknown[];
   open: boolean;
   onToggle: () => void;
   onDispatch: () => void;
