@@ -8,6 +8,7 @@ is rendered per session from the bootstrapped TenantContext.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import json
@@ -49,6 +50,10 @@ request_human{extra_tool_names}.
   get_availability straight away.
 - book_appointment requires: offering_id, team_member_id, starts_at (RFC3339),
   and the caller's phone number.
+- Documents: when they need to send you one (a pay stub, a receipt, an ID, a letter), call
+  send_document_upload_link and say what it tells you (on a web chat: the paperclip below the chat;
+  on a call: a WhatsApp upload link). When they say they have sent it, call check_shared_documents.
+  Say only its kind and where the check stands -- never read out details from a document.
 - request_human: use it when the caller explicitly asks for a human, is
   distressed, or you cannot resolve their request after two attempts.
 
@@ -260,6 +265,7 @@ def build_system_prompt(
     visitor: dict[str, str] | None = None,
     outbound: str | None = None,
     turn_knowledge: list[str] | None = None,
+    shared_documents: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -301,6 +307,12 @@ def build_system_prompt(
     # tokens on every turn (gemma's sliding-window cache only resumes from checkpoints taken near a prompt's end).
     tail = (TAIL_MARK + today_line(ctx.timezone, clock_only=True)
             + f"\n- conversation_id: {conversation_id}\n- site: {ctx.site_slug}\n")
+    if shared_documents:
+        # 2026-11-26: what the person has shared in this conversation (kind and check only, never the details).
+        from .documents import documents_in_words
+
+        tail += ("\nDOCUMENTS THEY SHARED IN THIS CONVERSATION\n"
+                 + "\n".join(f"- {d}" for d in documents_in_words(shared_documents)) + "\n")
     if turn_knowledge:
         tail += ("\nKNOWLEDGE FOR THE LATEST QUESTION (use it with the KNOWLEDGE above)\n"
                  + "\n".join(f"- {s}" for s in turn_knowledge) + "\n")

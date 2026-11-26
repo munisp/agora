@@ -44,6 +44,30 @@ log = get_logger("documents")
 #: How long an accepted upload's status is kept for polling (seconds).
 JOB_TTL_S = 3600
 
+
+def document_lookup_sig(secret: str, session_id: str) -> str:
+    """HMAC of a conversation id with the link secret: the call worker proves it may read the documents a caller shared
+    through that call's link (both processes hold the secret; no other token is needed)."""
+    return hmac.new(secret.encode(), f"docs:{session_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def documents_in_words(docs: list[dict[str, Any]]) -> list[str]:
+    """What the receptionist may say about shared documents: their kind and where the check stands -- never the details
+    read from them."""
+    out = []
+    for d in docs:
+        kind = _KIND_LABELS.get(str(d.get("kind") or ""), "document")
+        status, verdict = d.get("status"), d.get("validation_verdict")
+        if status == "processing":
+            out.append(f"a {kind}: received, still being checked (about two minutes)")
+        elif status == "failed":
+            out.append(f"a {kind}: could not be read -- ask them to send a clearer copy")
+        elif verdict == "validated":
+            out.append(f"a {kind}: received and passed the consistency checks")
+        else:
+            out.append(f"a {kind}: received; a team member will review it")
+    return out
+
 #: Caller-shareable kinds (SPEC-W116 §4: ALL non-KYC kinds — pay stub was
 #: the example, not the feature). KYC kinds are NEVER caller-shareable
 #: here — they keep their own consent-gated intake (kyc-service, SPEC-W58).
@@ -263,6 +287,10 @@ def wire_document_routes(
     # job's status -- the OCR row and the session entry are the durable record.
     jobs: dict[str, dict[str, Any]] = {}
     app.state.document_jobs = jobs
+    # Documents shared through a call's link, by conversation id. A live call's session lives in the call worker, not
+    # in this process's store, so the link's own token is the correlation; the worker reads these back (below).
+    link_docs: dict[str, list[dict[str, Any]]] = {}
+    app.state.link_documents = link_docs
     background: set[asyncio.Task] = set()
 
     def _prune_jobs() -> None:
@@ -274,6 +302,13 @@ def wire_document_routes(
         return str(form.get("respond") or "").strip().lower() == "async"
 
     async def _update_session_entry(session_id: str, job_id: str, update: dict[str, Any]) -> None:
+        listed = link_docs.setdefault(session_id, [])
+        for entry in listed:
+            if entry.get("job_id") == job_id:
+                entry.update(update)
+                break
+        else:
+            listed.append({"job_id": job_id, **update})
         session = await store_get(sessions, session_id)
         if session is None:
             return
@@ -443,9 +478,8 @@ def wire_document_routes(
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         filename, data, kind, mime = await _read_caller_upload(request)
         session_id = payload["sid"]
-        if await store_get(sessions, session_id) is None:
-            # honest: the whole point of the link is session correlation
-            raise HTTPException(status_code=404, detail="session not found")
+        # The signed token names the conversation: a live call's session is held by the call worker, not this process's
+        # store (2026-11-26), so a missing session here is not an error -- the result is kept by conversation id.
         if _wants_async(await request.form()):
             job_id = _start_job(tenant_id=payload["t"], kind=kind, filename=filename, data=data,
                                 mime=mime, channel="voice", session_id=session_id)
@@ -462,14 +496,17 @@ def wire_document_routes(
             raise HTTPException(status_code=502, detail="document analysis failed") from exc
         verdict = result.get("validation_verdict") or "needs_review"
         reasons = result.get("validation_reasons") or []
-        await _attach_to_session(session_id, {
+        entry = {
             "document_id": result.get("document_id"),
             "kind": kind,
+            "status": "done",
             "validation_verdict": verdict,
             "validation_reasons": reasons,
             "channel": "voice",
             "shared_at": time.time(),
-        })
+        }
+        link_docs.setdefault(session_id, []).append(entry)
+        await _attach_to_session(session_id, dict(entry))
         return {
             "document_id": result.get("document_id"),
             "kind": kind,
@@ -477,6 +514,23 @@ def wire_document_routes(
             "validation_reasons": reasons,
             "summary": verdict_summary(kind, verdict, reasons),
         }
+
+    @app.get("/voice/internal/documents/{session_id}")
+    async def internal_session_documents(session_id: str, request: Request) -> dict[str, Any]:
+        """The documents shared in a conversation, for the call worker's check_shared_documents tool. Signed with the
+        link secret (document_lookup_sig); answers kinds and check results only."""
+        if not settings.document_link_secret:
+            raise HTTPException(status_code=503, detail="document sharing not configured")
+        sig = request.headers.get("X-Document-Sig") or ""
+        if not hmac.compare_digest(sig, document_lookup_sig(settings.document_link_secret, session_id)):
+            raise HTTPException(status_code=401, detail="invalid signature")
+        docs = list(link_docs.get(session_id, []))
+        session = await store_get(sessions, session_id)
+        if session is not None:
+            seen = {d.get("job_id") or d.get("document_id") for d in docs}
+            docs += [dict(d) for d in session.shared_documents if (d.get("job_id") or d.get("document_id")) not in seen]
+        keep = ("kind", "status", "validation_verdict", "validation_reasons", "channel", "shared_at")
+        return {"documents": [{k: d.get(k) for k in keep} for d in docs]}
 
     @app.get("/voice/sessions/{session_id}/documents")
     async def list_session_documents(session_id: str, request: Request) -> dict[str, Any]:

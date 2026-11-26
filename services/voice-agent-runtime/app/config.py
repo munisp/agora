@@ -89,6 +89,10 @@ DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
     # form: booking-service only fills blank fields on an existing contact, so it can't take one over.
     "save_caller_details": TIER_LOW,
     "send_whatsapp_confirmation": TIER_LOW,
+    # 2026-11-26: a link to upload a document to this conversation, and what has been shared -- no identity needed
+    # (the link only adds a document to the conversation; the check answers kinds and check results, never details).
+    "send_document_upload_link": TIER_LOW,
+    "check_shared_documents": TIER_LOW,
     # Tier 1 — MEDIUM (confirmed identity)
     "book_appointment": TIER_MEDIUM,
     "capture_location": TIER_MEDIUM,
@@ -704,6 +708,10 @@ class Settings:
     ocr_timeout_s: float = 150.0
     document_link_secret: str = ""
     document_link_ttl_s: int = 900
+    # 2026-11-26: where a caller's upload link points (the public page that posts to /voice/documents/claim/{token}),
+    # e.g. "https://agora.newfire.app/d/"; and how the call worker reaches this control plane to read shared documents.
+    document_link_base_url: str = ""
+    voice_control_plane_url: str = "http://voice:7006"
     # 2026-11-24: quiet seconds before a text chat ends and goes to the CRM (0 = never).
     chat_end_idle_s: float = 600.0
     max_document_bytes: int = 10 * 1024 * 1024
@@ -839,6 +847,8 @@ def load_settings() -> Settings:
         ocr_timeout_s=_env_float("VOICE_OCR_TIMEOUT_S", 150.0),
         document_link_secret=_env("VOICE_DOCUMENT_LINK_SECRET", ""),
         document_link_ttl_s=_env_int("VOICE_DOCUMENT_LINK_TTL_S", 900),
+        document_link_base_url=_env("VOICE_DOCUMENT_LINK_BASE_URL", ""),
+        voice_control_plane_url=_env("VOICE_CONTROL_PLANE_URL", "http://voice:7006"),
         chat_end_idle_s=float(_env("CHAT_END_IDLE_S", "600")),
         max_document_bytes=_env_int("VOICE_MAX_DOCUMENT_BYTES", 10 * 1024 * 1024),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),

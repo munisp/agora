@@ -225,22 +225,47 @@ def test_claim_rejects_expired_and_tampered_tokens():
     assert payload["sid"] == "x" and payload["t"] == TENANT
 
 
-def test_claim_unknown_session_404():
+def test_claim_for_a_call_session_held_by_the_worker():
+    """2026-11-26: a live call's session lives in the call worker, not this process's store. The signed link names the
+    conversation, so the upload is accepted and kept by conversation id; the worker reads it back with a signed request."""
+    from app.documents import document_lookup_sig
+
     store = SessionStore()
     settings = _settings()
     client = TestClient(_app(settings, sessions=store))
-    token, _ = mint_document_link(
-        secret=settings.document_link_secret,
-        session_id=str(uuid.uuid4()),
-        tenant_id=TENANT,
-        ttl_s=900,
-    )
+    sid = str(uuid.uuid4())
+    token, _ = mint_document_link(secret=settings.document_link_secret, session_id=sid, tenant_id=TENANT, ttl_s=900)
     resp = client.post(
         f"/voice/documents/claim/{token}",
         files={"file": ("stub.png", PNG, "image/png")},
         data={"kind": "pay_stub"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200, resp.text
+    bad = client.get(f"/voice/internal/documents/{sid}", headers={"X-Document-Sig": "nope"})
+    assert bad.status_code == 401
+    ok = client.get(f"/voice/internal/documents/{sid}",
+                    headers={"X-Document-Sig": document_lookup_sig(settings.document_link_secret, sid)})
+    assert ok.status_code == 200
+    docs = ok.json()["documents"]
+    assert len(docs) == 1 and docs[0]["kind"] == "pay_stub" and docs[0]["validation_verdict"] == "validated"
+    assert "document_id" not in docs[0]  # kinds and checks only
+
+
+def test_documents_in_words_never_carries_details():
+    from app.documents import documents_in_words
+
+    words = documents_in_words([
+        {"kind": "pay_stub", "status": "processing"},
+        {"kind": "receipt", "status": "done", "validation_verdict": "validated"},
+        {"kind": "document", "status": "done", "validation_verdict": "needs_review", "validation_reasons": ["x"]},
+        {"kind": "pay_stub", "status": "failed"},
+    ])
+    assert words == [
+        "a pay stub: received, still being checked (about two minutes)",
+        "a receipt: received and passed the consistency checks",
+        "a document: received; a team member will review it",
+        "a pay stub: could not be read -- ask them to send a clearer copy",
+    ]
 
 
 def test_claim_bad_token_401():

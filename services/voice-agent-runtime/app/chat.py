@@ -311,6 +311,7 @@ class ChatService:
             # path sets it via whisper; None keeps the tenant default).
             language=session.active_language,
             visitor=visitor_mod.from_session(session),
+            shared_documents=list(getattr(session, "shared_documents", None) or []),
         )
         # 2026-11-23: a typed chat reads, it is not heard — write details normally.
         system_prompt = f"{system_prompt}\n{CHAT_TEXT_ADDENDUM}"

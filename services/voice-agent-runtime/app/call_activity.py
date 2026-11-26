@@ -35,6 +35,8 @@ _LABELS = {
     "capture_location": "Noting the location",
     "save_caller_details": "Saving your details",
     "send_whatsapp_confirmation": "Sending you a WhatsApp",
+    "send_document_upload_link": "Sending you an upload link",
+    "check_shared_documents": "Checking your documents",
     "prefill_booking": "Filling in the form",
     "navigate_to_page": "Opening the page",
     "highlight_element": "Pointing it out",

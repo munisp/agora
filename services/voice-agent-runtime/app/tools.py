@@ -263,6 +263,35 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "send_document_upload_link",
+            "description": (
+                "When the person needs to send you a document (a pay stub, a receipt, an ID, a letter): on a web chat this "
+                "tells you to point them to the paperclip; on a phone call it WhatsApps them a secure upload link. Say only "
+                "what the result's message tells you."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_type": {"type": "string", "enum": ["pay_stub", "receipt", "document"],
+                                      "description": "What they will send: pay_stub, receipt, or document for anything else"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_shared_documents",
+            "description": (
+                "List the documents the person has shared in this conversation and where each check stands (received, "
+                "still being checked, passed, or needs a person to review). Use it when they say they have sent one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "save_caller_details",
             "description": (
                 "Save the caller's name, email and phone number to the CRM as soon as they have CONFIRMED the "
@@ -1407,6 +1436,76 @@ class ToolLayer:
             await self._emit_tool_event("send_whatsapp_confirmation", "error", {"error": str(exc)[:200]})
             return {"status": "error", "message": "The WhatsApp message could not be sent just now; do not mention it."}
 
+    # ------------------------------------------------ caller documents (2026-11-26)
+    async def send_document_upload_link(self, document_type: str | None = None) -> dict[str, Any]:
+        """Point the person to where a document goes: the paperclip on a web chat, a photo on WhatsApp, and on a phone
+        call a signed upload link WhatsApped to the number the call set up (session.whatsapp_to, the same rule as
+        send_whatsapp_confirmation). NEVER raises: a failure tells the model what to say instead."""
+        kind = (document_type or "").strip().lower()
+        kind = kind if kind in ("pay_stub", "receipt", "document") else "document"
+        label = {"pay_stub": "pay stub", "receipt": "receipt"}.get(kind, "document")
+        if getattr(self._session, "text_chat", False) and self._session.channel in ("web", ""):
+            return {"status": "use_paperclip", "message": f"Tell them to tap the paperclip below the chat, pick the {label} "
+                    "and press Upload; it is checked in about two minutes and you will see the result."}
+        if self._session.channel == "whatsapp":
+            return {"status": "use_whatsapp", "message": f"Tell them to send a clear photo of the {label} here in WhatsApp."}
+        secret, base = self._settings.document_link_secret, self._settings.document_link_base_url
+        to = (self._session.whatsapp_to or "").strip()
+        if not (secret and base):
+            return {"status": "error", "message": "Document sharing is not set up; do not offer to receive documents."}
+        if not to:
+            return {"status": "error", "message": "There is no WhatsApp number for this call, so no link can be sent. Tell "
+                    "them they can share it from the chat on the website instead."}
+        from .documents import mint_document_link
+
+        token, _exp = mint_document_link(secret=secret, session_id=self._session.conversation_id,
+                                         tenant_id=self._ctx.tenant_id, ttl_s=self._settings.document_link_ttl_s)
+        minutes = max(1, int(self._settings.document_link_ttl_s // 60))
+        business = self._ctx.display_name or self._ctx.site_slug
+        text = (f"{business}: here is your secure link to upload your {label}: {base.rstrip('/')}/{token}?kind={kind} "
+                f"(it works for {minutes} minutes).")
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self._settings.http_timeout_s) as client:
+                r = await client.post(f"{self._settings.messaging_gateway_url.rstrip('/')}/v1/whatsapp/send",
+                                      json={"to": to, "message": text})
+            if r.status_code >= 400:
+                raise RuntimeError(f"messaging-gateway {r.status_code}: {r.text[:160]}")
+            await self._emit_tool_event("send_document_upload_link", "ok", self._event_phone_detail(to))
+            return {"status": "sent", "message": "Sent. Tell them a WhatsApp with a secure upload link is on its way; once "
+                    "they have uploaded it, use check_shared_documents to see it."}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("document link failed", error=str(exc)[:200])
+            await self._emit_tool_event("send_document_upload_link", "error", {"error": str(exc)[:200]})
+            return {"status": "error", "message": "The link could not be sent just now. Tell them they can share it from "
+                    "the chat on the website instead."}
+
+    async def check_shared_documents(self) -> dict[str, Any]:
+        """The documents shared in this conversation, as their kind and check result (never the details read from
+        them). A web chat's are on its session; a call's are kept by the control plane, read with a signed request."""
+        from .documents import document_lookup_sig, documents_in_words
+
+        docs = list(getattr(self._session, "shared_documents", None) or [])
+        secret = self._settings.document_link_secret
+        if not getattr(self._session, "text_chat", False) and secret:
+            try:
+                import httpx
+
+                sid = self._session.conversation_id
+                async with httpx.AsyncClient(timeout=self._settings.http_timeout_s) as client:
+                    r = await client.get(f"{self._settings.voice_control_plane_url.rstrip('/')}/voice/internal/documents/{sid}",
+                                         headers={"X-Document-Sig": document_lookup_sig(secret, sid)})
+                if r.status_code == 200:
+                    docs = r.json().get("documents") or docs
+            except Exception as exc:  # noqa: BLE001 - an empty answer, never a broken call
+                log.warning("shared documents lookup failed", error=str(exc)[:200])
+        if not docs:
+            return {"status": "none", "message": "Nothing has been shared in this conversation yet."}
+        return {"status": "ok", "documents": documents_in_words(docs),
+                "message": "Tell them, in a sentence, what you have and where each check stands. Never read out details "
+                "from the documents."}
+
     # -------------------------------------------- location capture (W11 C)
     async def capture_location(
         self,
@@ -1731,6 +1830,10 @@ class ToolLayer:
                 when=str(arguments.get("when", "")),
                 team_member=arguments.get("team_member"),
             ),
+            "send_document_upload_link": lambda: self.send_document_upload_link(
+                document_type=arguments.get("document_type"),
+            ),
+            "check_shared_documents": lambda: self.check_shared_documents(),
             "save_caller_details": lambda: self.save_caller_details(
                 name=str(arguments.get("name", "")),
                 phone=str(arguments.get("phone", "")),

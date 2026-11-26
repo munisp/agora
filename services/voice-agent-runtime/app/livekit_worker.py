@@ -1436,6 +1436,30 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
 
     @lk_llm.ai_callable(
         description=(
+            "When the caller needs to send a document (a pay stub, a receipt, an ID, a letter): WhatsApp them a secure "
+            "upload link. document_type is pay_stub, receipt or document. Say only what the result's message tells you."
+        )
+    )
+    async def send_document_upload_link(self, document_type: str = "document") -> str:
+        import json
+
+        result = await self._tools.send_document_upload_link(document_type=document_type or None)
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
+            "List the documents the caller has shared in this call and where each check stands. Use it when they say "
+            "they have uploaded one. Never read out details from a document."
+        )
+    )
+    async def check_shared_documents(self) -> str:
+        import json
+
+        result = await self._tools.check_shared_documents()
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
             "Save the caller's location to their contact record (emergency / "
             "location-first flow). Pass the spoken address in address_text; "
             "pass lat and lng only when the caller gave exact coordinates."
