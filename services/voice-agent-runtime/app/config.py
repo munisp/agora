@@ -711,6 +711,9 @@ class Settings:
     # 2026-11-26: where a caller's upload link points (the public page that posts to /voice/documents/claim/{token}),
     # e.g. "https://agora.newfire.app/d/"; and how the call worker reaches this control plane to read shared documents.
     document_link_base_url: str = ""
+    # 2026-11-26: "whatsapp" (default) sends a call's upload link by WhatsApp; "screen" shows it on the caller's call
+    # screen instead, labelled as a demo (no message leaves the platform).
+    document_link_delivery: str = "whatsapp"
     voice_control_plane_url: str = "http://voice:7006"
     # 2026-11-24: quiet seconds before a text chat ends and goes to the CRM (0 = never).
     chat_end_idle_s: float = 600.0
@@ -848,6 +851,7 @@ def load_settings() -> Settings:
         document_link_secret=_env("VOICE_DOCUMENT_LINK_SECRET", ""),
         document_link_ttl_s=_env_int("VOICE_DOCUMENT_LINK_TTL_S", 900),
         document_link_base_url=_env("VOICE_DOCUMENT_LINK_BASE_URL", ""),
+        document_link_delivery=_env("VOICE_DOCUMENT_LINK_DELIVERY", "whatsapp").strip().lower(),
         voice_control_plane_url=_env("VOICE_CONTROL_PLANE_URL", "http://voice:7006"),
         chat_end_idle_s=float(_env("CHAT_END_IDLE_S", "600")),
         max_document_bytes=_env_int("VOICE_MAX_DOCUMENT_BYTES", 10 * 1024 * 1024),

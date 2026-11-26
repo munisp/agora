@@ -176,6 +176,66 @@ def booking_claim(text: str) -> bool:
     return bool(_BOOKED_CLAIM.search(text) and _BOOKING_WORDS.search(text))
 
 
+# 2026-11-26: "I will send a WhatsApp upload link for your pay stub right now" -- said on a live call with no tool call
+# (no link was ever sent). A promise or claim of sending a link is held back like a booking claim.
+_LINK_CLAIM = re.compile(
+    r"\b(?:send|sent|sending|text|texting|whatsapp|share|sharing)\b[^.!?]{0,80}?\blink\b"
+    r"|\blink\b[^.!?]{0,60}?\b(?:on its way|sent|coming|is ready|ready for you)\b", re.I)
+
+
+def link_claim(text: str) -> bool:
+    """Does this reply say an upload link is (being) sent?"""
+    return bool(_LINK_CLAIM.search(text))
+
+
+def _tool_ran(chat_ctx: Any, names: tuple[str, ...]) -> bool:
+    for m in getattr(chat_ctx, "messages", None) or []:
+        if getattr(m, "role", None) == "tool" and getattr(m, "name", "") in names:
+            return True
+        for call in getattr(m, "tool_calls", None) or []:
+            name = getattr(getattr(call, "function_info", None), "name", "") or getattr(call, "function_name", "")
+            if name in names:
+                return True
+    return False
+
+
+def unbacked_claim(text: str, chat_ctx: Any, fnc_ctx: Any = None) -> str | None:
+    """"booking" / "link" when the reply claims an action whose tool has not run; None otherwise."""
+    if booking_claim(text) and not _booked_in(chat_ctx):
+        return "booking"
+    if link_claim(text) and not _tool_ran(chat_ctx, ("send_document_upload_link",)) and _has_tool(
+            fnc_ctx, "send_document_upload_link"):
+        return "link"
+    return None
+
+
+def _has_tool(fnc_ctx: Any, name: str) -> bool:
+    if fnc_ctx is None:
+        return True
+    fns = getattr(fnc_ctx, "ai_functions", None)
+    return True if fns is None else name in fns
+
+
+_NUDGE = {
+    "booking": ("You were about to tell the caller the appointment is booked, but book_appointment has NOT been called, "
+                "so nothing is booked. Call book_appointment now with the agreed offering, team member, start time, "
+                "the caller's confirmed phone number and name. Only after it succeeds, tell the caller it is booked."),
+    "link": ("You were about to tell the caller an upload link is on its way, but send_document_upload_link has NOT "
+             "been called, so nothing was sent. Call send_document_upload_link now with the document type, BEFORE "
+             "saying anything; then say in one or two sentences what it tells you."),
+}
+
+
+def _nudge(claim: str, spoken: str) -> str:
+    """The guard's instruction; what the caller already heard this turn is quoted so the reply carries on from it
+    (re-greeting the caller three times made a live call sound broken)."""
+    text = _NUDGE[claim]
+    if spoken.strip():
+        text += (f' The caller has ALREADY heard you say: "{spoken.strip()[:400]}". Do not repeat it or greet them '
+                 "again: continue from there.")
+    return text
+
+
 def _booked_in(chat_ctx: Any) -> bool:
     """True when a book/reschedule tool already ran in this conversation (its result is in the history)."""
     for m in getattr(chat_ctx, "messages", None) or []:
@@ -210,6 +270,7 @@ class _ClaimGuardStream(lk_llm.LLMStream):
             lead = _ThoughtPrefix()
             claimed = False
             first = True
+            spoken = ""
             try:
                 async for chunk in stream:
                     if first:
@@ -219,15 +280,18 @@ class _ClaimGuardStream(lk_llm.LLMStream):
                     held.append(chunk)
                     text += delta
                     if _SENTENCE_END.search(text) or len(text) > 220:
-                        if booking_claim(text) and not _booked_in(self._chat_ctx):
+                        claim = unbacked_claim(text, self._chat_ctx, self._fnc_ctx)
+                        if claim:
                             claimed = True
                             break
                         for c in held:
                             for out in lead.feed(c):
                                 await self._queue.put(out)
+                        spoken += text
                         held, text = [], ""
                 if not claimed:
-                    if held and booking_claim(text) and not _booked_in(self._chat_ctx) and not stream.function_calls:
+                    claim = unbacked_claim(text, self._chat_ctx, self._fnc_ctx) if held else None
+                    if claim and not stream.function_calls:
                         claimed = True
                     else:
                         for c in held:
@@ -239,12 +303,9 @@ class _ClaimGuardStream(lk_llm.LLMStream):
                         return
             finally:
                 await stream.aclose()
-            log.warning("unbacked booking claim held back; asking for book_appointment", said=text[:160])
+            log.warning("unbacked claim held back; asking for its tool", claim=claim, said=text[:160])
             ctx = self._chat_ctx.copy()
-            ctx.messages.append(lk_llm.ChatMessage.create(role="system", text=(
-                "You were about to tell the caller the appointment is booked, but book_appointment has NOT been called, "
-                "so nothing is booked. Call book_appointment now with the agreed offering, team member, start time, "
-                "the caller's confirmed phone number and name. Only after it succeeds, tell the caller it is booked.")))
+            ctx.messages.append(lk_llm.ChatMessage.create(role="system", text=_nudge(claim, spoken)))
             inner = _ToolLoopStream(owner, chat_ctx=ctx, fnc_ctx=self._fnc_ctx, first_round=True)
             async for chunk in inner:
                 await self._queue.put(chunk)

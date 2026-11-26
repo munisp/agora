@@ -125,7 +125,21 @@ def announce_language(agent: Any, room: Any) -> None:
 # --- Live captions -------------------------------------------------------------------------------------------------
 # The caller's screen shows what was just said: the caller's words as soon as they are recognised, the receptionist's
 # as each sentence starts playing. One call per job process, so a module-level sink is per call.
-_CAPTIONS: dict[str, Any] = {"fn": None}
+_CAPTIONS: dict[str, Any] = {"fn": None, "screen": None}
+
+
+def show_on_screen(message: dict[str, Any]) -> bool:
+    """2026-11-26: put a message on the caller's call screen (demo delivery of an upload link instead of a real
+    WhatsApp). Returns False outside a call."""
+    fn = _CAPTIONS["screen"]
+    if fn is None:
+        return False
+    try:
+        fn(message)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        log.warning("screen message not sent", error=str(exc)[:200])
+        return False
 
 
 def caption(role: str, text: str) -> None:
@@ -155,3 +169,16 @@ def announce_captions(room: Any) -> None:
             return
 
     _CAPTIONS["fn"] = _publish
+
+    def _screen(message: dict[str, Any]) -> None:
+        payload = json.dumps({"state": "screen_message", **message}).encode()
+
+        async def _run() -> None:
+            try:
+                await room.local_participant.publish_data(payload, reliable=True, topic=TOPIC)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("screen message not published", error=str(exc)[:200])
+
+        asyncio.get_running_loop().create_task(_run())
+
+    _CAPTIONS["screen"] = _screen

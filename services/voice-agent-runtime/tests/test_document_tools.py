@@ -161,3 +161,20 @@ def test_chat_prompt_says_how_to_share_a_document_on_each_channel():
     assert "paperclip" in chat_documents_line("web") and "Never offer a link" in chat_documents_line("web")
     assert "paperclip" in chat_documents_line(None)
     assert "photo" in chat_documents_line("whatsapp") and "paperclip" not in chat_documents_line("whatsapp")
+
+
+async def test_call_screen_delivery_shows_the_link_and_sends_nothing(monkeypatch):
+    """VOICE_DOCUMENT_LINK_DELIVERY=screen (demo): the message goes to the caller's call screen, no WhatsApp."""
+    from app import call_activity
+
+    shown = []
+    monkeypatch.setitem(call_activity._CAPTIONS, "screen", shown.append)
+    s = SessionState(conversation_id="conv-7", site_slug="demo")  # no WhatsApp number needed
+    out = await _layer(s, _settings(document_link_delivery="screen")).send_document_upload_link(document_type="pay_stub")
+    assert out["status"] == "sent" and FakeHttp.calls == []
+    assert shown and shown[0]["demo"] is True and shown[0]["link"].startswith("https://agora.example/d/")
+    token = shown[0]["link"].split("/d/")[1].split("?")[0]
+    assert verify_document_link(secret=SECRET, token=token)["sid"] == "conv-7"
+    monkeypatch.setitem(call_activity._CAPTIONS, "screen", None)
+    out = await _layer(s, _settings(document_link_delivery="screen")).send_document_upload_link()
+    assert out["status"] == "error"

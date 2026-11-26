@@ -89,6 +89,8 @@ export function VoiceSessionButton({
   const [callLanguage, setCallLanguage] = React.useState("en");
   // Live captions: the last lines said on the call (worker data topic "agora.activity", state "caption").
   const [captions, setCaptions] = React.useState<{ role: string; text: string }[]>([]);
+  /** 2026-11-26: a message the receptionist "sent" during the call, shown here in demo mode (not really sent). */
+  const [screenMsg, setScreenMsg] = React.useState<{ text: string; link?: string; demo?: boolean } | null>(null);
   const [avatarTrack, setAvatarTrack] =
     React.useState<import("livekit-client").RemoteVideoTrack | null>(null);
   const roomRef = React.useRef<import("livekit-client").Room | null>(null);
@@ -122,6 +124,7 @@ export function VoiceSessionButton({
     setError(null);
     setCallLanguage(language);
     setCaptions([]);
+    setScreenMsg(null);
     try {
       // 1. Mint a session via the voice runtime (through APISIX).
       const session = await api.post<VoiceSession>("/voice/session", {
@@ -195,6 +198,9 @@ export function VoiceSessionButton({
                 return [...prev.slice(-1), { role, text }];
               });
             }
+          } else if (msg.state === "screen_message") {
+            const m = msg as unknown as { text?: string; link?: string; demo?: boolean };
+            if (m.text) setScreenMsg({ text: m.text, link: m.link, demo: m.demo });
           } else if (msg.state === "language") {
             if (msg.language) setCallLanguage(msg.language);
           } else {
@@ -272,6 +278,28 @@ export function VoiceSessionButton({
                 {c.text}
               </p>
             ))}
+          </div>
+        ) : null}
+        {state === "connected" && screenMsg ? (
+          <div
+            className="w-[280px] max-w-full rounded-xl border border-emerald-200 bg-[#e7fbe6] px-3 py-2 text-[13px] leading-snug text-[#17311c] shadow"
+            role="status"
+            data-screen-message
+          >
+            <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-emerald-800">
+              WhatsApp{screenMsg.demo ? " · demo: shown here, not sent" : ""}
+            </p>
+            <p className="break-words">{screenMsg.link ? screenMsg.text.replace(screenMsg.link, "").replace(/\s+\(/, " (") : screenMsg.text}</p>
+            {screenMsg.link ? (
+              <a
+                href={screenMsg.link}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-1.5 inline-block rounded-full bg-emerald-700 px-3 py-1 text-xs font-medium text-white"
+              >
+                Open the upload link
+              </a>
+            ) : null}
           </div>
         ) : null}
         <button

@@ -1453,7 +1453,8 @@ class ToolLayer:
         to = (self._session.whatsapp_to or "").strip()
         if not (secret and base):
             return {"status": "error", "message": "Document sharing is not set up; do not offer to receive documents."}
-        if not to:
+        screen = self._settings.document_link_delivery == "screen"
+        if not to and not screen:
             return {"status": "error", "message": "There is no WhatsApp number for this call, so no link can be sent. Tell "
                     "them they can share it from the chat on the website instead."}
         from .documents import mint_document_link
@@ -1464,6 +1465,17 @@ class ToolLayer:
         business = self._ctx.display_name or self._ctx.site_slug
         text = (f"{business}: here is your secure link to upload your {label}: {base.rstrip('/')}/{token}?kind={kind} "
                 f"(it works for {minutes} minutes).")
+        if screen:
+            # Demo delivery: the message appears on the caller's call screen, marked as a demo; nothing is sent.
+            from . import call_activity
+
+            link = f"{base.rstrip('/')}/{token}?kind={kind}"
+            if not call_activity.show_on_screen({"channel": "whatsapp", "demo": True, "text": text, "link": link}):
+                return {"status": "error", "message": "The link could not be shown just now. Tell them they can share it "
+                        "from the chat on the website instead."}
+            await self._emit_tool_event("send_document_upload_link", "ok", {"delivery": "screen"})
+            return {"status": "sent", "message": "Sent. Tell them a WhatsApp with a secure upload link is on its way; once "
+                    "they have uploaded it, use check_shared_documents to see it."}
         try:
             import httpx
 

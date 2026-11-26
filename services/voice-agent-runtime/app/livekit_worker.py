@@ -935,10 +935,25 @@ def _decode_byte_tokens(text: str) -> str:
     return _BYTE_TOKENS.sub(repl, text)
 
 
+# 2026-11-26: after a tool call at the end of an English call gemma said goodbye in Chinese ("探寻更多信息…再见。").
+# Agora's call languages (English, Pidgin, Yoruba, Hausa, Igbo) never use CJK scripts: such text is never spoken.
+_CJK = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]+")
+
+
 def speakable(text: str) -> str:
     """What the voice should say: the model sometimes writes HTML ("</li><li>") or markdown, which was read aloud."""
-    out = _MARKDOWN.sub("", _TAG.sub(" ", _decode_byte_tokens(text or "")))
+    out = _MARKDOWN.sub("", _TAG.sub(" ", _CJK.sub(" ", _decode_byte_tokens(text or ""))))
     return re.sub(r"\s{2,}", " ", out).strip()
+
+
+def has_words(text: str) -> bool:
+    """Is there anything to say (a letter or digit in any script)?"""
+    return any(ch.isalnum() for ch in text or "")
+
+
+async def _no_audio():
+    return
+    yield  # noqa: unreachable - makes this an empty async generator
 
 
 class WhisperSTTNode(lk_stt.STT):
@@ -1089,6 +1104,10 @@ class PiperTTSNode(lk_tts.TTS):
 
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         spoken = speakable(text)
+        if not has_words(spoken):
+            # 2026-11-26: a reply of only punctuation ('"""' after a tool call at the end of a call) was sent to the
+            # voice, which failed and then said something odd. Nothing to say: no caption, no audio.
+            return _no_audio()
         caption("receptionist", spoken)  # live caption on the caller's screen, as the sentence starts
         return self._stream(spoken)
 
