@@ -397,6 +397,7 @@ function captureLead() {
     var place = selectedPlace();
     if (place.state) payload.state = place.state;
     if (place.lga) payload.lga = place.lga;
+    if (place.lga_code) payload.lga_code = place.lga_code;
     if (place.locality) payload.locality = place.locality;
     return enqueue("lead_capture", payload, gps).then(function () {
       document.getElementById("f-name").value = "";
@@ -725,6 +726,9 @@ function selectedPlace() {
     }
     if ($("f-lga").value && li >= 0) {
       out.lga = $("f-lga").options[li].getAttribute("data-name") || $("f-lga").options[li].textContent;
+      // 2026-11-21: the option value IS the gazetteer code (e.g. NG-LAGOS-IKEJA);
+      // the server stores it on the lead for the CAC LGA breakdown.
+      out.lga_code = $("f-lga").value;
     }
     // SPEC-W78: locality is optional — included only when actually picked.
     var locSel = $("f-locality"), oi = locSel ? locSel.selectedIndex : -1;
@@ -810,9 +814,9 @@ function uploadReceipt(item, blob, accessToken) {
       return res.json().catch(function () { return null; }).then(function (body) {
         var ef = body && body.extracted_fields;
         var amount = ef && ef.amount != null && ef.amount !== ""
-          ? String(ef.amount) + (ef.currency ? " " + ef.currency : "")
+          ? (ef.currency ? ef.currency + " " : "") + Number(ef.amount).toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
           : null;
-        return { ok: true, amount: amount };
+        return { ok: true, amount: amount, vendor: ef && ef.vendor ? String(ef.vendor) : null, date: ef && ef.date ? String(ef.date) : null };
       });
     }
     if (res.status === 415) {
@@ -861,6 +865,13 @@ function settleAppliedItem(item, accessToken) {
       if (outcome.ok) {
         return receiptDel(item.id).then(function () { return outboxDel(item.id); }).then(function () {
           toast("Receipt uploaded" + (outcome.amount ? " — extracted " + outcome.amount : "") + ".");
+          // Stays on screen (the toast is gone in ~3 s): what OCR read, so the agent can check it before leaving.
+          var last = $("receipt-last");
+          if (last) {
+            last.textContent = outcome.amount
+              ? "Last receipt read: " + outcome.amount + (outcome.vendor ? " · " + outcome.vendor : "") + (outcome.date ? " · " + outcome.date : "")
+              : "Last receipt uploaded; the amount could not be read — check the photo.";
+          }
           return true;
         });
       }

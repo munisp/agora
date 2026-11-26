@@ -225,22 +225,47 @@ def test_claim_rejects_expired_and_tampered_tokens():
     assert payload["sid"] == "x" and payload["t"] == TENANT
 
 
-def test_claim_unknown_session_404():
+def test_claim_for_a_call_session_held_by_the_worker():
+    """2026-11-26: a live call's session lives in the call worker, not this process's store. The signed link names the
+    conversation, so the upload is accepted and kept by conversation id; the worker reads it back with a signed request."""
+    from app.documents import document_lookup_sig
+
     store = SessionStore()
     settings = _settings()
     client = TestClient(_app(settings, sessions=store))
-    token, _ = mint_document_link(
-        secret=settings.document_link_secret,
-        session_id=str(uuid.uuid4()),
-        tenant_id=TENANT,
-        ttl_s=900,
-    )
+    sid = str(uuid.uuid4())
+    token, _ = mint_document_link(secret=settings.document_link_secret, session_id=sid, tenant_id=TENANT, ttl_s=900)
     resp = client.post(
         f"/voice/documents/claim/{token}",
         files={"file": ("stub.png", PNG, "image/png")},
         data={"kind": "pay_stub"},
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200, resp.text
+    bad = client.get(f"/voice/internal/documents/{sid}", headers={"X-Document-Sig": "nope"})
+    assert bad.status_code == 401
+    ok = client.get(f"/voice/internal/documents/{sid}",
+                    headers={"X-Document-Sig": document_lookup_sig(settings.document_link_secret, sid)})
+    assert ok.status_code == 200
+    docs = ok.json()["documents"]
+    assert len(docs) == 1 and docs[0]["kind"] == "pay_stub" and docs[0]["validation_verdict"] == "validated"
+    assert "document_id" not in docs[0]  # kinds and checks only
+
+
+def test_documents_in_words_never_carries_details():
+    from app.documents import documents_in_words
+
+    words = documents_in_words([
+        {"kind": "pay_stub", "status": "processing"},
+        {"kind": "receipt", "status": "done", "validation_verdict": "validated"},
+        {"kind": "document", "status": "done", "validation_verdict": "needs_review", "validation_reasons": ["x"]},
+        {"kind": "pay_stub", "status": "failed"},
+    ])
+    assert words == [
+        "a pay stub: received, still being checked (about two minutes)",
+        "a receipt: received and passed the consistency checks",
+        "a document: received; a team member will review it",
+        "a pay stub: could not be read -- ask them to send a clearer copy",
+    ]
 
 
 def test_claim_bad_token_401():
@@ -300,3 +325,96 @@ def test_verdict_summary_sentences():
     assert "team member will review" in review
     missing = verdict_summary("pay_stub", "rejected", ["missing_required_field:employer_name"])
     assert "employer name is missing" in missing
+
+
+# --- async intake (2026-11-26): accept at once, read in the background --------
+class SlowFailOcr:
+    async def extract(self, **kw):
+        raise RuntimeError("model timed out")
+
+
+def _poll(client, job_id, tries=50):
+    for _ in range(tries):
+        r = client.get(f"/voice/documents/jobs/{job_id}")
+        assert r.status_code == 200, r.text
+        if r.json()["status"] != "processing":
+            return r.json()
+        time.sleep(0.02)
+    raise AssertionError("job never finished")
+
+
+def test_async_upload_accepts_then_reports_the_verdict():
+    store = SessionStore()
+    session = store.get_or_create(None, site_slug="acme")
+    ocr = FakeOcr()
+    with TestClient(_app(_settings(), ocr=ocr, sessions=store)) as client:
+        resp = client.post(
+            "/voice/documents/upload",
+            files={"file": ("stub.png", PNG, "image/png")},
+            data={"kind": "pay_stub", "site_slug": "acme", "respond": "async",
+                  "session_id": session.conversation_id},
+        )
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["status"] == "processing" and body["job_id"] and "checking your document" in body["summary"]
+        done = _poll(client, body["job_id"])
+    assert done["status"] == "done" and done["validation_verdict"] == "validated"
+    assert "passed all consistency checks" in done["summary"]
+    assert ocr.calls[0]["source_channel"] == "web"
+    docs = session.shared_documents
+    assert len(docs) == 1 and docs[0]["job_id"] == body["job_id"]
+    assert docs[0]["status"] == "done" and docs[0]["validation_verdict"] == "validated"
+
+
+def test_async_upload_failure_is_reported_not_raised():
+    with TestClient(_app(_settings(), ocr=SlowFailOcr())) as client:
+        resp = client.post(
+            "/voice/documents/upload",
+            files={"file": ("stub.png", PNG, "image/png")},
+            data={"kind": "pay_stub", "site_slug": "acme", "respond": "async"},
+        )
+        assert resp.status_code == 202
+        done = _poll(client, resp.json()["job_id"])
+    assert done["status"] == "failed" and "couldn't read" in done["summary"]
+
+
+def test_async_claim_link_and_unknown_job():
+    store = SessionStore()
+    session = store.get_or_create(None, site_slug="acme")
+    ocr = FakeOcr()
+    with TestClient(_app(_settings(), ocr=ocr, sessions=store)) as client:
+        url = client.post(f"/voice/sessions/{session.conversation_id}/document-link",
+                          json={"session_secret": session.session_secret}).json()["upload_url"]
+        resp = client.post(url, files={"file": ("stub.png", PNG, "image/png")},
+                           data={"kind": "pay_stub", "respond": "async"})
+        assert resp.status_code == 202, resp.text
+        done = _poll(client, resp.json()["job_id"])
+        assert client.get("/voice/documents/jobs/" + "0" * 32).status_code == 404
+    assert done["status"] == "done" and ocr.calls[0]["source_channel"] == "voice"
+    assert session.shared_documents[0]["channel"] == "voice"
+
+
+def test_policy_reasons_in_words_and_summary():
+    """2026-11-26: a business's own policy rule is named (its wording, never a detail read from the document)."""
+    from app.documents import documents_in_words, verdict_summary
+
+    rule = "policy:Pay stubs must be from the last 3 months."
+    assert verdict_summary("pay_stub", "rejected", [rule, "currency_missing"]) == (
+        "We could not accept this pay stub. Our policy says: Pay stubs must be from the last 3 months.")
+    review = verdict_summary("pay_stub", "needs_review", ["policy:Gross monthly pay must be at least ₦70,000"])
+    assert review.startswith("Your pay stub was received, but it does not meet our policy: Gross monthly pay must "
+                             "be at least ₦70,000.") and "team member" in review
+    unchecked = verdict_summary("pay_stub", "needs_review", ["policy_unchecked:Pay stubs must show the pay date."])
+    assert "could not confirm" in unchecked
+    words = documents_in_words([
+        {"kind": "pay_stub", "status": "done", "validation_verdict": "rejected", "validation_reasons": [rule]},
+        {"kind": "pay_stub", "status": "done", "validation_verdict": "needs_review",
+         "validation_reasons": ["policy:Gross monthly pay must be at least ₦70,000."]},
+        {"kind": "pay_stub", "status": "done", "validation_verdict": "rejected", "validation_reasons": ["net_exceeds_gross"]},
+    ])
+    assert words == [
+        "a pay stub: not accepted -- it does not meet the policy: Pay stubs must be from the last 3 months.",
+        "a pay stub: received but it does not meet the policy: Gross monthly pay must be at least ₦70,000. "
+        "A team member will review it",
+        "a pay stub: not accepted -- ask them for a complete, readable copy",
+    ]

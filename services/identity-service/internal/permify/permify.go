@@ -75,42 +75,44 @@ func (c *HTTPClient) Check(ctx context.Context, tenantID, subject, permission, r
 	if err := c.post(ctx, "/v1/tenants/"+tenantID+"/permissions/check", body, &out); err != nil {
 		return false, err
 	}
-	return out.Can == "RESULT_ALLOWED" || out.Can == "allowed", nil
+	// Permify v1.x answers "CHECK_RESULT_ALLOWED" (the older "RESULT_ALLOWED" is kept for compatibility).
+	return out.Can == "CHECK_RESULT_ALLOWED" || out.Can == "RESULT_ALLOWED" || out.Can == "allowed", nil
 }
 
 // WriteRelationship implements RelationshipWriter via
-// POST /v1/tenants/{t}/data/relationships/write.
+// POST /v1/tenants/{t}/data/write (Permify v1.x).
 // entity and subject are "type:id" references, relation is e.g. "owner".
 func (c *HTTPClient) WriteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error {
 	et, ei := splitRef(entity)
 	st, si := splitRef(subject)
 	body := map[string]any{
 		"metadata": map[string]any{"schema_version": ""},
-		"tuple": map[string]any{
+		"tuples": []map[string]any{{
 			"entity":   map[string]string{"type": et, "id": ei},
 			"relation": relation,
 			"subject":  map[string]string{"type": st, "id": si},
-		},
+		}},
 	}
-	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/relationships/write", body, nil)
+	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/write", body, nil)
 }
 
 // DeleteRelationship removes one relationship tuple via
-// POST /v1/tenants/{t}/data/relationships/delete (SPEC-W45 K16 member
+// POST /v1/tenants/{t}/data/delete (SPEC-W45 K16 member
 // removal/role change). A missing tuple is a Permify no-op, so the call is
 // idempotent by construction.
 func (c *HTTPClient) DeleteRelationship(ctx context.Context, tenantID, entity, relation, subject string) error {
 	et, ei := splitRef(entity)
 	st, si := splitRef(subject)
+	// Permify v1.x: POST /v1/tenants/{t}/data/delete with a tuple filter.
 	body := map[string]any{
-		"metadata": map[string]any{"schema_version": ""},
-		"tuple": map[string]any{
-			"entity":   map[string]string{"type": et, "id": ei},
+		"tuple_filter": map[string]any{
+			"entity":   map[string]any{"type": et, "ids": []string{ei}},
 			"relation": relation,
-			"subject":  map[string]string{"type": st, "id": si},
+			"subject":  map[string]any{"type": st, "ids": []string{si}},
 		},
+		"attribute_filter": map[string]any{},
 	}
-	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/relationships/delete", body, nil)
+	return c.post(ctx, "/v1/tenants/"+tenantID+"/data/delete", body, nil)
 }
 
 // DeleteTenant removes the Permify tenant and every relationship it holds
@@ -143,16 +145,24 @@ func (c *HTTPClient) DeleteTenant(ctx context.Context, tenantID string) error {
 func (c *HTTPClient) CreateTenant(ctx context.Context, tenantID, name string) error {
 	body := map[string]any{"id": tenantID, "name": name}
 	err := c.post(ctx, "/v1/tenants/create", body, nil)
-	if err != nil && !strings.Contains(err.Error(), "status 409") {
+	if err != nil && !alreadyExists(err) {
 		return err
 	}
-	// 409 = already exists — idempotent. The schema is (re)written on every
+	// Already exists — idempotent. The schema is (re)written on every
 	// call so tenants provisioned before GF15 self-heal on the next
 	// ensure-permify / onboarding call (schemas/write versions are additive).
 	if err := c.WriteSchema(ctx, tenantID); err != nil {
 		return fmt.Errorf("write schema for tenant %s: %w", tenantID, err)
 	}
 	return nil
+}
+
+// alreadyExists: Permify answers a duplicate tenant with 409 on some versions and 400 ERROR_CODE_UNIQUE_CONSTRAINT
+// on others (the deployed one). Missing the second made every onboarding fail at its permify step, because tenant
+// creation had already created it.
+func alreadyExists(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "status 409") || strings.Contains(msg, "ERROR_CODE_UNIQUE_CONSTRAINT")
 }
 
 // WriteSchema posts the embedded ReBAC schema to

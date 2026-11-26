@@ -6,12 +6,14 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import field_validator, BaseModel, Field
 
-Role = Literal["user", "agent", "system", "tool"]
+# "staff" (2026-11-23): a person replying from the human inbox (Chatwoot) after a handoff.
+Role = Literal["user", "agent", "system", "tool", "staff"]
 # SPEC-W12 contract §2: "ussd" joins the channel enum (DB CHECK widened at
 # startup via Database.ensure_ussd_channel).
-Channel = Literal["voice", "chat", "phone", "api", "ussd"]
+# The messaging-gateway bridge records WhatsApp/Telegram chats under their own channel.
+Channel = Literal["voice", "chat", "phone", "api", "ussd", "whatsapp", "telegram", "email"]
 
 
 class ConversationCreate(BaseModel):
@@ -22,6 +24,9 @@ class ConversationCreate(BaseModel):
     # the caller knows the visitor's phone (or e-mail); enables ?contact=
     # filtering and privacy erasure. Nullable — anonymous sessions stay NULL.
     contact_phone: str | None = Field(default=None, max_length=64)
+    # 2026-11-23: the name the visitor gave (web chat pre-chat form); kept in call_details.contact_name so the
+    # dashboard list and the human inbox show a name instead of a number.
+    contact_name: str | None = Field(default=None, max_length=128)
 
 
 class Conversation(BaseModel):
@@ -32,6 +37,27 @@ class Conversation(BaseModel):
     contact_phone: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
+    # 2026-11-21 (list view only): who the caller said they were, read from the call's own booking tool turn
+    # (contact_name / phone arguments), and the time of the last turn. Browser voice calls carry no
+    # contact_phone and are never closed (ended_at stays NULL), so the dashboard showed every caller as
+    # "Not given" and 0 call minutes. Display-only: the stored contact_phone marker (GDPR) is unchanged.
+    contact_name: str | None = None
+    caller_phone: str | None = None
+    last_activity_at: datetime | None = None
+    # 2026-11-23: direction, purpose, length, outcome, mood and the AI summary of a call (also in its CRM note)
+    call_details: dict | None = None
+
+    @field_validator("call_details", mode="before")
+    @classmethod
+    def _parse_call_details(cls, v):  # asyncpg hands JSONB back as text
+        if isinstance(v, str):
+            import json
+
+            try:
+                return json.loads(v)
+            except ValueError:
+                return None
+        return v
 
 
 class TurnCreate(BaseModel):
@@ -39,6 +65,9 @@ class TurnCreate(BaseModel):
     text: str = Field(min_length=1)
     tool_calls: list[dict[str, Any]] | None = None
     audio_url: str | None = None
+    # The English a non-English line was made from (the voice receptionist thinks in English and speaks Yoruba,
+    # Hausa or Igbo): stored as the line's translation, so it is exact instead of re-translated later.
+    translation_en: str | None = Field(default=None, max_length=4000)
 
 
 class Turn(BaseModel):
@@ -52,6 +81,8 @@ class Turn(BaseModel):
     sentiment: float | None = None
     intent: str | None = None
     entities: dict[str, Any] | None = None
+    # English translation of a non-English line (None: English already, or not translated yet).
+    translation_en: str | None = None
     ts: datetime
 
 

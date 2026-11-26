@@ -45,6 +45,11 @@ type Booking struct {
 	PaymentStatus string    `json:"payment_status"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	// Display names for lists (filled by ListBookings; the dashboard showed raw ids without them).
+	ContactName    string `json:"contact_name,omitempty"`
+	ContactPhone   string `json:"contact_phone,omitempty"`
+	OfferingName   string `json:"offering_name,omitempty"`
+	TeamMemberName string `json:"team_member_name,omitempty"`
 }
 
 const bookingCols = `id, tenant_id, offering_id, team_member_id, contact_id, starts_at, ends_at, status, source, idempotency_key, public_ref, payment_status, created_at, updated_at`
@@ -365,9 +370,67 @@ func (s *Store) ListBookings(ctx context.Context, tenantID uuid.UUID, f BookingF
 			}
 			out = append(out, b)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows.Close()
+		return fillBookingNames(ctx, tx, tenantID, out)
 	})
 	return out, err
+}
+
+// fillBookingNames adds the contact, offering and team-member names to listed bookings (one query each, same
+// tenant-scoped transaction, so row-level security still applies).
+func fillBookingNames(ctx context.Context, tx pgx.Tx, tenantID uuid.UUID, bs []Booking) error {
+	if len(bs) == 0 {
+		return nil
+	}
+	contacts, offerings, members := map[uuid.UUID]bool{}, map[uuid.UUID]bool{}, map[uuid.UUID]bool{}
+	for _, b := range bs {
+		contacts[b.ContactID], offerings[b.OfferingID], members[b.TeamMemberID] = true, true, true
+	}
+	ids := func(m map[uuid.UUID]bool) []uuid.UUID {
+		out := make([]uuid.UUID, 0, len(m))
+		for id := range m {
+			out = append(out, id)
+		}
+		return out
+	}
+	names := func(q string, set map[uuid.UUID]bool) (map[uuid.UUID][2]string, error) {
+		out := map[uuid.UUID][2]string{}
+		rows, err := tx.Query(ctx, q, tenantID, ids(set))
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			var a, b string
+			if err := rows.Scan(&id, &a, &b); err != nil {
+				return nil, err
+			}
+			out[id] = [2]string{a, b}
+		}
+		return out, rows.Err()
+	}
+	cn, err := names(`SELECT id, COALESCE(name,''), COALESCE(phone,'') FROM contacts WHERE tenant_id=$1 AND id = ANY($2)`, contacts)
+	if err != nil {
+		return fmt.Errorf("booking contact names: %w", err)
+	}
+	on, err := names(`SELECT id, COALESCE(name,''), '' FROM offerings WHERE tenant_id=$1 AND id = ANY($2)`, offerings)
+	if err != nil {
+		return fmt.Errorf("booking offering names: %w", err)
+	}
+	tn, err := names(`SELECT id, COALESCE(name,''), '' FROM team_members WHERE tenant_id=$1 AND id = ANY($2)`, members)
+	if err != nil {
+		return fmt.Errorf("booking team member names: %w", err)
+	}
+	for i := range bs {
+		bs[i].ContactName, bs[i].ContactPhone = cn[bs[i].ContactID][0], cn[bs[i].ContactID][1]
+		bs[i].OfferingName = on[bs[i].OfferingID][0]
+		bs[i].TeamMemberName = tn[bs[i].TeamMemberID][0]
+	}
+	return nil
 }
 
 // ListBookingsForRange returns active (non-cancelled) bookings overlapping

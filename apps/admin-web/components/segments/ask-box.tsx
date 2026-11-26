@@ -93,7 +93,7 @@ export function AskBox({ orgSlug }: { orgSlug: string }) {
         <CardTitle>Ask your customer graph</CardTitle>
         <CardDescription>
           Ask a question in plain language — a local model turns it into a
-          read-only graph query over your tenant&apos;s data only.
+          search of your business&apos;s records only, without changing anything.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -156,7 +156,7 @@ export function AskBox({ orgSlug }: { orgSlug: string }) {
             ) : null}
             {answer.rows.length === 0 ? (
               <p className="py-4 text-center text-sm text-muted-foreground">
-                The query returned no rows.
+                Nothing matched that question.
               </p>
             ) : (
               <div className="overflow-x-auto rounded-md border border-border">
@@ -201,7 +201,7 @@ export function AskBox({ orgSlug }: { orgSlug: string }) {
                   className="flex w-full items-center justify-between font-medium text-muted-foreground cursor-pointer"
                   aria-expanded={showCypher}
                 >
-                  Generated graph query (read-only)
+                  How this was worked out
                   <ChevronDown
                     className={cn(
                       "h-3.5 w-3.5 transition-transform",

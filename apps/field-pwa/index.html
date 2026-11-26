@@ -73,12 +73,12 @@ summary{cursor:pointer}
   <!-- Auth / setup -->
   <section id="view-auth" class="card">
     <h2>Sign in</h2>
-    <p class="muted">Field capture for your team. Enter your tenant and sign in
-      with your Agora staff account (Keycloak).</p>
-    <label for="f-slug">Tenant slug</label>
-    <input id="f-slug" autocomplete="organization" placeholder="e.g. sunrise-dental">
-    <button id="btn-login" class="btn-primary">Sign in with Keycloak</button>
-    <button id="btn-demo" class="btn-ghost">No staff account? Continue in demo mode (offline queue only)</button>
+    <p class="muted">Capture leads and visits in the field, online or offline. Enter your
+      business's Agora name, then sign in with your staff account.</p>
+    <label for="f-slug">Business name on Agora</label>
+    <input id="f-slug" autocomplete="organization" placeholder="e.g. your-business">
+    <button id="btn-login" class="btn-primary">Sign in</button>
+    <button id="btn-demo" class="btn-ghost">No staff account yet? Try it offline</button>
     <p id="auth-msg" class="muted"></p>
   </section>
 
@@ -146,6 +146,7 @@ summary{cursor:pointer}
       <label for="f-receipt-photo">Receipt photo (required)</label>
       <input id="f-receipt-photo" type="file" accept="image/jpeg,image/png,image/webp" capture="environment">
       <button id="btn-receipt" class="btn-primary">Save receipt</button>
+      <p id="receipt-last" class="muted" role="status" aria-live="polite"></p>
     </div>
 
     <div class="card">

@@ -141,7 +141,11 @@ def compute(spark: SparkSession):
         )
         .withColumn(
             "no_show_rate",
-            F.col("no_shows") / F.nullif(F.col("confirmed") + F.col("no_shows"), F.lit(0)),
+            # 2026-11-21: F.nullif on aggregate columns fails in Spark 3.5 ("Invalid call to
+            # dataType on unresolved object"); same semantics: NULL when the denominator is 0.
+            F.when(
+                (F.col("confirmed") + F.col("no_shows")) == 0, F.lit(None)
+            ).otherwise(F.col("no_shows") / (F.col("confirmed") + F.col("no_shows"))),
         )
     )
 

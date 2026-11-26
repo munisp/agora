@@ -12,6 +12,8 @@ import json
 import time
 from typing import Any, Callable, Protocol
 
+import httpx
+
 import openai
 from openai import AsyncOpenAI
 
@@ -46,6 +48,38 @@ def _record_usage(usage: Any) -> None:
         registry.llm_tokens.inc(completion, kind="completion")
 
 
+class _BodyMergeTransport(httpx.AsyncBaseTransport):
+    """Merges fixed fields into JSON chat-completions bodies (clients like livekit's plugin can't add them)."""
+
+    def __init__(self, extra: dict[str, Any], inner: httpx.AsyncBaseTransport | None = None) -> None:
+        self._extra = extra
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/chat/completions"):
+            try:
+                body = json.loads(await request.aread())
+            except ValueError:
+                body = None
+            if isinstance(body, dict):
+                body = {**body, **{k: v for k, v in self._extra.items() if k not in body}}
+                content = json.dumps(body).encode()
+                headers = {k: v for k, v in request.headers.items() if k.lower() != "content-length"}
+                request = httpx.Request(request.method, request.url, headers=headers, content=content,
+                                        extensions=request.extensions)
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+def http_client_with_body(extra: dict[str, Any], timeout: Any = None) -> httpx.AsyncClient:
+    kwargs: dict[str, Any] = {"transport": _BodyMergeTransport(extra)}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    return httpx.AsyncClient(**kwargs)
+
+
 class OpenAICompatibleLLM:
     def __init__(
         self,
@@ -53,6 +87,7 @@ class OpenAICompatibleLLM:
         model: str,
         api_key: str = "ollama",
         timeout_s: float | None = None,
+        extra_body: dict[str, Any] | None = None,
         # SPEC-W71 P7: response-length cap (VOICE_LLM_MAX_TOKENS) applied on
         # OUR OWN client paths only (chat_with_tools / stream_with_tools) —
         # spoken replies are bounded, bounding LLM decode time per turn.
@@ -64,6 +99,8 @@ class OpenAICompatibleLLM:
         kwargs: dict[str, Any] = {"base_url": base_url, "api_key": api_key}
         if timeout_s is not None:
             kwargs["timeout"] = timeout_s
+        if extra_body:
+            kwargs["http_client"] = http_client_with_body(extra_body)
         self._client = AsyncOpenAI(**kwargs)
         self.model = model
         self._max_tokens = max_tokens
@@ -282,6 +319,7 @@ def build_llm(settings) -> LLMInterface:
         model=settings.llm_model,
         api_key=settings.llm_api_key,
         timeout_s=settings.llm_timeout_s,
+        extra_body=getattr(settings, "llm_extra_body", None) or None,
         max_tokens=getattr(settings, "voice_llm_max_tokens", 300),
     )
     if not settings.llm_fallback_base_url:

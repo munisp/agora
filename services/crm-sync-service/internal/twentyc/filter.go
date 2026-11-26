@@ -55,7 +55,8 @@ func PersonEmailFilter(email string) string {
 
 // PersonPhoneFilter matches a Person by primary phone number.
 func PersonPhoneFilter(phone string) string {
-	return Expr("phones.primaryPhoneNumber", OpEq, phone)
+	national, _, _ := NationalPhone(phone) // stored national, see NationalPhone
+	return Expr("phones.primaryPhoneNumber", OpEq, national)
 }
 
 // CompanyNameFilter matches a Company by exact name.

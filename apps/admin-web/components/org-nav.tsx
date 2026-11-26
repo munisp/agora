@@ -2,7 +2,10 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { DEFAULT_NAV_LABELS, type NavLabels } from "@/lib/terminology";
+import { DEV_EXTERNAL_LINKS, type ExternalLinks } from "@/lib/external-links";
 import {
+  Headphones,
   LayoutDashboard,
   LayoutGrid,
   CalendarCheck,
@@ -21,6 +24,7 @@ import {
   LineChart,
   Webhook,
   MessagesSquare,
+  MessageCircle,
   MapPin,
   Target,
   AudioLines,
@@ -39,6 +43,7 @@ import {
   Search,
   Scale,
   Fingerprint,
+  FileCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -52,14 +57,10 @@ import {
   canViewVoices,
 } from "@/lib/roles";
 
-/** Self-hosted Twenty CRM UI (SPEC-CRM §A). */
-const CRM_URL = "http://localhost:3100";
-/** Grafana dashboards (observability profile, SPEC-W3 §1). */
-const GRAFANA_URL = "http://localhost:3002";
 
 type NavItem =
   | { segment: string; label: string; icon: typeof LayoutDashboard }
-  | { external: string; label: string; icon: typeof LayoutDashboard };
+  | { external: keyof ExternalLinks; label: string; icon: typeof LayoutDashboard };
 
 const items: NavItem[] = [
   { segment: "", label: "Overview", icon: LayoutDashboard },
@@ -73,18 +74,22 @@ const items: NavItem[] = [
   // SPEC-W47 UIWEB-14/15: lead pipeline + contacts directory.
   { segment: "leads", label: "Leads", icon: Magnet },
   { segment: "contacts", label: "Contacts", icon: ContactRound },
+  { segment: "conversations", label: "Conversations", icon: MessageCircle },
   { segment: "knowledge", label: "Knowledge", icon: BookOpen },
+  // 2026-11-26: policy rules -- the business's own checks on documents callers share.
+  { segment: "document-checks", label: "Document checks", icon: FileCheck },
   // SPEC-W117: OpenSearch advanced search across transcripts.
-  { segment: "conversations", label: "Conversations", icon: Search },
+  // 2026-11-24 merge: lives under /conversations/search (the Conversations list keeps /conversations).
+  { segment: "conversations/search", label: "Search transcripts", icon: Search },
   { segment: "voice-agent", label: "Voice Agent", icon: Mic },
   // SPEC-W38: self-serve agents registry (wizard + capture records).
   { segment: "agents", label: "Agents", icon: Bot },
   { segment: "public-site", label: "Public Site", icon: Globe },
   { segment: "billing", label: "Billing", icon: CreditCard },
   { segment: "analytics", label: "Analytics", icon: BarChart3 },
-  { segment: "cac", label: "CAC", icon: CircleDollarSign },
+  { segment: "cac", label: "Acquisition cost", icon: CircleDollarSign },
   { segment: "growth", label: "Growth", icon: Gift },
-  { segment: "webhooks", label: "Webhooks", icon: Webhook },
+  { segment: "webhooks", label: "Integrations", icon: Webhook },
   { segment: "channels", label: "Channels", icon: MessagesSquare },
   { segment: "locations", label: "Locations", icon: MapPin },
   { segment: "geo-campaigns", label: "Geo campaigns", icon: Target },
@@ -97,7 +102,7 @@ const items: NavItem[] = [
   // SPEC-W61: media inbox review queue — owner/admin only (sender phone PII
   // + OCR document link; KYC review precedent); the page enforces the same
   // rule server-side.
-  { segment: "media-inbox", label: "Media inbox", icon: Inbox },
+  { segment: "media-inbox", label: "Received documents", icon: Inbox },
   // SPEC-W64: receipt reconciliation findings — UNGATED in nav: the page is
   // manage_bookings-permission gated with a 403-note posture and NO
   // realm-role redirect (page.tsx), so there is no roles gate here.
@@ -113,10 +118,11 @@ const items: NavItem[] = [
   // SPEC-W32: civic case triage console — operational, owner/admin/staff.
   { segment: "cases", label: "Cases", icon: FileWarning },
   { segment: "voices", label: "Voices", icon: AudioLines },
-  // SPEC-W82 B1.1: renamed from "CRM" to disambiguate the external Twenty
-  // console from the in-app CRM 360 console (now in the command palette).
-  { external: CRM_URL, label: "Twenty CRM (external)", icon: UsersRound },
-  { external: GRAFANA_URL, label: "Grafana", icon: LineChart },
+  // SPEC-W82 B1.1: labelled to tell the external Twenty console apart from the in-app CRM 360 console.
+  { external: "crm", label: "CRM", icon: UsersRound },
+  // 2026-11-23: the human agents' inbox (Chatwoot): chats handed over by the receptionist, answered by staff.
+  { external: "inbox", label: "Inbox", icon: Headphones },
+  { external: "grafana", label: "Grafana", icon: LineChart },
   // SPEC-W18 Agent B: app catalog & lifecycle management. Visible to all
   // roles (read-only); the page hides provision/enable/disable/config
   // actions for anyone but owner/admin, and identity-service enforces the
@@ -128,16 +134,23 @@ const items: NavItem[] = [
 const linkClass = (active: boolean) =>
   cn(
     "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+    // Dark umber sidebar: tan marks the current page.
     active
-      ? "bg-secondary text-secondary-foreground"
-      : "text-muted-foreground hover:bg-accent hover:text-foreground",
+      ? "bg-paper/10 text-paper shadow-[inset_3px_0_0_var(--color-tan)]"
+      : "text-paper/65 hover:bg-paper/5 hover:text-paper",
   );
 
 export function OrgNav({
   orgSlug,
   roles = [],
+  labels = DEFAULT_NAV_LABELS,
+  externalLinks = DEV_EXTERNAL_LINKS,
 }: {
   orgSlug: string;
+  /** addresses of the external tools (blank: entry hidden) */
+  externalLinks?: ExternalLinks;
+  /** the tenant's pack wording for the core entries (bookings, contacts, team, offerings) */
+  labels?: NavLabels;
   /** caller's Keycloak realm roles (session.realmRoles) — gates nav entries */
   roles?: string[];
 }) {
@@ -148,6 +161,7 @@ export function OrgNav({
   // analytics is owner/admin/analyst; staff/viewer see neither. The pages
   // enforce the same rule server-side — this is the client-side hiding.
   const visible = items.filter((item) => {
+    if ("external" in item) return Boolean(externalLinks[item.external]);
     if ("segment" in item && item.segment === "billing")
       return canViewBilling(roles);
     if ("segment" in item && item.segment === "analytics")
@@ -222,7 +236,7 @@ export function OrgNav({
           return (
             <a
               key={item.label}
-              href={item.external}
+              href={externalLinks[item.external]}
               target="_blank"
               rel="noreferrer noopener"
               className={linkClass(false)}
@@ -238,7 +252,9 @@ export function OrgNav({
         return (
           <Link key={href} href={href} className={linkClass(active)}>
             <Icon className="h-4 w-4 shrink-0" />
-            {item.label}
+            {item.segment === "bookings" || item.segment === "contacts" || item.segment === "team" || item.segment === "offerings"
+              ? labels[item.segment]
+              : item.label}
           </Link>
         );
       })}

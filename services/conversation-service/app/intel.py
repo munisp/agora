@@ -196,3 +196,73 @@ async def enrich_turn(
             result["intent"] = ner.get("intent")
             result["entities"] = ner.get("entities") or {}
     return result
+
+
+_TRANSLATE_SYSTEM = (
+    "You translate lines from a business phone call or chat in Nigeria into natural English for the business owner. "
+    "The line may be in Nigerian Pidgin, Yoruba, Hausa, Igbo, English or a mix. If it is already plain English, reply "
+    "with exactly: ENGLISH. Otherwise reply with the English translation only - no notes, no quotes. "
+    "Translate day names as weekdays - Yoruba: Ọjọ́ Ajé Monday, Ọjọ́ Ìṣẹ́gun Tuesday, Ọjọ́rú Wednesday, Ọjọ́bọ̀ "
+    "Thursday, Ọjọ́ Ẹtì Friday, Ọjọ́ Àbámẹ́ta Saturday, Ọjọ́ Àìkú Sunday; Hausa: Litinin Monday, Talata Tuesday, "
+    "Laraba Wednesday, Alhamis Thursday, Juma'a Friday, Asabar Saturday, Lahadi Sunday. Common words: Igbo 'Daalụ' "
+    "and Hausa 'Na gode' mean 'Thank you'; Yoruba 'Ẹ jọ̀wọ́' means 'Please'."
+)
+
+
+def parse_translation(reply: str | None, original: str) -> str | None:
+    """The model's reply -> the translation to store: "" when the line is English already (stored, so it is never
+    sent again), None when there is no usable reply (not stored, retried next time)."""
+    t = (reply or "").strip().strip('"').strip()
+    if not t:
+        return None
+    if t.upper().rstrip(".") == "ENGLISH" or t == original.strip():
+        return ""
+    return t
+
+
+# The receptionist's own fixed lines, translated exactly: a model once rendered the Yoruba recording notice as
+# "We cannot record this call" and the Hausa one as "I can hear this call" (voice-agent call_language.RECORDING_NOTICES).
+_KNOWN_LINES = {
+    "Dis call fit dey recorded.": "This call may be recorded.",
+    "A lè ṣe ìgbàsílẹ̀ ìpè yìí.": "This call may be recorded.",
+    "Ana iya nadar wannan kiran.": "This call may be recorded.",
+    "Enwere ike ịdekọ oku a.": "This call may be recorded.",
+}
+
+
+async def translate_to_english(text: str, cfg: Config, *, client: httpx.AsyncClient | None = None) -> str | None:
+    """English translation of one transcript line, or None when it is English already or the model is unavailable."""
+    if not cfg.translate_llm_base_url or not (text or "").strip():
+        return None
+    stripped = text.strip()
+    for line, english in _KNOWN_LINES.items():
+        if stripped.startswith(line):
+            rest = stripped[len(line):].strip()
+            if not rest:
+                return english
+            translated = await translate_to_english(rest, cfg, client=client)
+            if translated is None:
+                return None  # retried later as a whole
+            return f"{english} {translated or rest}"
+    payload = {
+        "model": cfg.translate_llm_model,
+        "messages": [{"role": "system", "content": _TRANSLATE_SYSTEM}, {"role": "user", "content": text[:2000]}],
+        "temperature": 0.0,
+        "reasoning_effort": "none",
+    }
+    owns = client is None
+    client = client or httpx.AsyncClient(timeout=httpx.Timeout(cfg.translate_llm_timeout_s))
+    try:
+        resp = await client.post(f"{cfg.translate_llm_base_url.rstrip('/')}/chat/completions", json=payload,
+                                 headers={"authorization": "Bearer ollama"})
+        if resp.status_code >= 300:
+            log.warning("translate llm http error", status=resp.status_code)
+            return None
+        reply = resp.json()["choices"][0]["message"]["content"]
+        return parse_translation(reply, text)
+    except Exception as exc:  # noqa: BLE001 - a missing translation never breaks the page
+        log.warning("translate llm failed", error=str(exc)[:200])
+        return None
+    finally:
+        if owns:
+            await client.aclose()

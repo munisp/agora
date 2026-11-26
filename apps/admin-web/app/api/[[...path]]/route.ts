@@ -74,6 +74,11 @@ async function proxy(
   const directToOcrRegistry = path[0] === "ocr-registry";
 
   const session = await auth();
+  // The session's token could not be refreshed (Keycloak session ended): forwarding the stale token only produces
+  // 401s from every service. Tell the browser plainly so it sends the user back through sign-in.
+  if (session?.error === "RefreshAccessTokenError") {
+    return NextResponse.json({ error: "session_expired", message: "Your session has ended. Please sign in again." }, { status: 401 });
+  }
 
   // SPEC-W77 R2/R3: the ocr-service registry-stats endpoint is internal-only
   // (X-Internal-Token), so it is only as protected as this handler makes it.
@@ -155,7 +160,8 @@ async function proxy(
       ? `${ANALYTICS_BASE}/${path.slice(1).join("/")}`
       : directToOcrRegistry
         ? `${OCR_BASE}/v1/internal/ocr/registry-stats`
-        : `${API_BASE}/${path.join("/")}`,
+        : // The gateway's routes keep the /api prefix (/api/bookings/*, /api/identity/*, …).
+          `${API_BASE}/api/${path.join("/")}`,
   );
   target.search = req.nextUrl.search;
   if (analyticsTenantSlug) {
@@ -236,7 +242,10 @@ async function proxy(
     );
   }
 
-  const body = await upstream.arrayBuffer();
+  // 204/205/304 must have a null body: passing even an empty buffer makes the Response constructor throw, so every
+  // successful DELETE (booking-service answers 204) reached the browser as a 500 (2026-11-21).
+  const nullBody = upstream.status === 204 || upstream.status === 205 || upstream.status === 304;
+  const body = nullBody ? null : await upstream.arrayBuffer();
   const res = new NextResponse(body, { status: upstream.status });
   const contentType = upstream.headers.get("content-type");
   if (contentType) res.headers.set("content-type", contentType);

@@ -7,6 +7,10 @@ is rendered per session from the bootstrapped TenantContext.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
+
 import json
 
 from .tenant_context import TenantContext
@@ -15,7 +19,8 @@ _TEMPLATE = """You are {agent_name}, the AI receptionist for {business_name}.
 
 STYLE
 - Warm, concise, professional. Short spoken sentences; no markdown, no lists
-  longer than three items when speaking.
+  longer than three items when speaking. Say each thing once: never repeat a
+  greeting, congratulation or offer within the same reply.
 - Never invent catalog facts, prices or availability. Use the tools.
 - Locale: {locale}. Currency: {currency}. The business timezone is {timezone};
   reason about opening hours and dates in that timezone.
@@ -38,8 +43,17 @@ book_appointment, lookup_appointment, reschedule_appointment,
 cancel_appointment, request_verification_code, verify_caller_code,
 request_human{extra_tool_names}.
 - Use get_availability before offering times; quote times in {timezone}.
+- Choosing the team member is your job: if the caller doesn't name one,
+  pick from TEAM someone who provides the service and check their
+  availability. Never ask the caller which advisor or team member they want.
+- As soon as the caller has said what they want and roughly when, call
+  get_availability straight away.
 - book_appointment requires: offering_id, team_member_id, starts_at (RFC3339),
   and the caller's phone number.
+- Documents: when they need to send you one (a pay stub, a receipt, an ID, a letter), call
+  send_document_upload_link and say what it tells you (on a web chat: the paperclip below the chat;
+  on a call: a WhatsApp upload link). When they say they have sent it, call check_shared_documents.
+  Say only its kind and where the check stands -- never read out details from a document.
 - request_human: use it when the caller explicitly asks for a human, is
   distressed, or you cannot resolve their request after two attempts.
 
@@ -52,7 +66,33 @@ PHONE-CONFIRMATION POLICY (hard rule, enforced server-side)
   same number.
 - Never claim a booking exists until the tool confirms it was accepted.
 
+CALLER DETAILS (start of every call, and every booking)
+- Unless VISITOR DETAILS are given below, the opening line has already asked
+  for the caller's full name, email and phone number: take them FIRST, at the
+  start of the call, before helping with anything else. If the caller starts
+  with a question, say you'll help right after, and take the details first.
+  Read them back once (as below). As soon as the caller confirms them, call
+  save_caller_details (name, phone, email) so they are in the CRM even if
+  they never book, then ask how you can help.
+- Before booking, collect the caller's first name, last name, email address
+  and phone number. Ask for whichever is missing, one at a time, in a
+  friendly way. Pass "First Last" as contact_name and the email as email to
+  book_appointment. If the caller has no email or prefers not to give one,
+  continue without it — never hold up the booking for it.
+- Read the details back ONCE, together, in one sentence: the caller's full
+  name, the email (say "dot" and "at") and the phone number digit by digit — for example "I have Kemi Ojo, email kemi dot ojo
+  at gmail dot com, phone zero eight zero two, five five five, four four one
+  seven. Is that all correct?" If the caller corrects anything, use the
+  corrected spelling exactly and read back only the corrected part.
+- When a caller spells a name or an email letter by letter ("C, H, I, O, M,
+  A"), the spelled letters are the truth: build the name and email from them,
+  even if the word you heard before the spelling looks different. As soon
+  as the caller confirms, book — do not ask about any detail separately.
+
 CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
+- Booking a NEW appointment never needs a one-time code: as soon as the
+  caller confirms the phone number you read back, call book_appointment —
+  do not mention or send any code, and do not ask "are you ready".
 - Looking up, rescheduling or cancelling an EXISTING booking requires a
   verified phone number. If a tool answers "verification_required", call
   request_verification_code with the caller's number, tell the caller a
@@ -66,10 +106,6 @@ CALLER-VERIFICATION POLICY (hard rule, enforced server-side)
   with verify_caller_code.
 - If a tool answers "verification_unavailable", apologize and explain that
   booking changes are temporarily unavailable; do NOT keep retrying.
-
-CALLER CONTEXT
-- conversation_id: {conversation_id}
-- site: {site_slug}
 """
 
 
@@ -138,7 +174,7 @@ def truncate_knowledge_snippets(
     return out
 
 
-def build_greeting(ctx: TenantContext, menu_line: str | None = None) -> str:
+def build_greeting(ctx: TenantContext, menu_line: str | None = None, ask_details: bool = False) -> str:
     """Session-opening greeting, with the SPEC-W11 Part C §5 disclosure.
 
     Default (no pack ``disclosure`` block on the tenant context) is
@@ -155,23 +191,65 @@ def build_greeting(ctx: TenantContext, menu_line: str | None = None) -> str:
     None/"" everywhere else) is appended LAST — recency: the keypad menu
     is the final thing the caller hears. Byte-identical when absent.
     """
+    # ask_details (2026-11-21): the caller filled no form, so the opening line asks for their details first.
     greeting = (
         f"Hello, thank you for calling {ctx.display_name}. "
-        "How can I help you today?"
+        + ("Before we start, may I have your full name, your email and your phone number?"
+           if ask_details else "How can I help you today?")
     )
     disclosure = getattr(ctx, "disclosure", None)
-    if isinstance(disclosure, dict):
-        if disclosure.get("spokenAiDisclosure"):
-            line = AI_DISCLOSURE_LINE
-            extra = str(disclosure.get("text") or "").strip()
-            if extra:
-                line = f"{line} {extra}"
-            greeting = f"{line} {greeting}"
-        if disclosure.get("recordingConsent"):
-            greeting = f"{greeting} {RECORDING_NOTICE_LINE}"
+    if isinstance(disclosure, dict) and disclosure.get("spokenAiDisclosure"):
+        line = AI_DISCLOSURE_LINE
+        extra = str(disclosure.get("text") or "").strip()
+        if extra:
+            line = f"{line} {extra}"
+        greeting = f"{line} {greeting}"
     if menu_line:
         greeting = f"{greeting} {menu_line}"
-    return greeting
+    # The recording notice is always the very first thing a caller hears (whatever the pack's
+    # recordingConsent flag says: every call here is recorded).
+    return f"{RECORDING_NOTICE_LINE} {greeting}"
+
+
+# 2026-11-23 latency: the model's chat template renders the TOOL list right after the first system message, so a
+# varying tail inside that message pushed ~2,000 tokens of tools out of the GPU server's prompt cache on every call.
+# Callers send the stable body and the per-conversation tail as two separate system messages (split_prompt).
+TAIL_MARK = "\n\nTHIS CONVERSATION\n"
+
+
+def split_prompt(text: str) -> tuple[str, str]:
+    """(stable body, per-conversation tail) of a build_system_prompt result; tail "" when there is none."""
+    if TAIL_MARK not in text:
+        return text, ""
+    body, tail = text.split(TAIL_MARK, 1)
+    return body, TAIL_MARK.lstrip("\n") + tail
+
+
+def is_tail_message(text: str) -> bool:
+    return text.startswith(TAIL_MARK.lstrip("\n"))
+
+
+def today_line(tz_name: str | None, now: datetime | None = None, *, clock_only: bool = False) -> str:
+    """Today's date in the business's time zone. Without it the model guessed the year from its training data and
+    asked for availability in the past (e.g. 2025), then told customers nothing was free."""
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:  # noqa: BLE001 - unknown zone name
+        tz = ZoneInfo("UTC")
+    local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    # The model mixed up weekdays and dates ("next Wednesday is the 26th"): spell the next two weeks out, and what each
+    # "next <weekday>" means (the first such day after today), so it never has to work a weekday out itself.
+    from datetime import timedelta
+    days = [local + timedelta(days=i) for i in range(15)]
+    fmt = lambda d: f"{d.strftime('%A')} {d.day} {d.strftime('%B')}"
+    calendar = ", ".join(fmt(d) for d in days[1:])
+    nxt = "; ".join(f"next {d.strftime('%A')} = {d.day} {d.strftime('%B')}" for d in days[1:8])
+    if clock_only:
+        return f"- The local time now is {local.strftime('%H:%M')} ({tz.key})."
+    return (f"Today is {local.strftime('%A')}, {local.day} {local.strftime('%B %Y')} ({tz.key}; the current local "
+            f"time is under THIS CONVERSATION below). Tomorrow is {fmt(days[1])}. The coming days: {calendar}. "
+            f"When a caller says \"next\" with a weekday it means the first such day after today: {nxt}. "
+            f"Use exactly these weekday/date pairs, and never check or book a date in the past.")
 
 
 def build_system_prompt(
@@ -184,6 +262,10 @@ def build_system_prompt(
     language: str | None = None,
     caller_phone: str | None = None,
     keypad_menu_hint: str | None = None,
+    visitor: dict[str, str] | None = None,
+    outbound: str | None = None,
+    turn_knowledge: list[str] | None = None,
+    shared_documents: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render the system prompt.
 
@@ -216,10 +298,26 @@ def build_system_prompt(
         if snippets
         else "- (no extra knowledge available)"
     )
-    if active_agent is not None:
-        agent_name = str(active_agent.get("name") or agent_name)
+    # 2026-11-23 latency: the first line no longer names the active specialist (it changed the prompt's very start
+    # when chat routing switched desks); the SPECIALIST AGENT ACTIVE block in the tail says who is speaking.
     extra_names = "".join(f", {n}" for n in (extra_tool_names or []))
-    prompt = _TEMPLATE.format(
+    # 2026-11-23 latency: the prompt is a STABLE body (identical for every conversation of this business) followed by
+    # a short per-conversation TAIL (date/time, ids, caller details, language, active specialist, this turn's
+    # knowledge). The GPU server can then resume from a saved point inside the body instead of re-reading ~5,000
+    # tokens on every turn (gemma's sliding-window cache only resumes from checkpoints taken near a prompt's end).
+    tail = (TAIL_MARK + today_line(ctx.timezone, clock_only=True)
+            + f"\n- conversation_id: {conversation_id}\n- site: {ctx.site_slug}\n")
+    if shared_documents:
+        # 2026-11-26: what the person has shared in this conversation (kind and check only, never the details).
+        from .documents import documents_in_words
+
+        tail += ("\nDOCUMENTS THEY SHARED IN THIS CONVERSATION\n"
+                 + "\n".join(f"- {d}" for d in documents_in_words(shared_documents)) + "\n")
+    if turn_knowledge:
+        tail += ("\nKNOWLEDGE FOR THE LATEST QUESTION (use it with the KNOWLEDGE above)\n"
+                 + "\n".join(f"- {s}" for s in turn_knowledge) + "\n")
+    # The date and the two-week calendar change once a day: they lead the stable body.
+    prompt = today_line(ctx.timezone) + "\n\n" + _TEMPLATE.format(
         agent_name=agent_name,
         business_name=ctx.display_name or ctx.site_slug,
         locale=ctx.locale,
@@ -253,6 +351,8 @@ def build_system_prompt(
     # SPEC-W70 A3: global spoken-fluency block for every language, BEFORE
     # the per-turn locale instruction so the language rule lands last.
     prompt += "\n" + SPOKEN_STYLE_BLOCK + "\n"
+    # Everything below varies per conversation or turn: it is collected after the stable body (see tail above).
+    stable, prompt = prompt, ""
     # Wave 5 #3: per-turn locale instruction when the caller speaks a
     # non-default language (whisper detection -> MultilangState).
     if language:
@@ -265,7 +365,14 @@ def build_system_prompt(
     # number (prompt hint + emergency location capture); the OTP gate still
     # applies to lookup/reschedule/cancel and the read-back policy to new
     # bookings.
-    if caller_phone:
+    # 2026-11-21: details from the public page's form (app/visitor.py); they replace the SIP caller-ID hint.
+    if outbound:
+        # 2026-11-22: a call the platform placed (app/outbound_script.prompt_block): replaces the caller-ID hint.
+        prompt += outbound
+    elif visitor:
+        from .visitor import prompt_block
+        prompt += prompt_block(visitor)
+    elif caller_phone:
         prompt += (
             f"\nCALLER ID (SIP, unverified)\n- The caller appears to be "
             f"phoning from {caller_phone}. You may use this number when the "
@@ -288,16 +395,16 @@ def build_system_prompt(
                 f"for this part of the conversation; the base receptionist "
                 f"rules above still apply.\n{persona}\n"
             )
-    elif ctx.agents:
+    if ctx.agents:
         roster = "\n".join(
             f"- {a.get('name')} (id {a.get('id')}): handles {', '.join(str(i) for i in (a.get('intents') or [])[:6])}"
             for a in ctx.agents
             if isinstance(a, dict)
         )
         if roster:
-            prompt += (
+            stable += (
                 "\nSPECIALIST AGENTS (the platform routes the conversation "
                 "automatically when the caller's intent matches; you do not "
                 "need to transfer explicitly)\n" + roster + "\n"
             )
-    return prompt
+    return stable + tail + prompt

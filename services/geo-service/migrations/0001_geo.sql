@@ -96,12 +96,28 @@ CREATE POLICY tenant_isolation ON geo_boundaries
 -- app_geo_login is the migration owner on fresh DBs, so its own future
 -- tables must keep default privileges for the group (W51-C idiom).
 -- ---------------------------------------------------------------------------
+-- 2026-11-20: per object, skipping ones this login may not grant on. The
+-- schema is shared with other services, and one table it cannot grant on
+-- (verification_grants) made "ON ALL TABLES" fail, so every restart crashed.
 DO $$
+DECLARE
+    obj RECORD;
 BEGIN
     IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_geo') THEN
         EXECUTE 'GRANT USAGE ON SCHEMA public TO app_geo';
-        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_geo';
-        EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_geo';
+        FOR obj IN SELECT c.relname, c.relkind FROM pg_class c
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S') LOOP
+            BEGIN
+                IF obj.relkind = 'S' THEN
+                    EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE public.%I TO app_geo', obj.relname);
+                ELSE
+                    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO app_geo', obj.relname);
+                END IF;
+            EXCEPTION WHEN insufficient_privilege THEN
+                NULL;
+            END;
+        END LOOP;
     END IF;
 END
 $$;

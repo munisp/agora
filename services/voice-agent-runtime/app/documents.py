@@ -28,6 +28,7 @@ import base64
 import hashlib
 import hmac
 import json
+import asyncio
 import time
 import uuid
 from typing import Any, Awaitable, Callable
@@ -39,6 +40,42 @@ from .logging import get_logger
 from .session_state import store_get, store_save_session
 
 log = get_logger("documents")
+
+#: How long an accepted upload's status is kept for polling (seconds).
+JOB_TTL_S = 3600
+
+
+def document_lookup_sig(secret: str, session_id: str) -> str:
+    """HMAC of a conversation id with the link secret: the call worker proves it may read the documents a caller shared
+    through that call's link (both processes hold the secret; no other token is needed)."""
+    return hmac.new(secret.encode(), f"docs:{session_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def documents_in_words(docs: list[dict[str, Any]]) -> list[str]:
+    """What the receptionist may say about shared documents: their kind and where the check stands -- never the details
+    read from them."""
+    out = []
+    for d in docs:
+        kind = _KIND_LABELS.get(str(d.get("kind") or ""), "document")
+        status, verdict = d.get("status"), d.get("validation_verdict")
+        if status == "processing":
+            out.append(f"a {kind}: received, still being checked (about two minutes)")
+        elif status == "failed":
+            out.append(f"a {kind}: could not be read -- ask them to send a clearer copy")
+        elif verdict == "validated":
+            out.append(f"a {kind}: received and passed the consistency checks")
+        else:
+            rule = _policy_rule(d.get("validation_reasons") or [])
+            if rule and rule[0] == "policy" and verdict == "rejected":
+                out.append(f"a {kind}: not accepted -- it does not meet the policy: {_sentence(rule[1])}")
+            elif rule and rule[0] == "policy":
+                out.append(f"a {kind}: received but it does not meet the policy: {_sentence(rule[1])} "
+                           "A team member will review it")
+            elif verdict == "rejected":
+                out.append(f"a {kind}: not accepted -- ask them for a complete, readable copy")
+            else:
+                out.append(f"a {kind}: received; a team member will review it")
+    return out
 
 #: Caller-shareable kinds (SPEC-W116 §4: ALL non-KYC kinds — pay stub was
 #: the example, not the feature). KYC kinds are NEVER caller-shareable
@@ -170,7 +207,26 @@ _REASON_PHRASES = {
 }
 
 
+def _policy_rule(reasons: list[str]) -> tuple[str, str] | None:
+    """2026-11-26: the first business-policy reason ("policy:<rule>" broken, "policy_unchecked:<rule>" not checkable),
+    as (kind, rule sentence). The rule is the business's own wording, not a detail read from the document."""
+    for r in reasons or []:
+        for prefix in ("policy:", "policy_unchecked:"):
+            if isinstance(r, str) and r.startswith(prefix) and r[len(prefix):].strip():
+                return prefix[:-1], r[len(prefix):].strip()
+    return None
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
 def _human_reason(reason: str) -> str:
+    if reason.startswith("policy:"):
+        return f"it does not meet our policy ({reason.split(':', 1)[1].strip().rstrip('.')})"
+    if reason.startswith("policy_unchecked:"):
+        return f"we could not confirm part of our policy ({reason.split(':', 1)[1].strip().rstrip('.')})"
     if reason.startswith("missing_required_field:"):
         field = reason.split(":", 1)[1].replace("_", " ")
         return f"the {field} is missing"
@@ -183,10 +239,19 @@ def verdict_summary(kind: str, verdict: str, reasons: list[str]) -> str:
     label = _KIND_LABELS.get(kind, "document")
     if verdict == "validated":
         return f"Your {label} was received and passed all consistency checks."
+    rule = _policy_rule(reasons)
     if verdict == "rejected":
+        if rule and rule[0] == "policy":
+            return f"We could not accept this {label}. Our policy says: {_sentence(rule[1])}"
         detail = f": {_human_reason(reasons[0])}" if reasons else ""
         return f"We could not accept this {label}{detail}."
     # needs_review
+    if rule and rule[0] == "policy":
+        return (f"Your {label} was received, but it does not meet our policy: {_sentence(rule[1])} "
+                "A team member will review it shortly.")
+    if rule:
+        return (f"Your {label} was received; we could not confirm this part of our policy: {_sentence(rule[1])} "
+                "A team member will review it shortly.")
     return f"Your {label} was received; a team member will review it shortly."
 
 
@@ -250,6 +315,100 @@ def wire_document_routes(
             )
         return upload.filename, data, kind, mime
 
+    # 2026-11-26: reading a document takes ~2 minutes on the GPU host, past the
+    # ~100 s an edge proxy (Cloudflare) holds a request open. A caller-facing
+    # upload can ask for `respond=async`: the file is validated and accepted at
+    # once (202 + job_id), the read finishes in the background and lands on the
+    # session; the browser polls GET /voice/documents/jobs/{job_id}. Single
+    # replica (voice), so jobs live in this process; a restart loses only the
+    # job's status -- the OCR row and the session entry are the durable record.
+    jobs: dict[str, dict[str, Any]] = {}
+    app.state.document_jobs = jobs
+    # Documents shared through a call's link, by conversation id. A live call's session lives in the call worker, not
+    # in this process's store, so the link's own token is the correlation; the worker reads these back (below).
+    link_docs: dict[str, list[dict[str, Any]]] = {}
+    app.state.link_documents = link_docs
+    background: set[asyncio.Task] = set()
+
+    def _prune_jobs() -> None:
+        cutoff = time.time() - JOB_TTL_S
+        for jid in [j for j, v in jobs.items() if v.get("created_at", 0) < cutoff]:
+            jobs.pop(jid, None)
+
+    def _wants_async(form: Any) -> bool:
+        return str(form.get("respond") or "").strip().lower() == "async"
+
+    async def _update_session_entry(session_id: str, job_id: str, update: dict[str, Any]) -> None:
+        listed = link_docs.setdefault(session_id, [])
+        for entry in listed:
+            if entry.get("job_id") == job_id:
+                entry.update(update)
+                break
+        else:
+            listed.append({"job_id": job_id, **update})
+        session = await store_get(sessions, session_id)
+        if session is None:
+            return
+        for entry in session.shared_documents:
+            if entry.get("job_id") == job_id:
+                entry.update(update)
+                break
+        else:
+            session.shared_documents.append({"job_id": job_id, **update})
+        session.touch()
+        try:
+            await store_save_session(sessions, session)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("documents.session_save_failed", error=str(exc)[:200])
+
+    def _start_job(*, tenant_id: str, kind: str, filename: str, data: bytes, mime: str,
+                   channel: str, session_id: str | None) -> str:
+        _prune_jobs()
+        job_id = uuid.uuid4().hex
+        jobs[job_id] = {"status": "processing", "kind": kind, "created_at": time.time()}
+
+        async def run() -> None:
+            try:
+                result = await ocr_client.extract(
+                    tenant_id=tenant_id, kind=kind, filename=filename,
+                    data=data, mime=mime, source_channel=channel,
+                )
+                verdict = result.get("validation_verdict") or "needs_review"
+                reasons = result.get("validation_reasons") or []
+                done = {"status": "done", "document_id": result.get("document_id"), "kind": kind,
+                        "validation_verdict": verdict, "validation_reasons": reasons,
+                        "summary": verdict_summary(kind, verdict, reasons)}
+            except Exception as exc:  # noqa: BLE001 -- reported to the poller, never raised
+                log.warning("documents.ocr_background_failed", error=str(exc)[:200])
+                done = {"status": "failed", "kind": kind,
+                        "summary": "Sorry, I couldn't read that document. Please try again, or send a clearer copy."}
+            jobs[job_id] = {**jobs.get(job_id, {}), **done}
+            if session_id:
+                await _update_session_entry(session_id, job_id, {
+                    k: done.get(k) for k in ("status", "document_id", "kind", "validation_verdict", "validation_reasons")
+                } | {"channel": channel, "shared_at": time.time()})
+
+        task = asyncio.create_task(run())
+        background.add(task)
+        task.add_done_callback(background.discard)
+        return job_id
+
+    def _accepted(job_id: str, kind: str) -> Any:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=202, content={
+            "job_id": job_id, "status": "processing", "kind": kind,
+            "summary": "Got it — I'm checking your document now. This usually takes about two minutes.",
+        })
+
+    @app.get("/voice/documents/jobs/{job_id}")
+    async def document_job(job_id: str) -> dict[str, Any]:
+        """The status of an accepted upload (public; the job id is an unguessable
+        128-bit token and the answer carries only the verdict, never the fields)."""
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return {k: v for k, v in job.items() if k != "created_at"} | {"job_id": job_id}
+
     async def _attach_to_session(session_id: str, entry: dict[str, Any]) -> bool:
         """Append the shared-document ref to the session (fail-open on
         save errors — the OCR row is the durable record)."""
@@ -275,6 +434,15 @@ def wire_document_routes(
             raise HTTPException(status_code=400, detail="site_slug required")
         filename, data, kind, mime = await _read_caller_upload(request)
         tenant_id = await _resolve_tenant(site_slug)
+        if _wants_async(form):
+            sid = form.get("session_id")
+            sid = sid if isinstance(sid, str) and sid else None
+            job_id = _start_job(tenant_id=tenant_id, kind=kind, filename=filename, data=data,
+                                mime=mime, channel="web", session_id=sid)
+            if sid:
+                await _update_session_entry(sid, job_id, {"status": "processing", "kind": kind,
+                                                           "channel": "web", "shared_at": time.time()})
+            return _accepted(job_id, kind)
         try:
             result = await ocr_client.extract(
                 tenant_id=tenant_id, kind=kind, filename=filename,
@@ -347,9 +515,14 @@ def wire_document_routes(
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         filename, data, kind, mime = await _read_caller_upload(request)
         session_id = payload["sid"]
-        if await store_get(sessions, session_id) is None:
-            # honest: the whole point of the link is session correlation
-            raise HTTPException(status_code=404, detail="session not found")
+        # The signed token names the conversation: a live call's session is held by the call worker, not this process's
+        # store (2026-11-26), so a missing session here is not an error -- the result is kept by conversation id.
+        if _wants_async(await request.form()):
+            job_id = _start_job(tenant_id=payload["t"], kind=kind, filename=filename, data=data,
+                                mime=mime, channel="voice", session_id=session_id)
+            await _update_session_entry(session_id, job_id, {"status": "processing", "kind": kind,
+                                                              "channel": "voice", "shared_at": time.time()})
+            return _accepted(job_id, kind)
         try:
             result = await ocr_client.extract(
                 tenant_id=payload["t"], kind=kind, filename=filename,
@@ -360,14 +533,17 @@ def wire_document_routes(
             raise HTTPException(status_code=502, detail="document analysis failed") from exc
         verdict = result.get("validation_verdict") or "needs_review"
         reasons = result.get("validation_reasons") or []
-        await _attach_to_session(session_id, {
+        entry = {
             "document_id": result.get("document_id"),
             "kind": kind,
+            "status": "done",
             "validation_verdict": verdict,
             "validation_reasons": reasons,
             "channel": "voice",
             "shared_at": time.time(),
-        })
+        }
+        link_docs.setdefault(session_id, []).append(entry)
+        await _attach_to_session(session_id, dict(entry))
         return {
             "document_id": result.get("document_id"),
             "kind": kind,
@@ -375,6 +551,23 @@ def wire_document_routes(
             "validation_reasons": reasons,
             "summary": verdict_summary(kind, verdict, reasons),
         }
+
+    @app.get("/voice/internal/documents/{session_id}")
+    async def internal_session_documents(session_id: str, request: Request) -> dict[str, Any]:
+        """The documents shared in a conversation, for the call worker's check_shared_documents tool. Signed with the
+        link secret (document_lookup_sig); answers kinds and check results only."""
+        if not settings.document_link_secret:
+            raise HTTPException(status_code=503, detail="document sharing not configured")
+        sig = request.headers.get("X-Document-Sig") or ""
+        if not hmac.compare_digest(sig, document_lookup_sig(settings.document_link_secret, session_id)):
+            raise HTTPException(status_code=401, detail="invalid signature")
+        docs = list(link_docs.get(session_id, []))
+        session = await store_get(sessions, session_id)
+        if session is not None:
+            seen = {d.get("job_id") or d.get("document_id") for d in docs}
+            docs += [dict(d) for d in session.shared_documents if (d.get("job_id") or d.get("document_id")) not in seen]
+        keep = ("kind", "status", "validation_verdict", "validation_reasons", "channel", "shared_at")
+        return {"documents": [{k: d.get(k) for k in keep} for d in docs]}
 
     @app.get("/voice/sessions/{session_id}/documents")
     async def list_session_documents(session_id: str, request: Request) -> dict[str, Any]:

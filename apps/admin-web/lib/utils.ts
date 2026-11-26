@@ -5,15 +5,20 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** Agora is Nigeria-first: amounts default to naira and times to Lagos. A fixed zone also keeps the server render and
+ * the browser render identical (an unset zone is UTC on the server but local time in the browser: React #418). */
+export const DEFAULT_CURRENCY = "NGN";
+export const DEFAULT_TIME_ZONE = "Africa/Lagos";
+
 /** Format cents as a localised currency string. */
-export function formatMoney(cents: number, currency = "USD", locale = "en-US") {
+export function formatMoney(cents: number, currency = DEFAULT_CURRENCY, locale = "en-NG") {
   return new Intl.NumberFormat(locale, {
     style: "currency",
     currency,
   }).format(cents / 100);
 }
 
-export function formatDateTime(iso: string, locale = "en-US", timeZone?: string) {
+export function formatDateTime(iso: string, locale = "en-US", timeZone: string = DEFAULT_TIME_ZONE) {
   return new Intl.DateTimeFormat(locale, {
     dateStyle: "medium",
     timeStyle: "short",
@@ -21,7 +26,7 @@ export function formatDateTime(iso: string, locale = "en-US", timeZone?: string)
   }).format(new Date(iso));
 }
 
-export function formatTime(iso: string, locale = "en-US", timeZone?: string) {
+export function formatTime(iso: string, locale = "en-US", timeZone: string = DEFAULT_TIME_ZONE) {
   return new Intl.DateTimeFormat(locale, {
     hour: "numeric",
     minute: "2-digit",
@@ -29,7 +34,7 @@ export function formatTime(iso: string, locale = "en-US", timeZone?: string) {
   }).format(new Date(iso));
 }
 
-export function formatDate(iso: string, locale = "en-US", timeZone?: string) {
+export function formatDate(iso: string, locale = "en-US", timeZone: string = DEFAULT_TIME_ZONE) {
   return new Intl.DateTimeFormat(locale, {
     dateStyle: "full",
     timeZone,
@@ -85,4 +90,18 @@ export function addDays(d: Date, n: number) {
 
 export function titleCase(s: string) {
   return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * The list in an API response: a bare array, `{items: [...]}`, or one named list such as booking-service's
+ * `{offerings: [...]}` / `{bookings: [...]}` (null or missing lists give []).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- callers type the result through their state
+export function listFrom<T = any>(data: unknown): T[] {
+  if (Array.isArray(data)) return data as T[];
+  if (typeof data !== "object" || data === null) return [];
+  const items = (data as { items?: unknown }).items;
+  if (Array.isArray(items)) return items as T[];
+  const lists = Object.values(data as Record<string, unknown>).filter((v) => Array.isArray(v));
+  return lists.length === 1 ? (lists[0] as T[]) : [];
 }

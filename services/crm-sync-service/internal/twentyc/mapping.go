@@ -2,8 +2,10 @@
 package twentyc
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -57,7 +59,31 @@ type Emails struct {
 
 // Phones is Twenty's PHONES field shape.
 type Phones struct {
-	PrimaryPhoneNumber string `json:"primaryPhoneNumber"`
+	PrimaryPhoneNumber      string `json:"primaryPhoneNumber"`
+	PrimaryPhoneCountryCode string `json:"primaryPhoneCountryCode,omitempty"`
+	PrimaryPhoneCallingCode string `json:"primaryPhoneCallingCode,omitempty"`
+}
+
+// NationalPhone splits a phone as callers give it into Twenty's parts. Twenty rejects a local number such as
+// "08065553108" with 400 "Provided phone number is invalid", so every booking/call failed to reach the CRM.
+// Nigerian numbers (0XXXXXXXXXX, 234XXXXXXXXXX, +234XXXXXXXXXX) become national "XXXXXXXXXX" + NG/+234;
+// anything else is passed through unchanged with no country.
+func NationalPhone(phone string) (national, country, calling string) {
+	raw := strings.TrimSpace(phone)
+	var b strings.Builder
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	d := b.String()
+	switch {
+	case strings.HasPrefix(d, "234") && len(d) == 13:
+		return d[3:], "NG", "+234"
+	case strings.HasPrefix(d, "0") && len(d) == 11:
+		return d[1:], "NG", "+234"
+	}
+	return raw, "", ""
 }
 
 // PersonFromContact maps booking contact fields -> Person upsert body.
@@ -67,10 +93,28 @@ func PersonFromContact(name, email, phone string) PersonUpsert {
 	if email != "" {
 		p.Emails = &Emails{PrimaryEmail: email}
 	}
-	if phone != "" {
-		p.Phones = &Phones{PrimaryPhoneNumber: phone}
+	if phone != "" && plausiblePhone(phone) {
+		national, country, calling := NationalPhone(phone)
+		p.Phones = &Phones{PrimaryPhoneNumber: national, PrimaryPhoneCountryCode: country, PrimaryPhoneCallingCode: calling}
 	}
 	return p
+}
+
+// plausiblePhone: a Nigerian number NationalPhone recognises, or an international "+" number of 8-15 digits. Anything
+// else (a voice-call mishearing like "080065553108") is left off the Person: Twenty rejects the whole create with 400,
+// which dead-lettered the event and lost the contributor, task and call summary.
+func plausiblePhone(phone string) bool {
+	if _, country, _ := NationalPhone(phone); country != "" {
+		return true
+	}
+	raw := strings.TrimSpace(phone)
+	digits := 0
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	return strings.HasPrefix(raw, "+") && digits >= 8 && digits <= 15
 }
 
 // SplitName splits a display name into first/last at the first space.
@@ -86,32 +130,89 @@ func SplitName(name string) FullName {
 	return FullName{FirstName: first, LastName: strings.TrimSpace(last)}
 }
 
-// TaskTitle renders "{offering} appointment at {starts_at}" (SPEC-CRM §B).
-// starts_at is rendered RFC3339 in UTC for stable, parseable titles.
+// TaskTitle renders "{offering} — Tue 24 Nov 2026, 9:00 am (Lagos)" in the business's time zone (env
+// CRM_TASK_TIMEZONE, default Africa/Lagos). It used to be "… appointment at 2026-11-24T08:00:00Z": a 9 am Lagos visit
+// read as 08:00 to the business. Tasks are matched by booking id (syncmap) and the machine time lives in dueAt, so the
+// title is only for people.
 func TaskTitle(offering string, startsAt time.Time) string {
 	if offering == "" {
 		offering = "Appointment"
 	}
-	return fmt.Sprintf("%s appointment at %s", offering, startsAt.UTC().Format(time.RFC3339))
+	tzName := os.Getenv("CRM_TASK_TIMEZONE")
+	if tzName == "" {
+		tzName = "Africa/Lagos"
+	}
+	loc, err := time.LoadLocation(tzName)
+	if err != nil {
+		loc = time.UTC
+	}
+	local := startsAt.In(loc)
+	city := tzName
+	if i := strings.LastIndex(tzName, "/"); i >= 0 {
+		city = strings.ReplaceAll(tzName[i+1:], "_", " ")
+	}
+	return fmt.Sprintf("%s — %s, %s (%s)", offering, local.Format("Mon 2 Jan 2006"),
+		strings.ToLower(local.Format("3:04 PM")), city)
+}
+
+// RichText is Twenty's rich-text field (v1.x renamed tasks'/notes' "body" to "bodyV2"; the old field is rejected with
+// 400 "Field metadata for field body is missing"). Twenty converts the markdown to its own format.
+type RichText struct {
+	Markdown string `json:"markdown"`
 }
 
 // TaskCreate is the body for creating a Twenty Task.
 type TaskCreate struct {
-	Title  string `json:"title"`
-	Body   string `json:"body,omitempty"`
-	DueAt  string `json:"dueAt,omitempty"`
-	Status string `json:"status,omitempty"`
+	Title  string    `json:"title"`
+	Body   string    `json:"-"`
+	BodyV2 *RichText `json:"bodyV2,omitempty"`
+	DueAt  string    `json:"dueAt,omitempty"`
+	Status string    `json:"status,omitempty"`
+}
+
+// MarshalJSON sends Body as Twenty's bodyV2 rich text.
+func (t TaskCreate) MarshalJSON() ([]byte, error) {
+	type plain TaskCreate
+	p := plain(t)
+	if p.BodyV2 == nil && p.Body != "" {
+		p.BodyV2 = &RichText{Markdown: p.Body}
+	}
+	return json.Marshal(p)
 }
 
 // TaskFromBooking maps a booking event -> Task create body linked to a person.
 func TaskFromBooking(d events.BookingData) TaskCreate {
 	return TaskCreate{
-		Title: TaskTitle(d.OfferingName, d.StartsAt),
-		Body: fmt.Sprintf("OpenDesk booking %s (%s) — contact %s, source %s, price %d %s.",
-			d.BookingID, d.Status, d.ContactName, d.Source, d.PriceCents, d.Currency),
+		Title:  TaskTitle(d.OfferingName, d.StartsAt),
+		Body:   BookingTaskBody(d.Status, d.ContactName, d.Source, d.PriceCents, d.Currency),
 		DueAt:  FormatTime(d.StartsAt),
 		Status: "TODO",
 	}
+}
+
+// BookingTaskBody is the plain-language task body a business reads (2026-11-23: it used to read
+// "OpenDesk booking <uuid> (confirmed) — contact X, source voice, price 0 NGN", exposing the platform's internals).
+func BookingTaskBody(status, contact, source string, priceCents int64, currency string) string {
+	st := strings.TrimSpace(status)
+	if st == "" {
+		st = "new"
+	}
+	st = strings.ToUpper(st[:1]) + strings.ReplaceAll(st[1:], "_", " ")
+	who := strings.TrimSpace(contact)
+	if who == "" {
+		who = "a customer"
+	}
+	via := map[string]string{"voice": "on a call with the receptionist", "phone": "on a call with the receptionist",
+		"web": "on the booking page", "chat": "in a web chat", "whatsapp": "on WhatsApp", "telegram": "on Telegram",
+		"staff": "by staff", "admin": "by staff", "field": "by a field agent", "ussd": "by USSD"}[strings.ToLower(strings.TrimSpace(source))]
+	if via == "" {
+		via = "online"
+	}
+	price := "Free consultation."
+	if priceCents > 0 {
+		price = fmt.Sprintf("Price: %s %.2f.", strings.ToUpper(currency), float64(priceCents)/100)
+	}
+	return fmt.Sprintf("%s booking for %s, made %s. %s", st, who, via, price)
 }
 
 // CancelNote renders the note appended to a task body on BookingCancelled.
@@ -119,60 +220,150 @@ func CancelNote(reason string) string {
 	if reason == "" {
 		reason = "no reason given"
 	}
-	return "Booking cancelled in OpenDesk: " + reason
+	return "Booking cancelled: " + reason
 }
 
 // AIBookingNote is the Note body for AI-receptionist bookings (SPEC-CRM §B).
 const AIBookingNote = "Booked via AI receptionist"
 
-// CallSummaryNoteTitle is the Note title for AI call-quality summaries
-// (enriched SessionEnded events on opendesk.conversation.events).
-const CallSummaryNoteTitle = "📞 AI call summary"
+// CallSummaryNoteTitle is the Note title for the call summary written when a
+// call ends (SessionEnded / CallQualityEnriched on the conversation topics).
+const CallSummaryNoteTitle = "📞 Call summary"
 
-// CallSummaryNote renders the markdown-ish Note body for an enriched
-// SessionEnded call-quality payload, e.g.:
+// CallSummaryNote renders the call summary a business owner reads in the CRM:
+// the plain-language summary (from callsummary, may be empty) followed by the
+// facts that matter to the business, e.g.
 //
-//	📞 AI call summary — duration 95s, 6 turns, tools: book_appointment×1,
-//	avg LLM 820ms (max 1400ms), escalated: no, fallback used: no
+//	The caller wanted to open a retirement savings account. The receptionist
+//	booked an RSA Registration call for Tuesday 24 November at 9:00 am.
 //
-// Optional segments are omitted when the payload lacks them (no tool calls,
-// no LLM latency samples, no avg sentiment). Sentiment is NOT produced by
-// the voice runtime — per-turn sentiment/intent lives in the OpenSearch
-// conversations index (conversation-service intel); the field exists only
-// for future/event-external enrichment.
-func CallSummaryNote(q events.CallQuality) string {
-	parts := []string{
-		fmt.Sprintf("duration %ds", int(math.Round(q.DurationS))),
-		fmt.Sprintf("%d turns", q.TurnCount),
+//	- Call length: 5 min 42 s
+//	- Phone confirmed: 0806 555 3108
+//	- Appointment booked: Yes
+//	- Passed to a person: No
+//
+// Engineering signals (turn counts, tool names, latencies, speech-engine call
+// counts) stay out of the CRM: they live in the call-quality metrics.
+// PurposeLabel turns an outbound call purpose into plain words.
+func PurposeLabel(p string) string {
+	switch strings.TrimSpace(p) {
+	case "confirm_appointment":
+		return "Confirm appointment"
+	case "waitlist_offer":
+		return "Waiting-list slot offer"
+	case "no_show_rebook":
+		return "Rebook a missed appointment"
+	case "callback":
+		return "Call back"
+	case "", "general":
+		return "General call"
 	}
-	if len(q.ToolCalls) > 0 {
-		names := make([]string, 0, len(q.ToolCalls))
-		for name := range q.ToolCalls {
-			names = append(names, name)
+	return strings.ReplaceAll(p, "_", " ")
+}
+
+// CallSummaryNoteTitleFor names the note by the kind of call (2026-11-23): "📞 Outbound call — Confirm appointment",
+// "📞 Inbound call", "💻 Web call". Notes from events without a direction keep the old generic title.
+func CallSummaryNoteTitleFor(q events.CallQuality) string {
+	switch {
+	case q.Channel == "email":
+		return "✉️ Email"
+	case q.Channel == "whatsapp":
+		return "💬 WhatsApp chat"
+	case q.Channel == "telegram":
+		return "💬 Telegram chat"
+	case q.Channel == "chat":
+		return "💬 Web chat"
+	case q.Direction == "outbound":
+		return "📞 Outbound call — " + PurposeLabel(q.Purpose)
+	case q.Channel == "web":
+		return "💻 Web call"
+	case q.Direction == "inbound":
+		return "📞 Inbound call"
+	}
+	return CallSummaryNoteTitle
+}
+
+// CallOutcomeLabel is the plain wording of an outbound call's recorded result ("" for none/unknown).
+func CallOutcomeLabel(outcome string) string {
+	return map[string]string{
+		"confirmed": "Confirmed they will attend", "declined": "Declined", "rescheduled": "Rescheduled",
+		"resolved": "Request handled", "call_back_later": "Asked us to call back later",
+		"wrong_person": "Reached someone else", "no_answer": "No answer (voicemail)",
+	}[outcome]
+}
+
+func CallSummaryNote(q events.CallQuality, summary string) string {
+	var b strings.Builder
+	if s := strings.TrimSpace(summary); s != "" {
+		b.WriteString(s)
+		b.WriteString("\n\n")
+	}
+	if q.IsTextChannel() {
+		// 2026-11-24: chats and WhatsApp conversations are written as such, not as calls.
+		fmt.Fprintf(&b, "- Conversation: %s (they wrote in)\n", map[string]string{
+			"chat": "web chat", "whatsapp": "WhatsApp", "telegram": "Telegram", "email": "e-mail"}[q.Channel])
+		fmt.Fprintf(&b, "- Messages from the customer: %d\n", q.TurnCount)
+		if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
+			fmt.Fprintf(&b, "- Phone: %s\n", spacedPhone(p))
 		}
-		sort.Strings(names)
-		tools := make([]string, 0, len(names))
-		for _, name := range names {
-			tools = append(tools, fmt.Sprintf("%s×%d", name, q.ToolCalls[name]))
+		if e := strings.TrimSpace(q.ContactEmail); e != "" {
+			fmt.Fprintf(&b, "- Email: %s\n", e)
 		}
-		parts = append(parts, "tools: "+strings.Join(tools, ", "))
-	}
-	if q.AvgLLMLatencyMs != nil {
-		seg := fmt.Sprintf("avg LLM %dms", *q.AvgLLMLatencyMs)
-		if q.MaxLLMLatencyMs != nil {
-			seg += fmt.Sprintf(" (max %dms)", *q.MaxLLMLatencyMs)
+	} else {
+		switch q.Direction {
+		case "outbound":
+			fmt.Fprintf(&b, "- Call: outbound (we called) — %s\n", PurposeLabel(q.Purpose))
+		case "inbound":
+			fmt.Fprintf(&b, "- Call: inbound (they called)\n")
 		}
-		parts = append(parts, seg)
+		fmt.Fprintf(&b, "- Call length: %s\n", callLength(q.DurationS))
+		if p := strings.TrimSpace(q.ConfirmedPhone); p != "" {
+			fmt.Fprintf(&b, "- Phone confirmed: %s\n", spacedPhone(p))
+		}
 	}
-	if q.SttCalls > 0 || q.TtsCalls > 0 {
-		parts = append(parts, fmt.Sprintf("stt %d calls, tts %d calls", q.SttCalls, q.TtsCalls))
+	booked := "No"
+	switch {
+	case q.ToolCalls["book_appointment"] > 0:
+		booked = "Yes"
+	case q.ToolCalls["reschedule_appointment"] > 0:
+		booked = "Rescheduled"
+	case q.ToolCalls["cancel_appointment"] > 0:
+		booked = "Cancelled"
 	}
-	parts = append(parts, "escalated: "+yesNo(q.Escalated))
-	parts = append(parts, "fallback used: "+yesNo(q.LLMFallbackUsed))
+	if label := CallOutcomeLabel(q.CallOutcome); booked == "No" && label != "" {
+		// 2026-11-23: an outbound call's recorded result says more than "not booked" (e.g. they confirmed).
+		fmt.Fprintf(&b, "- Outcome: %s\n", label)
+	} else {
+		fmt.Fprintf(&b, "- Appointment booked: %s\n", booked)
+	}
+	fmt.Fprintf(&b, "- Passed to a person: %s", strings.Title(yesNo(q.Escalated))) //nolint:staticcheck // ASCII yes/no
 	if q.AvgSentiment != nil {
-		parts = append(parts, fmt.Sprintf("avg sentiment %.2f", *q.AvgSentiment))
+		mood := "Neutral"
+		if *q.AvgSentiment >= 0.25 {
+			mood = "Positive"
+		} else if *q.AvgSentiment <= -0.25 {
+			mood = "Negative"
+		}
+		fmt.Fprintf(&b, "\n- Caller's mood: %s", mood)
 	}
-	return CallSummaryNoteTitle + " — " + strings.Join(parts, ", ")
+	return b.String()
+}
+
+func callLength(sec float64) string {
+	n := int(math.Round(sec))
+	if n < 60 {
+		return fmt.Sprintf("%d s", n)
+	}
+	return fmt.Sprintf("%d min %d s", n/60, n%60)
+}
+
+// spacedPhone writes an 11-digit Nigerian mobile as 0806 555 3108; other
+// formats are returned as given.
+func spacedPhone(p string) string {
+	if len(p) == 11 && strings.HasPrefix(p, "0") && strings.Trim(p, "0123456789") == "" {
+		return p[:4] + " " + p[4:7] + " " + p[7:]
+	}
+	return p
 }
 
 // CaptureNoteTitle is the Note title for post-call captured fields

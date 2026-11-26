@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ..config import Settings
+from ..graph import as_list
 from .base import Detector, Finding, hours_ago, parse_ts
 
 CYPHER = """
@@ -103,7 +104,7 @@ class SybilClusterDetector(Detector):
                     for j in range(i + 1, len(bucket)):
                         a, b = bucket[i], bucket[j]
                         pa, pb = str(a["person_id"]), str(b["person_id"])
-                        sim = cosine_similarity(a.get("embedding") or [], b.get("embedding") or [])
+                        sim = cosine_similarity(as_list(a.get("embedding")), as_list(b.get("embedding")))
                         if sim >= settings.sybil_sim_threshold:
                             uf.union(pa, pb)
                             pair_scores[(pa, pb)] = round(sim, 6)

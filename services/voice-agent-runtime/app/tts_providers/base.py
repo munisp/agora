@@ -16,6 +16,8 @@ converts to PCM for the LiveKit pipeline via app.pipeline.tts._wav_to_pcm.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
@@ -30,7 +32,31 @@ class Voice:
     labels: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """API shape (GET /voice/voices): ``labels`` is a list of strings, as the admin UI and the sidecars use it;
+        a cloned voice's display name is ``name``."""
+        out = asdict(self)
+        labels = self.labels or {}
+        out["labels"] = [str(t) for t in labels.get("tags", []) or []] + [
+            str(v) for k, v in labels.items() if k not in ("tags", "name") and isinstance(v, (str, int, float))
+        ]
+        if labels.get("name"):
+            out["name"] = str(labels["name"])
+        return out
+
+
+# The business a request acts for. Cloned (XTTS) voices are biometric data owned by one business: the xtts provider
+# only lists and speaks a voice for the business set here, and fails closed when none is set.
+voice_tenant: ContextVar[str | None] = ContextVar("voice_tenant", default=None)
+
+
+def labels_of(item: dict[str, Any]) -> dict[str, Any]:
+    """Sidecar labels as a dict. The mms/xtts sidecars send a list of tags (``["mms", "vits"]``), which ``dict()``
+    rejects; that made GET /voice/voices list those providers with no voices."""
+    raw = item.get("labels")
+    out: dict[str, Any] = dict(raw) if isinstance(raw, dict) else ({"tags": [str(t) for t in raw]} if isinstance(raw, list) else {})
+    if item.get("name"):
+        out.setdefault("name", str(item["name"]))
+    return out
 
 
 class TTSProvider(Protocol):

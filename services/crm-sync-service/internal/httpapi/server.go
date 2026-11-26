@@ -53,13 +53,17 @@ type WebhookDedupe interface {
 
 // Server bundles the HTTP dependencies.
 type Server struct {
-	Twenty         *twentyc.Client
-	Dapr           *daprc.Client
-	PubSubName     string
-	CRMEventsTopic string
-	WebhookSecret  string
-	DB             Pinger
-	Map            MapReader
+	Twenty *twentyc.Client
+	// TwentyRouter (2026-11-23): a business with its own Twenty instance gets its tasks there.
+	TwentyRouter *twentyc.Router
+	// ExtraWebhookSecrets: the webhook secrets of the per-business instances (any match is accepted).
+	ExtraWebhookSecrets []string
+	Dapr                *daprc.Client
+	PubSubName          string
+	CRMEventsTopic      string
+	WebhookSecret       string
+	DB                  Pinger
+	Map                 MapReader
 	// Dedupe is the webhook replay guard (webhook_events_seen, 24h window).
 	// Nil → dedupe disabled (tests / no-DB deployments).
 	Dedupe  WebhookDedupe
@@ -68,7 +72,10 @@ type Server struct {
 	// gate on the service-to-service /v1 surface — 503 fail-closed when
 	// unset, 401 missing/wrong (identity-service K2 pattern).
 	InternalToken string
-	Log           *zap.Logger
+	// Human inbox (Chatwoot) webhook, mounted at /webhooks/chatwoot/{secret} (2026-11-23). Nil = not mounted.
+	InboxWebhook       http.Handler
+	InboxWebhookSecret string
+	Log                *zap.Logger
 }
 
 // Router builds the chi router.
@@ -77,6 +84,15 @@ func (s *Server) Router() http.Handler {
 	r.Get("/healthz", s.healthz)
 	r.Get("/metrics", s.metricsHandler)
 	r.Post("/webhooks/twenty", s.twentyWebhook)
+	if s.InboxWebhook != nil && s.InboxWebhookSecret != "" {
+		r.Post("/webhooks/chatwoot/{secret}", func(w http.ResponseWriter, r *http.Request) {
+			if subtle.ConstantTimeCompare([]byte(chi.URLParam(r, "secret")), []byte(s.InboxWebhookSecret)) != 1 {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			s.InboxWebhook.ServeHTTP(w, r)
+		})
+	}
 	// SPEC-W45 K21 (OOS-09): the /v1 helper surface is internal-only.
 	r.Group(func(r chi.Router) {
 		r.Use(s.internauth)
@@ -223,7 +239,11 @@ func (s *Server) twentyWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sig := r.Header.Get("X-Twenty-Webhook-Signature")
-	if !VerifySignature(s.WebhookSecret, body, sig) {
+	ok := VerifySignature(s.WebhookSecret, body, sig)
+	for _, sec := range s.ExtraWebhookSecrets {
+		ok = ok || (sec != "" && VerifySignature(sec, body, sig))
+	}
+	if !ok {
 		s.Metrics.Inc("webhook_rejected")
 		writeError(w, http.StatusUnauthorized, "invalid webhook signature")
 		return
@@ -322,7 +342,11 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	personID := s.resolvePerson(r, req)
 
 	task := twentyc.TaskCreate{Title: req.Title, Body: req.Body, DueAt: dueAt, Status: "TODO"}
-	taskID, err := s.Twenty.CreateTask(r.Context(), task, personID)
+	tw := s.Twenty
+	if s.TwentyRouter != nil {
+		tw = s.TwentyRouter.ForTenantKey(firstNonEmptyStr(req.TenantID, req.TenantSlug))
+	}
+	taskID, err := tw.CreateTask(r.Context(), task, personID)
 	if err != nil {
 		if taskID != "" {
 			// Task exists but the person link (taskTarget) failed: accept the
@@ -400,7 +424,11 @@ func (s *Server) resolvePerson(r *http.Request, req createTaskRequest) string {
 			}
 			return id
 		}
-		rec, err := s.Twenty.FindPerson(r.Context(), req.Email, req.Phone)
+		tw := s.Twenty
+		if s.TwentyRouter != nil {
+			tw = s.TwentyRouter.ForTenantKey(firstNonEmptyStr(req.TenantID, req.TenantSlug))
+		}
+		rec, err := tw.FindPerson(r.Context(), req.Email, req.Phone)
 		if err == nil {
 			return rec.ID
 		}
@@ -419,4 +447,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

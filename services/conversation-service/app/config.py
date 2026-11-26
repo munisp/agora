@@ -67,6 +67,11 @@ class Config:
     intel_llm_model: str = "qwen3:8b"
     intel_llm_api_key: str = "ollama"
     intel_llm_timeout_s: float = 3.0
+    # English translation of non-English transcript lines, made when the owner opens a conversation (POST
+    # /v1/conversations/{id}/translate) and stored with the turn. Empty base URL = off.
+    translate_llm_base_url: str = ""
+    translate_llm_model: str = "gemma4:26b"
+    translate_llm_timeout_s: float = 60.0
     enriched_topic: str = "opendesk.conversation.enriched"
 
     # Call-quality sentiment enrichment (STRATEGY §3, Wave 5 innovation 2):
@@ -179,6 +184,9 @@ class Config:
     indexer_group: str = "conversation-service-indexer"
     indexer_bulk_size: int = 100
     indexer_bulk_flush_seconds: float = 2.0
+    # Reconcile the index with Postgres (drop docs of deleted conversations)
+    # every N seconds; 0 disables.
+    indexer_prune_seconds: int = 3600
 
     @property
     def database_dsn(self) -> str:
@@ -215,6 +223,9 @@ def load() -> Config:
         fluvio_endpoint=_env("FLUVIO_ENDPOINT", "fluvio:9003"),
         kafka_brokers=[b.strip() for b in _env("KAFKA_BROKERS", "kafka:9092").split(",") if b.strip()],
         intel_llm=_env("INTEL_LLM", "off").lower() in ("1", "on", "true", "yes"),
+        translate_llm_base_url=_env("TRANSLATE_LLM_BASE_URL", ""),
+        translate_llm_model=_env("TRANSLATE_LLM_MODEL", "gemma4:26b"),
+        translate_llm_timeout_s=float(_env("TRANSLATE_LLM_TIMEOUT_S", "60")),
         intel_llm_base_url=_env("INTEL_LLM_BASE_URL", _env("LLM_BASE_URL", "http://ollama:11434/v1")),
         intel_llm_model=_env("INTEL_LLM_MODEL", _env("LLM_MODEL", "qwen3:8b")),
         intel_llm_api_key=_env("INTEL_LLM_API_KEY", _env("LLM_API_KEY", "ollama")),
@@ -226,6 +237,7 @@ def load() -> Config:
         indexer_group=_env("INDEXER_GROUP", "conversation-service-indexer"),
         indexer_bulk_size=int(_env("INDEXER_BULK_SIZE", "100")),
         indexer_bulk_flush_seconds=float(_env("INDEXER_BULK_FLUSH_SECONDS", "2")),
+        indexer_prune_seconds=int(_env("INDEXER_PRUNE_SECONDS", "3600")),
         quality_enrich_enabled=_env("QUALITY_ENRICH_ENABLED", "true").lower() == "true",
         conversation_events_topic=_env(
             "CONVERSATION_EVENTS_TOPIC", "opendesk.conversation.events"

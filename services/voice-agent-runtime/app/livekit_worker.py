@@ -29,12 +29,14 @@ app/pipeline/ are version-agnostic.
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
 import inspect
 import re
 import threading
 import time
 import uuid
-from typing import Any, AsyncIterable, Optional
+from typing import Any, AsyncIterable, Iterator, Optional
 
 from livekit import agents, rtc
 from livekit.agents import llm as lk_llm
@@ -45,7 +47,8 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
-from . import dtmf, outbound, emergency, ivr_menu, metrics, sip
+from . import dtmf, outbound, outbound_script, emergency, ivr_menu, metrics, sip
+from . import visitor as visitor_mod
 from . import dead_mic, greeting_prerender
 from .async_tools import (
     SLOW_TOOLS,
@@ -55,6 +58,11 @@ from .async_tools import (
 )
 from .config import Settings, load_settings
 from .dapr_client import DaprClient, DaprError
+from . import call_language
+from .call_activity import announce_activity, announce_captions, announce_language, caption
+from .pipeline.naija_stt import NaijaSpeechSTT
+from .lk_tool_loop import ToolLoopLLM
+from .transcripts import TranscriptRecorder, tool_turn_text
 from .events import new_cloudevent, session_lifecycle_data
 from .logging import configure_logging, get_logger
 from .agent_definition import merge_definition
@@ -68,16 +76,23 @@ from .multilang import (
 )
 from .pipeline.stt import FasterWhisperSTT
 from .pipeline.tts import TTSInterface
+from .deburst import deburst_pcm
 from .prompts import (
     EMERGENCY_LOCATION_FIRST_ADDENDUM,
     build_greeting,
     build_system_prompt,
+    is_tail_message,
+    split_prompt,
 )
 from .session_state import SessionState
 from .tenant_context import TenantContext, fetch_tenant_context
 from .tools import ToolLayer
 from .translation import (
+    LLMTranslator,
     build_translator,
+    detect_language,
+    digit_words_to_digits,
+    native_digits,
     process_inbound_text,
     process_outbound_text,
 )
@@ -240,6 +255,84 @@ async def _warmup_tts(tts: Any) -> None:
         await tts.synthesize_pcm(PREWARM_PHRASE)
 
 
+def _openai_client(settings: Settings) -> Any:
+    import httpx
+    import openai
+
+    from .pipeline.llm import http_client_with_body
+
+    timeout = httpx.Timeout(settings.llm_timeout_s, connect=10.0)
+    extra = getattr(settings, "llm_extra_body", None) or {}
+    return openai.AsyncClient(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key,
+        timeout=timeout,
+        max_retries=0,
+        http_client=http_client_with_body(extra, timeout) if extra else None,
+    )
+
+
+def _set_system_prompt(msgs: list[Any], text: str) -> None:
+    """Swap the call's system prompt: stable body in message 0, per-conversation tail in message 1 (split_prompt)."""
+    if not msgs or msgs[0].role != "system":
+        return
+    body, tail = split_prompt(text)
+    msgs[0].content = body if isinstance(msgs[0].content, str) else [body]
+    second = msgs[1] if len(msgs) > 1 else None
+    second_text = ""
+    if second is not None and second.role == "system":
+        c = second.content
+        second_text = c if isinstance(c, str) else " ".join(x for x in (c or []) if isinstance(x, str))
+    if second is not None and second.role == "system" and is_tail_message(second_text):
+        second.content = tail if isinstance(second.content, str) else [tail]
+    elif tail:
+        msgs.insert(1, lk_llm.ChatMessage.create(text=tail, role="system"))
+
+
+def _worker_llm(settings: Settings) -> Any:
+    # The plugin refuses to start without api_key even when handed a client.
+    # ToolLoopLLM: the 0.10 pipeline drops tool calls made in the answer round (a second lookup = silence).
+    return ToolLoopLLM(lk_openai.LLM(model=settings.llm_model, api_key=settings.llm_api_key, client=_openai_client(settings)))
+
+
+async def _warmup_then_release(tts: Any) -> None:
+    """Warm the sidecars, then drop the HTTP clients. Prewarm runs in its own asyncio.run() loop, which closes
+    afterwards; clients kept from it made every later call fail with "Event loop is closed" (piper then fell
+    back to 16 kHz MMS: pitched audio and failed frame capture). Providers re-create clients lazily."""
+    try:
+        await _warmup_tts(tts)
+    finally:
+        aclose = getattr(tts, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def _prewarm(settings: Settings, proc) -> None:  # noqa: ARG001 - proc userdata unused; module cache suffices
+    if not settings.preload_models:
+        return
+    try:
+        stt = _build_stt(settings)
+        stt.preload_sync()
+        _PREWARMED["stt"] = stt
+        log.info("prewarm: whisper model loaded", model=settings.whisper_model)
+    except Exception as exc:  # noqa: BLE001 - degrade to lazy load
+        log.warning("prewarm: whisper load failed (lazy fallback)", error=str(exc)[:200])
+    try:
+        tts = _build_tts(settings)
+        asyncio.run(_warmup_then_release(tts))
+        _PREWARMED["tts"] = tts
+        # SPEC-W73 A2: job processes are spawned, so pre-render the configured tenants' greetings into THIS
+        # process' chain (empty tenant list / failure = no-op).
+        greeting_prerender.boot_prerender(settings, build_tts=lambda: tts)
+        log.info(
+            "prewarm: tts warmup synthesis done",
+            chain=settings.tts_provider_chain,
+            voice=settings.piper_voice,
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade to lazy load
+        log.warning("prewarm: tts warmup failed (lazy fallback)", error=str(exc)[:200])
+
+
 def make_prewarm_fnc(settings: Settings):
     """WorkerOptions.prewarm_fnc (livekit-agents 0.10.x: runs synchronously in
     each warm job process before it accepts jobs).
@@ -249,36 +342,9 @@ def make_prewarm_fnc(settings: Settings):
     multi-provider chains) so a warm process' first call has no dead air.
     Failures degrade to the old lazy-load behaviour (logged, never fatal).
     """
-
-    def _prewarm(proc) -> None:  # noqa: ARG001 - proc userdata unused; module cache suffices
-        if not settings.preload_models:
-            return
-        try:
-            stt = _build_stt(settings)
-            stt.preload_sync()
-            _PREWARMED["stt"] = stt
-            log.info("prewarm: whisper model loaded", model=settings.whisper_model)
-        except Exception as exc:  # noqa: BLE001 - degrade to lazy load
-            log.warning("prewarm: whisper load failed (lazy fallback)", error=str(exc)[:200])
-        try:
-            tts = _build_tts(settings)
-            asyncio.run(_warmup_tts(tts))
-            _PREWARMED["tts"] = tts
-            # SPEC-W73 A2: 0.10.2 spawns job processes (worker.py
-            # mp.get_context("spawn")), so the supervisor's boot prerender
-            # never reaches the processes that serve sessions — prerender
-            # the configured tenants' greetings into THIS process' chain
-            # (empty tenant list / failure = no-op, boot continues).
-            greeting_prerender.boot_prerender(settings, build_tts=lambda: tts)
-            log.info(
-                "prewarm: tts warmup synthesis done",
-                chain=settings.tts_provider_chain,
-                voice=settings.piper_voice,
-            )
-        except Exception as exc:  # noqa: BLE001 - degrade to lazy load
-            log.warning("prewarm: tts warmup failed (lazy fallback)", error=str(exc)[:200])
-
-    return _prewarm
+    # A module-level function bound with functools.partial: job processes start with "spawn", which pickles the
+    # prewarm function, and a nested closure can't be pickled (every job failed with "Can't get local object").
+    return functools.partial(_prewarm, settings)
 
 
 def cpu_load_fnc() -> float:
@@ -299,6 +365,597 @@ def cpu_load_fnc() -> float:
 # ---------------------------------------------------------------------------
 # Bridges: app pipeline stages -> livekit-agents 0.10 node types
 # ---------------------------------------------------------------------------
+_ENGLISH_FAMILY = frozenset({"en", "pcm"})
+
+
+class SwitchingLanguageSTT:
+    """Speech recognition that follows the caller between languages mid-call (English, Pidgin, Yorùbá, Hausa, Igbo).
+
+    Every caller turn of at least MIN_SWITCH_S seconds is checked with spoken-language identification (MMS-LID on the
+    GPU host: on real speech 30/30 correct for full sentences, ~80% on 2.5 s clips — so short turns never switch).
+    A switch needs MIN_CONFIDENCE and is reported through `on_switch(code)` (voice, prompt and the caller's screen
+    follow). English and Pidgin are one family here: identification cannot tell them apart reliably.
+    The turn is then transcribed with MMS for a Nigerian language, whisper (pinned) for English."""
+
+    LANGUAGE_HINT = "The caller may ask to speak Yoruba, Hausa, Igbo or Pidgin instead of English."
+    MIN_SWITCH_S = 3.0
+    MIN_CONFIDENCE = 0.65  # Igbo came back right at 0.72 on a clean clip
+    # Leaving English/Pidgin for Yorùbá, Hausa or Igbo needs much more: Pidgin lines were taken for Igbo at 0.78 and
+    # 0.95 (the receptionist then answered a Pidgin caller in Igbo), while real switches came back at 0.99-1.00.
+    MIN_CONFIDENCE_FROM_ENGLISH = 0.97
+
+    def __init__(self, naija: NaijaSpeechSTT, whisper: Any, start: str, allowed: list[str], on_switch: Any,
+                 detect_by_sound: bool = True) -> None:
+        self._naija, self._whisper = naija, whisper
+        # False (calls that start in English, VOICE_AUTO_LANGUAGE_SWITCH=nigerian): the SOUND of a turn never moves the
+        # call (Nigerian-accented English was taken for Yoruba), but asking for a language in words still does.
+        self._detect_by_sound = detect_by_sound
+        self.language = start or "en"
+        # The call's own language: English said inside a call that STARTED in Yoruba/Hausa/Igbo is code-switching
+        # (details given in English); a caller who started in English/Pidgin and moved away returns home with it.
+        self._home = self.language
+        self._english_side = start if start in _ENGLISH_FAMILY else "en"
+        self._allowed = [c for c in allowed if c != "ful"] or ["en"]
+        self._on_switch = on_switch
+        self.last_detected_language: str | None = self.language
+
+    def _target(self, detected: str) -> str | None:
+        if detected in _ENGLISH_FAMILY:
+            return None if self.language in _ENGLISH_FAMILY else self._english_side
+        return detected if detected != self.language else None
+
+    # Code-switching: in a Yoruba/Hausa/Igbo call, callers often give dates, names, numbers and emails in English. Such a
+    # turn is transcribed with whisper (MMS turned "yes, that's correct" into "go oton" and phone digits into nonsense)
+    # but the call stays in the caller's language unless they ask to change to English.
+    CODE_SWITCH_MIN_S = 1.2
+    CODE_SWITCH_MIN_CONFIDENCE = 0.6
+    _ASKS_FOR_ENGLISH = re.compile(r"\b(speak|talk|continue|switch|change)\b.{0,20}\benglish\b|\bin english\b", re.I)
+    # A caller asking in words ("can I switch to Hausa? I feel more comfortable speaking Hausa") gets that language
+    # for certain; detecting it from the sound alone missed requests made in the new language.
+    # The Pidgin recogniser spells phonetically: "please kan i swish to housa i feel more komfortabol", "switch to ebol".
+    # 2026-11-23: whisper (English) writes "Yoruba" as "Yeruba", "Yoroba", "Yarba"; "I'm speaking Yeruba" was missed.
+    _LANG_WORD = (r"((?:hau|hou)sa\w*|ausa\w*|yor[uo]\w*|yorùbá|y[eaou]r[uoa]b[aá]|yarba|yorba|igb\w*|ibo\w*|ebo\w*"
+                  r"|ebu\w*|ebl\w*|pidg\w*|pij\w*)")
+    _ASKS_FOR_LANGUAGE = re.compile(
+        r"\b(?:switch\w*|swich|swish|swits?h|change|chenj|speak\w*|spik\w*|talk\w*|tok|continue|go|use|in)\b.{0,25}?\b"
+        + _LANG_WORD + r"\b"
+        r"|\b[ck]omf\w*\s+(?:speaking\s+|speakin\s+|in\s+|en\s+|with\s+)?" + _LANG_WORD + r"\b"
+        # A turn that is little more than the language's name ("Yoruba.", "Yoruba please", "Hausa, abeg").
+        r"|^\W*(?:\w+\W+)?" + _LANG_WORD + r"\W*(?:\w+\W*){0,2}$", re.I)
+
+    @staticmethod
+    def _language_code(word: str) -> str | None:
+        w = word.lower()
+        if w.startswith(("ha", "ho", "au")):
+            return "ha"
+        if w.startswith("y"):
+            return "yo"
+        if w.startswith(("ig", "ib", "eb")):
+            return "ig"
+        if w.startswith(("pi", "pij")):
+            return "pcm"
+        return None
+
+    # A language the caller asked for in words sticks: an English-sounding half of the same sentence ("…I feel more
+    # comfortable speaking Hausa") once flipped the call straight back to Pidgin. Only another spoken request moves it.
+    _pinned = False
+    _pending: str | None = None  # a language heard once by sound, switched to only if heard again next turn
+
+    def _follow_request(self, text: str) -> None:
+        m = self._ASKS_FOR_LANGUAGE.search(text or "")
+        if not m:
+            return
+        code = self._language_code(next((g for g in m.groups() if g), ""))
+        if code and code != self.language and code in self._allowed:
+            self._pinned = code not in _ENGLISH_FAMILY
+            self._switch(code, 1.0)
+
+    async def _identify(self, pcm: bytes, sample_rate: int, channels: int) -> tuple[str, float]:
+        t0 = time.monotonic()
+        try:
+            out = await self._naija.identify(pcm, sample_rate=sample_rate, channels=channels, candidates=self._allowed)
+            log.info("timing language id", ms=int((time.monotonic() - t0) * 1000))
+        except Exception as exc:  # noqa: BLE001 - keep the current language
+            log.warning("language identification failed", error=str(exc)[:200])
+            return "", 0.0
+        detected = str(out.get("language") or "")
+        return detected, float((out.get("scores") or {}).get(detected, 0.0))
+
+    def _switch(self, target: str, confidence: float) -> None:
+        log.info("caller switched language", previous=self.language, language=target, confidence=confidence)
+        self.language = target
+        if target in _ENGLISH_FAMILY:
+            self._english_side = target
+        try:
+            self._on_switch(target)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("language switch hook failed", error=str(exc)[:200])
+
+    async def _maybe_switch(self, pcm: bytes, sample_rate: int, channels: int) -> bool:
+        """Follow a language switch. Returns True when this turn is English said inside a Nigerian-language call
+        (code-switching): transcribe it in English without changing the call's language."""
+        seconds = len(pcm) / (2 * max(1, channels) * max(1, sample_rate))
+        in_nigerian = self.language not in _ENGLISH_FAMILY and (self._home not in _ENGLISH_FAMILY or self._pinned)
+        if not self._detect_by_sound and not in_nigerian:
+            return False
+        if len(self._allowed) < 2 or seconds < (self.CODE_SWITCH_MIN_S if in_nigerian else self.MIN_SWITCH_S):
+            return False
+        detected, confidence = await self._identify(pcm, sample_rate, channels)
+        if in_nigerian and detected in _ENGLISH_FAMILY:
+            return confidence >= self.CODE_SWITCH_MIN_CONFIDENCE
+        if seconds < self.MIN_SWITCH_S:
+            return False
+        if self._pinned:
+            return False  # the caller ASKED for this language: only another spoken request moves the call
+        target = self._target(detected)
+        needed = (self.MIN_CONFIDENCE_FROM_ENGLISH
+                  if self.language in _ENGLISH_FAMILY and target not in _ENGLISH_FAMILY else self.MIN_CONFIDENCE)
+        if not target or confidence < needed:
+            self._pending = None
+            return False
+        # 2026-11-23: one Yorùbá question was identified as Hausa and the receptionist answered in Hausa. Between
+        # languages by sound alone, a switch needs the same language on two turns in a row (a caller who really
+        # switches keeps speaking it), unless identification is near certain. Asking in words still switches at once.
+        if confidence >= self.MIN_CONFIDENCE_FROM_ENGLISH or self._pending == target:
+            self._pending = None
+            self._switch(target, confidence)
+        else:
+            log.info("language change heard once; waiting for a second turn", current=self.language, heard=target,
+                     confidence=round(confidence, 3))
+            self._pending = target
+        return False
+
+    async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
+                             language: str | None = None, initial_prompt: str | None = None) -> str:
+        t0 = time.monotonic()
+        try:
+            return await self._transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, initial_prompt=initial_prompt)
+        finally:
+            log.info("timing speech recognition", ms=int((time.monotonic() - t0) * 1000),
+                     audio_s=round(len(pcm) / (2 * max(1, channels) * max(1, sample_rate)), 1), language=self.language)
+
+    async def _transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
+                              initial_prompt: str | None = None) -> str:
+        english_turn = await self._maybe_switch(pcm, sample_rate, channels)
+        # 2026-11-23: without a hint whisper wrote "continue in Yoruba" as "continue in your Uber" and the request to
+        # switch was missed. The hint names the call's languages so whisper spells them.
+        extra = {"initial_prompt": initial_prompt or self.LANGUAGE_HINT}
+        if english_turn:
+            text = await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en", **extra)
+            if self._ASKS_FOR_ENGLISH.search(text or ""):
+                self._pinned = False
+                self._switch(self._english_side, 1.0)
+            else:
+                log.info("english turn inside a nigerian-language call", language=self.language)
+                self._follow_request(text)
+            self.last_detected_language = self.language
+            return text
+        self.last_detected_language = self.language
+        text = None
+        if self.language in call_language.NIGERIAN:
+            try:
+                text = await self._naija.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels,
+                                                        language=self.language)
+            except Exception as exc:  # noqa: BLE001 - keep hearing the caller
+                log.warning("naija speech recognition failed; using whisper", language=self.language,
+                            error=str(exc)[:200])
+        if text is None:
+            text = await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels, language="en",
+                                                      **extra)
+        self._follow_request(text)
+        self.last_detected_language = self.language
+        return text
+
+
+class ChosenLanguageSTT:
+    """Speech recognition for a call whose caller chose a Nigerian language: MMS on the GPU host with that language's
+    adapter; whisper is the fallback if the service fails (so the call never goes deaf). Reports the chosen language
+    as "detected" so nothing downstream flips the call back to English."""
+
+    def __init__(self, naija: NaijaSpeechSTT, whisper: Any, language: str) -> None:
+        self._naija, self._whisper, self._language = naija, whisper, language
+        self.last_detected_language: str | None = language
+
+    async def transcribe_pcm(self, pcm: bytes, *, sample_rate: int = 16000, channels: int = 1,
+                             language: str | None = None, initial_prompt: str | None = None) -> str:
+        try:
+            return await self._naija.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels,
+                                                    language=self._language)
+        except Exception as exc:  # noqa: BLE001 - keep hearing the caller
+            log.warning("naija speech recognition failed; using whisper", language=self._language, error=str(exc)[:200])
+            return await self._whisper.transcribe_pcm(pcm, sample_rate=sample_rate, channels=channels)
+
+
+# Nigerian-language replies: the naija voices make one sentence at about real time, so a short sentence followed by a
+# long one left a gap of several seconds. Grouping sentences into chunks of at least this many characters lets the
+# service generate each chunk in one GPU batch (~3x real time): every chunk is ready before the previous one ends.
+NAIJA_MIN_CHUNK_CHARS = 60
+
+
+def call_voice(code: str, *, english_voice: str, naija: bool, voice_spec: Any,
+               language_voices: dict[str, str] | None = None) -> tuple[str, str]:
+    """(voice spec, synthesis language) for a call language code (en, pcm, yo, ha, ig, ful, or a locale like en-NG).
+
+    With a Nigerian English voice configured, English and Pidgin are spoken by it (YarnGPT reads Pidgin naturally; the
+    MMS Pidgin voice sounds robotic). Other Nigerian languages use the service's own voice for that language."""
+    code = normalize_language(code) or (code or "en").strip().lower()
+    if english_voice and ":" in english_voice and code in ("en", "pcm"):
+        return english_voice, "en"  # a full provider spec, e.g. "edge:en-NG-AbeoNeural"
+    if english_voice and naija and code in ("en", "pcm"):
+        return f"naija:{english_voice}", "en"
+    if naija and code in call_language.NIGERIAN:
+        # pins the naija provider; "auto" = the service picks the language's default voice
+        return f"naija:{(language_voices or {}).get(code) or 'auto'}", code
+    return voice_spec(code if code != "pcm" else "en"), ""
+
+
+# English replies use a fast voice (first audio in ~0.3 s): waiting for 60 characters made a short opener ("I can help
+# with that.") wait for the whole next sentence to be generated, ~2 s of silence (2026-11-23 latency timeline).
+ENGLISH_MIN_CHUNK_CHARS = 20
+
+
+# Nigerian-language replies: the first chunk is translated and voiced before anything plays, so it stays short; the
+# sentences after it are prepared while it plays (PrefetchStreamAdapter).
+NIGERIAN_FIRST_CHUNK_CHARS = 30
+
+
+def chunk_chars_for(language: str | None) -> int:
+    return ENGLISH_MIN_CHUNK_CHARS if (language or "en") in ("", "en") else NIGERIAN_FIRST_CHUNK_CHARS
+
+
+def _naija_tts(node: "PiperTTSNode", tokenizer: Any = None) -> Any:
+    from livekit.agents import tokenize as lk_tokenize
+
+    return PrefetchStreamAdapter(
+        tts=node,
+        sentence_tokenizer=tokenizer or lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS),
+    )
+
+
+class PrefetchStreamAdapter(lk_tts.StreamAdapter):
+    """livekit's StreamAdapter, but sentences are prepared AHEAD (2026-11-23).
+
+    The stock adapter synthesizes one sentence, plays it, then starts the next. A Yorùbá/Hausa/Igbo sentence first
+    goes through translation (~1-5 s) and then the naija voice (slower than real time), so callers heard 10-15 s of
+    silence before a long first sentence and gaps between sentences. Here every sentence starts (translate +
+    synthesize) as soon as it is complete in the reply, up to PREFETCH sentences at once; audio is still played in
+    the reply's order."""
+
+    PREFETCH = 2  # every sentence in flight shares the one GPU with the model and speech recognition
+
+    def stream(self) -> Any:
+        return _PrefetchStream(tts=self._tts, sentence_tokenizer=self._sentence_tokenizer, depth=self.PREFETCH)
+
+
+class _PrefetchStream(lk_tts.SynthesizeStream):
+    def __init__(self, *, tts: Any, sentence_tokenizer: Any, depth: int) -> None:
+        super().__init__()
+        self._tts = tts
+        self._sent_stream = sentence_tokenizer.stream()
+        self._depth = max(1, depth)
+
+    async def _main_task(self) -> None:
+        end = object()
+        order: asyncio.Queue = asyncio.Queue()
+        slots = asyncio.Semaphore(self._depth)
+        workers: list[asyncio.Task] = []
+
+        async def _forward_input() -> None:
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    self._sent_stream.flush()
+                    continue
+                self._sent_stream.push_text(item)
+            self._sent_stream.end_input()
+
+        async def _produce(text: str, out: asyncio.Queue) -> None:
+            try:
+                async for audio in self._tts.synthesize(text):
+                    out.put_nowait(audio)
+            except Exception as exc:  # noqa: BLE001 - one sentence lost, not the whole reply
+                log.warning("sentence synthesis failed", error=str(exc)[:200])
+            finally:
+                out.put_nowait(end)
+                slots.release()
+
+        async def _schedule() -> None:
+            async for ev in self._sent_stream:
+                await slots.acquire()  # at most `depth` sentences in flight
+                out: asyncio.Queue = asyncio.Queue()
+                workers.append(asyncio.create_task(_produce(ev.token, out)))
+                await order.put(out)
+            await order.put(None)
+
+        async def _emit() -> None:
+            while (out := await order.get()) is not None:
+                while (audio := await out.get()) is not end:
+                    self._event_ch.send_nowait(audio)
+
+        tasks = [asyncio.create_task(_forward_input()), asyncio.create_task(_schedule()), asyncio.create_task(_emit())]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await lk_utils.aio.gracefully_cancel(*tasks, *workers)
+
+
+_YES = re.compile(r"\b(yes|yeah|yep|correct|that'?s right|right|exactly|e correct|na so|ehen|bẹ́ẹ̀ni|beeni|bẹẹni|haka ne|haka|ee|eh|ọ dị mma)\b", re.I)
+
+
+def _message_plain(msg: Any) -> str:
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        content = " ".join(str(c) for c in content if isinstance(c, str))
+    return str(content or "")
+
+
+def read_back_confirmed(messages: list[Any], phone: str) -> bool:
+    """True when the receptionist's last message read this phone number back and the caller's reply after it said
+    yes. The model often reads the number back BEFORE its first booking call; without this the booking tool asked the
+    caller to confirm a second time (callers hung up thinking they were booked)."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) < 7:
+        return False
+    # The latest receptionist line that read this number back (times may have been offered after it)...
+    def _said_digits(text: str) -> str:
+        # Read-backs are spoken in words ("zero eight zero two, five five five…"), so words count as digits too.
+        return re.sub(r"\D", "", text) + "|" + re.sub(r"\D", "", spoken_phone(text) or "")
+
+    read_back = next((i for i in range(len(messages) - 1, -1, -1) if getattr(messages[i], "role", "") == "assistant"
+                      and digits[-7:] in _said_digits(_message_plain(messages[i]))), None)
+    if read_back is None:
+        return False
+    # ...and the caller's answer right after it was yes.
+    reply = next((_message_plain(m) for m in messages[read_back + 1:] if getattr(m, "role", "") == "user"), "")
+    return bool(_YES.search(reply))
+
+
+import unicodedata as _ud
+
+# Spoken digits in English/Pidgin, Yoruba, Hausa and Igbo (accents stripped: speech recognisers drop them unevenly).
+_DIGIT_WORDS = {
+    **dict.fromkeys(["zero", "oh", "o"], "0"), "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "odo": "0", "okan": "1", "meji": "2", "meta": "3", "merin": "4", "marun": "5", "marunun": "5", "mefa": "6",
+    "meje": "7", "mejo": "8", "mesan": "9", "mesanan": "9",
+    "sifiri": "0", "daya": "1", "biyu": "2", "uku": "3", "hudu": "4", "biyar": "5", "shida": "6", "bakwai": "7",
+    "takwas": "8", "tara": "9",
+    "efu": "0", "otu": "1", "abuo": "2", "ato": "3", "ano": "4", "ise": "5", "isii": "6", "asaa": "7", "asato": "8",
+    "itoolu": "9",
+}
+_MULT = {"double": 2, "triple": 3}
+_NG_MOBILE = re.compile(r"(?:0|234)[789][01]\d{8}")
+
+
+def _plain_word(w: str) -> str:
+    w = _ud.normalize("NFKD", w.lower().translate(str.maketrans("ɗƙƴ", "dky")))
+    return "".join(c for c in w if c.isalnum() and not _ud.combining(c))
+
+
+def spoken_phone(text: str) -> str | None:
+    """A Nigerian mobile number spoken in a line ("zero eight zero six, five five five…", "double five", digits, or
+    Yoruba/Hausa/Igbo number words) as 0XXXXXXXXXX, or None."""
+    digits, mult = [], 1
+    for raw in re.split(r"[\s,.;:!?\-–—]+", text or ""):
+        if not raw:
+            continue
+        if raw.isdigit():
+            digits.append(raw * 1); mult = 1; continue
+        w = _plain_word(raw)
+        if w in _MULT:
+            mult = _MULT[w]; continue
+        if w in _DIGIT_WORDS:
+            digits.append(_DIGIT_WORDS[w] * mult); mult = 1
+    m = _NG_MOBILE.search("".join(digits))
+    if not m:
+        return None
+    n = m.group(0)
+    return "0" + n[3:] if n.startswith("234") else n
+
+
+def caller_phone(messages: list[Any]) -> str | None:
+    """The phone number the caller most recently said, from their own words (newest first)."""
+    for m in reversed(messages):
+        if getattr(m, "role", "") == "user":
+            found = spoken_phone(_message_plain(m))
+            if found:
+                return found
+    return None
+
+
+_MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
+                                         "september", "october", "november", "december"], 1)}
+_ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
+                  "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14,
+                  "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+                  "twentieth": 20, "thirtieth": 30, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+                  "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+                  "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+                  "twenty": 20, "thirty": 30}
+_MONTH_RE = "(" + "|".join(_MONTHS) + ")"
+_DAY_RE = r"(\d{1,2}|(?:twenty|thirty)?[- ]?(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|one|two|three|four|five|six|seven|eight|nine)|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|thirtieth|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty)"
+
+
+def _day_number(word: str) -> int | None:
+    word = word.strip().lower()
+    if word.isdigit():
+        return int(word)
+    total = 0
+    for part in re.split(r"[- ]+", word):
+        if part not in _ORDINAL_WORDS:
+            return None
+        total += _ORDINAL_WORDS[part]
+    return total or None
+
+
+def caller_date(messages: list[Any]) -> tuple[int, int] | None:
+    """(month, day) of the date the caller most recently said outright ("24 November", "November 24th", "the
+    twenty-fourth of November"), newest first; None when they gave no explicit date."""
+    pats = [re.compile(rf"\b{_DAY_RE}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTH_RE}\b", re.I),
+            re.compile(rf"\b{_MONTH_RE}\s+(?:the\s+)?{_DAY_RE}(?:st|nd|rd|th)?\b", re.I)]
+    for m in reversed(messages):
+        if getattr(m, "role", "") != "user":
+            continue
+        text = _message_plain(m)
+        for i, pat in enumerate(pats):
+            hit = pat.search(text)
+            if hit:
+                day_word, month_word = (hit.group(1), hit.group(2)) if i == 0 else (hit.group(2), hit.group(1))
+                day = _day_number(day_word)
+                if day and 1 <= day <= 31:
+                    return _MONTHS[month_word.lower()], day
+    return None
+
+
+_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+_ORD_WORDS = ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+              "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
+              "nineteenth", "twentieth", "twenty-first", "twenty-second", "twenty-third", "twenty-fourth",
+              "twenty-fifth", "twenty-sixth", "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth",
+              "thirty-first"]
+_WEEKDAY_DATE = [
+    re.compile(rf"\b(?P<wd>{'|'.join(_WEEKDAYS)}),?\s+(?:the\s+)?(?P<day>{_DAY_RE})(?P<suf>st|nd|rd|th)?\s+(?:of\s+)?(?P<mon>{_MONTH_RE})\b", re.I),
+    re.compile(rf"\b(?P<wd>{'|'.join(_WEEKDAYS)}),?\s+(?P<mon>{_MONTH_RE})\s+(?:the\s+)?(?P<day>{_DAY_RE})(?P<suf>st|nd|rd|th)?\b", re.I),
+]
+
+
+def fix_weekday_dates(text: str, tz_name: str | None, now: Any = None) -> str:
+    """Make every "<weekday> <date>" the receptionist says agree: the date is moved to that weekday's date in the
+    coming two weeks. gemma said "Tuesday, November twenty-fifth" with "next Tuesday = 24 November" in its prompt."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(tz_name or "UTC")
+    today = (now or datetime.now(tz)).astimezone(tz).date()
+
+    def fix(m: "re.Match[str]") -> str:
+        day = _day_number(m.group("day"))
+        if not day:
+            return m.group(0)
+        month = _MONTHS[m.group("mon").lower()]
+        wd = _WEEKDAYS.index(m.group("wd").lower())
+        try:
+            said = today.replace(month=month, day=day)
+        except ValueError:
+            return m.group(0)
+        if said < today:
+            said = said.replace(year=said.year + 1)
+        if said.weekday() == wd or (said - today).days > 14:
+            return m.group(0)
+        right = next(today + timedelta(days=i) for i in range(1, 8) if (today + timedelta(days=i)).weekday() == wd)
+        if right.month != month:
+            return m.group(0)
+        word = m.group("day")
+        new = str(right.day) if word.isdigit() else _ORD_WORDS[right.day]
+        if word[:1].isupper():
+            new = new.capitalize()
+        start, end = m.span("day")
+        return m.group(0)[: start - m.start()] + new + m.group(0)[end - m.start():]
+
+    for pat in _WEEKDAY_DATE:
+        text = pat.sub(fix, text)
+    return text
+
+
+def date_mismatch_note(messages: list[Any], when_iso: str, tz_name: str | None) -> str | None:
+    """A correction when the tool date is not the date the caller said (a Hausa call booked Wednesday 25 November
+    after the caller said "Tuesday, 24 November" twice); None when they agree or the caller gave no date."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    said = caller_date(messages)
+    if not said:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(when_iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(tz_name or "UTC"))
+        local = dt.astimezone(ZoneInfo(tz_name or "UTC"))
+    except Exception:  # noqa: BLE001 - unparseable: let the booking service judge it
+        return None
+    if (local.month, local.day) == said:
+        return None
+    try:
+        wanted = local.replace(month=said[0], day=said[1])
+    except ValueError:
+        return None
+    if wanted.date() < datetime.now(local.tzinfo).date():
+        wanted = wanted.replace(year=wanted.year + 1)
+    return (f"date_mismatch: the caller asked for {wanted.strftime('%A')} {wanted.day} {wanted.strftime('%B')}, "
+            f"but this call used {local.strftime('%A')} {local.day} {local.strftime('%B')}. Call again with "
+            f"{wanted.strftime('%Y-%m-%d')} and tell the caller {wanted.strftime('%A')} {wanted.day} "
+            f"{wanted.strftime('%B')}.")
+
+
+# The receptionist sometimes repeats a misheard language name back ("we can continue in Eboe").
+_LANGUAGE_NAME_FIX = {"eboe": "Igbo", "ebo": "Igbo", "ebol": "Igbo", "ebul": "Igbo", "ebl": "Igbo", "igbol": "Igbo",
+                      "ibo": "Igbo", "housa": "Hausa", "housar": "Hausa", "hausar": "Hausa", "ausa": "Hausa",
+                      "yoroba": "Yoruba"}
+_LANGUAGE_NAMES_HEARD = re.compile(r"\b(" + "|".join(_LANGUAGE_NAME_FIX) + r")\b", re.I)
+_REAL_LANGUAGES = {"english", "pidgin", "yoruba", "yorùbá", "hausa", "igbo", "fulfulde"}
+_CONTINUE_IN = re.compile(r"\b(continue|carry on|switch|go on)\s+(in|to|with)\s+([A-Z][\w'’-]+)")
+
+
+def fix_continue_in(text: str, language: str | None) -> str:
+    """"We can continue in Ebon" -> "…in Igbo": a word that is no language becomes the call's language."""
+    name = call_language.NAMES.get(language or "", ("", ""))[0]
+    if not name:
+        return text
+    return _CONTINUE_IN.sub(lambda m: m.group(0) if m.group(3).lower() in _REAL_LANGUAGES
+                            else f"{m.group(1)} {m.group(2)} {name}", text)
+
+
+_LEAKED_TOKEN = re.compile(r"(?:(?<=[.!?]\s)|^)[a-z]{8,}\s+(?=[A-Z])")
+
+
+SWITCH_NOTE_MARK = "[language switch]"
+
+
+def _is_switch_note(m: Any) -> bool:
+    return getattr(m, "role", "") == "system" and SWITCH_NOTE_MARK in _message_plain(m)
+
+
+def plausible_ng_phone(phone: str) -> bool:
+    return bool(_NG_MOBILE.fullmatch(re.sub(r"\D", "", phone or "")))
+
+
+_TAG = re.compile(r"</?[a-zA-Z][^>]{0,80}>")
+_MARKDOWN = re.compile(r"[*_#`~|]+")
+
+
+# Byte-fallback tokens the model sometimes emits instead of a character ("<0xC7><0xB8>jẹ́", "<0xA0> Note"): a run
+# of them is the UTF-8 encoding of the real text, so it is decoded back; bytes that do not form a character
+# (a lone "<0xA0>") are dropped. They showed up raw in Hausa/Yoruba captions and transcripts (2026-11-21).
+_BYTE_TOKENS = re.compile(r"(?:<0x[0-9A-Fa-f]{2}>)+")
+
+
+def _decode_byte_tokens(text: str) -> str:
+    def repl(m: re.Match) -> str:
+        raw = bytes(int(h, 16) for h in re.findall(r"<0x([0-9A-Fa-f]{2})>", m.group(0)))
+        return raw.decode("utf-8", errors="ignore").replace("\u00a0", " ")
+    return _BYTE_TOKENS.sub(repl, text)
+
+
+# 2026-11-26: after a tool call at the end of an English call gemma said goodbye in Chinese ("探寻更多信息…再见。").
+# Agora's call languages (English, Pidgin, Yoruba, Hausa, Igbo) never use CJK scripts: such text is never spoken.
+_CJK = re.compile(r"[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]+")
+
+
+def speakable(text: str) -> str:
+    """What the voice should say: the model sometimes writes HTML ("</li><li>") or markdown, which was read aloud."""
+    out = _MARKDOWN.sub("", _TAG.sub(" ", _CJK.sub(" ", _decode_byte_tokens(text or ""))))
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+def has_words(text: str) -> bool:
+    """Is there anything to say (a letter or digit in any script)?"""
+    return any(ch.isalnum() for ch in text or "")
+
+
+async def _no_audio():
+    return
+    yield  # noqa: unreachable - makes this an empty async generator
+
+
 class WhisperSTTNode(lk_stt.STT):
     """Bridge FasterWhisperSTT into the LiveKit pipeline.
 
@@ -314,12 +971,17 @@ class WhisperSTTNode(lk_stt.STT):
     transcript is used (translation never breaks STT).
     """
 
+    # Whisper's language guess is unreliable on short clips: "Nine o'clock is fine." (1.5 s) came back as German
+    # ("Nein, der Klo"). Below this length the call's current language is used instead of a guess.
+    SHORT_CLIP_S = 3.0
+
     def __init__(
         self,
         impl: FasterWhisperSTT,
         on_language=None,
         on_transcript=None,
         hints: dict | None = None,
+        current_language=None,
     ) -> None:
         super().__init__(
             capabilities=lk_stt.STTCapabilities(
@@ -328,6 +990,7 @@ class WhisperSTTNode(lk_stt.STT):
         )
         self._impl = impl
         self._on_language = on_language
+        self._current_language = current_language
         self._on_transcript = on_transcript
         self._hints = hints or None
 
@@ -335,6 +998,10 @@ class WhisperSTTNode(lk_stt.STT):
         self, buffer: lk_utils.AudioBuffer, *, language: str | None = None
     ) -> lk_stt.SpeechEvent:
         frame = lk_utils.merge_frames(buffer)
+        if language is None and self._current_language is not None:
+            seconds = frame.samples_per_channel / max(1, frame.sample_rate)
+            if seconds < self.SHORT_CLIP_S:
+                language = self._current_language() or None
         # SPEC-W82 A4.4: an explicit language= argument still wins; the
         # tenant hint only forces a language when the pipeline left it open.
         forced_language = language
@@ -342,12 +1009,14 @@ class WhisperSTTNode(lk_stt.STT):
         if self._hints:
             forced_language = forced_language or self._hints.get("language") or None
             initial_prompt = self._hints.get("initial_prompt") or None
+        # initial_prompt only when a hint supplies one: recognisers without the parameter keep working.
+        extra = {"initial_prompt": initial_prompt} if initial_prompt else {}
         text = await self._impl.transcribe_pcm(
             bytes(frame.data),
             sample_rate=frame.sample_rate,
             channels=frame.num_channels,
             language=forced_language,
-            initial_prompt=initial_prompt,
+            **extra,
         )
         detected = forced_language or self._impl.last_detected_language or ""
         if detected and self._on_language is not None:
@@ -355,6 +1024,7 @@ class WhisperSTTNode(lk_stt.STT):
                 self._on_language(detected)
             except Exception as exc:  # noqa: BLE001 - never break STT
                 log.warning("language hook failed", error=str(exc)[:200])
+        caption("caller", text)  # the caller sees what they said, before any translation
         # SPEC-W82 A2: post-STT inbound-translation hook (pcm/yo/ig/ha -> en
         # before the LLM turn; the original transcript is stashed on the
         # tenant context by the hook). Fail-open: any hook failure keeps the
@@ -368,6 +1038,38 @@ class WhisperSTTNode(lk_stt.STT):
             type=lk_stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[lk_stt.SpeechData(text=text, language=detected)],
         )
+
+
+_CLAUSE_BREAK = re.compile(r"(?<=[,;:])\s+")
+VOICE_PIECE_MIN_CHARS = 25
+VOICE_SPLIT_FROM_CHARS = 60
+VOICE_PIECE_MAX_CHARS = 70
+
+
+def voice_pieces(text: str) -> list[str]:
+    """A long Nigerian-language sentence split at commas/semicolons into pieces of at least VOICE_PIECE_MIN_CHARS
+    (short clauses join their neighbour); short text stays whole."""
+    text = (text or "").strip()
+    if len(text) <= VOICE_SPLIT_FROM_CHARS:
+        return [text] if text else []
+    out: list[str] = []
+    for part in _CLAUSE_BREAK.split(text):
+        if out and (len(out[-1]) < VOICE_PIECE_MIN_CHARS or len(part) < VOICE_PIECE_MIN_CHARS):
+            out[-1] = f"{out[-1]} {part}"
+        else:
+            out.append(part)
+    # A long stretch with no comma (a 127-character sentence took 9 s to voice) is halved at the space nearest
+    # its middle until no piece is longer than VOICE_PIECE_MAX_CHARS.
+    done: list[str] = []
+    while out:
+        piece = out.pop(0)
+        if len(piece) <= VOICE_PIECE_MAX_CHARS or " " not in piece:
+            done.append(piece)
+            continue
+        mid = len(piece) // 2
+        cut = min((i for i, ch in enumerate(piece) if ch == " "), key=lambda i: abs(i - mid))
+        out[:0] = [piece[:cut].strip(), piece[cut:].strip()]
+    return [p for p in done if p]
 
 
 class PiperTTSNode(lk_tts.TTS):
@@ -401,22 +1103,38 @@ class PiperTTSNode(lk_tts.TTS):
         self._on_text = on_text
 
     def synthesize(self, text: str, **kwargs) -> AsyncIterable[lk_tts.SynthesizedAudio]:
-        return self._stream(text)
+        spoken = speakable(text)
+        if not has_words(spoken):
+            # 2026-11-26: a reply of only punctuation ('"""' after a tool call at the end of a call) was sent to the
+            # voice, which failed and then said something odd. Nothing to say: no caption, no audio.
+            return _no_audio()
+        caption("receptionist", spoken)  # live caption on the caller's screen, as the sentence starts
+        return self._stream(spoken)
 
-    def _audio(self, pcm: bytes) -> lk_tts.SynthesizedAudio:
-        frame = rtc.AudioFrame(
-            data=pcm,
-            sample_rate=self._impl.sample_rate,
-            num_channels=1,
-            samples_per_channel=len(pcm) // 2,
-        )
-        return lk_tts.SynthesizedAudio(
-            request_id=str(uuid.uuid4()),
-            segment_id=str(uuid.uuid4()),
-            frame=frame,
-        )
+    # LiveKit's AudioSource buffers about a second; one frame per sentence (several seconds) was refused with
+    # "InvalidState - failed to capture frame" and the caller heard the answer cut off. Ship 100 ms frames instead.
+    FRAME_MS = 100
+
+    def _audio_frames(self, pcm: bytes) -> Iterator[lk_tts.SynthesizedAudio]:
+        rate = self._impl.sample_rate
+        step = max(1, rate * self.FRAME_MS // 1000) * 2  # bytes per frame (16-bit mono)
+        pcm = pcm[: len(pcm) - (len(pcm) % 2)]
+        request_id, segment_id = str(uuid.uuid4()), str(uuid.uuid4())
+        for start in range(0, len(pcm), step):
+            chunk = pcm[start:start + step]
+            frame = rtc.AudioFrame(data=chunk, sample_rate=rate, num_channels=1, samples_per_channel=len(chunk) // 2)
+            yield lk_tts.SynthesizedAudio(request_id=request_id, segment_id=segment_id, frame=frame)
 
     async def _stream(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
+        # 2026-11-23 latency timeline: how long this chunk took from text to its first audio.
+        t0, first = time.monotonic(), True
+        async for audio in self._stream_inner(text):
+            if first:
+                first = False
+                log.info("timing tts first audio", ms=int((time.monotonic() - t0) * 1000), chars=len(text))
+            yield audio
+
+    async def _stream_inner(self, text: str) -> AsyncIterable[lk_tts.SynthesizedAudio]:
         # SPEC-W82 A3/A4.3/A4.5: pre-TTS transform (outbound translation,
         # normalization, pronunciation) BEFORE provider dispatch; fail-open
         # to the original text on any error.
@@ -425,16 +1143,37 @@ class PiperTTSNode(lk_tts.TTS):
                 text = await self._on_text(text)
             except Exception as exc:  # noqa: BLE001 - never break TTS
                 log.warning("pre-TTS transform failed", error=str(exc)[:200])
+        pieces = voice_pieces(text) if (getattr(self._impl, "voice", "") or "").startswith("naija:") else [text]
+        if len(pieces) > 1:
+            # 2026-11-23: a naija voice only returns audio once the whole text is made (slower than real time: a
+            # 132-character Yoruba sentence took 7.4 s before anything played). Long sentences are voiced in clause
+            # pieces, all requested at once (the service batches them), and played in order as they arrive.
+            tasks = [asyncio.create_task(self._impl.synthesize_pcm(p)) for p in pieces]
+            try:
+                for task in tasks:
+                    pcm = await task
+                    for audio in self._audio_frames(self._clean(pcm)):
+                        yield audio
+            finally:
+                for task in tasks:
+                    task.cancel()
+            return
         stream_pcm = getattr(self._impl, "stream_pcm", None)
         if self._chunked and stream_pcm is not None:
             async for pcm in stream_pcm(text):
-                if pcm:
-                    yield self._audio(pcm)
+                for audio in self._audio_frames(self._clean(pcm)):
+                    yield audio
             return
         pcm = await self._impl.synthesize_pcm(text)
-        if not pcm:
-            return
-        yield self._audio(pcm)
+        for audio in self._audio_frames(self._clean(pcm)):
+            yield audio
+
+    def _clean(self, pcm: bytes) -> bytes:
+        """2026-11-23: the naija voices (YarnGPT) end each line with a loud burst, heard as a bleep after every
+        Yorùbá/Hausa/Igbo sentence: cut it (app/deburst.py, same method as the films)."""
+        if (getattr(self._impl, "voice", "") or "").startswith("naija:"):
+            return deburst_pcm(pcm, self._impl.sample_rate)
+        return pcm
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +1206,9 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         super().__init__()
         self._tools = tool_layer
         self._runner = runner or AsyncToolRunner()
+        # The call's recent spoken lines (role, content), filled from the agent's committed-speech events; used to
+        # see whether a phone number was already read back and confirmed before the first booking call.
+        self.recent_lines: list[Any] = []
         self._ack_policy = ack_policy
         self._speaker = speaker
 
@@ -500,6 +1242,10 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
     ) -> str:
         import json
 
+        note = date_mismatch_note(list(self.recent_lines), from_iso, self._tools._ctx.timezone)
+        if note:
+            log.info("availability date differs from the caller's; asked the model to correct it")
+            return json.dumps({"slots": [], "note": note}, ensure_ascii=False)
         result = await self._run_slow(
             "get_availability",
             lambda: self._tools.get_availability(
@@ -512,7 +1258,7 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         return json.dumps(result, ensure_ascii=False)
 
     @lk_llm.ai_callable(
-        description="Book an appointment. Requires the caller's phone number (phone-confirmation policy: the first call returns confirmation_required; read the number back, and call again once the caller confirms)."
+        description="Book an appointment. Call this as soon as you have the slot and the caller's phone number — do NOT read the number back before this first call. The first call returns confirmation_required: then read the number back ONCE, and call again with the same number when the caller confirms."
     )
     async def book_appointment(
         self,
@@ -524,6 +1270,28 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
         email: str = "",
     ) -> str:
         import json
+
+        note = date_mismatch_note(list(self.recent_lines), starts_at, self._tools._ctx.timezone)
+        if note:
+            log.info("booking date differs from the caller's; asked the model to correct it")
+            return json.dumps({"status": "not_booked", "note": note}, ensure_ascii=False)
+        # The model sometimes miscounts spoken digits ("zero eight zero six…" became 080065553108): when its number is
+        # not a valid Nigerian mobile, use the number the caller actually said.
+        try:
+            if not plausible_ng_phone(phone):
+                heard = caller_phone(list(self.recent_lines))
+                if heard:
+                    log.info("booking phone corrected from the caller's own words")
+                    phone = heard
+        except Exception as exc:  # noqa: BLE001
+            log.warning("caller phone check skipped", error=str(exc)[:160])
+        # Already read back and confirmed on the call? Then this first call counts as the confirmed one.
+        try:
+            if read_back_confirmed(list(self.recent_lines), phone):
+                self._tools._session.pending_phone = (phone or "").strip()
+                log.info("phone already confirmed by read-back; booking without a second confirmation")
+        except Exception as exc:  # noqa: BLE001 - fall back to the normal two-step confirmation
+            log.warning("read-back check skipped", error=str(exc)[:160])
 
         result = await self._run_slow(
             "book_appointment",
@@ -635,6 +1403,78 @@ class ReceptionistFunctions(lk_llm.FunctionContext):
                 booking_id=booking_id, phone=phone, reason=reason or None
             ),
         )
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
+            "Save the caller's name, email and phone number to the CRM as soon as they have CONFIRMED the "
+            "read-back at the start of the call, so the business can always reach them, even if they never "
+            "book. Call it once, right after the caller says the details are correct."
+        )
+    )
+    async def save_caller_details(self, name: str, phone: str, email: str = "") -> str:
+        import json
+
+        result = await self._tools.save_caller_details(name=name, phone=phone, email=email or None)
+        return json.dumps(result, ensure_ascii=False)
+
+    CALL_OUTCOMES = ("confirmed", "declined", "rescheduled", "resolved", "call_back_later", "wrong_person", "no_answer")
+
+    @lk_llm.ai_callable(
+        description=(
+            "Outbound calls only: record how the call ended, once, just before you say goodbye. outcome is one of: "
+            "confirmed (they will attend the appointment), declined (they will not / turned the offer down), "
+            "rescheduled (moved to another time), resolved (their call-back request was handled), call_back_later "
+            "(bad time, call again), wrong_person (someone else answered), no_answer (voicemail or answering machine)."
+        )
+    )
+    async def record_call_outcome(self, outcome: str, note: str = "") -> str:
+        import json
+
+        value = (outcome or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if value not in self.CALL_OUTCOMES:
+            return json.dumps({"status": "error", "error": f"outcome must be one of {', '.join(self.CALL_OUTCOMES)}"})
+        session = getattr(self._tools, "_session", None)
+        if session is not None:
+            session.call_outcome = value
+        log.info("call outcome recorded", outcome=value, note=(note or "")[:120])
+        return json.dumps({"status": "recorded", "outcome": value})
+
+    @lk_llm.ai_callable(
+        description=(
+            "Send the person a WhatsApp message confirming their appointment (service, with whom, when). Call it "
+            "once, right after they confirm an appointment or you book one. Mention the WhatsApp only if this "
+            "returns status sent."
+        )
+    )
+    async def send_whatsapp_confirmation(self, offering: str, when: str, team_member: str = "") -> str:
+        import json
+
+        result = await self._tools.send_whatsapp_confirmation(offering=offering, when=when, team_member=team_member or None)
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
+            "When the caller needs to send a document (a pay stub, a receipt, an ID, a letter): WhatsApp them a secure "
+            "upload link. document_type is pay_stub, receipt or document. Say only what the result's message tells you."
+        )
+    )
+    async def send_document_upload_link(self, document_type: str = "document") -> str:
+        import json
+
+        result = await self._tools.send_document_upload_link(document_type=document_type or None)
+        return json.dumps(result, ensure_ascii=False)
+
+    @lk_llm.ai_callable(
+        description=(
+            "List the documents the caller has shared in this call and where each check stands. Use it when they say "
+            "they have uploaded one. Never read out details from a document."
+        )
+    )
+    async def check_shared_documents(self) -> str:
+        import json
+
+        result = await self._tools.check_shared_documents()
         return json.dumps(result, ensure_ascii=False)
 
     @lk_llm.ai_callable(
@@ -948,6 +1788,7 @@ async def _publish_lifecycle(
     *,
     quality: dict[str, Any] | None = None,
     agent_id: str | None = None,
+    stored_conversation_id: str | None = None,
     direction: str | None = None,
 ) -> None:
     event = new_cloudevent(
@@ -960,6 +1801,7 @@ async def _publish_lifecycle(
             site_slug=ctx.site_slug,
             quality=quality,
             agent_id=agent_id,
+            stored_conversation_id=stored_conversation_id,
             direction=direction,
         ),
     )
@@ -988,7 +1830,9 @@ async def build_voice_agent(
     site_slug: str,
     conversation_id: str,
     sip_call: "sip.InboundCallContext | None" = None,
+    caller_language: str = "",
     dtmf_buffer: "dtmf.DtmfBuffer | None" = None,
+    visitor: "visitor_mod.Visitor | None" = None,
 ) -> tuple[VoicePipelineAgent, TenantContext, SessionState]:
     """Bootstrap tenant context and assemble the VoicePipelineAgent.
 
@@ -1022,6 +1866,27 @@ async def build_voice_agent(
         # K15(c): claimed (unverified) hint only — never confirmed.
         sip.attach_caller_id(session, sip_call.caller_phone)
         caller_phone = session.claimed_phone or ""
+        if sip_call.tenant_source == "outbound":
+            # 2026-11-22: we placed this call (app/outbound_script.py): who we called and why, from the dialer.
+            brief = outbound_script.from_attributes(sip_call.attributes)
+            session.caller_name = brief.contact_name or None
+            session.outbound_purpose = brief.purpose or "general"
+            # We dialed this number and the person answered on it, so it is their phone for the booking read-back
+            # policy (unlike an inbound caller ID, which can be spoofed — K15(c) stays as is for inbound). This is NOT
+            # identity verification: lookups/changes of existing bookings still need the one-time code.
+            if caller_phone:
+                session.confirmed_phone = caller_phone
+            # WhatsApp confirmations: the number typed into the demo phone; the number we reached only when
+            # WHATSAPP_CONFIRMATIONS=on (demo contacts carry realistic numbers that may be real people's).
+            session.whatsapp_to = (sip_call.attributes or {}).get("agora.whatsapp") or (
+                caller_phone if settings.whatsapp_confirmations == "on" else "") or None
+            session.outbound_prompt = outbound_script.prompt_block(brief, caller_phone, whatsapp=bool(session.whatsapp_to))
+            session.outbound_greeting = outbound_script.greeting(ctx, brief)
+            log.info("outbound call brief", purpose=brief.purpose or "general", named=bool(brief.contact_name),
+                     facts=sorted(brief.context))
+    else:
+        # 2026-11-21: the web caller's pre-call form (self-reported; app/visitor.py).
+        visitor_mod.apply(session, visitor)
     # SPEC-W96 IVR-A: parse the keypad menu for PSTN sessions when enabled
     # ("" env -> DEFAULT_MENU; "none" -> disabled; web/non-SIP -> none).
     # Stashed on the session for the entrypoint's greeting line + buffer
@@ -1047,9 +1912,19 @@ async def build_voice_agent(
         conversation_id=conversation_id,
         caller_phone=caller_phone or None,
         keypad_menu_hint=keypad_hint,
+        visitor=visitor_mod.from_session(session),
+        outbound=session.outbound_prompt,
     )
 
-    chat_ctx = lk_llm.ChatContext().append(role="system", text=system_prompt)
+    # A Nigerian language the caller chose on the call page: the call starts in it; the caller may switch later.
+    chosen = caller_language if caller_language in call_language.NIGERIAN and settings.naija_speech_url else ""
+    base_prompt = system_prompt
+    replies_in_english = settings.naija_think_in_english and not settings.naija_reply_direct
+    system_prompt += call_language.prompt_instruction(chosen, think_in_english=replies_in_english)
+    _body, _tail = split_prompt(system_prompt)
+    chat_ctx = lk_llm.ChatContext().append(role="system", text=_body)
+    if _tail:
+        chat_ctx.append(role="system", text=_tail)
     runner = AsyncToolRunner(
         timeout_s=settings.tool_timeout_s,
         ack_grace_ms=settings.tool_ack_grace_ms,
@@ -1093,6 +1968,17 @@ async def build_voice_agent(
     # SPEC-W82 A1: translation layer for this session (mock-default;
     # fail-open — a turn never blocks on translation).
     translator = build_translator(settings)
+    if settings.naija_think_in_english:
+        # Think in English: what Yoruba/Hausa/Igbo callers say must reach the receptionist in English, read with the
+        # call's context (the mock translator passed the recogniser's rough phonetic text straight through, and the
+        # receptionist answered questions nobody asked).
+        def _inbound_context() -> dict:
+            return {"business": getattr(ctx, "display_name", ""), "industry": getattr(ctx, "industry", ""),
+                    "services": [o.get("name") for o in (getattr(ctx, "offerings", None) or []) if isinstance(o, dict)],
+                    "last_line": getattr(session, "last_agent_en", "")}
+
+        translator = LLMTranslator(settings.llm_base_url, settings.llm_model, api_key=settings.llm_api_key,
+                                   extra_body=settings.llm_extra_body or None, context=_inbound_context)
 
     def _voice_spec(language: str) -> str:
         # SPEC-W82 A4.2: the pack `voice:` per-language map slots into the
@@ -1123,12 +2009,34 @@ async def build_voice_agent(
             ctx=ctx,
         )
 
+    # A Nigerian-accented English voice (NAIJA_ENGLISH_VOICE): English and Pidgin are spoken by it, not piper/MMS.
+    english_voice = settings.naija_english_voice if (settings.naija_speech_url or ":" in settings.naija_english_voice) else ""
+
+    from livekit.agents import tokenize as lk_tokenize
+
+    # The reply chunker follows the spoken language: short chunks for the fast English voice, longer ones for the
+    # Nigerian-language voices (they make about one sentence in real time).
+    chunker = lk_tokenize.basic.SentenceTokenizer(min_sentence_len=NAIJA_MIN_CHUNK_CHARS)
+
+    def _set_voice(code: str) -> None:
+        try:
+            chunker._config.min_sentence_len = chunk_chars_for(code)
+        except Exception:  # noqa: BLE001 - keep the default chunking
+            pass
+        tts_impl.voice, tts_impl.language = call_voice(code, english_voice=english_voice,
+                                                       naija=bool(settings.naija_speech_url), voice_spec=_voice_spec,
+                                                       language_voices=settings.naija_language_voices)
+
     tts_impl.voice = _voice_spec(ml_state.active_language)
-    # SPEC-W82 A4.2 CRITICAL FIX: FallbackTTS.language was NEVER set by the
-    # worker (chain.py:113 gap), so provider-chain language routing never
-    # engaged. It now tracks the session's active language from bootstrap
-    # and on every switch/detection below.
-    tts_impl.language = ml_state.active_language
+    # SPEC-W82 A4.2 CRITICAL FIX: FallbackTTS.language tracks the session's active language from bootstrap (provider
+    # chain routing). Job processes are reused, so it is always reset here; the Nigerian English voice / chosen call
+    # language below then set voice + language together.
+    tts_impl.language = ml_state.active_language or ""
+    if english_voice:
+        _set_voice(ml_state.active_language)
+    if chosen:
+        session.active_language = chosen
+        _set_voice(chosen)
     # SPEC-W38 F2: definition.voice overrides the session's default voice
     # (per-turn language switching still applies on top). Only piper /
     # provider-less voices are applied here — other providers go through the
@@ -1138,6 +2046,7 @@ async def build_voice_agent(
         definition is not None
         and definition.voice.voice_id
         and definition.voice.provider in ("", "piper")
+        and not english_voice  # the Nigerian English voice replaces piper for the whole deployment
     ):
         tts_impl.voice = definition.voice.voice_id
 
@@ -1150,6 +2059,8 @@ async def build_voice_agent(
             tts_impl.voice = _voice_spec(detected)
         elif switched:
             tts_impl.voice = _voice_spec(ml_state.active_language)
+        if english_voice and (normalize_language(detected) in ("en", "pcm")):
+            _set_voice(detected)
         if not switched:
             return
         session.active_language = ml_state.active_language
@@ -1162,13 +2073,58 @@ async def build_voice_agent(
             language=ml_state.active_language,
             caller_phone=session.confirmed_phone or session.claimed_phone,
             keypad_menu_hint=keypad_hint,
+            visitor=visitor_mod.from_session(session),
+            outbound=session.outbound_prompt,
         )
         try:
-            msgs = agent.chat_ctx.messages
-            if msgs and msgs[0].role == "system":
-                msgs[0].content = [new_prompt]
+            _set_system_prompt(agent.chat_ctx.messages, new_prompt)
         except Exception as exc:  # noqa: BLE001 - prompt stays at default
             log.warning("locale instruction swap failed", error=str(exc)[:200])
+
+    # Mid-call language switching (Nigerian-language service configured): voice, prompt and the caller's screen follow.
+    language_listeners: list[Any] = []
+
+    def _switch_language(code: str) -> None:
+        session.active_language = code
+        _set_voice(code)
+        prompt = base_prompt + call_language.prompt_instruction(code, think_in_english=replies_in_english)
+        try:
+            msgs = agent.chat_ctx.messages
+            _set_system_prompt(msgs, prompt)
+            # The opening system prompt alone lost to the recent turns: after Hausa turns the model answered an Igbo
+            # turn in Hausa. A note at the end of the conversation, right before the reply, is followed reliably.
+            name = call_language.NAMES.get(code, (code, code))[0]
+            if replies_in_english and code in call_language.SPOKEN_BY_TRANSLATION:
+                note = (f"{SWITCH_NOTE_MARK} The caller asked to continue in {name}. Your NEXT reply must be exactly "
+                        f"this, and nothing else: \"{call_language.agreement_en(code)}\" Then wait for what they want. "
+                        f"Never repeat it in later replies. Keep writing in plain English: it is translated into {name} "
+                        f"before they hear it.")
+            else:
+                note = (f"{SWITCH_NOTE_MARK} The caller has switched to {name}. Begin your NEXT reply only with one "
+                        f"short, warm sentence in "
+                        f"{name} agreeing to continue in {name} (for example: of course, we can continue in {name}), "
+                        f"then answer what they asked. From now on reply ONLY in {name}. If some words are unclear, say "
+                        f"so in {name} and ask them to repeat — do not change language yourself.")
+            msgs[:] = [m for m in msgs if not _is_switch_note(m)]  # one switch, one agreement
+            msgs.append(lk_llm.ChatMessage.create(text=note, role="system"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("language prompt swap failed", error=str(exc)[:200])
+        for listener in list(language_listeners):
+            try:
+                listener(code)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("language listener failed", error=str(exc)[:200])
+
+    switching_stt = (
+        SwitchingLanguageSTT(NaijaSpeechSTT(settings.naija_speech_url), stt_impl, chosen or "en",
+                             call_language.allowed(settings.call_languages)
+                             if settings.voice_language_switch_mode in ("on", "nigerian") else [chosen or "en"],
+                             _switch_language,
+                             # "nigerian": an English-started call switches only when the caller ASKS (2026-11-23)
+                             detect_by_sound=(settings.voice_language_switch_mode == "on"
+                                              or chosen in call_language.NIGERIAN))
+        if settings.naija_speech_url and caller_language is not None and sip_call is None else None
+    )
 
     async def _on_transcript(text: str, detected: str) -> str:
         """SPEC-W82 A2/A4.1 post-STT hook: pure pcm/yo/ig/ha transcripts are
@@ -1184,6 +2140,8 @@ async def build_voice_agent(
             translator,
             enabled=settings.voice_translate_enabled,
             path="voice",
+            # The recogniser that heard this turn was for the caller's language: trust it over spelling heuristics.
+            language_hint=detected if detected in ("yo", "ha", "ig") else None,
         )
         lang = inbound.detected_language
         if not lang or lang == "en":
@@ -1203,14 +2161,14 @@ async def build_voice_agent(
                 language=lang,
                 caller_phone=session.confirmed_phone or session.claimed_phone,
                 keypad_menu_hint=keypad_hint,
+                visitor=visitor_mod.from_session(session),
+                outbound=session.outbound_prompt,
             )
             if inbound.code_switch:
                 ctx.code_switch = True
                 ctx.code_switch_segments = list(inbound.segments)
                 new_prompt = f"{new_prompt}{codeswitch_instruction()}"
-            msgs = agent.chat_ctx.messages
-            if msgs and msgs[0].role == "system":
-                msgs[0].content = [new_prompt]
+            _set_system_prompt(agent.chat_ctx.messages, new_prompt)
         except Exception as exc:  # noqa: BLE001 - prompt stays at default
             log.warning("locale instruction swap failed", error=str(exc)[:200])
         return inbound.text
@@ -1251,26 +2209,103 @@ async def build_voice_agent(
         out = pronunciation.apply_pronunciation(out, lexicon, provider=provider or "")
         return out
 
+    # Calls on our naija-speech path (a chosen Nigerian language / mid-call switching) keep their own recognition and
+    # voices; the W82 translation hook, STT hints and pre-TTS transforms serve every other call (phone, no naija).
+    w82_hooks = switching_stt is None and not english_voice
+
+    # Think in English, speak Yoruba/Hausa/Igbo (NAIJA_THINK_IN_ENGLISH): each English sentence group is translated
+    # just before the Nigerian voice says it. Lines already in the language (the greeting and recording notice) pass
+    # through. What was said, and the English it came from, are kept for the transcript.
+    spoken_pairs: list = []
+    session.spoken_pairs = spoken_pairs  # read by _record_voice_transcript
+    speak_translator = (LLMTranslator(settings.translate_llm_base_url or settings.llm_base_url, settings.llm_model,
+                                      api_key=settings.llm_api_key,
+                                      extra_body=settings.llm_extra_body or None)
+                        if settings.naija_think_in_english else None)
+
+    async def _speak_in_caller_language(text: str) -> str:
+        # A model token leaked into speech once, between the text before and after a tool call ("...twelve noon.
+        # lvisertguard I have found a slot"): a lowercase non-word opening a sentence, followed by a capital, is dropped.
+        text = _LEAKED_TOKEN.sub("", text)
+        text = _LANGUAGE_NAMES_HEARD.sub(lambda m: _LANGUAGE_NAME_FIX[m.group(0).lower()], text)
+        text = fix_continue_in(text, session.active_language)
+        try:
+            text = fix_weekday_dates(text, getattr(ctx, "timezone", None))
+        except Exception as exc:  # noqa: BLE001 - never block speech on this
+            log.warning("weekday/date check skipped", error=str(exc)[:160])
+        lang = session.active_language
+        # 2026-11-23: the receptionist answered in Yoruba while the call was still in English (the caller had asked for
+        # Yoruba, but the request was missed): the Yoruba was read by the English voice, with English intonation. A
+        # reply written in Yoruba/Hausa/Igbo now moves the call (voice, recognition, prompt) to that language first.
+        written = detect_language(text)
+        if (switching_stt is not None and written in ("yo", "ha", "ig") and lang in _ENGLISH_FAMILY
+                and written in getattr(switching_stt, "_allowed", ())):
+            log.info("reply written in another language; call follows it", language=written)
+            switching_stt._pinned = True
+            switching_stt._switch(written, 1.0)
+            lang = session.active_language
+        if speak_translator is None or lang not in call_language.SPOKEN_BY_TRANSLATION or not text.strip():
+            return text
+        if written != "en":
+            return text
+        # Numbers stay digits into translation: the model says times, dates and amounts in the language, and phone
+        # numbers are then spoken digit by digit with the language's own number words. (English number words
+        # inside a Yoruba/Hausa/Igbo sentence were where the voices mumbled.)
+        out = native_digits((await speak_translator.translate(digit_words_to_digits(text), "en", lang)).text, lang)
+        if detect_language(out) == "en":
+            # Translation failed open (timeout / error): this English would be read by the Nigerian-language voice.
+            log.warning("reply translation fell back to english", language=lang, chars=len(text))
+        if out != text:
+            spoken_pairs.append((text, out))
+            session.last_agent_en = text  # the caller's next words are read against this (inbound translation)
+        return out
+
+    # What a Yoruba/Hausa/Igbo caller said, as the receptionist should understand it. The recogniser writes those
+    # languages phonetically (no tone marks, words split or run together): read raw, the receptionist answered
+    # questions nobody asked. It now gets the English meaning, worked out with the call's context; the caller's own
+    # words are kept for the transcript (session.caller_heard: English -> what was heard).
+    session.caller_heard = {}
+
+    async def _understand_caller(text: str, detected: str) -> str:
+        lang = detected if detected in ("yo", "ha", "ig") else None
+        if lang is None and (detected or "") in ("", "und") and session.active_language in ("yo", "ha", "ig"):
+            lang = session.active_language
+        if speak_translator is None or lang is None or not text.strip():
+            return text
+        inbound = await process_inbound_text(text, translator, enabled=settings.voice_translate_enabled,
+                                             path="voice", language_hint=lang)
+        english = (inbound.text or "").strip()
+        if not english or english == text:
+            return text
+        # 2026-11-23: given an unreadable line ("[?]") the translator answered with chatter ("Please provide the
+        # transcript...") and the receptionist replied to that. A "translation" far longer than what was heard is not
+        # one: the receptionist gets the caller's own words and asks again if it can't follow them.
+        if len(english) > 4 * len(text) + 40:
+            log.warning("caller translation discarded (not a translation)", heard=text[:80], english=english[:120])
+            return text
+        session.caller_heard[english] = text
+        log.info("caller understood", language=lang, heard=text[:160], english=english[:160])
+        return english
+
     agent = VoicePipelineAgent(
         vad=_load_vad(settings),
-        stt=WhisperSTTNode(
-            stt_impl,
-            on_language=_on_language,
-            on_transcript=_on_transcript,
-            hints=stt_hints,
-        ),
+        stt=(WhisperSTTNode(switching_stt, on_transcript=_understand_caller) if switching_stt is not None
+             else WhisperSTTNode(stt_impl, on_language=_on_language,
+                                 on_transcript=_on_transcript if w82_hooks else None,
+                                 hints=stt_hints,
+                                 current_language=lambda: normalize_language(ml_state.active_language) or "en")),
         # NOTE (VOICE-SCALING §3): the livekit-plugins-openai LLM node cannot
         # hot-swap endpoints mid-process, so the LLM fallback chain
         # (app/pipeline/llm.py FallbackLLM) covers the chat/tool-loop paths;
         # the worker node relies on the primary endpoint + job-level retry.
-        llm=lk_openai.LLM(
-            model=settings.llm_model,
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
-        ),
-        tts=PiperTTSNode(
-            tts_impl, chunked=settings.tts_chunked, on_text=_prepare_tts_text
-        ),
+        # Own client: the plugin's default read timeout is 5 s, which cut off every reply from a CPU-hosted model
+        # (Ollama logged "cancel task" while still reading the prompt). LLM_TIMEOUT governs it instead.
+        llm=_worker_llm(settings),
+        tts=_naija_tts(PiperTTSNode(tts_impl, chunked=settings.tts_chunked,
+                                    on_text=_speak_in_caller_language if speak_translator is not None else None),
+                       chunker)
+        if (switching_stt is not None or english_voice)
+        else PiperTTSNode(tts_impl, chunked=settings.tts_chunked, on_text=_prepare_tts_text if w82_hooks else None),
         chat_ctx=chat_ctx,
         fnc_ctx=fnc_ctx,
         allow_interruptions=True,
@@ -1282,6 +2317,32 @@ async def build_voice_agent(
             label="VoicePipelineAgent",
         ),
     )
+    agent.agora_call_language = chosen  # read by the greeting in entrypoint
+
+    def _remember(role: str):
+        def handler(msg: Any, *_a: Any, **_k: Any) -> None:
+            from types import SimpleNamespace
+
+            fnc_ctx.recent_lines.append(SimpleNamespace(role=role, content=_message_plain(msg)))
+            del fnc_ctx.recent_lines[:-12]
+        return handler
+
+    try:
+        agent.on("user_speech_committed", _remember("user"))
+        agent.on("agent_speech_committed", _remember("assistant"))
+
+        def _drop_switch_note(*_a: Any, **_k: Any) -> None:
+            # The agreement has been said: drop the note, or the model opens every later reply with it again.
+            try:
+                msgs = agent.chat_ctx.messages
+                msgs[:] = [m for m in msgs if not _is_switch_note(m)]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("switch note cleanup skipped", error=str(exc)[:160])
+
+        agent.on("agent_speech_committed", _drop_switch_note)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("recent-lines hooks unavailable", error=str(exc)[:200])
+    agent.agora_language_listeners = language_listeners  # entrypoint tells the caller's screen about switches
     # Voice-path filler: speak the ack line through the agent's TTS while a
     # slow tool call is in flight (cancelled when the tool answers fast).
     fnc_ctx.set_speaker(lambda text: agent.say(text, allow_interruptions=True))
@@ -1310,6 +2371,157 @@ async def build_voice_agent(
         except Exception as exc:  # noqa: BLE001 - trimming off, call unaffected
             log.warning("history trim hook registration failed", error=str(exc)[:200])
     return agent, ctx, session
+
+
+
+_TRANSCRIPTS: "TranscriptRecorder | None" = None
+
+
+def _message_text(msg: Any) -> str:
+    content = getattr(msg, "content", msg)
+    if isinstance(content, list):
+        content = " ".join(str(c) for c in content if isinstance(c, str))
+    return speakable(str(content or ""))
+
+
+def _record_voice_transcript(agent: Any, settings: Settings, tenant_ctx: Any, session: Any, conversation_id: str,
+                             site_slug: str, *, channel: str, spoken_pairs: list | None = None) -> None:
+    """Store the call's words for the business's Conversations page: what the caller said (STT, committed turns),
+    what the receptionist said (greeting included) and the tools it used. Fire-and-forget; never affects the call."""
+    global _TRANSCRIPTS
+    if _TRANSCRIPTS is None:
+        _TRANSCRIPTS = TranscriptRecorder(getattr(settings, "conversation_url", ""))
+    rec = _TRANSCRIPTS
+    if not rec.enabled:
+        return
+    key = f"voice:{conversation_id}"
+    session.stored_id_lookup = lambda: rec.stored_id(key)
+
+    def _send(turns: list[dict[str, Any]]) -> None:
+        rec.record(key, turns, tenant_id=str(getattr(tenant_ctx, "tenant_id", "") or ""), site_slug=site_slug,
+                   channel=channel, contact_phone=session.verified_phone or session.confirmed_phone or session.claimed_phone,
+                   contact_name=getattr(session, "caller_name", None))
+
+    def _said(role: str):
+        return lambda msg, *_a, **_k: (lambda t: _send([{"role": role, "text": t}]) if t else None)(_message_text(msg))
+
+    def _user_said(msg, *_a, **_k) -> None:
+        # A Yoruba/Hausa/Igbo turn reached the receptionist as English (see _understand_caller): the Conversations
+        # page shows what the caller said, with that English as its translation.
+        text = _message_text(msg)
+        heard = (getattr(session, "caller_heard", None) or {}).pop((text or "").strip(), None)
+        if heard:
+            _send([{"role": "user", "text": heard, "translation_en": text}])
+            return
+        _said("user")(msg)
+
+    def _agent_said(msg, *_a, **_k) -> None:
+        # Spoken through translation: store what the caller heard, with the English it came from as its translation.
+        # Only the pieces of THIS reply: an interrupted reply never commits, and its pieces once piled into the next
+        # bubble (one Igbo bubble held three replies).
+        if spoken_pairs:
+            letters = lambda x: re.sub(r"[^a-z]", "", x.lower())  # numbers became words in the spoken copy
+            said = letters(_message_plain(msg))
+            mine = [(e, t) for e, t in spoken_pairs if letters(e)[:24] and letters(e)[:24] in said] or \
+                list(spoken_pairs[-1:])
+            spoken_pairs.clear()
+            english = " ".join(e for e, _ in mine)
+            heard = " ".join(t for _, t in mine)
+            _send([{"role": "agent", "text": speakable(heard), "translation_en": speakable(english)}])
+            return
+        _said("agent")(msg)
+
+    def _agent_interrupted(msg, *_a, **_k) -> None:
+        text = _message_text(msg)
+        if spoken_pairs:
+            spoken_pairs.clear()  # the translated pieces of a cut-off reply must not pile into the next bubble
+        if text and text.strip():
+            _send([{"role": "agent", "text": text.rstrip() + " …"}])
+
+    def _tools(called, *_a, **_k) -> None:
+        turns = []
+        for fn in called or []:
+            info = getattr(fn, "call_info", fn)
+            name = getattr(getattr(info, "function_info", None), "name", None) or getattr(info, "name", "tool")
+            args = getattr(info, "arguments", None) or {}
+            turns.append({"role": "tool", "text": tool_turn_text({"tool": name, "arguments": args}),
+                          "tool_calls": [{"tool": name, "arguments": args}]})
+        if turns:
+            _send(turns)
+
+    try:
+        agent.on("user_speech_committed", _user_said)
+        # 2026-11-23 latency timeline (worker logs): caller stops -> transcript -> receptionist audio.
+        for _ev in ("user_stopped_speaking", "user_speech_committed", "agent_started_speaking"):
+            agent.on(_ev, (lambda name: (lambda *_a, **_k: log.info("timing event", event_name=name)))(_ev))
+        agent.on("agent_speech_committed", _agent_said)
+        # livekit-agents 0.10 never commits an interrupted reply, so on phone calls (people talk over each other)
+        # whole receptionist turns were missing from Conversations (2026-11-22): store what was said, marked "…".
+        agent.on("agent_speech_interrupted", _agent_interrupted)
+        agent.on("function_calls_finished", _tools)
+        llm = getattr(agent, "_llm", None)
+        if hasattr(llm, "on_extra_tools"):
+            llm.on_extra_tools(finished=_tools)  # second and later lookups for the same question
+    except Exception as exc:  # noqa: BLE001 - event surface may shift; the call itself is unaffected
+        log.warning("voice transcript hooks unavailable", error=str(exc)[:200])
+
+def keep_listening_after_reconnect(agent: Any, room: Any) -> None:
+    """A caller whose connection blips does a full reconnect (LiveKit logs CLIENT_REQUEST_LEAVE, then a new session
+    with the same identity). livekit-agents 0.10 keeps listening to the OLD participant object, which never gets a
+    microphone track again, so the receptionist went deaf for the rest of the call (seen 2026-11-16, twice, a few
+    minutes into calls). Point the listener at the new participant and subscribe to its microphone."""
+
+    def _relink(participant: Any) -> None:
+        listener = getattr(agent, "_human_input", None)
+        old = getattr(listener, "_participant", None)
+        if listener is None or old is None or participant is old:
+            return
+        if getattr(participant, "identity", None) != getattr(old, "identity", None):
+            return
+        listener._participant = participant
+        try:
+            listener._subscribe_to_microphone()
+        except Exception as exc:  # noqa: BLE001 - the track events retry the subscription
+            log.warning("re-subscribe after reconnect failed", error=str(exc)[:200])
+        log.info("caller reconnected; listening to the new connection", identity=participant.identity)
+
+    def _trace(event: str):
+        def handler(*args: Any) -> None:
+            names = [getattr(a, "identity", None) or getattr(a, "sid", None) or type(a).__name__ for a in args]
+            listener = getattr(agent, "_human_input", None)
+            linked = getattr(getattr(listener, "_participant", None), "identity", None)
+            log.info("room event", room_event=event, args=names, linked=linked,
+                     listening_to=getattr(getattr(listener, "_subscribed_track", None), "sid", None))
+        return handler
+
+    try:
+        room.on("participant_connected", _relink)
+        # Diagnostics for mid-call reconnects: what the worker sees when a caller drops and rejoins.
+        for event in ("participant_disconnected", "track_published", "track_subscribed", "track_unsubscribed",
+                      "reconnecting", "reconnected"):
+            room.on(event, _trace(event))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reconnect hook unavailable", error=str(exc)[:200])
+
+
+async def _caller_visitor(ctx: agents.JobContext, timeout_s: float = 8.0) -> "visitor_mod.Visitor | None":
+    """The web caller's pre-call form (token metadata, app/visitor.py); None when they filled none."""
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=timeout_s)
+        return visitor_mod.from_metadata(getattr(participant, "metadata", ""))
+    except Exception as exc:  # noqa: BLE001 - no form = the receptionist asks as before
+        log.info("caller visitor details not read", error=str(exc)[:120])
+        return None
+
+
+async def _caller_language(ctx: agents.JobContext, timeout_s: float = 8.0) -> str:
+    """The language the web caller chose (token metadata, app/call_language.py); "" = English / not chosen."""
+    try:
+        participant = await asyncio.wait_for(ctx.wait_for_participant(), timeout=timeout_s)
+        return call_language.from_metadata(getattr(participant, "metadata", ""))
+    except Exception as exc:  # noqa: BLE001 - no choice = the default (English) call
+        log.info("caller language not read", error=str(exc)[:120])
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1342,6 +2554,12 @@ def start_dead_mic_monitor(
         )
         agent.on("user_started_speaking", monitor.note_user_speech)
         agent.on("user_speech_committed", monitor.note_user_speech)
+        # The caller's silence only counts once the receptionist has finished: a reply here takes ~7 s to start and
+        # ~10 s to speak, and lookups longer, so counting from the caller's last word made the receptionist ask
+        # "can you check your microphone?" over its own answer and hang up on working callers.
+        for event in ("agent_started_speaking", "agent_stopped_speaking", "function_calls_collected",
+                      "function_calls_finished"):
+            agent.on(event, monitor.note_user_speech)
         monitor.start()
         return monitor
     except Exception as exc:  # noqa: BLE001 - monitor off, call unaffected
@@ -1366,6 +2584,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     await ctx.connect()
     room_name = ctx.room.name or ""
+    if room_name.startswith("escalation-"):
+        # 2026-11-23: a staff handoff room (request_human): people talk there, not the receptionist.
+        log.info("staff escalation room; receptionist not joining", room=room_name)
+        await dapr.aclose()
+        return
     # Wave 5 #1 SIP inbound: `call-*` rooms (dispatch-rule.yaml) or rooms
     # joined by a SIP participant are PSTN calls. Resolve the tenant from the
     # dialed number (TENANT_PHONE_MAP) instead of the `site-{slug}` web
@@ -1373,6 +2596,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     sip_call: sip.InboundCallContext | None = None
     direction: str | None = None
     participants = list(getattr(ctx.room, "remote_participants", {}).values())
+    # 2026-11-22: an outbound room joined before its callee (the browser demo phone joins on Answer): wait for them, so
+    # the call brief is there before the opening line.
+    if room_name.startswith(outbound.OUTBOUND_ROOM_PREFIX) and not participants:
+        try:
+            await asyncio.wait_for(ctx.wait_for_participant(), timeout=15)
+        except Exception:  # noqa: BLE001 - no callee: fall through to a general outbound call
+            pass
+        participants = list(getattr(ctx.room, "remote_participants", {}).values())
     # SPEC-W101 C4: OUTBOUND call — the platform dialed the customer (see
     # app/outbound.py build_outbound_call_context; R3).
     out_ctx = outbound.build_outbound_call_context(room_name, participants)
@@ -1416,7 +2647,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             site_slug,
             conversation_id,
             sip_call=sip_call,
+            caller_language=await _caller_language(ctx) if sip_call is None else "",
             dtmf_buffer=dtmf_buffer,
+            visitor=await _caller_visitor(ctx) if sip_call is None else None,
         )
     except DaprError as exc:
         log.error("session bootstrap failed", site_slug=site_slug, error=str(exc))
@@ -1436,6 +2669,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # the contextvars at creation). The instrumented STT/TTS/LLM/tool call
     # sites feed it; the SessionEnded event below ships its payload.
     session_metrics = metrics.activate_session(metrics.SessionMetrics(conversation_id))
+    _record_voice_transcript(agent, settings, tenant_ctx, session, conversation_id, site_slug,
+                             channel="phone" if sip_call is not None else "voice",
+                             spoken_pairs=getattr(session, "spoken_pairs", None))
     try:
         # Turn = one committed user utterance (livekit-agents 0.10.x event).
         agent.on("user_speech_committed", lambda *_a, **_k: metrics.session_turn())
@@ -1457,6 +2693,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     metrics.get_registry().active_sessions.inc()
 
     agent.start(ctx.room)
+    # The caller's screen: talking / typing (tool in use) / listening.
+    announce_activity(agent, ctx.room)
+    keep_listening_after_reconnect(agent, ctx.room)
+    announce_language(agent, ctx.room)
+    announce_captions(ctx.room)
     # Greet the caller so the conversation opens naturally. SPEC-W11 Part C
     # §5: build_greeting prepends/appends the pack's spoken-AI-disclosure /
     # recording-consent lines when the tenant context carries a `disclosure`
@@ -1465,10 +2706,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # disclosure lines) so the shortcuts are the caller's last heard
     # instruction; None when the menu is disabled or the call is non-SIP.
     menu_line = ivr_menu.menu_line(session.ivr_menu) if session.ivr_menu else None
-    await agent.say(
-        build_greeting(tenant_ctx, menu_line=menu_line),
-        allow_interruptions=True,
-    )
+    # 2026-11-21: name, email and phone are taken at the start of the call unless the caller's form gave them.
+    ask_first_known = visitor_mod.from_session(session) is not None
+    # 2026-11-22: a call WE placed opens with who is calling and an identity check, never "thank you for calling".
+    opening = session.outbound_greeting or call_language.greeting(
+        getattr(agent, "agora_call_language", ""), getattr(tenant_ctx, "display_name", ""),
+        build_greeting(tenant_ctx, menu_line=menu_line, ask_details=not ask_first_known),
+        ask_details=not ask_first_known)
+    await agent.say(opening, allow_interruptions=True)
     # SPEC-W71 P6: warm the TTS LRU mid-call with the tool-ack/filler phrases
     # (derived from this tenant's ToolAckPolicy) + standard closers. Scheduled
     # AFTER session start and the greeting — fire-and-forget; failures log.
@@ -1478,10 +2723,23 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     # (helper above; None when disabled). Cancelled on room disconnect below.
     dead_mic_monitor = start_dead_mic_monitor(settings, agent, session, ctx.room)
 
+    ended = {"done": False}
+
+    # 2026-11-23: an outbound callee hanging up never fired the room's "disconnected" (the job simply exits), so no
+    # SessionEnded went out and the call never reached the CRM or the dashboard. End the session once, on whichever
+    # comes first: our own disconnect, or the last caller leaving the room.
+    @ctx.room.on("participant_disconnected")
+    def _on_caller_left(*args) -> None:  # noqa: ARG001
+        if not getattr(ctx.room, "remote_participants", {}):
+            _on_disconnected()
+
     @ctx.room.on("disconnected")
     def _on_disconnected(*args) -> None:  # noqa: ARG001
         import asyncio
 
+        if ended["done"]:
+            return
+        ended["done"] = True
         if dead_mic_monitor is not None:
             dead_mic_monitor.cancel()  # no orphan watchdog past session end
         metrics.get_registry().active_sessions.dec()
@@ -1491,6 +2749,20 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             escalated=session.escalation_room is not None,
             confirmed_phone=session.confirmed_phone,
         )
+        # 2026-11-23: who we called and why ride inside `quality` (conversation-service copies that object into
+        # CallQualityEnriched as is), so the web app and the CRM can both say "Outbound call — confirm appointment".
+        if quality is not None:
+            quality["direction"] = direction or "inbound"
+            if getattr(session, "outbound_purpose", None):
+                quality["purpose"] = session.outbound_purpose
+            if session.caller_name:
+                quality["contact_name"] = session.caller_name
+            quality["channel"] = "phone" if sip_call is not None else "web"
+            if getattr(session, "call_outcome", None):
+                quality["call_outcome"] = session.call_outcome  # 2026-11-23: outbound result (record_call_outcome)
+            # 2026-11-23: the language the call ended in (the CRM's "preferred language").
+            if getattr(session, "active_language", None):
+                quality["language"] = session.active_language
         asyncio.get_event_loop().create_task(
             _publish_lifecycle(
                 dapr,
@@ -1500,6 +2772,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 conversation_id,
                 quality=quality,
                 agent_id=session.resolved_agent_id,
+                stored_conversation_id=_TRANSCRIPTS.stored_id(f"voice:{conversation_id}") if _TRANSCRIPTS else None,
+                direction=direction,
             )
         )
 
@@ -1517,6 +2791,9 @@ def build_worker_options(settings: Settings) -> "agents.WorkerOptions":
         "load_fnc": cpu_load_fnc,
         "load_threshold": settings.load_threshold,
         "prewarm_fnc": make_prewarm_fnc(settings),
+        # A fresh pod downloads the whisper model (~480 MB for "small") inside the first process' prewarm; the 10 s
+        # default killed every process mid-download ("initialization timed out") and no call could start.
+        "initialize_process_timeout": float(os.environ.get("VOICE_INIT_PROCESS_TIMEOUT_S", "180")),
     }
     base_kwargs: dict[str, Any] = {
         "entrypoint_fnc": entrypoint,

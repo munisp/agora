@@ -55,17 +55,22 @@ import base64
 import binascii
 import hmac
 import json
+import re
+import time
 import uuid
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from . import metrics, outbound, sip, verification
+from . import call_language, metrics, outbound, outbound_script, sip, verification
+from . import visitor as visitor_mod
+from .visitor import Visitor
 from .avatar import PROVIDER_NONE, create_provider, resolve_provider_name
 from .chat import ChatService
+from .chat_end import ChatEndTracker
 from .config import Settings, load_settings
 from .dapr_client import DaprClient
 from .elevenlabs_adapter import ElevenLabsBackend
@@ -82,6 +87,9 @@ from .pipeline.stt_stream import (
 )
 from . import documents, tenant_context
 from .session_state import DaprSessionStore, SessionStore, store_get
+from .ice import IceServerSource
+from .transcripts import TranscriptRecorder
+from .tts_providers.base import voice_tenant
 from .tts_providers.chain import build_fallback_tts
 
 log = get_logger("control-plane")
@@ -90,6 +98,10 @@ log = get_logger("control-plane")
 class SessionRequest(BaseModel):
     site_slug: str = Field(min_length=1)
     participant_name: str | None = None
+    # Language the caller chose on the call page (app/call_language.py); unknown or not offered = English.
+    language: str | None = None
+    # 2026-11-21: the pre-call form (app/visitor.py); rides the caller's token metadata to the worker.
+    visitor: Visitor | None = None
 
 
 class ChatRequest(BaseModel):
@@ -104,6 +116,8 @@ class ChatRequest(BaseModel):
     # accepted via the X-Session-Secret request header (web widget resume;
     # the body field wins when both are present).
     session_secret: str | None = None
+    # 2026-11-21: the pre-chat form (name/phone/email, self-reported; app/visitor.py).
+    visitor: Visitor | None = None
     # SPEC-W3 §3: stream=true switches the response to text/event-stream.
     stream: bool = False
     # Wave 5 #8 A/B prompt testing: candidate persona for eval/ab_test.py.
@@ -121,6 +135,9 @@ class ChatRequest(BaseModel):
     # tokens) AND channel names a provider-verified source. Otherwise
     # silently ignored — the caller faces the normal OTP gate.
     channel_identity: str | None = None
+    # 2026-11-24: the sender's display name on a provider-verified channel (WhatsApp profile name, e-mail From
+    # name); honored only together with a pinned channel_identity (internal token), like channel_identity.
+    contact_name: str | None = Field(default=None, max_length=120)
 
 
 class TtsPreviewRequest(BaseModel):
@@ -146,6 +163,32 @@ class OutboundCallRequest(BaseModel):
 
     site_slug: str = Field(min_length=1, max_length=64)
     phone_number: str = Field(min_length=2, max_length=32)
+    # 2026-11-22 (app/outbound_script.py): why we are calling and what to say. All optional; without a purpose the
+    # receptionist introduces itself and asks how it can help.
+    purpose: Literal["confirm_appointment", "waitlist_offer", "no_show_rebook", "callback"] | None = None
+    contact_name: str | None = Field(default=None, max_length=120)
+    context: dict[str, str] = Field(default_factory=dict, max_length=8)
+    # 2026-11-22: ring the business's browser "demo phone" (/app/<slug>/demo-phone) instead of dialing out — for demos
+    # without a carrier. Honoured on POST /voice-admin/calls only.
+    demo_phone: bool = False
+
+
+class WhatsAppSendRequest(BaseModel):
+    """2026-11-22: the dashboard's "WhatsApp reminder" button (separate from the call buttons)."""
+
+    site_slug: str = Field(min_length=1, max_length=64)
+    to: str = Field(min_length=5, max_length=32)
+    kind: Literal["reminder", "confirmation"] = "reminder"
+    contact_name: str | None = Field(default=None, max_length=120)
+    offering: str = Field(min_length=1, max_length=120)
+    team_member: str | None = Field(default=None, max_length=80)
+    when: str = Field(min_length=1, max_length=80)
+
+
+class DemoPhoneAction(BaseModel):
+    call_id: str = Field(min_length=8, max_length=64)
+    # Answer only: the WhatsApp number confirmations go to (the person demoing, not the contributor on the booking).
+    whatsapp: str | None = Field(default=None, max_length=32)
 
 
 class VoiceSessionResponse(BaseModel):
@@ -158,6 +201,8 @@ class VoiceSessionResponse(BaseModel):
     # {"provider": "tavus", "status": "joining"}. None when AVATAR_PROVIDER
     # is `none` (default) — the client renders audio-only in that case.
     avatar: dict | None = None
+    # RTCIceServer list (STUN/TURN) for the browser's rtcConfig; None = client defaults.
+    ice_servers: list[dict] | None = None
 
 
 def create_app(
@@ -203,11 +248,16 @@ def create_app(
     # Primary LLM endpoint + optional circuit-broken fallback chain
     # (LLM_FALLBACK_* envs, VOICE-SCALING §3).
     llm = build_llm(settings)
-    chat_service = ChatService(settings=settings, dapr=dapr, llm=llm, sessions=sessions)
+    # 2026-11-24: text conversations end after CHAT_END_IDLE_S quiet seconds (0 = never) and reach the CRM like calls.
+    chat_end = (ChatEndTracker(dapr=dapr, settings=settings, idle_s=settings.chat_end_idle_s)
+                if settings.chat_end_idle_s > 0 else None)
+    chat_service = ChatService(settings=settings, dapr=dapr, llm=llm, sessions=sessions,
+                               transcripts=TranscriptRecorder(settings.conversation_url), chat_end=chat_end)
     # SPEC-W10 Part A: TTS provider fallback chain (default "piper" =
     # pre-W10 behavior). Backs the /voice/voices, /voice/tts-preview and
     # /voice/voices/enroll endpoints below.
     tts_chain = build_fallback_tts(settings)
+    ice_source = IceServerSource(settings.cf_turn_key_id, settings.cf_turn_api_token)
     elevenlabs = (
         ElevenLabsBackend(settings=settings, dapr=dapr, sessions=sessions)
         if settings.agent_backend == "elevenlabs"
@@ -235,8 +285,16 @@ def create_app(
         tenant_resolver=_document_tenant_resolver,
     )
 
+    if chat_end is not None:
+
+        @app.on_event("startup")
+        async def _start_chat_end() -> None:
+            chat_end.start()
+
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        if chat_end is not None:
+            await chat_end.stop()
         await dapr.aclose()
         await tts_chain.aclose()
         if elevenlabs is not None:
@@ -294,6 +352,10 @@ def create_app(
 
         room = f"{ROOM_PREFIX}{req.site_slug}-{uuid.uuid4().hex}"
         identity = f"web-{uuid.uuid4().hex[:8]}"
+        # The worker reads the caller's chosen language from their participant metadata.
+        caller_language = (
+            call_language.normalize(req.language, settings.call_languages) if settings.naija_speech_url else ""
+        )
         token = (
             lk_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
             .with_identity(identity)
@@ -307,9 +369,12 @@ def create_app(
                 )
             )
             .with_ttl(timedelta(minutes=30))
-            .to_jwt()
         )
-        log.info("livekit session token minted", room=room, identity=identity)
+        metadata = visitor_mod.token_metadata(caller_language, req.visitor)
+        if metadata:
+            token = token.with_metadata(metadata)
+        token = token.to_jwt()
+        log.info("livekit session token minted", room=room, identity=identity, language=caller_language or "en")
 
         # SPEC-W9 Part A: optional avatar presence. Fire-and-forget — the
         # provider join is a background task; misconfiguration is reported
@@ -341,14 +406,15 @@ def create_app(
         return VoiceSessionResponse(
             backend="livekit",
             room=room,
-            url=settings.livekit_url,
+            url=settings.livekit_public_url or settings.livekit_url,
             token=token,
             avatar=avatar_payload,
+            ice_servers=await ice_source.get(),
         )
 
     # SPEC-W45 K15(c): channels whose provider cryptographically verifies
     # the sender identity (WhatsApp wa_id via the messaging-gateway).
-    PROVIDER_VERIFIED_CHANNELS = frozenset({"whatsapp", "telegram"})
+    PROVIDER_VERIFIED_CHANNELS = frozenset({"whatsapp", "telegram", "email"})
 
     def _valid_internal_token(request: Request) -> bool:
         """Constant-time check against VOICE_ADMIN_INTERNAL_TOKEN. False
@@ -383,6 +449,24 @@ def create_app(
         raw = request.headers.get("X-User-Roles", "")
         roles = {r.strip().lower() for r in raw.split(",") if r.strip()}
         return bool(roles & ADMIN_GATEWAY_ROLES)
+
+    TENANT_ADMIN_ROLES = frozenset({"owner", "admin"})
+
+    def _caller_roles(request: Request) -> set[str]:
+        raw = request.headers.get("X-User-Roles", "")
+        return {r.strip().lower() for r in raw.split(",") if r.strip()}
+
+    def _caller_tenant(request: Request) -> str | None:
+        """The business this request acts for, from the gateway-verified token: the X-Tenant-Slug the page names must
+        be one of the caller's X-Tenant-Slugs (re-injected by APISIX after OIDC; client copies are stripped). Agency
+        staff may name any business. One business on the token and none named: that one. Otherwise None."""
+        wanted = (request.headers.get("X-Tenant-Slug") or request.query_params.get("tenant") or "").strip().lower()
+        mine = [t.strip().lower() for t in request.headers.get("X-Tenant-Slugs", "").split(",") if t.strip()]
+        if wanted:
+            if wanted in mine or _caller_roles(request) & ADMIN_GATEWAY_ROLES:
+                return wanted
+            return None
+        return mine[0] if len(mine) == 1 else None
 
     def _require_admin_access(request: Request) -> None:
         """Hard guard for /voice-admin/* (K15(d)/(e); verifier F-2 fix).
@@ -452,7 +536,8 @@ def create_app(
         await outbound_pacer.acquire()
         try:
             call = await outbound.place_outbound_call(
-                settings, req.site_slug, req.phone_number
+                settings, req.site_slug, req.phone_number,
+                purpose=req.purpose, contact_name=req.contact_name, context=req.context,
             )
         except outbound.OutboundError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
@@ -462,7 +547,14 @@ def create_app(
             "status": "dialing",
             "site_slug": call.site_slug,
             "phone_number": call.phone_number,
+            "purpose": req.purpose or "general",
         }
+
+    @app.get("/voice/chat/staff-messages")
+    async def voice_chat_staff_messages(conversation_id: str, request: Request, after: int = 0) -> Any:
+        """2026-11-23: replies a person sent from the human inbox (Chatwoot) to this web chat; the widget polls it
+        while a handoff is active. Same resume credential as the chat itself (X-Session-Secret)."""
+        return await chat_service.staff_messages(conversation_id, request.headers.get("X-Session-Secret"), after)
 
     @app.post("/voice/chat")
     async def voice_chat(req: ChatRequest, request: Request) -> Any:
@@ -495,7 +587,12 @@ def create_app(
             # and booking-side contact resolution are form-independent.
             # Non-conforming identities pin NOTHING (supersedes the W85
             # leniency; both production gateway paths conform).
-            pin = verification.canonical_e164(req.channel_identity) or None
+            if req.channel == "email":
+                # 2026-11-24: the email channel pins the sender's address (lower-cased), not a phone.
+                addr = req.channel_identity.strip().lower()
+                pin = addr if "@" in addr and " " not in addr and len(addr) <= 254 else None
+            else:
+                pin = verification.canonical_e164(req.channel_identity) or None
             if pin is None:
                 log.warning(
                     "channel_identity present but not E.164-conforming; ignoring",
@@ -514,6 +611,7 @@ def create_app(
                         message=req.message,
                         conversation_id=req.conversation_id,
                         session_secret=session_secret,
+                        visitor=req.visitor,
                     ):
                         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 except Exception as exc:  # noqa: BLE001
@@ -534,6 +632,8 @@ def create_app(
                 persona_override=req.persona_override,
                 channel=req.channel,
                 pin_verified_identity=pin,
+                visitor=req.visitor,
+                pinned_name=(req.contact_name or "").strip() or None if pin else None,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("chat failed", site_slug=req.site_slug, error=str(exc))
@@ -633,9 +733,11 @@ def create_app(
     # plane endpoints; enrollment is an admin path at the BFF layer.
     # ------------------------------------------------------------------
     @app.get("/voice/voices")
-    async def list_tts_voices() -> dict[str, Any]:
+    async def list_tts_voices(request: Request) -> dict[str, Any]:
         """Aggregate the configured TTS providers with availability flags;
-        unavailable providers are listed with available:false and no voices."""
+        unavailable providers are listed with available:false and no voices.
+        Cloned voices are listed only for the caller's own business."""
+        voice_tenant.set(_caller_tenant(request))
         providers_out: list[dict[str, Any]] = []
         for name, provider in tts_chain.providers_in_order():
             try:
@@ -654,11 +756,12 @@ def create_app(
         return {"providers": providers_out}
 
     @app.post("/voice/tts-preview")
-    async def tts_preview(req: TtsPreviewRequest) -> Response:
+    async def tts_preview(req: TtsPreviewRequest, request: Request) -> Response:
         """Synthesize a preview clip through the same FallbackTTS chain the
         calls use. Voice resolution: explicit `voice` param, then
         TTS_VOICE_MAP (provider-qualified), then PIPER_VOICE_MAP, then the
         default piper voice (app/multilang.py resolve_tts_voice)."""
+        voice_tenant.set(_caller_tenant(request))  # a cloned voice speaks only for its own business
         voice_spec = (req.voice or "").strip() or resolve_tts_voice(
             req.language or "",
             settings.tts_voice_map,
@@ -695,7 +798,10 @@ def create_app(
     ) -> dict[str, Any]:
         """Enroll a brand voice on the XTTS provider (requires `xtts` in
         TTS_PROVIDER_CHAIN). Consent (NDPA) is captured in the admin UI."""
-        _require_admin_access(request)
+        # Agency staff (or the internal token) for any business; a business's owner/admin for their own.
+        tenant = req.tenant.strip().lower()
+        if not (_caller_roles(request) & TENANT_ADMIN_ROLES and _caller_tenant(request) == tenant):
+            _require_admin_access(request)
         xtts = tts_chain.provider("xtts")
         if xtts is None:
             raise HTTPException(
@@ -709,12 +815,155 @@ def create_app(
                 status_code=400, detail="sample_base64 is not valid base64"
             ) from exc
         try:
-            voice_id = await xtts.enroll_voice(req.name, req.sample_base64)
+            voice_id = await xtts.enroll_voice(req.name, req.sample_base64, tenant)
         except Exception as exc:  # noqa: BLE001
             log.warning("voice enrollment failed", tenant=req.tenant, error=str(exc)[:200])
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         log.info("brand voice enrolled", tenant=req.tenant, voice_id=voice_id)
         return {"voice_id": voice_id}
+
+    # ------------------------------------------------------------------
+    # 2026-11-22: the DEMO PHONE — a browser page (/app/<slug>/demo-phone) that stands in for the contributor's phone so
+    # outbound calls can be shown live without a carrier. A dashboard call with demo_phone=true leaves a ring here for
+    # that business (one at a time, 45 s); the page polls, rings, and on Answer joins the outcall- room as the callee
+    # with the call brief in its metadata (outbound.build_outbound_call_context reads it). The receptionist, prompt,
+    # tools and transcript are exactly those of a real outbound call. In-memory: the voice control plane runs 1 replica.
+    # ------------------------------------------------------------------
+    DEMO_RING_S = 45.0
+    demo_rings: dict[str, dict[str, Any]] = {}
+
+    def _tenant_staff(request: Request, site: str) -> None:
+        if not (_caller_roles(request) & TENANT_ADMIN_ROLES and _caller_tenant(request) == site):
+            _require_admin_access(request)
+
+    def _ring_demo_phone(site: str, number: str, req: OutboundCallRequest, request: Request) -> dict[str, Any]:
+        call_id = uuid.uuid4().hex
+        room = outbound.outbound_room_name(site, call_id)
+        attrs = outbound_script.to_attributes(req.purpose, req.contact_name, req.context)
+        attrs[outbound_script.ATTR_PREFIX + "phone"] = number
+        demo_rings[site] = {
+            "call_id": call_id, "room": room, "site_slug": site, "phone_number": number,
+            "contact_name": req.contact_name or "", "purpose": req.purpose or "general", "attributes": attrs,
+            "expires_at": time.time() + DEMO_RING_S,
+        }
+        log.info("demo phone ringing", site_slug=site, purpose=req.purpose or "general",
+                 by=request.headers.get("X-User-Id", "internal"), room=room)
+        return {"room": room, "call_id": call_id, "status": "ringing_demo_phone", "site_slug": site,
+                "phone_number": number, "purpose": req.purpose or "general"}
+
+    def _current_ring(site: str) -> dict[str, Any] | None:
+        ring = demo_rings.get(site)
+        if ring and ring["expires_at"] < time.time():
+            demo_rings.pop(site, None)
+            return None
+        return ring
+
+    @app.get("/voice-admin/demo-phone/ring")
+    async def demo_phone_ring(request: Request) -> dict[str, Any]:
+        site = _caller_tenant(request) or ""
+        if not site:
+            raise HTTPException(status_code=400, detail="tenant required")
+        _tenant_staff(request, site)
+        ring = _current_ring(site)
+        if not ring:
+            return {"ringing": False}
+        return {"ringing": True, **{k: ring[k] for k in ("call_id", "contact_name", "phone_number", "purpose")},
+                "seconds_left": max(0, int(ring["expires_at"] - time.time()))}
+
+    @app.post("/voice-admin/demo-phone/answer")
+    async def demo_phone_answer(body: DemoPhoneAction, request: Request) -> dict[str, Any]:
+        site = _caller_tenant(request) or ""
+        _tenant_staff(request, site)
+        ring = _current_ring(site)
+        if not ring or ring["call_id"] != body.call_id:
+            raise HTTPException(status_code=410, detail="this call is no longer ringing")
+        demo_rings.pop(site, None)
+        wa = re.sub(r"[\s().-]", "", body.whatsapp or "")
+        if re.fullmatch(r"0[789]\d{9}", wa):
+            wa = "+234" + wa[1:]
+        if re.fullmatch(r"\+?\d{8,15}", wa):
+            ring["attributes"][outbound_script.ATTR_PREFIX + "whatsapp"] = wa if wa.startswith("+") else "+" + wa
+        from livekit import api as lk_api
+
+        token = (
+            lk_api.AccessToken(settings.livekit_api_key, settings.livekit_api_secret)
+            .with_identity(outbound.DEMO_IDENTITY_PREFIX + body.call_id[:12])
+            .with_name(ring["contact_name"] or "Demo phone")
+            .with_metadata(json.dumps({"agora_outbound": ring["attributes"]}))
+            .with_grants(lk_api.VideoGrants(room_join=True, room=ring["room"], can_publish=True, can_subscribe=True))
+            .with_ttl(timedelta(minutes=30))
+            .to_jwt()
+        )
+        log.info("demo phone answered", site_slug=site, room=ring["room"],
+                 whatsapp=bool(ring["attributes"].get(outbound_script.ATTR_PREFIX + "whatsapp")))
+        return {"room": ring["room"], "url": settings.livekit_public_url or settings.livekit_url, "token": token,
+                "ice_servers": await ice_source.get()}
+
+    @app.post("/voice-admin/demo-phone/decline")
+    async def demo_phone_decline(body: DemoPhoneAction, request: Request) -> dict[str, Any]:
+        site = _caller_tenant(request) or ""
+        _tenant_staff(request, site)
+        ring = _current_ring(site)
+        if ring and ring["call_id"] == body.call_id:
+            demo_rings.pop(site, None)
+            log.info("demo phone declined", site_slug=site, room=ring["room"])
+        return {"declined": True}
+
+    @app.post("/voice-admin/whatsapp")
+    async def send_staff_whatsapp(req: WhatsAppSendRequest, request: Request) -> dict[str, Any]:
+        """Send one appointment WhatsApp (reminder/confirmation) to the number staff chose, through the messaging-gateway.
+        Same access rule as the call buttons. The text is composed from the facts (app/whatsapp_messages.py)."""
+        from .whatsapp_messages import appointment_text
+        import httpx
+
+        site = req.site_slug.strip().lower()
+        _tenant_staff(request, site)
+        to = re.sub(r"[\s().-]", "", req.to)
+        if re.fullmatch(r"0[789]\d{9}", to):
+            to = "+234" + to[1:]
+        if not re.fullmatch(r"\+?\d{8,15}", to):
+            raise HTTPException(status_code=422, detail="not a phone number")
+        business = site
+        try:
+            async with httpx.AsyncClient(timeout=settings.http_timeout_s) as client:
+                r = await client.get(f"{settings.booking_url.rstrip('/')}/public/sites/{site}")
+                if r.status_code == 200:
+                    business = (r.json() or {}).get("business_name") or site
+                text = appointment_text(req.kind, business, req.contact_name, req.offering, req.when, req.team_member)
+                g = await client.post(f"{settings.messaging_gateway_url.rstrip('/')}/v1/whatsapp/send",
+                                      json={"to": to, "message": text})
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"WhatsApp could not be reached: {exc}") from exc
+        if g.status_code >= 400:
+            detail = "WhatsApp is not switched on for this business" if g.status_code == 503 else f"WhatsApp refused it ({g.status_code})"
+            raise HTTPException(status_code=502, detail=detail)
+        log.info("staff whatsapp sent", site_slug=site, kind=req.kind, by=request.headers.get("X-User-Id", "internal"))
+        return {"status": "sent", "to": to, "message": text}
+
+    @app.post("/voice-admin/calls")
+    async def place_staff_outbound_call(req: OutboundCallRequest, request: Request) -> dict[str, Any]:
+        """2026-11-22: the dashboard's call buttons (Call to confirm / Call to rebook / Offer slot by phone / Call back).
+        Same dial path as POST /v1/calls, reached through the signed-in APISIX /api/voice-admin/* route: a business's
+        owner/admin may call for their own business only; agency staff (or the internal token) for any. Local Nigerian
+        numbers (0803...) are dialed as +234..., the form contacts and bookings store them in."""
+        site = req.site_slug.strip().lower()
+        _tenant_staff(request, site)
+        number = re.sub(r"[\s().-]", "", req.phone_number)
+        if re.fullmatch(r"0[789]\d{9}", number):
+            number = "+234" + number[1:]
+        if req.demo_phone:
+            return _ring_demo_phone(site, number, req, request)
+        await outbound_pacer.acquire()
+        try:
+            call = await outbound.place_outbound_call(
+                settings, site, number, purpose=req.purpose, contact_name=req.contact_name, context=req.context,
+            )
+        except outbound.OutboundError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        log.info("staff outbound call", site_slug=site, purpose=req.purpose or "general",
+                 by=request.headers.get("X-User-Id", "internal"), room=call.room)
+        return {"room": call.room, "call_id": call.call_id, "status": "dialing", "site_slug": call.site_slug,
+                "phone_number": call.phone_number, "purpose": req.purpose or "general"}
 
     @app.post("/voice-admin/escalations/{conversation_id}/staff-token")
     async def mint_escalation_staff_token(
@@ -734,9 +983,16 @@ def create_app(
         log.info("escalation staff token minted", room=room)
         return {
             "room": room,
-            "url": settings.livekit_url,
+            "url": settings.livekit_public_url or settings.livekit_url,
             "token": token,
+            "ice_servers": await ice_source.get(),
         }
+
+    @app.get("/voice/ice-servers")
+    async def ice_servers() -> dict[str, Any]:
+        """Relay credentials for a browser joining a room it already holds a token for (the staff call page).
+        Reached only through the signed-in /api/voice/* gateway route; the anonymous path is closed."""
+        return {"ice_servers": await ice_source.get()}
 
     if elevenlabs is not None:
 

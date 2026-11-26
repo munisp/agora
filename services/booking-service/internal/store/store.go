@@ -586,7 +586,7 @@ func (s *Store) SetAvailability(ctx context.Context, tenantID, teamMemberID uuid
 			return fmt.Errorf("clear availability rules: %w", err)
 		}
 		const ins = `INSERT INTO availability_rules (id, tenant_id, team_member_id, weekday, start_min, end_min, effective_from, effective_to)
-		             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`
+		             VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7::date, CURRENT_DATE),$8)` // no effective_from = from today (the column's default)
 		for _, r := range rules {
 			if r.ID == uuid.Nil {
 				r.ID = uuid.New()
@@ -668,7 +668,7 @@ func (s *Store) ListContacts(ctx context.Context, tenantID uuid.UUID) ([]Contact
 	var out []Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts WHERE tenant_id=$1 ORDER BY name LIMIT 1000`, tenantID)
+			`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts WHERE tenant_id=$1 ORDER BY name LIMIT 1000`, tenantID)
 		if err != nil {
 			return err
 		}
@@ -690,7 +690,7 @@ func (s *Store) GetContact(ctx context.Context, tenantID, id uuid.UUID) (Contact
 	var c Contact
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts WHERE tenant_id=$1 AND id=$2`,
+			`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts WHERE tenant_id=$1 AND id=$2`,
 			tenantID, id).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

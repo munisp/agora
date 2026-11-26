@@ -199,6 +199,8 @@ type FunnelEvent struct {
 	Channel        string     `json:"channel"`
 	CampaignID     *uuid.UUID `json:"campaign_id"`
 	LgaID          *int       `json:"lga_id"`
+	LgaCode        *string    `json:"lga_code,omitempty"` // 2026-11-21: gazetteer LGA code
+	LgaName        *string    `json:"lga_name,omitempty"`
 	AmountNGN      *float64   `json:"amount_ngn"` // null for leads (filled by txn events)
 	IdempotencyKey string     `json:"idempotency_key"`
 }
@@ -217,6 +219,8 @@ func NewFunnelEvent(l *store.Lead, eventName string, ts time.Time) FunnelEvent {
 		Channel:        l.ChannelOfFirstTouch,
 		CampaignID:     l.CampaignID,
 		LgaID:          l.LgaID,
+		LgaCode:        l.LgaCode,
+		LgaName:        l.LgaName,
 		AmountNGN:      nil,
 		IdempotencyKey: "lead:" + l.ID.String() + ":" + eventName,
 	}
@@ -236,7 +240,7 @@ func (e FunnelEvent) Map() map[string]any {
 	if e.AmountNGN != nil {
 		amount = *e.AmountNGN
 	}
-	return map[string]any{
+	m := map[string]any{
 		"event_id":        e.EventID,
 		"tenant_id":       e.TenantID,
 		"entity_type":     e.EntityType,
@@ -249,4 +253,12 @@ func (e FunnelEvent) Map() map[string]any {
 		"amount_ngn":      amount,
 		"idempotency_key": e.IdempotencyKey,
 	}
+	// Only when known, so the PII-free §2 shape is unchanged for other leads.
+	if e.LgaCode != nil && *e.LgaCode != "" {
+		m["lga_code"] = *e.LgaCode
+		if e.LgaName != nil {
+			m["lga_name"] = *e.LgaName
+		}
+	}
+	return m
 }

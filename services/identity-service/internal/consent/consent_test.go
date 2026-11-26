@@ -581,3 +581,38 @@ func TestRelaySweepPublishesOnce(t *testing.T) {
 		t.Errorf("second sweep republished: events = %d", len(h.pub.events))
 	}
 }
+
+// 2026-11-21: a capture publishes ConsentGranted on the identity topic (graph-sync ConsentData shape) when
+// IdentityTopic is set; a phone subject travels as "phone".
+func TestCapturePublishesConsentGranted(t *testing.T) {
+	h := newHarness()
+	h.h.Events, h.h.PubSub, h.h.IdentityTopic = h.pub, "pubsub-kafka", "opendesk.identity.events"
+	rec := h.captureOnce(t, "marketing")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if len(h.pub.events) != 1 || h.pub.events[0].topic != "opendesk.identity.events" {
+		t.Fatalf("events = %+v", h.pub.events)
+	}
+	raw, _ := json.Marshal(h.pub.events[0].data)
+	var evt struct {
+		Type string         `json:"type"`
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		t.Fatal(err)
+	}
+	if evt.Type != ConsentGrantedEventType || evt.Data["purpose"] != "marketing" || evt.Data["phone"] != "+2348012345678" || evt.Data["consent_id"] == "" {
+		t.Errorf("event = %s", raw)
+	}
+}
+
+func TestGrantedEventDataSubjectKinds(t *testing.T) {
+	cid := uuid.New().String()
+	if d := grantedEventData(Record{ConsentID: uuid.New(), DataSubjectID: cid, Purpose: "marketing"}); d["contact_id"] != cid || d["phone"] != nil {
+		t.Errorf("uuid subject: %+v", d)
+	}
+	if d := grantedEventData(Record{ConsentID: uuid.New(), DataSubjectID: "a@b.co", Purpose: "marketing"}); d["contact_id"] != nil || d["phone"] != nil {
+		t.Errorf("email subject: %+v", d)
+	}
+}

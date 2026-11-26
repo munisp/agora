@@ -23,12 +23,13 @@ fallback philosophy). Tests drive fakes through the same seam.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from . import sip
+from . import outbound_script, sip
 from .logging import get_logger
 
 log = get_logger("outbound")
@@ -155,6 +156,10 @@ def build_outbound_call_context(
     if slug is None:
         return None
     callee, _, attrs = sip.extract_call_info(room_name, participants)
+    if not callee and not attrs:
+        demo = demo_callee(participants)
+        if demo is not None:
+            callee, attrs = demo
     return sip.InboundCallContext(
         site_slug=slug,
         caller_phone=callee,
@@ -164,12 +169,33 @@ def build_outbound_call_context(
     )
 
 
+# 2026-11-22: the dashboard's browser DEMO PHONE answers outcall- rooms as this identity, with the call brief (the
+# same agora.* keys the SIP dial sets as attributes, plus agora.phone) in its participant metadata.
+DEMO_IDENTITY_PREFIX = "out-demo-"
+
+
+def demo_callee(participants: Any) -> tuple[str, dict[str, str]] | None:
+    """(callee phone, brief attributes) from a demo-phone participant, or None when there is none."""
+    for p in participants or ():
+        if not (getattr(p, "identity", "") or "").startswith(DEMO_IDENTITY_PREFIX):
+            continue
+        try:
+            meta = json.loads(getattr(p, "metadata", "") or "{}")
+        except ValueError:
+            meta = {}
+        raw = meta.get("agora_outbound") if isinstance(meta, dict) else None
+        attrs = {str(k): str(v) for k, v in (raw or {}).items()} if isinstance(raw, dict) else {}
+        return sip.normalize_phone(attrs.get("agora.phone", "")), attrs
+    return None
+
+
 async def _create_sip_participant(api: Any, request: Any) -> Any:
     """The single livekit-api touchpoint: api.sip.create_sip_participant."""
     return await api.sip.create_sip_participant(request)
 
 
-def _build_participant_request(trunk_id: str, room: str, call_to: str, identity: str) -> Any:
+def _build_participant_request(trunk_id: str, room: str, call_to: str, identity: str,
+                               attributes: dict[str, str] | None = None) -> Any:
     """Construct the CreateSIPParticipant request for the INSTALLED
     livekit-api (lazy import — tests stub livekit.protocol.sip)."""
     from livekit.protocol import sip as proto_sip  # noqa: PLC0415 - lazy by design
@@ -184,6 +210,8 @@ def _build_participant_request(trunk_id: str, room: str, call_to: str, identity:
             "room_name": room,
             "participant_identity": identity,
         }
+        if attributes:  # 2026-11-22: the call's purpose + facts (app/outbound_script.py)
+            kwargs["participant_attributes"] = dict(attributes)
         try:
             return cls(**kwargs)
         except TypeError:
@@ -200,6 +228,9 @@ async def place_outbound_call(
     site_slug: str,
     phone_number: str,
     *,
+    purpose: str | None = None,
+    contact_name: str | None = None,
+    context: dict[str, Any] | None = None,
     api: Any | None = None,
 ) -> OutboundCall:
     """Dial ``phone_number`` (E.164) on behalf of ``site_slug``.
@@ -233,7 +264,8 @@ async def place_outbound_call(
         close_api = True
     try:
         request = _build_participant_request(
-            trunk_id, room, callee, identity=f"out-{callee}"
+            trunk_id, room, callee, identity=f"out-{callee}",
+            attributes=outbound_script.to_attributes(purpose, contact_name, context),
         )
         await _create_sip_participant(api, request)
     except OutboundError:
@@ -251,5 +283,6 @@ async def place_outbound_call(
         site_slug=slug,
         callee=callee,
         trunk_id=trunk_id,
+        purpose=purpose or "general",
     )
     return OutboundCall(room=room, call_id=call_id, site_slug=slug, phone_number=callee)

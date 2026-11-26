@@ -76,6 +76,7 @@ from .config import (
     settings,
 )
 from .validators import validate_document
+from .policy import POLICY_FIELDS as _POLICY_FIELDS, apply_rules as _policy_apply, combine as _policy_combine
 from .dapr_client import DaprClient
 from .llm import OcrClient, OcrUpstreamError, mock_extraction
 from .logging import configure_logging, get_logger
@@ -116,6 +117,10 @@ class AppState:
     ocr: OcrClient
     dapr: DaprClient
     av: AvClient | None  # SPEC-W59: None == AV disabled (CLAMAV_HOST empty)
+
+
+def _policy_kinds() -> tuple[str, ...]:
+    return tuple(_POLICY_FIELDS)
 
 
 def get_state(request: Request) -> AppState:
@@ -727,6 +732,14 @@ async def _run_extraction(
         kind, extraction.fields
     )
     async with deps.db.tenant_conn(tenant_id) as conn:
+        # 2026-11-26: the business's own policy rules (turned on by staff) on top of the built-in checks.
+        if kind in _policy_kinds() and hasattr(deps.db, "active_policy_rules"):
+            rules = await deps.db.active_policy_rules(conn, kind)
+            if rules:
+                validation_verdict, validation_reasons = _policy_combine(
+                    (validation_verdict, validation_reasons),
+                    _policy_apply(kind, extraction.fields, rules),
+                )
         await deps.db.mark_extracted(
             conn,
             document_id,
@@ -1411,3 +1424,163 @@ async def tenant_deleted_event(request: Request, deps: AppState = Depends(get_st
         log.error("tenant_deleted.handler_failed", error=str(exc))
         raise HTTPException(status_code=500, detail="tenant-delete handler failed") from exc
     return {"status": "SUCCESS", **result}
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-26: policy rules (app/policy.py). Staff upload the business's policy; a text model drafts rules in a fixed
+# vocabulary (background job, ~1 min); staff review, untick, turn them on. Active rules then apply to every caller
+# document of that kind in _run_extraction. Browser calls come through the gateway (X-Tenant-Slugs binding).
+# ---------------------------------------------------------------------------
+from . import policy as _policy  # noqa: E402
+from .policy_text import ExtractError as _PolicyExtractError, extract_text as _policy_text  # noqa: E402
+
+_policy_jobs: set[asyncio.Task] = set()
+
+
+def _actor(request: Request) -> str | None:
+    """Who is acting, from the gateway's OIDC userinfo header when present (for the record only)."""
+    import base64
+    import json as _json
+
+    raw = request.headers.get("x-userinfo")
+    if not raw:
+        return None
+    try:
+        info = _json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)))
+        return str(info.get("email") or info.get("preferred_username") or info.get("sub") or "")[:200] or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _policy_out(p: dict[str, Any]) -> dict[str, Any]:
+    out = dict(p)
+    out["id"] = str(out["id"])
+    for k in ("created_at", "updated_at", "activated_at"):
+        if out.get(k) is not None:
+            out[k] = out[k].isoformat()
+    return out
+
+
+async def _draft_rules(text: str) -> list[dict[str, Any]]:
+    body = {
+        "model": settings.policy_llm_model,
+        "messages": _policy.extraction_prompt(text),
+        "temperature": 0,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+        "reasoning_effort": "none",
+    }
+    async with httpx.AsyncClient(timeout=settings.policy_llm_timeout_s) as client:
+        r = await client.post(f"{settings.policy_llm_base_url.rstrip('/')}/chat/completions", json=body)
+    if r.status_code >= 400:
+        raise RuntimeError(f"policy model answered {r.status_code}")
+    content = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    return _policy.normalize_rules(_policy.parse_model_json(content))
+
+
+async def _read_policy_job(deps: AppState, tenant_id: str, policy_id: uuid.UUID, text: str, pages: int) -> None:
+    try:
+        rules = await _draft_rules(text)
+        status, error = "draft", None if rules else "No checkable rules were found in this policy."
+    except Exception as exc:  # noqa: BLE001 - recorded on the policy, shown to staff
+        log.warning("policy.read_failed", policy_id=str(policy_id), error=str(exc)[:200])
+        rules, status, error = [], "failed", "The policy could not be read just now. Try again in a few minutes."
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        await deps.db.finish_policy(conn, policy_id, status=status, rules=rules, error=error,
+                                    pages=pages, chars=len(text))
+    log.info("policy.read", policy_id=str(policy_id), status=status, rules=len(rules))
+
+
+@app.post("/v1/ocr/policies", status_code=202)
+async def create_policy(request: Request, deps: AppState = Depends(get_state)):
+    """Upload a policy document (multipart: file, title?, tenant_id?). Answers at once with status "reading"; poll
+    GET /v1/ocr/policies/{id} until "draft" (or "failed")."""
+    if not (settings.policy_llm_base_url and settings.policy_llm_model):
+        raise HTTPException(status_code=503, detail="policy rules not configured")
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not getattr(upload, "filename", None):
+        raise HTTPException(status_code=400, detail="multipart field 'file' required")
+    tenant_id = await _authenticate(request, _as_str(form.get("tenant_id")) or _as_str(form.get("tenant")), deps)
+    data = await upload.read()
+    try:
+        text, pages = _policy_text(upload.filename, data)
+    except _PolicyExtractError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    title = (_as_str(form.get("title")) or upload.filename.rsplit(".", 1)[0])[:200]
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        row = await deps.db.insert_policy(conn, tenant_id=tenant_id, title=title, filename=upload.filename[:200],
+                                          created_by=_actor(request))
+    task = asyncio.create_task(_read_policy_job(deps, tenant_id, row["id"], text, pages))
+    _policy_jobs.add(task)
+    task.add_done_callback(_policy_jobs.discard)
+    return JSONResponse(status_code=202, content=_policy_out(row))
+
+
+@app.get("/v1/ocr/policies")
+async def list_policies(request: Request, tenant: str | None = None, deps: AppState = Depends(get_state)):
+    tenant_id = await _authenticate(request, tenant, deps)
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        rows = await deps.db.list_policies(conn)
+    return {"items": [_policy_out(r) for r in rows], "fields": _policy.POLICY_FIELDS}
+
+
+def _policy_uuid(policy_id: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(policy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="policy not found") from exc
+
+
+@app.get("/v1/ocr/policies/{policy_id}")
+async def get_policy(policy_id: str, request: Request, tenant: str | None = None,
+                     deps: AppState = Depends(get_state)):
+    tenant_id = await _authenticate(request, tenant, deps)
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        row = await deps.db.get_policy(conn, _policy_uuid(policy_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="policy not found")
+    return _policy_out(row)
+
+
+@app.put("/v1/ocr/policies/{policy_id}")
+async def update_policy(policy_id: str, request: Request, tenant: str | None = None,
+                        deps: AppState = Depends(get_state)):
+    """Turn a policy's checks on or off: {"status": "active"|"off", "enabled": ["r1", ...]?}. Only the drafted rules
+    can be kept or left out; their content is never edited from outside (it stays what the model read and the person
+    approved)."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    status = (body or {}).get("status")
+    if status not in ("active", "off"):
+        raise HTTPException(status_code=400, detail='status must be "active" or "off"')
+    tenant_id = await _authenticate(request, tenant, deps)
+    pid = _policy_uuid(policy_id)
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        row = await deps.db.get_policy(conn, pid)
+        if row is None:
+            raise HTTPException(status_code=404, detail="policy not found")
+        if row["status"] in ("reading", "failed"):
+            raise HTTPException(status_code=409, detail="this policy has no rules to turn on")
+        rules = list(row["rules"] or [])
+        enabled = (body or {}).get("enabled")
+        if isinstance(enabled, list):
+            keep = {str(x) for x in enabled}
+            rules = [dict(r, enabled=r.get("id") in keep) for r in rules]
+        if status == "active" and not any(r.get("enabled", True) for r in rules):
+            raise HTTPException(status_code=400, detail="choose at least one rule to turn on")
+        row = await deps.db.set_policy(conn, pid, status=status, rules=rules, actor=_actor(request))
+    log.info("policy.updated", policy_id=policy_id, status=status)
+    return _policy_out(row)
+
+
+@app.delete("/v1/ocr/policies/{policy_id}", status_code=204)
+async def delete_policy(policy_id: str, request: Request, tenant: str | None = None,
+                        deps: AppState = Depends(get_state)):
+    tenant_id = await _authenticate(request, tenant, deps)
+    async with deps.db.tenant_conn(tenant_id) as conn:
+        if not await deps.db.delete_policy(conn, _policy_uuid(policy_id)):
+            raise HTTPException(status_code=404, detail="policy not found")
+    return Response(status_code=204)

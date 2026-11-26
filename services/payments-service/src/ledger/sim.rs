@@ -203,6 +203,36 @@ pub struct SimLedgerClient {
     fee_bps: u64,
 }
 
+/// 2026-11-21: serialisable form of SimState for the durable sim ledger
+/// (ledger/durable.rs). Vecs, not maps, so u128 ids never become JSON keys.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SimSnapshot {
+    accounts: Vec<Account>,
+    transfers: Vec<Transfer>,
+}
+
+impl SimLedgerClient {
+    /// The whole ledger state as JSON text (accounts + transfers).
+    pub(crate) async fn export_snapshot(&self) -> Result<String, String> {
+        let st = self.state.lock().await;
+        let snap = SimSnapshot {
+            accounts: st.accounts.values().cloned().collect(),
+            transfers: st.transfers.values().cloned().collect(),
+        };
+        serde_json::to_string(&snap).map_err(|e| format!("sim snapshot encode failed: {e}"))
+    }
+
+    /// Replace the ledger state with a snapshot produced by export_snapshot.
+    pub(crate) async fn import_snapshot(&self, text: &str) -> Result<(usize, usize), String> {
+        let snap: SimSnapshot =
+            serde_json::from_str(text).map_err(|e| format!("sim snapshot decode failed: {e}"))?;
+        let mut st = self.state.lock().await;
+        st.accounts = snap.accounts.into_iter().map(|a| (a.name.clone(), a)).collect();
+        st.transfers = snap.transfers.into_iter().map(|t| (t.id, t)).collect();
+        Ok((st.accounts.len(), st.transfers.len()))
+    }
+}
+
 impl SimLedgerClient {
     pub fn new(fee_bps: u64) -> Self {
         Self {

@@ -243,6 +243,75 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "send_whatsapp_confirmation",
+            "description": (
+                "Send the person a WhatsApp message confirming their appointment (service, with whom, when). Call it "
+                "once, right after they confirm an appointment or you book one. Mention the WhatsApp only if this "
+                "returns status sent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "offering": {"type": "string", "description": "The service, e.g. 'RSA Registration and Onboarding Call'"},
+                    "team_member": {"type": "string", "description": "Who it is with, e.g. 'Aisha Bello' (empty if unknown)"},
+                    "when": {"type": "string", "description": "Day and time as you said it, e.g. 'Tuesday 24 November at 9:00 am'"},
+                },
+                "required": ["offering", "when"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_document_upload_link",
+            "description": (
+                "When the person needs to send you a document (a pay stub, a receipt, an ID, a letter): on a web chat this "
+                "tells you to point them to the paperclip; on a phone call it WhatsApps them a secure upload link. Say only "
+                "what the result's message tells you."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_type": {"type": "string", "enum": ["pay_stub", "receipt", "document"],
+                                      "description": "What they will send: pay_stub, receipt, or document for anything else"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_shared_documents",
+            "description": (
+                "List the documents the person has shared in this conversation and where each check stands (received, "
+                "still being checked, passed, or needs a person to review). Use it when they say they have sent one."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_caller_details",
+            "description": (
+                "Save the caller's name, email and phone number to the CRM as soon as they have CONFIRMED the "
+                "read-back at the start of the call, so the business can always reach them, even if they never "
+                "book. Call it once, right after the caller says the details are correct."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Caller's full name, e.g. 'Ngozi Okafor'"},
+                    "phone": {"type": "string", "description": "Caller's phone number as digits, e.g. '08065553108'"},
+                    "email": {"type": "string", "description": "Caller's email, e.g. 'ngozi.okafor@gmail.com' (empty if none)"},
+                },
+                "required": ["name", "phone"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "capture_location",
             "description": (
                 "Save the caller's location to their contact record "
@@ -272,7 +341,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "Escalate the conversation to a human staff member (warm "
                 "handoff). Creates a LiveKit escalation room, notifies staff "
                 "and confirms to the caller. Use when the caller asks for a "
-                "human, is distressed, or the request cannot be resolved."
+                "human, is distressed, or the request cannot be resolved. "
+                "Tell the customer exactly what the result's message says "
+                "(in a typed chat staff reply in the chat; never mention a call)."
             ),
             "parameters": {
                 "type": "object",
@@ -473,6 +544,72 @@ def _verification_unavailable_payload() -> dict[str, Any]:
         ),
     }
 
+
+
+def known_id(value: str, candidates: list[str]) -> str:
+    """The real id the model meant. It copies long UUIDs out of the prompt and sometimes slips a character
+    ("4a5dca9a-3663-…" for "…-3963-…"): the booking service then 400s and the caller hears "trouble reaching our
+    booking system". An id that is not known exactly but is ≥ 0.9 similar to exactly one known id is that id."""
+    import difflib
+
+    v = str(value or "").strip()
+    if not v or v in candidates or not candidates:
+        return v
+    scored = sorted(((difflib.SequenceMatcher(None, v, c).ratio(), c) for c in candidates), reverse=True)
+    best = scored[0]
+    if best[0] >= 0.9 and (len(scored) == 1 or scored[1][0] < best[0] - 0.05):
+        return best[1]
+    return v
+
+
+def _rfc3339(value: str, tz_name: str | None) -> str:
+    """The booking API needs RFC3339 (with an offset). The model often sends a bare local time ("2026-11-18T08:00:00"),
+    which booking rejected with 400 "from must be RFC3339" and the caller heard "trouble reaching our booking system".
+    A bare date/time is read in the business's time zone; anything unparseable is passed through unchanged."""
+    from zoneinfo import ZoneInfo
+
+    raw = str(value or "").strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if dt.tzinfo is not None:
+        # A UTC time from the model is a local time with the wrong marker: a receptionist in Lagos asked for "12 noon"
+        # sent "...T12:00:00Z" and booked 1pm. Read UTC wall-clock times in the business's zone; real offsets
+        # ("+01:00") pass through unchanged.
+        if dt.utcoffset() == timedelta(0) and (tz_name or "UTC") not in ("UTC", "Etc/UTC", "GMT"):
+            try:
+                return dt.replace(tzinfo=ZoneInfo(tz_name)).isoformat()
+            except Exception:  # noqa: BLE001
+                return raw
+        return raw
+    if dt.tzinfo is None:
+        try:
+            dt = dt.replace(tzinfo=ZoneInfo(tz_name or "UTC"))
+        except Exception:  # noqa: BLE001
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def _past_window_note(to_iso: str, tz_name: str | None, now: datetime | None = None) -> str | None:
+    """A note when the requested window ends before today in the business's time zone, else None."""
+    from zoneinfo import ZoneInfo
+
+    try:
+        end = datetime.fromisoformat(str(to_iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except Exception:  # noqa: BLE001
+        tz = ZoneInfo("UTC")
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=tz)
+    today = (now or datetime.now(timezone.utc)).astimezone(tz).date()
+    if end.astimezone(tz).date() >= today:
+        return None
+    return (f"The requested dates ({end.astimezone(tz).date().isoformat()}) are in the past. Today is "
+            f"{today.strftime('%A')} {today.isoformat()}. Check again with a date from today onwards.")
 
 class ToolLayer:
     """Implements the six tools against Dapr. One instance per session."""
@@ -826,17 +963,30 @@ class ToolLayer:
         await self._emit_tool_event("get_business_info", "ok", {})
         return result
 
+    def _real_ids(self, offering_id: str, team_member_id: str) -> tuple[str, str]:
+        offerings = [str(o.get("id")) for o in (self._ctx.offerings or []) if o.get("id")]
+        team = [str(m.get("id")) for m in (self._ctx.team_members or []) if m.get("id")]
+        return known_id(offering_id, offerings), known_id(team_member_id, team)
+
     async def get_availability(
         self, offering_id: str, team_member_id: str, from_iso: str, to_iso: str
     ) -> dict[str, Any]:
+        offering_id, team_member_id = self._real_ids(offering_id, team_member_id)
+        # A window that ends before today cannot have free slots; the model sometimes guesses the wrong year. Say so
+        # (with today's date) instead of returning an empty list it reads as "fully booked".
+        past = _past_window_note(to_iso, self._ctx.timezone)
+        if past is not None:
+            await self._emit_tool_event("get_availability", "past_date", {"offering_id": offering_id})
+            return {"offering_id": offering_id, "team_member_id": team_member_id, "timezone": self._ctx.timezone,
+                    "slots": [], "note": past}
         resp = await self._dapr.invoke_get(
             self._settings.booking_app_id,
             f"public/sites/{self._ctx.site_slug}/availability",
             params={
                 "offering_id": offering_id,
                 "team_member_id": team_member_id,
-                "from": from_iso,
-                "to": to_iso,
+                "from": _rfc3339(from_iso, self._ctx.timezone),
+                "to": _rfc3339(to_iso, self._ctx.timezone),
             },
         )
         slots = (resp or {}).get("slots") or []
@@ -860,6 +1010,10 @@ class ToolLayer:
         contact_name: str | None = None,
         email: str | None = None,
     ) -> dict[str, Any]:
+        offering_id, team_member_id = self._real_ids(offering_id, team_member_id)
+        # The model often sends a bare local time; booking dead-lettered "bad starts_at" and the caller had been told
+        # the visit was booked. Read it in the business's time zone, as for availability.
+        starts_at = _rfc3339(starts_at, self._ctx.timezone)
         try:
             confirmed = self._require_phone(phone)
         except PhoneConfirmationRequired as pcr:
@@ -1144,6 +1298,7 @@ class ToolLayer:
     async def reschedule_appointment(
         self, booking_id: str, starts_at: str, phone: str
     ) -> dict[str, Any]:
+        starts_at = _rfc3339(starts_at, self._ctx.timezone)
         gate = await self._require_verified(phone)
         if isinstance(gate, dict):
             return await self._refuse_gate("reschedule_appointment", gate)
@@ -1197,6 +1352,171 @@ class ToolLayer:
             "command_id": event_id,
             "booking_id": booking_id,
         }
+
+    # ------------------------------------- caller details to the CRM (2026-11-21)
+    async def save_caller_details(
+        self, name: str, phone: str, email: str | None = None
+    ) -> dict[str, Any]:
+        """Save the details the caller gave (and confirmed) at the start of the call as a contact, so the
+        business can reach them even without a booking. booking-service ``POST /internal/contacts/upsert``
+        with ``capture_channel``: it matches an existing contact by phone or e-mail and, for these
+        self-reported details, only FILLS blank fields (a caller can claim any number, so an existing
+        contact's name/e-mail is never overwritten); it then publishes ContactCaptured so crm-sync adds the
+        person to the CRM. Also remembers the details on the session for the rest of the call.
+
+        NEVER raises: failures resolve to a payload the model can carry on from (the call must go on)."""
+        name = (name or "").strip()
+        email = (email or "").strip()
+        # the same form book_appointment sends (the model's digits, stripped), so a later booking for this
+        # caller matches the contact saved here instead of creating a second one
+        phone_n = (phone or "").strip()
+        if not name or not phone_n:
+            return {"status": "error", "message": "save_caller_details needs the caller's name and phone number."}
+        self._session.caller_name = name
+        if email:
+            self._session.caller_email = email
+        if not self._session.claimed_phone:
+            self._session.claimed_phone = phone_n
+        headers = {"X-Tenant-Slug": self._ctx.tenant_slug}
+        if self._settings.voice_booking_internal_token:
+            headers["X-Internal-Token"] = self._settings.voice_booking_internal_token
+        try:
+            res = await self._dapr.invoke_post(
+                self._settings.booking_app_id,
+                "internal/contacts/upsert",
+                payload={"name": name, "phone": phone_n, "email": email,
+                         "capture_channel": self._session.channel or "voice"},
+                headers=headers,
+            )
+            contact = (res or {}).get("contact") or {}
+            contact_id = str(contact.get("id") or "")
+            await self._emit_tool_event(
+                "save_caller_details", "ok",
+                {"contact_id": contact_id, "created": bool((res or {}).get("created")), **self._event_phone_detail(phone_n)},
+            )
+            log.info("caller details saved", conversation_id=self._session.conversation_id, contact_id=contact_id)
+            return {"status": "ok", "contact_id": contact_id,
+                    "message": "Saved. Now ask how you can help them today."}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("save_caller_details failed", error=str(exc)[:200])
+            await self._emit_tool_event("save_caller_details", "error", {"error": str(exc)[:200]})
+            return {"status": "error", "message": "The details could not be saved just now; carry on helping the caller."}
+
+    # ------------------------------------ WhatsApp confirmation (2026-11-22)
+    async def send_whatsapp_confirmation(
+        self, offering: str, when: str, team_member: str | None = None
+    ) -> dict[str, Any]:
+        """WhatsApp the person their appointment details via the messaging-gateway (POST /v1/whatsapp/send). The text is
+        composed HERE from the arguments (no free-form model text reaches the customer). Sent to the session's WhatsApp
+        number (session.whatsapp_to: the demo phone's chosen number, or the callee when WHATSAPP_CONFIRMATIONS=on).
+        NEVER raises: a failure tells the model to carry on (the call must go on)."""
+        # only the number the call set up for this (demo phone's number, or the callee when enabled) — never a guess
+        to = (self._session.whatsapp_to or "").strip()
+        offering, when = " ".join((offering or "").split())[:120], " ".join((when or "").split())[:80]
+        team_member = " ".join((team_member or "").split())[:80]
+        if not to or not offering or not when:
+            return {"status": "error", "message": "No WhatsApp number for this call; do not mention WhatsApp, carry on."}
+        from .whatsapp_messages import appointment_text
+
+        text = appointment_text("confirmation", self._ctx.display_name or self._ctx.site_slug, self._session.caller_name,
+                                offering, when, team_member)
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self._settings.http_timeout_s) as client:
+                r = await client.post(f"{self._settings.messaging_gateway_url.rstrip('/')}/v1/whatsapp/send",
+                                      json={"to": to, "message": text})
+            if r.status_code >= 400:
+                raise RuntimeError(f"messaging-gateway {r.status_code}: {r.text[:160]}")
+            await self._emit_tool_event("send_whatsapp_confirmation", "ok", self._event_phone_detail(to))
+            log.info("whatsapp confirmation sent", conversation_id=self._session.conversation_id)
+            return {"status": "sent", "message": "Sent. Tell them a WhatsApp confirmation is on its way."}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("whatsapp confirmation failed", error=str(exc)[:200])
+            await self._emit_tool_event("send_whatsapp_confirmation", "error", {"error": str(exc)[:200]})
+            return {"status": "error", "message": "The WhatsApp message could not be sent just now; do not mention it."}
+
+    # ------------------------------------------------ caller documents (2026-11-26)
+    async def send_document_upload_link(self, document_type: str | None = None) -> dict[str, Any]:
+        """Point the person to where a document goes: the paperclip on a web chat, a photo on WhatsApp, and on a phone
+        call a signed upload link WhatsApped to the number the call set up (session.whatsapp_to, the same rule as
+        send_whatsapp_confirmation). NEVER raises: a failure tells the model what to say instead."""
+        kind = (document_type or "").strip().lower()
+        kind = kind if kind in ("pay_stub", "receipt", "document") else "document"
+        label = {"pay_stub": "pay stub", "receipt": "receipt"}.get(kind, "document")
+        if getattr(self._session, "text_chat", False) and self._session.channel in ("web", ""):
+            return {"status": "use_paperclip", "message": f"Tell them to tap the paperclip below the chat, pick the {label} "
+                    "and press Upload; it is checked in about two minutes and you will see the result."}
+        if self._session.channel == "whatsapp":
+            return {"status": "use_whatsapp", "message": f"Tell them to send a clear photo of the {label} here in WhatsApp."}
+        secret, base = self._settings.document_link_secret, self._settings.document_link_base_url
+        to = (self._session.whatsapp_to or "").strip()
+        if not (secret and base):
+            return {"status": "error", "message": "Document sharing is not set up; do not offer to receive documents."}
+        screen = self._settings.document_link_delivery == "screen"
+        if not to and not screen:
+            return {"status": "error", "message": "There is no WhatsApp number for this call, so no link can be sent. Tell "
+                    "them they can share it from the chat on the website instead."}
+        from .documents import mint_document_link
+
+        token, _exp = mint_document_link(secret=secret, session_id=self._session.conversation_id,
+                                         tenant_id=self._ctx.tenant_id, ttl_s=self._settings.document_link_ttl_s)
+        minutes = max(1, int(self._settings.document_link_ttl_s // 60))
+        business = self._ctx.display_name or self._ctx.site_slug
+        text = (f"{business}: here is your secure link to upload your {label}: {base.rstrip('/')}/{token}?kind={kind} "
+                f"(it works for {minutes} minutes).")
+        if screen:
+            # Demo delivery: the message appears on the caller's call screen, marked as a demo; nothing is sent.
+            from . import call_activity
+
+            link = f"{base.rstrip('/')}/{token}?kind={kind}"
+            if not call_activity.show_on_screen({"channel": "whatsapp", "demo": True, "text": text, "link": link}):
+                return {"status": "error", "message": "The link could not be shown just now. Tell them they can share it "
+                        "from the chat on the website instead."}
+            await self._emit_tool_event("send_document_upload_link", "ok", {"delivery": "screen"})
+            return {"status": "sent", "message": "Sent. Tell them a WhatsApp with a secure upload link is on its way; once "
+                    "they have uploaded it, use check_shared_documents to see it."}
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self._settings.http_timeout_s) as client:
+                r = await client.post(f"{self._settings.messaging_gateway_url.rstrip('/')}/v1/whatsapp/send",
+                                      json={"to": to, "message": text})
+            if r.status_code >= 400:
+                raise RuntimeError(f"messaging-gateway {r.status_code}: {r.text[:160]}")
+            await self._emit_tool_event("send_document_upload_link", "ok", self._event_phone_detail(to))
+            return {"status": "sent", "message": "Sent. Tell them a WhatsApp with a secure upload link is on its way; once "
+                    "they have uploaded it, use check_shared_documents to see it."}
+        except Exception as exc:  # noqa: BLE001 - surfaced to the model
+            log.warning("document link failed", error=str(exc)[:200])
+            await self._emit_tool_event("send_document_upload_link", "error", {"error": str(exc)[:200]})
+            return {"status": "error", "message": "The link could not be sent just now. Tell them they can share it from "
+                    "the chat on the website instead."}
+
+    async def check_shared_documents(self) -> dict[str, Any]:
+        """The documents shared in this conversation, as their kind and check result (never the details read from
+        them). A web chat's are on its session; a call's are kept by the control plane, read with a signed request."""
+        from .documents import document_lookup_sig, documents_in_words
+
+        docs = list(getattr(self._session, "shared_documents", None) or [])
+        secret = self._settings.document_link_secret
+        if not getattr(self._session, "text_chat", False) and secret:
+            try:
+                import httpx
+
+                sid = self._session.conversation_id
+                async with httpx.AsyncClient(timeout=self._settings.http_timeout_s) as client:
+                    r = await client.get(f"{self._settings.voice_control_plane_url.rstrip('/')}/voice/internal/documents/{sid}",
+                                         headers={"X-Document-Sig": document_lookup_sig(secret, sid)})
+                if r.status_code == 200:
+                    docs = r.json().get("documents") or docs
+            except Exception as exc:  # noqa: BLE001 - an empty answer, never a broken call
+                log.warning("shared documents lookup failed", error=str(exc)[:200])
+        if not docs:
+            return {"status": "none", "message": "Nothing has been shared in this conversation yet."}
+        return {"status": "ok", "documents": documents_in_words(docs),
+                "message": "Tell them, in a sentence, what you have and where each check stands. Never read out details "
+                "from the documents."}
 
     # -------------------------------------------- location capture (W11 C)
     async def capture_location(
@@ -1354,6 +1674,9 @@ class ToolLayer:
                 "site_slug": self._ctx.site_slug,
                 "room": room,
                 "reason": reason or "caller_requested",
+                # 2026-11-23: the stored transcript's id, so the human inbox opens the right conversation.
+                "stored_conversation_id": (self._session.stored_id_lookup() if callable(
+                    getattr(self._session, "stored_id_lookup", None)) else None),
                 # K15(e): staff join via the internal staff-token endpoint.
                 "staff_token_endpoint": (
                     f"/voice-admin/escalations/{self._session.conversation_id}"
@@ -1379,8 +1702,12 @@ class ToolLayer:
             "status": "escalated",
             "room": room,
             "room_created": room_created,
+            # 2026-11-23: a typed chat is answered in the same chat (human inbox), not on a call.
             "message": (
-                "I'm connecting you with a member of our team right now. "
+                "I've passed this conversation to a member of our team. They will reply right here in this "
+                "chat shortly, so please keep this chat open."
+                if getattr(self._session, "text_chat", False)
+                else "I'm connecting you with a member of our team right now. "
                 "They've been notified and will join shortly; I'll stay on "
                 "the line to help in the meantime."
             ),
@@ -1509,6 +1836,20 @@ class ToolLayer:
                 booking_id=str(arguments.get("booking_id", "")),
                 phone=str(arguments.get("phone", "")),
                 reason=arguments.get("reason"),
+            ),
+            "send_whatsapp_confirmation": lambda: self.send_whatsapp_confirmation(
+                offering=str(arguments.get("offering", "")),
+                when=str(arguments.get("when", "")),
+                team_member=arguments.get("team_member"),
+            ),
+            "send_document_upload_link": lambda: self.send_document_upload_link(
+                document_type=arguments.get("document_type"),
+            ),
+            "check_shared_documents": lambda: self.check_shared_documents(),
+            "save_caller_details": lambda: self.save_caller_details(
+                name=str(arguments.get("name", "")),
+                phone=str(arguments.get("phone", "")),
+                email=arguments.get("email"),
             ),
             "capture_location": lambda: self.capture_location(
                 address_text=arguments.get("address_text"),

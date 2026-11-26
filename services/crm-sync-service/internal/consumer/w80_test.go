@@ -60,7 +60,8 @@ func TestReschedulePatchesTitleAndDueAt(t *testing.T) {
 	}
 	// A2 core assertion: the title embeds the start time and MUST be
 	// re-rendered — a dueAt-only patch leaves a stale title.
-	wantTitle := "Manicure appointment at 2026-04-02T15:30:00Z"
+	// (deploy: titles are rendered in the business's local time, CRM_TASK_TIMEZONE, default Africa/Lagos)
+	wantTitle := "Manicure \u2014 Thu 2 Apr 2026, 4:30 pm (Lagos)"
 	if got := patch.body["title"]; got != wantTitle {
 		t.Errorf("title = %v, want %q (stale-title bug)", got, wantTitle)
 	}

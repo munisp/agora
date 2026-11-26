@@ -340,6 +340,30 @@ func (c *Client) FindPerson(ctx context.Context, email, phone string) (Record, e
 	return Record{}, ErrNotFound
 }
 
+// FindPersonByUniqueName returns the one Person whose first and last name match exactly (case-insensitive). Two or
+// more matches (or none) return ErrNotFound: a name alone must never pick between namesakes.
+func (c *Client) FindPersonByUniqueName(ctx context.Context, first, last string) (Record, error) {
+	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
+	if first == "" || last == "" {
+		return Record{}, ErrNotFound
+	}
+	filter := AndExpr(Expr("name.firstName", OpIlike, first), Expr("name.lastName", OpIlike, last))
+	var env envelope
+	if err := c.do(ctx, http.MethodGet, "/rest/people", Query(filter, 2).Encode(), nil, &env); err != nil {
+		return Record{}, err
+	}
+	for _, raw := range env.Data {
+		var arr []Record
+		if err := json.Unmarshal(raw, &arr); err == nil {
+			if len(arr) == 1 && arr[0].ID != "" {
+				return arr[0], nil
+			}
+			return Record{}, ErrNotFound
+		}
+	}
+	return Record{}, ErrNotFound
+}
+
 // CreatePerson creates a Person record.
 func (c *Client) CreatePerson(ctx context.Context, p PersonUpsert) (string, error) {
 	return c.create(ctx, "people", p)
@@ -456,7 +480,7 @@ func (c *Client) GetTask(ctx context.Context, id string) (TaskRecord, error) {
 
 // CreateNote creates a Note and links it to a person via /rest/noteTargets.
 func (c *Client) CreateNote(ctx context.Context, title, body, personID string) (string, error) {
-	id, err := c.create(ctx, "notes", map[string]string{"title": title, "body": body})
+	id, err := c.create(ctx, "notes", map[string]any{"title": title, "bodyV2": RichText{Markdown: body}})
 	if err != nil {
 		return "", err
 	}
@@ -472,5 +496,5 @@ func (c *Client) CreateNote(ctx context.Context, title, body, personID string) (
 // when a sentiment-enriched CallQualityEnriched event arrives after the
 // plain SessionEnded fallback already created the call-summary note).
 func (c *Client) UpdateNote(ctx context.Context, id, title, body string) error {
-	return c.patch(ctx, "notes", id, map[string]string{"title": title, "body": body})
+	return c.patch(ctx, "notes", id, map[string]any{"title": title, "bodyV2": RichText{Markdown: body}})
 }

@@ -29,9 +29,11 @@ _MAX_ATTEMPTS = 3
 class TenantLifecycleConsumer:
     """Background task: TenantDeleted tombstones -> purge_tenant_data."""
 
-    def __init__(self, cfg: Config, db: Database) -> None:
+    def __init__(self, cfg: Config, db: Database, search_index: Any = None) -> None:
         self._cfg = cfg
         self._db = db
+        # app.search_index.SearchIndex (optional): mirrors the delete in OpenSearch.
+        self._search_index = search_index
         self._task: asyncio.Task | None = None
         self._consumer: Any = None
 
@@ -118,6 +120,9 @@ class TenantLifecycleConsumer:
                     conversations_deleted=convs,
                     turns_deleted=turns,
                 )
+                if self._search_index is not None:
+                    if await self._search_index.delete_tenant(tenant_id) is None:
+                        raise RuntimeError("search index tenant purge failed")
                 return True
             except Exception as exc:  # noqa: BLE001
                 log.error("tenant purge failed", error=str(exc), attempt=attempt,

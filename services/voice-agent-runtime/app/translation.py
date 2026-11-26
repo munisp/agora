@@ -365,6 +365,241 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+_LLM_LANGUAGE_NAMES = {"yo": "Yoruba", "ha": "Hausa", "ig": "Igbo", "pcm": "Nigerian Pidgin", "en": "English"}
+
+
+class LLMTranslator:
+    """Translate through an OpenAI-compatible chat model (the receptionist's own Ollama).
+
+    Used by the "think in English, speak the caller's language" mode: the receptionist reasons and calls its tools
+    in English, and each sentence group is translated just before it is spoken. Dates, times, phone numbers, names,
+    emails and service names stay as written — Nigerian callers say those in English, and the speech voices read
+    English words fine. Fail-open: any error returns the original text. Results are cached per (text, target).
+    """
+
+    provider = "llm"
+
+    def __init__(self, base_url: str, model: str, *, api_key: str = "", timeout_s: float = 20.0,
+                 extra_body: dict | None = None, client: Any = None,
+                 context: Any = None, review: bool = False) -> None:
+        self._url = (base_url or "").rstrip("/")
+        self._model = model
+        self._api_key = api_key or "ollama"
+        self._timeout_s = timeout_s
+        self._extra = dict(extra_body or {})
+        self._client = client
+        self._cache: dict[tuple[str, str], str] = {}
+        # Inbound (caller -> English) only: a callable returning {"business", "industry", "services", "last_line"}
+        # for the current call, read at each turn (the receptionist's last line changes every turn).
+        self._context = context
+        self._review = review
+
+    def _inbound_prompt(self, source_lang: str) -> str:
+        """What the caller said, from rough speech recognition, into plain English.
+
+        The Yoruba/Hausa/Igbo recogniser writes what it hears phonetically (tone marks missing or wrong, words split
+        or run together, some misheard): read word for word it means nothing ("The price of your goods is too low"
+        for "I just started a new job and want to open a pension account"). Told who was called, what they offer and
+        what the receptionist just asked, the model recovers what the caller most likely said.
+        """
+        name = _LLM_LANGUAGE_NAMES.get(source_lang, source_lang)
+        ctx: dict = {}
+        try:
+            ctx = dict(self._context() or {}) if callable(self._context) else {}
+        except Exception:  # noqa: BLE001 - context is a help, never a requirement
+            ctx = {}
+        business = str(ctx.get("business") or "a Nigerian business").strip()
+        industry = str(ctx.get("industry") or "").strip()
+        services = [str(s).strip() for s in (ctx.get("services") or []) if str(s).strip()][:12]
+        last = str(ctx.get("last_line") or "").strip()
+        about = f"{business}" + (f" ({industry.replace('-', ' ')})" if industry else "")
+        return (
+            f"You are listening to a phone call to {about}."
+            + (f" Its services: {'; '.join(services)}." if services else "")
+            + f" The caller speaks {name}. Their words below come from speech recognition, so they are rough: tone "
+            "marks missing or wrong, words split or run together, some words misheard. Work out what the caller most "
+            "likely said, using the business, its services and the receptionist's last line, and write it as plain "
+            "English in the caller's own voice (\"I ...\"), keeping every detail you can make out (who, what, which "
+            "day, what time). Keep names, numbers, emails, days and times exactly as given. If English words are mixed "
+            "in, keep them. Short answers stay short (\"Yes.\", \"Thank you, goodbye.\"). Reply with the English only. "
+            "Always give your best reading of what they most likely said - never reply that it is unclear: the "
+            "receptionist confirms what it understood, so the caller can correct a wrong guess."
+            + (f"\nThe receptionist last said: \"{last}\"" if last else "")
+        )
+
+    # A few exact lines per language, all in the language itself. The Yoruba/Hausa/Igbo voices mumble or garble
+    # English words and English numbers inside a sentence (measured 2026-11-20 by recognising the voice's own audio:
+    # a phone read-back mixed with English scored 0.06-0.29, the same line all in Yoruba 0.56-0.71), so only names,
+    # the business name and email addresses stay as written. Digit strings stay digits here and are spoken with the
+    # language's own number words afterwards (native_digits), so the model never has to spell a phone number.
+    _EXAMPLES = {
+        "yo": [("Please tell me your first name and last name.", "Ẹ jọ̀wọ́, ẹ sọ orúkọ àkọ́kọ́ yín àti orúkọ ìdílé yín fún mi."),
+               ("You are booked with Aisha Bello for Tuesday, 24 November, at 12 noon.",
+                "Mo ti ṣètò ìpàdé yín pẹ̀lú Aisha Bello ní ọjọ́ Ìṣẹ́gun, ọjọ́ kẹrìnlélógún oṣù kọkànlá, ní aago méjìlá ọ̀sán."),
+               ("I have your number as 0802 555 4417. Is that correct?",
+                "Nọ́mbà fóònù yín tí mo gbà ni 0802 555 4417. Ṣé ó tọ̀nà?"),
+               ("Would you like me to book a registration call with a pension advisor?",
+                "Ṣé ẹ fẹ́ kí n ṣètò ìpè ìforúkọsílẹ̀ pẹ̀lú olùdámọ̀ràn ìfẹ̀yìntì?"),
+               ("One moment while I check.", "Ẹ dúró díẹ̀, mo ń wò ó.")],
+        "ha": [("Please tell me your first name and last name.", "Don Allah, gaya mini sunanka na farko da sunan mahaifinka."),
+               ("You are booked with Aisha Bello for Tuesday, 24 November, at 12 noon.",
+                "Na shirya muku ganawa da Aisha Bello ranar Talata, ashirin da huɗu ga watan Nuwamba, da ƙarfe goma sha biyu na rana."),
+               ("I have your number as 0802 555 4417. Is that correct?",
+                "Lambar wayarku da na rubuta ita ce 0802 555 4417. Haka ne?"),
+               ("Would you like me to book a registration call with a pension advisor?",
+                "Kuna so in shirya muku kiran rajista da mai ba da shawara kan fansho?"),
+               ("One moment while I check.", "Ku dakata kaɗan, ina dubawa.")],
+        "ig": [("Please tell me your first name and last name.", "Biko, gwa m aha mbụ gị na aha nna gị."),
+               ("You are booked with Aisha Bello for Tuesday, 24 November, at 12 noon.",
+                "Edebela m gị oge gị na Aisha Bello na Tuzdee, ụbọchị iri abụọ na anọ nke ọnwa Nọvemba, n'elekere iri na abụọ nke ehihie."),
+               ("I have your number as 0802 555 4417. Is that correct?",
+                "Nọmba ekwentị gị m dere bụ 0802 555 4417. Ọ ziri ezi?"),
+               ("Would you like me to book a registration call with a pension advisor?",
+                "Ị chọrọ ka m deba gị oku ndebanye aha gị na onye ndụmọdụ ezumike nká?"),
+               ("One moment while I check.", "Chere ntakịrị, ana m elele.")],
+    }
+
+    async def _chat(self, system: str, user: str) -> str:
+        if not self._url or not self._model:
+            raise RuntimeError("translator model not configured")
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_s))
+        body = {"model": self._model, "temperature": 0.0,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], **self._extra}
+        resp = await self._client.post(f"{self._url}/chat/completions", json=body,
+                                       headers={"Authorization": f"Bearer {self._api_key}"})
+        if resp.status_code != 200:
+            raise RuntimeError(f"translator HTTP {resp.status_code}")
+        out = (resp.json()["choices"][0]["message"].get("content") or "").strip().strip('"').strip()
+        return re.sub(r"<0x[0-9A-Fa-f]{2}>", "", out).strip()  # stray byte tokens from the model
+
+    def _review_prompt(self, target_lang: str) -> str:
+        name = _LLM_LANGUAGE_NAMES.get(target_lang, target_lang)
+        return (
+            f"You check a {name} translation of a phone receptionist's English line before it is spoken to a caller. "
+            "It must say exactly what the English says. Check in particular: every negative (do not, never, no) is "
+            "kept; who does what to whom is the same; numbers, days, dates and times match; nothing is added or left "
+            f"out; and only {name} words are used, except names of people, the business name and email addresses. If "
+            f"the translation is right, reply with it unchanged. If not, reply with the corrected {name} translation. "
+            "Reply with the translation only - no notes, no quotes."
+        )
+
+    def _prompt(self, target_lang: str) -> str:
+        name = _LLM_LANGUAGE_NAMES.get(target_lang, target_lang)
+        examples = "".join(f"\nEnglish: {e}\n{name}: {t}" for e, t in self._EXAMPLES.get(target_lang, []))
+        return (
+            f"You translate a phone receptionist's line from English into natural, polite spoken {name}, as a "
+            f"Nigerian receptionist would say it. Translate faithfully: keep the exact meaning (something done stays "
+            f"done, a question stays a question). Reply with the {name} translation only - no notes, no quotes. "
+            f"Use {name} words only. Keep in English ONLY: names of people, the name of the business, and email "
+            f"addresses. Say services and products in plain {name} words (a short known abbreviation such as RSA may "
+            f"stay). Say days, months, dates, times and amounts of money in {name} words. Copy phone numbers and other "
+            "digit strings exactly as digits. Keep it short and easy to say aloud; no lists, symbols or emojis."
+            + (f"\nExamples:{examples}" if examples else "")
+        )
+
+    async def translate(self, text: str, source_lang: str, target_lang: str) -> TranslationResult:
+        try:  # the fixed switch agreement: said exactly, never machine-translated
+            from . import call_language
+
+            if text.strip() == call_language.agreement_en(target_lang) and target_lang in call_language.AGREEMENTS:
+                return TranslationResult(call_language.AGREEMENTS[target_lang], source_lang, target_lang, self.provider)
+        except Exception:  # noqa: BLE001
+            pass
+        inbound = target_lang == "en" and source_lang in ("yo", "ha", "ig", "pcm")
+        system = self._inbound_prompt(source_lang) if inbound else self._prompt(target_lang)
+        # Inbound depends on the turn's context (the receptionist's last line), so it is cached on the whole prompt.
+        key = (text, target_lang) if not inbound else (text, system)
+        if key in self._cache:
+            return TranslationResult(self._cache[key], source_lang, target_lang, self.provider, cached=True)
+        try:
+            if inbound:
+                out = await self._chat(system, text)
+            else:
+                out = clean_spoken(await self._chat(system, emails_spoken(text)))
+                # Review pass: the model sometimes changed the meaning (an Igbo "do not share your BVN" came out as
+                # "share your BVN with anyone") or left an English word in. A second look against the English, told
+                # what to check, catches those before anything is said.
+                if self._review and out:
+                    try:
+                        reviewed = clean_spoken(await self._chat(self._review_prompt(target_lang),
+                                                                 f"English: {text}\nTranslation: {out}"))
+                        if reviewed and reviewed != out:
+                            log.info("translation corrected by review", lang=target_lang, before=out[:160],
+                                     after=reviewed[:160])
+                            out = reviewed
+                    except Exception as exc:  # noqa: BLE001 - keep the first translation
+                        log.warning("translation review skipped", error=str(exc)[:200])
+            if not out:
+                raise RuntimeError("empty translation")
+            self._cache[key] = out
+            return TranslationResult(out, source_lang, target_lang, self.provider)
+        except Exception as exc:  # noqa: BLE001 - fail-open: the English line is still spoken
+            metrics.translation_error(self.provider)
+            log.warning("llm translator failed; speaking the original", error=str(exc)[:200])
+            return TranslationResult(text, source_lang, target_lang, self.provider)
+
+
+# Each digit in the language's own counting word, for phone numbers and codes read back to a caller.
+_NATIVE_DIGITS = {
+    "yo": ["òdo", "ọ̀kan", "èjì", "ẹ̀ta", "ẹ̀rin", "àrún", "ẹ̀fà", "èje", "ẹ̀jọ", "ẹ̀sán"],
+    "ha": ["sifili", "ɗaya", "biyu", "uku", "huɗu", "biyar", "shida", "bakwai", "takwas", "tara"],
+    "ig": ["efu", "otu", "abụọ", "atọ", "anọ", "ise", "isii", "asaa", "asatọ", "itoolu"],
+}
+
+
+def native_digits(text: str, lang: str) -> str:
+    """Phone numbers and codes (4+ digits) in a translated line, spoken digit by digit with the language's own words
+    ("0802" -> "òdo, ẹ̀jọ, òdo, èjì"); a pause between groups. Shorter numbers are left to the translation."""
+    words = _NATIVE_DIGITS.get(lang)
+    if not words:
+        return text
+
+    def group(m: "re.Match[str]") -> str:
+        if sum(c.isdigit() for c in m.group(0)) < 4:  # a short number is a time, day or amount: the model words those
+            return m.group(0)
+        parts = re.split(r"[\s-]+", m.group(0).strip())
+        return "; ".join(", ".join(words[int(d)] for d in p if d.isdigit()) for p in parts if p)
+
+    return re.sub(r"\d+(?:[\s-]\d+)*", group, text)
+
+
+_EMAIL = re.compile(r"\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+
+
+def emails_spoken(text: str) -> str:
+    """kemi.ojo@gmail.com -> kemi dot ojo at gmail dot com: the voices garble the symbols."""
+    return _EMAIL.sub(lambda m: f"{m.group(1).replace('.', ' dot ')} at {m.group(2).replace('.', ' dot ')}", text)
+
+
+# Letters a Yoruba/Hausa/Igbo line may contain: Latin with its tone marks and dots, plus the Hausa hooked letters.
+# A stray character from another script (a Hebrew letter once appeared inside a Yoruba word) is dropped.
+_NOT_SPOKEN = re.compile(r"[^\u0000-\u024F\u0300-\u036F\u1E00-\u1EFF\u0253\u0257\u0199\u01B4\u2018\u2019\u201C\u201D\u2013\u2014]")
+
+
+def clean_spoken(text: str) -> str:
+    return re.sub(r"\s{2,}", " ", _NOT_SPOKEN.sub("", text or "")).strip()
+
+
+_DIGIT_WORDS = {"zero": "0", "oh": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+                "seven": "7", "eight": "8", "nine": "9"}
+_DIGIT_WORD_RUN = re.compile(r"\b(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)(?:[\s,]+(?:zero|oh|one|two|three|"
+                             r"four|five|six|seven|eight|nine)\b){3,}", re.IGNORECASE)
+
+
+def digit_words_to_digits(text: str) -> str:
+    """A read-back in English digit words ("zero eight zero two, five five five") back to digits ("0802 555"), so it
+    reaches the native-number step instead of being spoken as English inside a Yoruba/Hausa/Igbo sentence. Commas
+    keep the caller's grouping. Runs of 4+ digit words only: "one moment" and "two people" are left alone."""
+    def run(m: "re.Match[str]") -> str:
+        groups = re.split(r"\s*,\s*", m.group(0).strip())
+        return " ".join("".join(_DIGIT_WORDS[w.lower()] for w in g.split()) for g in groups if g.strip())
+
+    return _DIGIT_WORD_RUN.sub(run, text)
+
+
 def build_translator(settings: Any) -> TranslatorInterface:
     """Provider selection, mirroring the existing chain idioms.
 
@@ -375,6 +610,14 @@ def build_translator(settings: Any) -> TranslatorInterface:
     if _truthy(getattr(settings, "translate_mock", True)):
         return MockTranslator()
     provider = (getattr(settings, "translate_provider", "mock") or "mock").strip().lower()
+    if provider == "llm":
+        return LLMTranslator(
+            getattr(settings, "translate_llm_base_url", "") or getattr(settings, "llm_base_url", ""),
+            getattr(settings, "translate_llm_model", "") or getattr(settings, "llm_model", ""),
+            api_key=getattr(settings, "llm_api_key", ""),
+            timeout_s=max(getattr(settings, "translate_timeout_s", 3.0), 20.0),
+            extra_body=getattr(settings, "llm_extra_body", None) or None,
+        )
     if provider == "http":
         return HTTPTranslator(
             getattr(settings, "translate_url", ""),
@@ -450,6 +693,7 @@ async def process_inbound_text(
     *,
     enabled: bool = True,
     path: str = "chat",
+    language_hint: str | None = None,
 ) -> InboundResult:
     """Inbound seam (A2): detect the caller language, translate pure
     pcm/yo/ig/ha turns to English for routing/LLM.
@@ -463,7 +707,10 @@ async def process_inbound_text(
     if not enabled or not original.strip():
         return InboundResult(text=original, original_text=original)
     try:
-        detected = detect_language(original)
+        # The call already knows the caller's language (they chose it, or the recogniser that heard them was for
+        # it): a rough Hausa/Igbo/Yoruba transcript without its marked letters reads as English to the heuristic.
+        hint = (language_hint or "").strip().lower()
+        detected = hint if hint in ("yo", "ha", "ig") else detect_language(original)
     except Exception as exc:  # noqa: BLE001 - detection must never break a turn
         log.warning("language detection failed; passing through", error=str(exc)[:200])
         return InboundResult(text=original, original_text=original)
@@ -495,8 +742,12 @@ async def process_inbound_text(
     result = await _safe_translate(
         translator, original, detected, "en", direction="inbound"
     )
+    text_en = result.text
+    if text_en.strip().lower().strip(".") == "(unclear)":
+        # Nothing could be made out: say so plainly, so the receptionist asks again instead of guessing.
+        text_en = "(The caller said something that could not be made out.)"
     return InboundResult(
-        text=result.text,
+        text=text_en,
         detected_language=detected,
         original_text=original,
         translated=result.text != original,

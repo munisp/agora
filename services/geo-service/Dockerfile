@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
-# Multi-stage build: rust:1.80-bookworm -> debian:bookworm-slim
+# Multi-stage build: rust:1.90-bookworm -> debian:bookworm-slim
 # (payments-service Dockerfile pattern, SPEC §15).
 
-FROM rust:1.80-bookworm AS build
+# 1.90: Cargo.lock now pins crates needing rust >= 1.90 (terrio, uuid 1.29); 1.80 only built from layer cache.
+FROM rust:1.90-bookworm AS build
 WORKDIR /app
 
 # libsqlite3-sys (terrio `tiles` -> `sqlite` feature) compiles bundled SQLite.
@@ -19,6 +20,8 @@ RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
 
 COPY src ./src
 COPY migrations ./migrations
+# gazetteer.rs embeds the NG seed CSV (include_str!), so the build needs it too.
+COPY seeds ./seeds
 RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim

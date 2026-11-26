@@ -21,6 +21,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +39,11 @@ type InboundMessage struct {
 	MessageID string `json:"message_id"` // provider message id (idempotency)
 	Text      string `json:"text"`
 	Timestamp int64  `json:"timestamp"` // unix seconds (telegram: message.date)
+	// Email channel (2026-11-24): From is the sender's address; To is the business address written to (the site
+	// map route and the reply's From); Subject/FromName thread and address the reply.
+	To       string `json:"to,omitempty"`
+	Subject  string `json:"subject,omitempty"`
+	FromName string `json:"from_name,omitempty"`
 }
 
 // Site is one CHANNEL_SITE_MAP entry: the tenant + site a channel identity
@@ -85,6 +93,10 @@ type Bridge struct {
 
 	WhatsApp *provider.WhatsApp
 	Telegram *provider.Telegram
+	// Email replies over SMTP (2026-11-24); nil/unconfigured = inbound e-mail is recorded but not answered.
+	Email *provider.Email
+	// EmailFromName is the display name on e-mail replies, by site slug (falls back to the slug).
+	EmailFromName map[string]string
 
 	HC  *http.Client
 	Log *zap.Logger
@@ -312,7 +324,7 @@ func NewBridge(sites map[string]Site, convURL, voiceURL string, wa *provider.Wha
 		VoiceURL:        voiceURL,
 		WhatsApp:        wa,
 		Telegram:        tg,
-		HC:              &http.Client{Timeout: 10 * time.Second},
+		HC:              &http.Client{Timeout: bridgeHTTPTimeout()},
 		Log:             log,
 		done:            map[string]time.Time{},
 		doneExp:         doneHeap{},
@@ -396,13 +408,21 @@ func (b *Bridge) Handle(ctx context.Context, msg InboundMessage, routeID string)
 		return err
 	}
 
+	// 2026-11-23: a person took this conversation over in the human inbox (Chatwoot): the customer's message is
+	// recorded above (the inbox bridge mirrors it to the staff member) and the receptionist stays quiet.
+	if b.humanHandling(ctx, convID, site.TenantID) {
+		b.markDone(msg)
+		log.Info("inbound message left for staff (human handoff active)", zap.String("conversation_id", convID))
+		return nil
+	}
+
 	reply, requestContact, err := b.agentReply(ctx, site, convID, msg)
 	if err != nil {
 		log.Warn("agent reply failed", zap.Error(err))
 		return err
 	}
 
-	if err := b.recordTurn(ctx, convID, site.TenantID, msg.Channel+":"+msg.MessageID+":reply", "assistant", reply); err != nil {
+	if err := b.recordTurn(ctx, convID, site.TenantID, msg.Channel+":"+msg.MessageID+":reply", "agent", reply); err != nil {
 		log.Warn("record assistant turn failed", zap.Error(err))
 		return err
 	}
@@ -491,7 +511,10 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 			ID string `json:"id"`
 		} `json:"conversations"`
 	}
-	if err := b.doJSON(ctx, http.MethodGet, b.ConversationURL+"/v1/conversations?"+q.Encode(), nil, nil, &list); err != nil {
+	// In-cluster callers name the tenant in X-Tenant-Slugs (as the voice runtime does); without it the conversation
+	// service answers 401 and no WhatsApp/Telegram message was ever recorded or answered.
+	tenantHdr := map[string]string{"X-Tenant-Slugs": site.TenantID}
+	if err := b.doJSON(ctx, http.MethodGet, b.ConversationURL+"/v1/conversations?"+q.Encode(), nil, tenantHdr, &list); err != nil {
 		return "", fmt.Errorf("list conversations: %w", err)
 	}
 	if len(list.Conversations) > 0 {
@@ -506,7 +529,7 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 		"channel":       msg.Channel,
 		"contact_phone": msg.From,
 	}
-	if err := b.doJSON(ctx, http.MethodPost, b.ConversationURL+"/v1/conversations", body, nil, &created); err != nil {
+	if err := b.doJSON(ctx, http.MethodPost, b.ConversationURL+"/v1/conversations", body, tenantHdr, &created); err != nil {
 		return "", fmt.Errorf("create conversation: %w", err)
 	}
 	if created.ID == "" {
@@ -515,11 +538,30 @@ func (b *Bridge) resolveConversation(ctx context.Context, site Site, msg Inbound
 	return created.ID, nil
 }
 
+// humanHandling reports whether staff own the conversation (call_details.handoff.active, set by the human inbox
+// bridge). Fail-open to the receptionist: any lookup error answers false.
+func (b *Bridge) humanHandling(ctx context.Context, convID, tenantID string) bool {
+	var conv struct {
+		CallDetails struct {
+			Handoff struct {
+				Active bool `json:"active"`
+			} `json:"handoff"`
+		} `json:"call_details"`
+	}
+	hdr := map[string]string{"X-Tenant-ID": tenantID, "X-Tenant-Slugs": tenantID}
+	u := fmt.Sprintf("%s/v1/conversations/%s", b.ConversationURL, url.PathEscape(convID))
+	if err := b.doJSON(ctx, http.MethodGet, u, nil, hdr, &conv); err != nil {
+		return false
+	}
+	return conv.CallDetails.Handoff.Active
+}
+
 // recordTurn appends one turn with tenant + idempotency headers (SPEC-W6
 // §A3 steps 3/5).
 func (b *Bridge) recordTurn(ctx context.Context, convID, tenantID, idemKey, role, text string) error {
 	headers := map[string]string{
 		"X-Tenant-ID":     tenantID,
+		"X-Tenant-Slugs":  tenantID,
 		"Idempotency-Key": idemKey,
 	}
 	body := map[string]string{"role": role, "text": text}
@@ -553,7 +595,8 @@ func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg I
 	// chat pins nothing — the request stays byte-identical to the pre-W85
 	// shape, so the W81 telegram byte-compat guarantee holds.
 	pin := ""
-	if msg.Channel == "whatsapp" {
+	if msg.Channel == "whatsapp" || msg.Channel == "email" {
+		// whatsapp: the wa_id; email: the sender's address (the voice runtime pins it as the customer's e-mail).
 		pin = msg.From
 	} else if msg.Channel == "telegram" {
 		pin = b.telegramBoundPhoneCtx(ctx, msg.From)
@@ -561,6 +604,9 @@ func (b *Bridge) agentReply(ctx context.Context, site Site, convID string, msg I
 	var headers map[string]string
 	if pin != "" {
 		body["channel_identity"] = pin
+		if n := strings.TrimSpace(msg.FromName); n != "" {
+			body["contact_name"] = n // WhatsApp profile / e-mail From name (honored only with the pin)
+		}
 		if b.VoiceInternalToken != "" {
 			headers = map[string]string{"X-Internal-Token": b.VoiceInternalToken}
 		}
@@ -601,9 +647,26 @@ func (b *Bridge) sendReply(ctx context.Context, msg InboundMessage, reply string
 		}
 		_, _, err := b.Telegram.SendMessage(ctx, msg.From, reply)
 		return err
+	case "email":
+		if b.Email == nil || !b.Email.Configured() {
+			return fmt.Errorf("email provider not configured")
+		}
+		_, err := b.Email.SendReply(ctx, msg.To, b.emailFromName(msg.To), msg.From, msg.Subject, reply, msg.MessageID)
+		return err
 	default:
 		return fmt.Errorf("unknown channel %q", msg.Channel)
 	}
+}
+
+// emailFromName is the reply's display name for the business address written to.
+func (b *Bridge) emailFromName(to string) string {
+	if site, ok := b.Sites["email:"+strings.ToLower(strings.TrimSpace(to))]; ok {
+		if n := b.EmailFromName[site.SiteSlug]; n != "" {
+			return n
+		}
+		return site.SiteSlug
+	}
+	return ""
 }
 
 // doJSON performs one JSON request/response against an internal service.
@@ -646,4 +709,13 @@ func (b *Bridge) doJSON(ctx context.Context, method, u string, body, headers map
 		}
 	}
 	return nil
+}
+
+// bridgeHTTPTimeout is the per-request timeout for conversation/voice calls:
+// 10s, or BRIDGE_HTTP_TIMEOUT_S (an LLM reply on a busy GPU can take longer).
+func bridgeHTTPTimeout() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("BRIDGE_HTTP_TIMEOUT_S")); err == nil && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return 10 * time.Second
 }

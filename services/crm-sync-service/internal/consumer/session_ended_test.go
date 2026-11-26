@@ -159,16 +159,11 @@ func TestSessionEndedCreatesCallSummaryNoteViaPhoneLookup(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("expected 1 note, got %d; requests=%+v", len(notes), stub.requests)
 	}
-	body, _ := notes[0].body["body"].(string)
+	body, _ := noteText(notes[0].body), true
 	for _, want := range []string{
-		"📞 AI call summary",
-		"duration 95s",
-		"6 turns",
-		"book_appointment×1",
-		"lookup_appointment×2",
-		"avg LLM 820ms (max 1400ms)",
-		"escalated: yes",
-		"fallback used: no",
+		"- Call length: 1 min 35 s",
+		"- Appointment booked: Yes",
+		"- Passed to a person: Yes",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("note body missing %q:\n%s", want, body)

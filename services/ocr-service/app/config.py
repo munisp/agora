@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # Max PDF pages rasterized per document (ctx 40960 / CPU latency bound).
     ocr_max_pages: int = Field(default=8, validation_alias=AliasChoices("OCR_MAX_PAGES"))
 
+    # 2026-11-26: policy rules -- a TEXT model drafts a business's document checks from its policy (app/policy.py).
+    # OpenAI-compatible; empty base URL = the feature answers 503. Background job, so a long read is fine.
+    policy_llm_base_url: str = Field(default="", validation_alias=AliasChoices("POLICY_LLM_BASE_URL"))
+    policy_llm_model: str = Field(default="", validation_alias=AliasChoices("POLICY_LLM_MODEL"))
+    policy_llm_timeout_s: float = Field(default=300.0, validation_alias=AliasChoices("POLICY_LLM_TIMEOUT_S"))
+
     # DEV ONLY deterministic fixture extraction (fixed vendor/amount/date).
     # Safe default OFF; CRITICAL startup log when on. NEVER set in prod.
     ocr_mock: bool = Field(default=False, validation_alias=AliasChoices("OCR_MOCK"))

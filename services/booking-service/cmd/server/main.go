@@ -66,7 +66,11 @@ type tenantDataDeleterBySlug struct {
 	st *store.Store
 }
 
-func (a tenantDataDeleterBySlug) DeleteTenantData(ctx context.Context, slug string) error {
+func (a tenantDataDeleterBySlug) DeleteTenantData(ctx context.Context, slug, tenantID string) error {
+	if id, err := uuid.Parse(tenantID); err == nil {
+		_, err := a.st.DeleteTenantData(ctx, id)
+		return err
+	}
 	_, err := a.st.DeleteTenantDataBySlug(ctx, slug)
 	return err
 }
@@ -194,13 +198,20 @@ func run() error {
 			zap.String("host_port", cfg.TemporalHostPort), zap.Error(err))
 	} else {
 		defer tc.Close()
+		// booking-hosted workflows run on booking's own queue; their "NotifyPaced" sends target notification-worker's.
+		tc.SetOwnQueue(cfg.BookingTaskQueue())
+		if cfg.BookingTaskQueue() != cfg.TemporalTaskQueue {
+			geo.NotifyTaskQueue = cfg.TemporalTaskQueue
+			incidents.NotifyTaskQueue = cfg.TemporalTaskQueue
+			campaignstudio.NotifyTaskQueue = cfg.TemporalTaskQueue
+		}
 		saga = tc
 		gdpr = tc
 		geoStarter = tc
 		incidentStarter = tc
 		// SPEC-W19 integrator (additive): the studio step endpoint starts
 		// StudioSendWorkflow batches via this starter.
-		studioStarter = campaignstudio.TemporalStarter{Client: tc.Underlying(), TaskQueue: cfg.TemporalTaskQueue}
+		studioStarter = campaignstudio.TemporalStarter{Client: tc.Underlying(), TaskQueue: cfg.BookingTaskQueue()}
 
 		// SPEC-W8 A2: booking-service hosts the GeoCampaignWorkflow and its
 		// DB activities on the shared opendesk-main task queue. Recipient
@@ -208,7 +219,7 @@ func run() error {
 		// notification-worker picks up from the same queue (it owns the CPS
 		// pacer + sender rotation).
 		geoActs := &geo.CampaignActivities{Store: st, UsageTopic: cfg.UsageEventsTopic, Logger: logger}
-		w := worker.New(tc.Underlying(), cfg.TemporalTaskQueue, worker.Options{})
+		w := worker.New(tc.Underlying(), cfg.BookingTaskQueue(), worker.Options{})
 		w.RegisterWorkflowWithOptions(geo.GeoCampaignWorkflow, workflow.RegisterOptions{Name: geo.WorkflowType})
 		w.RegisterActivityWithOptions(geoActs.AudienceBatch, activity.RegisterOptions{Name: geo.ActivityGeoAudienceBatch})
 		w.RegisterActivityWithOptions(geoActs.FilterUnsent, activity.RegisterOptions{Name: geo.ActivityGeoFilterUnsent})
@@ -283,7 +294,7 @@ func run() error {
 			logger.Error("geo campaign worker failed to start", zap.Error(err))
 		} else {
 			defer w.Stop()
-			logger.Info("geo campaign worker started", zap.String("task_queue", cfg.TemporalTaskQueue))
+			logger.Info("geo campaign worker started", zap.String("task_queue", cfg.BookingTaskQueue()))
 		}
 	}
 

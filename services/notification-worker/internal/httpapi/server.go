@@ -105,6 +105,14 @@ func NewRouter(s *Server) http.Handler {
 			r.Post("/dev/trigger-twin-cleanup", s.triggerTwinCleanup)
 		})
 	}
+	// Production provisioning triggers (identity-service → Dapr invoke, K2 internal token). Identity used to call
+	// the /dev/* twins above, which are compiled out unless OPENDESK_DEV_ENDPOINTS=1 — so on a normal deployment
+	// every new tenant 404'd here and TenantOnboardingWorkflow (ApplyIndustryPack) never ran. Same handlers.
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireInternalToken)
+		r.Post("/internal/tenants/onboard", s.triggerOnboarding)
+		r.Post("/internal/tenants/twin-cleanup", s.triggerTwinCleanup)
+	})
 	// POST /v1/signals delivers a signal to a running workflow (staff UI:
 	// IntakeCompleted / Responded on the pack workflows, SPEC-CRM §C2).
 	// Machine-only route (S1-F7-04): K2 internal token + required tenant_slug

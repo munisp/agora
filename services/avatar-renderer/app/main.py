@@ -35,7 +35,27 @@ import math
 import os
 from typing import Any, Protocol
 
-log = logging.getLogger("avatar-renderer")
+
+
+class _KvLogger:
+    """Structured-style calls (``log.info("msg", key=value)``) on the stdlib logger, which rejects extra kwargs."""
+
+    def __init__(self, name: str) -> None:
+        self._log = logging.getLogger(name)
+
+    def _emit(self, level: int, msg: str, *args: Any, exc_info: Any = None, **fields: Any) -> None:
+        if fields:
+            msg = f"{msg} " + " ".join(f"{k}={v!r}" for k, v in fields.items())
+        self._log.log(level, msg, *args, exc_info=exc_info)
+
+    def debug(self, msg: str, *a: Any, **k: Any) -> None: self._emit(logging.DEBUG, msg, *a, **k)
+    def info(self, msg: str, *a: Any, **k: Any) -> None: self._emit(logging.INFO, msg, *a, **k)
+    def warning(self, msg: str, *a: Any, **k: Any) -> None: self._emit(logging.WARNING, msg, *a, **k)
+    def error(self, msg: str, *a: Any, **k: Any) -> None: self._emit(logging.ERROR, msg, *a, **k)
+    def exception(self, msg: str, *a: Any, **k: Any) -> None: self._emit(logging.ERROR, msg, *a, exc_info=True, **k)
+
+
+log = _KvLogger("avatar-renderer")
 
 LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "ws://livekit:7880")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "devkey")

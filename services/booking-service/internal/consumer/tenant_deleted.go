@@ -27,7 +27,10 @@ const TenantDeletedEventType = "TenantDeleted"
 // *store.Store.DeleteTenantData (booking core contract: anonymize the
 // tenant's contacts and cancel its open bookings; MUST be idempotent).
 type TenantDataDeleter interface {
-	DeleteTenantData(ctx context.Context, slug string) error
+	// tenantID is the event's tenant_id (may be empty on old events): purge THAT tenant. Resolving by slug alone
+	// picked the oldest site row for the slug, so after one same-slug re-create every later deletion hit the
+	// wrong (already deleted) tenant.
+	DeleteTenantData(ctx context.Context, slug, tenantID string) error
 }
 
 // tenantDeletedEnvelope is the CloudEvents envelope of identity lifecycle
@@ -151,7 +154,7 @@ func (c *TenantDeletedConsumer) Process(ctx context.Context, raw []byte) error {
 	if slug == "" {
 		return permanentTenantDeleted(errors.New("TenantDeleted carries no tenant_slug"))
 	}
-	if err := c.deleter.DeleteTenantData(ctx, slug); err != nil {
+	if err := c.deleter.DeleteTenantData(ctx, slug, env.Data.TenantID); err != nil {
 		return fmt.Errorf("delete tenant data %s: %w", slug, err)
 	}
 	c.log.Info("tenant data deleted (K9 TenantDeleted cascade)",

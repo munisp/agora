@@ -1,0 +1,690 @@
+"use client";
+
+import * as React from "react";
+import { ArrowUpRight, Landmark, PiggyBank, TrendingUp, Wallet } from "lucide-react";
+import { api, ApiError } from "@/lib/api";
+import { PageHeader } from "@/components/page-header";
+import { ErrorNote } from "@/components/error-note";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input, Label, Select } from "@/components/ui/input";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableEmpty,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { useToast } from "@/components/ui/toast";
+import { formatMoney, titleCase, listFrom } from "@/lib/utils";
+import { DEFAULT_CURRENCY } from "@/lib/utils";
+import type {
+  AccountBalance,
+  Beneficiary,
+  Payout,
+  PricingRecommendation,
+} from "@/lib/types";
+import { InvoicesPanel } from "./invoices-panel";
+import { QuoteComparisonCard, ReconciliationCard } from "./marketplace-panels";
+
+export function BillingClient({ orgSlug }: { orgSlug: string }) {
+  const { toast } = useToast();
+  const [balance, setBalance] = React.useState<AccountBalance | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [amount, setAmount] = React.useState<string>("");
+  const [busy, setBusy] = React.useState(false);
+  // W44/K7: payouts go to a registered beneficiary (payee registry), never a
+  // free-form payee. The list comes from GET /api/payments/v1/beneficiaries.
+  const [beneficiaries, setBeneficiaries] = React.useState<Beneficiary[] | null>(
+    null,
+  );
+  const [beneficiariesError, setBeneficiariesError] = React.useState<
+    string | null
+  >(null);
+  const [beneficiaryId, setBeneficiaryId] = React.useState<string>("");
+  const [showNewBeneficiary, setShowNewBeneficiary] = React.useState(false);
+  const [newLabel, setNewLabel] = React.useState("");
+  const [newPartyIdType, setNewPartyIdType] = React.useState("MSISDN");
+  const [newPartyIdentifier, setNewPartyIdentifier] = React.useState("");
+  const [creatingBeneficiary, setCreatingBeneficiary] = React.useState(false);
+  // W45 K20 / SPEC-W47 UIWEB-20: above-threshold payouts park as
+  // `pending_approval` (no rail transfer yet) until POST
+  // /v1/payouts/{id}/approve. The queue loads from GET /v1/payouts
+  // ?state=pending_approval (2026-11-21), so it survives a reload and shows
+  // payouts requested anywhere; manual id entry stays as a fallback.
+  const [pendingPayouts, setPendingPayouts] = React.useState<Payout[]>([]);
+  const [approveBusyId, setApproveBusyId] = React.useState<string | null>(null);
+  const [manualPayoutId, setManualPayoutId] = React.useState("");
+
+  const loadBeneficiaries = React.useCallback(async () => {
+    setBeneficiariesError(null);
+    try {
+      const data = await api.get<Beneficiary[] | { items: Beneficiary[] }>(
+        `/api/payments/v1/beneficiaries?tenant_id=${encodeURIComponent(orgSlug)}`,
+      );
+      const list = listFrom(data);
+      setBeneficiaries(list);
+      setBeneficiaryId((cur) =>
+        cur && list.some((b) => b.id === cur) ? cur : (list[0]?.id ?? ""),
+      );
+    } catch (e) {
+      setBeneficiaries(null);
+      setBeneficiariesError(
+        e instanceof ApiError
+          ? e.message
+          : "Failed to load payout beneficiaries.",
+      );
+    }
+  }, []);
+
+  const load = React.useCallback(async () => {
+    setError(null);
+    try {
+      const bal = await api.get<AccountBalance>(
+        `/api/payments/v1/accounts/${orgSlug}/balance`,
+      );
+      const b = toBalance(bal, orgSlug);
+      setBalance(b);
+      setAmount((b.revenue_cents / 100).toFixed(2));
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.message : "Failed to load billing data.",
+      );
+    }
+  }, [orgSlug]);
+
+  const loadPending = React.useCallback(async () => {
+    try {
+      const rows = await api.get<
+        Array<{ payout_id: string; tenant_id: string; amount_cents: number; currency: string; state: string; dfsp_fsp_id?: string | null; created_at: string }>
+      >(`/api/payments/v1/payouts?tenant_id=${encodeURIComponent(orgSlug)}&state=pending_approval`);
+      setPendingPayouts(
+        (Array.isArray(rows) ? rows : []).map((r) => ({
+          id: r.payout_id,
+          payout_id: r.payout_id,
+          tenant_id: r.tenant_id,
+          amount_cents: r.amount_cents,
+          currency: r.currency,
+          status: r.state,
+          dfsp_fsp_id: r.dfsp_fsp_id ?? null,
+          created_at: r.created_at,
+        })),
+      );
+    } catch {
+      // Older payments-service without the list route: keep session-only behaviour.
+    }
+  }, [orgSlug]);
+
+  React.useEffect(() => {
+    void load();
+    void loadBeneficiaries();
+    void loadPending();
+  }, [load, loadBeneficiaries, loadPending]);
+
+  const createBeneficiary = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const label = newLabel.trim();
+    const partyIdentifier = newPartyIdentifier.trim();
+    if (!label || !partyIdentifier) return;
+    setCreatingBeneficiary(true);
+    try {
+      // W44/K7: POST /v1/beneficiaries { label, party_id_info }.
+      const created = await api.post<Beneficiary>(
+        "/api/payments/v1/beneficiaries",
+        {
+          tenant_id: orgSlug,
+          label,
+          party_id_info: {
+            partyIdType: newPartyIdType,
+            partyIdentifier,
+          },
+        },
+      );
+      toast({
+        title: "Beneficiary added",
+        description: created.label ?? label,
+        variant: "success",
+      });
+      setNewLabel("");
+      setNewPartyIdentifier("");
+      setShowNewBeneficiary(false);
+      await loadBeneficiaries();
+      if (created.id) setBeneficiaryId(created.id);
+    } catch (err) {
+      toast({
+        title: "Could not add beneficiary",
+        description: err instanceof ApiError ? err.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setCreatingBeneficiary(false);
+    }
+  };
+
+  const currency = balance?.currency ?? DEFAULT_CURRENCY;
+  const amountCents = Math.round(parseFloat(amount || "0") * 100);
+  const amountValid =
+    Number.isFinite(amountCents) &&
+    amountCents > 0 &&
+    balance !== null &&
+    amountCents <= balance.revenue_cents;
+  const beneficiaryValid = beneficiaryId !== "";
+
+  const requestPayout = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!balance || !amountValid || !beneficiaryValid) return;
+    setBusy(true);
+    try {
+      // W44/K7: POST /v1/payouts { beneficiary_id, amount, currency,
+      // idempotency_key } — the registered beneficiary replaces the raw
+      // per-call payee (rejected 422 by the service). `amount_cents` is sent
+      // alongside `amount` (same integer-cent value) so the call works with
+      // both the pre-K7 and K7 body schemas.
+      const payout = await api.post<Payout>("/api/payments/v1/payouts", {
+        tenant_id: balance.tenant_id,
+        beneficiary_id: beneficiaryId,
+        amount: amountCents,
+        amount_cents: amountCents,
+        currency,
+        idempotency_key: crypto.randomUUID(),
+      });
+      // K20: above the approval threshold the payout parks as
+      // pending_approval — surface it in the approval queue below.
+      const id = payout.payout_id ?? payout.id;
+      if (payout.status === "pending_approval" && id) {
+        setPendingPayouts((p) => [
+          { ...payout, id },
+          ...p.filter((x) => x.id !== id),
+        ]);
+      }
+      toast({
+        title:
+          payout.status === "pending_approval"
+            ? "Payout awaiting approval"
+            : "Payout requested",
+        description:
+          payout.status === "pending_approval"
+            ? `${formatMoney(payout.amount_cents ?? amountCents, payout.currency ?? currency)} is above the approval threshold — an owner must approve it below before any money moves.`
+            : `${formatMoney(payout.amount_cents ?? amountCents, payout.currency ?? currency)} · status ${payout.status ?? "requested"}. Settlement runs over the Mojaloop rails.`,
+        variant: "success",
+      });
+      await load();
+    } catch (err) {
+      toast({
+        title: "Payout failed",
+        description: err instanceof ApiError ? err.message : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // W45 K20: approve a parked payout (owner role required above the
+  // threshold — enforced server-side, fail-closed).
+  const approvePayout = async (id: string) => {
+    setApproveBusyId(id);
+    try {
+      await api.post(`/api/payments/v1/payouts/${encodeURIComponent(id)}/approve`, {});
+      toast({
+        title: "Payout approved",
+        description: "The rail transfer now runs over the Mojaloop rails.",
+        variant: "success",
+      });
+      setPendingPayouts((p) => p.filter((x) => x.id !== id));
+      setManualPayoutId("");
+      await load();
+    } catch (err) {
+      toast({
+        title: "Approval failed",
+        description:
+          err instanceof ApiError
+            ? err.status === 403
+              ? "Above-threshold payouts require the owner role."
+              : err.message
+            : undefined,
+        variant: "destructive",
+      });
+    } finally {
+      setApproveBusyId(null);
+    }
+  };
+
+  return (
+    <div>
+      <PageHeader
+        title="Billing"
+        description="Usage invoices, deposits, revenue and payouts."
+      />
+      {error ? <ErrorNote message={error} /> : null}
+
+      <InvoicesPanel orgSlug={orgSlug} />
+
+      <Card className="mt-6">
+        <CardHeader>
+          <CardTitle>Payout approvals</CardTitle>
+          <CardDescription>
+            Large payouts wait here until an owner approves them. No money
+            moves before approval.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {pendingPayouts.length === 0 ? (
+            <p className="mb-3 text-sm text-muted-foreground">
+              Nothing awaiting approval. Large payouts appear here
+              automatically.
+            </p>
+          ) : (
+            <ul className="mb-4 space-y-2">
+              {pendingPayouts.map((p) => (
+                <li
+                  key={p.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border px-3 py-2 text-sm"
+                >
+                  <div>
+                    <span className="font-medium">
+                      {formatMoney(p.amount_cents, p.currency ?? currency)}
+                    </span>
+                    <span className="ml-2 font-mono text-xs text-muted-foreground">
+                      {p.id}
+                    </span>
+                  </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={approveBusyId === p.id}
+                    onClick={() => void approvePayout(p.id)}
+                  >
+                    {approveBusyId === p.id ? "Approving…" : "Approve payout"}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const id = manualPayoutId.trim();
+              if (id) void approvePayout(id);
+            }}
+            className="flex flex-wrap items-end gap-3"
+          >
+            <div className="grid min-w-64 flex-1 gap-1.5">
+              <Label htmlFor="approve-payout-id">Payout id</Label>
+              <Input
+                id="approve-payout-id"
+                placeholder="uuid of a pending_approval payout"
+                value={manualPayoutId}
+                onChange={(e) => setManualPayoutId(e.target.value)}
+              />
+            </div>
+            <Button
+              type="submit"
+              variant="outline"
+              disabled={approveBusyId !== null || !manualPayoutId.trim()}
+            >
+              Approve by id
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+            <p className="text-sm font-medium text-muted-foreground">
+              Deposit holds
+            </p>
+            <PiggyBank className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">
+              {balance ? formatMoney(balance.deposits_cents, currency) : "—"}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Pending capture or release
+            </p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+            <p className="text-sm font-medium text-muted-foreground">
+              Available revenue
+            </p>
+            <Wallet className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">
+              {balance ? formatMoney(balance.revenue_cents, currency) : "—"}
+            </p>
+            <p className="text-xs text-muted-foreground">Ready to pay out</p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+            <p className="text-sm font-medium text-muted-foreground">
+              Paid out (lifetime)
+            </p>
+            <Landmark className="h-4 w-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold">
+              {balance ? formatMoney(balance.paid_out_cents, currency) : "—"}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Settled via Mojaloop rails
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="mt-6 max-w-xl">
+        <CardHeader>
+          <CardTitle>Request payout</CardTitle>
+          <CardDescription>
+            Pay out available revenue to one of your registered accounts. For
+            safety, money only goes to accounts you have registered.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {beneficiariesError ? (
+            <p className="mb-3 text-sm text-muted-foreground">
+              Beneficiaries unavailable ({beneficiariesError}). Payouts cannot
+              be requested until the beneficiary list loads.
+            </p>
+          ) : null}
+          <form onSubmit={requestPayout} className="flex flex-wrap items-end gap-3">
+            <div className="grid min-w-56 flex-1 gap-1.5">
+              <Label htmlFor="payout-beneficiary">Beneficiary</Label>
+              <Select
+                id="payout-beneficiary"
+                value={beneficiaryId}
+                onChange={(e) => setBeneficiaryId(e.target.value)}
+                disabled={!beneficiaries || beneficiaries.length === 0}
+              >
+                {beneficiaries === null || beneficiaries.length === 0 ? (
+                  <option value="">
+                    {beneficiaries === null
+                      ? "Loading…"
+                      : "No beneficiaries yet — add one below"}
+                  </option>
+                ) : (
+                  beneficiaries.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.label}
+                    </option>
+                  ))
+                )}
+              </Select>
+              <button
+                type="button"
+                className="justify-self-start text-xs text-primary underline-offset-2 hover:underline"
+                onClick={() => setShowNewBeneficiary((v) => !v)}
+              >
+                {showNewBeneficiary
+                  ? "Hide new-beneficiary form"
+                  : "+ New beneficiary"}
+              </button>
+            </div>
+            <div className="grid min-w-48 flex-1 gap-1.5">
+              <Label htmlFor="payout-amount">Amount ({currency})</Label>
+              <Input
+                id="payout-amount"
+                type="number"
+                min="0.01"
+                step="0.01"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                disabled={!balance || balance.revenue_cents <= 0}
+              />
+              {balance && amountCents > balance.revenue_cents ? (
+                <p className="text-xs text-destructive">
+                  Exceeds available revenue of{" "}
+                  {formatMoney(balance.revenue_cents, currency)}.
+                </p>
+              ) : null}
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={!balance || balance.revenue_cents <= 0}
+              onClick={() =>
+                balance && setAmount((balance.revenue_cents / 100).toFixed(2))
+              }
+            >
+              Full amount
+            </Button>
+            <Button
+              type="submit"
+              disabled={busy || !amountValid || !beneficiaryValid}
+            >
+              <ArrowUpRight className="h-4 w-4" />
+              {busy ? "Requesting…" : "Request payout"}
+            </Button>
+          </form>
+
+          {showNewBeneficiary ? (
+            <form
+              onSubmit={createBeneficiary}
+              className="mt-4 flex flex-wrap items-end gap-3 rounded-md border border-border p-3"
+            >
+              <div className="grid min-w-40 flex-1 gap-1.5">
+                <Label htmlFor="beneficiary-label">Label</Label>
+                <Input
+                  id="beneficiary-label"
+                  placeholder="e.g. Main settlement account"
+                  value={newLabel}
+                  onChange={(e) => setNewLabel(e.target.value)}
+                />
+              </div>
+              <div className="grid min-w-32 gap-1.5">
+                <Label htmlFor="beneficiary-id-type">ID type</Label>
+                <Select
+                  id="beneficiary-id-type"
+                  value={newPartyIdType}
+                  onChange={(e) => setNewPartyIdType(e.target.value)}
+                >
+                  <option value="MSISDN">MSISDN (phone)</option>
+                  <option value="ALIAS">Alias</option>
+                  <option value="IBAN">IBAN</option>
+                  <option value="ACCOUNT_ID">Account ID</option>
+                </Select>
+              </div>
+              <div className="grid min-w-48 flex-1 gap-1.5">
+                <Label htmlFor="beneficiary-identifier">Identifier</Label>
+                <Input
+                  id="beneficiary-identifier"
+                  placeholder="e.g. +234… / account number"
+                  value={newPartyIdentifier}
+                  onChange={(e) => setNewPartyIdentifier(e.target.value)}
+                />
+              </div>
+              <Button
+                type="submit"
+                variant="secondary"
+                disabled={
+                  creatingBeneficiary ||
+                  !newLabel.trim() ||
+                  !newPartyIdentifier.trim()
+                }
+              >
+                {creatingBeneficiary ? "Adding…" : "Add beneficiary"}
+              </Button>
+            </form>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      {/* SPEC-W99 (innovation #11 MVP): read-only DFSP quote comparison +
+          payout reconciliation report (payments-service). */}
+      <QuoteComparisonCard orgSlug={orgSlug} beneficiaries={beneficiaries} />
+      <ReconciliationCard orgSlug={orgSlug} />
+
+      <RecommendationsCard orgSlug={orgSlug} />
+    </div>
+  );
+}
+
+/**
+ * Revenue intelligence (innovation 9): pricing recommendations computed in
+ * the lakehouse (gold.reco_pricing) and served by the analytics-pipeline.
+ * Reached via the BFF special-case: /api/analytics/* → http://analytics:7009
+ * (APISIX has no analytics route). Recommendations are human-review only —
+ * nothing is auto-applied.
+ */
+/** The analytics-pipeline row (gold.reco_pricing) as served; older builds used the PricingRecommendation names. */
+type RawRecommendation = Partial<PricingRecommendation> & {
+  offering_id: string;
+  suggested_peak_multiplier?: number;
+  no_show_rate?: number;
+  computed_at?: string;
+};
+
+/**
+ * Map a served row onto the table's shape (2026-11-21): the pipeline sends suggested_peak_multiplier /
+ * no_show_rate / computed_at, and reading peak_hour_multiplier.toFixed on it crashed the whole Billing page.
+ */
+function normalizeRecommendation(r: RawRecommendation, names: Map<string, string>): PricingRecommendation {
+  const rate = typeof r.no_show_rate === "number" ? r.no_show_rate : null;
+  return {
+    tenant_id: r.tenant_id ?? "",
+    offering_id: r.offering_id,
+    offering_name: r.offering_name ?? names.get(r.offering_id),
+    peak_hour_multiplier: Number(r.peak_hour_multiplier ?? r.suggested_peak_multiplier ?? 1),
+    suggested_deposit_pct: Number(r.suggested_deposit_pct ?? 0),
+    no_show_risk_band:
+      r.no_show_risk_band ?? (rate === null ? undefined : rate >= 0.25 ? "high" : rate >= 0.1 ? "medium" : "low"),
+    generated_at: r.generated_at ?? r.computed_at,
+  };
+}
+
+function RecommendationsCard({ orgSlug }: { orgSlug: string }) {
+  const [recs, setRecs] = React.useState<PricingRecommendation[] | null>(null);
+  const [unavailable, setUnavailable] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const [data, offeringsRaw] = await Promise.all([
+          api.get<unknown>("/api/analytics/v1/recommendations", { tenant: orgSlug }),
+          api.get<unknown>("/api/bookings/v1/offerings", { tenant: orgSlug }).catch(() => []),
+        ]);
+        const names = new Map(
+          listFrom<{ id: string; name: string }>(offeringsRaw).map((o) => [o.id, o.name]),
+        );
+        setRecs(listFrom<RawRecommendation>(data).map((r) => normalizeRecommendation(r, names)));
+      } catch (e) {
+        setUnavailable(
+          e instanceof ApiError
+            ? e.message
+            : "Analytics service unreachable.",
+        );
+      }
+    })();
+  }, [orgSlug]);
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <TrendingUp className="h-4 w-4" /> Pricing recommendations
+        </CardTitle>
+        <CardDescription>
+          Suggested peak-hour multipliers and deposit percentages from your
+          booking and payment history.{" "}
+          <span className="font-medium">
+            Recommendation only — review and apply manually; nothing changes
+            automatically.
+          </span>
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {unavailable ? (
+          <p className="text-sm text-muted-foreground">
+            Recommendations are not available right now ({unavailable}). They
+            appear once the lakehouse revenue-intelligence job has run.
+          </p>
+        ) : recs === null ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Offering</TableHead>
+                <TableHead>Peak-hour multiplier</TableHead>
+                <TableHead>Suggested deposit</TableHead>
+                <TableHead>No-show risk</TableHead>
+                <TableHead className="pr-2 text-right">Generated</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {recs.length === 0 ? (
+                <TableEmpty colSpan={5}>
+                  No recommendations yet — they are generated from your booking
+                  and payment history once enough data has landed in the
+                  lakehouse.
+                </TableEmpty>
+              ) : (
+                recs.map((r) => (
+                  <TableRow key={r.offering_id}>
+                    <TableCell className="font-medium">
+                      {r.offering_name ?? r.offering_id}
+                    </TableCell>
+                    <TableCell>×{r.peak_hour_multiplier.toFixed(2)}</TableCell>
+                    <TableCell>{r.suggested_deposit_pct}%</TableCell>
+                    <TableCell>
+                      {r.no_show_risk_band ? (
+                        <Badge
+                          variant={
+                            r.no_show_risk_band === "high"
+                              ? "destructive"
+                              : r.no_show_risk_band === "medium"
+                                ? "warning"
+                                : "secondary"
+                          }
+                        >
+                          {titleCase(r.no_show_risk_band)}
+                        </Badge>
+                      ) : (
+                        "—"
+                      )}
+                    </TableCell>
+                    <TableCell className="pr-2 text-right text-xs text-muted-foreground">
+                      {r.generated_at
+                        ? new Date(r.generated_at).toLocaleDateString()
+                        : "—"}
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * payments-service answers the ledger accounts ({tenant_id, accounts: [{account: "tenant:x:deposits", posted_net,
+ * pending_net}, …]}); the cards need three totals. Deposit holds are pending deposit credits, revenue is posted revenue,
+ * paid out is the posted payouts account (absent = nothing paid out yet). Already-flat answers pass through.
+ */
+function toBalance(raw: unknown, tenant: string): AccountBalance {
+  const r = (raw ?? {}) as Partial<AccountBalance> & {
+    accounts?: { account: string; posted_net?: number; pending_net?: number }[];
+  };
+  if (!Array.isArray(r.accounts)) return r as AccountBalance;
+  const find = (suffix: string) => r.accounts!.find((a) => a.account.endsWith(`:${suffix}`));
+  const deposits = find("deposits"), revenue = find("revenue"), payouts = find("payouts") ?? find("paid_out");
+  return {
+    ...(r as AccountBalance),
+    tenant_id: r.tenant_id ?? tenant,
+    deposits_cents: (deposits?.pending_net ?? 0) + (deposits?.posted_net ?? 0),
+    revenue_cents: revenue?.posted_net ?? 0,
+    paid_out_cents: payouts?.posted_net ?? 0,
+  };
+}

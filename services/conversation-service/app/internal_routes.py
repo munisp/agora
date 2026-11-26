@@ -97,18 +97,67 @@ async def gdpr_erase(body: GdprEraseRequest, request: Request) -> dict[str, Any]
             status.HTTP_400_BAD_REQUEST, "phone or email is required"
         )
     db = request.app.state.db
-    convs, turns = await db.erase_contact_data(body.tenant_id, body.phone, body.email)
+    ids, turns = await db.erase_contact_conversations(body.tenant_id, body.phone, body.email)
     log.info(
         "contact data erased via internal endpoint (GDPR)",
         tenant_id=str(body.tenant_id),
-        conversations=convs,
+        conversations=len(ids),
         turns_deleted=turns,
     )
+    # Erased text must not stay searchable. Postgres is already erased and the
+    # call is idempotent, so a 503 here tells the caller to retry.
+    search_index = getattr(request.app.state, "search_index", None)
+    if search_index is not None and ids:
+        if await search_index.delete_conversations(body.tenant_id, ids) is None:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "turns erased but the search index could not be updated; retry",
+            )
     return {
         "status": "erased",
-        "conversations_matched": convs,
+        "conversations_matched": len(ids),
         "turns_deleted": turns,
     }
+
+
+@router.post("/internal/search/prune")
+async def search_prune(request: Request) -> dict[str, Any]:
+    """Drop search docs of conversations that no longer exist in Postgres
+    (also runs every INDEXER_PRUNE_SECONDS). X-Internal-Token gated."""
+    _require_internal_token(request)
+    search_index = getattr(request.app.state, "search_index", None)
+    if search_index is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "indexer disabled")
+    result = await search_index.prune_orphans(request.app.state.db)
+    if result is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "search index unreachable")
+    return {"pruned_docs": result}
+
+
+
+@router.post("/internal/conversations/{conversation_id}/call-details")
+async def merge_call_details(conversation_id: str, request: Request) -> dict:
+    """2026-11-23: crm-sync saves the call's AI summary here so the dashboard shows the same summary as the CRM
+    note. Body: {"tenant_id": "<uuid>", "details": {"summary": "..."}}. X-Internal-Token gated."""
+    _require_internal_token(request)
+    import uuid as _uuid
+    from fastapi import HTTPException
+
+    body = await request.json()
+    try:
+        cid, tid = _uuid.UUID(conversation_id), _uuid.UUID(str(body.get("tenant_id")))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="conversation id and tenant_id must be UUIDs")
+    details = body.get("details") or {}
+    if not isinstance(details, dict) or not details:
+        raise HTTPException(status_code=422, detail="details must be a non-empty object")
+    # "handoff" (2026-11-23): {"active": bool, "agent": "<name>", "inbox_conversation_id": n} — set by the human inbox
+    # bridge; while active the receptionist stays quiet on this conversation.
+    allowed = {k: v for k, v in details.items() if k in ("summary", "purpose", "contact_name", "handoff")}
+    ok = await request.app.state.db.merge_call_details(cid, tid, allowed)
+    if not ok:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"updated": True}
 
 
 class BridgeTurnRequest(BaseModel):

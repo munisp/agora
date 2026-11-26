@@ -71,6 +71,10 @@ func (f *FalkorDB) exec(ctx context.Context, statement q) error {
 // parseQueryResult decodes the non-compact GRAPH.QUERY reply.
 func parseQueryResult(res any) ([]map[string]any, error) {
 	top, ok := res.([]any)
+	if ok && len(top) == 1 {
+		// A write with no RETURN answers [statistics] only: no rows (2026-11-20).
+		return []map[string]any{}, nil
+	}
 	if !ok || len(top) < 2 {
 		return nil, fmt.Errorf("unexpected GRAPH.QUERY reply shape %T", res)
 	}
@@ -80,12 +84,22 @@ func parseQueryResult(res any) ([]map[string]any, error) {
 	}
 	cols := make([]string, 0, len(header))
 	for _, h := range header {
-		cell, ok := h.([]any)
-		if !ok || len(cell) != 2 {
+		// A header cell is [column type, name] in the older reply format and just the column name in the format
+		// FalkorDB v4.x sends for a non-compact query (every event was dead-lettered on v4.22 before this).
+		switch cell := h.(type) {
+		case string:
+			cols = append(cols, cell)
+		case []byte:
+			cols = append(cols, string(cell))
+		case []any:
+			if len(cell) != 2 {
+				return nil, fmt.Errorf("unexpected GRAPH.QUERY header cell %v", h)
+			}
+			name, _ := cell[1].(string)
+			cols = append(cols, name)
+		default:
 			return nil, fmt.Errorf("unexpected GRAPH.QUERY header cell %v", h)
 		}
-		name, _ := cell[1].(string)
-		cols = append(cols, name)
 	}
 	rows, ok := top[1].([]any)
 	if !ok {

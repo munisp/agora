@@ -60,8 +60,8 @@ export function ReferralCreateForm({
       <CardHeader>
         <CardTitle>Record a referral</CardTitle>
         <CardDescription>
-          Register who referred a new customer. Duplicate open referrals for
-          the same referee phone are rejected server-side.
+          Record who referred a new customer. A phone number can only have
+          one open referral at a time.
         </CardDescription>
       </CardHeader>
       <CardContent>

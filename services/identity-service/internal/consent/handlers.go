@@ -6,10 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/opendesk/identity-service/internal/authn"
+	"github.com/opendesk/identity-service/internal/events"
 	"github.com/opendesk/identity-service/internal/store"
 	"go.uber.org/zap"
 )
@@ -44,6 +46,10 @@ type Handler struct {
 	Events       EventPublisher
 	PubSub       string
 	ErasureTopic string
+	// IdentityTopic (IDENTITY_EVENTS_TOPIC) receives com.opendesk.identity.ConsentGranted after each capture,
+	// so graph-sync links the person to a Consent node (2026-11-21). Nothing published it before, so every
+	// consent-gated segment counted 0. Empty disables it (tests).
+	IdentityTopic string
 	// InternalToken (IDENTITY_INTERNAL_TOKEN) authorizes K2 service callers
 	// of the gated consent surfaces; TrustDirectTenancy
 	// (OPENDESK_TRUST_DIRECT_TENANT=1) is the logged dev escape for
@@ -165,7 +171,40 @@ func (h *Handler) capture(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, err)
 		return
 	}
+	h.publishGranted(r.Context(), rec, tenant.Slug)
 	writeJSON(w, http.StatusCreated, rec)
+}
+
+// ConsentGrantedEventType is the identity-topic event graph-sync turns into a (Person)-[:CONSENTED]->(Consent) edge.
+const ConsentGrantedEventType = "com.opendesk.identity.ConsentGranted"
+
+// grantedEventData is the graph-sync ConsentData shape: the subject is sent as phone (E.164) or contact_id (uuid);
+// an email subject carries neither, so the person is keyed by the consent id.
+func grantedEventData(rec Record) map[string]any {
+	data := map[string]any{
+		"tenant_id":  rec.TenantID.String(),
+		"consent_id": rec.ConsentID.String(),
+		"purpose":    rec.Purpose,
+		"granted_at": rec.CapturedTS.UTC().Format(time.RFC3339),
+		"proof_ref":  "consent:" + rec.ConsentID.String(),
+	}
+	if phone, _ := contactOf(rec.DataSubjectID); phone != "" {
+		data["phone"] = phone
+	} else if _, err := uuid.Parse(rec.DataSubjectID); err == nil {
+		data["contact_id"] = rec.DataSubjectID
+	}
+	return data
+}
+
+// publishGranted is best-effort (the consent row is the record of truth; a lost event only delays the graph).
+func (h *Handler) publishGranted(ctx context.Context, rec Record, tenantSlug string) {
+	if h.Events == nil || h.IdentityTopic == "" {
+		return
+	}
+	evt := events.New("identity-service", ConsentGrantedEventType, tenantSlug, rec.TenantID.String(), grantedEventData(rec))
+	if err := h.Events.PublishEvent(ctx, h.PubSub, h.IdentityTopic, evt); err != nil && h.Logger != nil {
+		h.Logger.Warn("ConsentGranted publish failed (graph link delayed)", zap.String("consent_id", rec.ConsentID.String()), zap.Error(err))
+	}
 }
 
 // deriveCapturedBy resolves the capture provenance (STK O13). An explicit

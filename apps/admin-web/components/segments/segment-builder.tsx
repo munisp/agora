@@ -202,14 +202,14 @@ export function SegmentBuilder({
                 message:
                   e2 instanceof ApiError && e2.status === 404
                     ? "Live preview is not available yet — save the segment to see its count."
-                    : "Preview unavailable — the graph service may be offline.",
+                    : "Preview unavailable — please try again in a moment.",
               });
               return;
             }
           }
           setPreview({
             status: "unavailable",
-            message: "Preview unavailable — the graph service may be offline.",
+            message: "Preview unavailable — please try again in a moment.",
           });
         }
       })();
@@ -556,7 +556,7 @@ export function SegmentBuilder({
 
         <details className="rounded-md border border-border bg-card px-3 py-2 text-xs">
           <summary className="cursor-pointer font-medium text-muted-foreground">
-            Segment definition (DSL sent to the graph service)
+            How this audience is defined
           </summary>
           <pre className="mt-2 overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-relaxed">
             {JSON.stringify(dsl, null, 2)}

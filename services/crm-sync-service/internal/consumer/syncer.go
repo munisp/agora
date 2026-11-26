@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/opendesk/crm-sync-service/internal/callsummary"
 	"github.com/opendesk/crm-sync-service/internal/events"
 	"github.com/opendesk/crm-sync-service/internal/metrics"
 	"github.com/opendesk/crm-sync-service/internal/syncmap"
@@ -59,10 +60,61 @@ type MapStore interface {
 
 // Syncer applies CloudEvents to Twenty via the REST client + sync_map.
 type Syncer struct {
-	Twenty  *twentyc.Client
+	Twenty *twentyc.Client
+	// Router (2026-11-23) sends a business with its own Twenty instance there; nil = everything to Twenty.
+	Router *twentyc.Router
+	// Inbox (2026-11-23): the human inbox bridge; EscalationRequested opens the conversation there. Nil = off.
+	Inbox interface {
+		HandleEscalation(ctx context.Context, evt events.CloudEvent) error
+	}
 	Map     MapStore
 	Metrics *metrics.Registry
 	Log     *zap.Logger
+	// Summary writes the plain-language sentences of the call-summary note
+	// (nil or unconfigured: the note carries the structured facts only).
+	Summary CallSummarizer
+	// BookingURL (2026-11-23): booking-service base, for advisor names in person fields.
+	BookingURL string
+	teams      teamNames
+}
+
+// CallSummarizer turns a conversation into a short plain-language summary
+// ("" when unavailable). Implemented by callsummary.Summarizer.
+type CallSummarizer interface {
+	Summarize(ctx context.Context, conversationID, tenantID string) string
+}
+
+// tw is the Twenty client for a tenant: its own instance when routed, else the default.
+func (s *Syncer) tw(tenantID *uuid.UUID) *twentyc.Client {
+	if s.Router != nil {
+		return s.Router.ForTenant(tenantID)
+	}
+	return s.Twenty
+}
+
+// saveSummary stores the call's AI summary on the conversation (2026-11-23) so the dashboard shows the same summary
+// as the CRM note. Best effort: needs the summarizer's conversation URL and CONVERSATION_INTERNAL_TOKEN.
+func (s *Syncer) saveSummary(ctx context.Context, conversationID, tenantID, summary string) {
+	if strings.TrimSpace(summary) == "" || conversationID == "" || tenantID == "" {
+		return
+	}
+	if saver, ok := s.Summary.(interface {
+		SaveSummary(ctx context.Context, conversationID, tenantID, summary string) error
+	}); ok {
+		if err := saver.SaveSummary(ctx, conversationID, tenantID, summary); err != nil {
+			s.Log.Warn("call summary not saved to the conversation", zap.String("conversation_id", conversationID), zap.Error(err))
+		}
+	}
+}
+
+func (s *Syncer) summarize(ctx context.Context, conversationID, tenantID string, q *events.CallQuality) string {
+	if s.Summary == nil {
+		return ""
+	}
+	if q != nil && q.IsTextChannel() {
+		ctx = callsummary.WithTextChat(ctx) // "The customer wrote in ..." instead of "The caller ..."
+	}
+	return s.Summary.Summarize(ctx, conversationID, tenantID)
 }
 
 // HandleIdentity processes opendesk.identity.events.
@@ -87,7 +139,7 @@ func (s *Syncer) handleTenantProvisioned(ctx context.Context, evt events.CloudEv
 		return permanent(fmt.Errorf("TenantProvisioned missing slug/name"))
 	}
 	tenantUUID := parseUUID(d.TenantID)
-	companyID, err := s.Twenty.UpsertCompany(ctx, d.Name, d.Slug)
+	companyID, err := s.tw(tenantUUID).UpsertCompany(ctx, d.Name, d.Slug)
 	if err != nil {
 		return fmt.Errorf("upsert company: %w", err)
 	}
@@ -131,6 +183,9 @@ func (s *Syncer) handleTenantDeleted(ctx context.Context, evt events.CloudEvent)
 
 // HandleBooking processes opendesk.booking.events.
 func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error {
+	if evt.Type == events.TypeContactCaptured {
+		return s.handleContactCaptured(ctx, evt)
+	}
 	switch evt.Type {
 	case events.TypeBookingCreated, events.TypeBookingConfirmed,
 		events.TypeBookingRescheduled, events.TypeBookingCancelled:
@@ -166,12 +221,41 @@ func (s *Syncer) HandleBooking(ctx context.Context, evt events.CloudEvent) error
 	}
 }
 
+// handleContactCaptured (2026-11-21) creates or updates the CRM person for details the AI receptionist
+// saved at the start of a call: the same tenant-scoped syncPerson path a booking uses (so the later
+// booking for this caller finds the same person), without a task. No phone and no e-mail: nothing to key
+// a person on — skip and ack.
+func (s *Syncer) handleContactCaptured(ctx context.Context, evt events.CloudEvent) error {
+	d, err := events.DataAs[events.BookingData](evt)
+	if err != nil {
+		return permanent(err)
+	}
+	if d.Phone == "" && d.Email == "" {
+		s.Log.Debug("ContactCaptured without phone or email; skipping")
+		return nil
+	}
+	tenantUUID := parseUUID(evt.TenantID)
+	personID, err := s.syncPerson(ctx, d, tenantUUID)
+	if err != nil {
+		return err
+	}
+	if personID != "" && d.Phone != "" {
+		if err := s.Map.Put(ctx, syncmap.KindContactPhone, d.Phone, personID, tenantUUID); err != nil {
+			return err
+		}
+	}
+	s.Log.Info("receptionist contact synced to CRM", zap.String("person_id", personID), zap.String("contact_id", d.ContactID))
+	return nil
+}
+
 // handleBookingUpsert syncs the contact (Person) and the appointment (Task).
 func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, tenantUUID *uuid.UUID) error {
 	personID, err := s.syncPerson(ctx, d, tenantUUID)
 	if err != nil {
 		return err
 	}
+	s.fillPersonFields(ctx, tenantUUID, personID,
+		twentyc.PersonFacts{Channel: d.Source, Offering: d.OfferingName}, d.TeamMemberID)
 	if personID != "" && d.Phone != "" {
 		// Phone -> person edge: lets the SessionEnded call-quality note path
 		// resolve the caller when the Twenty phone lookup misses.
@@ -181,7 +265,7 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 	}
 	if m, err := s.Map.Get(ctx, KindBooking, d.BookingID, tenantUUID); err == nil {
 		// Task already exists: keep it current (confirmed / re-created paths).
-		if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{
+		if err := s.tw(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{
 			"title": twentyc.TaskTitle(d.OfferingName, d.StartsAt),
 			"dueAt": twentyc.FormatTime(d.StartsAt),
 		}); err != nil {
@@ -197,7 +281,7 @@ func (s *Syncer) handleBookingUpsert(ctx context.Context, d events.BookingData, 
 	} else if !errors.Is(err, syncmap.ErrNotFound) {
 		return err
 	}
-	taskID, err := s.Twenty.CreateTask(ctx, twentyc.TaskFromBooking(d), personID)
+	taskID, err := s.tw(tenantUUID).CreateTask(ctx, twentyc.TaskFromBooking(d), personID)
 	if err != nil {
 		// SPEC-W80 A3: CreateTask returns a NON-EMPTY task id when the task
 		// was created in Twenty but the person link (taskTarget) failed.
@@ -259,7 +343,7 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	if d.ContactID != "" {
 		if m, err := s.Map.Get(ctx, KindContact, d.ContactID, tenantUUID); err == nil {
 			// Keep the person record fresh (name/phone may have changed).
-			if err := s.Twenty.UpdatePerson(ctx, m.TwentyID,
+			if err := s.tw(tenantUUID).UpdatePerson(ctx, m.TwentyID,
 				twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone)); err != nil {
 				s.Log.Warn("person update failed; keeping existing mapping",
 					zap.String("person_id", m.TwentyID), zap.Error(err))
@@ -278,7 +362,7 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	if personID, err := s.findTenantPerson(ctx, d.Email, d.Phone, tenantUUID); err != nil {
 		return "", err
 	} else if personID != "" {
-		if err := s.Twenty.UpdatePerson(ctx, personID,
+		if err := s.tw(tenantUUID).UpdatePerson(ctx, personID,
 			twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone)); err != nil {
 			s.Log.Warn("person update failed; keeping existing record",
 				zap.String("person_id", personID), zap.Error(err))
@@ -292,7 +376,7 @@ func (s *Syncer) syncPerson(ctx context.Context, d events.BookingData, tenantUUI
 	}
 	// No mapping for this tenant: CREATE a new person (never merge into
 	// another tenant's record).
-	personID, err := s.Twenty.CreatePerson(ctx, twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone))
+	personID, err := s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(d.ContactName, d.Email, d.Phone))
 	if err != nil {
 		return "", fmt.Errorf("create person: %w", err)
 	}
@@ -361,11 +445,11 @@ func (s *Syncer) handleBookingCancelled(ctx context.Context, d events.BookingDat
 	}
 	// Twenty task statuses are TODO/IN_PROGRESS/DONE: a cancelled appointment
 	// is closed out as DONE with an explanatory note (SPEC-CRM §B).
-	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{"status": "DONE"}); err != nil {
+	if err := s.tw(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{"status": "DONE"}); err != nil {
 		return fmt.Errorf("patch task status: %w", err)
 	}
 	if personID, perr := s.findPersonForNote(ctx, d.Phone, d.Email, tenantUUID); perr == nil && personID != "" {
-		if _, nerr := s.Twenty.CreateNote(ctx, "Booking cancelled", twentyc.CancelNote(d.Reason), personID); nerr != nil {
+		if _, nerr := s.tw(tenantUUID).CreateNote(ctx, "Booking cancelled", twentyc.CancelNote(d.Reason), personID); nerr != nil {
 			s.Log.Warn("cancel note failed (task already closed)", zap.Error(nerr))
 		}
 	}
@@ -384,7 +468,7 @@ func (s *Syncer) handleBookingRescheduled(ctx context.Context, d events.BookingD
 	// SPEC-W80 A2: the title embeds the start time ("{offering} appointment
 	// at {starts_at}"), so a dueAt-only patch leaves a STALE title after a
 	// reschedule — patch both.
-	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{
+	if err := s.tw(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{
 		"title": twentyc.TaskTitle(d.OfferingName, d.StartsAt),
 		"dueAt": twentyc.FormatTime(d.StartsAt),
 	}); err != nil {
@@ -398,6 +482,9 @@ func (s *Syncer) handleBookingRescheduled(ctx context.Context, d events.BookingD
 func (s *Syncer) HandleConversation(ctx context.Context, evt events.CloudEvent) error {
 	if evt.Type == events.TypeSessionEnded {
 		return s.handleSessionEnded(ctx, evt)
+	}
+	if evt.Type == "com.opendesk.conversation.EscalationRequested" && s.Inbox != nil {
+		return s.Inbox.HandleEscalation(ctx, evt)
 	}
 	switch evt.Type {
 	case events.TypeToolInvoked:
@@ -430,7 +517,7 @@ func (s *Syncer) HandleConversation(ctx context.Context, evt events.CloudEvent) 
 	if personID == "" {
 		return nil // person not synced yet; note is best-effort
 	}
-	if _, err := s.Twenty.CreateNote(ctx, "AI receptionist", twentyc.AIBookingNote, personID); err != nil {
+	if _, err := s.tw(parseUUID(evt.TenantID)).CreateNote(ctx, "AI receptionist", twentyc.AIBookingNote, personID); err != nil {
 		return fmt.Errorf("create AI booking note: %w", err)
 	}
 	s.Log.Info("AI booking note added", zap.String("person_id", personID))
@@ -455,13 +542,23 @@ func (s *Syncer) findPersonForNote(ctx context.Context, phone, email string, ten
 	if personID != "" {
 		return personID, nil
 	}
-	if p := strings.TrimSpace(phone); p != "" {
+	for _, p := range syncmap.PhoneVariants(phone) {
 		m, err := s.Map.Get(ctx, syncmap.KindContactPhone, p, tenantUUID)
 		if err == nil && m.TwentyID != "" {
 			return m.TwentyID, nil
 		}
 		if err != nil && !errors.Is(err, syncmap.ErrNotFound) {
 			return "", fmt.Errorf("lookup contact_phone mapping: %w", err)
+		}
+	}
+	// 2026-11-23: a business with its OWN Twenty instance holds only its own people, so the instance itself can be
+	// searched by phone (the shared instance can't: that would match another business's person).
+	if s.Router != nil && s.Router.ForTenant(tenantUUID) != s.Router.Default {
+		for _, p := range syncmap.PhoneVariants(phone) {
+			rec, err := s.tw(tenantUUID).FindPerson(ctx, email, p)
+			if err == nil && rec.ID != "" {
+				return rec.ID, nil
+			}
 		}
 	}
 	return "", nil
@@ -502,8 +599,14 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	// 2026-11-23: every call gets its plain-language summary on the stored conversation (the dashboard shows it), even
+	// when no phone was confirmed and so no CRM note can follow.
+	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
+	summary := s.summarize(ctx, convID, evt.TenantID, d.Quality)
+	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
-	if phone == "" {
+	// 2026-11-24: an e-mail conversation may carry only the sender's address — that identifies the person too.
+	if phone == "" && !(d.Quality.IsTextChannel() && strings.TrimSpace(d.Quality.ContactEmail) != "") {
 		s.Log.Debug("SessionEnded without confirmed_phone; skipping call-summary note",
 			zap.String("conversation_id", d.ConversationID))
 		return nil
@@ -516,7 +619,7 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID)
+	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID, *d.Quality)
 	if err != nil {
 		return fmt.Errorf("resolve person for call summary: %w", err)
 	}
@@ -525,8 +628,9 @@ func (s *Syncer) handleSessionEnded(ctx context.Context, evt events.CloudEvent) 
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	noteID, err := s.Twenty.CreateNote(ctx,
-		twentyc.CallSummaryNoteTitle, twentyc.CallSummaryNote(*d.Quality), personID)
+	s.fillPersonFields(ctx, tenantUUID, personID, callFacts(d.Quality), "")
+	noteID, err := s.tw(tenantUUID).CreateNote(ctx,
+		twentyc.CallSummaryNoteTitleFor(*d.Quality), twentyc.CallSummaryNote(*d.Quality, summary), personID)
 	if err != nil {
 		return fmt.Errorf("create call summary note: %w", err)
 	}
@@ -572,8 +676,12 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
+	convID := firstNonEmpty(d.StoredConversationID, d.ConversationID)
+	summary := s.summarize(ctx, convID, evt.TenantID, d.Quality)
+	s.saveSummary(ctx, convID, evt.TenantID, summary)
 	phone := strings.TrimSpace(d.Quality.ConfirmedPhone)
-	if phone == "" {
+	// 2026-11-24: an e-mail conversation may carry only the sender's address — that identifies the person too.
+	if phone == "" && !(d.Quality.IsTextChannel() && strings.TrimSpace(d.Quality.ContactEmail) != "") {
 		s.Log.Debug("CallQualityEnriched without confirmed_phone; skipping note",
 			zap.String("conversation_id", d.ConversationID))
 		return nil
@@ -584,14 +692,14 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 		q.AvgSentiment = d.AvgSentiment
 	}
 	tenantUUID := parseUUID(evt.TenantID)
-	body := twentyc.CallSummaryNote(q)
+	body := twentyc.CallSummaryNote(q, summary)
 	if d.ConversationID != "" {
 		m, err := s.Map.Get(ctx, KindQualityNote, d.ConversationID, tenantUUID)
 		if err != nil && !errors.Is(err, syncmap.ErrNotFound) {
 			return fmt.Errorf("lookup quality_note mapping: %w", err)
 		}
 		if err == nil && m.TwentyID != "" {
-			if err := s.Twenty.UpdateNote(ctx, m.TwentyID, twentyc.CallSummaryNoteTitle, body); err != nil {
+			if err := s.tw(tenantUUID).UpdateNote(ctx, m.TwentyID, twentyc.CallSummaryNoteTitleFor(q), body); err != nil {
 				return fmt.Errorf("patch call summary note with sentiment: %w", err)
 			}
 			s.Log.Info("AI call summary note enriched with sentiment",
@@ -600,7 +708,7 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			return nil
 		}
 	}
-	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID)
+	personID, err := s.resolvePersonForCall(ctx, phone, tenantUUID, q)
 	if err != nil {
 		return fmt.Errorf("resolve person for call summary: %w", err)
 	}
@@ -609,7 +717,8 @@ func (s *Syncer) handleCallQualityEnriched(ctx context.Context, evt events.Cloud
 			zap.String("conversation_id", d.ConversationID))
 		return nil
 	}
-	noteID, err := s.Twenty.CreateNote(ctx, twentyc.CallSummaryNoteTitle, body, personID)
+	s.fillPersonFields(ctx, tenantUUID, personID, callFacts(&q), "")
+	noteID, err := s.tw(tenantUUID).CreateNote(ctx, twentyc.CallSummaryNoteTitleFor(q), body, personID)
 	if err != nil {
 		return fmt.Errorf("create enriched call summary note: %w", err)
 	}
@@ -660,8 +769,51 @@ func (s *Syncer) rememberQualityNote(ctx context.Context, conversationID, noteID
 // confirmed number and the natural key recorded at booking sync). The
 // legacy global Twenty people lookup is gone: it could resolve the caller
 // to ANOTHER tenant's person record when two tenants share a number.
-func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantUUID *uuid.UUID) (string, error) {
-	return s.findPersonForNote(ctx, phone, "", tenantUUID)
+//
+// 2026-11-23: an OUTBOUND call reached someone we chose to dial, by name; when no Person has that number yet the
+// call creates one (name + phone) so the call is never lost from the CRM. Inbound strangers are still skipped.
+func (s *Syncer) resolvePersonForCall(ctx context.Context, phone string, tenantUUID *uuid.UUID, q events.CallQuality) (string, error) {
+	email := ""
+	if q.IsTextChannel() {
+		email = strings.ToLower(strings.TrimSpace(q.ContactEmail))
+	}
+	personID, err := s.findPersonForNote(ctx, phone, email, tenantUUID)
+	if err != nil || personID != "" {
+		return personID, err
+	}
+	name := strings.TrimSpace(q.ContactName)
+	// 2026-11-24: a text chat (web chat / WhatsApp / Telegram) from a number the CRM doesn't have yet creates the
+	// contact, as an outbound call with a name does — chats that never booked used to leave no trace in the CRM.
+	// Without a name the number is the name, so the record is still findable.
+	if q.IsTextChannel() {
+		if name == "" {
+			name = firstNonEmpty(phone, email)
+		}
+		return s.createPersonForConversation(ctx, name, email, phone, tenantUUID, "text chat")
+	}
+	if q.Direction != "outbound" || name == "" {
+		return "", nil
+	}
+	// The number may be new to the CRM while the person is not (we dialled them from a booking): one exact namesake
+	// gets the call; otherwise a new Person is created.
+	split := twentyc.SplitName(name)
+	if rec, err := s.tw(tenantUUID).FindPersonByUniqueName(ctx, split.FirstName, split.LastName); err == nil && rec.ID != "" {
+		return rec.ID, nil
+	}
+	return s.createPersonForConversation(ctx, name, "", phone, tenantUUID, "outbound call")
+}
+
+// createPersonForConversation creates (and remembers) the CRM person a call or chat note belongs to.
+func (s *Syncer) createPersonForConversation(ctx context.Context, name, email, phone string, tenantUUID *uuid.UUID, what string) (string, error) {
+	personID, err := s.tw(tenantUUID).CreatePerson(ctx, twentyc.PersonFromContact(name, email, phone))
+	if err != nil {
+		return "", fmt.Errorf("create person for %s: %w", what, err)
+	}
+	if err := s.rememberTenantPerson(ctx, personID, email, phone, tenantUUID); err != nil {
+		return "", err
+	}
+	s.Log.Info("person created for "+what, zap.String("person_id", personID))
+	return personID, nil
 }
 
 func parseUUID(v string) *uuid.UUID {
@@ -715,8 +867,9 @@ func (s *Syncer) HandlePrivacy(ctx context.Context, evt events.CloudEvent) error
 			zap.String("event_id", evt.ID))
 		return nil
 	}
-	for _, personID := range personIDs {
-		if err := s.Twenty.DeletePerson(ctx, personID); err != nil {
+	for _, ref := range personIDs {
+		personID := ref.id
+		if err := ref.client.DeletePerson(ctx, personID); err != nil {
 			return fmt.Errorf("delete Twenty person %s: %w", personID, err)
 		}
 		removed, err := s.Map.DeleteByTwentyID(ctx, personID)
@@ -730,6 +883,15 @@ func (s *Syncer) HandlePrivacy(ctx context.Context, evt events.CloudEvent) error
 	s.Log.Info("gdpr erase complete",
 		zap.String("event_id", evt.ID), zap.Int("persons_deleted", len(personIDs)))
 	return nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // findAllPersonsForErase enumerates EVERY Twenty person record matching the
@@ -746,13 +908,19 @@ func (s *Syncer) HandlePrivacy(ctx context.Context, evt events.CloudEvent) error
 // created out-of-band), the global FindPerson first-match is still erased
 // so such records are not stranded — but any mapped match takes precedence
 // and short-circuits the global find.
-func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string) ([]string, error) {
+// personRef is a Twenty person and the instance (client) that holds it.
+type personRef struct {
+	id     string
+	client *twentyc.Client
+}
+
+func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string) ([]personRef, error) {
 	seen := map[string]bool{}
-	var ids []string
-	add := func(id string) {
+	var ids []personRef
+	add := func(id string, c *twentyc.Client) {
 		if id != "" && !seen[id] {
 			seen[id] = true
-			ids = append(ids, id)
+			ids = append(ids, personRef{id: id, client: c})
 		}
 	}
 	for _, k := range personNaturalKeys(email, phone) {
@@ -761,7 +929,7 @@ func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string
 			return nil, err
 		}
 		for _, m := range rows {
-			add(m.TwentyID)
+			add(m.TwentyID, s.tw(m.TenantID))
 		}
 	}
 	if p := strings.TrimSpace(phone); p != "" {
@@ -770,20 +938,39 @@ func (s *Syncer) findAllPersonsForErase(ctx context.Context, email, phone string
 			return nil, err
 		}
 		for _, m := range rows {
-			add(m.TwentyID)
+			add(m.TwentyID, s.tw(m.TenantID))
 		}
 	}
 	if len(ids) > 0 {
 		return ids, nil
 	}
-	// Legacy fallback: no sync_map trace of the identity at all.
-	rec, err := s.Twenty.FindPerson(ctx, email, phone)
-	if errors.Is(err, twentyc.ErrNotFound) {
-		return nil, nil
+	// Legacy fallback: no sync_map trace of the identity at all — look in every instance.
+	clients := []*twentyc.Client{s.Twenty}
+	if s.Router != nil {
+		clients = s.Router.All()
 	}
-	if err != nil {
-		return nil, err
+	for _, c := range clients {
+		rec, err := c.FindPerson(ctx, email, phone)
+		if errors.Is(err, twentyc.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		add(rec.ID, c)
 	}
-	add(rec.ID)
 	return ids, nil
+}
+
+// callFacts: what a finished call says about the caller (2026-11-23). Only phone calls count as a channel (a website
+// voice call has no matching "how they reached us" choice).
+func callFacts(q *events.CallQuality) twentyc.PersonFacts {
+	if q == nil {
+		return twentyc.PersonFacts{}
+	}
+	f := twentyc.PersonFacts{Language: q.Language}
+	if q.Channel == "phone" {
+		f.Channel = "phone"
+	}
+	return f
 }

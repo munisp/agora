@@ -7,8 +7,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/opendesk/crm-sync-service/internal/inbox"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/opendesk/crm-sync-service/internal/callsummary"
 	"github.com/opendesk/crm-sync-service/internal/config"
 	"github.com/opendesk/crm-sync-service/internal/consumer"
 	"github.com/opendesk/crm-sync-service/internal/daprc"
@@ -101,14 +104,51 @@ func run() error {
 	twenty := twentyc.New(cfg.TwentyAPIURL, cfg.TwentyAPIKey, cfg.TwentyRatePerMin)
 	twenty.Observe = reg.ObserveTwentyCall
 	daprClient := daprc.New(cfg.DaprHost, cfg.DaprHTTPPort)
+	// 2026-11-23: businesses with their own Twenty instance (TWENTY_ROUTES).
+	router := twentyc.NewRouter(twenty)
+	var extraSecrets []string
+	for _, rt := range cfg.TwentyRoutes {
+		c := twentyc.New(rt.URL, rt.APIKey, cfg.TwentyRatePerMin)
+		c.Observe = reg.ObserveTwentyCall
+		router.Add(rt.Tenants, rt.WorkspaceID, c)
+		router.SetFields(rt.Tenants, rt.PersonFields)
+		extraSecrets = append(extraSecrets, rt.WebhookSecret)
+		logger.Info("twenty route", zap.String("name", rt.Name), zap.String("url", rt.URL),
+			zap.Strings("tenants", rt.Tenants), zap.String("workspace_id", rt.WorkspaceID))
+	}
 
-	syncer := &consumer.Syncer{Twenty: twenty, Map: st, Metrics: reg, Log: logger}
+	syncer := &consumer.Syncer{Twenty: twenty, Router: router, Map: st, Metrics: reg, Log: logger, BookingURL: cfg.BookingURL}
+	if cfg.ConversationURL != "" && cfg.SummaryLLMURL != "" {
+		syncer.Summary = callsummary.New(cfg.ConversationURL, cfg.SummaryLLMURL, cfg.SummaryLLMModel, cfg.SummaryTimeout)
+		logger.Info("call-summary sentences enabled", zap.String("model", cfg.SummaryLLMModel))
+	}
+
+	// Human inbox (Chatwoot, 2026-11-23): mirrors chats, opens escalations, delivers staff replies.
+	var inboxBridge *inbox.Bridge
+	if cfg.InboxRoutesJSON != "" {
+		var routes []inbox.Route
+		if err := json.Unmarshal([]byte(cfg.InboxRoutesJSON), &routes); err != nil {
+			logger.Fatal("INBOX_ROUTES is not valid JSON", zap.Error(err))
+		}
+		for i := range routes {
+			routes[i].Token, routes[i].BotToken = os.Getenv(routes[i].TokenEnv), os.Getenv(routes[i].BotEnv)
+			if routes[i].Token == "" || routes[i].BotToken == "" || routes[i].AccountID == 0 || routes[i].InboxID == 0 {
+				logger.Fatal("INBOX_ROUTES entry incomplete (tokens, account_id, inbox_id)", zap.String("name", routes[i].Name))
+			}
+		}
+		inboxBridge = &inbox.Bridge{Routes: routes, Map: st, ConversationURL: cfg.ConversationURL,
+			InternalToken: cfg.ConversationToken, GatewayURL: cfg.GatewayURL, Log: logger.Named("inbox")}
+		// Escalations are opened from the transcript's request_human tool line (HandleTurn), which always has the
+		// stored conversation id; the EscalationRequested event path (syncer.Inbox) is left unwired to avoid a second note.
+		logger.Info("human inbox bridge enabled", zap.Int("routes", len(routes)))
+	}
 
 	// Reverse worker (Twenty -> OpenDesk): consumes the webhook CloudEvents
 	// from opendesk.crm.events in its own group so it scales/offsets
 	// independently of the forward consumers.
 	reverse := &consumer.ReverseSyncer{
 		Twenty:               twenty,
+		Router:               router,
 		Map:                  st,
 		Invoker:              daprClient,
 		BookingAppID:         cfg.BookingAppID,
@@ -137,6 +177,10 @@ func run() error {
 			// Reverse direction: Twenty webhook events -> OpenDesk.
 			consumer.New(cfg.KafkaBrokers, cfg.CRMEventsTopic, cfg.ReverseGroup, cfg.DLQTopic, reverse.HandleCRMEvent, reg, logger),
 		}
+		if inboxBridge != nil {
+			consumers = append(consumers, consumer.New(cfg.KafkaBrokers, cfg.TranscriptsTopic, cfg.InboxGroup, cfg.DLQTopic,
+				inboxBridge.HandleTurn, reg, logger))
+		}
 		for _, c := range consumers {
 			c := c
 			g.Go(func() error { return c.Run(gctx) })
@@ -162,17 +206,21 @@ func run() error {
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.Port),
 		Handler: (&httpapi.Server{
-			Twenty:         twenty,
-			Dapr:           daprClient,
-			PubSubName:     cfg.PubSubName,
-			CRMEventsTopic: cfg.CRMEventsTopic,
-			WebhookSecret:  cfg.TwentyWebhookSecret,
-			DB:             st,
-			Map:            st,
-			Dedupe:         st, // SPEC-W43 K-13: webhook_events_seen replay guard
-			Metrics:        reg,
-			InternalToken:  cfg.InternalToken,
-			Log:            logger,
+			Twenty:              twenty,
+			TwentyRouter:        router,
+			ExtraWebhookSecrets: extraSecrets,
+			Dapr:                daprClient,
+			PubSubName:          cfg.PubSubName,
+			CRMEventsTopic:      cfg.CRMEventsTopic,
+			WebhookSecret:       cfg.TwentyWebhookSecret,
+			DB:                  st,
+			Map:                 st,
+			Dedupe:              st, // SPEC-W43 K-13: webhook_events_seen replay guard
+			Metrics:             reg,
+			InternalToken:       cfg.InternalToken,
+			InboxWebhook:        inboxHandler(inboxBridge),
+			InboxWebhookSecret:  cfg.InboxWebhookSecret,
+			Log:                 logger,
 		}).Router(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -193,4 +241,12 @@ func run() error {
 	logger.Info("crm-sync-service started",
 		zap.String("twenty_api", cfg.TwentyAPIURL), zap.Int("rate_per_min", cfg.TwentyRatePerMin))
 	return g.Wait()
+}
+
+// inboxHandler returns the Chatwoot webhook handler, or nil when the human inbox is off.
+func inboxHandler(b *inbox.Bridge) http.Handler {
+	if b == nil {
+		return nil
+	}
+	return http.HandlerFunc(b.ServeWebhook)
 }

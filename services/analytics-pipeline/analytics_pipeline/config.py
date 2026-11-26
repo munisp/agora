@@ -80,6 +80,12 @@ class Settings:
         default_factory=lambda: os.getenv("TOPIC_OCR_EVENTS", "opendesk.ocr.events")
     )
 
+    # 2026-11-21: geo-service base URL for LGA boundary geometry on the
+    # Acquisition cost map (GET /v1/geo/boundaries). Empty = no geometry.
+    geo_base_url: str = field(
+        default_factory=lambda: os.getenv("GEO_BASE_URL", "http://geo:7015").rstrip("/")
+    )
+
     # Micro-batching
     batch_size: int = field(default_factory=lambda: _int("BATCH_SIZE", 500))
     flush_interval_seconds: float = field(

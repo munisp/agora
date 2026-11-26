@@ -59,7 +59,7 @@ func TestCaptureCreatesNoteWithCapturedFields(t *testing.T) {
 	if notes[0].body["title"] != twentyc.CaptureNoteTitle {
 		t.Errorf("note title = %v", notes[0].body["title"])
 	}
-	body, _ := notes[0].body["body"].(string)
+	body, _ := noteText(notes[0].body), true
 	for _, want := range []string{
 		"📋 AI captured fields",
 		"caller_name: Ada",

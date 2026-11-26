@@ -450,7 +450,8 @@ func run() error {
 					ID   string `json:"id"`
 					Slug string `json:"slug"`
 				}
-				if err := daprClient.InvokeService(ctx, cfg.IdentityAppID, "v1/tenants/"+slug, nil, &out); err != nil {
+				// identity serves GET /v1/tenants/{slug}; InvokeService always POSTs (405), so name the method.
+				if err := daprClient.InvokeServiceMethod(ctx, http.MethodGet, cfg.IdentityAppID, "v1/tenants/"+slug, nil, httpapi.ForwardedAuth(ctx), &out); err != nil {
 					return httpapi.TenantRef{}, err
 				}
 				id, err := uuid.Parse(out.ID)

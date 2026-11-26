@@ -65,7 +65,7 @@ func (h *Handlers) Capture(w http.ResponseWriter, r *http.Request, tenant bookin
 		writeError(w, http.StatusBadRequest, "too many items (max per batch)")
 		return
 	}
-	results := h.Svc.CaptureWithCaller(r.Context(), tenant, req.Items, callerEmail(r))
+	results := h.Svc.CaptureWithCaller(WithAgent(r.Context(), callerSub(r)), tenant, req.Items, callerEmail(r))
 	writeJSON(w, http.StatusOK, captureResponse{Results: results})
 }
 
@@ -104,4 +104,25 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// callerSub is the caller's user id for capture attribution (2026-11-21):
+// the JWT sub claim (same payload-only parse as callerEmail; the token was
+// verified upstream), else the trusted X-User-Id header. "" when absent.
+func callerSub(r *http.Request) string {
+	const prefix = "Bearer "
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, prefix) {
+		parts := strings.Split(strings.TrimPrefix(h, prefix), ".")
+		if len(parts) == 3 {
+			if payload, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
+				var claims struct {
+					Sub string `json:"sub"`
+				}
+				if json.Unmarshal(payload, &claims) == nil && claims.Sub != "" {
+					return claims.Sub
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("X-User-Id"))
 }

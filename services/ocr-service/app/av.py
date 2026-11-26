@@ -46,7 +46,9 @@ class Infected:
 
 
 def _parse_reply(reply: bytes) -> Clean | Infected:
-    text = reply.decode("utf-8", "replace").strip()
+    # z-commands (zINSTREAM) are answered NUL-terminated ("stream: OK\0"); str.strip() keeps the NUL, so a clean
+    # file used to read as an error and every upload failed closed (503).
+    text = reply.decode("utf-8", "replace").replace("\x00", "").strip()
     if not text.startswith("stream:"):
         raise AvUnavailable(f"unexpected clamd reply: {text[:200]!r}")
     body = text[len("stream:"):].strip()

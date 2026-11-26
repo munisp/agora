@@ -274,6 +274,12 @@ type fakeKeycloak struct {
 	removedRoles []string
 	groupsDel    []string
 	actionsEmail []string
+	joined       []string
+}
+
+func (f *fakeKeycloak) AddUserToTenantGroup(_ context.Context, userID, slug string) error {
+	f.joined = append(f.joined, userID+"@"+slug)
+	return nil
 }
 
 func (f *fakeKeycloak) CreateTenantGroup(context.Context, string) (string, error) {
@@ -743,5 +749,18 @@ func TestResolveCallerMalformedIsErrorClosed(t *testing.T) {
 	}
 	if c.Subject != "u-1" || !c.HasRole("platform-admin") || !c.HasSlug("other") {
 		t.Errorf("caller = %+v", c)
+	}
+}
+
+func TestCreateTenantOwnerJoinsTenantGroup(t *testing.T) {
+	// The creator must land in /tenants/{slug} (tenant_slugs claim), or their own dashboard says "No access".
+	h := newHarness("secret-token")
+	rec := h.do(http.MethodPost, "/v1/tenants", `{"slug":"harbour","name":"Harbour","industry":"insurance"}`,
+		map[string]string{"X-User-Id": "owner-1"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if len(h.kc.joined) != 1 || h.kc.joined[0] != "owner-1@harbour" {
+		t.Fatalf("owner group joins = %v, want [owner-1@harbour]", h.kc.joined)
 	}
 }

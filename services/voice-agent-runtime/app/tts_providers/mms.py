@@ -15,7 +15,7 @@ from __future__ import annotations
 import httpx
 
 from ..logging import get_logger
-from .base import Voice
+from .base import Voice, labels_of
 
 log = get_logger("tts.mms")
 
@@ -105,7 +105,7 @@ class MmsTTS:
                     id=str(item["id"]),
                     languages=[str(l) for l in item.get("languages", []) or []],
                     gender=str(item.get("gender", "") or ""),
-                    labels=dict(item.get("labels", {}) or {}),
+                    labels=labels_of(item),
                 )
             )
         return out

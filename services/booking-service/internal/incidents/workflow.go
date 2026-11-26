@@ -7,6 +7,18 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
+
+// NotifyTaskQueue is the notification-worker's task queue, where the "NotifyPaced" activity lives. Set at startup
+// when booking-service runs its worker on its own queue (TEMPORAL_WORKER_TASK_QUEUE); "" = this workflow's queue.
+var NotifyTaskQueue string
+
+func notifyCtx(ctx workflow.Context) workflow.Context {
+	if NotifyTaskQueue == "" {
+		return ctx
+	}
+	return workflow.WithTaskQueue(ctx, NotifyTaskQueue)
+}
+
 // Incident outreach (SPEC-W11 Part B §5). booking-service owns the tiny
 // IncidentAlertWorkflow; it runs on booking-service's own Temporal worker
 // on the shared opendesk-main task queue (same pattern as
@@ -71,5 +83,5 @@ func IncidentAlertWorkflow(ctx workflow.Context, in AlertStart) error {
 			Text:       in.Text,
 		},
 	}
-	return workflow.ExecuteActivity(ao, ActivityNotifyPaced, req).Get(ctx, nil)
+	return workflow.ExecuteActivity(notifyCtx(ao), ActivityNotifyPaced, req).Get(ctx, nil)
 }

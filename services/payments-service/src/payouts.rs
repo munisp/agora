@@ -129,6 +129,14 @@ pub trait PayoutAttemptStore: Send + Sync {
         tenant_id: &str,
         limit: i64,
     ) -> Result<Vec<PayoutAttempt>, String>;
+
+    /// 2026-11-21: newest-first history of this tenant's attempts (every
+    /// state), for the Billing page's approval queue and attempt list.
+    async fn list_recent_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String>;
 }
 
 /// SPEC-W99 C2: per-state rollup row of the reconciliation report.
@@ -534,6 +542,33 @@ impl PayoutAttemptStore for PgPayoutAttemptStore {
             .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
         out
     }
+
+    async fn list_recent_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String> {
+        // Tenant-pinned (DB-01), like list_in_flight_scoped.
+        let mut tx = crate::tenant::begin_tenant_tx(&self.pool, tenant_id)
+            .await
+            .map_err(|e| format!("payout_attempts tx failed: {e}"))?;
+        let rows = sqlx::query(
+            "SELECT payout_id, tenant_id, amount_cents, currency, payee, state, detail,
+                    dfsp_fsp_id, created_at, updated_at
+             FROM payout_attempts WHERE tenant_id = $1
+             ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| format!("payout_attempts recent read failed: {e}"))?;
+        let out = rows.iter().map(Self::row_to_attempt).collect::<Result<Vec<_>, _>>();
+        tx.commit()
+            .await
+            .map_err(|e| format!("payout_attempts commit failed: {e}"))?;
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +670,19 @@ impl PayoutAttemptStore for MemPayoutAttemptStore {
             .cloned()
             .collect();
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.truncate(limit.max(0) as usize);
+        Ok(out)
+    }
+
+    async fn list_recent_scoped(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> Result<Vec<PayoutAttempt>, String> {
+        let rows = self.rows.lock().await;
+        let mut out: Vec<PayoutAttempt> =
+            rows.values().filter(|a| a.tenant_id == tenant_id).cloned().collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         out.truncate(limit.max(0) as usize);
         Ok(out)
     }
@@ -805,6 +853,28 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    // 2026-11-21: GET /v1/payouts history — newest first, own tenant only.
+    #[tokio::test]
+    async fn mem_store_list_recent_scoped_newest_first() {
+        let store = MemPayoutAttemptStore::default();
+        let mut older = attempt("p-old", AttemptState::Committed);
+        older.created_at = Utc::now() - chrono::Duration::minutes(5);
+        store.record(&older).await.unwrap();
+        store.record(&attempt("p-new", AttemptState::PendingApproval)).await.unwrap();
+        let mut foreign = attempt("p-foreign", AttemptState::Failed);
+        foreign.tenant_id = "t-foreign".to_string();
+        store.record(&foreign).await.unwrap();
+        let got: Vec<String> = store
+            .list_recent_scoped("t-rec", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.payout_id)
+            .collect();
+        assert_eq!(got, vec!["p-new".to_string(), "p-old".to_string()]);
+        assert_eq!(store.list_recent_scoped("t-rec", 1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

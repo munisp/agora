@@ -16,11 +16,15 @@ JWT verification is dependency-light: HS256 via stdlib hmac; RS256/ES256 via
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
+import urllib.parse
+import urllib.request
 from typing import Any
 
 from fastapi import Header, HTTPException, Request
@@ -155,14 +159,59 @@ def tenant_from_request(
     raise AuthError("Authorization Bearer token required")
 
 
+_log = logging.getLogger(__name__)
+# slug -> (expires_at, tenant uuid): the business id rarely changes; ten minutes keeps a lookup off most requests.
+_TENANT_ID_CACHE: dict[str, tuple[float, str]] = {}
+_TENANT_ID_TTL_S = 600.0
+
+
+def _lookup_tenant_id(identity_url: str, slug: str, authorization: str, slugs_header: str) -> str | None:
+    """The business's tenant uuid from identity-service (GET /v1/tenants/{slug}), asked with the caller's own token,
+    so a user can only resolve a business they belong to."""
+    req = urllib.request.Request(
+        f"{identity_url.rstrip('/')}/v1/tenants/{urllib.parse.quote(slug, safe='')}",
+        headers={"Authorization": authorization, "X-Tenant-Slugs": slugs_header, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - internal service URL from config
+        data = json.loads(resp.read().decode() or "{}")
+    tid = data.get("id") or data.get("tenant_id")
+    return str(tid) if tid else None
+
+
+async def tenant_id_from_slugs(settings: Settings, authorization: str | None, x_tenant_slugs: str | None) -> str | None:
+    """The business behind this request, from the gateway-injected X-Tenant-Slugs (the JWT tenant_slugs claim; first
+    slug wins, as in the other services). graph-sync writes every node under the business's tenant uuid (the
+    CloudEvent tenantid), so reads must use the same id - the JWT sub is the USER, and resolving to it filed segments
+    under the user and hid every synced person and fraud alert from the business."""
+    if not authorization or not x_tenant_slugs or not settings.identity_url:
+        return None
+    slugs = [s.strip().rsplit("/", 1)[-1] for s in x_tenant_slugs.split(",") if s.strip()]
+    if not slugs:
+        return None
+    slug = slugs[0]
+    hit = _TENANT_ID_CACHE.get(slug)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    try:
+        tid = await asyncio.to_thread(_lookup_tenant_id, settings.identity_url, slug, authorization, x_tenant_slugs)
+    except Exception as exc:  # noqa: BLE001 - fall back to the old resolution, never fail the request on this
+        _log.warning("tenant lookup for slug %s failed: %s", slug, exc)
+        return None
+    if tid:
+        _TENANT_ID_CACHE[slug] = (time.time() + _TENANT_ID_TTL_S, tid)
+    return tid
+
+
 async def current_tenant(
     request: Request,
     authorization: str | None = Header(default=None),
     x_tenant_id: str | None = Header(default=None),
+    x_tenant_slugs: str | None = Header(default=None),
 ) -> str:
     """FastAPI dependency: the tenant id for this request."""
     settings: Settings = request.app.state.settings
-    return tenant_from_request(settings, authorization, x_tenant_id)
+    fallback = tenant_from_request(settings, authorization, x_tenant_id)  # also verifies the token
+    return (await tenant_id_from_slugs(settings, authorization, x_tenant_slugs)) or fallback
 
 
 async def resolve_admin_principal(
@@ -171,6 +220,7 @@ async def resolve_admin_principal(
     x_tenant_id: str | None = Header(default=None),
     x_internal_token: str | None = Header(default=None),
     x_user_roles: str | None = Header(default=None),
+    x_tenant_slugs: str | None = Header(default=None),
 ) -> tuple[str, str]:
     """SPEC-W45 OOS-12 principal for alert-resolution routes.
 
@@ -198,10 +248,11 @@ async def resolve_admin_principal(
                 detail="X-Tenant-Id header required for service callers",
             )
         return x_tenant_id.strip(), "service:internal"
-    tenant_id = tenant_from_request(settings, authorization, x_tenant_id)
+    user_id = tenant_from_request(settings, authorization, x_tenant_id)  # the person resolving (JWT sub)
+    tenant_id = (await tenant_id_from_slugs(settings, authorization, x_tenant_slugs)) or user_id
     roles = {r.strip().lower() for r in (x_user_roles or "").split(",") if r.strip()}
     if "admin" not in roles:
         raise HTTPException(
             status_code=403, detail="admin realm role required to resolve alerts"
         )
-    return tenant_id, tenant_id
+    return tenant_id, user_id

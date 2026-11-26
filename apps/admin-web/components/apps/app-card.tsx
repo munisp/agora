@@ -70,7 +70,8 @@ export function AppCard({
         <div className="flex flex-wrap items-center gap-2">
           <TierBadge tier={app.default_plan_tier} />
         </div>
-        {app.backend_note ? (
+        {/* Engineering notes (backend_note) are for the platform team, not shown to business owners. */}
+        {false && app.backend_note ? (
           // Data-driven hint (no hardcoded app list): for the apps whose
           // backends land in a later wave the note itself says so
           // ("backend module lands W19/W20" — the catalog's "module ships

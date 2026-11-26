@@ -36,6 +36,10 @@ type Config struct {
 	TemporalHostPort   string        // temporal:7233
 	TemporalNamespace  string        // opendesk
 	TemporalTaskQueue  string        // opendesk-main
+	// TemporalWorkerTaskQueue: the queue booking's own worker polls and its own workflows (geo campaigns, incident
+	// alerts, campaign studio, commissions) start on. "" = TemporalTaskQueue (the old shared-queue behaviour, where
+	// notification-worker activities such as onboarding steps randomly landed on this worker and failed).
+	TemporalWorkerTaskQueue string
 	KafkaBrokers       []string      // direct broker list for the command consumer
 	CommandsTopic      string        // opendesk.booking.commands
 	CommandsGroup      string        // consumer group id
@@ -229,6 +233,7 @@ func Load() (Config, error) {
 		TemporalHostPort:   envStr("TEMPORAL_HOST_PORT", "temporal:7233"),
 		TemporalNamespace:  envStr("TEMPORAL_NAMESPACE", "opendesk"),
 		TemporalTaskQueue:  envStr("TEMPORAL_TASK_QUEUE", "opendesk-main"),
+		TemporalWorkerTaskQueue: os.Getenv("TEMPORAL_WORKER_TASK_QUEUE"),
 		KafkaBrokers:       strings.Split(envStr("KAFKA_BROKERS", "kafka:9092"), ","),
 		CommandsTopic:      envStr("BOOKING_COMMANDS_TOPIC", "opendesk.booking.commands"),
 		CommandsGroup:      envStr("BOOKING_COMMANDS_GROUP", "booking-service-commands"),
@@ -429,4 +434,12 @@ func SatellitePoolMaxConns() int32 {
 		return int32(n)
 	}
 	return 1
+}
+
+// BookingTaskQueue is the queue booking-service's worker polls and its own workflows run on.
+func (c Config) BookingTaskQueue() string {
+	if c.TemporalWorkerTaskQueue != "" {
+		return c.TemporalWorkerTaskQueue
+	}
+	return c.TemporalTaskQueue
 }

@@ -11,6 +11,7 @@ standalone/existing deployments — geo/payments bootstrap idiom).
 
 from __future__ import annotations
 
+import json as _json
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
@@ -145,6 +146,31 @@ CREATE POLICY registry_internal_access ON ocr_doc_registry_tenants
 
 CREATE INDEX IF NOT EXISTS idx_ocr_registry_tenants_first_seen
     ON ocr_doc_registry_tenants (first_seen);
+
+-- 2026-11-26: policy rules. A business's policy document, the rules drafted from it (app/policy.py vocabulary) and
+-- whether they are on. Tenant-scoped exactly like ocr_documents.
+CREATE TABLE IF NOT EXISTS ocr_policies (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id   UUID NOT NULL,
+    title       TEXT NOT NULL,
+    filename    TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'reading' CHECK (status IN ('reading','draft','active','off','failed')),
+    rules       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    error       TEXT,
+    pages       INTEGER NOT NULL DEFAULT 0,
+    chars       INTEGER NOT NULL DEFAULT 0,
+    created_by  TEXT,
+    activated_by TEXT,
+    activated_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ocr_policies_tenant ON ocr_policies (tenant_id, created_at DESC);
+ALTER TABLE ocr_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ocr_policies FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON ocr_policies;
+CREATE POLICY tenant_isolation ON ocr_policies
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
 """
 
 
@@ -429,6 +455,7 @@ class Database:
         the app.ocr_registry GUC escape and can never be reached from this
         tenant-scoped connection."""
         result = await conn.execute("DELETE FROM ocr_documents")
+        await conn.execute("DELETE FROM ocr_policies")  # 2026-11-26: the business's policy rules go with it
         return int(result.split()[-1]) if result else 0
 
     # --- SPEC-W66 WS1-A: D9 backfill reconciler helpers ---------------------
@@ -499,3 +526,69 @@ class Database:
             limit,
         )
         return [dict(r) for r in rows]
+
+
+    # --- 2026-11-26: policy rules (caller supplies a tenant-scoped conn) -----
+    _POLICY_COLS = ("id, title, filename, status, rules, error, pages, chars, created_by, activated_by, activated_at, "
+                    "created_at, updated_at")
+
+    @staticmethod
+    def _policy(row: Any) -> dict[str, Any]:
+        d = dict(row)
+        if isinstance(d.get("rules"), str):
+            d["rules"] = _json.loads(d["rules"])
+        return d
+
+    @staticmethod
+    async def insert_policy(conn, *, tenant_id: str, title: str, filename: str, created_by: str | None) -> dict[str, Any]:
+        row = await conn.fetchrow(
+            f"INSERT INTO ocr_policies (tenant_id, title, filename, created_by) VALUES ($1, $2, $3, $4) "
+            f"RETURNING {Database._POLICY_COLS}",
+            uuid.UUID(tenant_id), title, filename, created_by,
+        )
+        return Database._policy(row)
+
+    @staticmethod
+    async def finish_policy(conn, policy_id: uuid.UUID, *, status: str, rules: list | None = None,
+                            error: str | None = None, pages: int = 0, chars: int = 0) -> None:
+        await conn.execute(
+            "UPDATE ocr_policies SET status = $2, rules = COALESCE($3::jsonb, rules), error = $4, pages = $5, "
+            "chars = $6, updated_at = now() WHERE id = $1",
+            policy_id, status, _json.dumps(rules) if rules is not None else None, error, pages, chars,
+        )
+
+    @staticmethod
+    async def list_policies(conn) -> list[dict[str, Any]]:
+        rows = await conn.fetch(f"SELECT {Database._POLICY_COLS} FROM ocr_policies ORDER BY created_at DESC LIMIT 100")
+        return [Database._policy(r) for r in rows]
+
+    @staticmethod
+    async def get_policy(conn, policy_id: uuid.UUID) -> dict[str, Any] | None:
+        row = await conn.fetchrow(f"SELECT {Database._POLICY_COLS} FROM ocr_policies WHERE id = $1", policy_id)
+        return Database._policy(row) if row else None
+
+    @staticmethod
+    async def set_policy(conn, policy_id: uuid.UUID, *, status: str, rules: list, actor: str | None) -> dict[str, Any] | None:
+        row = await conn.fetchrow(
+            "UPDATE ocr_policies SET status = $2, rules = $3::jsonb, updated_at = now(), "
+            "activated_by = CASE WHEN $2 = 'active' THEN $4 ELSE activated_by END, "
+            "activated_at = CASE WHEN $2 = 'active' THEN now() ELSE activated_at END "
+            f"WHERE id = $1 RETURNING {Database._POLICY_COLS}",
+            policy_id, status, _json.dumps(rules), actor,
+        )
+        return Database._policy(row) if row else None
+
+    @staticmethod
+    async def delete_policy(conn, policy_id: uuid.UUID) -> bool:
+        return (await conn.execute("DELETE FROM ocr_policies WHERE id = $1", policy_id)).endswith(" 1")
+
+    @staticmethod
+    async def active_policy_rules(conn, kind: str) -> list[dict[str, Any]]:
+        """Every enabled rule for this kind across the business's policies that are on."""
+        rows = await conn.fetch("SELECT rules FROM ocr_policies WHERE status = 'active'")
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            rules = r["rules"]
+            rules = _json.loads(rules) if isinstance(rules, str) else (rules or [])
+            out += [x for x in rules if isinstance(x, dict) and x.get("kind") == kind and x.get("enabled", True)]
+        return out

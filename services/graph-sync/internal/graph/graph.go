@@ -205,7 +205,14 @@ type Booking struct {
 	// CreatedBy is optional staff attribution (SPEC-W30 detector D6);
 	// CancelledAt is stamped on booking.cancelled events (D6 flash
 	// create->cancel detection).
-	CreatedBy   string
+	CreatedBy string
+	// StatusInitial (2026-11-21): Status applies only when this upsert
+	// creates the node (BookingCreated/Rescheduled), never over a newer one.
+	StatusInitial bool
+	// BookedAt (2026-11-21): when the booking was made (event time).
+	// CreatedAt stays the appointment start (existing contract); D6
+	// measures create->cancel from booked_at.
+	BookedAt    time.Time
 	CancelledAt *time.Time
 }
 

@@ -158,7 +158,7 @@ func (s *Store) GetContactByChannel(ctx context.Context, tenantID uuid.UUID, cha
 	err := s.withTenant(ctx, tenantID, func(tx pgx.Tx) error {
 		if channel == PortalChannelEmail {
 			return tx.QueryRow(ctx,
-				`SELECT id, tenant_id, name, phone, email, notes FROM contacts
+				`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts
 				 WHERE tenant_id=$1 AND lower(email)=$2 ORDER BY name LIMIT 1`,
 				tenantID, strings.ToLower(value)).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)
 		}
@@ -173,7 +173,7 @@ func (s *Store) GetContactByChannel(ctx context.Context, tenantID uuid.UUID, cha
 		// each other ('' = '' would otherwise be true).
 		d := mediaInboxDigitsSQL
 		return tx.QueryRow(ctx,
-			`SELECT id, tenant_id, name, phone, email, notes FROM contacts
+			`SELECT id, tenant_id, name, COALESCE(phone, ''), COALESCE(email, ''), COALESCE(notes, '') FROM contacts
 			 WHERE tenant_id=$1 AND `+d(`phone`)+` <> '' AND `+d(`phone`)+` = `+d(`$2`)+`
 			 ORDER BY name LIMIT 1`,
 			tenantID, value).Scan(&c.ID, &c.TenantID, &c.Name, &c.Phone, &c.Email, &c.Notes)

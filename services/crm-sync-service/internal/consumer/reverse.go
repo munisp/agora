@@ -78,7 +78,9 @@ type BookingInvoker interface {
 
 // ReverseSyncer applies Twenty webhook CloudEvents to OpenDesk.
 type ReverseSyncer struct {
-	Twenty       *twentyc.Client
+	Twenty *twentyc.Client
+	// Router (2026-11-23): the instance a webhook came from (by its workspaceId) or a tenant's own instance.
+	Router       *twentyc.Router
 	Map          ReverseMapStore
 	Invoker      BookingInvoker
 	BookingAppID string        // Dapr app-id of booking-service (default "booking")
@@ -118,6 +120,23 @@ func (s *ReverseSyncer) bookingHeaders(slug string) map[string]string {
 		h["X-Internal-Token"] = s.BookingInternalToken
 	}
 	return h
+}
+
+// twEvent is the Twenty client of the instance a webhook event came from (its workspaceId).
+func (s *ReverseSyncer) twEvent(evt events.CloudEvent) *twentyc.Client {
+	if s.Router != nil {
+		ws, _ := evt.Data["workspaceId"].(string)
+		return s.Router.ForWorkspace(ws)
+	}
+	return s.Twenty
+}
+
+// twTenant is the Twenty client holding a tenant's records.
+func (s *ReverseSyncer) twTenant(tenantID *uuid.UUID) *twentyc.Client {
+	if s.Router != nil {
+		return s.Router.ForTenant(tenantID)
+	}
+	return s.Twenty
 }
 
 // HandleCRMEvent processes one opendesk.crm.events CloudEvent.
@@ -172,7 +191,7 @@ func (s *ReverseSyncer) handlePerson(ctx context.Context, evt events.CloudEvent)
 		return fmt.Errorf("sync_map contact lookup: %w", err)
 	}
 
-	person, err := s.Twenty.GetPerson(ctx, personID)
+	person, err := s.twEvent(evt).GetPerson(ctx, personID)
 	if err != nil {
 		return fmt.Errorf("get twenty person: %w", err)
 	}
@@ -183,7 +202,7 @@ func (s *ReverseSyncer) handlePerson(ctx context.Context, evt events.CloudEvent)
 			zap.String("person_id", personID))
 		return nil
 	}
-	slug, err := s.resolveTenantSlug(ctx, contactMapping, person.CompanyID)
+	slug, err := s.resolveTenantSlug(ctx, s.twEvent(evt), contactMapping, person.CompanyID)
 	if errors.Is(err, errUnresolvable) {
 		s.Metrics.Inc("reverse_tenant_unresolvable")
 		s.Log.Info("tenant unresolvable for person; skipping (ack)",
@@ -222,7 +241,7 @@ func (s *ReverseSyncer) handleTaskUpdated(ctx context.Context, evt events.CloudE
 	status, _ := rec["status"].(string)
 	if status == "" {
 		// Payload without the new status: fetch the current task state.
-		t, err := s.Twenty.GetTask(ctx, taskID)
+		t, err := s.twEvent(evt).GetTask(ctx, taskID)
 		if err != nil {
 			return fmt.Errorf("get twenty task: %w", err)
 		}
@@ -299,7 +318,7 @@ func (s *ReverseSyncer) handleTicketEscalated(ctx context.Context, evt events.Cl
 	if err != nil {
 		return fmt.Errorf("sync_map booking lookup: %w", err)
 	}
-	if err := s.Twenty.PatchTask(ctx, m.TwentyID, map[string]any{"priority": "HIGH"}); err != nil {
+	if err := s.twTenant(tenantUUID).PatchTask(ctx, m.TwentyID, map[string]any{"priority": "HIGH"}); err != nil {
 		return fmt.Errorf("patch escalated task priority: %w", err)
 	}
 	s.Metrics.Inc("reverse_ticket_escalated")
@@ -328,7 +347,7 @@ type TicketEscalatedData struct {
 //     slug.
 //
 // Returns errUnresolvable (skip+ack) when neither path yields a slug.
-func (s *ReverseSyncer) resolveTenantSlug(ctx context.Context, cm *syncmap.Mapping, companyID string) (string, error) {
+func (s *ReverseSyncer) resolveTenantSlug(ctx context.Context, tw *twentyc.Client, cm *syncmap.Mapping, companyID string) (string, error) {
 	if cm != nil && cm.TenantID != nil && *cm.TenantID != uuid.Nil {
 		slug, err := s.slugForTenant(ctx, *cm.TenantID)
 		if err == nil {
@@ -347,7 +366,7 @@ func (s *ReverseSyncer) resolveTenantSlug(ctx context.Context, cm *syncmap.Mappi
 			}
 			return "", fmt.Errorf("sync_map tenant lookup: %w", err)
 		}
-		comp, err := s.Twenty.GetCompany(ctx, companyID)
+		comp, err := tw.GetCompany(ctx, companyID)
 		if err != nil {
 			return "", fmt.Errorf("get twenty company: %w", err)
 		}
@@ -365,7 +384,7 @@ func (s *ReverseSyncer) slugForTenant(ctx context.Context, tenantID uuid.UUID) (
 	if err != nil {
 		return "", err // ErrNotFound possible
 	}
-	comp, err := s.Twenty.GetCompany(ctx, tm.TwentyID)
+	comp, err := s.twTenant(&tenantID).GetCompany(ctx, tm.TwentyID)
 	if err != nil {
 		return "", fmt.Errorf("get twenty company: %w", err)
 	}

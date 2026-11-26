@@ -322,7 +322,7 @@ func guardedPacedSend(ctx workflow.Context, req PacedSendRequest, quiet QuietHou
 			}
 		}
 	}
-	if err := workflow.ExecuteActivity(ctx, ActivityNotifyPaced, req).Get(ctx, &res); err != nil {
+	if err := workflow.ExecuteActivity(notifyCtx(ctx), ActivityNotifyPaced, req).Get(ctx, &res); err != nil {
 		return res, err
 	}
 	if res.Status == "" {

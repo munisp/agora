@@ -125,9 +125,8 @@ func TestCreateTenantSchemaWriteFailureFailsClosed(t *testing.T) {
 	}
 }
 
-// TestDeleteRelationshipAndTenant (SPEC-W45 K16/K9): tuple delete posts the
-// same tuple shape as write to relationships/delete; tenant delete issues
-// DELETE /v1/tenants/{id} and tolerates 404 (idempotent cascade).
+// TestDeleteRelationshipAndTenant (SPEC-W45 K16/K9): tuple delete posts a Permify v1 tuple filter to
+// /data/delete; tenant delete issues DELETE /v1/tenants/{id} and tolerates 404 (idempotent cascade).
 func TestDeleteRelationshipAndTenant(t *testing.T) {
 	var mu sync.Mutex
 	var delTuples []string
@@ -135,18 +134,26 @@ func TestDeleteRelationshipAndTenant(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/data/relationships/delete"):
+		case strings.HasSuffix(r.URL.Path, "/data/delete"):
+			type ref struct {
+				Type string   `json:"type"`
+				IDs  []string `json:"ids"`
+			}
 			var body struct {
-				Tuple struct {
-					Entity   map[string]string `json:"entity"`
-					Relation string            `json:"relation"`
-					Subject  map[string]string `json:"subject"`
-				} `json:"tuple"`
+				Filter struct {
+					Entity   ref    `json:"entity"`
+					Relation string `json:"relation"`
+					Subject  ref    `json:"subject"`
+				} `json:"tuple_filter"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			f := body.Filter
+			if len(f.Entity.IDs) != 1 || len(f.Subject.IDs) != 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			mu.Lock()
-			delTuples = append(delTuples,
-				body.Tuple.Entity["type"]+":"+body.Tuple.Entity["id"]+"#"+body.Tuple.Relation+"@"+body.Tuple.Subject["type"]+":"+body.Tuple.Subject["id"])
+			delTuples = append(delTuples, f.Entity.Type+":"+f.Entity.IDs[0]+"#"+f.Relation+"@"+f.Subject.Type+":"+f.Subject.IDs[0])
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/tenants/"):

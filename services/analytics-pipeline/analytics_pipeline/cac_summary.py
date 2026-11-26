@@ -30,10 +30,12 @@ period -> null.
 from __future__ import annotations
 
 import asyncio
+import zlib
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+import httpx
 import structlog
 
 from . import metrics
@@ -146,6 +148,8 @@ def build_summary(
     spend_unavailable: bool,
     day_bounds: tuple[date | None, date | None],
     spend_missing_channels: set[str] | frozenset[str] = frozenset(),
+    lga_code_rows: list[dict[str, Any]] | None = None,
+    lga_geoms: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure rollup math — unit-tested without Postgres/Dapr.
 
@@ -218,6 +222,24 @@ def build_summary(
         }
         for row in lga_rows
     ]
+    # 2026-11-21: gazetteer-coded LGAs (field captures). lga_id is a stable
+    # synthetic int (CRC32 of the code) so the dashboard's numeric keys keep
+    # working; lga_code/lga_name are the real identity and label.
+    by_lga += [
+        {
+            "lga_id": lga_synthetic_id(str(row["lga_code"])),
+            "lga_code": str(row["lga_code"]),
+            "lga_name": row.get("lga_name") or str(row["lga_code"]),
+            "leads": int(row["leads"]),
+            "conversions": int(row["conversions"]),
+            "spend_ngn": None,
+            "cac_ngn": None,
+            # GeoJSON geometry from geo-service reference boundaries, keyed
+            # by gazetteer code; null (table only) when unknown/unavailable.
+            "geom": (lga_geoms or {}).get(str(row["lga_code"])),
+        }
+        for row in (lga_code_rows or [])
+    ]
 
     # MW-H1: when ANY spend lookup failed the total spend is partial — a
     # blended CAC computed over it would be silently understated, so it is
@@ -275,6 +297,9 @@ async def fetch_summary(
     date_to: date | None,
 ) -> dict[str, Any]:
     """Orchestrate store reads + the resilient per-campaign spend join."""
+    lga_code_recs: list[Any] = []
+    if hasattr(store, "fetch_lga_code_rollup"):
+        lga_code_recs = await store.fetch_lga_code_rollup(tenant_id, date_from, date_to)
     channel_recs, lga_recs, campaign_recs, day_bounds = await asyncio.gather(
         store.fetch_channel_rollup(tenant_id, date_from, date_to),
         store.fetch_lga_rollup(tenant_id, date_from, date_to),
@@ -324,14 +349,60 @@ async def fetch_summary(
             tenant_id=tenant_id,
         )
 
+    lga_geoms = await fetch_lga_geoms(
+        settings, [str(rec["lga_code"]) for rec in lga_code_recs]
+    )
+
     return build_summary(
         tenant_id=tenant_id,
         date_from=date_from,
         date_to=date_to,
         channel_rows=[dict(rec) for rec in channel_recs],
         lga_rows=[dict(rec) for rec in lga_recs],
+        lga_code_rows=[dict(rec) for rec in lga_code_recs],
+        lga_geoms=lga_geoms,
         spend_by_channel=spend_by_channel,
         spend_unavailable=spend_unavailable,
         day_bounds=day_bounds,
         spend_missing_channels=spend_missing_channels,
     )
+
+
+def lga_synthetic_id(code: str) -> int:
+    """Stable positive int for a gazetteer LGA code (dashboard row key)."""
+    return zlib.crc32(code.encode("utf-8")) & 0x7FFFFFFF
+
+
+
+async def fetch_lga_geoms(
+    settings: Settings, codes: list[str], client: httpx.AsyncClient | None = None
+) -> dict[str, Any]:
+    """LGA polygons by gazetteer code from geo-service (2026-11-21).
+
+    Fail-open: any error returns {} and the rows stay table-only, so the
+    summary never fails because the map data is unavailable."""
+    base = getattr(settings, "geo_base_url", "")
+    wanted = sorted({c for c in codes if c})
+    if not base or not wanted:
+        return {}
+    own = client is None
+    http = client or httpx.AsyncClient(timeout=5.0)
+    try:
+        resp = await http.get(
+            f"{base}/v1/geo/boundaries",
+            params={"kind": "lga", "codes": ",".join(wanted)},
+        )
+        resp.raise_for_status()
+        out: dict[str, Any] = {}
+        for feat in resp.json().get("features") or []:
+            code = (feat.get("properties") or {}).get("code")
+            geom = feat.get("geometry")
+            if code and isinstance(geom, dict):
+                out[str(code)] = geom
+        return out
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning("cac.lga_geoms_unavailable", error=str(exc), codes=len(wanted))
+        return {}
+    finally:
+        if own:
+            await http.aclose()

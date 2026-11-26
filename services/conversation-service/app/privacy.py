@@ -27,9 +27,11 @@ _MAX_ATTEMPTS = 3
 class PrivacyEraseConsumer:
     """Background task: tombstones -> erase_contact_data."""
 
-    def __init__(self, cfg: Config, db: Database) -> None:
+    def __init__(self, cfg: Config, db: Database, search_index: Any = None) -> None:
         self._cfg = cfg
         self._db = db
+        # app.search_index.SearchIndex (optional): mirrors the delete in OpenSearch.
+        self._search_index = search_index
         self._task: asyncio.Task | None = None
         self._consumer: Any = None
 
@@ -105,13 +107,20 @@ class PrivacyEraseConsumer:
             return True
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
-                convs, turns = await self._db.erase_contact_data(tenant_id, phone, email)
+                ids, turns = await self._db.erase_contact_conversations(
+                    tenant_id, phone, email
+                )
                 log.info(
                     "contact data erased (GDPR)",
                     tenant_id=str(tenant_id),
-                    conversations=convs,
+                    conversations=len(ids),
                     turns_deleted=turns,
                 )
+                if self._search_index is not None and ids:
+                    if await self._search_index.delete_conversations(tenant_id, ids) is None:
+                        # Erased text must not stay searchable: retry the event.
+                        # Postgres side is idempotent, so the replay converges.
+                        raise RuntimeError("search index erase failed")
                 return True
             except Exception as exc:  # noqa: BLE001
                 log.error("erase failed", error=str(exc), attempt=attempt)

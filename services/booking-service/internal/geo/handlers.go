@@ -175,17 +175,17 @@ func (h *Handlers) LocationsSummary(w http.ResponseWriter, r *http.Request, tena
 	q := r.URL.Query()
 	var f SummaryFilter
 	if v := q.Get("from"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseSummaryBound(v, false)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid from (RFC3339)")
+			writeError(w, http.StatusBadRequest, "invalid from (RFC3339 or YYYY-MM-DD)")
 			return
 		}
 		f.From = &t
 	}
 	if v := q.Get("to"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseSummaryBound(v, true)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid to (RFC3339)")
+			writeError(w, http.StatusBadRequest, "invalid to (RFC3339 or YYYY-MM-DD)")
 			return
 		}
 		f.To = &t
@@ -490,4 +490,20 @@ func (h *Handlers) GetGeoCampaign(w http.ResponseWriter, r *http.Request, tenant
 		return
 	}
 	writeJSON(w, http.StatusOK, campaign)
+}
+
+// parseSummaryBound accepts RFC3339 or a plain date (the dashboard's date pickers send YYYY-MM-DD). A plain "to" date
+// means the whole of that day, so the range includes it.
+func parseSummaryBound(v string, endOfDay bool) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	day, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if endOfDay {
+		return day.Add(24*time.Hour - time.Nanosecond), nil
+	}
+	return day, nil
 }

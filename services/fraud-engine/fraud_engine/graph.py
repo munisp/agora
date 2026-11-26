@@ -17,6 +17,8 @@ emit any statement that does not.
 
 from __future__ import annotations
 
+import json
+
 import threading
 from typing import Any, Protocol
 
@@ -214,3 +216,28 @@ def client_from_settings(settings: Any) -> GraphClient:
         username=settings.falkordb_username,
         password=settings.falkordb_password,
     )
+
+
+def as_list(value: Any) -> list[Any]:
+    """2026-11-21: FalkorDB's standard (non-compact) reply returns an array
+    VALUE as its string form ("[a, b, c]"), so code iterating it walked the
+    characters (D1 saw every character of the ring as a person). Lists pass
+    through; a bracketed string becomes a list (JSON when it parses, e.g.
+    numeric embeddings, else comma-split, e.g. person ids); None -> []."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return parsed
+            except ValueError:
+                pass
+            inner = text[1:-1].strip()
+            return [part.strip() for part in inner.split(",")] if inner else []
+    return [value]
+

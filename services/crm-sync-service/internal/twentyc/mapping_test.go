@@ -82,11 +82,11 @@ func TestPersonFromContactOmitsEmptyChannels(t *testing.T) {
 func TestTaskTitle(t *testing.T) {
 	ts := time.Date(2026, 3, 1, 15, 30, 0, 0, time.FixedZone("X", 3600))
 	got := TaskTitle("Haircut", ts)
-	want := "Haircut appointment at 2026-03-01T14:30:00Z"
+	want := "Haircut — Sun 1 Mar 2026, 3:30 pm (Lagos)"
 	if got != want {
 		t.Fatalf("TaskTitle = %q, want %q", got, want)
 	}
-	if got := TaskTitle("", ts); got != "Appointment appointment at 2026-03-01T14:30:00Z" {
+	if got := TaskTitle("", ts); got != "Appointment — Sun 1 Mar 2026, 3:30 pm (Lagos)" {
 		t.Fatalf("TaskTitle empty offering = %q", got)
 	}
 }
@@ -103,7 +103,7 @@ func TestTaskFromBooking(t *testing.T) {
 		Currency:     "USD",
 	}
 	task := TaskFromBooking(d)
-	if task.Title != "Consultation appointment at 2026-03-01T10:00:00Z" {
+	if task.Title != "Consultation — Sun 1 Mar 2026, 11:00 am (Lagos)" {
 		t.Fatalf("Title = %q", task.Title)
 	}
 	if task.DueAt != "2026-03-01T10:00:00Z" {
@@ -118,10 +118,21 @@ func TestTaskFromBooking(t *testing.T) {
 }
 
 func TestCancelNote(t *testing.T) {
-	if got := CancelNote("sick"); got != "Booking cancelled in OpenDesk: sick" {
+	if got := CancelNote("sick"); got != "Booking cancelled: sick" {
 		t.Fatalf("CancelNote = %q", got)
 	}
-	if got := CancelNote(""); got != "Booking cancelled in OpenDesk: no reason given" {
+	if got := CancelNote(""); got != "Booking cancelled: no reason given" {
 		t.Fatalf("CancelNote empty = %q", got)
+	}
+}
+
+func TestBookingTaskBodyIsPlainLanguage(t *testing.T) {
+	got := BookingTaskBody("confirmed", "Ngozi Okafor", "voice", 0, "NGN")
+	want := "Confirmed booking for Ngozi Okafor, made on a call with the receptionist. Free consultation."
+	if got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	if b := BookingTaskBody("no_show", "", "web", 250000, "ngn"); b != "No show booking for a customer, made on the booking page. Price: NGN 2500.00." {
+		t.Fatalf("body = %q", b)
 	}
 }

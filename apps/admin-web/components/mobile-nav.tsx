@@ -9,13 +9,20 @@ import * as React from "react";
 import { usePathname } from "next/navigation";
 import { Menu, X } from "lucide-react";
 import { OrgNav } from "@/components/org-nav";
+import type { NavLabels } from "@/lib/terminology";
+import type { ExternalLinks } from "@/lib/external-links";
 import { Button } from "@/components/ui/button";
 
 export function MobileNav({
   orgSlug,
   roles = [],
   tenantName,
+  labels,
+  externalLinks,
 }: {
+  /** the tenant's pack wording and external tool links, as the desktop sidebar gets them */
+  labels?: NavLabels;
+  externalLinks?: ExternalLinks;
   orgSlug: string;
   /** caller's Keycloak realm roles — forwarded to OrgNav gating */
   roles?: string[];
@@ -67,20 +74,20 @@ export function MobileNav({
             role="dialog"
             aria-modal="true"
             aria-label="Navigation"
-            className="absolute inset-y-0 left-0 flex w-72 max-w-[85vw] flex-col border-r border-border bg-card shadow-lg"
+            className="absolute inset-y-0 left-0 flex w-72 max-w-[85vw] flex-col bg-umber-deep text-paper shadow-lg"
           >
-            <div className="flex items-center justify-between border-b border-border px-5 py-4">
+            <div className="flex items-center justify-between border-b border-paper/10 px-5 py-4">
               <p className="truncate text-sm font-semibold">{tenantName}</p>
               <button
                 onClick={() => setOpen(false)}
                 aria-label="Close navigation"
-                className="rounded-sm text-muted-foreground transition-opacity hover:opacity-70 cursor-pointer"
+                className="rounded-sm text-paper/70 transition-opacity hover:opacity-70 cursor-pointer"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
             <div className="flex-1 overflow-y-auto py-3">
-              <OrgNav orgSlug={orgSlug} roles={roles} />
+              <OrgNav orgSlug={orgSlug} roles={roles} labels={labels} externalLinks={externalLinks} />
             </div>
           </div>
         </div>

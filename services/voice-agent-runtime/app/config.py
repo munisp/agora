@@ -85,6 +85,14 @@ DEFAULT_VOICE_TOOL_TIERS: dict[str, int] = {
     "verify_caller_code": TIER_LOW,
     # SPEC-W86: passive keypad listener — no identity required.
     "read_keypad_entry": TIER_LOW,
+    # 2026-11-21: self-reported caller details to the CRM at the start of a call. Tier 0 like the web
+    # form: booking-service only fills blank fields on an existing contact, so it can't take one over.
+    "save_caller_details": TIER_LOW,
+    "send_whatsapp_confirmation": TIER_LOW,
+    # 2026-11-26: a link to upload a document to this conversation, and what has been shared -- no identity needed
+    # (the link only adds a document to the conversation; the check answers kinds and check results, never details).
+    "send_document_upload_link": TIER_LOW,
+    "check_shared_documents": TIER_LOW,
     # Tier 1 — MEDIUM (confirmed identity)
     "book_appointment": TIER_MEDIUM,
     "capture_location": TIER_MEDIUM,
@@ -254,6 +262,12 @@ class Settings:
 
     # LiveKit (SPEC §11: dev keys on 7880)
     livekit_url: str = "ws://livekit:7880"
+    # What browsers dial (wss through the public edge); livekit_url stays the in-cluster address for workers.
+    livekit_public_url: str = ""
+    # Cloudflare Realtime TURN (app/ice.py): per-session relay credentials for browsers when LiveKit takes no
+    # inbound UDP. Empty = no TURN offered.
+    cf_turn_key_id: str = ""
+    cf_turn_api_token: str = ""
     livekit_api_key: str = "devkey"
     livekit_api_secret: str = "secret"
 
@@ -265,6 +279,9 @@ class Settings:
     llm_model: str = "qwen3:8b"
     llm_api_key: str = "ollama"  # Ollama ignores the key; hosted providers require one
     llm_timeout_s: float = 20.0  # per-call timeout; exceeding it trips fallback
+    # Extra JSON merged into every chat-completions body (LLM_EXTRA_BODY), e.g. {"reasoning_effort": "none"} so
+    # a thinking model answers a caller straight away instead of reasoning first.
+    llm_extra_body: dict = field(default_factory=dict)
     # LLM fallback chain (VOICE-SCALING §3): secondary OpenAI-compatible
     # endpoint used when the primary fails (connection error, 429, 5xx,
     # timeout). Empty base URL disables the chain.
@@ -558,6 +575,14 @@ class Settings:
     # misses or is unreachable (fail-open). Empty URL disables the registry
     # path; AGENTS_CACHE_TTL_S bounds the in-process resolve cache.
     agents_registry_url: str = "http://conversation:7007"
+    # conversation-service base for transcripts (app/transcripts.py); "" disables recording.
+    conversation_url: str = "http://conversation:7007"
+    # 2026-11-22: WhatsApp confirmations after a call (send_whatsapp_confirmation -> POST /v1/whatsapp/send).
+    messaging_gateway_url: str = "http://messaging-gateway:7011"
+    # Who send_whatsapp_confirmation may message: "demo_only" (default) = only the number typed into the browser demo
+    # phone (Leadway's demo contacts have realistic numbers that may belong to real people); "on" = also the person an
+    # outbound call reached. Inbound calls never send.
+    whatsapp_confirmations: str = "demo_only"
     agents_cache_ttl_s: int = 30
 
     # Multilingual receptionist (Wave 5 #3, app/multilang.py): language ->
@@ -583,6 +608,30 @@ class Settings:
     tts_voice_map: dict = field(default_factory=dict)
     mms_tts_url: str = "http://mms-tts:5800"
     xtts_tts_url: str = "http://xtts-tts:5810"
+    # Nigerian-language speech on the GPU host (services/naija-speech): YarnGPT voices for ig/yo/ha, MMS for pcm/ful,
+    # MMS speech recognition for all. Empty = callers can't pick a Nigerian language (English only).
+    naija_speech_url: str = ""
+    # Languages a caller may choose on the call page (ISO codes; en always allowed).
+    call_languages: str = "en,pcm,yo,ha,ig"
+    # Follow a caller who changes language mid-call. Off: the language picked on the call page holds for the whole
+    # call (real Nigerian-accented English was taken for Yoruba at 0.976 and the receptionist switched languages).
+    voice_auto_language_switch: bool = True
+    # "on" | "off" | "nigerian": follow language changes only in calls that START in a Nigerian language (an English
+    # caller's accent cannot switch the call; the multi-language demo starting in Pidgin still switches).
+    voice_language_switch_mode: str = "on"
+    # Nigerian-accented English voice on the naija-speech service (a YarnGPT English speaker, e.g. "idera"). Set: the
+    # receptionist speaks English and Pidgin in it instead of piper (piper stays the fallback). Empty = piper/MMS.
+    naija_english_voice: str = ""
+    # Per-language naija-speech voices for the other Nigerian languages, "yo=yoruba_male1,ig=igbo_male2" (unset
+    # languages: the service's default voice for that language).
+    naija_language_voices: dict = field(default_factory=dict)
+    # Yoruba/Hausa/Igbo calls: the model reasons and uses its tools in English and each reply is translated just
+    # before it is spoken (a model answering in Yoruba stopped calling its tools and claimed bookings it never made).
+    naija_think_in_english: bool = False
+    # 2026-11-23: with think-in-English on, the receptionist still writes Yoruba/Hausa/Igbo replies DIRECTLY (one
+    # model round instead of reply + translation per sentence); the caller's words are still translated to English
+    # for it, and an English reply is still translated as a fallback. NAIJA_REPLY_DIRECT=1.
+    naija_reply_direct: bool = False
     cosyvoice_tts_url: str = "http://cosyvoice-tts:5820"
     # SPEC-W102 C3: LongCat-AudioDiT (Meituan, MIT code + weights) GPU-tier
     # provider via the longcat-tts sidecar — ZH+EN only (NOT a Nigerian
@@ -632,6 +681,10 @@ class Settings:
     translate_url: str = ""
     translate_api_key: str = ""
     translate_timeout_s: float = 3.0
+    # 2026-11-23: where the LLM translators run (live Yoruba/Hausa/Igbo calls translate every reply sentence). The
+    # second Ollama server on ghana keeps these small requests from evicting the receptionist's cached prompt on the
+    # main one. Empty = llm_base_url.
+    translate_llm_base_url: str = ""
 
     # SPEC-W82 A4.4: per-tenant STT hints (VOICE_STT_HINTS JSON keyed by
     # site/tenant slug) — a forced whisper language= and an initial_prompt
@@ -655,6 +708,15 @@ class Settings:
     ocr_timeout_s: float = 150.0
     document_link_secret: str = ""
     document_link_ttl_s: int = 900
+    # 2026-11-26: where a caller's upload link points (the public page that posts to /voice/documents/claim/{token}),
+    # e.g. "https://agora.newfire.app/d/"; and how the call worker reaches this control plane to read shared documents.
+    document_link_base_url: str = ""
+    # 2026-11-26: "whatsapp" (default) sends a call's upload link by WhatsApp; "screen" shows it on the caller's call
+    # screen instead, labelled as a demo (no message leaves the platform).
+    document_link_delivery: str = "whatsapp"
+    voice_control_plane_url: str = "http://voice:7006"
+    # 2026-11-24: quiet seconds before a text chat ends and goes to the CRM (0 = never).
+    chat_end_idle_s: float = 600.0
     max_document_bytes: int = 10 * 1024 * 1024
 
     extra: dict = field(default_factory=dict)
@@ -662,6 +724,16 @@ class Settings:
     @property
     def dapr_base_url(self) -> str:
         return f"http://{self.dapr_host}:{self.dapr_http_port}"
+
+
+def parse_naija_language_voices(raw: str) -> dict[str, str]:
+    """"yo=yoruba_male1, ig=igbo_male2" -> {"yo": "yoruba_male1", "ig": "igbo_male2"}; malformed entries are skipped."""
+    out: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        lang, sep, voice = part.partition("=")
+        if sep and lang.strip() and voice.strip():
+            out[lang.strip().lower()] = voice.strip()
+    return out
 
 
 def load_settings() -> Settings:
@@ -681,6 +753,9 @@ def load_settings() -> Settings:
             "CONVERSATION_EVENTS_TOPIC", "opendesk.conversation.events"
         ),
         livekit_url=_env("LIVEKIT_URL", "ws://livekit:7880"),
+        livekit_public_url=_env("LIVEKIT_PUBLIC_URL", ""),
+        cf_turn_key_id=_env("CF_TURN_KEY_ID", ""),
+        cf_turn_api_token=_env("CF_TURN_API_TOKEN", ""),
         livekit_api_key=_env("LIVEKIT_API_KEY", "devkey"),
         livekit_api_secret=_env("LIVEKIT_API_SECRET", "secret"),
         llm_base_url=_env("LLM_BASE_URL", "http://ollama:11434/v1"),
@@ -689,6 +764,7 @@ def load_settings() -> Settings:
         # ignores it, hosted providers (e.g. MiniMax) require it.
         llm_api_key=_env("LLM_API_KEY", "ollama"),
         llm_timeout_s=float(os.environ.get("LLM_TIMEOUT", "20")),
+        llm_extra_body=json.loads(os.environ.get("LLM_EXTRA_BODY") or "{}"),
         llm_fallback_base_url=_env("LLM_FALLBACK_BASE_URL", ""),
         llm_fallback_model=_env("LLM_FALLBACK_MODEL", ""),
         llm_fallback_api_key=_env("LLM_FALLBACK_API_KEY", ""),
@@ -774,6 +850,10 @@ def load_settings() -> Settings:
         ocr_timeout_s=_env_float("VOICE_OCR_TIMEOUT_S", 150.0),
         document_link_secret=_env("VOICE_DOCUMENT_LINK_SECRET", ""),
         document_link_ttl_s=_env_int("VOICE_DOCUMENT_LINK_TTL_S", 900),
+        document_link_base_url=_env("VOICE_DOCUMENT_LINK_BASE_URL", ""),
+        document_link_delivery=_env("VOICE_DOCUMENT_LINK_DELIVERY", "whatsapp").strip().lower(),
+        voice_control_plane_url=_env("VOICE_CONTROL_PLANE_URL", "http://voice:7006"),
+        chat_end_idle_s=float(_env("CHAT_END_IDLE_S", "600")),
         max_document_bytes=_env_int("VOICE_MAX_DOCUMENT_BYTES", 10 * 1024 * 1024),
         http_timeout_s=float(os.environ.get("HTTP_TIMEOUT_S", "15")),
         tenant_ctx_ttl_s=_env_int("VOICE_TENANT_CTX_TTL_S", 120),
@@ -807,6 +887,9 @@ def load_settings() -> Settings:
         outbound_trunk_id=_env("OUTBOUND_TRUNK_ID", ""),
         outbound_cps=_env_float("OUTBOUND_CPS", 1.0),
         agents_registry_url=_env("AGENTS_REGISTRY_URL", "http://conversation:7007"),
+        conversation_url=_env("CONVERSATION_URL", "http://conversation:7007"),
+        messaging_gateway_url=_env("MESSAGING_GATEWAY_URL", "http://messaging-gateway:7011"),
+        whatsapp_confirmations=_env("WHATSAPP_CONFIRMATIONS", "demo_only"),
         agents_cache_ttl_s=_env_int("AGENTS_CACHE_TTL_S", 30),
         piper_voice_map=parse_voice_map(_env("PIPER_VOICE_MAP", "")),
         tts_cache_size=_env_int("VOICE_TTS_CACHE_SIZE", 256),
@@ -816,6 +899,16 @@ def load_settings() -> Settings:
         tts_voice_map=parse_tts_voice_map(_env("TTS_VOICE_MAP", "")),
         mms_tts_url=_env("MMS_TTS_URL", "http://mms-tts:5800"),
         xtts_tts_url=_env("XTTS_TTS_URL", "http://xtts-tts:5810"),
+        naija_speech_url=_env("NAIJA_SPEECH_URL", ""),
+        call_languages=_env("CALL_LANGUAGES", "en,pcm,yo,ha,ig"),
+        naija_english_voice=_env("NAIJA_ENGLISH_VOICE", "").strip(),
+        voice_auto_language_switch=_env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() in ("1", "true", "yes", "on"),
+        voice_language_switch_mode=("on" if _env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() in ("1", "true", "yes", "on")
+                                    else "nigerian" if _env("VOICE_AUTO_LANGUAGE_SWITCH", "1").lower() == "nigerian"
+                                    else "off"),
+        naija_language_voices=parse_naija_language_voices(_env("NAIJA_LANGUAGE_VOICES", "")),
+        naija_think_in_english=_env("NAIJA_THINK_IN_ENGLISH", "0").strip().lower() in ("1", "true", "yes", "on"),
+        naija_reply_direct=_env("NAIJA_REPLY_DIRECT", "0").strip().lower() in ("1", "true", "yes", "on"),
         cosyvoice_tts_url=_env("COSYVOICE_TTS_URL", "http://cosyvoice-tts:5820"),
         longcat_tts_url=_env("LONGCAT_TTS_URL", "http://longcat-tts:5830"),
         tts_prosody=_env("TTS_PROSODY", "off").lower() in ("1", "on", "true", "yes"),
@@ -842,6 +935,7 @@ def load_settings() -> Settings:
         translate_url=_env("TRANSLATE_URL", ""),
         translate_api_key=_env("TRANSLATE_API_KEY", ""),
         translate_timeout_s=_env_float("TRANSLATE_TIMEOUT_S", 3.0),
+        translate_llm_base_url=_env("TRANSLATE_LLM_BASE_URL", ""),
         # SPEC-W82 A4.4/A4.5 per-tenant hints + pronunciation lexicon.
         voice_stt_hints=parse_stt_hints(_env("VOICE_STT_HINTS", "")),
         voice_pronunciation_lexicon=parse_tenant_lexicons(

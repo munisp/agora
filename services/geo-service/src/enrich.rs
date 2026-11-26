@@ -147,3 +147,111 @@ pub async fn handler(
     };
     Ok(Json(resp))
 }
+
+// ---------------------------------------------------------------------------
+// GET /v1/geo/boundaries?kind=lga&codes=NG-LAGOS-IKEJA,NG-FCT-ABUJA-MUNICIPAL
+// (2026-11-21): REFERENCE boundary geometry by code, as a GeoJSON
+// FeatureCollection. analytics-pipeline uses it to put LGA polygons on the
+// Acquisition cost map. Reference rows only (tenant_id IS NULL), which are
+// world-visible platform data like the gazetteer snapshot, so no tenant
+// gate. Codes are bound as a text[] parameter, never interpolated.
+// ---------------------------------------------------------------------------
+
+/// Upper bound on codes per request (Nigeria has 774 LGAs).
+pub const MAX_BOUNDARY_CODES: usize = 1000;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BoundariesQuery {
+    kind: Option<String>,
+    codes: Option<String>,
+}
+
+/// Validate and split the query: kind must be a known boundary kind; codes
+/// are comma separated, trimmed, upper-cased, deduplicated, non-empty.
+pub fn parse_boundaries_query(
+    kind: Option<&str>,
+    codes: Option<&str>,
+) -> Result<(String, Vec<String>), String> {
+    let kind = kind.unwrap_or("lga").trim().to_ascii_lowercase();
+    if !["state", "lga", "ward", "custom"].contains(&kind.as_str()) {
+        return Err(format!("unknown kind {kind:?}"));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for c in codes.unwrap_or_default().split(',') {
+        let c = c.trim().to_ascii_uppercase();
+        if !c.is_empty() && !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    if out.is_empty() {
+        return Err("codes is required (comma separated)".into());
+    }
+    if out.len() > MAX_BOUNDARY_CODES {
+        return Err(format!("at most {MAX_BOUNDARY_CODES} codes per request"));
+    }
+    Ok((kind, out))
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct BoundaryGeom {
+    kind: String,
+    name: String,
+    code: String,
+    geojson: String,
+}
+
+pub async fn boundaries(
+    State(state): State<AppState>,
+    Query(q): Query<BoundariesQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (kind, codes) = parse_boundaries_query(q.kind.as_deref(), q.codes.as_deref())
+        .map_err(|e| err_json(StatusCode::BAD_REQUEST, e))?;
+    // 5 decimal places (~1 m) keeps the payload small for a dashboard map.
+    let rows: Vec<BoundaryGeom> = sqlx::query_as(
+        "SELECT kind, name, code, ST_AsGeoJSON(geom::geometry, 5) AS geojson \
+         FROM geo_boundaries WHERE tenant_id IS NULL AND kind = $1 AND code = ANY($2) \
+         ORDER BY code",
+    )
+    .bind(&kind)
+    .bind(&codes)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("boundaries query: {e}")))?;
+    let mut features = Vec::with_capacity(rows.len());
+    for r in rows {
+        let geometry: serde_json::Value = serde_json::from_str(&r.geojson).map_err(|e| {
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("boundary geojson: {e}"))
+        })?;
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "properties": { "kind": r.kind, "name": r.name, "code": r.code },
+            "geometry": geometry,
+        }));
+    }
+    Ok(Json(serde_json::json!({ "type": "FeatureCollection", "features": features })))
+}
+
+#[cfg(test)]
+mod boundaries_query_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_lga_and_normalises_codes() {
+        let (k, c) = parse_boundaries_query(None, Some(" ng-lagos-ikeja ,NG-LAGOS-IKEJA,,NG-FCT-ABUJA-MUNICIPAL")).unwrap();
+        assert_eq!(k, "lga");
+        assert_eq!(c, vec!["NG-LAGOS-IKEJA", "NG-FCT-ABUJA-MUNICIPAL"]);
+    }
+
+    #[test]
+    fn rejects_unknown_kind_and_missing_codes() {
+        assert!(parse_boundaries_query(Some("country"), Some("NG")).is_err());
+        assert!(parse_boundaries_query(Some("lga"), None).is_err());
+        assert!(parse_boundaries_query(Some("lga"), Some(" , ")).is_err());
+    }
+
+    #[test]
+    fn caps_code_count() {
+        let many: Vec<String> = (0..=MAX_BOUNDARY_CODES).map(|i| format!("C{i}")).collect();
+        assert!(parse_boundaries_query(None, Some(&many.join(","))).is_err());
+    }
+}

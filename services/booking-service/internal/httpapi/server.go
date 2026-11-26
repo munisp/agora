@@ -328,7 +328,7 @@ func NewRouter(d Deps) http.Handler {
 		r.Use(s.tenantMiddleware)
 		r.Route("/offerings", func(r chi.Router) {
 			r.Get("/", s.listOfferings)
-			r.With(s.require("manage_catalog")).Post("/", s.createOffering)
+			r.With(s.requireOrService("manage_catalog")).Post("/", s.createOffering)
 			r.Get("/{id}", s.getOffering)
 			r.With(s.require("manage_catalog")).Put("/{id}", s.updateOffering)
 			// SPEC-W47 (W47-A item 1, A-UIWEB UIWEB-02): PATCH alias of the
@@ -935,6 +935,15 @@ func (s *server) tenantMiddleware(next http.Handler) http.Handler {
 
 		slug := r.Header.Get("X-Tenant-Slug")
 		if slug == "" {
+			// The public gateway strips client-sent x-tenant-* headers, so the
+			// dashboard names the business in ?tenant=<slug> (as it does for
+			// conversation-service). Without this, a login with several
+			// businesses always got the FIRST one's bookings, contacts and
+			// leads, whichever business page was open (2026-11-24). The
+			// entitlement check below still applies to this value.
+			slug = strings.TrimSpace(r.URL.Query().Get("tenant"))
+		}
+		if slug == "" {
 			slug = claims.firstTenant()
 		}
 		if slug == "" {
@@ -997,6 +1006,24 @@ func (s *server) internAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// requireOrService admits a trusted service caller (X-Internal-Token == BOOKING_INTERNAL_TOKEN, constant time) or a
+// user holding the Permify permission. Used where a platform workflow writes on the tenant's behalf: onboarding's
+// ApplyIndustryPack seeds the pack's offerings with no user in the loop and was refused (401) on every tenant.
+func (s *server) requireOrService(permission string) func(http.Handler) http.Handler {
+	userGate := s.require(permission)
+	return func(next http.Handler) http.Handler {
+		gated := userGate(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if tok := r.Header.Get("X-Internal-Token"); tok != "" && s.d.InternalToken != "" &&
+				subtle.ConstantTimeCompare([]byte(tok), []byte(s.d.InternalToken)) == 1 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			gated.ServeHTTP(w, r)
+		})
+	}
 }
 
 // require returns middleware enforcing a Permify permission
@@ -1181,6 +1208,9 @@ func (s *server) fieldCaptureHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "field capture unavailable")
 		return
 	}
+	// 2026-11-21: the capturing agent (resolved JWT sub) rides the context
+	// to the ContactCaptured event, on both the plain and enriched paths.
+	r = r.WithContext(fieldcapture.WithAgent(r.Context(), userFrom(r.Context())))
 	if s.d.GeoEnrich.Enabled() {
 		s.d.FieldCapture.CaptureEnriched(w, r, tenantFrom(r.Context()), geoEnricherAdapter{c: s.d.GeoEnrich})
 		return

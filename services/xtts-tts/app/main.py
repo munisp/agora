@@ -18,6 +18,8 @@ Config (env):
 
 from __future__ import annotations
 
+from typing import Optional
+
 import base64
 import binascii
 import hashlib
@@ -52,11 +54,21 @@ class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_TEXT_LEN)
     voice_id: str = Field(min_length=1, max_length=64)
     language: str = Field(min_length=2, max_length=8)
+    # When set, the voice must belong to this tenant (a voiceprint is biometric data: never cross businesses).
+    tenant: Optional[str] = Field(default=None, max_length=100)
 
 
 class EnrollRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     sample_base64: str = Field(min_length=1)
+    tenant: Optional[str] = Field(default=None, max_length=100)
+
+
+def _owned(entry: Optional[dict], tenant: Optional[str]) -> Optional[dict]:
+    """The voice if the caller may use it: no tenant named (internal/ops call) or the voice is that tenant's."""
+    if entry is None or (tenant is not None and entry.get("tenant") != tenant):
+        return None
+    return entry
 
 
 def mock_synthesize(text: str, voice_id: str, language: str) -> bytes:
@@ -109,9 +121,28 @@ class XTTSModel:
     def _load(self):
         with self._lock:
             if self._tts is None:
+                import torch
                 from TTS.api import TTS  # lazy heavy import
 
-                self._tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+                if os.environ.get("XTTS_DISABLE_CUDNN") == "1":
+                    # Some GPUs/driver stacks (e.g. NVIDIA GB10 + CUDA 13) have no cuDNN engine for XTTS's
+                    # transposed convolutions; plain CUDA kernels work.
+                    torch.backends.cudnn.enabled = False
+                import torchaudio
+
+                if os.environ.get("XTTS_SOUNDFILE_LOAD", "1") == "1":
+                    # torchaudio >= 2.9 reads audio only through TorchCodec (FFmpeg-linked, torch-ABI-bound). XTTS
+                    # only loads the reference wav, so read it with soundfile instead.
+                    import soundfile as sf
+
+                    def _load(path, *_args, **_kwargs):
+                        data, rate = sf.read(str(path), dtype="float32", always_2d=True)
+                        return torch.from_numpy(data.T.copy()), rate
+
+                    torchaudio.load = _load
+                # TTS() loads on the CPU: without .to() the "GPU" sidecar synthesised on the CPU (minutes per line).
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                self._tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
             return self._tts
 
     def synthesize(self, text: str, sample_wav: Path, language: str) -> bytes:
@@ -163,8 +194,8 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/voices")
-    def list_voices() -> dict:
-        return {"voices": registry.list()}
+    def list_voices(tenant: Optional[str] = None) -> dict:
+        return {"voices": [v for v in registry.list() if _owned(v, tenant)]}
 
     @app.post("/voices", status_code=201)
     def enroll(req: EnrollRequest) -> dict:
@@ -185,11 +216,13 @@ def create_app() -> FastAPI:
                 status_code=413,
                 detail=f"decoded sample too large ({len(sample)} bytes; max {MAX_SAMPLE_BYTES})",
             )
-        entry = registry.add(req.name, sample)
+        entry = registry.add(req.name, sample, tenant=req.tenant)
         return {"voice_id": entry["id"], "voice": entry}
 
     @app.delete("/voices/{voice_id}")
-    def delete_voice(voice_id: str) -> dict:
+    def delete_voice(voice_id: str, tenant: Optional[str] = None) -> dict:
+        if _owned(registry.get(voice_id), tenant) is None:
+            raise HTTPException(status_code=404, detail=f"unknown voice_id '{voice_id}'")
         try:
             entry = registry.delete(voice_id)
         except VoiceNotFound as exc:
@@ -198,7 +231,7 @@ def create_app() -> FastAPI:
 
     @app.post("/tts", response_class=Response)
     def tts(req: TTSRequest) -> Response:
-        voice = registry.get(req.voice_id)
+        voice = _owned(registry.get(req.voice_id), req.tenant)
         if voice is None:
             raise HTTPException(status_code=404, detail=f"unknown voice_id '{req.voice_id}'")
         language = req.language.lower()

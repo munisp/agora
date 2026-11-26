@@ -37,6 +37,9 @@ const (
 	TypeBookingConfirmed   = "com.opendesk.booking.BookingConfirmed"
 	TypeBookingRescheduled = "com.opendesk.booking.BookingRescheduled"
 	TypeBookingCancelled   = "com.opendesk.booking.BookingCancelled"
+	// TypeContactCaptured (2026-11-21): caller details the AI receptionist saved at the start of a
+	// call (booking-service internal upsert), so the person reaches the CRM without a booking.
+	TypeContactCaptured = "com.opendesk.booking.ContactCaptured"
 
 	TypeToolInvoked  = "com.opendesk.conversation.ToolInvoked"
 	TypeSessionEnded = "com.opendesk.conversation.SessionEnded"
@@ -107,6 +110,9 @@ type SessionEndedData struct {
 	Channel        string       `json:"channel"`
 	SiteSlug       string       `json:"siteSlug"`
 	Quality        *CallQuality `json:"quality"`
+	// StoredConversationID is the conversation-service id of the call's
+	// transcript (the runtime's session id differs); absent on older runtimes.
+	StoredConversationID string `json:"storedConversationId,omitempty"`
 }
 
 // CallQualityEnrichedData mirrors conversation-service app/quality.py
@@ -115,12 +121,14 @@ type SessionEndedData struct {
 // "turn_sentiment_count"}. quality.avg_sentiment is also set; the top-level
 // fields exist so consumers need not re-derive them.
 type CallQualityEnrichedData struct {
-	ConversationID    string       `json:"conversationId"`
-	Channel           string       `json:"channel"`
-	SiteSlug          string       `json:"siteSlug"`
-	Quality           *CallQuality `json:"quality"`
-	AvgSentiment      *float64     `json:"avg_sentiment"`
-	TurnSentimentCount int         `json:"turn_sentiment_count"`
+	ConversationID string       `json:"conversationId"`
+	Channel        string       `json:"channel"`
+	SiteSlug       string       `json:"siteSlug"`
+	Quality        *CallQuality `json:"quality"`
+	AvgSentiment   *float64     `json:"avg_sentiment"`
+	// StoredConversationID (2026-11-23): conversation-service's id of the call's transcript.
+	StoredConversationID string `json:"storedConversationId,omitempty"`
+	TurnSentimentCount   int    `json:"turn_sentiment_count"`
 }
 
 // CaptureExtractedData mirrors conversation-service app/capture.py
@@ -154,6 +162,25 @@ type CallQuality struct {
 	Escalated       bool           `json:"escalated"`
 	ConfirmedPhone  string         `json:"confirmed_phone"`
 	AvgSentiment    *float64       `json:"avg_sentiment,omitempty"`
+	// 2026-11-23 (voice-agent-runtime): who called whom and why, carried inside quality.
+	Direction   string `json:"direction,omitempty"`
+	Purpose     string `json:"purpose,omitempty"`
+	ContactName string `json:"contact_name,omitempty"`
+	Channel     string `json:"channel,omitempty"`
+	Language    string `json:"language,omitempty"`     // call language code at the end of the call (2026-11-23)
+	CallOutcome string `json:"call_outcome,omitempty"` // outbound result: confirmed, declined, ... (2026-11-23)
+	// 2026-11-24: text conversations (web chat / WhatsApp / Telegram) end too; the pre-chat form's e-mail rides along.
+	ContactEmail string `json:"contact_email,omitempty"`
+}
+
+// IsTextChannel reports whether the conversation was a text chat (channel "chat", "whatsapp" or "telegram") rather
+// than a call.
+func (q CallQuality) IsTextChannel() bool {
+	switch q.Channel {
+	case "chat", "whatsapp", "telegram", "email":
+		return true
+	}
+	return false
 }
 
 // Parse unmarshals one Kafka message value into a CloudEvent envelope.

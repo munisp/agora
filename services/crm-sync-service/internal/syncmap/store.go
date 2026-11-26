@@ -124,10 +124,51 @@ func ContactIdentityKeys(email, phone string) []string {
 	if e := strings.ToLower(strings.TrimSpace(email)); e != "" {
 		keys = append(keys, "email:"+e)
 	}
-	if p := strings.TrimSpace(phone); p != "" {
+	for _, p := range PhoneVariants(phone) {
 		keys = append(keys, "phone:"+p)
 	}
 	return keys
+}
+
+// PhoneVariants returns the number as given plus its other Nigerian spellings (2026-11-23): a contributor saved as
+// 08065553108 and an outbound call that reached +2348065553108 are the same person, but exact-match keys missed it,
+// so most outbound calls never got their CRM note. The given spelling comes first; non-Nigerian numbers only get
+// the given spelling and its digits-only form.
+func PhoneVariants(phone string) []string {
+	p := strings.TrimSpace(phone)
+	if p == "" {
+		return nil
+	}
+	var digits strings.Builder
+	for _, r := range p {
+		if r >= '0' && r <= '9' {
+			digits.WriteRune(r)
+		}
+	}
+	d := digits.String()
+	out, seen := []string{}, map[string]bool{}
+	add := func(v string) {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	add(p)
+	switch {
+	case strings.HasPrefix(d, "234") && len(d) == 13:
+		add("+" + d)
+		add("0" + d[3:])
+		add(d)
+		add(d[3:]) // national form, as Twenty stores primaryPhoneNumber
+	case strings.HasPrefix(d, "0") && len(d) == 11:
+		add(d)
+		add("+234" + d[1:])
+		add("234" + d[1:])
+		add(d[1:])
+	default:
+		add(d)
+	}
+	return out
 }
 
 // normTenant maps nil to uuid.Nil (stored as a regular value, never NULL).

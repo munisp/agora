@@ -397,6 +397,10 @@ export interface Conversation {
   contact_phone?: string | null;
   started_at: string;
   ended_at?: string | null;
+  /** List view: caller name/phone from the call's booking turn, and the last turn's time (2026-11-21). */
+  contact_name?: string | null;
+  caller_phone?: string | null;
+  last_activity_at?: string | null;
 }
 
 /** Conversation detail including scored turns (GET /v1/conversations/{id}). */
@@ -534,6 +538,10 @@ export interface ChatResponse {
    * back in the body and as X-Session-Secret.
    */
   session_secret?: string;
+  /** 2026-11-23: the chat was handed to a person (request_human). */
+  escalated?: boolean;
+  /** 2026-11-23: a person owns this chat in the human inbox; the receptionist stayed quiet (reply is ""). */
+  human?: boolean;
 }
 
 /**
@@ -552,6 +560,8 @@ export interface VoiceSession {
   signed_url?: string | null;
   /** Optional avatar presence descriptor (SPEC-W9 Part A) */
   avatar?: Record<string, unknown> | null;
+  /** STUN/TURN servers for the browser (per-session relay credentials); absent = browser defaults */
+  ice_servers?: RTCIceServer[] | null;
 }
 
 // ---------- gateway-edge WebSocket events ----------
@@ -740,6 +750,8 @@ export interface VoiceInfo {
   languages: string[];
   gender?: string | null;
   labels?: string[];
+  /** Display name of a cloned (XTTS) brand voice. */
+  name?: string;
 }
 
 /** A configured TTS provider and its voice catalog (GET /voice/voices). */

@@ -400,11 +400,11 @@ def compile_alert_resolve_write(
         followup = (
             "MATCH (a:Alert {tenant_id: $tenant_id, alert_id: $alert_id})\n"
             "MATCH (p:Person {tenant_id: $tenant_id, person_id: a.person_id})\n"
-            "WHERE NOT EXISTS {\n"
-            "  MATCH (o:Alert)-[:FLAGGED]->(p)\n"
-            "  WHERE o.tenant_id = $tenant_id AND o.alert_id <> $alert_id\n"
-            "    AND o.status = 'open' AND o.severity = 'high'\n"
-            "}\n"
+            # FalkorDB has no EXISTS { MATCH ... }: count the other open high-severity alerts instead.
+            "OPTIONAL MATCH (o:Alert)-[:FLAGGED]->(p)\n"
+            "WHERE o.tenant_id = $tenant_id AND o.alert_id <> $alert_id\n"
+            "  AND o.status = 'open' AND o.severity = 'high'\n"
+            "WITH p, count(o) AS others WHERE others = 0\n"
             "SET p.quarantine = false\n"
             "RETURN p.person_id AS person_id"
         )

@@ -36,8 +36,9 @@ export function VoicePicker({
     const controller = new AbortController();
     (async () => {
       try {
+        // Signed-in route (the anonymous /voice/voices is closed): only Piper voices are used here.
         const catalog = await api.get<VoicesCatalog>(
-          "/voice/voices",
+          "/api/voice/voices",
           undefined,
           controller.signal,
         );

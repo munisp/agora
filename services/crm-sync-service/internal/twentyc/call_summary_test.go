@@ -7,79 +7,65 @@ import (
 	"github.com/opendesk/crm-sync-service/internal/events"
 )
 
-func intPtr(v int) *int           { return &v }
 func floatPtr(v float64) *float64 { return &v }
+func intPtr(v int) *int           { return &v }
 
-func TestCallSummaryNoteFullPayload(t *testing.T) {
+func TestCallSummaryNoteReadsLikeASummary(t *testing.T) {
 	body := CallSummaryNote(events.CallQuality{
-		DurationS:       95.24, // rounds to 95s
-		TurnCount:       6,
-		ToolCalls:       map[string]int{"lookup_appointment": 2, "book_appointment": 1},
+		DurationS:       341.9,
+		TurnCount:       8,
+		ToolCalls:       map[string]int{"get_availability": 2, "book_appointment": 1},
 		AvgLLMLatencyMs: intPtr(820),
-		MaxLLMLatencyMs: intPtr(1400),
-		SttCalls:        6,
-		TtsCalls:        5,
-		LLMFallbackUsed: true,
-		Escalated:       true,
-		ConfirmedPhone:  "+1555000111",
-	})
-	want := "📞 AI call summary — duration 95s, 6 turns, " +
-		"tools: book_appointment×1, lookup_appointment×2, " +
-		"avg LLM 820ms (max 1400ms), stt 6 calls, tts 5 calls, " +
-		"escalated: yes, fallback used: yes"
+		TtsCalls:        12,
+		ConfirmedPhone:  "08065553108",
+	}, "The caller wanted to open a retirement savings account. The receptionist booked an RSA Registration call for Tuesday 24 November at 9:00 am.")
+	want := "The caller wanted to open a retirement savings account. The receptionist booked an RSA Registration call for Tuesday 24 November at 9:00 am.\n\n" +
+		"- Call length: 5 min 42 s\n" +
+		"- Phone confirmed: 0806 555 3108\n" +
+		"- Appointment booked: Yes\n" +
+		"- Passed to a person: No"
 	if body != want {
 		t.Fatalf("CallSummaryNote =\n%q\nwant\n%q", body, want)
 	}
 }
 
-func TestCallSummaryNoteFallbackFlagRendering(t *testing.T) {
-	off := CallSummaryNote(events.CallQuality{DurationS: 10, TurnCount: 1})
-	if !strings.Contains(off, "fallback used: no") || !strings.Contains(off, "escalated: no") {
-		t.Errorf("false flags should render as 'no': %q", off)
-	}
-	on := CallSummaryNote(events.CallQuality{DurationS: 10, TurnCount: 1, LLMFallbackUsed: true, Escalated: true})
-	if !strings.Contains(on, "fallback used: yes") || !strings.Contains(on, "escalated: yes") {
-		t.Errorf("true flags should render as 'yes': %q", on)
-	}
-}
-
-func TestCallSummaryNoteOmitsMissingOptionals(t *testing.T) {
+func TestCallSummaryNoteHasNoEngineeringJargon(t *testing.T) {
 	body := CallSummaryNote(events.CallQuality{
-		DurationS: 12,
-		// no tool calls, no LLM latency samples, no stt/tts, no sentiment
-	})
-	if strings.Contains(body, "tools:") {
-		t.Errorf("tools segment should be omitted: %q", body)
+		DurationS: 95, TurnCount: 6, ToolCalls: map[string]int{"lookup_appointment": 2},
+		AvgLLMLatencyMs: intPtr(820), MaxLLMLatencyMs: intPtr(1400), SttCalls: 6, TtsCalls: 5, LLMFallbackUsed: true,
+	}, "")
+	for _, bad := range []string{"turns", "tools", "×", "LLM", "stt", "tts", "fallback", "ms"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("summary should not mention %q: %q", bad, body)
+		}
 	}
-	if strings.Contains(body, "avg LLM") {
-		t.Errorf("latency segment should be omitted: %q", body)
-	}
-	if strings.Contains(body, "stt ") || strings.Contains(body, "tts ") {
-		t.Errorf("stt/tts segment should be omitted: %q", body)
-	}
-	if strings.Contains(body, "sentiment") {
-		t.Errorf("sentiment must be omitted when nil: %q", body)
-	}
-	want := "📞 AI call summary — duration 12s, 0 turns, escalated: no, fallback used: no"
-	if body != want {
-		t.Fatalf("CallSummaryNote =\n%q\nwant\n%q", body, want)
+	if !strings.HasPrefix(body, "- Call length: 1 min 35 s") {
+		t.Errorf("without sentences the note starts with the facts: %q", body)
 	}
 }
 
-func TestCallSummaryNoteOptionalAvgSentiment(t *testing.T) {
-	withSentiment := CallSummaryNote(events.CallQuality{
-		DurationS: 30, TurnCount: 2, AvgSentiment: floatPtr(0.42),
-	})
-	if !strings.Contains(withSentiment, "avg sentiment 0.42") {
-		t.Errorf("sentiment segment missing: %q", withSentiment)
+func TestCallSummaryNoteBookingOutcomeAndHandover(t *testing.T) {
+	cases := map[string]events.CallQuality{
+		"Appointment booked: No":          {DurationS: 40},
+		"Appointment booked: Rescheduled": {DurationS: 40, ToolCalls: map[string]int{"reschedule_appointment": 1}},
+		"Passed to a person: Yes":         {DurationS: 40, Escalated: true},
+		"Call length: 40 s":               {DurationS: 40},
+	}
+	for want, q := range cases {
+		if body := CallSummaryNote(q, ""); !strings.Contains(body, want) {
+			t.Errorf("want %q in %q", want, body)
+		}
 	}
 }
 
-func TestCallSummaryNoteAvgWithoutMax(t *testing.T) {
-	body := CallSummaryNote(events.CallQuality{
-		DurationS: 5, TurnCount: 1, AvgLLMLatencyMs: intPtr(640),
-	})
-	if !strings.Contains(body, "avg LLM 640ms") || strings.Contains(body, "max") {
-		t.Errorf("avg without max should render plainly: %q", body)
+func TestCallSummaryNoteMood(t *testing.T) {
+	for v, want := range map[float64]string{0.42: "Positive", -0.35: "Negative", 0.1: "Neutral"} {
+		body := CallSummaryNote(events.CallQuality{DurationS: 30, AvgSentiment: floatPtr(v)}, "")
+		if !strings.Contains(body, "Caller's mood: "+want) {
+			t.Errorf("sentiment %v: want mood %s in %q", v, want, body)
+		}
+	}
+	if strings.Contains(CallSummaryNote(events.CallQuality{DurationS: 30}, ""), "mood") {
+		t.Error("no mood line without sentiment")
 	}
 }

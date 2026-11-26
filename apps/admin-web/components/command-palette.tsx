@@ -82,16 +82,16 @@ const NAV_ENTRIES: { segment: string; label: string; keywords?: string }[] = [
   { segment: "public-site", label: "Public Site" },
   { segment: "billing", label: "Billing", keywords: "invoices payments" },
   { segment: "analytics", label: "Analytics" },
-  { segment: "cac", label: "CAC", keywords: "acquisition cost marketing" },
+  { segment: "cac", label: "Acquisition cost", keywords: "acquisition cost marketing" },
   { segment: "growth", label: "Growth", keywords: "referrals commissions loyalty" },
-  { segment: "webhooks", label: "Webhooks" },
+  { segment: "webhooks", label: "Integrations" },
   { segment: "channels", label: "Channels", keywords: "whatsapp telegram sms" },
   { segment: "locations", label: "Locations" },
   { segment: "geo-campaigns", label: "Geo campaigns", keywords: "marketing" },
   { segment: "segments", label: "Segments", keywords: "audiences" },
   { segment: "alerts", label: "Alerts", keywords: "fraud trust" },
   { segment: "kyc", label: "KYC review" },
-  { segment: "media-inbox", label: "Media inbox" },
+  { segment: "media-inbox", label: "Received documents" },
   { segment: "bookings/reconciliation", label: "Reconciliation" },
   { segment: "incidents", label: "Incidents", keywords: "iot civic" },
   { segment: "ops-alerts", label: "Ops alerts" },
@@ -134,7 +134,7 @@ const CRM_CONSOLES: { segment: string; label: string; keywords?: string }[] = [
 const EXTERNAL_ENTRIES: { url: string; label: string; keywords?: string }[] = [
   {
     url: "http://localhost:3100",
-    label: "Twenty CRM (external)",
+    label: "CRM",
     keywords: "crm twenty self-hosted",
   },
   {

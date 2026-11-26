@@ -22,13 +22,14 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 from . import analytics
 from . import suggestions as kb_suggestions
+from .extract import MAX_BYTES as MAX_UPLOAD_BYTES, ExtractError, extract_text
 from .chunking import chunk_text
 from .config import settings
 from .dapr_client import DaprClient
@@ -411,6 +412,30 @@ async def _reaper_loop(deps: AppState) -> None:
         except Exception as exc:  # noqa: BLE001 - reaper never dies on error
             log.error("upload_reaper.sweep_failed", error=str(exc)[:200])
         await asyncio.sleep(settings.doc_intel_reaper_interval_s)
+
+
+
+@app.post("/v1/documents/upload-file", status_code=201)
+async def upload_document_file(
+    request: Request,
+    tenant: str = Form(..., description="tenant slug or UUID"),
+    file: UploadFile = File(..., description="PDF, Word (.docx), .txt or .md"),
+    title: str | None = Form(None),
+    deps: AppState = Depends(get_state),
+):
+    """2026-11-21: upload a policy document; its text is chunked, embedded and indexed like a typed document, so
+    the receptionist's knowledge_search answers contributors' questions from it. Scanned PDFs are refused with a
+    pointer to the OCR "Upload scan" path (app/extract.py)."""
+    tenant_id = await _bound_tenant_id(request, tenant, deps)
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    try:
+        text, pages = extract_text(file.filename or "", data)
+    except ExtractError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    name = (file.filename or "document").rsplit("/", 1)[-1][:200]
+    doc_title = (title or "").strip()[:300] or name.rsplit(".", 1)[0].replace("_", " ").strip() or "Uploaded document"
+    out = await _ingest_document(deps, tenant_id, doc_title, text, f"upload:{name}")
+    return {**out, "file_name": name, "pages": pages, "characters": len(text)}
 
 
 @app.get("/v1/documents/upload/{job_id}")

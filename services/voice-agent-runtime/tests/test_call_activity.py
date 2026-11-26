@@ -1,0 +1,84 @@
+import asyncio
+import json
+
+from app.call_activity import TOPIC, activity_message, announce_activity, tool_label
+
+
+class _Info:
+    def __init__(self, name):
+        self.function_info = type("F", (), {"name": name})()
+
+
+class _Called:
+    def __init__(self, name):
+        self.call_info = _Info(name)
+
+
+class _Agent:
+    def __init__(self):
+        self.handlers = {}
+
+    def on(self, event, fn):
+        self.handlers.setdefault(event, []).append(fn)
+
+    def emit(self, event, *args):
+        for fn in self.handlers.get(event, []):
+            fn(*args)
+
+
+class _Participant:
+    def __init__(self):
+        self.sent = []
+
+    async def publish_data(self, payload, *, reliable=True, topic=""):
+        self.sent.append((topic, json.loads(payload)))
+
+
+def test_labels():
+    assert tool_label("get_availability") == "Checking availability"
+    assert tool_label("something_new") == "Looking that up"
+    assert json.loads(activity_message("listening")) == {"state": "listening"}
+
+
+def test_turn_is_announced_thinking_working_speaking_listening():
+    async def run():
+        agent, room = _Agent(), type("R", (), {"local_participant": _Participant()})()
+        announce_activity(agent, room)
+        agent.emit("user_started_speaking")
+        agent.emit("user_stopped_speaking")
+        agent.emit("function_calls_collected", [_Called("get_availability")])
+        agent.emit("function_calls_finished", [])
+        agent.emit("agent_started_speaking")
+        agent.emit("agent_stopped_speaking")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return room.local_participant.sent
+
+    sent = asyncio.run(run())
+    assert sent == [
+        (TOPIC, {"state": "listening"}),
+        (TOPIC, {"state": "thinking"}),
+        (TOPIC, {"state": "working", "tool": "get_availability", "label": "Checking availability"}),
+        (TOPIC, {"state": "thinking"}),
+        (TOPIC, {"state": "speaking"}),
+        (TOPIC, {"state": "listening"}),
+    ]
+
+
+def test_captions_are_published_for_both_sides():
+    from app.call_activity import announce_captions, caption
+
+    async def run():
+        room = type("R", (), {"local_participant": _Participant()})()
+        announce_captions(room)
+        caption("caller", "Good evening, I had an accident.")
+        caption("receptionist", "  ")  # empty: nothing sent
+        caption("receptionist", "I'm sorry to hear that.")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return room.local_participant.sent
+
+    assert asyncio.run(run()) == [
+        (TOPIC, {"state": "caption", "role": "caller", "text": "Good evening, I had an accident."}),
+        (TOPIC, {"state": "caption", "role": "receptionist", "text": "I'm sorry to hear that."}),
+    ]

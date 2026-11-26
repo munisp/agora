@@ -152,9 +152,11 @@ class TestGreetingMenuLine:
         line = ivr_menu.menu_line(ivr_menu.DEFAULT_MENU)
         greeting = build_greeting(ctx, menu_line=line)
         assert greeting.endswith(f" {line}")
-        # disclosure lines still applied around the base greeting
-        assert greeting.startswith("You're speaking with an automated assistant.")
-        assert "This call may be recorded" in greeting
+        # disclosure lines still applied around the base greeting; on this
+        # deployment the recording notice is always the very first words
+        # (product rule), then the AI disclosure.
+        assert greeting.startswith("This call may be recorded")
+        assert "You're speaking with an automated assistant." in greeting
 
     def test_empty_menu_line_treated_as_absent(self):
         ctx = _GreetingCtx()

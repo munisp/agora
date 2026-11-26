@@ -133,13 +133,25 @@ SET pt.tenant_id = $tenant_id`
 // captureLocationQuery wires (Contact)-[:CAPTURED_AT]->(Location) (only
 // issued when the contact carries geo).
 func captureLocationQuery(c Contact) q {
+	merge := `MERGE (l:Location {tenant_id: $tenant_id, lga: $lga, ward: $ward})`
+	cell := ""
+	if strings.TrimSpace(c.LGA) == "" && strings.TrimSpace(c.Ward) == "" {
+		// 2026-11-21: GPS-only captures have no LGA/ward; keyed on ("",""),
+		// every such capture in a tenant shared ONE Location and overwrote
+		// its coordinates (D4 then saw no travel at all). Key them on a
+		// ~100 m coordinate cell instead.
+		cell = fmt.Sprintf("%.3f,%.3f", c.Lat, c.Lon)
+		merge = `MERGE (l:Location {tenant_id: $tenant_id, cell: $cell})
+ON CREATE SET l.lga = $lga, l.ward = $ward`
+	}
 	return q{
 		text: `MATCH (c:Contact {tenant_id: $tenant_id, lead_id: $lead_id})
-MERGE (l:Location {tenant_id: $tenant_id, lga: $lga, ward: $ward})
+` + merge + `
 SET l.lat = $lat, l.lon = $lon, l.updated_at = $now
 MERGE (c)-[r:CAPTURED_AT]->(l)
 SET r.tenant_id = $tenant_id`,
 		params: map[string]any{
+			"cell":      cell,
 			"tenant_id": c.TenantID,
 			"lead_id":   c.LeadID,
 			"lga":       c.LGA,
@@ -183,8 +195,13 @@ SET r.tenant_id = $tenant_id, r.purpose = $purpose, r.at = $granted_at`,
 // upsertBookingQuery upserts Booking (+ Offering) and wires BOOKED + FOR.
 func upsertBookingQuery(b Booking, personID string) q {
 	text := `MERGE (b:Booking {tenant_id: $tenant_id, booking_id: $booking_id})
-ON CREATE SET b.created_at = $created_at
+ON CREATE SET b.created_at = $created_at, b.booked_at = $booked_at
 SET b.status = $status, b.offering_id = $offering_id, b.updated_at = $now`
+	if b.StatusInitial {
+		text = `MERGE (b:Booking {tenant_id: $tenant_id, booking_id: $booking_id})
+ON CREATE SET b.created_at = $created_at, b.booked_at = $booked_at, b.status = $status
+SET b.offering_id = $offering_id, b.updated_at = $now`
+	}
 	params := map[string]any{
 		"tenant_id":     b.TenantID,
 		"booking_id":    b.BookingID,
@@ -193,6 +210,7 @@ SET b.status = $status, b.offering_id = $offering_id, b.updated_at = $now`
 		"offering_id":   b.OfferingID,
 		"offering_name": b.OfferingName,
 		"created_at":    FormatTime(b.CreatedAt),
+		"booked_at":     FormatTime(b.BookedAt),
 		"now":           FormatTime(time.Now()),
 	}
 	if b.Showed != nil {

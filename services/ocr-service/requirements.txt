@@ -11,3 +11,6 @@ python-multipart==0.0.12
 # Official MinIO client — pure-Python, ~1 MB wheel (+ certifi/urllib3/
 # argon2-cffi/pycryptodome). Slim enough for I5; see README rationale.
 minio==7.2.15
+# 2026-11-26: policy rules read the policy document (app/policy_text.py, as knowledge-service).
+pypdf==5.1.0
+python-docx==1.1.2

@@ -19,7 +19,8 @@
  */
 "use strict";
 
-var OPENDESK_SW_V = "field-pwa-v7"; // SPEC-W78: mandatory bump (G-SW4) — 3-level locality picker changes precached app.js/index.html
+var OPENDESK_SW_V = "field-pwa-v8"; // v8: merge of v7 "Last receipt read" line and SPEC-W78 3-level locality picker (G-SW4 bump).
+// v7 (deploy): persistent "Last receipt read" line; v7 (W78): 3-level locality picker; v6: SPEC-W68 cache guard.
 var SHELL = "opendesk-field-" + OPENDESK_SW_V;
 
 var PRECACHE = [

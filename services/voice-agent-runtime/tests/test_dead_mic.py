@@ -296,3 +296,13 @@ def test_env_parsing(monkeypatch):
     # A typo'd float must not crash boot (W70 A1 posture).
     monkeypatch.setenv("VOICE_DEAD_MIC_FIRST_PROMPT_S", "soon-ish")
     assert load_settings().voice_dead_mic_first_prompt_s == 12.0
+
+
+async def test_receptionist_activity_also_resets_the_watchdog():
+    """Silence only counts after the receptionist has finished (replies and lookups take longer than the window)."""
+    agent = FakeAgent()
+    settings = Settings(voice_dead_mic_enabled=True, voice_dead_mic_first_prompt_s=60.0, voice_dead_mic_second_prompt_s=60.0)
+    monitor = lw.start_dead_mic_monitor(settings, agent, FakeSession(), FakeRoom())
+    for event in ("agent_started_speaking", "agent_stopped_speaking", "function_calls_collected", "function_calls_finished"):
+        assert agent.listeners[event] == [monitor.note_user_speech]
+    await monitor.aclose()

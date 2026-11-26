@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -39,6 +40,34 @@ import (
 // webhookTimeout bounds the synchronous bridge processing per message
 // (SPEC-W6 §A1: process synchronously but bounded).
 const webhookTimeout = 25 * time.Second
+
+// whatsappBridgeAsync (WHATSAPP_BRIDGE_ASYNC=1) acks WhatsApp text webhooks
+// immediately and bridges them in the background with asyncBridgeTimeout.
+var whatsappBridgeAsync = os.Getenv("WHATSAPP_BRIDGE_ASYNC") == "1"
+
+const asyncBridgeTimeout = 2 * time.Minute
+
+// inFlight holds message ids being bridged in the background, so a Meta
+// redelivery that lands mid-reply is not answered twice.
+var inFlight sync.Map
+
+func (s *Server) bridgeAsync(msg channel.InboundMessage, routeID string) {
+	if _, busy := inFlight.LoadOrStore(msg.Channel+":"+msg.MessageID, true); busy {
+		return
+	}
+	go func() {
+		defer inFlight.Delete(msg.Channel + ":" + msg.MessageID)
+		ctx, cancel := context.WithTimeout(context.Background(), asyncBridgeTimeout)
+		defer cancel()
+		if s.Bridge == nil {
+			return
+		}
+		if err := s.Bridge.Handle(ctx, msg, routeID); err != nil {
+			s.Log.Warn("inbound bridge failed (async)",
+				zap.String("channel", msg.Channel), zap.Error(err))
+		}
+	}()
+}
 
 // Bridger is the inbound bridge contract used by the webhook handlers
 // (implemented by *channel.Bridge; faked in tests).
@@ -81,7 +110,14 @@ type waWebhook struct {
 				Metadata struct {
 					PhoneNumberID string `json:"phone_number_id"`
 				} `json:"metadata"`
-				Messages []waMessage       `json:"messages"`
+				Messages []waMessage `json:"messages"`
+				// 2026-11-24: the sender's WhatsApp profile name (contacts[].profile.name, keyed by wa_id).
+				Contacts []struct {
+					WaID    string `json:"wa_id"`
+					Profile struct {
+						Name string `json:"name"`
+					} `json:"profile"`
+				} `json:"contacts"`
 				Statuses []json.RawMessage `json:"statuses"`
 			} `json:"value"`
 		} `json:"changes"`
@@ -179,13 +215,26 @@ func (s *Server) handleWhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
 				switch m.Type {
 				case "text":
 					ts, _ := strconv.ParseInt(m.Timestamp, 10, 64)
-					err := s.bridge(r.Context(), channel.InboundMessage{
+					in := channel.InboundMessage{
 						Channel:   "whatsapp",
 						From:      m.From,
 						MessageID: m.ID,
 						Text:      m.Text.Body,
 						Timestamp: ts,
-					}, v.Metadata.PhoneNumberID)
+					}
+					for _, c := range v.Contacts {
+						if c.WaID == m.From {
+							in.FromName = c.Profile.Name
+						}
+					}
+					if whatsappBridgeAsync {
+						// Ack Meta now and answer in the background: an LLM reply can
+						// outlast Meta's webhook wait, and each redelivery would
+						// restart the same slow reply.
+						s.bridgeAsync(in, v.Metadata.PhoneNumberID)
+						continue
+					}
+					err := s.bridge(r.Context(), in, v.Metadata.PhoneNumberID)
 					if err != nil {
 						// N-05 fail-loud: 500 → Meta redelivers; the bridge
 						// dedupes on MessageID so the redelivery skips the

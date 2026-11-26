@@ -133,6 +133,10 @@ var tenantPIIPurgeSteps = []piiPurgeStep{
 	// (cross-tenant dispatcher); payload->>'tenant_id' is the only handle.
 	// Rows whose payloads lack the key are untouched (documented limit).
 	{"outbox", "delete tenant outbox rows (payload key)", `DELETE FROM outbox WHERE payload->>'tenant_id'=$1`},
+	// The public site registry row: kept, it went on serving the deleted tenant's page at /p/{slug}, and it kept the
+	// slug, so a new tenant created with the same slug got the dead tenant's catalogue (bookings failed: "offering not
+	// found"). No foreign keys point at sites; the table has no RLS (public slug registry).
+	{"sites", "delete public site registry row (frees the slug)", `DELETE FROM sites WHERE tenant_id=$1`},
 }
 
 // TenantCascadeTables enumerates every booking-DB table the TenantDeleted

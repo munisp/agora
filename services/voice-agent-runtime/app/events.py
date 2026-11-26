@@ -21,6 +21,7 @@ def session_lifecycle_data(
     site_slug: str,
     quality: dict[str, Any] | None = None,
     agent_id: str | None = None,
+    stored_conversation_id: str | None = None,
     direction: str | None = None,
 ) -> dict[str, Any]:
     """Data payload for SessionStarted/SessionEnded events.
@@ -43,6 +44,10 @@ def session_lifecycle_data(
     }
     if agent_id:
         data["agentId"] = agent_id
+    if stored_conversation_id:
+        # The id conversation-service stored the call's transcript under (it differs from the runtime's session
+        # id): lets crm-sync read the transcript for the CRM call summary.
+        data["storedConversationId"] = stored_conversation_id
     if quality:
         data["quality"] = quality
     # SPEC-W101 C4: "outbound" marks platform-dialed calls; absent on the

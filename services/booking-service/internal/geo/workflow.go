@@ -14,6 +14,18 @@ import (
 	"go.uber.org/zap"
 )
 
+
+// NotifyTaskQueue is the notification-worker's task queue, where the "NotifyPaced" activity lives. Set at startup
+// when booking-service runs its worker on its own queue (TEMPORAL_WORKER_TASK_QUEUE); "" = this workflow's queue.
+var NotifyTaskQueue string
+
+func notifyCtx(ctx workflow.Context) workflow.Context {
+	if NotifyTaskQueue == "" {
+		return ctx
+	}
+	return workflow.WithTaskQueue(ctx, NotifyTaskQueue)
+}
+
 // Geo-targeted campaigns (SPEC-W8 A2). booking-service owns the
 // GeoCampaignWorkflow and its DB activities; it runs its own Temporal
 // worker on the shared opendesk-main task queue (main.go). Every

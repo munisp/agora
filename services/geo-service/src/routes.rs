@@ -20,6 +20,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/geo/boundaries/import", post(import::handler))
+        // 2026-11-21: reference boundary geometry by code (Acquisition cost map).
+        .route("/v1/geo/boundaries", get(enrich::boundaries))
         // SPEC-W63 Scope A: offline gazetteer (geo_places). Static
         // /gazetteer/snapshot + /gazetteer/import are distinct paths from
         // /gazetteer, so registration order is irrelevant.

@@ -20,8 +20,15 @@ dependencies = [
     "livekit-plugins-openai>=0.10,<0.10.4",
     # In-process STT
     "faster-whisper==1.0.*",
+    # faster-whisper 1.0 imports requests without declaring it (newer huggingface_hub no longer brings it):
+    # without this, speech-to-text failed on first use and the receptionist could not hear callers.
+    "requests>=2.31,<3",
+    # Microsoft neural voices (Nigerian English "Abeo") for the demo receptionist: the free Edge read-aloud service.
+    "edge-tts==7.*",
     # Control plane
     "fastapi==0.115.*",
+    # W115 document upload: FastAPI needs it to read multipart forms (without it /voice/documents/upload answered 500).
+    "python-multipart>=0.0.9",
     "uvicorn==0.30.*",
     # Dapr HTTP client / outbound HTTP
     "httpx==0.27.*",

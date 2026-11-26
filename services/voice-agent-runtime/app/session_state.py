@@ -73,11 +73,29 @@ class SessionState:
     # bypass (OOS-03).
     claimed_phone: str | None = None
     caller_name: str | None = None
+    # 2026-11-23: an outbound call's purpose (confirm_appointment, waitlist_offer, no_show_rebook, callback, general)
+    outbound_purpose: str | None = None
+    # 2026-11-23: how an outbound call ended (record_call_outcome): "confirmed", "declined", ... (None = not recorded)
+    call_outcome: str | None = None
+    # 2026-11-23: returns the stored transcript's id (conversation-service) — set by the chat service / voice worker,
+    # read by request_human so the human inbox knows which conversation to open. Never persisted.
+    stored_id_lookup: Any = field(default=None, repr=False, compare=False)
+    # 2026-11-23: True for typed chats (set by the chat service every turn), False for calls. Never persisted.
+    text_chat: bool = field(default=False, repr=False, compare=False)
+    # 2026-11-21: details from the public page's pre-chat form (app/visitor.py). Self-reported.
+    caller_email: str | None = None
+    visitor_form: bool = False
     # SPEC-W96 IVR-A: the session's parsed IVR menu (ivr_menu.IvrEntry
     # tuple), set by build_voice_agent for PSTN sessions when the menu is
     # enabled; None everywhere else. Typed Any to keep this module free of
     # the ivr_menu import (duck-typed, same discipline as other bags).
     ivr_menu: Any = None
+    # 2026-11-22: outbound call (app/outbound_script.py) — the opening line and the prompt block, derived per call
+    # from the SIP attributes (not persisted, like ivr_menu).
+    outbound_greeting: str | None = None
+    outbound_prompt: str | None = None
+    # WhatsApp number for send_whatsapp_confirmation (the demo phone may name a different one than the number called)
+    whatsapp_to: str | None = None
     last_booking_ids: list[str] = field(default_factory=list)
     # Multi-agent crews (SPEC-W3 §4, innovation 6): id of the specialist
     # agent currently steering the persona, or None for the base persona.
@@ -175,6 +193,8 @@ class SessionState:
             "verified_phone": self.verified_phone,
             "claimed_phone": self.claimed_phone,
             "caller_name": self.caller_name,
+            "caller_email": self.caller_email,
+            "visitor_form": self.visitor_form,
             "last_booking_ids": list(self.last_booking_ids),
             "active_agent": self.active_agent,
             "escalation_room": self.escalation_room,
@@ -210,6 +230,8 @@ class SessionState:
         session.verified_phone = _str("verified_phone")
         session.claimed_phone = _str("claimed_phone")
         session.caller_name = _str("caller_name")
+        session.caller_email = _str("caller_email")
+        session.visitor_form = bool(data.get("visitor_form"))
         ids = data.get("last_booking_ids")
         session.last_booking_ids = (
             [x for x in ids if isinstance(x, str)] if isinstance(ids, list) else []

@@ -55,11 +55,10 @@ func TestCallQualityEnrichedCreatesNoteWithSentiment(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("expected 1 note, got %d; requests=%+v", len(notes), stub.requests)
 	}
-	body, _ := notes[0].body["body"].(string)
+	body, _ := noteText(notes[0].body), true
 	for _, want := range []string{
-		"📞 AI call summary",
-		"duration 95s",
-		"avg sentiment 0.42",
+		"- Call length: 1 min 35 s",
+		"Caller's mood: Positive",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("note body missing %q:\n%s", want, body)
@@ -96,7 +95,7 @@ func TestCallQualityEnrichedPatchesExistingFallbackNote(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("fallback should create 1 note, got %d", len(notes))
 	}
-	if body, _ := notes[0].body["body"].(string); strings.Contains(body, "sentiment") {
+	if body, _ := noteText(notes[0].body), true; strings.Contains(body, "sentiment") {
 		t.Fatalf("fallback note must not contain sentiment yet:\n%s", body)
 	}
 
@@ -114,8 +113,8 @@ func TestCallQualityEnrichedPatchesExistingFallbackNote(t *testing.T) {
 	if len(patches) != 1 {
 		t.Fatalf("expected 1 note patch, got %d; requests=%+v", len(patches), stub.requests)
 	}
-	body, _ := patches[0].body["body"].(string)
-	if !strings.Contains(body, "avg sentiment -0.35") {
+	body, _ := noteText(patches[0].body), true
+	if !strings.Contains(body, "Caller's mood: Negative") {
 		t.Errorf("patched body missing sentiment:\n%s", body)
 	}
 	// mapping still points at the same note
@@ -147,8 +146,8 @@ func TestPlainSessionEndedSkippedAfterEnrichedNote(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("expected exactly 1 note across both events, got %d", len(notes))
 	}
-	body, _ := notes[0].body["body"].(string)
-	if !strings.Contains(body, "avg sentiment 0.90") {
+	body, _ := noteText(notes[0].body), true
+	if !strings.Contains(body, "Caller's mood: Positive") {
 		t.Errorf("enriched-created note missing sentiment:\n%s", body)
 	}
 }
@@ -227,8 +226,8 @@ func TestEnrichedNoteUsesNestedAvgSentiment(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("expected 1 note, got %d", len(notes))
 	}
-	body, _ := notes[0].body["body"].(string)
-	if !strings.Contains(body, "avg sentiment 0.77") {
+	body, _ := noteText(notes[0].body), true
+	if !strings.Contains(body, "Caller's mood: Positive") {
 		t.Errorf("note body missing nested avg sentiment:\n%s", body)
 	}
 }

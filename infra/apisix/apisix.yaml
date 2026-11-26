@@ -3259,6 +3259,44 @@ routes:
         max_age: 3600
         allow_credential: false
 
+  # ---- Voice catalogue + preview for the dashboard (signed in) ------------
+  # Cloned brand voices are biometric data owned by one business. The voice
+  # runtime lists and speaks a cloned voice only for the caller's business,
+  # read from the X-Tenant-Slugs this route re-injects from the verified JWT
+  # (agency staff roles may name any business). The anonymous /voice/voices
+  # and /voice/tts-preview paths are closed below.
+  - id: api-voice
+    uris: [/api/voice/voices, /api/voice/tts-preview, /api/voice/ice-servers]
+    methods: [GET, POST, OPTIONS]
+    upstream_id: voice
+    plugins:
+      proxy-rewrite:
+        regex_uri: [^/api/voice/(.*), /voice/$1]
+      openid-connect: {discovery: 'http://keycloak:8080/realms/opendesk/.well-known/openid-configuration', bearer_only: true, realm: opendesk, client_id: admin-web, use_pkce: true}
+      serverless-pre-function:
+        phase: rewrite
+        functions:
+        - "-- SPEC-W43 G-02 (C1) / SPEC-W44 K1: inject X-Tenant-Slugs,\n-- X-User-Id (sub) and X-User-Roles (realm_access.roles) from the JWT\n-- tenant_slugs claim (etc.). global_rules id 1 already stripped\
+          \ any\n-- client-supplied x-tenant-*/x-user-* header (global rules run before\n-- route plugins in the rewrite phase), so the value set here is\n-- claim-derived only. openid-connect (bearer_only)\
+          \ still\n-- verifies the token signature in the access phase AFTER this\n-- runs, so a forged token never reaches upstream (it 401s\n-- first) \u2014 decoding the payload without re-verifying is\
+          \ safe.\n-- W46-I (P-DATA A-03): per-worker LRU of decoded JWT payload\n-- JSON keyed by the token payload segment (resty.lrucache,\n-- 1000 entries). Created ONCE at chunk load \u2014 nil (caching\n\
+          -- disabled, original per-request decode) if lrucache fails to\n-- load, so behavior degrades safely.\nlocal jwt_claims_cache = nil\ndo\n  local ok_lru, lrucache = pcall(require, \"resty.lrucache\"\
+          )\n  if ok_lru and lrucache then\n    jwt_claims_cache = lrucache.new(1000)\n  end\nend\nreturn function()\n  local auth = ngx.var.http_authorization\n  if not auth then return end\n  local token\
+          \ = auth:match(\"^[Bb]earer%s+(%S+)%s*$\")\n  if not token then return end\n  local payload = token:match(\"^[^%.]+%.([^%.]+)%.[^%.]+$\")\n  if not payload then return end\n  -- W46-I (P-DATA A-03):\
+          \ the base64 decode below is a pure\n  -- function of the token payload segment, so its result is\n  -- cached in a bounded per-worker LRU (jwt_claims_cache, 1000\n  -- entries, chunk-local). Extracted\
+          \ claims / injected headers\n  -- are BYTE-IDENTICAL to the uncached path; openid-connect\n  -- still verifies the signature in the access phase AFTER this\n  -- rewrite-phase function, so a cached\
+          \ decode can never\n  -- authenticate a forged token. `false` is the \"undecodable\"\n  -- sentinel (distinguished from a cache miss == nil).\n  local json = jwt_claims_cache and jwt_claims_cache:get(payload)\n\
+          \  if json == nil then\n    local b64 = payload:gsub(\"%-\", \"+\"):gsub(\"_\", \"/\")\n    local rem = #b64 % 4\n    if rem == 2 then b64 = b64 .. \"==\"\n    elseif rem == 3 then b64 = b64 ..\
+          \ \"=\"\n    elseif rem == 1 then return end\n    json = ngx.decode_base64(b64)\n    if jwt_claims_cache then\n      jwt_claims_cache:set(payload, json or false)\n    end\n  end\n  if not json then\
+          \ return end\n  -- SPEC-W44 K1: X-User-Id = token sub; X-User-Roles = csv of\n  -- realm_access.roles (EMPTY STRING when the claim is absent, so\n  -- downstream fail-closed role gates (K6) can\
+          \ distinguish\n  -- \"gateway ran, user has no roles\" from a stripped caller\n  -- header). Claims are matched independently: a token without\n  -- tenant_slugs still gets its identity headers.\n\
+          \  local arr = json:match('\"tenant_slugs\"%s*:%s*%[(.-)%]')\n  if arr then\n    local slugs = {}\n    for s in arr:gmatch('\"([^\"]-)\"') do\n      slugs[#slugs + 1] = s\n    end\n    if #slugs\
+          \ > 0 then\n      ngx.req.set_header(\"X-Tenant-Slugs\", table.concat(slugs, \",\"))\n    end\n  end\n  local sub = json:match('\"sub\"%s*:%s*\"([^\"]-)\"')\n  if sub then\n    ngx.req.set_header(\"\
+          X-User-Id\", sub)\n  end\n  local roles = {}\n  local realm = json:match('\"realm_access\"%s*:%s*%{(.-)%}')\n  if realm then\n    local rarr = realm:match('\"roles\"%s*:%s*%[(.-)%]')\n    if rarr\
+          \ then\n      for r in rarr:gmatch('\"([^\"]-)\"') do\n        roles[#roles + 1] = r\n      end\n    end\n  end\n  ngx.req.set_header(\"X-User-Roles\", table.concat(roles, \",\"))\nend\n"
+      limit-count: {count: 600, time_window: 60, rejected_code: 429, key: remote_addr, policy: redis, redis_host: redis, redis_port: 6379, redis_database: 0, redis_timeout: 1000}
+      cors: {allow_origins: 'http://localhost:3001,http://localhost:9080', allow_methods: '*', allow_headers: '*', expose_headers: '*', max_age: 3600, allow_credential: false}
+
   # ---- Voice admin (K15d / SPEC-W45): /api/voice-admin/* -> voice /voice-admin/* ----
   # Voice enrollment is biometric onboarding (NDPA-sensitive) — it moved OFF
   # the public /voice/* prefix. This route carries openid-connect bearer_only
@@ -3350,6 +3388,17 @@ routes:
                 end
               end
               ngx.req.set_header("X-User-Roles", table.concat(roles, ","))
+              -- The caller's businesses (tenant_slugs claim): an owner may enroll a voice for their own business only.
+              local arr = json:match('"tenant_slugs"%s*:%s*%[(.-)%]')
+              if arr then
+                local slugs = {}
+                for s in arr:gmatch('"([^"]-)"') do
+                  slugs[#slugs + 1] = s
+                end
+                if #slugs > 0 then
+                  ngx.req.set_header("X-Tenant-Slugs", table.concat(slugs, ","))
+                end
+              end
             end
           - |
             -- K15d (SPEC-W45): staff tooling gate — staff, admin or
@@ -3400,7 +3449,7 @@ routes:
               if not json then return end
               local realm = json:match('"realm_access"%s*:%s*%{(.-)%}') or ""
               local roles = realm:match('"roles"%s*:%s*%[(.-)%]') or ""
-              for _, r in ipairs({"staff", "admin", "platform-admin"}) do
+              for _, r in ipairs({"staff", "admin", "platform-admin", "owner"}) do
                 if roles:find('"' .. r .. '"', 1, true) then return end
               end
               ngx.exit(403)
@@ -3433,6 +3482,10 @@ routes:
     uris:
       - /voice/voices/enroll
       - /voice/voices/enroll/
+      # Signed-in only (api-voice above): the cloned-voice catalogue and preview.
+      - /voice/voices
+      - /voice/tts-preview
+      - /voice/ice-servers
     methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     priority: 10
     plugins:

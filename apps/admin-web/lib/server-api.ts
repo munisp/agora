@@ -91,5 +91,12 @@ export function unwrapList<T>(data: unknown): T[] {
   ) {
     return (data as { items: T[] }).items;
   }
+  // booking-service and others wrap lists under the resource name ({"offerings": [...]}, {"bookings": [...]}, or
+  // {"bookings": null} when empty): take the one list-valued field.
+  if (typeof data === "object" && data !== null) {
+    const values = Object.values(data as Record<string, unknown>);
+    const lists = values.filter((v) => Array.isArray(v));
+    if (lists.length === 1) return lists[0] as T[];
+  }
   return [];
 }

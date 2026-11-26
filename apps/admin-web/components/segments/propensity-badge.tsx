@@ -94,7 +94,7 @@ export function PropensityBadges({
         <PropensityBadge
           label="Churn"
           score={churn}
-          title="Likelihood this person lapses (no booking within the tenant-typical interval)."
+          title="Likelihood this person lapses (no booking within the usual time between visits)."
         />
       ) : null}
       {convert !== undefined ? (
@@ -108,7 +108,7 @@ export function PropensityBadges({
         <PropensityBadge
           label="Turnout"
           score={turnout}
-          title="Campaign tenants: likelihood this person shows up / votes when contacted."
+          title="Campaigns: likelihood this person shows up / votes when contacted."
         />
       ) : null}
     </div>

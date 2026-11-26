@@ -41,6 +41,9 @@ type GdprRequest struct {
 type Client struct {
 	tc        client.Client
 	taskQueue string
+	// ownQueue: booking-service's own worker queue for the workflows it hosts (geo campaigns, incident alerts,
+	// commissions). "" = taskQueue. The saga, GDPR and webhook delivery stay on taskQueue (notification-worker).
+	ownQueue string
 }
 
 // Dial connects to Temporal (host:port, namespace, task queue per SPEC §6).
@@ -95,6 +98,16 @@ func DialWithRetry(ctx context.Context, hostPort, namespace, taskQueue string, a
 // Close releases the underlying connection.
 func (c *Client) Close() { c.tc.Close() }
 
+// SetOwnQueue points booking-hosted workflow starts at booking-service's own worker queue.
+func (c *Client) SetOwnQueue(q string) { c.ownQueue = q }
+
+func (c *Client) bookingQueue() string {
+	if c.ownQueue != "" {
+		return c.ownQueue
+	}
+	return c.taskQueue
+}
+
 // Underlying exposes the raw SDK client so main can run a worker on the
 // same connection (GeoCampaignWorkflow host, SPEC-W8 A2).
 func (c *Client) Underlying() client.Client { return c.tc }
@@ -107,7 +120,7 @@ func (c *Client) StartGeoCampaign(ctx context.Context, in geo.GeoCampaignInput) 
 	id := "geo-campaign-" + in.CampaignID
 	opts := client.StartWorkflowOptions{
 		ID:                    id,
-		TaskQueue:             c.taskQueue,
+		TaskQueue:             c.bookingQueue(),
 		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 	}
 	_, err := c.tc.ExecuteWorkflow(ctx, opts, geo.WorkflowType, in)
@@ -194,7 +207,7 @@ func (c *Client) StartIncidentAlert(ctx context.Context, in incidents.AlertStart
 	id := "incident-alert-" + in.IncidentID
 	opts := client.StartWorkflowOptions{
 		ID:                    id,
-		TaskQueue:             c.taskQueue,
+		TaskQueue:             c.bookingQueue(),
 		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 	}
 	_, err := c.tc.ExecuteWorkflow(ctx, opts, incidents.WorkflowTypeAlert, in)

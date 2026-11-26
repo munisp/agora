@@ -47,7 +47,7 @@ export const ALERT_STATUSES = [
  * (own document ids + seen_elsewhere_count only — never other tenant ids).
  */
 export const ALERT_SIGNALS = [
-  { value: "cross_tenant_exact_duplicate", label: "Cross-tenant document reuse" },
+  { value: "cross_tenant_exact_duplicate", label: "Same document used by another business" },
 ] as const;
 
 export function alertSignalLabel(signal: string): string {

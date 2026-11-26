@@ -214,7 +214,7 @@ def test_qwen3_in_provider_names():
     assert "qwen3" in PROVIDER_NAMES
     # SPEC-W102 C3: "longcat" appended to the provider registry.
     assert PROVIDER_NAMES == (
-        "piper", "mms", "xtts", "azure", "spitch", "cosyvoice", "qwen3", "longcat"
+        "piper", "mms", "xtts", "azure", "spitch", "naija", "cosyvoice", "qwen3", "edge", "longcat"
     )
 
 

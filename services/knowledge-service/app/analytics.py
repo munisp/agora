@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import os
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -118,6 +119,11 @@ async def generate_sql(question: str, *, client: httpx.AsyncClient | None = None
         ],
         "temperature": 0.0,
     }
+    # 2026-11-22: a "thinking" model (gemma4 on Ollama) spends minutes reasoning before the SQL and trips the 20 s
+    # timeout; LLM_REASONING_EFFORT=none asks it to answer straight away (5 s for the same, correct SQL).
+    effort = os.environ.get("LLM_REASONING_EFFORT", "").strip()
+    if effort:
+        payload["reasoning_effort"] = effort
     headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
     own = client is None
     if own:
@@ -187,7 +193,7 @@ async def run_analytics_query(tenant_id: str, question: str) -> AnalyticsQueryRe
     try:
         llm_sql = await generate_sql(question)
     except Exception as exc:
-        log.warning("analytics.llm_failed", error=str(exc))
+        log.warning("analytics.llm_failed", error=str(exc) or repr(exc))  # a timeout has an empty str()
         raise HTTPException(
             status_code=400,
             detail={"error": "analytics query translation failed"},

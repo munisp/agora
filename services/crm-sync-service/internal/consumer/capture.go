@@ -89,7 +89,7 @@ func (s *Syncer) HandleCapture(ctx context.Context, evt events.CloudEvent) error
 			zap.String("record_id", d.RecordID))
 		return nil
 	}
-	noteID, err := s.Twenty.CreateNote(ctx, twentyc.CaptureNoteTitle,
+	noteID, err := s.tw(tenantUUID).CreateNote(ctx, twentyc.CaptureNoteTitle,
 		twentyc.CaptureNote(d), personID)
 	if err != nil {
 		return fmt.Errorf("create capture note: %w", err)

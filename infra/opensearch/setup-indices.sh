@@ -39,7 +39,7 @@ req PUT /_ingest/pipeline/pii-safe '{
   "processors": [
     {"gsub": {"field": "text", "pattern": "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "replacement": "[REDACTED_EMAIL]", "ignore_missing": true}},
     {"gsub": {"field": "text", "pattern": "\\+?[0-9][0-9 .()\\-]{7,}[0-9]", "replacement": "[REDACTED_PHONE]", "ignore_missing": true}},
-    {"set": {"field": "redacted", "value": true, "ignore_missing": false}}
+    {"set": {"field": "redacted", "value": true}}
   ]
 }'
 

@@ -1,4 +1,5 @@
 "use client";
+import { TableBody } from "@/components/ui/table";
 
 /**
  * SPEC-W32 WS-C: PUBLIC civic dashboard — aggregate-only stats, no auth.
@@ -315,7 +316,7 @@ export function PublicDashboardClient({ site }: { site: PublicSite }) {
                         <th className="py-2 font-semibold">Load</th>
                       </tr>
                     </thead>
-                    <tbody>
+                    <TableBody>
                       {[...stats.byWard]
                         .sort((a, b) => b.open - a.open)
                         .map((w) => {
@@ -351,7 +352,7 @@ export function PublicDashboardClient({ site }: { site: PublicSite }) {
                             </tr>
                           );
                         })}
-                    </tbody>
+                    </TableBody>
                   </table>
                 </div>
               )}

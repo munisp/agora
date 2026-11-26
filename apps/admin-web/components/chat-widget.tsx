@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { MessageCircle, Paperclip, Send, X } from "lucide-react";
+import { Maximize2, MessageCircle, Minimize2, Paperclip, Send, X } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
+import { useVisitor, VisitorForm } from "@/components/visitor-form";
 import { cn } from "@/lib/utils";
 import type { ChatResponse } from "@/lib/types";
 import {
@@ -13,8 +14,10 @@ import {
 } from "@/lib/chat-upload";
 
 interface Turn {
-  role: "user" | "agent";
+  role: "user" | "agent" | "staff";
   text: string;
+  /** staff turns: who replied from the human inbox */
+  agent?: string;
   /** SPEC-W115 C8: verdict chip on document-attachment turns. */
   chip?: { label: string; tone: "success" | "warning" | "danger" | "neutral" };
 }
@@ -33,12 +36,35 @@ interface DocumentUploadResult {
   validation_verdict: string;
   validation_reasons: string[];
   summary: string;
+  /** 2026-11-26: async intake -- "processing" with a job_id, then "done" / "failed" from the job endpoint */
+  status?: string;
+  job_id?: string;
+}
+
+/** Reading a document takes ~2 minutes: poll the accepted upload's job until it is read (or give up after ~6). */
+async function pollDocumentJob(jobId: string): Promise<DocumentUploadResult | null> {
+  for (let i = 0; i < 72; i += 1) {
+    await new Promise((r) => setTimeout(r, 5000));
+    try {
+      const res = await fetch(`/voice/documents/jobs/${encodeURIComponent(jobId)}`, { cache: "no-store" });
+      if (res.status === 404) return null;
+      if (!res.ok) continue;
+      const job = (await res.json()) as DocumentUploadResult;
+      if (job.status && job.status !== "processing") return job;
+    } catch {
+      /* a dropped poll: try again */
+    }
+  }
+  return null;
 }
 
 interface ChatResult {
   reply: string;
   conversationId?: string;
   sessionSecret?: string;
+  /** 2026-11-23: handed to a person (escalated) / a person owns the chat (human) */
+  escalated?: boolean;
+  human?: boolean;
 }
 
 /**
@@ -138,6 +164,8 @@ async function sendStreaming(
   let conversationId: string | undefined;
   let secret: string | undefined;
   let sawDone = false;
+  let escalated = false;
+  let human = false;
 
   const handleEvent = (data: string) => {
     if (!data || data === "[DONE]") return;
@@ -148,7 +176,11 @@ async function sendStreaming(
         reply?: string;
         conversation_id?: string;
         session_secret?: string;
+        escalated?: boolean;
+        human?: boolean;
       };
+      if (evt.escalated) escalated = true;
+      if (evt.human) human = true;
       if (typeof evt.conversation_id === "string") {
         conversationId = evt.conversation_id;
       }
@@ -159,7 +191,9 @@ async function sendStreaming(
         reply += evt.delta;
         onDelta(reply);
       }
-      if (typeof evt.reply === "string" && !reply) {
+      // The terminal frame's reply replaces what streamed: a translation, or the text cleaned of model
+      // template tokens (2026-11-23).
+      if (typeof evt.reply === "string" && evt.reply && (!reply || evt.done)) {
         reply = evt.reply;
         onDelta(reply);
       }
@@ -185,7 +219,7 @@ async function sendStreaming(
     handleEvent(buffer.trim().slice(5).trim());
   }
   if (!reply && !sawDone) return null;
-  return { reply, conversationId, sessionSecret: secret };
+  return { reply, conversationId, sessionSecret: secret, escalated, human };
 }
 
 /**
@@ -204,11 +238,27 @@ export function ChatWidget({
   accent?: string;
 }) {
   const [open, setOpen] = React.useState(false);
+  // Full screen: the chat fills the window (easier on a phone or for a long
+  // conversation); Collapse (or Escape) returns to the corner panel.
+  const [full, setFull] = React.useState(false);
+  React.useEffect(() => {
+    if (!full) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFull(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [full]);
+  // 2026-11-21: name/phone/email asked once before the first message (components/visitor-form.tsx).
+  const [visitor, setVisitor] = useVisitor(tenant);
   const [turns, setTurns] = React.useState<Turn[]>([]);
   const [draft, setDraft] = React.useState("");
   const [conversationId, setConversationId] = React.useState<string | undefined>();
   const [sessionSecret, setSessionSecret] = React.useState<string | undefined>();
   const [sending, setSending] = React.useState(false);
+  // 2026-11-23: human inbox — once a person is involved, fetch their replies every few seconds.
+  const [withStaff, setWithStaff] = React.useState(false);
+  const lastStaffSeq = React.useRef(0);
   // SPEC-W115 C8: caller document sharing. `pendingFile` is the staged
   // attachment shown in the bar above the input until uploaded/cancelled.
   const [pendingFile, setPendingFile] = React.useState<File | null>(null);
@@ -216,6 +266,36 @@ export function ChatWidget({
   const [uploading, setUploading] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    if (!withStaff || !conversationId || !sessionSecret) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(
+          `/voice/chat/staff-messages?conversation_id=${encodeURIComponent(conversationId)}&after=${lastStaffSeq.current}`,
+          { headers: { "x-session-secret": sessionSecret }, cache: "no-store" },
+        );
+        if (!res.ok || stopped) return;
+        const body = (await res.json()) as {
+          messages?: { seq: number; text: string; agent?: string }[];
+        };
+        const fresh = (body.messages ?? []).filter((m) => m.seq > lastStaffSeq.current);
+        if (fresh.length) {
+          lastStaffSeq.current = Math.max(...fresh.map((m) => m.seq));
+          setTurns((t) => [...t, ...fresh.map((m) => ({ role: "staff" as const, text: m.text, agent: m.agent }))]);
+        }
+      } catch {
+        // offline for a moment — the next poll catches up
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 5000); // 12/min: the /voice/* route allows 30 per visitor
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [withStaff, conversationId, sessionSecret]);
 
   React.useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
@@ -259,6 +339,7 @@ export function ChatWidget({
     form.append("file", file);
     form.append("kind", pendingKind);
     form.append("site_slug", siteSlug);
+    form.append("respond", "async"); // accepted at once; the read finishes in the background (2026-11-26)
     if (conversationId) form.append("session_id", conversationId);
     try {
       const res = await fetch("/voice/documents/upload", {
@@ -278,6 +359,20 @@ export function ChatWidget({
         throw new Error(detail);
       }
       const result = (await res.json()) as DocumentUploadResult;
+      if (result.status === "processing" && result.job_id) {
+        // Accepted: say so now, then post the verdict when the read is done.
+        setTurns((t) => [...t, { role: "user", text: `Attached: ${file.name}` }, { role: "agent", text: result.summary }]);
+        setPendingFile(null);
+        void pollDocumentJob(result.job_id).then((done) => {
+          setTurns((t) => [
+            ...t,
+            done && done.status === "done"
+              ? { role: "agent", text: done.summary, chip: verdictChip(done.validation_verdict) }
+              : { role: "agent", text: done?.summary || "I couldn't finish checking that document. Please try sending it again." },
+          ]);
+        });
+        return;
+      }
       setTurns((t) => [
         ...t,
         { role: "user", text: `Attached: ${file.name}` },
@@ -316,6 +411,7 @@ export function ChatWidget({
       conversation_id: conversationId,
       // K15(b): resume credential in the body (current runtime contract).
       session_secret: sessionSecret,
+      ...(visitor ? { visitor } : {}),
     };
     try {
       // 1. Streaming path: append an empty agent turn and fill it as deltas arrive.
@@ -339,6 +435,8 @@ export function ChatWidget({
             streamed.sessionSecret ?? sessionSecret,
           );
         }
+        if (streamed.escalated || streamed.human) setWithStaff(true);
+        if (streamed.human) return; // a person is answering; their reply arrives through the poll
         if (!streamed.reply) {
           // Stream ended without content — drop the placeholder turn.
           setTurns((t) => t.filter((_, i) => i !== streamedIdx));
@@ -355,7 +453,8 @@ export function ChatWidget({
         sessionSecret ? { "x-session-secret": sessionSecret } : undefined,
       );
       rememberSession(res.conversation_id, res.session_secret ?? sessionSecret);
-      setTurns((t) => [...t, { role: "agent", text: res.reply }]);
+      if (res.escalated || res.human) setWithStaff(true);
+      if (!res.human) setTurns((t) => [...t, { role: "agent", text: res.reply }]);
     } catch (err) {
       setTurns((t) => [
         ...t,
@@ -370,9 +469,20 @@ export function ChatWidget({
   };
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col items-end gap-3">
+    <div
+      className={cn(
+        "fixed z-50 flex flex-col items-end gap-3",
+        open && full ? "inset-0" : "bottom-4 right-4",
+      )}
+    >
       {open ? (
-        <div className="flex h-96 w-80 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl">
+        <div
+          data-chat-panel={full ? "full" : "compact"}
+          className={cn(
+            "flex flex-col overflow-hidden bg-card shadow-xl",
+            full ? "h-full w-full" : "h-96 w-80 rounded-xl border border-border",
+          )}
+        >
           <div
             className="flex items-center justify-between px-4 py-3 text-white"
             style={{ backgroundColor: accent }}
@@ -383,22 +493,49 @@ export function ChatWidget({
                 Ask anything — I can book for you too
               </p>
             </div>
-            <button
-              onClick={() => setOpen(false)}
-              aria-label="Close chat"
-              className="rounded p-1 hover:bg-white/20 cursor-pointer"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setFull((f) => !f)}
+                aria-label={full ? "Collapse chat" : "Full screen chat"}
+                title={full ? "Collapse" : "Full screen"}
+                className="rounded p-1 hover:bg-white/20 cursor-pointer"
+              >
+                {full ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+              </button>
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  setFull(false);
+                }}
+                aria-label="Close chat"
+                className="rounded p-1 hover:bg-white/20 cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
+          {!visitor ? (
+            <div
+              className={cn(
+                "min-h-0 flex-1 overflow-y-auto bg-muted/30",
+                full && "px-[max(0.75rem,calc((100%-32rem)/2))] py-6",
+              )}
+            >
+              <VisitorForm onSubmit={setVisitor} submitLabel="Start chat" />
+            </div>
+          ) : (
+          <>
           <div
             ref={scrollRef}
-            className="min-h-0 flex-1 space-y-2 overflow-y-auto bg-muted/30 p-3"
+            className={cn(
+              "min-h-0 flex-1 space-y-2 overflow-y-auto bg-muted/30 p-3",
+              full && "px-[max(0.75rem,calc((100%-48rem)/2))] py-6",
+            )}
           >
             {turns.length === 0 ? (
               <p className="py-6 text-center text-xs text-muted-foreground">
-                Hi! Ask me about services, hours, or say “book me in Friday
-                morning”.
+                Hi {visitor.name.split(" ")[0]}! Ask me about services, hours,
+                or say “book me in Friday morning”.
               </p>
             ) : (
               turns.map((t, i) => (
@@ -414,6 +551,11 @@ export function ChatWidget({
                     t.role === "user" ? { backgroundColor: accent } : undefined
                   }
                 >
+                  {t.role === "staff" ? (
+                    <span className="mb-0.5 block text-xs font-medium text-muted-foreground">
+                      {t.agent || "Staff"}
+                    </span>
+                  ) : null}
                   {t.chip ? (
                     <span
                       className={cn(
@@ -468,7 +610,13 @@ export function ChatWidget({
               </button>
             </div>
           ) : null}
-          <form onSubmit={send} className="flex gap-2 border-t border-border p-2">
+          <form
+            onSubmit={send}
+            className={cn(
+              "flex gap-2 border-t border-border p-2",
+              full && "px-[max(0.5rem,calc((100%-48rem)/2))] py-3",
+            )}
+          >
             <input
               ref={fileInputRef}
               type="file"
@@ -505,8 +653,11 @@ export function ChatWidget({
               <Send className="h-4 w-4" />
             </button>
           </form>
+          </>
+          )}
         </div>
       ) : null}
+      {open && full ? null : (
       <button
         onClick={() => setOpen((o) => !o)}
         aria-label={open ? "Close chat" : "Open chat"}
@@ -515,6 +666,7 @@ export function ChatWidget({
       >
         <MessageCircle className="h-5 w-5" />
       </button>
+      )}
     </div>
   );
 }

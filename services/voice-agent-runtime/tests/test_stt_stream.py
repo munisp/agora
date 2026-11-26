@@ -278,6 +278,11 @@ def test_ws_backpressure_closes_1008_on_overflow():
     assert exc_info.value.reason
 
 
+def test_faster_whisper_imports():
+    """The receptionist's ears: the STT backend must import in the shipped image (it lacked `requests`)."""
+    import faster_whisper  # noqa: F401
+
+
 # ---------------------------------------------------------------------------
 # SPEC-W73 C2: env-tunable rolling-window parameters. Env is read at ENGINE
 # CONSTRUCTION (StreamingSTTEngine.__init__), never at import. Precedence:

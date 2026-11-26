@@ -189,6 +189,17 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_conversations_contact_phone "
                 "ON conversations (tenant_id, contact_phone)"
             )
+            # 2026-11-23: the call's details (direction, purpose, length, outcome, mood, AI summary) — one record
+            # both the dashboard and the CRM note read, so they always show the same facts.
+            await conn.execute(
+                "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS call_details JSONB"
+            )
+            # 2026-11-23: "staff" turns — a person replying from the human inbox (Chatwoot) after a handoff.
+            await conn.execute(
+                "ALTER TABLE turns DROP CONSTRAINT IF EXISTS turns_role_check; "
+                "ALTER TABLE turns ADD CONSTRAINT turns_role_check "
+                "CHECK (role IN ('user', 'agent', 'system', 'tool', 'staff')) NOT VALID"
+            )
         log.info("conversation contact_phone column ensured")
 
     async def ensure_ussd_channel(self) -> None:
@@ -207,7 +218,7 @@ class Database:
             await conn.execute(
                 "ALTER TABLE conversations "
                 "ADD CONSTRAINT conversations_channel_check "
-                "CHECK (channel IN ('voice','chat','phone','api','ussd')) NOT VALID"
+                "CHECK (channel IN ('voice','chat','phone','api','ussd','whatsapp','telegram','email')) NOT VALID"
             )
         log.info("conversation ussd channel check ensured")
 
@@ -513,19 +524,58 @@ class Database:
         """List conversations, optionally filtered by the GDPR contact
         marker (SPEC-W3 §2 ?contact= filter; None = no filter)."""
         async with self._tenant_tx(tenant_id) as conn:
+            # contact_name / caller_phone: the newest tool turn whose arguments name the caller (the booking
+            # tool records contact_name + phone); last_activity_at: the newest turn. Display-only (see
+            # models.Conversation); both are per-row LATERAL lookups on turns' conversation_id index.
             return await conn.fetch(
                 """
-                SELECT id, tenant_id, site_slug, channel, contact_phone,
-                       started_at, ended_at
-                FROM conversations
-                WHERE ($3::text IS NULL OR contact_phone = $3)
-                ORDER BY started_at DESC
+                SELECT c.id, c.tenant_id, c.site_slug, c.channel, c.contact_phone,
+                       c.started_at, c.ended_at, c.call_details,
+                       COALESCE(NULLIF(btrim(c.call_details->>'contact_name'), ''), who.contact_name) AS contact_name,
+                       who.caller_phone, last.ts AS last_activity_at
+                FROM conversations c
+                LEFT JOIN LATERAL (
+                    SELECT NULLIF(btrim(tc->'arguments'->>'contact_name'), '') AS contact_name,
+                           NULLIF(btrim(tc->'arguments'->>'phone'), '') AS caller_phone
+                    FROM turns t, jsonb_array_elements(
+                        CASE WHEN jsonb_typeof(t.tool_calls) = 'array' THEN t.tool_calls ELSE '[]'::jsonb END) tc
+                    WHERE t.conversation_id = c.id AND t.role = 'tool'
+                      AND (tc->'arguments' ? 'contact_name' OR tc->'arguments' ? 'phone')
+                    ORDER BY t.seq DESC LIMIT 1
+                ) who ON true
+                LEFT JOIN LATERAL (
+                    SELECT max(t.ts) AS ts FROM turns t WHERE t.conversation_id = c.id
+                ) last ON true
+                WHERE ($3::text IS NULL OR c.contact_phone = $3)
+                ORDER BY c.started_at DESC
                 LIMIT $1 OFFSET $2
                 """,
                 limit,
                 offset,
                 contact,
             )
+
+    async def merge_call_details(
+        self, conversation_id: uuid.UUID, tenant_id: uuid.UUID, details: dict, ended: bool = False
+    ) -> bool:
+        """Merge keys into conversations.call_details (2026-11-23); ended=True also closes the conversation.
+        Returns False when the conversation does not exist (e.g. a call that stored no transcript)."""
+        import json as _json
+
+        async with self._tenant_tx(tenant_id) as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE conversations
+                   SET call_details = COALESCE(call_details, '{}'::jsonb) || $2::jsonb,
+                       ended_at = CASE WHEN $3 THEN COALESCE(ended_at, now()) ELSE ended_at END
+                 WHERE id = $1
+                RETURNING id
+                """,
+                conversation_id,
+                _json.dumps(details),
+                ended,
+            )
+            return row is not None
 
     async def get_conversation(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID
@@ -534,7 +584,7 @@ class Database:
             row = await conn.fetchrow(
                 """
                 SELECT id, tenant_id, site_slug, channel, contact_phone,
-                       started_at, ended_at
+                       started_at, ended_at, call_details
                 FROM conversations WHERE id = $1
                 """,
                 conversation_id,
@@ -550,16 +600,25 @@ class Database:
     async def erase_contact_data(
         self, tenant_id: uuid.UUID, phone: str | None, email: str | None
     ) -> tuple[int, int]:
+        """See erase_contact_conversations; returns (conversations_matched,
+        turns_deleted)."""
+        ids, deleted = await self.erase_contact_conversations(tenant_id, phone, email)
+        return (len(ids), deleted)
+
+    async def erase_contact_conversations(
+        self, tenant_id: uuid.UUID, phone: str | None, email: str | None
+    ) -> tuple[list[uuid.UUID], int]:
         """Right-to-erasure tombstone: delete all turns of conversations
         whose contact_phone matches the given phone or e-mail, then clear the
         contact_phone marker itself (conversation shells are kept so booking
         history and analytics stay referentially intact).
 
-        Returns (conversations_matched, turns_deleted).
+        Returns (matched conversation ids, turns_deleted); the ids let the
+        caller drop the same turns from the search index.
         """
         refs = [r for r in (phone, email) if r]
         if not refs:
-            return (0, 0)
+            return ([], 0)
         async with self._tenant_tx(tenant_id) as conn:
             convs = await conn.fetch(
                 "SELECT id FROM conversations WHERE contact_phone = ANY($1::text[])",
@@ -567,7 +626,7 @@ class Database:
             )
             ids = [r["id"] for r in convs]
             if not ids:
-                return (0, 0)
+                return ([], 0)
             deleted = await conn.fetchval(
                 "WITH d AS (DELETE FROM turns WHERE conversation_id = ANY($1::uuid[]) "
                 "RETURNING 1) SELECT count(*) FROM d",
@@ -577,7 +636,7 @@ class Database:
                 "UPDATE conversations SET contact_phone = NULL WHERE id = ANY($1::uuid[])",
                 ids,
             )
-            return (len(ids), int(deleted or 0))
+            return (ids, int(deleted or 0))
 
     async def export_contact_conversations(
         self, tenant_id: uuid.UUID, contact: str
@@ -841,13 +900,18 @@ class Database:
                 json.dumps(entities) if entities is not None else None,
             )
 
+    async def update_turn_translation(self, turn_id: uuid.UUID, tenant_id: uuid.UUID, translation: str) -> None:
+        """Store a turn's English translation (made when the owner opens a non-English conversation)."""
+        async with self._tenant_tx(tenant_id) as conn:
+            await conn.execute("UPDATE turns SET translation_en = $2 WHERE id = $1", turn_id, translation)
+
     async def list_turns(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> list[asyncpg.Record]:
         async with self._tenant_tx(tenant_id) as conn:
             return await conn.fetch(
                 """
-                SELECT id, conversation_id, seq, role, text, tool_calls, ts
+                SELECT id, conversation_id, seq, role, text, tool_calls, ts, translation_en
                 FROM turns WHERE conversation_id = $1 ORDER BY seq
                 """,
                 conversation_id,
@@ -884,6 +948,48 @@ class Database:
                     "SELECT 1 FROM conversations WHERE id = $1", conversation_id
                 )
             )
+
+    async def turn_index_meta(
+        self, conversation_id: uuid.UUID, tenant_id: uuid.UUID, ts: datetime, role: str
+    ) -> dict[str, Any] | None:
+        """Indexer lookup: the conversation's site_slug/channel plus whether
+        the turn (conversation, ts, role) still exists. None when the
+        conversation itself is gone. The turn event is published after the
+        insert commits and carries the row's own ts, so a live turn always
+        matches; a missing one was deleted (erase, retention, reset)."""
+        async with self._tenant_tx(tenant_id) as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT c.site_slug, c.channel,
+                       EXISTS (SELECT 1 FROM turns t
+                               WHERE t.conversation_id = c.id AND t.ts = $2 AND t.role = $3)
+                           AS turn_exists
+                FROM conversations c WHERE c.id = $1
+                """,
+                conversation_id, ts, role,
+            )
+            return dict(row) if row else None
+
+    async def existing_conversation_ids(
+        self, tenant_id: uuid.UUID, conversation_ids: list[str]
+    ) -> set[str]:
+        """Which of these conversation ids still exist for the tenant
+        (search-index prune). Non-UUID ids are treated as gone."""
+        ids: list[uuid.UUID] = []
+        for c in conversation_ids:
+            try:
+                ids.append(uuid.UUID(c))
+            except ValueError:
+                continue
+        found: set[str] = set()
+        async with self._tenant_tx(tenant_id) as conn:
+            for start in range(0, len(ids), 1000):
+                rows = await conn.fetch(
+                    "SELECT id FROM conversations WHERE id = ANY($1::uuid[])",
+                    ids[start:start + 1000],
+                )
+                found.update(str(r["id"]) for r in rows)
+        return found
 
     async def conversation_meta(
         self, conversation_id: uuid.UUID, tenant_id: uuid.UUID

@@ -170,6 +170,9 @@ async def create_conversation(
     row = await db.create_conversation(
         tenant_id, body.site_slug, body.channel, body.contact_phone
     )
+    name = (body.contact_name or "").strip()
+    if name and hasattr(db, "merge_call_details"):
+        await db.merge_call_details(row["id"], tenant_id, {"contact_name": name})
     return models.Conversation(**dict(row))
 
 
@@ -209,6 +212,55 @@ async def get_conversation(
     )
 
 
+# Translations share the GPU model with live calls: at most TRANSLATE_CONCURRENCY lines are in flight per process (not
+# per request — overlapping page opens used to multiply the load and stall the receptionist mid-call), and a line is
+# never sent twice at once.
+_TRANSLATING: set[Any] = set()
+_TRANSLATE_SEM: asyncio.Semaphore | None = None
+
+
+def _translate_slots() -> asyncio.Semaphore:
+    global _TRANSLATE_SEM
+    if _TRANSLATE_SEM is None:
+        import os
+
+        _TRANSLATE_SEM = asyncio.Semaphore(max(1, int(os.environ.get("TRANSLATE_CONCURRENCY", "2"))))
+    return _TRANSLATE_SEM
+
+
+@router.post("/v1/conversations/{conversation_id}/translate")
+async def translate_conversation(
+    conversation_id: uuid.UUID,
+    request: Request,
+    tenant_id: Annotated[uuid.UUID, Depends(_require_tenant)],
+) -> models.ConversationWithTurns:
+    """Translate the conversation's caller/receptionist lines into English (once; stored) and return it."""
+    st = _state(request)
+    try:
+        conv = await st.db.get_conversation(conversation_id, tenant_id)
+    except NotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"conversation {conversation_id} not found") from None
+    turns = [dict(t) for t in await st.db.list_turns(conversation_id, tenant_id)]
+    todo = [t for t in turns if t["role"] in ("user", "agent") and t.get("translation_en") is None and (t.get("text") or "").strip()]
+    # Lines another request is already translating are left to it (the page re-opens a live call every few seconds).
+    todo = [t for t in todo if t["id"] not in _TRANSLATING]
+    if todo and st.cfg.translate_llm_base_url:
+        _TRANSLATING.update(t["id"] for t in todo)
+
+        async def one(t: dict) -> None:
+            try:
+                async with _translate_slots():
+                    tr = await intel.translate_to_english(t["text"], st.cfg)
+                if tr is not None:  # "" = English already: stored so the line is not sent again
+                    await st.db.update_turn_translation(t["id"], tenant_id, tr)
+                    t["translation_en"] = tr
+            finally:
+                _TRANSLATING.discard(t["id"])
+
+        await asyncio.gather(*(one(t) for t in todo))
+    return models.ConversationWithTurns(**dict(conv), turns=[models.Turn(**_turn_dict(t)) for t in turns])
+
+
 def _turn_dict(row: Any) -> dict[str, Any]:
     d = dict(row)
     if isinstance(d.get("tool_calls"), str):
@@ -241,6 +293,12 @@ async def add_turn(
         audio_url=body.audio_url,
         idempotency_key=idempotency_key,
     )
+
+    if created and body.translation_en and body.translation_en.strip():
+        st = _state(request)
+        if hasattr(st.db, "update_turn_translation"):
+            await st.db.update_turn_translation(turn.id, tenant_id, body.translation_en.strip())
+            turn = turn.model_copy(update={"translation_en": body.translation_en.strip()})
 
     # SPEC-W3 §3: Idempotency-Key replay — return the original turn with
     # 200 and do NOT re-publish sink/Dapr/enriched events (exactly-once

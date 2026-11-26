@@ -98,3 +98,86 @@ def test_prewarm_failure_degrades_to_lazy(monkeypatch, _clean_prewarm_cache):
 
     assert "stt" not in lw._PREWARMED
     assert "tts" in lw._PREWARMED
+
+
+def test_prewarm_fnc_survives_spawn_pickling():
+    """Job processes start with "spawn", which pickles prewarm_fnc: a nested closure failed every job."""
+    import pickle
+
+    from app.config import Settings
+    from app.livekit_worker import make_prewarm_fnc
+
+    fn = pickle.loads(pickle.dumps(make_prewarm_fnc(Settings(preload_models=False))))
+    assert fn(None) is None  # preload off: returns without loading anything
+
+
+def test_prewarm_releases_clients_bound_to_its_own_loop():
+    """The prewarm loop closes after asyncio.run(): its HTTP clients must not outlive it."""
+    import asyncio
+
+    from app.livekit_worker import _warmup_then_release
+
+    class Chain:
+        closed = False
+        order: list = []
+
+        async def synthesize_pcm(self, text):
+            return b"\x00\x00"
+
+        async def aclose(self):
+            Chain.closed = True
+
+    asyncio.run(_warmup_then_release(Chain()))
+    assert Chain.closed
+
+
+def test_worker_llm_client_uses_llm_timeout():
+    """The livekit openai plugin defaults to a 5 s read timeout; the worker passes its own client."""
+    from app.config import Settings
+    from app.livekit_worker import _openai_client
+
+    client = _openai_client(Settings(llm_timeout_s=42.0, llm_base_url="http://ollama:11434/v1"))
+    assert client.timeout.read == 42.0 and str(client.base_url).startswith("http://ollama:11434/v1")
+
+
+async def test_llm_extra_body_is_merged_into_chat_requests():
+    """LLM_EXTRA_BODY reaches the model server (e.g. reasoning_effort=none for a thinking model on a live call)."""
+    import json
+
+    import httpx
+
+    from app.pipeline.llm import _BodyMergeTransport
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    client = httpx.AsyncClient(transport=_BodyMergeTransport({"reasoning_effort": "none", "model": "ignored"},
+                                                             httpx.MockTransport(handler)))
+    await client.post("http://llm/v1/chat/completions", json={"model": "gemma4:26b", "messages": []})
+    assert seen["body"] == {"model": "gemma4:26b", "messages": [], "reasoning_effort": "none"}
+
+
+def test_worker_llm_node_builds():
+    """Built exactly as a job builds it: the plugin raised "OpenAI API key is required" and every call died."""
+    from app.config import Settings
+    from app.livekit_worker import _worker_llm
+
+    assert _worker_llm(Settings(llm_api_key="ollama", llm_extra_body={"reasoning_effort": "none"})) is not None
+
+
+async def test_tts_node_ships_short_frames():
+    """A whole sentence in one frame overflowed LiveKit's ~1 s AudioSource buffer (answers cut off)."""
+    from app.livekit_worker import PiperTTSNode
+
+    class Impl:
+        sample_rate = 22050
+
+        async def stream_pcm(self, text):
+            yield b"\x01\x00" * (22050 * 3) + b"\x02"  # 3 s of audio plus a stray odd byte
+
+    frames = [a.frame async for a in PiperTTSNode(Impl(), chunked=True).synthesize("hello")]
+    assert len(frames) == 30
+    assert all(f.samples_per_channel == 2205 and f.sample_rate == 22050 for f in frames)

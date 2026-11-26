@@ -403,7 +403,8 @@ async def test_mms_list_voices_and_available():
     mms = MmsTTS("http://mms", client=_mock_client(handler))
     voices = await mms.list_voices()
     assert [v.id for v in voices] == ["pcm"]
-    assert voices[0].as_dict()["labels"] == {"name": "Pidgin"}
+    # API shape: labels are strings (the admin UI maps over them); the display name is its own field.
+    assert voices[0].as_dict()["labels"] == [] and voices[0].as_dict()["name"] == "Pidgin"
     assert await mms.available() is True
 
     down = MmsTTS(
@@ -426,14 +427,30 @@ async def test_xtts_synthesize_and_enroll():
             return httpx.Response(200, json={"voice_id": "brand-1"})
         return httpx.Response(404)
 
-    xtts = XttsTTS("http://xtts:5810", client=_mock_client(handler))
-    wav = await xtts.synthesize("hello", "brand-1", "en")
-    assert wav == WAV
-    assert seen["tts"] == {"text": "hello", "voice_id": "brand-1", "language": "en"}
+    from app.tts_providers.base import voice_tenant
 
-    voice_id = await xtts.enroll_voice("Acme Brand", "QUJD")
+    xtts = XttsTTS("http://xtts:5810", client=_mock_client(handler))
+    token = voice_tenant.set("acme")
+    try:
+        wav = await xtts.synthesize("hello", "brand-1", "en")
+    finally:
+        voice_tenant.reset(token)
+    assert wav == WAV
+    assert seen["tts"] == {"text": "hello", "voice_id": "brand-1", "language": "en", "tenant": "acme"}
+
+    voice_id = await xtts.enroll_voice("Acme Brand", "QUJD", "acme")
     assert voice_id == "brand-1"
-    assert seen["enroll"] == {"name": "Acme Brand", "sample_base64": "QUJD"}
+    assert seen["enroll"] == {"name": "Acme Brand", "sample_base64": "QUJD", "tenant": "acme"}
+
+
+async def test_xtts_fails_closed_without_a_business():
+    """No business on the request: no cloned voices listed, none spoken (a voiceprint never crosses businesses)."""
+    calls = []
+    xtts = XttsTTS("http://xtts", client=_mock_client(lambda r: calls.append(r) or httpx.Response(200, json={"voices": []})))
+    assert await xtts.list_voices() == []
+    with pytest.raises(RuntimeError, match="business"):
+        await xtts.synthesize("hi", "brand-1", "en")
+    assert calls == []
 
 
 async def test_xtts_synthesize_requires_voice():
@@ -664,8 +681,8 @@ async def test_enroll_happy_path_and_base64_guard(monkeypatch):
             super().__init__("xtts")
             self.enrolled = []
 
-        async def enroll_voice(self, name, sample_base64):
-            self.enrolled.append((name, sample_base64))
+        async def enroll_voice(self, name, sample_base64, tenant):
+            self.enrolled.append((name, sample_base64, tenant))
             return "voice-42"
 
     xtts = FakeXtts()
@@ -686,7 +703,18 @@ async def test_enroll_happy_path_and_base64_guard(monkeypatch):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"voice_id": "voice-42"}
-    assert xtts.enrolled == [("Acme", "QUJD")]
+    assert xtts.enrolled == [("Acme", "QUJD", "acme")]
+
+    # A business's owner may enroll for their own business only (gateway-verified roles + tenant slugs).
+    owner = {"X-User-Roles": "owner", "X-Tenant-Slugs": "acme"}
+    resp = await _post_enroll(app, {"name": "Desk", "sample_base64": "QUJD", "tenant": "acme"}, owner)
+    assert resp.status_code == 200, resp.text
+    assert xtts.enrolled[-1] == ("Desk", "QUJD", "acme")
+    resp = await _post_enroll(app, {"name": "Desk", "sample_base64": "QUJD", "tenant": "globex"}, owner)
+    assert resp.status_code in (401, 403)
+    resp = await _post_enroll(app, {"name": "Desk", "sample_base64": "QUJD", "tenant": "acme"},
+                              {"X-User-Roles": "receptionist", "X-Tenant-Slugs": "acme"})
+    assert resp.status_code in (401, 403)
 
 
 async def test_enroll_auth_matrix(monkeypatch):
@@ -720,7 +748,7 @@ async def test_enroll_gateway_role_path(monkeypatch):
     otherwise every human (admin-web voices-client) call 401s."""
 
     class FakeXtts(FakeProvider):
-        async def enroll_voice(self, name, sample_base64):
+        async def enroll_voice(self, name, sample_base64, tenant):
             return "voice-gw"
 
     chain = _FakeChain({"xtts": FakeXtts("xtts")})
@@ -756,3 +784,33 @@ def test_metrics_series_registered():
     rendered = registry.render()
     assert "# TYPE tts_provider_failures_total counter" in rendered
     assert 'tts_provider_failures_total{provider="mms"} 1' in rendered
+
+
+def test_labels_of_accepts_the_sidecars_list_labels():
+    """mms-tts/xtts-tts send labels as a list of tags; dict(list) raised and emptied GET /voice/voices."""
+    from app.tts_providers.base import labels_of
+
+    assert labels_of({"id": "yor", "labels": ["mms", "vits"]}) == {"tags": ["mms", "vits"]}
+    assert labels_of({"id": "v1", "name": "Front desk", "labels": ["xtts-v2"]}) == {"tags": ["xtts-v2"], "name": "Front desk"}
+    assert labels_of({"id": "x", "labels": {"locale_name": "English (Nigeria)"}}) == {"locale_name": "English (Nigeria)"}
+    assert labels_of({"id": "x"}) == {}
+
+
+def test_voice_as_dict_sends_labels_as_strings():
+    """The admin UI maps over labels; a dict there crashed the Voices page."""
+    v = Voice(id="v1", languages=["en"], labels={"tags": ["xtts-v2"], "name": "Front desk", "engine": "xtts"})
+    assert v.as_dict()["labels"] == ["xtts-v2", "xtts"] and v.as_dict()["name"] == "Front desk"
+    assert Voice(id="en_US", labels={"engine": "piper"}).as_dict()["labels"] == ["piper"]
+
+
+async def test_pinned_provider_keeps_a_bare_voice_id():
+    """Admin preview sends provider="xtts", voice="<id>": the id must reach xtts, not its (empty) default."""
+    xtts = FakeProvider("xtts", default_voice="")
+    piper = FakeProvider("piper")
+    chain = FallbackTTS({"xtts": xtts, "piper": piper}, ["piper", "xtts"])
+    await chain.synthesize("hello", voice="5fc7ac9f", language="en", provider="xtts")
+    assert xtts.calls == [("hello", "5fc7ac9f", "en")]
+    mms = FakeProvider("mms")
+    chain = FallbackTTS({"mms": mms, "piper": piper}, ["piper", "mms"])
+    await chain.synthesize("bawo", voice="yor", language="yo", provider="mms")
+    assert mms.calls[-1][1] == "yor"

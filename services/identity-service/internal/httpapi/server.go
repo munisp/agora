@@ -68,6 +68,8 @@ type PermifyClient interface {
 type KeycloakClient interface {
 	CreateTenantGroup(ctx context.Context, slug string) (string, error)
 	CreateUser(ctx context.Context, slug string, in keycloak.CreateUserInput) (string, error)
+	// Creator → /tenants/{slug} so the new tenant appears in their token (tenant_slugs).
+	AddUserToTenantGroup(ctx context.Context, userID, slug string) error
 	// SPEC-W45 K8: execute-actions e-mail after invite (fail-soft).
 	SendExecuteActionsEmail(ctx context.Context, userID string, actions []string) error
 	// SPEC-W45 K16 member lifecycle.
@@ -393,6 +395,18 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 			zap.String("slug", t.Slug), zap.Error(err))
 	}
 
+	// The owner joins the tenant's Keycloak group (tenant_slugs claim) and gets a membership row. Without this a
+	// self-signed-up owner — or anyone a platform admin provisioned for — saw "No access" to their own business.
+	if req.OwnerUserID != "" {
+		if err := s.d.Keycloak.AddUserToTenantGroup(r.Context(), req.OwnerUserID, t.Slug); err != nil {
+			s.d.Logger.Error("owner could not join the tenant group (sign-in will show no access until fixed)",
+				zap.String("slug", t.Slug), zap.String("owner", req.OwnerUserID), zap.Error(err))
+		}
+		if err := s.d.Store.AddMember(r.Context(), store.Membership{TenantID: t.ID, UserID: req.OwnerUserID, Role: "owner"}); err != nil {
+			s.d.Logger.Error("owner membership row", zap.String("slug", t.Slug), zap.Error(err))
+		}
+	}
+
 	// Permify tenant + owner relationship.
 	if err := s.d.Permify.CreateTenant(r.Context(), t.ID.String(), t.Slug); err != nil {
 		s.d.Logger.Warn("permify tenant creation deferred", zap.String("slug", t.Slug), zap.Error(err))
@@ -425,7 +439,7 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, t)
 }
 
-// triggerOnboarding invokes notification-worker's POST /dev/trigger-onboarding
+// triggerOnboarding invokes notification-worker's POST /internal/tenants/onboard
 // via Dapr service invocation with a fresh context (the request context dies
 // with the response).
 func (s *server) triggerOnboarding(t store.Tenant) {
@@ -433,7 +447,7 @@ func (s *server) triggerOnboarding(t store.Tenant) {
 	defer cancel()
 	// SPEC-W44 K2: notification-worker gates its /dev/* triggers behind
 	// X-Internal-Token == NOTIFICATION_INTERNAL_TOKEN (401/503 fail-closed).
-	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "dev/trigger-onboarding", map[string]any{
+	err := s.d.Dapr.InvokeServiceWithHeaders(ctx, s.d.NotificationAppID, "internal/tenants/onboard", map[string]any{
 		"tenant_id":   t.ID.String(),
 		"tenant_slug": t.Slug,
 		"slug":        t.Slug,
@@ -477,7 +491,25 @@ func (s *server) listMembers(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"members": members})
+	// Names and emails for the dashboard (it showed bare user ids); best effort — a lookup failure leaves them out.
+	type summarizer interface {
+		UserSummary(ctx context.Context, userID string) (string, string, error)
+	}
+	out := make([]map[string]any, 0, len(members))
+	for _, m := range members {
+		raw, _ := json.Marshal(m)
+		row := map[string]any{}
+		_ = json.Unmarshal(raw, &row)
+		if kc, ok := s.d.Keycloak.(summarizer); ok {
+			if id, _ := row["user_id"].(string); id != "" {
+				if email, name, err := kc.UserSummary(r.Context(), id); err == nil {
+					row["email"], row["name"] = email, name
+				}
+			}
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": out})
 }
 
 // requireOrgAccess resolves the caller and authorizes them against the

@@ -174,3 +174,15 @@ class TestTTS:
         assert client.post("/tts", json={"text": "", "voice_id": "x", "language": "en"}).status_code == 422
         assert client.post("/tts", json={"voice_id": "x", "language": "en"}).status_code == 422
         assert client.post("/tts", json={"text": "x" * 5001, "voice_id": "x", "language": "en"}).status_code == 422
+
+
+def test_voices_stay_with_their_tenant(client):
+    """A cloned voice is biometric data: another business can't list, speak or delete it."""
+    vid = client.post("/voices", json={"name": "Acme desk", "sample_base64": _sample_b64(), "tenant": "acme"}).json()["voice_id"]
+    assert [v["id"] for v in client.get("/voices", params={"tenant": "acme"}).json()["voices"]] == [vid]
+    assert client.get("/voices", params={"tenant": "globex"}).json()["voices"] == []
+    say = {"text": "hello", "voice_id": vid, "language": "en"}
+    assert client.post("/tts", json={**say, "tenant": "globex"}).status_code == 404
+    assert client.post("/tts", json={**say, "tenant": "acme"}).status_code == 200
+    assert client.delete(f"/voices/{vid}", params={"tenant": "globex"}).status_code == 404
+    assert client.delete(f"/voices/{vid}", params={"tenant": "acme"}).status_code == 200

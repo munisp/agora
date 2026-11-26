@@ -112,6 +112,15 @@ ALTER TABLE field_captures ADD CONSTRAINT field_captures_kind_check
 -- (Anchor never names these columns) keeps working byte-identically.
 ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS receipt_document_id UUID;
 ALTER TABLE field_captures ADD COLUMN IF NOT EXISTS receipt_fields JSONB;
+-- 2026-11-20: tenant ids that hold receipt captures. field_captures is
+-- FORCE RLS and the booking login is its owner without BYPASSRLS, so the
+-- recon sweep could never enumerate tenants across it (it always scanned
+-- 0). Ids only, no RLS; each tenant's receipts are still read under
+-- withTenant.
+CREATE TABLE IF NOT EXISTS recon_receipt_tenants (
+    tenant_id       UUID PRIMARY KEY,
+    last_receipt_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ALTER TABLE field_captures ENABLE ROW LEVEL SECURITY;
 ALTER TABLE field_captures FORCE ROW LEVEL SECURITY;
 DO $$
@@ -282,6 +291,11 @@ func (s *Store) AttachReceipt(ctx context.Context, tenantID uuid.UUID, clientID 
 			return ErrNotFound
 		}
 		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO recon_receipt_tenants (tenant_id, last_receipt_at) VALUES ($1, now())
+			 ON CONFLICT (tenant_id) DO UPDATE SET last_receipt_at = now()`, tenantID); err != nil {
 			return err
 		}
 		if eventsTopic == "" {

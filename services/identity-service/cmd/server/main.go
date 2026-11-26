@@ -93,6 +93,8 @@ func run() error {
 		Events:       daprClient,
 		PubSub:       cfg.PubSubName,
 		ErasureTopic: cfg.ConsentErasureTopic,
+		// 2026-11-21: ConsentGranted -> graph-sync (consent-gated segments).
+		IdentityTopic: cfg.IdentityEventsTopic,
 		// SPEC-W44 F4 / V2-D3: erasure + consent-record read are gated —
 		// K2 service token or K1 tenant-bound subject (dev escape logged).
 		InternalToken:      cfg.InternalToken,

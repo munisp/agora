@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/opendesk/booking-service/internal/bookingops"
 	"github.com/opendesk/booking-service/internal/civic"
+	"github.com/opendesk/booking-service/internal/events"
 	"github.com/opendesk/booking-service/internal/leads"
 	"github.com/opendesk/booking-service/internal/store"
 	"go.uber.org/zap"
@@ -185,13 +188,81 @@ func (s *Service) applyLeadCapture(ctx context.Context, tenant bookingops.Tenant
 		UTM:        p.UTM,
 		CampaignID: p.CampaignID,
 		LgaID:      p.LgaID,
+		LgaCode:    lgaCodeOf(p),
+		LgaName:    lgaNameOf(p),
 		ConsentID:  p.ConsentID,
 	}, tenant.Slug)
 	if err != nil {
 		return err
 	}
 	res.LeadID = &lead.ID
+	s.emitContactCaptured(ctx, tenant, it, p, lead)
 	return nil
+}
+
+// EventTypeContactCaptured is the graph-sync contact-capture contract
+// (graph-sync events.TypeContactCaptured).
+const EventTypeContactCaptured = "com.opendesk.identity.ContactCaptured"
+
+type agentKey struct{}
+
+// WithAgent carries the capturing agent's user id (JWT sub) to the apply
+// path (2026-11-21), so captures can be attributed without changing the
+// Capture signatures.
+func WithAgent(ctx context.Context, userID string) context.Context {
+	if strings.TrimSpace(userID) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, agentKey{}, strings.TrimSpace(userID))
+}
+
+func agentFrom(ctx context.Context) string {
+	v, _ := ctx.Value(agentKey{}).(string)
+	return v
+}
+
+// emitContactCaptured (2026-11-21) sends the field lead to the graph as a
+// ContactCaptured event on cac.events (the leads funnel event is PII-free
+// by contract, so graph-sync never saw field captures): phone (hashed by
+// graph-sync), capture time, GPS and the agent's user id — the inputs the
+// fraud engine's D2 look-alike, D3 velocity and D4 geo-impossibility
+// detectors read. Best-effort: the lead row is already durable.
+func (s *Service) emitContactCaptured(ctx context.Context, tenant bookingops.TenantInfo, it CaptureItem, p LeadCapturePayload, lead store.Lead) {
+	if s.Leads == nil || s.Leads.Store == nil || s.Leads.CACEventsTopic == "" {
+		return
+	}
+	capturedAt := time.Now().UTC()
+	if it.CapturedAt != nil {
+		capturedAt = it.CapturedAt.UTC()
+	}
+	data := map[string]any{
+		"lead_id":     lead.ID.String(),
+		"name":        strings.TrimSpace(p.Name),
+		"phone":       p.PhoneE164,
+		"channel":     "field",
+		"source":      "field_app",
+		"captured_at": capturedAt.Format(time.RFC3339Nano),
+	}
+	if it.GPS != nil {
+		data["lat"], data["lon"] = it.GPS.Lat, it.GPS.Lng
+	}
+	// 2026-11-21: the LGA picked in the field app, so graph-sync links the contact to (Location {lga}) and
+	// LGA-filtered segments ("Ikeja customers") can match field leads; before this only GPS travelled.
+	if name := lgaNameOf(p); name != nil {
+		data["lga"] = *name
+		data["lga_code"] = *lgaCodeOf(p)
+	}
+	if agent := agentFrom(ctx); agent != "" {
+		data["captured_by"] = agent
+	}
+	payload, err := json.Marshal(events.New("booking-service", EventTypeContactCaptured, tenant.Slug, tenant.ID.String(), data))
+	if err != nil {
+		return
+	}
+	if err := s.Leads.Store.EnqueueOutbox(ctx, lead.ID, s.Leads.CACEventsTopic, payload); err != nil {
+		s.log().Warn("contact-captured enqueue failed; lead durable, graph misses this capture",
+			zap.String("lead_id", lead.ID.String()), zap.Error(err))
+	}
 }
 
 // applyCheckin appends the geo check-in row for kind=checkin (the W8
@@ -314,3 +385,26 @@ var errCivicUnavailable = fmt.Errorf("%w: civic service unavailable", ErrInvalid
 
 // errInvalidPayload wraps ErrInvalidInput for payload-schema failures.
 func errInvalidPayload(msg string) error { return fmt.Errorf("%w: %s", ErrInvalidInput, msg) }
+
+// lgaCodePattern bounds the gazetteer code the field app sends (option value
+// of its LGA picker, e.g. NG-LAGOS-IKEJA); anything else is ignored.
+var lgaCodePattern = regexp.MustCompile(`^[A-Z]{2}(-[A-Z0-9]+)+$`)
+
+func lgaCodeOf(p LeadCapturePayload) *string {
+	c := strings.ToUpper(strings.TrimSpace(p.LgaCode))
+	if len(c) == 0 || len(c) > 64 || !lgaCodePattern.MatchString(c) {
+		return nil
+	}
+	return &c
+}
+
+func lgaNameOf(p LeadCapturePayload) *string {
+	if lgaCodeOf(p) == nil {
+		return nil
+	}
+	n := strings.TrimSpace(p.LGA)
+	if n == "" || len(n) > 120 {
+		return nil
+	}
+	return &n
+}

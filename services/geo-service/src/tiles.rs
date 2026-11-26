@@ -156,12 +156,68 @@ pub async fn style(State(state): State<AppState>) -> Response {
         source["bounds"] = serde_json::json!(b);
     }
 
+    // 2026-11-20: a readable street-map palette for the Protomaps basemap
+    // layers (land, parks, water, roads, buildings, borders) drawn in map
+    // order; every layer used to share one blue fill + outline, so land,
+    // water and roads were indistinguishable. Unknown layers keep the old
+    // generic pair. Point-only layers (places, pois) need glyphs, so skip.
     let mut layers = vec![serde_json::json!({
         "id": "background",
         "type": "background",
-        "paint": {"background-color": "#f8f9fa"}
+        "paint": {"background-color": "#f2efe9"}
     })];
-    for id in &vector_layer_ids {
+    let poly = serde_json::json!(["==", ["geometry-type"], "Polygon"]);
+    let line = serde_json::json!(["==", ["geometry-type"], "LineString"]);
+    let fill = |id: &str, color: &str, opacity: f64| serde_json::json!({
+        "id": format!("{id}-fill"), "type": "fill", "source": "geo", "source-layer": id,
+        "filter": poly.clone(), "paint": {"fill-color": color, "fill-opacity": opacity}
+    });
+    const ORDER: [&str; 9] = ["earth", "landcover", "landuse", "water", "roads", "buildings", "boundaries", "places", "pois"];
+    let mut ordered: Vec<&String> = vector_layer_ids.iter().filter(|id| ORDER.contains(&id.as_str())).collect();
+    ordered.sort_by_key(|id| ORDER.iter().position(|o| o == id));
+    for id in ordered {
+        match id.as_str() {
+            "earth" => layers.push(fill(id, "#f2efe9", 1.0)),
+            "landcover" => layers.push(fill(id, "#d8e8c8", 0.6)),
+            "landuse" => layers.push(fill(id, "#e3ecd5", 0.7)),
+            "water" => {
+                layers.push(fill(id, "#aad3df", 1.0));
+                layers.push(serde_json::json!({
+                    "id": "water-line", "type": "line", "source": "geo", "source-layer": id,
+                    "filter": line.clone(), "paint": {"line-color": "#aad3df", "line-width": 1.2}
+                }));
+            }
+            "roads" => {
+                layers.push(serde_json::json!({
+                    "id": "roads-minor", "type": "line", "source": "geo", "source-layer": id,
+                    "filter": ["all", line.clone(), ["!", ["in", ["get", "kind"], ["literal", ["highway", "major_road"]]]]],
+                    "minzoom": 11,
+                    "paint": {"line-color": "#ffffff", "line-width": ["interpolate", ["linear"], ["zoom"], 11, 0.5, 16, 4]}
+                }));
+                layers.push(serde_json::json!({
+                    "id": "roads-major", "type": "line", "source": "geo", "source-layer": id,
+                    "filter": ["all", line.clone(), ["==", ["get", "kind"], "major_road"]],
+                    "paint": {"line-color": "#fcd6a4", "line-width": ["interpolate", ["linear"], ["zoom"], 6, 0.6, 16, 6]}
+                }));
+                layers.push(serde_json::json!({
+                    "id": "roads-highway", "type": "line", "source": "geo", "source-layer": id,
+                    "filter": ["all", line.clone(), ["==", ["get", "kind"], "highway"]],
+                    "paint": {"line-color": "#e892a2", "line-width": ["interpolate", ["linear"], ["zoom"], 5, 0.8, 16, 8]}
+                }));
+            }
+            "buildings" => {
+                let mut b = fill(id, "#d9d0c9", 0.8);
+                b["minzoom"] = serde_json::json!(13);
+                layers.push(b);
+            }
+            "boundaries" => layers.push(serde_json::json!({
+                "id": "boundaries-line", "type": "line", "source": "geo", "source-layer": id,
+                "paint": {"line-color": "#9e8aa6", "line-width": 1, "line-dasharray": [3, 2]}
+            })),
+            _ => {}
+        }
+    }
+    for id in vector_layer_ids.iter().filter(|id| !ORDER.contains(&id.as_str())) {
         layers.push(serde_json::json!({
             "id": format!("{id}-fill"),
             "type": "fill",

@@ -78,6 +78,13 @@ const REASON_PHRASES: Record<string, string> = {
 };
 
 function humanReason(reason: string): string {
+  // 2026-11-26: the business's own policy rules (ocr-service policy rules).
+  if (reason.startsWith("policy:")) {
+    return `it does not meet our policy (${reason.slice("policy:".length).trim().replace(/\.$/, "")})`;
+  }
+  if (reason.startsWith("policy_unchecked:")) {
+    return `we could not confirm part of our policy (${reason.slice("policy_unchecked:".length).trim().replace(/\.$/, "")})`;
+  }
   if (reason.startsWith("missing_required_field:")) {
     const field = reason.slice("missing_required_field:".length).replace(/_/g, " ");
     return `the ${field} is missing`;
